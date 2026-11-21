@@ -100,6 +100,11 @@ pub const TYPING: &str = "typing";
 pub const RECEIPTS: &str = "receipts";
 /// P4. Days messages are kept on this Mac: 7, 30 or 90.
 pub const KEEP_DAYS: &str = "keep_days";
+/// Client-side link preview cards (e.g. Google Messages). On for known contacts by default.
+pub const LINK_PREVIEWS: &str = "link_previews";
+/// Client-side link preview cards for numbers not in contacts. Off by default to avoid
+/// fetching phishing links automatically.
+pub const LINK_PREVIEWS_UNKNOWN: &str = "link_previews_unknown";
 /// D2. The image and file cache's cap in MB: 250, 500, 1000 or 2000.
 pub const CACHE_MB: &str = "cache_mb";
 /// The schema of these rows, for migrations. Not a setting anyone changes.
@@ -227,7 +232,7 @@ enum Kind {
 
 fn kind(key: &str) -> Option<Kind> {
     Some(match key {
-        KEEP_RUNNING | SOUNDS | CUE_JOINS | CUE_MINE | CUE_CONNECTION => Kind::Switch(true),
+        KEEP_RUNNING | SOUNDS | CUE_JOINS | CUE_MINE | CUE_CONNECTION | LINK_PREVIEWS => Kind::Switch(true),
         NOTIFY | NOTIFY_DIRECT | NOTIFY_GROUPS | NOTIFY_MENTIONS | NOTIFY_TINY | NOTIFY_THREADS | CALLS_THROUGH | FLASH | BADGE | RINGBACK => Kind::Switch(true),
         NOTIFY_REACTIONS => Kind::Word(&REACTION_NOTIFY_CHOICES, "off"),
         NOTIFY_KEYWORDS => Kind::Keywords,
@@ -255,7 +260,7 @@ fn kind(key: &str) -> Option<Kind> {
         ECHO_CANCELLATION | AUTO_GAIN => Kind::Switch(true),
         NOISE_SUPPRESSION => Kind::Word(&NOISE_CHOICES, "enhanced"),
         VOICE_QUALITY => Kind::Word(&QUALITY_CHOICES, "standard"),
-        JOIN_MUTED | PUSH_TO_TALK | REQUIRE_CALL_E2EE => Kind::Switch(false),
+        JOIN_MUTED | PUSH_TO_TALK | REQUIRE_CALL_E2EE | LINK_PREVIEWS_UNKNOWN => Kind::Switch(false),
         MUTED_TALK => Kind::Switch(true),
         PTT_RELEASE_MS => Kind::Choice(&PTT_RELEASE_CHOICES, 200),
         CUE_VOLUME => Kind::Percent(50),
@@ -417,10 +422,19 @@ pub fn conversation_scope(conversation: &Key) -> String {
 
 /// The network of a conversation's scope, `conv:<network>:<account>:<id>` with every part.
 pub fn conversation_of(scope: &str) -> Option<Network> {
+    conversation_key_of(scope).map(|key| key.network)
+}
+
+/// The full conversation key named by a `conv:<network>:<account>:<id>` scope.
+pub fn conversation_key_of(scope: &str) -> Option<Key> {
     let (word, rest) = scope.strip_prefix("conv:")?.split_once(':')?;
     let network = Network::ALL.into_iter().find(|n| network_word(*n) == word)?;
-    let (account, id) = rest.split_once(':')?;
-    (!account.is_empty() && !id.is_empty()).then_some(network)
+    let (account, id) = rest.rsplit_once(':')?;
+    (!account.is_empty() && !id.is_empty()).then(|| Key {
+        network,
+        account: account.to_owned(),
+        id: id.to_owned(),
+    })
 }
 
 /// The account an `account:` scope names.

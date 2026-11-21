@@ -197,6 +197,44 @@ impl TinyRoom {
     }
 }
 
+/// One text channel on a Tiny server: its category, order, encryption state, per-role overrides
+/// and what this account may do in it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyChannel {
+    pub id: String,
+    #[serde(default, deserialize_with = "text_or_null")]
+    pub name: String,
+    #[serde(default, deserialize_with = "text_or_null", skip_serializing_if = "String::is_empty")]
+    pub topic: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category_id: Option<String>,
+    #[serde(default, deserialize_with = "or_default", skip_serializing_if = "is_zero_i32")]
+    pub position: i32,
+    #[serde(default, deserialize_with = "or_default", skip_serializing_if = "crate::is_false")]
+    pub e2ee: bool,
+    #[serde(default, deserialize_with = "or_default", skip_serializing_if = "Vec::is_empty")]
+    pub overrides: Vec<TinyOverride>,
+    /// What this account may do in this channel. `None` from an older server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub my_permissions: Option<u64>,
+}
+
+impl TinyChannel {
+    /// A text channel with just an id and name.
+    pub fn new(id: &str, name: &str) -> TinyChannel {
+        TinyChannel {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            topic: String::new(),
+            category_id: None,
+            position: 0,
+            e2ee: false,
+            overrides: Vec::new(),
+            my_permissions: None,
+        }
+    }
+}
+
 fn yes() -> bool {
     true
 }
@@ -260,6 +298,9 @@ pub struct TinyCommunity {
     /// The server's rooms, in its order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rooms: Vec<TinyRoom>,
+    /// The server's text channels, in its order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channels: Vec<TinyChannel>,
     /// Members online now, as the live socket last said. Empty while it is not connected.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub online: Vec<String>,
@@ -344,6 +385,7 @@ pub struct TinyCapabilities {
 pub const TINY_FEATURE_SERVER: &str = "server";
 pub const TINY_FEATURE_ROLES: &str = "roles";
 pub const TINY_FEATURE_CATEGORIES: &str = "categories";
+pub const TINY_FEATURE_CHANNEL_LAYOUT: &str = "channel_layout";
 pub const TINY_FEATURE_BANS: &str = "bans";
 pub const TINY_FEATURE_TIMEOUTS: &str = "timeouts";
 pub const TINY_FEATURE_INVITE_OPTIONS: &str = "invite_options";
@@ -371,6 +413,12 @@ pub fn incognito_host(host: &str) -> bool {
 pub const TINY_FEATURE_UPLOAD_LIMITS: &str = "upload_limits";
 /// Uploads are scanned, and archives stay off until an owner allows them.
 pub const TINY_FEATURE_FILE_SCAN: &str = "file_scan";
+/// Conversations support pinning messages (`PUT`/`DELETE /v1/messages/{id}/pin`, `GET /v1/conversations/{id}/pins`).
+pub const TINY_FEATURE_PINS: &str = "pins";
+/// Server-side plaintext message search (`GET /v1/search`).
+pub const TINY_FEATURE_MESSAGE_SEARCH: &str = "message_search";
+/// Member block list (`GET/PUT/DELETE /v1/blocks`).
+pub const TINY_FEATURE_BLOCKS: &str = "blocks";
 /// Images and GIFs, until an admin changes it.
 pub const TINY_IMAGE_MAX_DEFAULT: i64 = 8 * 1024 * 1024;
 /// Video and every other file, until an admin changes it.
@@ -411,8 +459,9 @@ pub const TINY_DISCONNECT_MEMBERS: u64 = 1 << 17;
 pub const TINY_VIEW_AUDIT_LOG: u64 = 1 << 18;
 pub const TINY_MANAGE_SERVER: u64 = 1 << 19;
 pub const TINY_MANAGE_REPORTS: u64 = 1 << 20;
+pub const TINY_MANAGE_MESSAGES: u64 = 1 << 21;
 /// Every bit there is.
-pub const TINY_ALL: u64 = (1 << 21) - 1;
+pub const TINY_ALL: u64 = (1 << 22) - 1;
 /// The bits a room's override may change.
 pub const TINY_CHANNEL_SCOPED: u64 = TINY_VIEW_CHANNEL
     | TINY_CONNECT
@@ -425,13 +474,14 @@ pub const TINY_CHANNEL_SCOPED: u64 = TINY_VIEW_CHANNEL
     | TINY_MUTE_MEMBERS
     | TINY_DEAFEN_MEMBERS
     | TINY_MOVE_MEMBERS
-    | TINY_DISCONNECT_MEMBERS;
+    | TINY_DISCONNECT_MEMBERS
+    | TINY_MANAGE_MESSAGES;
 /// What @everyone has on a server that was never changed.
 pub const TINY_EVERYONE_DEFAULT: u64 = TINY_VIEW_CHANNEL | TINY_CONNECT | TINY_SPEAK | TINY_VIDEO | TINY_SHARE_SCREEN | TINY_VOICE_ACTIVITY;
 
 /// Every permission, in the server's order, with its wire name: for the settings page's
 /// toggles. Bit `n` is `1 << n`.
-pub const TINY_PERMISSIONS: [(u64, &str); 21] = [
+pub const TINY_PERMISSIONS: [(u64, &str); 22] = [
     (TINY_VIEW_CHANNEL, "view_channel"),
     (TINY_CONNECT, "connect"),
     (TINY_SPEAK, "speak"),
@@ -453,6 +503,7 @@ pub const TINY_PERMISSIONS: [(u64, &str); 21] = [
     (TINY_VIEW_AUDIT_LOG, "view_audit_log"),
     (TINY_MANAGE_SERVER, "manage_server"),
     (TINY_MANAGE_REPORTS, "manage_reports"),
+    (TINY_MANAGE_MESSAGES, "manage_messages"),
 ];
 
 /// The server's identity and settings, from `GET /v1/server`.
@@ -663,6 +714,15 @@ impl TinyAccess {
         room.my_permissions.unwrap_or(self.permissions) & bits == bits
     }
 
+    /// Whether this account has all of `bits` in `channel`, by the channel's `my_permissions`
+    /// where the server sent them, else by the server-wide bits.
+    pub fn has_in_channel(&self, channel: &TinyChannel, bits: u64) -> bool {
+        if self.owner {
+            return true;
+        }
+        channel.my_permissions.unwrap_or(self.permissions) & bits == bits
+    }
+
     /// Whether this account may act on someone (kick, ban, timeout, roles, server mute or
     /// deafen, move, disconnect): only on people ranked below it, and only an owner on an owner's
     /// peers. Nobody acts on themselves this way.
@@ -725,10 +785,17 @@ fn tiny_bits(id: &str) -> Option<u64> {
         "community.members.timeout" => TINY_TIMEOUT_MEMBERS,
         "community.audit.read" => TINY_VIEW_AUDIT_LOG,
         "community.server.edit" | "community.bots.manage" => TINY_MANAGE_SERVER,
-        "community.rooms.create" | "community.rooms.rename" | "community.rooms.delete" | "community.rooms.edit" | "community.categories.manage" => {
+        "community.rooms.create"
+        | "community.rooms.rename"
+        | "community.rooms.delete"
+        | "community.rooms.edit"
+        | "community.channels.create"
+        | "community.channels.edit"
+        | "community.channels.delete"
+        | "community.categories.manage" => {
             TINY_MANAGE_CHANNELS
         }
-        "community.rooms.overrides" => TINY_MANAGE_CHANNELS | TINY_MANAGE_ROLES,
+        "community.rooms.overrides" | "community.channels.overrides" => TINY_MANAGE_CHANNELS | TINY_MANAGE_ROLES,
         "community.calls.join" => TINY_CONNECT,
         "community.calls.kick" => TINY_DISCONNECT_MEMBERS,
         "community.calls.mute" => TINY_MUTE_MEMBERS,
@@ -1107,6 +1174,25 @@ pub struct TinyRoomEdit {
     pub e2ee_required: Option<bool>,
 }
 
+/// A text channel to make, or a change to one. Only what is `Some` is sent; `category_id: Some("")`
+/// moves it out of its category. `e2ee` is only used when creating a channel and only sent when true.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyChannelEdit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub e2ee: Option<bool>,
+}
+
+/// The server's limit for a text channel's topic.
+pub const TINY_CHANNEL_TOPIC_MAX: usize = 1024;
+
 /// The lowest and highest bitrate a room may have, and what one has unless set.
 pub const TINY_BITRATE_MIN: u32 = 16;
 pub const TINY_BITRATE_MAX: u32 = 128;
@@ -1131,14 +1217,32 @@ pub struct TinyInviteOptions {
     pub default_expiry: bool,
 }
 
-/// One group of the channel list's order: a category, or `None` for the rooms outside any
-/// (always shown first), with its rooms top first.
+/// Whether an entry in a mixed `PUT /v1/layout` bucket is a text channel or a voice room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TinyLayoutItemKind {
+    Channel,
+    Room,
+}
+
+/// One text channel or voice room inside a [`TinyLayoutGroup`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TinyLayoutItem {
+    pub kind: TinyLayoutItemKind,
+    pub id: String,
+}
+
+/// One group of the channel list's order: a category, or `None` for the channels outside any
+/// (always shown first), with its items top first. `items` is used on servers with
+/// `channel_layout`; `room_ids` stays for older servers.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TinyLayoutGroup {
     #[serde(default)]
     pub category_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub room_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<TinyLayoutItem>,
 }
 
 /// One page of the audit, newest first. Page on by passing the last row's id as `before`.
@@ -1401,6 +1505,50 @@ pub fn parse_room_link(input: &str) -> Option<(String, String)> {
     (!host.is_empty()).then_some((host, id))
 }
 
+const MESSAGE_APP_PREFIX: &str = "tinyclient://message#";
+
+fn is_uuid(id: &str) -> bool {
+    let b = id.as_bytes();
+    b.len() == 36
+        && b[8] == b'-'
+        && b[13] == b'-'
+        && b[18] == b'-'
+        && b[23] == b'-'
+        && b.iter().enumerate().all(|(i, &c)| matches!(i, 8 | 13 | 18 | 23) || c.is_ascii_hexdigit())
+}
+
+/// Build an app deep link for a Tiny message:
+/// `tinyclient://message#<https server origin>/<conversation uuid>/<message uuid>`.
+/// The parts live in the fragment so nothing is sent to a web server if pasted in a browser.
+pub fn message_link(origin: &str, conversation_id: &str, message_id: &str) -> Option<String> {
+    let origin = invite_origin(origin)?;
+    if !origin.starts_with("https://") || !is_uuid(conversation_id) || !is_uuid(message_id) {
+        return None;
+    }
+    Some(format!("{MESSAGE_APP_PREFIX}{origin}/{conversation_id}/{message_id}"))
+}
+
+/// Parse a Tiny message deep link (`tinyclient://message#<origin>/<conversation_id>/<message_id>`),
+/// returning `(normalized_origin, conversation_id, message_id)`.
+pub fn parse_message_link(input: &str) -> Option<(String, String, String)> {
+    if input.len() > INVITE_ORIGIN_MAX + 128
+        || input.chars().any(|c| c.is_whitespace() || c.is_control() || c == '\\')
+    {
+        return None;
+    }
+    let rest = input.strip_prefix(MESSAGE_APP_PREFIX)?;
+    let (prefix, message_id) = rest.rsplit_once('/')?;
+    let (origin, conversation_id) = prefix.rsplit_once('/')?;
+    if !is_uuid(conversation_id) || !is_uuid(message_id) {
+        return None;
+    }
+    let normalized = invite_origin(origin)?;
+    if !normalized.starts_with("https://") {
+        return None;
+    }
+    Some((normalized, conversation_id.to_owned(), message_id.to_owned()))
+}
+
 /// The host, and a port when it is not the usual one. `https://private.tinyclient.io` is
 /// `private.tinyclient.io`. `http://127.0.0.1:8080` keeps the port.
 pub fn join_host(origin: &str) -> String {
@@ -1452,7 +1600,13 @@ pub fn tiny_can(role: &str, id: &str) -> bool {
         "account.name.edit" | "account.sessions.end" | "community.calls.join" => {
             matches!(role, "owner" | "admin" | "member")
         }
-        "community.rooms.create" | "community.rooms.rename" | "community.rooms.delete" | "community.calls.kick" => {
+        "community.rooms.create"
+        | "community.rooms.rename"
+        | "community.rooms.delete"
+        | "community.channels.create"
+        | "community.channels.edit"
+        | "community.channels.delete"
+        | "community.calls.kick" => {
             matches!(role, "owner" | "admin")
         }
         _ => false,
@@ -1645,6 +1799,42 @@ mod tests {
         }
         assert!(room_link("https://tiny.example", "../etc").is_none());
         assert!(room_link("ftp://tiny.example", "lounge").is_none());
+    }
+
+    #[test]
+    fn message_links_round_trip_and_reject_malformed_inputs() {
+        let conv = "11111111-2222-3333-4444-555555555555";
+        let msg = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let link = message_link("https://Chat.Example:8443", conv, msg).unwrap();
+        assert_eq!(link, format!("tinyclient://message#https://chat.example:8443/{conv}/{msg}"));
+        assert_eq!(
+            parse_message_link(&link),
+            Some(("https://chat.example:8443".into(), conv.into(), msg.into()))
+        );
+
+        let plain = message_link("https://tiny.example", conv, msg).unwrap();
+        assert_eq!(plain, format!("tinyclient://message#https://tiny.example/{conv}/{msg}"));
+        assert_eq!(
+            parse_message_link(&plain),
+            Some(("https://tiny.example".into(), conv.into(), msg.into()))
+        );
+
+        assert!(message_link("http://tiny.example", conv, msg).is_none());
+        assert!(message_link("https://tiny.example", "not-a-uuid", msg).is_none());
+        assert!(message_link("https://tiny.example", conv, "not-a-uuid").is_none());
+
+        for bad in [
+            "tinyclient://message#",
+            "tinyclient://message#http://tiny.example/11111111-2222-3333-4444-555555555555/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "tinyclient://message#https://tiny.example/11111111-2222-3333-4444-555555555555",
+            "tinyclient://message#https://tiny.example/bad/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "tinyclient://message#https://tiny.example/11111111-2222-3333-4444-555555555555/bad",
+            "tinyclient://message#https://user@tiny.example/11111111-2222-3333-4444-555555555555/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "tinyclient://message#https://tiny.example/extra/11111111-2222-3333-4444-555555555555/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "tinyclient://join#abc",
+        ] {
+            assert_eq!(parse_message_link(bad), None, "{bad}");
+        }
     }
 
     #[test]
@@ -1867,7 +2057,7 @@ mod tests {
         let options = TinyInviteOptions { max_uses: Some(5), ..TinyInviteOptions::default() };
         assert_eq!(serde_json::to_string(&options).unwrap(), r#"{"max_uses":5}"#);
         let names: Vec<&str> = TINY_PERMISSIONS.iter().map(|(_, name)| *name).collect();
-        assert_eq!(names.len(), 21);
+        assert_eq!(names.len(), 22);
         assert!(TINY_PERMISSIONS.iter().enumerate().all(|(n, (bit, _))| *bit == 1 << n));
     }
 
@@ -2137,5 +2327,20 @@ mod tests {
         assert!(own.contains("http, not https") && own.contains("your network"));
         let open = super::plain_http_words(Open).unwrap();
         assert!(open.contains("http, not https") && open.contains("not on your own network") && open.contains("take over your account"));
+    }
+
+    #[test]
+    fn has_in_channel_checks_owner_my_permissions_and_fallback() {
+        let owner = TinyAccess { owner: true, roles: vec![], permissions: 0, rank: i32::MAX };
+        let member = TinyAccess { owner: false, roles: vec!["r".into()], permissions: TINY_VIEW_CHANNEL | TINY_MANAGE_CHANNELS, rank: 1 };
+        let denied = TinyChannel { my_permissions: Some(TINY_VIEW_CHANNEL), ..TinyChannel::new("c1", "general") };
+        let granted = TinyChannel { my_permissions: Some(TINY_VIEW_CHANNEL | TINY_MANAGE_CHANNELS), ..TinyChannel::new("c2", "ops") };
+        let legacy = TinyChannel::new("c3", "legacy");
+        assert!(owner.has_in_channel(&denied, TINY_MANAGE_CHANNELS));
+        assert!(!member.has_in_channel(&denied, TINY_MANAGE_CHANNELS));
+        assert!(member.has_in_channel(&denied, TINY_VIEW_CHANNEL));
+        assert!(member.has_in_channel(&granted, TINY_MANAGE_CHANNELS));
+        assert!(member.has_in_channel(&legacy, TINY_MANAGE_CHANNELS));
+        assert!(!member.has_in_channel(&legacy, TINY_BAN_MEMBERS));
     }
 }

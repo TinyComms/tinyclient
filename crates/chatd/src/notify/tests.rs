@@ -355,6 +355,30 @@ fn a_refused_notification_plays_no_sound() {
     assert!(!notes.test(&Values::default(), false).0);
 }
 
+#[test]
+fn otp_notification_offers_copy_only_when_previews_are_shown() {
+    let fake = Fake::default();
+    let mut notes = Notes::new(Box::new(fake.clone()));
+    let otp = message("Bank", "Your verification code is 482910.");
+    let full = Verdict { banner: true, sound: None, preview: Preview::Full, mention: false };
+    notes.message(&dm(), &otp, &full, Instant::now());
+    let id = note_id(&dm().key);
+    assert_eq!(fake.log().shown[&id].copy_code.as_deref(), Some("482910"));
+    assert_eq!(notes.code(&id), Some("482910"));
+
+    // Hidden previews: neither the body nor copy_code exposes the code.
+    let hidden = Verdict { banner: true, sound: None, preview: Preview::Sender, mention: false };
+    notes.message(&dm(), &otp, &hidden, Instant::now());
+    assert_eq!(fake.log().shown[&id].copy_code, None);
+    assert!(!fake.log().shown[&id].body.contains("482910"));
+    assert_eq!(notes.code(&id), None);
+
+    let nothing = Verdict { banner: true, sound: None, preview: Preview::Nothing, mention: false };
+    notes.message(&dm(), &otp, &nothing, Instant::now());
+    assert_eq!(fake.log().shown[&id].copy_code, None);
+    assert!(!fake.log().shown[&id].body.contains("482910"));
+}
+
 fn ringing(conversation: &Key, from: &str) -> Call {
     serde_json::from_value(serde_json::json!({
         "conversation": conversation,
@@ -404,6 +428,35 @@ fn a_tiny_direct_rings_when_server_notifications_are_off() {
     let room = key(Network::Tiny, "R1");
     assert!(decide_ring(&values, &room, &moment()).is_none());
     assert!(decide_ring_in(&values, &room, &moment(), true).is_some());
+}
+
+#[test]
+fn tiny_channel_local_notify_levels_and_muted_direct_ring() {
+    let mut values = Values::default();
+    let now = moment();
+    let chan = row(Network::Tiny, "C1", ConversationKind::Channel, "general");
+    let chan_scope = conversation_scope(&chan.key);
+
+    // Off: posts nothing, even mentions.
+    set(&mut values, &chan_scope, settings::NOTIFY_ABOUT, "off");
+    assert!(!posts(&values, &chan, &message("Kai", "hello"), &now));
+    assert!(!posts(&values, &chan, &mention("Kai", "@me hi"), &now));
+
+    // Mentions: posts mentions, not plain messages.
+    set(&mut values, &chan_scope, settings::NOTIFY_ABOUT, "mentions");
+    assert!(!posts(&values, &chan, &message("Kai", "hello"), &now));
+    assert!(posts(&values, &chan, &mention("Kai", "@me hi"), &now));
+
+    // All: posts plain messages too.
+    set(&mut values, &chan_scope, settings::NOTIFY_ABOUT, "all");
+    assert!(posts(&values, &chan, &message("Kai", "hello"), &now));
+
+    // A muted Tiny direct silences message notifications, but still rings for a call.
+    let direct = row(Network::Tiny, "D1", ConversationKind::Direct, "Bea");
+    let direct_scope = conversation_scope(&direct.key);
+    set(&mut values, &direct_scope, settings::NOTIFY_ABOUT, "off");
+    assert!(!posts(&values, &direct, &message("Bea", "ping"), &now));
+    assert!(decide_ring_in(&values, &direct.key, &now, true).is_some());
 }
 
 #[test]

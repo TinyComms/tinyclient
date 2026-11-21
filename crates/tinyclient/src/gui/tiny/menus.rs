@@ -65,7 +65,7 @@ impl Shell {
             items = items.child(menu_separator());
         }
         if may.make_room {
-            items = items.child(self.plain(menu_item("tiny-menu-channel", Some("icons/plus.svg"), "Create channel", None), cx).on_click(cx.listener(|this, _, window, cx| this.tiny_open_modal(Modal::NewRoom(None), window, cx))));
+            items = items.child(self.plain(menu_item("tiny-menu-channel", Some("icons/plus.svg"), "Create channel", None), cx).on_click(cx.listener(|this, _, window, cx| this.tiny_open_modal(Modal::NewChannel { category: None, kind: super::NewChannelKind::Text, e2ee: false }, window, cx))));
         }
         if may.categories {
             items = items.child(self.plain(menu_item("tiny-menu-category", Some("icons/folder-plus.svg"), "Create category", None), cx).on_click(cx.listener(|this, _, window, cx| this.tiny_open_modal(Modal::NewCategory, window, cx))));
@@ -153,6 +153,39 @@ impl Shell {
         } else {
             let message_id = user_id.to_owned();
             items = items.child(self.plain(menu_item("tiny-person-message", Some("icons/message-square.svg"), "Message", None), cx).on_click(cx.listener(move |this, _, _, cx| this.tiny_message(message_id.clone(), cx))));
+            if facts.call && !model::in_call_with(self.tiny_call().as_ref(), &page.account, user_id) {
+                let call_id = user_id.to_owned();
+                items = items.child(
+                    self.plain(menu_item("tiny-person-call", Some("icons/phone.svg"), "Call", None), cx)
+                        .on_click(cx.listener(move |this, _, _, cx| this.tiny_call_person(call_id.clone(), cx))),
+                );
+            }
+            if !member.role.eq_ignore_ascii_case("bot") && page.community.has(protocol::TINY_FEATURE_BLOCKS) {
+                let person_key = page.key(user_id);
+                let blocked = self
+                    .people_state
+                    .hub()
+                    .person(&person_key)
+                    .is_some_and(|p| p.relation == protocol::Relation::Blocked);
+                let target = protocol::Person::new(person_key, name.clone());
+                if blocked {
+                    items = items.child(
+                        self.plain(menu_item("tiny-person-unblock", Some("icons/circle-alert.svg"), "Unblock", None), cx)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.tiny_close_float(cx);
+                                this.relate(&target, protocol::RelateAction::Unblock, cx);
+                            })),
+                    );
+                } else {
+                    items = items.child(
+                        self.plain(menu_item_danger("tiny-person-block", Some("icons/circle-alert.svg"), "Block…"), cx)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.tiny_close_float(cx);
+                                this.confirm_block(target.key.clone(), cx);
+                            })),
+                    );
+                }
+            }
         }
         if facts.local {
             items = items
@@ -324,6 +357,55 @@ impl Shell {
         items
     }
 
+    pub(super) fn tiny_text_channel_menu(&self, page: &Page, channel_id: &str, cx: &mut Context<Self>) -> Option<Div> {
+        let (name, _) = self.tiny_text_channel_info(channel_id);
+        let title = if name.is_empty() { channel_id.to_owned() } else { format!("#{name}") };
+        let can_manage = self.tiny_text_channel_can_manage(page, channel_id);
+        let unread_key = self
+            .tiny_chats()
+            .into_iter()
+            .find(|chat| chat.key.id == channel_id && chat.unread > 0)
+            .map(|chat| chat.key.clone());
+        if !can_manage && unread_key.is_none() {
+            return None;
+        }
+        let mut items = menu().w(px(220.)).child(menu_label(title));
+        if let Some(key) = unread_key {
+            items = items.child(
+                self.plain(menu_item("tiny-text-channel-read", Some("icons/check.svg"), "Mark as read", None), cx)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.tiny_close_float(cx);
+                        this.mark_conversation_read(key.clone(), cx);
+                    })),
+            );
+            if can_manage {
+                items = items.child(menu_separator());
+            }
+        }
+        if can_manage {
+            let edit_id = channel_id.to_owned();
+            let delete_id = channel_id.to_owned();
+            let modern = page.community.has(protocol::TINY_FEATURE_ROLES) || page.community.has(protocol::TINY_FEATURE_CATEGORIES);
+            items = items
+                .child(
+                    self.plain(menu_item("tiny-text-channel-edit", Some("icons/pencil.svg"), "Edit channel…", None), cx)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if modern {
+                                this.tiny_open_settings(super::settings::Page::Channels, Some(edit_id.clone()), window, cx);
+                            } else {
+                                this.tiny_open_modal(Modal::EditChannel(edit_id.clone()), window, cx);
+                            }
+                        })),
+                )
+                .child(menu_separator())
+                .child(
+                    self.plain(menu_item_danger("tiny-text-channel-delete", Some("icons/trash-2.svg"), "Delete channel…"), cx)
+                        .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_modal(Modal::DeleteChannel(delete_id.clone()), window, cx))),
+                );
+        }
+        Some(items)
+    }
+
     pub(super) fn tiny_category_menu(&self, page: &Page, key: &str, cx: &mut Context<Self>) -> Div {
         let may = page.may;
         let category = page.community.categories.iter().find(|category| category.id == key);
@@ -338,7 +420,7 @@ impl Shell {
         );
         if may.make_room {
             let id = category.map(|category| category.id.clone());
-            items = items.child(self.plain(menu_item("tiny-category-channel", Some("icons/plus.svg"), "Create channel", None), cx).on_click(cx.listener(move |this, _, window, cx| this.tiny_open_modal(Modal::NewRoom(id.clone()), window, cx))));
+            items = items.child(self.plain(menu_item("tiny-category-channel", Some("icons/plus.svg"), "Create channel", None), cx).on_click(cx.listener(move |this, _, window, cx| this.tiny_open_modal(Modal::NewChannel { category: id.clone(), kind: super::NewChannelKind::Text, e2ee: false }, window, cx))));
         }
         if let (Some(category), true) = (category, may.categories) {
             items = items.child(self.plain(menu_item("tiny-category-edit", Some("icons/pencil.svg"), "Edit categories", None), cx).on_click(cx.listener(|this, _, window, cx| this.tiny_open_settings(super::settings::Page::Channels, None, window, cx))));

@@ -558,6 +558,7 @@ mod tests {
             audit: Vec::new(),
             origin: String::new(),
             rooms: Vec::new(),
+            channels: Vec::new(),
             online: Vec::new(),
             media: String::new(),
             capabilities: TinyCapabilities { version: String::new(), features: features.iter().map(|feature| (*feature).to_owned()).collect() },

@@ -57,6 +57,7 @@ pub(in crate::gui) const GROUPS: [(&str, &[(u64, &str, &str)]); 5] = [
             (TINY_MOVE_MEMBERS, "Move members", "Move people from one channel to another."),
             (TINY_DISCONNECT_MEMBERS, "Disconnect members", "Take someone out of a call."),
             (TINY_MANAGE_REPORTS, "Manage reports", "Read reports, including who reported whom, and act on them."),
+            (TINY_MANAGE_MESSAGES, "Manage messages", "Delete other people's messages in channels."),
         ],
     ),
     (
@@ -141,9 +142,9 @@ pub(in crate::gui) fn grantable(community: &TinyCommunity, bit: u64) -> bool {
 }
 
 /// Whether this account may give `bit` to `role`: only what it holds itself (unless it is an
-/// owner), and `@everyone` can never hold `manage_reports`.
+/// owner), and `@everyone` can never hold `manage_reports` or `manage_messages`.
 pub(in crate::gui) fn grantable_for(community: &TinyCommunity, role: &TinyRole, bit: u64) -> bool {
-    grantable(community, bit) && !(role.default && bit == TINY_MANAGE_REPORTS)
+    grantable(community, bit) && !(role.default && (bit == TINY_MANAGE_REPORTS || bit == TINY_MANAGE_MESSAGES))
 }
 
 impl Shell {

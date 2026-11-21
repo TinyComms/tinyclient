@@ -464,6 +464,7 @@ impl InfoPane {
             direct: self.row.as_ref().map(|row| (row.call, self.notify_of(row, None) == Notify::Nothing)),
             online: self.online(person.key.network),
             close_direct: super::scene_can_close_direct(&self.scene, &person.key),
+            can_block: self.scene.blocks_accounts.contains(&person.key.account()),
         }
     }
 
@@ -520,14 +521,28 @@ impl InfoPane {
         }
         if actions.notifications {
             if let Some(row) = self.row.clone() {
-                let on = self.notify_of(&row, None) != Notify::Nothing;
+                let local = row.key.network == Network::Tiny;
+                let on = if local {
+                    profile::details::local_notify_shown(&row) != Notify::Nothing
+                } else {
+                    self.notify_of(&row, None) != Notify::Nothing
+                };
                 let key = row.key.clone();
                 top = top.child(
                     draw::notifications_row(draw::switch("info-notify", on).on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_notify(key.clone(), if on { Notify::Nothing } else { Notify::All }, cx)
+                        let to = if on { Notify::Nothing } else { Notify::All };
+                        if local {
+                            profile::details::set_local_notify(&key, to, cx);
+                            cx.notify();
+                        } else {
+                            this.set_notify(key.clone(), to, cx);
+                        }
                     })))
                     .mt(px(12.)),
                 );
+                if local {
+                    top = top.child(div().type_small().text_color(theme::text_faint()).child("Kept on this device."));
+                }
             }
         }
         if let Some(heads_up) = facts::heads_up(person, profile, online) {
@@ -868,7 +883,11 @@ impl InfoPane {
             // The pane's foot says "Open in" whenever it can; Shared does not say it again.
             open_in: link.filter(|_| !self.foot_opens(network)).map(|url| Box::new(move |_: &mut Window, cx: &mut App| cx.open_url(&url)) as shared::Hook),
         };
-        shared::draw(&self.shared, network, &self.hub, self.width, hooks, cx)
+        let has_pins = self
+            .row
+            .as_ref()
+            .is_some_and(|row| self.scene.pins_accounts.contains(&row.key.account()));
+        shared::draw(&self.shared, network, has_pins, &self.hub, self.width, hooks, cx)
     }
 }
 
@@ -1129,9 +1148,14 @@ impl Shell {
     }
 
     /// A row's notifications, from its menu: everything, or nothing. The row changes when the
-    /// network says so.
+    /// network says so (or immediately in local settings for Tiny).
     pub(in crate::gui) fn set_row_mute(&mut self, conversation: Key, mute: bool, cx: &mut Context<Self>) {
         let notify = if mute { Notify::Nothing } else { Notify::All };
+        if conversation.network == Network::Tiny {
+            profile::details::set_local_notify(&conversation, notify, cx);
+            cx.notify();
+            return;
+        }
         self.conversation_act(Request::SetMute { conversation, notify, until: None }, "Can't change notifications".to_owned(), cx);
     }
 
@@ -1213,7 +1237,8 @@ impl InfoPane {
                 let person = self.hub.person(key)?;
                 let seen = self.seen(&person);
                 if confirm {
-                    let (_, block) = facts::offers(&person);
+                    let can_block = self.scene.blocks_accounts.contains(&person.key.account());
+                    let (_, block) = facts::offers_with(&person, can_block);
                     return block.then(|| Float::Confirm(key.clone(), RelateAction::Block));
                 }
                 Some(Float::Person { person: key.clone(), seen, alt: false })

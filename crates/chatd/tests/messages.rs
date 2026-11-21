@@ -1671,3 +1671,422 @@ fn typing_resolves_a_raw_number_to_the_contact_name() {
         "raw phone number leaked into typist name: {unknown_typists:?}"
     );
 }
+
+#[test]
+fn alphanumeric_senders_are_read_only_short_codes_stay_replyable_and_emergency_is_blocked() {
+    let world = World::linked();
+    world.connected();
+
+    // Alphanumeric sender: read_only with exact reason, no call handoff.
+    world.steer("noreply phone-bank BANKOTP");
+    let bank = world.until("bank chat", || world.conversation("phone-bank"));
+    assert!(bank.read_only, "alphanumeric sender should be read_only");
+    assert_eq!(bank.read_only_reason, "This sender can't receive replies");
+    assert_eq!(bank.call, CallSupport::None);
+    match world.ask(Request::Send {
+        conversation: key("phone-bank"),
+        client_id: "no-reply-1".into(),
+        text: "STOP".into(),
+        reply_to: None,
+        with: Default::default(),
+    }) {
+        Response::Error { detail, .. } => {
+            assert!(detail.contains("can't receive replies"), "{detail}");
+        }
+        other => panic!("expected send to alphanumeric sender to be refused, got {other:?}"),
+    }
+
+    // Numeric short code: stays replyable (e.g. "STOP").
+    world.steer("shortcode phone-short 89203");
+    let short = world.until("short code chat", || world.conversation("phone-short"));
+    assert!(!short.read_only, "numeric short code should stay replyable");
+
+    // Verified business sender: Mark::Verified.
+    world.steer("verified phone-biz Acme Bank");
+    let biz = world.until("verified biz chat", || world.conversation("phone-biz"));
+    assert_eq!(biz.mark, Some(protocol::Mark::Verified));
+
+    // Emergency number: never offer call or text from tinyclient.
+    world.steer("emergency phone-911 911");
+    let em = world.until("emergency chat", || world.conversation("phone-911"));
+    assert!(em.read_only, "emergency number must be read_only");
+    assert_eq!(em.call, CallSupport::None);
+    assert!(em.read_only_reason.contains("phone"), "{}", em.read_only_reason);
+}
+
+#[test]
+fn rcs_messages_can_be_edited_inside_window_and_incoming_edits_are_marked() {
+    let world = World::linked();
+    world.connected();
+
+    let (accounts, _) = world.status();
+    let mine = accounts
+        .iter()
+        .find(|status| status.key == account())
+        .expect("Messages account");
+    assert_eq!(mine.can.edit_window, 15 * 60);
+
+    // Switch Grace to RCS.
+    world.steer("rcs grace");
+    world.until("RCS topic", || {
+        world
+            .conversation(GRACE)
+            .filter(|row| row.topic.contains("RCS message"))
+    });
+
+    // Incoming message edited by Grace is marked edited.
+    world.steer("incoming grace Typo here");
+    let incoming = world.arrived(GRACE, "Typo here");
+    assert!(!incoming.edited);
+    world.steer(&format!("edited grace {} Fixed text", incoming.id));
+    let updated = world.until("incoming edit", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == incoming.id && m.edited)
+    });
+    assert_eq!(updated.text, "Fixed text");
+    assert!(updated.edited);
+
+    // Outgoing RCS message inside window can be edited.
+    let sent = world.send(GRACE, "edit-1", "Original text");
+    world.heard(&format!("send {GRACE} Original text"));
+    world.until("sent settled", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == sent.id && m.state == SendState::Sent)
+    });
+    match world.ask(Request::Edit {
+        conversation: key(GRACE),
+        message_id: sent.id.clone(),
+        text: "Edited text".into(),
+        spans: Vec::new(),
+    }) {
+        Response::Ok => {}
+        other => panic!("expected Edit Ok, got {other:?}"),
+    }
+    let edited = world.until("own edited message", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == sent.id && m.edited && m.text == "Edited text")
+    });
+    assert!(edited.edited);
+    assert!(world.calls().iter().any(|c| c.starts_with(&format!("edit {GRACE} ")) && c.ends_with(" Edited text")));
+
+    // Outgoing RCS message outside the 15-minute window is refused.
+    world.steer("old-mine grace m-too-old 1800 Way too old");
+    let old = world.arrived(GRACE, "Way too old");
+    match world.ask(Request::Edit {
+        conversation: key(GRACE),
+        message_id: old.id.clone(),
+        text: "Cannot edit".into(),
+        spans: Vec::new(),
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("no longer be edited"), "{detail}"),
+        other => panic!("expected stale edit refusal, got {other:?}"),
+    }
+
+    // SMS chat refuses edits.
+    world.steer("sms grace");
+    world.until("SMS topic", || {
+        world
+            .conversation(GRACE)
+            .filter(|row| row.topic == "Text message")
+    });
+    match world.ask(Request::Edit {
+        conversation: key(GRACE),
+        message_id: sent.id.clone(),
+        text: "SMS edit".into(),
+        spans: Vec::new(),
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("RCS"), "{detail}"),
+        other => panic!("expected SMS edit refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn profile_shows_masked_number_open_group_fetches_member_avatars_and_contacts_search() {
+    let world = World::linked();
+    world.connected();
+
+    // 1:1 profile shows masked phone number and accent colour.
+    match world.ask(Request::Profile {
+        person: key("participant-grace"),
+        space: None,
+    }) {
+        Response::Profile { profile } => {
+            assert_eq!(profile.contacts.len(), 1, "{:?}", profile.contacts);
+            assert_eq!(profile.contacts[0].kind, protocol::ContactKind::Phone);
+            assert_eq!(profile.contacts[0].value, "+15550100002");
+            assert!(profile.contacts[0].masked, "phone number must be masked by default");
+            assert_eq!(profile.accent, Some(0x34A853));
+        }
+        other => panic!("expected Profile, got {other:?}"),
+    }
+
+    // Opening the group requests thumbnails for group participants and populates member avatars.
+    world.ask(Request::Watch(protocol::Watching {
+        conversation: Some(key(CLUB)),
+        ..Default::default()
+    }));
+    world.until("group participant avatars", || {
+        match world.ask(Request::Members {
+            conversation: key(CLUB),
+            offset: 0,
+            limit: 20,
+        }) {
+            Response::Members { members, .. } => {
+                let alan = members.iter().find(|m| m.key.id == "participant-alan")?;
+                let grace = members.iter().find(|m| m.key.id == "participant-grace")?;
+                (alan.avatar.is_some() && grace.avatar.is_some()).then_some(())
+            }
+            _ => None,
+        }
+    });
+
+    // Searching People queries the phone's address book and returns contacts with no existing chat.
+    let _ = world.ask(Request::People {
+        network: Some(Network::Messages),
+        relation: None,
+        query: Some("Linnea".into()),
+        offset: 0,
+        limit: 20,
+    });
+    world.heard("contacts");
+    let linnea = world.until("Linnea Sol contact", || {
+        match world.ask(Request::People {
+            network: Some(Network::Messages),
+            relation: None,
+            query: Some("Linnea".into()),
+            offset: 0,
+            limit: 20,
+        }) {
+            Response::People { people, .. } => people.into_iter().find(|p| p.name == "Linnea Sol"),
+            _ => None,
+        }
+    });
+    assert_eq!(linnea.key.id, "participant-linnea");
+}
+
+#[test]
+fn start_direct_opens_a_chat_for_a_typed_number_or_contact_and_blocks_emergency() {
+    let world = World::linked();
+    world.connected();
+
+    // StartDirect with a typed phone number normalizes to E.164 and creates a row with RCS topic.
+    match world.ask(Request::StartDirect {
+        person: key("(555) 010-0099"),
+    }) {
+        Response::Conversation { conversation } => {
+            assert_eq!(conversation.kind, ConversationKind::Direct);
+            assert!(conversation.topic.contains("RCS message"), "{}", conversation.topic);
+            let stored = world.conversation(&conversation.key.id).expect("new row stored");
+            assert_eq!(stored.key, conversation.key);
+        }
+        other => panic!("expected Conversation, got {other:?}"),
+    }
+    world.heard("create +15550100099");
+
+    // StartDirect with a phone contact id resolves their number and creates a chat.
+    match world.ask(Request::StartDirect {
+        person: key("participant-linnea"),
+    }) {
+        Response::Conversation { conversation } => {
+            assert_eq!(conversation.title, "Linnea Sol");
+        }
+        other => panic!("expected Conversation for Linnea, got {other:?}"),
+    }
+    world.heard("create +15550100004");
+
+    // StartDirect with an emergency number is refused.
+    match world.ask(Request::StartDirect {
+        person: key("911"),
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("phone"), "{detail}"),
+        other => panic!("expected emergency refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn create_group_starts_a_named_group_conversation_with_multiple_numbers() {
+    let world = World::linked();
+    world.connected();
+
+    match world.ask(Request::CreateGroup {
+        account: account(),
+        members: vec![
+            "participant-grace".into(),
+            "participant-alan".into(),
+            "(555) 010-0099".into(),
+        ],
+        name: Some("Weekend trip".into()),
+    }) {
+        Response::Conversation { conversation } => {
+            assert_eq!(conversation.kind, ConversationKind::Group);
+            assert_eq!(conversation.title, "Weekend trip");
+            assert!(conversation.topic.contains("RCS message"), "{}", conversation.topic);
+            let stored = world.conversation(&conversation.key.id).expect("group row stored");
+            assert_eq!(stored.title, "Weekend trip");
+        }
+        other => panic!("expected group Conversation, got {other:?}"),
+    }
+    world.heard("create +15550100002,+15550100003,+15550100099 Weekend trip");
+
+    // Fewer than two members is refused.
+    match world.ask(Request::CreateGroup {
+        account: account(),
+        members: vec!["+15550100002".into()],
+        name: None,
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("two"), "{detail}"),
+        other => panic!("expected too-few-members refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn link_previews_unfurl_for_known_contacts_and_skip_unknown_numbers_and_spam() {
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_bg = hits.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            hits_bg.fetch_add(1, Ordering::SeqCst);
+            let mut stream = stream;
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let body = r#"<!doctype html><html><head>
+                <meta property="og:title" content="Bridge Schedule">
+                <meta property="og:site_name" content="Club News">
+                <meta property="og:description" content="Tuesday at seven.">
+            </head><body>ok</body></html>"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+
+    let world = World::linked();
+    world.connected();
+
+    // 1. Unknown number triggers NO fetch by default.
+    let unknown_url = format!("http://{addr}/phish");
+    world.steer(&format!("unknown-link +15550199888 Verify now {unknown_url}"));
+    let unk_msg = world.arrived("phone-unk-15550199888", &format!("Verify now {unknown_url}"));
+    sleep(Duration::from_millis(250));
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "unknown number must not trigger a link fetch by default");
+    assert!(unk_msg.previews.is_empty());
+
+    // 2. Known contact (Grace) unfurls the link into a preview card.
+    let known_url = format!("http://{addr}/schedule");
+    world.steer(&format!("incoming grace See {known_url}"));
+    let with_card = world.until("link preview card", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.text.contains(&known_url) && !m.previews.is_empty())
+    });
+    assert_eq!(with_card.previews[0].title, "Bridge Schedule");
+    assert_eq!(with_card.previews[0].site, "Club News");
+    assert_eq!(with_card.previews[0].description, "Tuesday at seven.");
+    let hits_after_known = hits.load(Ordering::SeqCst);
+    assert!(hits_after_known >= 1);
+
+    // 3. Spam folder never unfurls, even for a previously named sender.
+    world.steer("spam grace");
+    world.until("Grace in spam", || {
+        world
+            .conversation(GRACE)
+            .filter(|c| c.special == Special::Request)
+    });
+    let spam_url = format!("http://{addr}/spam-link");
+    world.steer(&format!("incoming grace Win {spam_url}"));
+    world.arrived(GRACE, &format!("Win {spam_url}"));
+    sleep(Duration::from_millis(250));
+    assert_eq!(hits.load(Ordering::SeqCst), hits_after_known, "spam conversation must never unfurl links");
+}
+
+#[test]
+fn messages_can_be_starred_unstarred_and_listed_under_starred() {
+    let world = World::linked();
+    world.connected();
+
+    // 1. Incoming starred message carries `starred == true` and appears in Pinned (Starred tab)
+    //    and account-wide StarredMessages.
+    world.steer("starred grace m-star-1 Gate code is 1234");
+    let incoming = world.arrived(GRACE, "Gate code is 1234");
+    assert!(incoming.starred, "incoming starred message must set starred=true");
+
+    match world.ask(Request::Pinned {
+        conversation: key(GRACE),
+    }) {
+        Response::Pinned { messages, .. } => {
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].id, "m-star-1");
+            assert!(messages[0].starred);
+        }
+        other => panic!("expected Pinned/Starred response, got {other:?}"),
+    }
+
+    match world.ask(Request::StarredMessages {
+        account: account(),
+        conversation: None,
+        limit: 50,
+    }) {
+        Response::Pinned { messages, .. } => {
+            assert!(messages.iter().any(|m| m.id == "m-star-1"));
+        }
+        other => panic!("expected StarredMessages response, got {other:?}"),
+    }
+
+    // 2. Starring an ordinary message via Request::StarMessage calls the phone and adds it to Starred.
+    world.steer("incoming grace Remember milk");
+    let plain = world.arrived(GRACE, "Remember milk");
+    assert!(!plain.starred);
+    assert_eq!(
+        world.ask(Request::StarMessage {
+            conversation: key(GRACE),
+            message_id: plain.id.clone(),
+            starred: true,
+        }),
+        Response::Ok
+    );
+    world.heard(&format!("star {GRACE} {} 1", plain.id));
+    let starred_plain = world.until("starred flag persisted", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == plain.id && m.starred)
+    });
+    assert!(starred_plain.starred);
+
+    // 3. Unstarring removes it from Starred.
+    assert_eq!(
+        world.ask(Request::StarMessage {
+            conversation: key(GRACE),
+            message_id: plain.id.clone(),
+            starred: false,
+        }),
+        Response::Ok
+    );
+    world.heard(&format!("star {GRACE} {} 0", plain.id));
+    match world.ask(Request::Pinned {
+        conversation: key(GRACE),
+    }) {
+        Response::Pinned { messages, .. } => {
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].id, "m-star-1");
+        }
+        other => panic!("expected Pinned/Starred response, got {other:?}"),
+    }
+}

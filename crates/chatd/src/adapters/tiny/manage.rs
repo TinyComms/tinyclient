@@ -341,6 +341,20 @@ pub(crate) fn categories_of(saved: &Saved) -> Vec<TinyCategory> {
     categories
 }
 
+/// Text channels from `GET /v1/channels`. A 403, 404 or unreadable answer leaves it empty and
+/// does not fail the page: an older server has no such route.
+pub(crate) fn channels_of(saved: &Saved) -> Vec<protocol::TinyChannel> {
+    match asked("GET", saved, "/v1/channels", None) {
+        Ok((200, body)) => {
+            let value = body.get("channels").cloned().unwrap_or(body);
+            let mut read: Vec<protocol::TinyChannel> = rows(value, "channels").unwrap_or_default();
+            read.truncate(LIST_MAX);
+            read
+        }
+        _ => Vec::new(),
+    }
+}
+
 pub(crate) fn bans_of(saved: &Saved) -> Vec<TinyBan> {
     list(saved, "/v1/bans", "bans")
 }
@@ -944,13 +958,61 @@ pub(crate) fn category_delete(account: AccountKey, category_id: String) -> Respo
 }
 
 pub(crate) fn layout(account: AccountKey, groups: Vec<TinyLayoutGroup>) -> Response {
-    let rooms: usize = groups.iter().map(|group| group.room_ids.len()).sum();
-    let ids_fine = groups.iter().all(|group| group.category_id.as_deref().is_none_or(safe_id) && group.room_ids.iter().all(|id| safe_id(id)));
-    if groups.len() > LIST_MAX || rooms > LIST_MAX || !ids_fine {
+    let count: usize = groups.iter().map(|group| group.room_ids.len().max(group.items.len())).sum();
+    let ids_fine = groups.iter().all(|group| {
+        group.category_id.as_deref().is_none_or(safe_id)
+            && group.room_ids.iter().all(|id| safe_id(id))
+            && group.items.iter().all(|item| safe_id(&item.id))
+    });
+    if groups.len() > LIST_MAX || count > LIST_MAX || !ids_fine {
         return refused(CHECK);
     }
-    let categories: Vec<Value> = groups.iter().map(|group| json!({ "id": group.category_id, "room_ids": group.room_ids })).collect();
-    change(&account, Some(TINY_FEATURE_CATEGORIES), "community.categories.manage", "PUT", "/v1/layout", Some(json!({ "categories": categories })), Missing::Room)
+    let saved = match allowed(&account, Some(TINY_FEATURE_CATEGORIES), "community.categories.manage") {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    let mixed = known(&saved).capabilities.has(protocol::TINY_FEATURE_CHANNEL_LAYOUT);
+    let categories: Vec<Value> = if mixed {
+        groups
+            .iter()
+            .map(|group| {
+                let items: Vec<Value> = if !group.items.is_empty() {
+                    group
+                        .items
+                        .iter()
+                        .map(|item| {
+                            let kind = match item.kind {
+                                protocol::TinyLayoutItemKind::Channel => "channel",
+                                protocol::TinyLayoutItemKind::Room => "room",
+                            };
+                            json!({ "kind": kind, "id": item.id })
+                        })
+                        .collect()
+                } else {
+                    group.room_ids.iter().map(|id| json!({ "kind": "room", "id": id })).collect()
+                };
+                json!({ "id": group.category_id, "items": items })
+            })
+            .collect()
+    } else {
+        groups
+            .iter()
+            .map(|group| {
+                let room_ids: Vec<&str> = if !group.room_ids.is_empty() {
+                    group.room_ids.iter().map(String::as_str).collect()
+                } else {
+                    group
+                        .items
+                        .iter()
+                        .filter(|item| item.kind == protocol::TinyLayoutItemKind::Room)
+                        .map(|item| item.id.as_str())
+                        .collect()
+                };
+                json!({ "id": group.category_id, "room_ids": room_ids })
+            })
+            .collect()
+    };
+    sent(&saved, "PUT", "/v1/layout", Some(json!({ "categories": categories })), Missing::Room)
 }
 
 // Rooms.
@@ -1020,6 +1082,134 @@ pub(crate) fn room_create(account: AccountKey, room: TinyRoomEdit) -> Response {
     sent(&saved, "POST", "/v1/rooms", Some(body), Missing::Room)
 }
 
+const CHANNEL_TOPIC_SIZE: &str = "A topic is at most 1024 characters.";
+const CHANNELS_UNSUPPORTED: &str = "This server is older than text channels.";
+const E2EE_NOT_SET_UP: &str = "This device isn't set up for encrypted messages yet. Open Encryption in the server's settings.";
+
+fn channel_body(channel: &protocol::TinyChannelEdit, creating: bool) -> Result<(Map<String, Value>, Option<String>), Response> {
+    let mut body = Map::new();
+    let mut kept_name = None;
+    match &channel.name {
+        Some(name) => match tiny_name(name) {
+            Some(name) => {
+                kept_name = Some(name.to_owned());
+                body.insert("name".into(), json!(name));
+            }
+            None => return Err(refused(super::ROOM_NAME_SIZE)),
+        },
+        None if creating => return Err(refused(super::ROOM_NAME_SIZE)),
+        None => {}
+    }
+    if let Some(category) = &channel.category_id {
+        if !category.is_empty() && !safe_id(category) {
+            return Err(refused(CHECK));
+        }
+        body.insert("category_id".into(), id_or_null(category));
+    }
+    if let Some(position) = channel.position {
+        body.insert("position".into(), json!(position));
+    }
+    if let Some(topic) = &channel.topic {
+        let Some(topic) = text_within(topic, protocol::TINY_CHANNEL_TOPIC_MAX) else {
+            return Err(refused(CHANNEL_TOPIC_SIZE));
+        };
+        body.insert("topic".into(), json!(topic));
+    }
+    Ok((body, kept_name))
+}
+
+pub(crate) fn channel_create(account: AccountKey, channel: protocol::TinyChannelEdit) -> Response {
+    let saved = match allowed(&account, None, "community.channels.create") {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    let (mut body, kept_name) = match channel_body(&channel, true) {
+        Ok(parsed) => parsed,
+        Err(answer) => return answer,
+    };
+    // If this device is not ready for encryption and the server requires it (or caller asked for
+    // it), refuse with the same words a new direct message uses.
+    if let Some(device) = super::e2ee::started(&saved) {
+        let (ready, mode) = {
+            let device = device.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            (device.ready(), device.mode().to_owned())
+        };
+        if !ready && (channel.e2ee == Some(true) || mode == "new_required" || mode == "required") {
+            return refused(E2EE_NOT_SET_UP);
+        }
+    }
+    // Send `e2ee` only when true so a server from before encrypted text gets the body it has
+    // always taken.
+    if channel.e2ee == Some(true) {
+        body.insert("e2ee".into(), json!(true));
+    }
+    // When no position is given, send one past the highest position among text channels in that
+    // category (older servers default to 0, which ties and sorts by name).
+    if channel.position.is_none() {
+        let target_cat = channel.category_id.as_deref().filter(|id| !id.is_empty());
+        let existing = channels_of(&saved);
+        let next_pos = existing
+            .iter()
+            .filter(|ch| ch.category_id.as_deref() == target_cat)
+            .map(|ch| ch.position)
+            .max()
+            .map(|max| max.saturating_add(1))
+            .unwrap_or(0);
+        body.insert("position".into(), json!(next_pos));
+    }
+    match asked("POST", &saved, "/v1/channels", Some(Value::Object(body))) {
+        Err(detail) => refused(detail),
+        Ok((200 | 201, answer)) => {
+            let id = answer
+                .get("id")
+                .and_then(Value::as_str)
+                .or_else(|| answer.pointer("/channel/id").and_then(Value::as_str))
+                .unwrap_or("")
+                .to_owned();
+            let name = answer
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| answer.pointer("/channel/name").and_then(Value::as_str))
+                .map(str::to_owned)
+                .or(kept_name)
+                .unwrap_or_default();
+            if !safe_id(&id) {
+                return refused(super::UNREADABLE);
+            }
+            Response::TinyChannelCreated { id, name }
+        }
+        Ok((404, _)) => refused(CHANNELS_UNSUPPORTED),
+        Ok((status, answer)) => refused(explain(status, &answer, Missing::Channel)),
+    }
+}
+
+pub(crate) fn channel_update(account: AccountKey, channel_id: String, channel: protocol::TinyChannelEdit) -> Response {
+    if !safe_id(&channel_id) {
+        return refused(CHECK);
+    }
+    let saved = match open(&account) {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    let (body, _) = match channel_body(&channel, false) {
+        Ok(parsed) => parsed,
+        Err(answer) => return answer,
+    };
+    // Never send `e2ee` on PATCH; the server refuses it.
+    sent(&saved, "PATCH", &format!("/v1/channels/{channel_id}"), Some(Value::Object(body)), Missing::Channel)
+}
+
+pub(crate) fn channel_delete(account: AccountKey, channel_id: String) -> Response {
+    if !safe_id(&channel_id) {
+        return refused(CHECK);
+    }
+    let saved = match open(&account) {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    sent(&saved, "DELETE", &format!("/v1/channels/{channel_id}"), None, Missing::Channel)
+}
+
 pub(crate) fn room_update(account: AccountKey, room_id: String, room: TinyRoomEdit) -> Response {
     if !safe_id(&room_id) {
         return refused(CHECK);
@@ -1048,6 +1238,30 @@ pub(crate) fn override_clear(account: AccountKey, room_id: String, role_id: Stri
     }
     let path = format!("/v1/rooms/{room_id}/overrides/{role_id}");
     change(&account, Some(TINY_FEATURE_ROLES), "community.rooms.overrides", "DELETE", &path, None, Missing::Room)
+}
+
+pub(crate) fn channel_override_set(account: AccountKey, channel_id: String, role_id: String, allow: u64, deny: u64) -> Response {
+    if !ids_ok(&[&channel_id, &role_id]) || (allow | deny) & !TINY_ALL != 0 || allow & deny != 0 {
+        return refused(CHECK);
+    }
+    let saved = match open(&account) {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    let path = format!("/v1/channels/{channel_id}/overrides/{role_id}");
+    sent(&saved, "PUT", &path, Some(json!({ "allow": allow, "deny": deny })), Missing::Channel)
+}
+
+pub(crate) fn channel_override_clear(account: AccountKey, channel_id: String, role_id: String) -> Response {
+    if !ids_ok(&[&channel_id, &role_id]) {
+        return refused(CHECK);
+    }
+    let saved = match open(&account) {
+        Ok(saved) => saved,
+        Err(answer) => return answer,
+    };
+    let path = format!("/v1/channels/{channel_id}/overrides/{role_id}");
+    sent(&saved, "DELETE", &path, None, Missing::Channel)
 }
 
 // Invites and the audit.

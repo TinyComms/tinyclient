@@ -108,6 +108,10 @@ pub(in crate::gui) struct Scene {
     /// Tiny accounts that can ring any member, including before a direct exists.
     pub callable_accounts: Vec<AccountKey>,
     pub close_direct_accounts: Vec<AccountKey>,
+    /// Accounts whose server/network supports pinned messages (`Capabilities::pins`).
+    pub pins_accounts: Vec<AccountKey>,
+    /// Accounts whose server/network supports blocking (`Capabilities::blocks`).
+    pub blocks_accounts: Vec<AccountKey>,
 }
 
 /// True when this run only draws a state for `--shot`: nothing that changes the user's state on
@@ -375,6 +379,12 @@ impl Shell {
             close_direct_accounts: snapshot.accounts.iter()
                 .filter(|account| account.can.close_direct)
                 .map(|account| account.key.clone()).collect(),
+            pins_accounts: snapshot.accounts.iter()
+                .filter(|account| account.can.pins)
+                .map(|account| account.key.clone()).collect(),
+            blocks_accounts: snapshot.accounts.iter()
+                .filter(|account| account.can.blocks)
+                .map(|account| account.key.clone()).collect(),
         }
     }
 
@@ -406,7 +416,7 @@ impl Shell {
     }
 
     /// The rows the shell holds now, wherever they are drawn.
-    fn held_rows(&self) -> impl Iterator<Item = &Conversation> {
+    pub(in crate::gui) fn held_rows(&self) -> impl Iterator<Item = &Conversation> {
         let open = self.snapshot.as_ref().and_then(|snapshot| snapshot.open.as_ref());
         let lists = self.sidebar_state.held();
         let trees = self.trees.values().flat_map(|tree| &tree.conversations);
@@ -562,7 +572,7 @@ impl Shell {
     }
 
     /// The same, and then rings them.
-    fn call_person(&mut self, person: &Person, cx: &mut Context<Self>) {
+    pub(super) fn call_person(&mut self, person: &Person, cx: &mut Context<Self>) {
         self.open_person_then(person, true, cx);
     }
 
@@ -641,7 +651,11 @@ impl Shell {
 
     /// Answers, withdraws or ends a friendship, or blocks: only ever from a click. The row
     /// changes in place when the network has agreed.
-    fn relate(&mut self, person: &Person, action: RelateAction, cx: &mut Context<Self>) {
+    pub(in crate::gui) fn confirm_block(&mut self, person: Key, cx: &mut Context<Self>) {
+        self.open_float(card::Float::Confirm(person, RelateAction::Block), gpui::Point::default(), cx);
+    }
+
+    pub(in crate::gui) fn relate(&mut self, person: &Person, action: RelateAction, cx: &mut Context<Self>) {
         if only_draws() {
             return;
         }
@@ -801,7 +815,7 @@ mod tests {
             private: false,
             encryption: protocol::Encryption::Unknown,
             draft: String::new(),
-            folders: Vec::new(), archived: false, pin: None, hidden: false, followed: false, bot: false, meeting: false, special: Default::default(), mark: None, topic_icon: None, opted_out: false, quiet: false, preview_from: String::new(), preview_mine: false, seen: false, delivered: false, sending: false, max_file_bytes: 0, read_only_reason: String::new(), spam: false, rights: Default::default(), disappearing: None,
+            folders: Vec::new(), archived: false, pin: None, hidden: false, followed: false, bot: false, meeting: false, special: Default::default(), mark: None, topic_icon: None, opted_out: false, quiet: false, preview_from: String::new(), preview_mine: false, seen: false, delivered: false, sending: false, max_file_bytes: 0, read_only_reason: String::new(), spam: false, rights: Default::default(), disappearing: None, moderate: false, can_pin: false,
         }
     }
 

@@ -265,6 +265,7 @@ impl Floating {
             direct: self.direct.as_ref().map(|row| (row.call, row.muted)),
             online: self.online(person),
             close_direct: super::scene_can_close_direct(&self.scene, person),
+            can_block: self.scene.blocks_accounts.contains(&person.account()),
         }
     }
 
@@ -471,7 +472,11 @@ impl Floating {
                         return;
                     };
                     let notify = if muted { Notify::All } else { Notify::Nothing };
-                    super::ask_later(cx, Request::SetMute { conversation, notify, until: None }, |_, _| {});
+                    if conversation.network == protocol::Network::Tiny {
+                        super::info::profile::details::set_local_notify(&conversation, notify, cx);
+                    } else {
+                        super::ask_later(cx, Request::SetMute { conversation, notify, until: None }, |_, _| {});
+                    }
                 })))
             }
             Item::CopyHandle => {

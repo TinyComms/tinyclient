@@ -60,6 +60,7 @@ pub(super) enum Float {
     Header,
     Person { user_id: String, at: Point<Pixels> },
     Channel { room_id: String, at: Point<Pixels> },
+    TextChannel { id: String, at: Point<Pixels> },
     /// A category's header; `key` is its id, or empty for the rooms in none.
     Category { key: String, at: Point<Pixels> },
     /// The connection's numbers, over the user panel.
@@ -74,6 +75,13 @@ pub(super) enum Sub {
     Roles,
 }
 
+/// What kind of channel the Create channel modal is making.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum NewChannelKind {
+    Text,
+    Voice,
+}
+
 /// The modal on show.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Modal {
@@ -83,10 +91,16 @@ pub(super) enum Modal {
     Kick(String),
     Ban(String),
     DeleteRoom(String),
+    DeleteChannel(String),
     DeleteCategory(String),
-    /// A new channel, in this category.
-    NewRoom(Option<String>),
+    /// A new channel (text or voice), in this category.
+    NewChannel {
+        category: Option<String>,
+        kind: NewChannelKind,
+        e2ee: bool,
+    },
     RenameRoom(String),
+    EditChannel(String),
     NewCategory,
     Profile(String),
     /// Signing out of the server: the encrypted history kept on this device (the default) or
@@ -154,6 +168,10 @@ pub(super) enum Dragged {
     },
     Room {
         room_id: String,
+        name: String,
+    },
+    Channel {
+        channel_id: String,
         name: String,
     },
     Category {
@@ -249,9 +267,12 @@ pub struct State {
     stats_task: Option<Task<()>>,
 
     name_input: Entity<TextInput>,
+    topic_input: Entity<TextInput>,
     label_input: Entity<TextInput>,
     reason_input: Entity<TextInput>,
     search_input: Entity<TextInput>,
+    /// Last-read encryption status for an account, used by the Create channel modal.
+    e2ee_status: Option<(AccountKey, protocol::E2eeStatus)>,
 
     /// Server Settings, while open.
     settings: Option<settings::Overlay>,
@@ -266,18 +287,21 @@ pub struct State {
 impl State {
     pub(super) fn new(cx: &mut Context<Shell>) -> State {
         let name_input = cx.new(|cx| TextInput::new("Name", cx));
+        let topic_input = cx.new(|cx| TextInput::new("Topic (optional)", cx));
         let label_input = cx.new(|cx| TextInput::new("Who it's for (optional)", cx));
         let reason_input = cx.new(|cx| TextInput::new("Reason (optional, goes in the audit log)", cx));
         let search_input = cx.new(|cx| TextInput::new("Search members", cx));
-        cx.subscribe(&name_input, |this, _, event: &InputEvent, cx| match event {
-            InputEvent::Submit => this.submit_name(cx),
-            InputEvent::Changed => {
-                this.tiny_state.modal_error = None;
-                cx.notify();
-            }
-        })
-        .detach();
-        for input in [&name_input, &label_input, &reason_input] {
+        for input in [&name_input, &topic_input] {
+            cx.subscribe(input, |this, _, event: &InputEvent, cx| match event {
+                InputEvent::Submit => this.submit_name(cx),
+                InputEvent::Changed => {
+                    this.tiny_state.modal_error = None;
+                    cx.notify();
+                }
+            })
+            .detach();
+        }
+        for input in [&name_input, &topic_input, &label_input, &reason_input] {
             cx.subscribe(input, |this, _, event: &InputKey, cx| {
                 if *event == InputKey::Escape {
                     this.close_modal(cx);
@@ -339,9 +363,11 @@ impl State {
             stats_note: None,
             stats_task: None,
             name_input,
+            topic_input,
             label_input,
             reason_input,
             search_input,
+            e2ee_status: None,
             settings: None,
             settings_fields,
             setup: setup::State::default(),
@@ -682,6 +708,18 @@ impl Shell {
 
     /// A fresh read of the page. What it no longer has goes from the panes and menus with it.
     fn tiny_loaded(&mut self, community: TinyCommunity, cx: &mut Context<Self>) {
+        let had_channel = |id: &str| {
+            self.tiny_state
+                .community
+                .as_ref()
+                .is_some_and(|prev| prev.channels.iter().any(|ch| ch.id == id))
+        };
+        let channel_gone = |id: &String| community.channels.iter().all(|ch| &ch.id != id);
+        if let (Some(account), Some(open)) = (self.tiny_state.account.as_ref(), self.open.as_ref()) {
+            if open.network == Network::Tiny && open.account == account.account && had_channel(&open.id) && channel_gone(&open.id) {
+                self.open = None;
+            }
+        }
         let state = &mut self.tiny_state;
         let room_gone = |id: &String| community.rooms.iter().all(|room| &room.id != id);
         let person_gone = |id: &String| community.members.iter().all(|member| &member.user_id != id);
@@ -692,6 +730,7 @@ impl Shell {
         let stale = match &state.float {
             Some(Float::Person { user_id, .. }) => person_gone(user_id),
             Some(Float::Channel { room_id, .. }) => room_gone(room_id),
+            Some(Float::TextChannel { id, .. }) => !community.channels.is_empty() && channel_gone(id),
             _ => false,
         };
         if stale {
@@ -701,6 +740,7 @@ impl Shell {
         let stale = match &state.modal {
             Some(Modal::Kick(id) | Modal::Ban(id) | Modal::Profile(id)) => person_gone(id),
             Some(Modal::DeleteRoom(id) | Modal::RenameRoom(id)) => room_gone(id),
+            Some(Modal::DeleteChannel(id) | Modal::EditChannel(id)) => !community.channels.is_empty() && channel_gone(id),
             _ => false,
         };
         if stale {
@@ -765,6 +805,14 @@ impl Shell {
                 }
                 self.tiny_settings_saved(cx);
                 self.fetch(account, Some(epoch), cx);
+                None
+            }
+            Ok(Response::TinyChannelCreated { id, name }) => {
+                self.tiny_state.modal = None;
+                self.tiny_settings_saved(cx);
+                let key = Key { network: Network::Tiny, account: account.account.clone(), id };
+                self.fetch(account, Some(epoch), cx);
+                self.select(key, &name, cx);
                 None
             }
             Ok(Response::TinyCode { code }) => {
@@ -1097,6 +1145,91 @@ impl Shell {
         }
     }
 
+    /// Server origin (`https://host[:port]`) for a signed-in Tiny account, for building message links.
+    pub(in crate::gui) fn tiny_origin(&self, account: &AccountKey) -> Option<String> {
+        if self.tiny_state.account.as_ref() == Some(account) {
+            if let Some(origin) = self.tiny_state.community.as_ref().map(|c| c.origin.trim()).filter(|o| !o.is_empty()) {
+                return Some(origin.to_owned());
+            }
+        }
+        let host = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.accounts.iter().find(|a| a.key == *account))
+            .map(|a| a.name.trim())
+            .filter(|n| !n.is_empty())?;
+        if host.starts_with("https://") || host.starts_with("http://") {
+            Some(host.to_owned())
+        } else {
+            Some(format!("https://{host}"))
+        }
+    }
+
+    /// Open a `tinyclient://message#<origin>/<conversation_id>/<message_id>` link:
+    /// find the signed-in account for `origin`, open the conversation, and jump to the message.
+    pub(in crate::gui) fn tiny_open_message_link(
+        &mut self,
+        origin: &str,
+        conversation_id: &str,
+        message_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let server = protocol::join_host(origin);
+        let matched = self
+            .tiny_state
+            .community
+            .as_ref()
+            .filter(|c| protocol::join_host(&c.origin).eq_ignore_ascii_case(&server))
+            .and_then(|_| self.tiny_state.account.clone())
+            .or_else(|| {
+                self.spaces
+                    .iter()
+                    .find(|s| s.key.network == Network::Tiny && s.name.eq_ignore_ascii_case(&server))
+                    .map(|s| s.key.account())
+            })
+            .or_else(|| {
+                self.snapshot.as_ref()?.accounts.iter().find_map(|a| {
+                    (a.key.network == Network::Tiny
+                        && (a.name.eq_ignore_ascii_case(&server)
+                            || protocol::join_host(&a.name).eq_ignore_ascii_case(&server)))
+                    .then(|| a.key.clone())
+                })
+            });
+        let Some(account) = matched else {
+            self.toast(None, "That message is on a server you're not signed in to.", cx);
+            return;
+        };
+        let key = Key::new(&account, conversation_id);
+        let msg_id = message_id.to_owned();
+        if self.open.as_ref() == Some(&key) {
+            let pane = self.pane(cx);
+            pane.update(cx, |pane, cx| pane.jump_to(&msg_id, cx));
+            return;
+        }
+        let held = self.held_rows().find(|r| r.key == key).cloned();
+        if let Some(row) = held {
+            let pane = self.pane(cx);
+            pane.update(cx, |pane, _| pane.land_next(msg_id));
+            self.select(row.key, &row.title, cx);
+            return;
+        }
+        let asked = key.clone();
+        self.off_thread(
+            cx,
+            move || ask(&Request::Conversation { conversation: asked }),
+            move |this, answer, cx| match answer {
+                Ok(Response::Conversation { conversation }) => {
+                    let pane = this.pane(cx);
+                    pane.update(cx, |pane, _| pane.land_next(msg_id));
+                    this.select(conversation.key, &conversation.title, cx);
+                }
+                _ => {
+                    this.toast(None, "That message isn't available.", cx);
+                }
+            },
+        );
+    }
+
     pub(super) fn tiny_fold(&mut self, key: String, cx: &mut Context<Self>) {
         if !self.tiny_state.folded.remove(&key) {
             self.tiny_state.folded.insert(key);
@@ -1226,6 +1359,9 @@ impl Shell {
                 }
                 cx.notify();
             }
+            Change::Conversation { conversation } if conversation.account() == account => {
+                cx.notify();
+            }
             _ => {}
         }
     }
@@ -1327,8 +1463,10 @@ impl Shell {
     /// The name field's Return: whichever modal holds it.
     fn submit_name(&mut self, cx: &mut Context<Self>) {
         match self.tiny_state.modal.clone() {
-            Some(Modal::NewRoom(category)) => self.tiny_create_room(category, cx),
+            Some(Modal::NewChannel { category, kind: NewChannelKind::Voice, .. }) => self.tiny_create_room(category, cx),
+            Some(Modal::NewChannel { category, kind: NewChannelKind::Text, e2ee }) => self.tiny_create_channel(category, e2ee, cx),
             Some(Modal::RenameRoom(room_id)) => self.tiny_rename_room(room_id, cx),
+            Some(Modal::EditChannel(channel_id)) => self.tiny_update_channel(channel_id, cx),
             Some(Modal::NewCategory) => self.tiny_create_category(cx),
             _ => {}
         }
@@ -1357,11 +1495,143 @@ impl Shell {
         self.act(request, cx);
     }
 
+    pub(super) fn tiny_e2ee_status_for(&self, account: &AccountKey) -> Option<&protocol::E2eeStatus> {
+        self.tiny_state
+            .settings
+            .as_ref()
+            .and_then(|overlay| overlay.encryption.status.as_ref())
+            .or_else(|| self.tiny_state.e2ee_status.as_ref().filter(|(acc, _)| acc == account).map(|(_, status)| status))
+    }
+
+    fn tiny_load_e2ee_status(&mut self, account: AccountKey, cx: &mut Context<Self>) {
+        let asked_account = account.clone();
+        self.off_thread(
+            cx,
+            move || ask(&Request::TinyE2ee { account, ask: protocol::E2eeAsk::Status }),
+            move |this, answer, cx| {
+                if let Ok(Response::TinyE2ee { status }) = answer {
+                    let default_e2ee = matches!(status.mode.as_str(), "new_required" | "required")
+                        || (status.mode == "optional" && status.device == protocol::DeviceState::Ready);
+                    this.tiny_state.e2ee_status = Some((asked_account.clone(), status));
+                    if this.tiny_state.account.as_ref() == Some(&asked_account) {
+                        if let Some(Modal::NewChannel { e2ee, .. }) = this.tiny_state.modal.as_mut() {
+                            *e2ee = default_e2ee;
+                        }
+                    }
+                    cx.notify();
+                }
+            },
+        );
+    }
+
+    pub(super) fn tiny_create_channel(&mut self, category: Option<String>, e2ee: bool, cx: &mut Context<Self>) {
+        let (Some(account), Some(name)) = (self.with_account(), self.typed_name(cx)) else {
+            return;
+        };
+        let topic_raw = self.tiny_state.topic_input.read(cx).text().trim().to_owned();
+        if topic_raw.chars().count() > protocol::TINY_CHANNEL_TOPIC_MAX {
+            self.tiny_state.modal_error = Some("A topic is at most 1024 characters.".to_owned());
+            cx.notify();
+            return;
+        }
+        let has_e2ee_feature = self.tiny_state.community.as_ref().is_some_and(|c| c.has(protocol::TINY_FEATURE_E2EE_TEXT));
+        let status = self.tiny_e2ee_status_for(&account);
+        let mode = status.map(|s| s.mode.as_str()).unwrap_or("off");
+        let ready = status.is_some_and(|s| s.device == protocol::DeviceState::Ready);
+        let want_e2ee = if !has_e2ee_feature {
+            false
+        } else {
+            match mode {
+                "new_required" | "required" => {
+                    if !ready {
+                        self.tiny_state.modal_error = Some("This device isn't set up for encrypted messages yet. Open Encryption in the server's settings.".to_owned());
+                        cx.notify();
+                        return;
+                    }
+                    true
+                }
+                "optional" => e2ee && ready,
+                _ => false,
+            }
+        };
+        let topic = (!topic_raw.is_empty()).then_some(topic_raw);
+        let request = Request::TinyChannelCreate {
+            account,
+            channel: protocol::TinyChannelEdit {
+                name: Some(name),
+                topic,
+                category_id: category,
+                position: None,
+                e2ee: want_e2ee.then_some(true),
+            },
+        };
+        self.act(request, cx);
+    }
+
     pub(super) fn tiny_rename_room(&mut self, room_id: String, cx: &mut Context<Self>) {
         let (Some(account), Some(name)) = (self.with_account(), self.typed_name(cx)) else {
             return;
         };
         self.act(Request::TinyRoomRename { account, room_id, name }, cx);
+    }
+
+    pub(super) fn tiny_update_channel(&mut self, channel_id: String, cx: &mut Context<Self>) {
+        let (Some(account), Some(name)) = (self.with_account(), self.typed_name(cx)) else {
+            return;
+        };
+        let topic = self.tiny_state.topic_input.read(cx).text().trim().to_owned();
+        if topic.chars().count() > protocol::TINY_CHANNEL_TOPIC_MAX {
+            self.tiny_state.modal_error = Some("A topic is at most 1024 characters.".to_owned());
+            cx.notify();
+            return;
+        }
+        self.act(
+            Request::TinyChannelUpdate {
+                account,
+                channel_id,
+                channel: protocol::TinyChannelEdit {
+                    name: Some(name),
+                    topic: Some(topic),
+                    ..Default::default()
+                },
+            },
+            cx,
+        );
+    }
+
+    pub(super) fn tiny_delete_channel(&mut self, channel_id: String, cx: &mut Context<Self>) {
+        let Some(account) = self.with_account() else {
+            return;
+        };
+        if self.open.as_ref().is_some_and(|key| key.network == Network::Tiny && key.account == account.account && key.id == channel_id) {
+            self.open = None;
+        }
+        self.act(Request::TinyChannelDelete { account, channel_id }, cx);
+    }
+
+    pub(super) fn tiny_text_channel_can_manage(&self, page: &Page, channel_id: &str) -> bool {
+        if let (Some(access), Some(channel)) = (
+            page.community.access.as_ref(),
+            page.community.channels.iter().find(|ch| ch.id == channel_id),
+        ) {
+            return access.has_in_channel(channel, protocol::TINY_MANAGE_CHANNELS);
+        }
+        page.may.edit_room
+    }
+
+    pub(super) fn tiny_text_channel_info(&self, channel_id: &str) -> (String, String) {
+        if let Some(ch) = self
+            .tiny_state
+            .community
+            .as_ref()
+            .and_then(|c| c.channels.iter().find(|ch| ch.id == channel_id))
+        {
+            return (ch.name.clone(), ch.topic.clone());
+        }
+        if let Some(chat) = self.tiny_chats().into_iter().find(|c| c.key.id == channel_id) {
+            return (chat.title.clone(), chat.topic.clone());
+        }
+        (String::new(), String::new())
     }
 
     pub(super) fn tiny_create_category(&mut self, cx: &mut Context<Self>) {
@@ -1377,14 +1647,34 @@ impl Shell {
         self.tiny_state.card = None;
         self.tiny_state.modal_error = None;
         self.tiny_state.copied = false;
-        let focus = match &modal {
-            Modal::NewRoom(_) | Modal::NewCategory => {
+        let mut modal = modal;
+        let focus = match &mut modal {
+            Modal::NewChannel { e2ee, .. } => {
+                self.tiny_state.name_input.update(cx, |input, cx| input.set_text("", cx));
+                self.tiny_state.topic_input.update(cx, |input, cx| input.set_text("", cx));
+                if let Some(account) = self.tiny_state.account.clone() {
+                    if let Some(status) = self.tiny_e2ee_status_for(&account) {
+                        *e2ee = matches!(status.mode.as_str(), "new_required" | "required")
+                            || (status.mode == "optional" && status.device == protocol::DeviceState::Ready);
+                    } else {
+                        self.tiny_load_e2ee_status(account, cx);
+                    }
+                }
+                Some(self.tiny_state.name_input.clone())
+            }
+            Modal::NewCategory => {
                 self.tiny_state.name_input.update(cx, |input, cx| input.set_text("", cx));
                 Some(self.tiny_state.name_input.clone())
             }
             Modal::RenameRoom(room_id) => {
                 let now = self.tiny_state.community.as_ref().and_then(|community| community.rooms.iter().find(|room| room.id == *room_id)).map(|room| room.name.clone()).unwrap_or_default();
                 self.tiny_state.name_input.update(cx, |input, cx| input.set_text(&now, cx));
+                Some(self.tiny_state.name_input.clone())
+            }
+            Modal::EditChannel(channel_id) => {
+                let (name_now, topic_now) = self.tiny_text_channel_info(channel_id);
+                self.tiny_state.name_input.update(cx, |input, cx| input.set_text(&name_now, cx));
+                self.tiny_state.topic_input.update(cx, |input, cx| input.set_text(&topic_now, cx));
                 Some(self.tiny_state.name_input.clone())
             }
             Modal::Transfer(_) | Modal::RevokeInvites { typed: true } => {
@@ -1437,6 +1727,22 @@ impl Shell {
         self.tiny_close_float(cx);
         self.go(Mode::People, cx);
         self.open_person(&person, cx);
+    }
+
+    /// Rings someone on this server directly from the person menu.
+    pub(super) fn tiny_call_person(&mut self, user_id: String, cx: &mut Context<Self>) {
+        let Some(page) = self.tiny_page_facts() else {
+            return;
+        };
+        if user_id == page.me {
+            return;
+        }
+        let name = page.community.member(&user_id).map(model::name_of).unwrap_or_else(|| "Someone".to_owned());
+        let person = protocol::Person::new(page.key(&user_id), name);
+        drop(page);
+        self.close_modal(cx);
+        self.tiny_close_float(cx);
+        self.call_person(&person, cx);
     }
 
     /// The system's file panel. The picture chosen becomes this account's avatar.

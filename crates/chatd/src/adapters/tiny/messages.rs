@@ -91,6 +91,18 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         Vec::new()
     };
     let callable = directs_callable(saved);
+    let caps = super::manage::capabilities_of(saved);
+    let has_pins = caps.has(protocol::TINY_FEATURE_PINS);
+    let blocked_rows = if caps.has(protocol::TINY_FEATURE_BLOCKS) {
+        optional_list::<WireBlock>(saved, "/v1/blocks", "blocks").unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let blocked_ids: HashSet<String> = blocked_rows
+        .iter()
+        .filter(|b| super::safe_id(&b.user_id))
+        .map(|b| b.user_id.clone())
+        .collect();
     let mut people: Vec<PersonRow> = names
         .iter()
         .filter(|(id, _)| super::safe_id(id))
@@ -100,6 +112,19 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
             ..PersonRow::default()
         })
         .collect();
+    let category_map: HashMap<String, (String, i32)> = super::manage::categories_of(saved)
+        .into_iter()
+        .map(|cat| (cat.id, (cat.name, cat.position)))
+        .collect();
+    for block in &blocked_rows {
+        if super::safe_id(&block.user_id) && !people.iter().any(|p| p.id == block.user_id) {
+            people.push(PersonRow {
+                id: block.user_id.clone(),
+                name: title_or(&block.display_name, "Someone"),
+                ..PersonRow::default()
+            });
+        }
+    }
     let mut groups = Vec::new();
     let mut rows = Vec::new();
     let mut noted = Vec::new();
@@ -116,6 +141,13 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         row.space = Some(SPACE.to_owned());
         row.topic = channel.topic.clone();
         row.position = channel.position;
+        row.moderate = channel.my_permissions.unwrap_or(0) & protocol::TINY_MANAGE_MESSAGES != 0;
+        row.can_pin = has_pins && (channel.my_permissions.unwrap_or(0) & protocol::TINY_MANAGE_CHANNELS != 0);
+        row.rights = protocol::ConversationRights {
+            delete_others: row.moderate,
+            pin: row.can_pin,
+            ..protocol::ConversationRights::default()
+        };
         let (e2ee, history) =
             sealed_state(saved, &channel.id, channel.e2ee, channel.plaintext_history);
         row.encryption = encryption_of(saved, &channel.id, e2ee, history);
@@ -126,17 +158,19 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         {
             row.group = Some(category.to_owned());
             if categories.insert(category.to_owned()) {
-                let position = channels
-                    .iter()
-                    .filter(|other| other.category_id.as_deref() == Some(category))
-                    .map(|other| other.position)
-                    .min()
-                    .unwrap_or(0);
-                let name = channel
-                    .category_name
-                    .as_deref()
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or(category);
+                let (name, position) = category_map
+                    .get(category)
+                    .filter(|(name, _)| !name.is_empty())
+                    .map(|(name, pos)| (name.as_str(), *pos))
+                    .unwrap_or_else(|| {
+                        let position = channels
+                            .iter()
+                            .filter(|other| other.category_id.as_deref() == Some(category))
+                            .map(|other| other.position)
+                            .min()
+                            .unwrap_or(0);
+                        (category, position)
+                    });
                 groups.push(Group::new(category, name, position));
             }
         }
@@ -178,6 +212,14 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         row.position = DIRECTS_AT + index as i32;
         if callable {
             row.call = CallSupport::Native;
+        }
+        row.can_pin = has_pins;
+        row.rights.pin = has_pins;
+        if blocked_ids.contains(&direct.peer.user_id) {
+            row.filing = Some(crate::store::Filing {
+                hidden: true,
+                ..crate::store::Filing::default()
+            });
         }
         let (e2ee, history) =
             sealed_state(saved, &direct.id, direct.e2ee, direct.plaintext_history);
@@ -222,6 +264,9 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
     if !people.is_empty() {
         let _ = ctx.people(&people);
     }
+    for id in &blocked_ids {
+        let _ = ctx.relation(id, protocol::Relation::Blocked);
+    }
     if ctx.tree(SPACE, &groups, &rows).is_err() {
         return;
     }
@@ -261,6 +306,16 @@ pub(crate) fn on_live(
                 let _ = ctx.conversation_gone(id);
             }
         }
+        "category.updated" => {
+            if let Some(category) = frame.get("category") {
+                let id = field(category, "id");
+                let name = field(category, "name");
+                let position = category.get("position").and_then(Value::as_i64).unwrap_or(0) as i32;
+                if super::safe_id(id) && !name.is_empty() {
+                    let _ = ctx.group(SPACE, &Group::new(id, name, position));
+                }
+            }
+        }
         "direct.created" => direct_upsert(ctx, saved, names, frame),
         "direct.call" => {
             if let Ok(call) = serde_json::from_value::<WireCall>(frame.clone()) {
@@ -291,8 +346,40 @@ pub(crate) fn on_live(
         "message.deleted" => {
             let conversation = nested_str(frame, "conversation_id");
             let message = nested_id(frame, "message", "message_id").unwrap_or("");
+            let deleted_by = nested_str(frame, "deleted_by");
             if super::safe_id(conversation) && super::safe_id(message) {
-                let _ = ctx.deleted(conversation, message);
+                if !deleted_by.is_empty() {
+                    let _ = ctx.deleted_by_moderator(conversation, message);
+                } else {
+                    let _ = ctx.deleted(conversation, message);
+                }
+            }
+        }
+        "pin.added" | "message.pinned" => {
+            let conversation = nested_str(frame, "conversation_id");
+            let message = nested_id(frame, "message", "message_id").unwrap_or("");
+            if super::safe_id(conversation) && super::safe_id(message) {
+                let _ = ctx.pinned(conversation, message, true);
+            }
+        }
+        "pin.removed" | "message.unpinned" => {
+            let conversation = nested_str(frame, "conversation_id");
+            let message = nested_id(frame, "message", "message_id").unwrap_or("");
+            if super::safe_id(conversation) && super::safe_id(message) {
+                let _ = ctx.pinned(conversation, message, false);
+            }
+        }
+        "block.updated" => {
+            let user_id = field(frame, "user_id");
+            let blocked = frame.get("blocked").and_then(Value::as_bool).unwrap_or(false);
+            if super::safe_id(user_id) {
+                let rel = if blocked {
+                    protocol::Relation::Blocked
+                } else {
+                    protocol::Relation::None
+                };
+                let _ = ctx.relation(user_id, rel);
+                hide_direct_for_peer(ctx, user_id, blocked);
             }
         }
         "reaction.updated" => merge_reaction(ctx, saved, frame),
@@ -359,6 +446,11 @@ pub(crate) fn live_kind(kind: &str) -> bool {
             | "message.created"
             | "message.edited"
             | "message.deleted"
+            | "pin.added"
+            | "pin.removed"
+            | "message.pinned"
+            | "message.unpinned"
+            | "block.updated"
             | "reaction.updated"
             | "e2ee.reaction"
             | "read.updated"
@@ -438,6 +530,25 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
                 delete(ctx, saved, &conversation_id, &message_id, reply);
             }
         }
+        Command::Pinned { conversation_id, reply } => pinned(ctx, saved, &conversation_id, reply),
+        Command::Pin {
+            conversation_id,
+            message_id,
+            pinned,
+            reply,
+            ..
+        } => pin(ctx, saved, &conversation_id, &message_id, pinned, reply),
+        Command::Search {
+            query,
+            scope,
+            reply,
+            ..
+        } => search(ctx, saved, &query, scope, reply),
+        Command::Relate {
+            person_id,
+            action,
+            reply,
+        } => relate(ctx, saved, &person_id, action, reply),
         Command::Typing { conversation_id, activity: _ } => {
             if super::safe_id(&conversation_id) {
                 live.ask(Ask::Type { conversation_id });
@@ -582,8 +693,12 @@ fn channel_upsert(ctx: &Context, saved: &Saved, names: &HashMap<String, String>,
         return;
     }
     if let Some(category) = channel.category_id.as_deref().filter(|id| super::safe_id(id)) {
-        let name = channel.category_name.as_deref().filter(|name| !name.is_empty()).unwrap_or(category);
-        let _ = ctx.group(SPACE, &Group::new(category, name, channel.position));
+        let (name, position) = super::manage::categories_of(saved)
+            .into_iter()
+            .find(|cat| cat.id == category && !cat.name.is_empty())
+            .map(|cat| (cat.name, cat.position))
+            .unwrap_or_else(|| (category.to_owned(), channel.position));
+        let _ = ctx.group(SPACE, &Group::new(category, &name, position));
     }
     let mut row = ConversationRow::new(&channel.id, ConversationKind::Channel, title_or(&channel.name, &channel.id));
     row.space = Some(SPACE.to_owned());
@@ -1838,6 +1953,279 @@ fn delete(ctx: &Context, saved: &Saved, conversation_id: &str, message_id: &str,
     }
 }
 
+fn pinned(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: &str,
+    reply: crate::adapters::Reply<Vec<Message>>,
+) {
+    if !super::safe_id(conversation_id) {
+        let _ = reply.send(Err(Refusal::Refused(super::CHECK.to_owned())));
+        return;
+    }
+    let path = format!("/v1/conversations/{conversation_id}/pins");
+    match super::asked("GET", saved, &path, None) {
+        Ok((200, body)) => {
+            let Ok(wires) = list_of::<WireMessage>(body, "messages") else {
+                let _ = reply.send(Err(Refusal::Refused(super::UNREADABLE.to_owned())));
+                return;
+            };
+            let names = member_names(saved);
+            let mut media = Vec::new();
+            let opened = open_rows(ctx, saved, conversation_id, &wires.iter().collect::<Vec<_>>());
+            let mut messages = Vec::with_capacity(wires.len());
+            for wire in &wires {
+                let Some(mut msg) = map_message(saved, &names, wire, &opened, &mut media) else {
+                    continue;
+                };
+                msg.pinned = true;
+                if row_is_sealed(wire) && !matches!(opened.get(&wire.id), Some(Read::Opened(_) | Read::Legacy(_))) {
+                    msg.text = "Pinned message isn't available on this device".to_owned();
+                }
+                messages.push(msg);
+            }
+            if !media.is_empty() {
+                let _ = ctx.media(&media);
+            }
+            let _ = reply.send(Ok(messages));
+        }
+        Ok((404, _)) => {
+            let _ = reply.send(Err(Refusal::Unsupported));
+        }
+        Ok((status, body)) => {
+            let _ = reply.send(Err(Refusal::Refused(super::explain(status, &body, super::Missing::Plain).to_owned())));
+        }
+        Err(detail) => {
+            let _ = reply.send(Err(Refusal::Refused(detail.to_owned())));
+        }
+    }
+}
+
+fn pin(
+    ctx: &Context,
+    saved: &Saved,
+    conversation_id: &str,
+    message_id: &str,
+    on: bool,
+    reply: crate::adapters::Reply<()>,
+) {
+    if !super::safe_id(conversation_id) || !super::safe_id(message_id) {
+        let _ = reply.send(Err(Refusal::Refused(super::CHECK.to_owned())));
+        return;
+    }
+    let method = if on { "PUT" } else { "DELETE" };
+    let path = format!("/v1/messages/{message_id}/pin");
+    match super::asked(method, saved, &path, None) {
+        Ok((200 | 204, _)) => {
+            let _ = ctx.pinned(conversation_id, message_id, on);
+            let _ = reply.send(Ok(()));
+        }
+        other => answer_ok(other, reply),
+    }
+}
+
+fn percent_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
+}
+
+#[derive(Deserialize)]
+struct WireSearchHit {
+    conversation_id: String,
+    message: WireMessage,
+}
+
+#[derive(Deserialize)]
+struct WireSearchResponse {
+    #[serde(default)]
+    hits: Vec<WireSearchHit>,
+    #[serde(default)]
+    skipped_encrypted: bool,
+}
+
+fn search(
+    ctx: &Context,
+    saved: &Saved,
+    query: &str,
+    scope: crate::adapters::SearchScope,
+    reply: crate::adapters::Reply<Vec<protocol::MessageHit>>,
+) {
+    let trimmed = query.trim();
+    if trimmed.len() < 2 {
+        let _ = reply.send(Ok(Vec::new()));
+        return;
+    }
+    let mut path = format!("/v1/search?q={}&limit=25", percent_encode(trimmed));
+    match &scope {
+        crate::adapters::SearchScope::Conversation(conv_id) => {
+            if !super::safe_id(conv_id) {
+                let _ = reply.send(Err(Refusal::Refused(super::CHECK.to_owned())));
+                return;
+            }
+            // Encrypted conversations (or ones whose encryption state cannot be verified locally)
+            // must never send search queries to the server; answer from local cache only.
+            if sealed_here(ctx, saved, conv_id) != Ok(false) {
+                let key = ctx.key(conv_id);
+                let hits = ctx
+                    .hub
+                    .store()
+                    .search_messages(Some(&key), None, None, trimmed, 25)
+                    .unwrap_or_default();
+                let _ = reply.send(Ok(hits));
+                return;
+            }
+            path.push_str("&conversation_id=");
+            path.push_str(conv_id);
+        }
+        crate::adapters::SearchScope::Space(_) | crate::adapters::SearchScope::Account => {}
+    }
+    match super::asked("GET", saved, &path, None) {
+        Ok((200, body)) => {
+            let Ok(parsed) = serde_json::from_value::<WireSearchResponse>(body) else {
+                let _ = reply.send(Err(Refusal::Refused(super::UNREADABLE.to_owned())));
+                return;
+            };
+            let names = member_names(saved);
+            let space_title = join_host(&saved.base_url);
+            let mut hits = Vec::with_capacity(parsed.hits.len());
+            let mut seen = HashSet::new();
+            for item in parsed.hits {
+                if !super::safe_id(&item.conversation_id) || !super::safe_id(&item.message.id) {
+                    continue;
+                }
+                let conv_key = ctx.key(&item.conversation_id);
+                let title = ctx
+                    .known(&item.conversation_id)
+                    .ok()
+                    .flatten()
+                    .map(|row| row.title)
+                    .unwrap_or_default();
+                let snippet: String = item
+                    .message
+                    .body
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(200)
+                    .collect();
+                let sent = rfc3339(&item.message.created_at).unwrap_or(0);
+                let sender = name_of(&names, saved, &item.message.author_id);
+                seen.insert((conv_key.clone(), item.message.id.clone()));
+                hits.push(protocol::MessageHit {
+                    conversation: conv_key,
+                    message_id: item.message.id,
+                    sent,
+                    sender,
+                    outgoing: item.message.author_id == saved.user_id,
+                    snippet,
+                    title,
+                    space_title: space_title.clone(),
+                });
+            }
+            // If the server skipped encrypted conversations in a space-wide search, merge cached hits
+            // from encrypted conversations on this device.
+            if parsed.skipped_encrypted && matches!(scope, crate::adapters::SearchScope::Space(_)) {
+                let space_key = ctx.key(SPACE);
+                if let Ok(local) = ctx
+                    .hub
+                    .store()
+                    .search_messages(None, None, Some(&space_key), trimmed, 25)
+                {
+                    for hit in local {
+                        if seen.insert((hit.conversation.clone(), hit.message_id.clone())) {
+                            hits.push(hit);
+                        }
+                    }
+                    hits.sort_by(|a, b| b.sent.cmp(&a.sent));
+                }
+            }
+            let _ = reply.send(Ok(hits));
+        }
+        Ok((404, _)) => {
+            let _ = reply.send(Err(Refusal::Unsupported));
+        }
+        Ok((status, body)) => {
+            let _ = reply.send(Err(Refusal::Refused(
+                super::explain(status, &body, super::Missing::Plain).to_owned(),
+            )));
+        }
+        Err(detail) => {
+            let _ = reply.send(Err(Refusal::Refused(detail.to_owned())));
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+struct WireBlock {
+    user_id: String,
+    #[serde(default)]
+    display_name: String,
+}
+
+fn hide_direct_for_peer(ctx: &Context, user_id: &str, hidden: bool) {
+    let space = ctx.key(SPACE);
+    let directs = ctx
+        .hub
+        .store()
+        .space_rows_of_kinds(&space, &[ConversationKind::Direct])
+        .unwrap_or_default();
+    for row in directs {
+        if row.peer.as_deref() == Some(user_id) {
+            let _ = ctx.filing(
+                &row.id,
+                &crate::store::Filing {
+                    hidden,
+                    ..crate::store::Filing::default()
+                },
+            );
+        }
+    }
+}
+
+fn relate(
+    ctx: &Context,
+    saved: &Saved,
+    person_id: &str,
+    action: protocol::RelateAction,
+    reply: crate::adapters::Reply<()>,
+) {
+    if !super::safe_id(person_id) {
+        let _ = reply.send(Err(Refusal::Refused(super::CHECK.to_owned())));
+        return;
+    }
+    let (method, blocked) = match action {
+        protocol::RelateAction::Block => ("PUT", true),
+        protocol::RelateAction::Unblock => ("DELETE", false),
+        _ => {
+            let _ = reply.send(Err(Refusal::Unsupported));
+            return;
+        }
+    };
+    let path = format!("/v1/blocks/{person_id}");
+    match super::asked(method, saved, &path, None) {
+        Ok((200 | 204, _)) => {
+            let rel = if blocked {
+                protocol::Relation::Blocked
+            } else {
+                protocol::Relation::None
+            };
+            let _ = ctx.relation(person_id, rel);
+            hide_direct_for_peer(ctx, person_id, blocked);
+            let _ = reply.send(Ok(()));
+        }
+        other => answer_ok(other, reply),
+    }
+}
+
 fn mark_read(saved: &Saved, conversation_id: &str, message_id: &str) {
     if !super::safe_id(conversation_id) || !super::safe_id(message_id) {
         return;
@@ -1988,6 +2376,12 @@ fn map_message(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessag
     message.edited = present(&wire.edited_at);
     message.edited_at = wire.edited_at.as_deref().and_then(unix_of);
     message.deleted = deleted;
+    message.moderated = deleted
+        && wire
+            .deleted_by
+            .as_deref()
+            .is_some_and(|by| !by.is_empty() && by != wire.author_id);
+    message.pinned = !deleted && wire.pinned;
     message.client_id = wire.client_id.clone().filter(|id| !id.is_empty());
     message.seq = wire.seq;
     message.reply_to = reply_of(wire.reply_to.as_ref());
@@ -2034,6 +2428,12 @@ fn map_sealed(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessage
     let mut message = Message::plain(&wire.id, sender, "", sent, outgoing);
     message.sender.id = wire.author_id.clone();
     message.deleted = deleted;
+    message.moderated = deleted
+        && wire
+            .deleted_by
+            .as_deref()
+            .is_some_and(|by| !by.is_empty() && by != wire.author_id);
+    message.pinned = !deleted && wire.pinned;
     message.client_id = wire.client_id.clone().filter(|id| !id.is_empty());
     message.seq = wire.seq;
     message.seal = Seal::Encrypted;
@@ -2170,7 +2570,8 @@ struct UploadLimits {
 /// What this account may send. `file_scan` is absent on an older server, which keeps today's upload.
 fn account_caps(saved: &Saved) -> Capabilities {
     let limits = upload_limits(saved);
-    let scans = super::manage::capabilities_of(saved).has(protocol::TINY_FEATURE_FILE_SCAN);
+    let caps = super::manage::capabilities_of(saved);
+    let scans = caps.has(protocol::TINY_FEATURE_FILE_SCAN);
     Capabilities {
         max_file_bytes: limits.image.max(limits.file),
         max_files: protocol::ATTACHMENTS_LIMIT as u32,
@@ -2180,7 +2581,9 @@ fn account_caps(saved: &Saved) -> Capabilities {
         reply: true,
         edit: true,
         delete: true,
-        pins: false,
+        pins: caps.has(protocol::TINY_FEATURE_PINS),
+        search: caps.has(protocol::TINY_FEATURE_MESSAGE_SEARCH),
+        blocks: caps.has(protocol::TINY_FEATURE_BLOCKS),
         reactions: true,
         gif_file: true,
         profile_avatar: true,
@@ -2662,8 +3065,6 @@ struct WireChannel {
     #[serde(default)]
     category_id: Option<String>,
     #[serde(default)]
-    category_name: Option<String>,
-    #[serde(default)]
     position: i32,
     #[serde(default, deserialize_with = "flex_u32")]
     unread: u32,
@@ -2678,6 +3079,9 @@ struct WireChannel {
     /// Per-role permission overrides on this channel, when the server includes them.
     #[serde(default)]
     overrides: Vec<protocol::TinyOverride>,
+    /// Caller's effective permission bits in this channel, when the server includes them.
+    #[serde(default)]
+    my_permissions: Option<u64>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -2867,6 +3271,10 @@ struct WireMessage {
     edited_at: Option<String>,
     #[serde(default)]
     deleted_at: Option<String>,
+    #[serde(default)]
+    deleted_by: Option<String>,
+    #[serde(default)]
+    pinned: bool,
     #[serde(default)]
     attachments: Vec<WireFile>,
     #[serde(default)]
@@ -3313,8 +3721,11 @@ mod tests {
     fn lists(request: &str) -> Vec<u8> {
         if request.starts_with("GET /v1/channels ") {
             return http(200, "OK", &format!(
-                r#"{{"channels":[{{"id":"channel-1","name":"general","topic":"Hello","category_id":"cat-1","category_name":"Text","position":1,"unread":2,"last_message":{{"id":"c-9","author_id":"{PEER}","body":"hey","created_at":"{WHEN}"}}}}]}}"#
+                r#"{{"channels":[{{"id":"channel-1","name":"general","topic":"Hello","category_id":"cat-1","position":1,"unread":2,"last_message":{{"id":"c-9","author_id":"{PEER}","body":"hey","created_at":"{WHEN}"}}}}]}}"#
             ));
+        }
+        if request.starts_with("GET /v1/categories ") {
+            return http(200, "OK", r#"[{"id":"cat-1","name":"Text","position":0}]"#);
         }
         if request.starts_with("GET /v1/directs ") {
             return http(200, "OK", &format!(
@@ -3639,7 +4050,6 @@ mod tests {
                 "name": "general",
                 "topic": "Moved",
                 "category_id": "cat-1",
-                "category_name": "Text",
                 "position": 1,
                 "unread": 0,
                 "last_message": {
@@ -3655,6 +4065,32 @@ mod tests {
         assert_eq!(channel.unread, 2, "a channel update carries the actor's unread, not ours");
         assert_eq!(channel.topic, "Moved");
         assert_eq!(channel.preview, "later");
+    }
+
+    #[test]
+    fn store_groups_use_category_names_and_positions_and_rename_on_category_updated() {
+        let (_adapter, ctx, saved) = fixture(|request| {
+            if request.starts_with("GET /v1/categories ") {
+                return Some(http(200, "OK", r#"[{"id":"cat-text","name":"Text","position":2},{"id":"cat-proj","name":"Projects","position":5}]"#));
+            }
+            if request.starts_with("GET /v1/channels ") {
+                return Some(http(200, "OK", r#"{"channels":[{"id":"c-1","name":"general","topic":"","category_id":"cat-text","position":10,"unread":0},{"id":"c-2","name":"random","topic":"","category_id":"cat-text","position":11,"unread":0},{"id":"c-3","name":"roadmap","topic":"","category_id":"cat-proj","position":0,"unread":0}]}"#));
+            }
+            None
+        });
+        let space = ctx.key(SPACE);
+        let groups = ctx.hub.store().tree(&space, 0, 50).unwrap().unwrap().groups;
+        let text = groups.iter().find(|g| g.id == "cat-text").expect("Text group");
+        let proj = groups.iter().find(|g| g.id == "cat-proj").expect("Projects group");
+        assert_eq!((text.name.as_str(), text.position), ("Text", 2));
+        assert_eq!((proj.name.as_str(), proj.position), ("Projects", 5));
+
+        on_live(&ctx, &saved, &HashMap::new(), "category.updated", &json!({
+            "category": { "id": "cat-proj", "name": "Roadmap", "position": 1 }
+        }));
+        let groups = ctx.hub.store().tree(&space, 0, 50).unwrap().unwrap().groups;
+        let proj = groups.iter().find(|g| g.id == "cat-proj").expect("renamed group");
+        assert_eq!((proj.name.as_str(), proj.position), ("Roadmap", 1));
     }
 
     /// A 403 on the channel list is a refusal, not an empty server. Treating it as empty makes

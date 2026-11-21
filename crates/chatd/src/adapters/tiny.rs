@@ -766,6 +766,7 @@ enum Missing {
     Member,
     Invite,
     Room,
+    Channel,
     Role,
     Category,
     Ban,
@@ -806,12 +807,17 @@ fn explain(status: u16, body: &Value, missing: Missing) -> &'static str {
         (_, "timed_out") => "You're timed out on this server for now.",
         (_, "too_large") => "That picture is too big. The most is 256 KB.",
         (_, "unsupported_media") => "That picture isn't a PNG, JPEG or WebP.",
+        (_, "e2ee_required") => "This server requires new channels to be end-to-end encrypted.",
+        (_, "e2ee_off") => "End-to-end encryption is turned off on this server.",
+        (_, "e2ee_group_too_large") => "Too many devices can see this channel for it to be encrypted. Make it for fewer people, or make it unencrypted.",
         (403, _) => "You can't do that.",
         (409, "last_owner") => "This server needs an owner. Make someone else the owner first.",
         (409, "already_member") => "That person is already on this server.",
+        (409, "block_limit") => "You've reached the maximum number of blocked people.",
         (404, _) if missing == Missing::Member => "That person is no longer on this server.",
         (404, _) if missing == Missing::Invite => "That invite is gone or was already used.",
         (404, _) if missing == Missing::Room => "That room is gone.",
+        (404, _) if missing == Missing::Channel => "That channel is gone.",
         (404, _) if missing == Missing::Role => "That role is gone.",
         (404, _) if missing == Missing::Category => "That category is gone.",
         (404, _) if missing == Missing::Ban => "That person isn't banned.",
@@ -1058,6 +1064,7 @@ pub(crate) fn community(hub: &Hub, account: AccountKey) -> Response {
         Some(extras) => (extras.server, extras.roles, extras.categories, extras.bans),
         None => (None, Vec::new(), Vec::new(), Vec::new()),
     };
+    let channels = manage::channels_of(&saved);
     // "New device added", from what this device knows: no request.
     let new_devices = e2ee::added(&saved);
     Response::TinyCommunity {
@@ -1068,6 +1075,7 @@ pub(crate) fn community(hub: &Hub, account: AccountKey) -> Response {
             audit,
             origin: saved.base_url,
             rooms,
+            channels,
             online,
             media,
             capabilities: known.capabilities,

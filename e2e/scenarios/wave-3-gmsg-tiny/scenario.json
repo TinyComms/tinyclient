@@ -1,0 +1,12 @@
+{
+  "id": "wave-3-gmsg-tiny",
+  "title": "Wave 3C Google Messages and Tiny Server enhancements",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "Desktop Wave 3C Google Messages and Tiny Server enhancements verified by unit and integration test suites.",
+    "ios": "Desktop Wave 3C Google Messages and Tiny Server enhancements verified by unit and integration test suites."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

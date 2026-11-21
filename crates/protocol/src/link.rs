@@ -190,12 +190,15 @@ pub fn find(text: &str, skip: &[Range<usize>]) -> Vec<Found> {
     let mut i = 0;
     let (mut failed, mut token_end, mut tries) = (0, 0, 0);
     while i < bytes.len() && out.len() < LINKS_PER_MESSAGE {
-        if !matches!(bytes[i], b'h' | b'H' | b'w' | b'W') || !text.is_char_boundary(i) {
+        if !matches!(bytes[i], b'h' | b'H' | b'w' | b'W' | b't' | b'T') || !text.is_char_boundary(i) {
             i += 1;
             continue;
         }
         let rest = &text[i..];
-        let scheme = if rest.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://")) {
+        let tiny_msg = rest.starts_with("tinyclient://message#");
+        let scheme = if tiny_msg {
+            21
+        } else if rest.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://")) {
             8
         } else if rest.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("http://")) {
             7
@@ -221,6 +224,8 @@ pub fn find(text: &str, skip: &[Range<usize>]) -> Vec<Found> {
         let blocked = skip.iter().any(|code| range.start < code.end && code.start < range.end);
         let url = if blocked || address.len() <= scheme.max(4) {
             None
+        } else if tiny_msg {
+            crate::tiny::parse_message_link(address).map(|_| address.to_owned())
         } else if bare {
             let full = format!("https://{address}");
             parse_web(&full).filter(|url| {

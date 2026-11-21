@@ -818,10 +818,55 @@ impl Pane {
                 .into_any_element()
         });
 
+        let blocked_hidden = !message.outgoing
+            && !message.deleted
+            && !message.sender.id.is_empty()
+            && !self.revealed_blocked.contains(&message.id)
+            && self.open.as_ref().is_some_and(|open| !open.kind.is_direct())
+            && self
+                .shell
+                .upgrade()
+                .zip(self.open.as_ref())
+                .is_some_and(|(shell, open)| {
+                    let key = Key::new(&open.key.account(), &message.sender.id);
+                    shell
+                        .read(cx)
+                        .people_state
+                        .hub()
+                        .person(&key)
+                        .is_some_and(|p| p.relation == protocol::Relation::Blocked)
+                });
         let mut sent = div().flex().flex_col();
         if message.deleted {
             // What it said is gone; the row stays for the thread that hangs off it.
-            sent = sent.child(div().type_body().italic().text_color(theme::text_faint()).child("Message deleted"));
+            let tombstone = if message.moderated { "Removed by a moderator" } else { "Message deleted" };
+            sent = sent.child(div().type_body().italic().text_color(theme::text_faint()).child(tombstone));
+        } else if blocked_hidden {
+            let reveal_id = message.id.clone();
+            sent = sent.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .type_body()
+                    .italic()
+                    .text_color(theme::text_faint())
+                    .child("Blocked message.")
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("reveal-blocked-{}", message.id)))
+                            .not_italic()
+                            .cursor_pointer()
+                            .text_color(theme::text_soft())
+                            .hover(|style| style.underline())
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.revealed_blocked.insert(reveal_id.clone());
+                                cx.notify();
+                            }))
+                            .child("Show"),
+                    ),
+            );
         } else {
             let said = match &message.kind {
                 MessageKind::Unsupported { link } => vec![self.unsupported(message, link, cx).into_any_element()],
@@ -896,6 +941,7 @@ impl Pane {
             .flex_col()
             .children(head.then(|| self.header(message, in_header, cx)))
             .child(sent)
+            .children(self.otp_chip(message, cx))
             .children(self.views_line(message))
             .children(self.reactions(message, window, cx))
             .children(self.thread_line(message, window, cx))
@@ -1155,6 +1201,17 @@ impl Pane {
                     .child(icon(Icon::Pin, 12., theme::text_faint()))
                     .child("Pinned")
             }))
+            .children(message.starred.then(|| {
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .type_micro()
+                    .text_color(theme::text_faint())
+                    .child("★")
+                    .child("Starred")
+            }))
     }
 
     // Words.
@@ -1262,6 +1319,60 @@ impl Pane {
             }
         }
         out
+    }
+
+    /// Inline "Copy <code>" chip for an incoming message containing a one-time verification code.
+    /// Only copies when clicked; never auto-copies.
+    fn otp_chip(&mut self, message: &Message, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if message.outgoing || message.deleted || message.kind != MessageKind::Normal {
+            return None;
+        }
+        let code = protocol::otp::extract_code(&message.text)?;
+        let key = (message.id.clone(), usize::MAX);
+        let copied = self.copied.as_ref() == Some(&key);
+        let label = if copied {
+            "Copied".to_owned()
+        } else {
+            format!("Copy code {code}")
+        };
+        let copy = key.clone();
+        let chip = div()
+            .id(name_id("otp", &message.id))
+            .mt(px(4.))
+            .h(px(26.))
+            .px(px(10.))
+            .rounded(px(theme::R_CONTROL))
+            .bg(theme::field())
+            .border_1()
+            .border_color(theme::border())
+            .hover(|style| style.bg(theme::selected()).border_color(theme::border_strong()))
+            .active(|style| style.bg(theme::pressed()))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .type_small()
+            .text_color(theme::text())
+            .cursor_pointer()
+            .child(icon(if copied { Icon::Check } else { Icon::Copy }, 12., theme::text_soft()))
+            .child(label)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                cx.write_to_clipboard(ClipboardItem::new_string(code.clone()));
+                this.copied = Some(copy.clone());
+                cx.notify();
+                let copy = copy.clone();
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(Duration::from_millis(1500)).await;
+                    let _ = this.update(cx, |this, cx| {
+                        if this.copied.as_ref() == Some(&copy) {
+                            this.copied = None;
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+            }));
+        Some(div().flex().child(chip).into_any_element())
     }
 
     /// "(edited)", with the time it was edited. A network that keeps earlier wordings opens them on a click.

@@ -1102,11 +1102,24 @@ fn unix_seconds(raw: i64) -> i64 {
 pub struct Participant {
     pub id: String,
     pub name: String,
+    pub first_name: String,
     pub number: String,
     pub is_me: bool,
+    /// Avatar colour assigned by the phone (`0xRRGGBB`), when present.
+    pub color: Option<u32>,
 }
 
-#[derive(Clone)]
+/// One contact from the phone's address book (`LIST_CONTACTS`, action 6).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContactEntry {
+    pub id: String,
+    pub participant_id: String,
+    pub name: String,
+    pub number: String,
+    pub formatted_number: String,
+}
+
+#[derive(Clone, Default)]
 pub struct Chat {
     pub id: String,
     pub title: String,
@@ -1116,7 +1129,7 @@ pub struct Chat {
     /// The other side of a one-to-one chat, by participant id: whose picture the row shows.
     /// Empty for a group.
     pub peer: String,
-    /// `Conversation.type`, field 22: 1 SMS, 2 RCS, 0 when the phone did not say.
+    /// `Conversation.type`, field 22: 1 SMS, 2 RCS, 3 RBM (business), 0 when the phone did not say.
     pub carrier: u64,
     /// Unix seconds of the latest message, from field 5. 0 when the phone did not say.
     /// The inbox cursor uses it when the response has no cursor of its own.
@@ -1127,8 +1140,73 @@ pub struct Chat {
     /// `Conversation.status`, field 12. 0 when the phone did not say, which keeps the status
     /// already stored. 3 is DELETED.
     pub status: u64,
+    /// `Conversation.readOnly`, field 13: the phone says this sender cannot receive replies.
+    pub read_only: bool,
+    /// Verified business sender (RBM or verified business flag).
+    pub verified: bool,
     /// Participants reported on this conversation (id, name, number, is_me).
     pub participants: Vec<Participant>,
+}
+
+/// True when a sender identifier is alphanumeric (e.g. "BANKOTP", "FedEx") rather than a phone
+/// number or numeric short code. Alphanumeric senders cannot receive SMS replies; numeric short
+/// codes often accept "STOP" and stay replyable unless the phone marks the chat read-only.
+pub fn is_alphanumeric_sender(number: &str) -> bool {
+    let trimmed = number.trim();
+    !trimmed.is_empty() && trimmed.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// Standard emergency numbers that must never be texted or called from tinyclient.
+pub fn is_emergency_number(number: &str) -> bool {
+    let digits: String = number.chars().filter(char::is_ascii_digit).collect();
+    matches!(
+        digits.as_str(),
+        "911" | "112" | "999" | "000" | "111" | "110" | "119" | "118" | "100" | "101" | "102"
+            | "108" | "190" | "192" | "193" | "995" | "997" | "998"
+    )
+}
+
+/// Normalises a user-typed phone number to E.164 using `default_cc` (e.g. `"+1"`).
+/// Refuses alphanumeric senders, emergency numbers, and too-short/too-long inputs.
+pub fn normalize_e164(input: &str, default_cc: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() || is_alphanumeric_sender(trimmed) || is_emergency_number(trimmed) {
+        return None;
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_digit() || matches!(c, '+' | '-' | '(' | ')' | ' ' | '.'))
+    {
+        return None;
+    }
+    let has_plus = trimmed.starts_with('+');
+    let digits: String = trimmed.chars().filter(char::is_ascii_digit).collect();
+    if digits.len() < 7 || digits.len() > 15 {
+        return None;
+    }
+    if has_plus {
+        return Some(format!("+{digits}"));
+    }
+    if let Some(rest) = digits.strip_prefix("00") {
+        if (7..=15).contains(&rest.len()) {
+            return Some(format!("+{rest}"));
+        }
+    }
+    let cc: String = default_cc.chars().filter(char::is_ascii_digit).collect();
+    let cc = if cc.is_empty() { "1" } else { cc.as_str() };
+    if cc == "1" {
+        if digits.len() == 10 {
+            return Some(format!("+1{digits}"));
+        }
+        if digits.len() == 11 && digits.starts_with('1') {
+            return Some(format!("+{digits}"));
+        }
+    }
+    if digits.starts_with(cc) && digits.len() >= 10 {
+        Some(format!("+{digits}"))
+    } else {
+        Some(format!("+{cc}{digits}"))
+    }
 }
 
 /// One photo or file on a message. Bytes are already opened when the phone sent them inline.
@@ -1177,6 +1255,12 @@ pub struct Note {
     pub phones: Option<bool>,
     /// `ReplyMessage.messageID`, field 21.1. Empty when this message is not a reply.
     pub reply: String,
+    /// True when the phone marked this RCS message as edited.
+    pub edited: bool,
+    /// Unix seconds when the message was edited, if reported by the phone.
+    pub edited_at: Option<i64>,
+    /// `Message.isStarred`, field 24.
+    pub starred: bool,
 }
 
 /// What the other side did with one of my messages, as far as the phone knows.
@@ -1326,6 +1410,14 @@ pub fn wire_tag(wire: u64, carrier: u64) -> &'static str {
         4 => "RCS",
         _ => "",
     }
+}
+
+/// Google Messages lets a person edit an RCS message for 15 minutes after sending.
+pub const EDIT_WINDOW_SECS: u32 = 15 * 60;
+
+/// Editing is only allowed in an RCS conversation (`Conversation.type` 2), never SMS/MMS.
+pub fn allows_edit(carrier: u64) -> bool {
+    carrier == 2
 }
 
 /// A reply reference is only sent in an RCS conversation (`Conversation.type` 2). SMS, MMS,
@@ -1948,6 +2040,33 @@ impl Session {
         Ok(decode_thumbnails(&bytes))
     }
 
+    /// Lists the phone's contacts (`LIST_CONTACTS`, action 6).
+    pub fn contacts(&self) -> Result<Vec<ContactEntry>, String> {
+        let bytes = self.rpc(6, &list_contacts_request(), 2)?;
+        Ok(decode_contacts(&bytes))
+    }
+
+    /// Gets or creates a 1:1 or group conversation (`GET_OR_CREATE_CONVERSATION`, action 11).
+    pub fn get_or_create_conversation(
+        &self,
+        numbers: &[String],
+        group_name: Option<&str>,
+    ) -> Result<Chat, String> {
+        let bytes = self.rpc(
+            11,
+            &get_or_create_conversation_request(numbers, group_name),
+            2,
+        )?;
+        refused(&bytes)?;
+        let chats = decode_chats(&bytes);
+        let chat = chats
+            .into_iter()
+            .next()
+            .ok_or_else(|| "Messages didn't return a conversation.".to_owned())?;
+        self.apply_chats(vec![chat.clone()]);
+        Ok(chat)
+    }
+
     fn upload(&self, packed: &[u8], mime: &str) -> Result<String, String> {
         let (payload, cookies) = {
             let live = self
@@ -2076,6 +2195,16 @@ impl Session {
             return Err("Messages didn't delete that. Keep the phone online.".into());
         }
         Ok(())
+    }
+
+    pub fn edit_message(&self, conversation: &str, message: &str, text: &str) -> Result<(), String> {
+        let bytes = self.rpc(47, &edit_message_request(conversation, message, text), 2)?;
+        refused(&bytes)
+    }
+
+    pub fn star_message(&self, conversation: &str, message: &str, starred: bool) -> Result<(), String> {
+        let bytes = self.rpc(48, &star_message_request(conversation, message, starred), 2)?;
+        refused(&bytes)
     }
 
     pub fn delete_conversation(&self, conversation: &str) -> Result<(), String> {
@@ -2559,6 +2688,8 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
         let unread = field_int(&conv, 6) != 0;
         let carrier = field_int(&conv, 22);
         let status = field_int(&conv, 12);
+        let read_only = field_int(&conv, 13) != 0;
+        let mut verified = carrier == 3 || field_int(&conv, 26) != 0;
         let mut mine = field_text(&conv, 11);
         let mut peer = String::new();
         let mut participants = Vec::new();
@@ -2566,10 +2697,14 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
             let participant = fields(&person.bytes);
             let info = fields(&field_bytes(&participant, 1));
             let pid = field_text(&info, 3);
+            if field_int(&participant, 18) != 0 || field_int(&info, 1) == 3 {
+                verified = true;
+            }
+            let first_name = field_text(&participant, 2);
             let name = {
                 let full = field_text(&participant, 3);
                 if full.is_empty() {
-                    field_text(&participant, 2)
+                    first_name.clone()
                 } else {
                     full
                 }
@@ -2583,6 +2718,7 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
                 }
             };
             let is_me = field_int(&participant, 6) != 0;
+            let color = parse_hex_color(&field_text(&participant, 22));
             if !is_me && !group && peer.is_empty() {
                 peer = pid.clone();
             }
@@ -2597,8 +2733,10 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
                 participants.push(Participant {
                     id: pid,
                     name,
+                    first_name,
                     number,
                     is_me,
+                    color,
                 });
             }
         }
@@ -2620,10 +2758,78 @@ fn decode_chats(bytes: &[u8]) -> Vec<Chat> {
             updated: unix_seconds(field_int(&conv, 5) as i64),
             phones: false,
             status,
+            read_only,
+            verified,
             participants,
         });
     }
     chats
+}
+
+fn parse_hex_color(raw: &str) -> Option<u32> {
+    let hex = raw.trim().trim_start_matches('#');
+    if hex.len() == 6 {
+        u32::from_str_radix(hex, 16).ok()
+    } else if hex.len() == 8 {
+        // ARGB -> RGB
+        u32::from_str_radix(&hex[2..], 16).ok()
+    } else {
+        None
+    }
+}
+
+fn list_contacts_request() -> Vec<u8> {
+    let mut req = Buf::new();
+    req.int(1, 1);
+    req.int(2, 1);
+    req.int(3, 500);
+    req.0
+}
+
+fn get_or_create_conversation_request(numbers: &[String], group_name: Option<&str>) -> Vec<u8> {
+    let mut req = Buf::new();
+    for number in numbers {
+        let mut entry = Buf::new();
+        entry.text(1, number);
+        req.msg(2, &entry.0);
+    }
+    if let Some(name) = group_name.filter(|n| !n.trim().is_empty()) {
+        req.text(3, name.trim());
+    }
+    if numbers.len() > 1 {
+        req.int(4, 1);
+    }
+    req.0
+}
+
+fn decode_contacts(bytes: &[u8]) -> Vec<ContactEntry> {
+    let list = fields(bytes);
+    let mut out = Vec::new();
+    for item in list.iter().filter(|f| f.number == 2) {
+        let entry = fields(&item.bytes);
+        let participant_id = field_text(&entry, 1);
+        let name = field_text(&entry, 2);
+        let num = fields(&field_bytes(&entry, 3));
+        let number = field_text(&num, 1);
+        let formatted_number = {
+            let f = field_text(&num, 2);
+            if f.is_empty() { number.clone() } else { f }
+        };
+        let id = {
+            let cid = field_text(&entry, 7);
+            if cid.is_empty() { participant_id.clone() } else { cid }
+        };
+        if !name.is_empty() || !number.is_empty() {
+            out.push(ContactEntry {
+                id,
+                participant_id,
+                name,
+                number,
+                formatted_number,
+            });
+        }
+    }
+    out
 }
 
 fn emoji_of(unicode: &str, kind: u64) -> String {
@@ -2851,6 +3057,8 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
         let reply = field(&msg, 21)
             .map(|field| field_text(&fields(&field.bytes), 1))
             .unwrap_or_default();
+        let (edited, edited_at) = decode_edit_status(&msg);
+        let starred = field_int(&msg, 24) != 0;
         if text.is_empty()
             && file
             && pieces
@@ -2884,9 +3092,62 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
             wire,
             phones: None,
             reply,
+            edited,
+            edited_at,
+            starred,
         });
     }
     notes
+}
+
+/// Decodes RCS edit metadata from a Bugle `Message`:
+/// - field 27 as submessage (edit status with timestamp in field 1 or 2) or varint != 0
+/// - field 28 as boolean `isEdited`
+fn decode_edit_status(msg: &[Field]) -> (bool, Option<i64>) {
+    if let Some(f) = field(msg, 27) {
+        if let Some(v) = f.varint {
+            if v != 0 {
+                return (true, None);
+            }
+        } else if !f.bytes.is_empty() {
+            let inner = fields(&f.bytes);
+            let ts = field_int(&inner, 2).max(field_int(&inner, 1)) as i64;
+            let at = if ts > 1_000_000_000_000_000 {
+                Some(ts / 1_000_000)
+            } else if ts > 1_000_000_000_000 {
+                Some(ts / 1_000)
+            } else if ts > 0 {
+                Some(ts)
+            } else {
+                None
+            };
+            return (true, at);
+        }
+    }
+    if field_int(msg, 28) != 0 {
+        return (true, None);
+    }
+    (false, None)
+}
+
+fn edit_message_request(conversation: &str, message: &str, text: &str) -> Vec<u8> {
+    let mut content = Buf::new();
+    content.text(1, text);
+    let mut info = Buf::new();
+    info.msg(2, &content.0);
+    let mut req = Buf::new();
+    req.text(1, conversation);
+    req.text(2, message);
+    req.msg(3, &info.0);
+    req.0
+}
+
+fn star_message_request(conversation: &str, message: &str, starred: bool) -> Vec<u8> {
+    let mut req = Buf::new();
+    req.text(1, conversation);
+    req.text(2, message);
+    req.int(3, u64::from(starred));
+    req.0
 }
 
 /// The lab sets `TINYCLIENT_PROVE=messages-reply`. A build from before this ignores that
@@ -3484,5 +3745,136 @@ mod tests {
         assert!(clear_action(46));
         assert!(clear_action(44));
         assert!(!clear_action(3));
+    }
+
+    #[test]
+    fn read_only_verified_alphanumeric_and_emergency_helpers() {
+        assert!(is_alphanumeric_sender("BANKOTP"));
+        assert!(is_alphanumeric_sender("FedEx"));
+        assert!(!is_alphanumeric_sender("89203"));
+        assert!(!is_alphanumeric_sender("+15550100002"));
+
+        assert!(is_emergency_number("911"));
+        assert!(is_emergency_number("112"));
+        assert!(is_emergency_number("999"));
+        assert!(!is_emergency_number("+15550100911"));
+
+        let mut conv = Buf::new();
+        conv.text(1, "c-ro");
+        conv.text(2, "Acme Alerts");
+        conv.int(13, 1); // readOnly
+        conv.int(22, 3); // RBM verified business
+        let mut list = Buf::new();
+        list.msg(2, &conv.0);
+        let chats = decode_chats(&list.0);
+        assert_eq!(chats.len(), 1);
+        assert!(chats[0].read_only);
+        assert!(chats[0].verified);
+    }
+
+    #[test]
+    fn rcs_edit_flag_decodes_and_edit_request_encodes() {
+        assert!(allows_edit(2));
+        assert!(!allows_edit(1));
+        assert!(!allows_edit(0));
+
+        let mut edit_info = Buf::new();
+        edit_info.int(2, 1_791_893_000_000_000);
+        let mut msg = Buf::new();
+        msg.text(1, "m-edit");
+        msg.text(7, "c-rcs");
+        msg.msg(27, &edit_info.0);
+        let mut words = Buf::new();
+        words.text(1, "corrected");
+        let mut info = Buf::new();
+        info.msg(2, &words.0);
+        msg.msg(10, &info.0);
+        let mut wrap = Buf::new();
+        wrap.msg(1, &msg.0);
+        let notes = decode_messages(&wrap.0);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].edited);
+        assert_eq!(notes[0].edited_at, Some(1_791_893_000));
+        assert_eq!(notes[0].text, "corrected");
+
+        let req = fields(&edit_message_request("c-rcs", "m-edit", "updated text"));
+        assert_eq!(field_text(&req, 1), "c-rcs");
+        assert_eq!(field_text(&req, 2), "m-edit");
+        let inner = fields(&field_bytes(&req, 3));
+        assert_eq!(field_text(&fields(&field_bytes(&inner, 2)), 1), "updated text");
+    }
+
+    #[test]
+    fn contacts_and_participant_color_decode() {
+        assert_eq!(parse_hex_color("#4285F4"), Some(0x4285F4));
+        assert_eq!(parse_hex_color("FF4285F4"), Some(0x4285F4));
+        assert_eq!(parse_hex_color("bad"), None);
+
+        let mut num = Buf::new();
+        num.text(1, "+15550100004");
+        num.text(2, "(555) 010-0004");
+        let mut contact = Buf::new();
+        contact.text(1, "participant-linnea");
+        contact.text(2, "Linnea Sol");
+        contact.msg(3, &num.0);
+        contact.text(7, "contact-4");
+        let mut resp = Buf::new();
+        resp.msg(2, &contact.0);
+        let decoded = decode_contacts(&resp.0);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].participant_id, "participant-linnea");
+        assert_eq!(decoded[0].name, "Linnea Sol");
+        assert_eq!(decoded[0].number, "+15550100004");
+        assert_eq!(decoded[0].formatted_number, "(555) 010-0004");
+        assert_eq!(decoded[0].id, "contact-4");
+    }
+
+    #[test]
+    fn e164_normalization_and_get_or_create_request() {
+        assert_eq!(normalize_e164("(555) 010-0099", "+1").as_deref(), Some("+15550100099"));
+        assert_eq!(normalize_e164("+44 20 7946 0958", "+1").as_deref(), Some("+442079460958"));
+        assert_eq!(normalize_e164("1-555-010-0099", "+1").as_deref(), Some("+15550100099"));
+        assert_eq!(normalize_e164("911", "+1"), None);
+        assert_eq!(normalize_e164("BANKOTP", "+1"), None);
+        assert_eq!(normalize_e164("123", "+1"), None);
+
+        let single = fields(&get_or_create_conversation_request(&["+15550100099".into()], None));
+        let nums: Vec<String> = single
+            .iter()
+            .filter(|f| f.number == 2)
+            .map(|f| field_text(&fields(&f.bytes), 1))
+            .collect();
+        assert_eq!(nums, ["+15550100099"]);
+        assert_eq!(field_int(&single, 4), 0);
+
+        let group = fields(&get_or_create_conversation_request(
+            &["+15550100002".into(), "+15550100003".into()],
+            Some("Weekend"),
+        ));
+        assert_eq!(field_text(&group, 3), "Weekend");
+        assert_eq!(field_int(&group, 4), 1);
+    }
+
+    #[test]
+    fn starred_flag_decodes_and_star_request_encodes() {
+        let mut msg = Buf::new();
+        msg.text(1, "m-star");
+        msg.text(7, "c1");
+        msg.int(24, 1);
+        let mut words = Buf::new();
+        words.text(1, "Keep this");
+        let mut info = Buf::new();
+        info.msg(2, &words.0);
+        msg.msg(10, &info.0);
+        let mut wrap = Buf::new();
+        wrap.msg(1, &msg.0);
+        let notes = decode_messages(&wrap.0);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].starred);
+
+        let req = fields(&star_message_request("c1", "m-star", true));
+        assert_eq!(field_text(&req, 1), "c1");
+        assert_eq!(field_text(&req, 2), "m-star");
+        assert_eq!(field_int(&req, 3), 1);
     }
 }

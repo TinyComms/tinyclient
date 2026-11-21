@@ -161,7 +161,10 @@ fn every_change_goes_to_its_route_with_its_body() {
         assert_eq!(json_body(&last(&log, "POST /v1/categories "))["name"], "Voice");
         assert_eq!(category_rename(account.clone(), VOICE.into(), "Talk".into()), Response::Ok);
         assert_eq!(category_delete(account.clone(), VOICE.into()), Response::Ok);
-        let groups = vec![TinyLayoutGroup { category_id: None, room_ids: vec![LOBBY.into()] }, TinyLayoutGroup { category_id: Some(VOICE.into()), room_ids: vec![] }];
+        let groups = vec![
+            TinyLayoutGroup { category_id: None, room_ids: vec![LOBBY.into()], items: vec![] },
+            TinyLayoutGroup { category_id: Some(VOICE.into()), room_ids: vec![], items: vec![] },
+        ];
         assert_eq!(layout(account.clone(), groups), Response::Ok);
         let body = json_body(&last(&log, "PUT /v1/layout "));
         assert!(body["categories"][0]["id"].is_null() && body["categories"][1]["id"] == VOICE);
@@ -710,4 +713,269 @@ fn a_passkey_already_gone_is_said_so_and_not_blamed_on_the_server() {
         assert_eq!(passkey_rename(account, "p1".into(), "Phone".into()), said(PASSKEY_GONE));
     });
     assert_eq!(PASSKEY_GONE, "That passkey is gone.");
+}
+
+#[test]
+fn community_loads_channels_with_categories_positions_overrides_and_permissions() {
+    let base = serve(|request| {
+        let first = request.lines().next().unwrap_or("");
+        let route = first.split(' ').take(2).collect::<Vec<_>>().join(" ");
+        match route.as_str() {
+            "GET /v1/capabilities" => http(200, "OK", r#"{"version":"0.4.0","features":["server","roles","categories"]}"#),
+            "GET /v1/me" => http(200, "OK", OWNER),
+            "GET /v1/members" => http(200, "OK", &members()),
+            "GET /v1/invites" => http(200, "OK", "[]"),
+            "GET /v1/rooms" => http(200, "OK", &format!(r#"[{{"id":"{LOBBY}","name":"Lobby"}}]"#)),
+            "GET /v1/categories" => http(200, "OK", r#"[{"id":"cat-text","name":"Text","position":0},{"id":"cat-proj","name":"Projects","position":1}]"#),
+            "GET /v1/channels" => http(200, "OK", &format!(
+                r#"{{"channels":[{{"id":"ch-1","name":"general","topic":"Welcome","category_id":"cat-text","position":0,"e2ee":false,"overrides":[{{"role_id":"{MODS}","allow":512,"deny":0}}],"my_permissions":517}},{{"id":"ch-2","name":"roadmap","topic":"","category_id":"cat-proj","position":2,"e2ee":true,"overrides":[],"my_permissions":1}},{{"id":"ch-3","name":"loose","topic":"","category_id":null,"position":0,"overrides":[]}}]}}"#
+            )),
+            "GET /v1/server" => http(200, "OK", r#"{"name":"Test","description":"","welcome":"","icon":null,"created_at":"t"}"#),
+            "GET /v1/roles" => http(200, "OK", "[]"),
+            "GET /health" => http(200, "OK", r#"{"ok":true,"media":"up"}"#),
+            _ if first.starts_with("GET /v1/audit?") => http(200, "OK", "[]"),
+            _ => http(404, "Not Found", "{}"),
+        }
+    });
+    with_session(&base, "owner", |account| match community(&test_hub(), account) {
+        Response::TinyCommunity { community } => {
+            assert_eq!(community.channels.len(), 3);
+            assert_eq!(community.channels[0].id, "ch-1");
+            assert_eq!(community.channels[0].category_id.as_deref(), Some("cat-text"));
+            assert_eq!(community.channels[0].position, 0);
+            assert_eq!(community.channels[0].overrides.len(), 1);
+            assert_eq!(community.channels[0].overrides[0].allow, 512);
+            assert_eq!(community.channels[0].my_permissions, Some(517));
+            assert_eq!(community.channels[1].category_id.as_deref(), Some("cat-proj"));
+            assert_eq!(community.channels[1].position, 2);
+            assert!(community.channels[1].e2ee);
+            assert_eq!(community.channels[1].my_permissions, Some(1));
+            assert_eq!(community.channels[2].category_id, None);
+            assert_eq!(community.channels[2].my_permissions, None);
+        }
+        other => panic!("expected community, got {other:?}"),
+    });
+}
+
+#[test]
+fn community_loads_rooms_when_channels_route_answers_404() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let base = newer(OWNER, log);
+    with_session(&base, "owner", |account| match community(&test_hub(), account) {
+        Response::TinyCommunity { community } => {
+            assert_eq!(community.rooms.len(), 1);
+            assert!(community.channels.is_empty());
+        }
+        other => panic!("expected community, got {other:?}"),
+    });
+}
+
+#[test]
+fn channel_create_sends_position_e2ee_only_when_true_and_explains_refusals() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let log_srv = log.clone();
+    let base = serve(move |request| {
+        log_srv.lock().unwrap().push(request.to_owned());
+        let first = request.lines().next().unwrap_or("");
+        let body = request.split("\r\n\r\n").nth(1).unwrap_or("");
+        if first.starts_with("GET /v1/channels ") {
+            return http(200, "OK", r#"{"channels":[{"id":"c1","name":"a","category_id":"cat-1","position":4},{"id":"c2","name":"b","category_id":"cat-1","position":7}]}"#);
+        }
+        if first.starts_with("POST /v1/channels ") {
+            if body.contains("\"err-req\"") {
+                return http(400, "Bad Request", r#"{"error":"e2ee_required"}"#);
+            }
+            if body.contains("\"err-off\"") {
+                return http(400, "Bad Request", r#"{"error":"e2ee_off"}"#);
+            }
+            if body.contains("\"err-large\"") {
+                return http(400, "Bad Request", r#"{"error":"e2ee_group_too_large"}"#);
+            }
+            if body.contains("\"err-old\"") {
+                return http(404, "Not Found", r#"{"error":"not_found"}"#);
+            }
+            return http(201, "Created", r#"{"id":"ch-new","name":"design"}"#);
+        }
+        http(200, "OK", "{}")
+    });
+    with_session(&base, "owner", |account| {
+        // Plaintext channel omits `e2ee` and computes next position in category (7 + 1 = 8).
+        let res = channel_create(
+            account.clone(),
+            protocol::TinyChannelEdit {
+                name: Some("design".into()),
+                topic: Some("UI".into()),
+                category_id: Some("cat-1".into()),
+                position: None,
+                e2ee: Some(false),
+            },
+        );
+        assert_eq!(res, Response::TinyChannelCreated { id: "ch-new".into(), name: "design".into() });
+        let body = json_body(&last(&log, "POST /v1/channels "));
+        assert_eq!(body["name"], "design");
+        assert_eq!(body["topic"], "UI");
+        assert_eq!(body["category_id"], "cat-1");
+        assert_eq!(body["position"], 8);
+        assert!(body.get("e2ee").is_none(), "e2ee should only be sent when true");
+
+        // Encrypted channel sends `e2ee: true`.
+        let res = channel_create(
+            account.clone(),
+            protocol::TinyChannelEdit {
+                name: Some("secret".into()),
+                e2ee: Some(true),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(res, Response::TinyChannelCreated { .. }));
+        let body = json_body(&last(&log, "POST /v1/channels "));
+        assert_eq!(body["e2ee"], true);
+
+        // Refusal messages.
+        let req = channel_create(account.clone(), protocol::TinyChannelEdit { name: Some("err-req".into()), ..Default::default() });
+        assert!(matches!(req, Response::Error { detail, .. } if detail.contains("requires")));
+        let off = channel_create(account.clone(), protocol::TinyChannelEdit { name: Some("err-off".into()), ..Default::default() });
+        assert!(matches!(off, Response::Error { detail, .. } if detail.contains("turned off")));
+        let large = channel_create(account.clone(), protocol::TinyChannelEdit { name: Some("err-large".into()), ..Default::default() });
+        assert!(matches!(large, Response::Error { detail, .. } if detail.contains("Too many devices")));
+        let old = channel_create(account.clone(), protocol::TinyChannelEdit { name: Some("err-old".into()), ..Default::default() });
+        assert_eq!(old, said("This server is older than text channels."));
+
+        // Topic over 1024 chars is refused locally.
+        let long_topic = channel_create(
+            account,
+            protocol::TinyChannelEdit { name: Some("ok".into()), topic: Some("x".repeat(1025)), ..Default::default() },
+        );
+        assert!(matches!(long_topic, Response::Error { detail, .. } if detail.contains("1024")));
+    });
+}
+
+#[test]
+fn channel_update_never_sends_e2ee_and_clears_topic_and_delete_explains_404() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let log_srv = log.clone();
+    let base = serve(move |request| {
+        log_srv.lock().unwrap().push(request.to_owned());
+        let first = request.lines().next().unwrap_or("");
+        if first.starts_with("PATCH /v1/channels/ch-1 ") {
+            return http(200, "OK", r#"{"id":"ch-1","name":"renamed"}"#);
+        }
+        if first.starts_with("DELETE /v1/channels/ch-1 ") {
+            return http(204, "No Content", "");
+        }
+        if first.starts_with("DELETE /v1/channels/gone ") || first.starts_with("PATCH /v1/channels/gone ") {
+            return http(404, "Not Found", r#"{"error":"not_found"}"#);
+        }
+        http(200, "OK", "{}")
+    });
+    with_session(&base, "owner", |account| {
+        // Rename + clear topic + e2ee set on struct must never serialize e2ee.
+        let res = channel_update(
+            account.clone(),
+            "ch-1".into(),
+            protocol::TinyChannelEdit {
+                name: Some("renamed".into()),
+                topic: Some(String::new()),
+                e2ee: Some(true),
+                ..Default::default()
+            },
+        );
+        assert_eq!(res, Response::Ok);
+        let body = json_body(&last(&log, "PATCH /v1/channels/ch-1 "));
+        assert_eq!(body["name"], "renamed");
+        assert_eq!(body["topic"], "");
+        assert!(body.get("e2ee").is_none(), "PATCH must never send e2ee");
+
+        // Delete succeeds with 204.
+        assert_eq!(channel_delete(account.clone(), "ch-1".into()), Response::Ok);
+        // 404 says "That channel is gone."
+        assert_eq!(channel_delete(account.clone(), "gone".into()), said("That channel is gone."));
+        assert_eq!(
+            channel_update(account, "gone".into(), protocol::TinyChannelEdit { name: Some("x".into()), ..Default::default() }),
+            said("That channel is gone.")
+        );
+    });
+}
+
+#[test]
+fn channel_override_set_and_clear_hit_channel_routes_and_reject_overlap() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let log_srv = log.clone();
+    let base = serve(move |request| {
+        log_srv.lock().unwrap().push(request.to_owned());
+        let first = request.lines().next().unwrap_or("");
+        if first.starts_with("PUT /v1/channels/ch-1/overrides/role-1 ") {
+            return http(200, "OK", r#"{"id":"ch-1"}"#);
+        }
+        if first.starts_with("DELETE /v1/channels/ch-1/overrides/role-1 ") {
+            return http(200, "OK", r#"{"id":"ch-1"}"#);
+        }
+        http(404, "Not Found", r#"{"error":"not_found"}"#)
+    });
+    with_session(&base, "owner", |account| {
+        // Overlapping allow & deny refused locally before sending.
+        assert_eq!(channel_override_set(account.clone(), "ch-1".into(), "role-1".into(), 1, 1), said(CHECK));
+        assert!(sent(&log, "PUT /v1/channels/").is_empty());
+
+        // Set sends PUT /v1/channels/{id}/overrides/{role_id} with {allow, deny}.
+        assert_eq!(channel_override_set(account.clone(), "ch-1".into(), "role-1".into(), 5, 512), Response::Ok);
+        let body = json_body(&last(&log, "PUT /v1/channels/ch-1/overrides/role-1 "));
+        assert_eq!(body["allow"], 5);
+        assert_eq!(body["deny"], 512);
+
+        // Clear sends DELETE /v1/channels/{id}/overrides/{role_id}.
+        assert_eq!(channel_override_clear(account, "ch-1".into(), "role-1".into()), Response::Ok);
+        assert!(!sent(&log, "DELETE /v1/channels/ch-1/overrides/role-1 ").is_empty());
+    });
+}
+
+#[test]
+fn layout_sends_items_with_channel_layout_and_room_ids_without() {
+    use protocol::{TinyLayoutItem, TinyLayoutItemKind};
+    let groups = || {
+        vec![TinyLayoutGroup {
+            category_id: Some(VOICE.into()),
+            room_ids: vec![],
+            items: vec![
+                TinyLayoutItem { kind: TinyLayoutItemKind::Channel, id: "ch-1".into() },
+                TinyLayoutItem { kind: TinyLayoutItemKind::Room, id: LOBBY.into() },
+            ],
+        }]
+    };
+
+    // Server WITH channel_layout gets `items` (both channel and room) and no `room_ids`.
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let log_srv = log.clone();
+    let base = serve(move |request| {
+        log_srv.lock().unwrap().push(request.to_owned());
+        let first = request.lines().next().unwrap_or("");
+        if first.starts_with("GET /v1/capabilities ") {
+            return http(200, "OK", r#"{"version":"0.6.0","features":["categories","channel_layout"]}"#);
+        }
+        if first.starts_with("GET /v1/me ") {
+            return http(200, "OK", OWNER);
+        }
+        http(200, "OK", "{}")
+    });
+    with_session(&base, "owner", |account| {
+        let _ = community(&test_hub(), account.clone());
+        assert_eq!(layout(account, groups()), Response::Ok);
+        let body = json_body(&last(&log, "PUT /v1/layout "));
+        let bucket = &body["categories"][0];
+        assert!(bucket.get("room_ids").is_none());
+        assert_eq!(bucket["items"][0], json!({ "kind": "channel", "id": "ch-1" }));
+        assert_eq!(bucket["items"][1], json!({ "kind": "room", "id": LOBBY }));
+    });
+
+    // Server WITHOUT channel_layout gets `room_ids` with text channels omitted, and no `items`.
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let base = newer(OWNER, log.clone());
+    with_session(&base, "owner", |account| {
+        let _ = community(&test_hub(), account.clone());
+        assert_eq!(layout(account, groups()), Response::Ok);
+        let body = json_body(&last(&log, "PUT /v1/layout "));
+        let bucket = &body["categories"][0];
+        assert!(bucket.get("items").is_none());
+        assert_eq!(bucket["room_ids"], json!([LOBBY]));
+    });
 }

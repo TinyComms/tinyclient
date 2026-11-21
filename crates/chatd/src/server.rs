@@ -515,10 +515,21 @@ impl Chat {
         if !allowed {
             return error(ErrorCode::Refused, format!("{key} cannot be {value:?} here"));
         }
-        if let Err(err) = self.hub.set_setting(&scope, &key, value) {
+        if let Err(err) = self.hub.set_setting(&scope, &key, value.clone()) {
             return internal(err);
         }
         match key.as_str() {
+            settings::NOTIFY_ABOUT => {
+                if let Some(conversation) = settings::conversation_key_of(&scope) {
+                    if conversation.network == Network::Tiny {
+                        let muted = value.as_deref() == Some("off");
+                        if self.hub.store().set_muted(&conversation, muted).unwrap_or(false) {
+                            self.hub.changed(Change::Conversation { conversation });
+                            self.hub.changed(Change::Status);
+                        }
+                    }
+                }
+            }
             settings::KEEP_DAYS => self.hub.prune_soon(),
             settings::CACHE_MB => self.blobs.cap_changed(),
             settings::SOUNDS
@@ -1064,20 +1075,24 @@ impl Chat {
         let marked = self.hub.store().mark_read(&conversation, &message_id);
         match marked {
             Ok(true) => {
-                let marker = self
+                let row = self
                     .hub
                     .store()
                     .conversation(&conversation)
                     .ok()
-                    .flatten()
+                    .flatten();
+                let is_tiny_channel = conversation.network == Network::Tiny
+                    && row.as_ref().is_some_and(|row| row.kind != ConversationKind::Direct);
+                let marker = row
                     .and_then(|row| row.last_read)
                     .filter(|id| !id.is_empty())
                     .unwrap_or(message_id);
                 let conversation_id = conversation.id.clone();
                 // P2: off, the chat is read here and the network is not told, which is what
-                // others would see as a receipt.
+                // others would see as a receipt. On a Tiny server, a channel read is private
+                // (stored for this person's unread count only), so always send it.
                 let account = conversation.account();
-                if self.hub.settings().receipts(&account) && !marker.is_empty() {
+                if (is_tiny_channel || self.hub.settings().receipts(&account)) && !marker.is_empty() {
                     self.command(&account, Command::MarkRead { conversation_id, message_id: marker });
                 }
                 self.hub.changed(Change::Conversation { conversation });
@@ -2886,6 +2901,22 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
+            Request::CreateGroup { account, members, name } => {
+                let started = self.ask(&account, |reply| Command::CreateGroup {
+                    members,
+                    name,
+                    reply,
+                });
+                let id = match started {
+                    Ok(id) => id,
+                    Err(refused) => return *refused,
+                };
+                match self.hub.store().conversation(&Key::new(&account, id)) {
+                    Ok(Some(conversation)) => Response::Conversation { conversation: self.row(conversation) },
+                    Ok(None) => error(ErrorCode::Internal, "group created, but not recorded"),
+                    Err(err) => internal(err),
+                }
+            }
             Request::StartThread { conversation, message } => self.start_thread(conversation, message),
             Request::Profile { person, space } => self.profile(person, space),
             Request::ConversationInfo { conversation } => self.conversation_info(conversation),
@@ -2920,6 +2951,32 @@ impl Chat {
                     me_only,
                     reply,
                 })
+            }
+            Request::StarMessage { conversation, message_id, starred } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::StarMessage {
+                    conversation_id: conversation.id.clone(),
+                    message_id,
+                    starred,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::StarredMessages { account, conversation, limit } => {
+                let conv_id = conversation.as_ref().map(|c| c.id.clone());
+                let key = conversation.unwrap_or_else(|| Key::new(&account, ""));
+                match self.hub.store().starred_messages(&account, conv_id.as_deref(), limit) {
+                    Ok(mut messages) => {
+                        messages.iter_mut().for_each(Message::bound);
+                        Response::Pinned { conversation: key, messages }
+                    }
+                    Err(err) => internal(err),
+                }
             }
             Request::Shared { conversation, kind, before, limit, search } => self.shared(conversation, kind, before, limit, search),
             Request::Relate { person, action } => self.relate(person, action),
@@ -3117,9 +3174,14 @@ impl Chat {
             Request::TinyCategoryDelete { account, category_id } => adapters::tiny::manage::category_delete(account, category_id),
             Request::TinyLayout { account, groups } => adapters::tiny::manage::layout(account, groups),
             Request::TinyRoomCreateWith { account, room } => adapters::tiny::manage::room_create(account, room),
+            Request::TinyChannelCreate { account, channel } => adapters::tiny::manage::channel_create(account, channel),
+            Request::TinyChannelUpdate { account, channel_id, channel } => adapters::tiny::manage::channel_update(account, channel_id, channel),
+            Request::TinyChannelDelete { account, channel_id } => adapters::tiny::manage::channel_delete(account, channel_id),
             Request::TinyRoomUpdate { account, room_id, room } => adapters::tiny::manage::room_update(account, room_id, room),
             Request::TinyOverrideSet { account, room_id, role_id, allow, deny } => adapters::tiny::manage::override_set(account, room_id, role_id, allow, deny),
             Request::TinyOverrideClear { account, room_id, role_id } => adapters::tiny::manage::override_clear(account, room_id, role_id),
+            Request::TinyChannelOverrideSet { account, channel_id, role_id, allow, deny } => adapters::tiny::manage::channel_override_set(account, channel_id, role_id, allow, deny),
+            Request::TinyChannelOverrideClear { account, channel_id, role_id } => adapters::tiny::manage::channel_override_clear(account, channel_id, role_id),
             Request::TinyInviteWith { account, options } => adapters::tiny::manage::invite_with(account, options),
             Request::TinyAudit { account, filter } => adapters::tiny::manage::audit(account, filter),
             Request::TinySetupRead { account } => adapters::tiny::manage::setup_read(account),
@@ -4759,5 +4821,59 @@ mod tests {
         lock(&chat.adapters).remove(&account);
         drop(ctx);
         let _ = worker.join();
+    }
+
+    #[test]
+    fn tiny_channel_mark_read_sends_command_with_receipts_off_but_direct_does_not() {
+        use super::*;
+        let store = Store::open(std::path::Path::new(":memory:")).expect("memory store");
+        let chat = Chat::new(store);
+        let hub = chat.hub.clone();
+        let account = AccountKey { network: Network::Tiny, account: "me".into() };
+        hub.set_setting(&protocol::settings::account_scope(&account), protocol::settings::RECEIPTS, Some("off".into())).unwrap();
+        assert!(!hub.settings().receipts(&account));
+
+        let (adapter, ctx, inbox) = crate::adapters::local(account.clone(), hub);
+        lock(&chat.adapters).insert(account.clone(), adapter);
+
+        let mut ch_row = ConversationRow::new("ch-1", ConversationKind::Channel, "general");
+        ch_row.space = Some("server".into());
+        ctx.conversation(&ch_row).unwrap();
+        ctx.counts("ch-1", 2, 0, None, 10).unwrap();
+
+        let mut dm_row = ConversationRow::new("dm-1", ConversationKind::Direct, "Bea");
+        dm_row.space = Some("server".into());
+        ctx.conversation(&dm_row).unwrap();
+        ctx.counts("dm-1", 1, 0, None, 10).unwrap();
+
+        let seen = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let seen_worker = seen.clone();
+        let worker = std::thread::spawn(move || {
+            for cmd in inbox {
+                match cmd {
+                    Command::MarkRead { conversation_id, message_id } => {
+                        seen_worker.lock().unwrap().push((conversation_id, message_id));
+                    }
+                    Command::Stop => break,
+                    _ => {}
+                }
+            }
+        });
+
+        assert_eq!(
+            chat.handle(Request::MarkRead { conversation: Key::new(&account, "ch-1"), message_id: "m-1".into() }),
+            Response::Ok
+        );
+        assert_eq!(
+            chat.handle(Request::MarkRead { conversation: Key::new(&account, "dm-1"), message_id: "m-2".into() }),
+            Response::Ok
+        );
+
+        lock(&chat.adapters).remove(&account);
+        drop(ctx);
+        let _ = worker.join();
+
+        let commands = seen.lock().unwrap().clone();
+        assert_eq!(commands, vec![("ch-1".to_owned(), "m-1".to_owned())]);
     }
 }

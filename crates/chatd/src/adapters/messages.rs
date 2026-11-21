@@ -155,9 +155,19 @@ trait Drive: Send + Sync {
     ) -> Result<Vec<u8>, String>;
     /// The pictures the phone keeps for these participants, as (participant, bytes).
     fn thumbnails(&self, participants: &[String]) -> Result<Vec<(String, Vec<u8>)>, String>;
+    /// The phone's address book contacts.
+    fn contacts(&self) -> Result<Vec<bugle::ContactEntry>, String>;
+    /// Gets or creates a 1:1 or group conversation by phone number(s).
+    fn get_or_create_conversation(
+        &self,
+        numbers: &[String],
+        group_name: Option<&str>,
+    ) -> Result<Chat, String>;
     fn mark_read(&self, conversation: &str, message: &str) -> Result<(), String>;
     fn typing(&self, conversation: &str) -> Result<(), String>;
     fn delete_message(&self, message: &str) -> Result<(), String>;
+    fn edit_message(&self, conversation: &str, message: &str, text: &str) -> Result<(), String>;
+    fn star_message(&self, conversation: &str, message: &str, starred: bool) -> Result<(), String>;
     fn delete_conversation(&self, conversation: &str) -> Result<(), String>;
     fn unpair(&self) -> Result<(), String>;
     fn block(&self, conversation: &str) -> Result<(), String>;
@@ -228,6 +238,16 @@ impl Drive for LiveDrive {
     fn thumbnails(&self, participants: &[String]) -> Result<Vec<(String, Vec<u8>)>, String> {
         self.inner.thumbnails(participants)
     }
+    fn contacts(&self) -> Result<Vec<bugle::ContactEntry>, String> {
+        self.inner.contacts()
+    }
+    fn get_or_create_conversation(
+        &self,
+        numbers: &[String],
+        group_name: Option<&str>,
+    ) -> Result<Chat, String> {
+        self.inner.get_or_create_conversation(numbers, group_name)
+    }
     fn mark_read(&self, conversation: &str, message: &str) -> Result<(), String> {
         self.inner.mark_read(conversation, message)
     }
@@ -236,6 +256,12 @@ impl Drive for LiveDrive {
     }
     fn delete_message(&self, message: &str) -> Result<(), String> {
         self.inner.delete_message(message)
+    }
+    fn edit_message(&self, conversation: &str, message: &str, text: &str) -> Result<(), String> {
+        self.inner.edit_message(conversation, message, text)
+    }
+    fn star_message(&self, conversation: &str, message: &str, starred: bool) -> Result<(), String> {
+        self.inner.star_message(conversation, message, starred)
     }
     fn delete_conversation(&self, conversation: &str) -> Result<(), String> {
         self.inner.delete_conversation(conversation)
@@ -550,6 +576,9 @@ struct Account {
     outbox: Mutex<HashMap<String, Attempt>>,
     /// Newest message seen, so a chat read on the phone can move the marker there.
     newest: Mutex<HashMap<String, (String, i64)>>,
+    /// Phone contacts cached for this session.
+    contacts: Mutex<Vec<bugle::ContactEntry>>,
+    contacts_loaded: std::sync::atomic::AtomicBool,
 }
 
 pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<(), String> {
@@ -636,10 +665,14 @@ fn connect(
         phone: Mutex::default(),
         outbox: Mutex::default(),
         newest: Mutex::default(),
+        contacts: Mutex::default(),
+        contacts_loaded: std::sync::atomic::AtomicBool::new(false),
     });
     ctx.capabilities(Capabilities {
         max_file_bytes: bugle::FILE_CAP,
         max_files: file_limit(),
+        edit: true,
+        edit_window: bugle::EDIT_WINDOW_SECS,
         close_direct: true,
         delete: true,
         reactions: true,
@@ -690,21 +723,38 @@ fn connect(
     ended
 }
 
-fn peer_phone(chat: &Chat) -> Option<String> {
+fn peer_number_raw(chat: &Chat) -> Option<&str> {
     if chat.group {
         return None;
     }
-    let raw = chat
-        .participants
+    chat.participants
         .iter()
         .find(|p| !p.is_me && !p.number.is_empty())
-        .map(|p| p.number.as_str())?;
+        .map(|p| p.number.as_str())
+}
+
+fn peer_is_emergency(chat: &Chat) -> bool {
+    peer_number_raw(chat).is_some_and(bugle::is_emergency_number)
+}
+
+fn peer_is_alphanumeric(chat: &Chat) -> bool {
+    peer_number_raw(chat).is_some_and(bugle::is_alphanumeric_sender)
+}
+
+fn peer_phone(chat: &Chat) -> Option<String> {
+    let raw = peer_number_raw(chat)?;
+    if bugle::is_alphanumeric_sender(raw) || bugle::is_emergency_number(raw) {
+        return None;
+    }
     let cleaned: String = raw
         .chars()
         .filter(|c| c.is_ascii_digit() || *c == '+')
         .collect();
     (!cleaned.is_empty()).then_some(cleaned)
 }
+
+const NO_REPLY_REASON: &str = "This sender can't receive replies";
+const EMERGENCY_REASON: &str = "Emergency numbers must be contacted directly from your phone.";
 
 fn row(chat: &Chat) -> ConversationRow {
     let kind = if chat.group {
@@ -715,14 +765,33 @@ fn row(chat: &Chat) -> ConversationRow {
     let mut row = ConversationRow::new(chat.id.clone(), kind, chat.title.clone());
     row.listed = true;
     row.private = !chat.group;
-    // A 1:1 chat with a phone number hands off to the OS `tel:` handler; groups have no call button.
-    row.call = if peer_phone(chat).is_some() {
-        protocol::CallSupport::Handoff
+    let emergency = peer_is_emergency(chat);
+    let no_reply = !emergency && (chat.read_only || (!chat.group && peer_is_alphanumeric(chat)));
+    if emergency {
+        row.read_only = true;
+        row.read_only_reason = EMERGENCY_REASON.to_owned();
+        row.call = protocol::CallSupport::None;
+    } else if no_reply {
+        row.read_only = true;
+        row.read_only_reason = NO_REPLY_REASON.to_owned();
+        row.call = protocol::CallSupport::None;
     } else {
-        protocol::CallSupport::None
-    };
-    if !chat.group && !chat.mine.is_empty() {
-        row.peer = Some(chat.id.clone());
+        // A 1:1 chat with a phone number hands off to the OS `tel:` handler; groups have no call button.
+        row.call = if peer_phone(chat).is_some() {
+            protocol::CallSupport::Handoff
+        } else {
+            protocol::CallSupport::None
+        };
+    }
+    if chat.verified {
+        row.mark = Some(protocol::Mark::Verified);
+    }
+    if !chat.group && (!chat.peer.is_empty() || !chat.mine.is_empty()) {
+        row.peer = Some(if !chat.peer.is_empty() {
+            chat.peer.clone()
+        } else {
+            chat.id.clone()
+        });
     }
     // The shell already draws this line. It is not `Encryption::EndToEnd`: those words would
     // claim this computer checked the keys, and the paired browser is a separate hop.
@@ -748,15 +817,8 @@ fn file_as(account: &Account, id: &str, status: u64) {
         let mut chat = held.get(id).cloned().unwrap_or_else(|| Chat {
             id: id.to_owned(),
             title: "Messages".into(),
-            group: false,
-            unread: false,
-            mine: String::new(),
-            peer: String::new(),
-            carrier: 0,
-            updated: 0,
-            phones: false,
             status,
-            participants: Vec::new(),
+            ..Chat::default()
         });
         chat.status = status;
         chat
@@ -789,6 +851,8 @@ fn remember(account: &Account, incoming: &[Chat]) -> Vec<Chat> {
         let mut chat = chat.clone();
         if let Some(had) = held.get(&chat.id) {
             chat.phones = chat.phones || had.phones;
+            chat.read_only = chat.read_only || had.read_only;
+            chat.verified = chat.verified || had.verified;
             // 0 means this update did not say. An archived chat must not bounce back to the inbox.
             if chat.status == 0 {
                 chat.status = had.status;
@@ -812,15 +876,7 @@ fn seal(account: &Account, conversation: &str, on: bool) {
         let chat = held.entry(conversation.to_owned()).or_insert_with(|| Chat {
             id: conversation.to_owned(),
             title: "Messages".into(),
-            group: false,
-            unread: false,
-            mine: String::new(),
-            peer: String::new(),
-            carrier: 0,
-            updated: 0,
-            phones: false,
-            status: 0,
-            participants: Vec::new(),
+            ..Chat::default()
         });
         chat.phones = on;
         chat.clone()
@@ -845,18 +901,49 @@ fn apply(account: &Account, event: Event) {
                     continue;
                 }
                 // A picture fetched earlier stays the row's when the row is recorded again.
-                let avatar = account.ctx.avatar_of(&chat.id);
-                let _ = account.ctx.conversation(&ConversationRow { avatar: avatar.clone(), ..row(chat) });
+                let row_avatar = account
+                    .ctx
+                    .avatar_of(&chat.id)
+                    .or_else(|| (!chat.peer.is_empty()).then(|| account.ctx.avatar_of(&chat.peer)).flatten());
+                let _ = account.ctx.conversation(&ConversationRow { avatar: row_avatar.clone(), ..row(chat) });
                 // The flag is not a count. True leaves what the messages added. False clears.
                 if bugle::flag_count(chat.unread) == Some(0) {
                     clear_read(account, &chat.id);
                 }
-                if !chat.group {
+                let mut added_participant = false;
+                for participant in &chat.participants {
+                    if participant.is_me || participant.id.is_empty() {
+                        continue;
+                    }
+                    added_participant = true;
+                    let person_avatar = account
+                        .ctx
+                        .avatar_of(&participant.id)
+                        .or_else(|| (!chat.group && participant.id == chat.peer).then(|| row_avatar.clone()).flatten());
+                    let display = if !participant.name.is_empty() {
+                        participant.name.clone()
+                    } else if !chat.group && !chat.title.is_empty() {
+                        chat.title.clone()
+                    } else {
+                        "Messages".to_owned()
+                    };
                     people.push(PersonRow {
-                        id: chat.id.clone(),
+                        id: participant.id.clone(),
+                        name: display,
+                        handle: String::new(),
+                        avatar: person_avatar,
+                        bot: false,
+                        status: String::new(),
+                        link: String::new(),
+                    });
+                }
+                if !chat.group && !added_participant {
+                    let pid = if !chat.peer.is_empty() { chat.peer.clone() } else { chat.id.clone() };
+                    people.push(PersonRow {
+                        id: pid,
                         name: chat.title.clone(),
                         handle: String::new(),
-                        avatar,
+                        avatar: row_avatar,
                         bot: false,
                         status: String::new(),
                         link: String::new(),
@@ -887,15 +974,7 @@ fn apply(account: &Account, event: Event) {
                 let chat = Chat {
                     id: note.conversation.clone(),
                     title: note.name.clone(),
-                    group: false,
-                    unread: false,
-                    mine: String::new(),
-                    peer: String::new(),
-                    carrier: 0,
-                    updated: 0,
-                    phones: false,
-                    status: 0,
-                    participants: Vec::new(),
+                    ..Chat::default()
                 };
                 let chat = remember(account, &[chat]);
                 let _ = account.ctx.conversation(&row(&chat[0]));
@@ -1076,6 +1155,7 @@ fn show(account: &Account, note: &bugle::Note, page: &[bugle::Note]) {
     }
     let id = shown.id.clone();
     let _ = account.ctx.message(&note.conversation, &shown);
+    maybe_unfurl(account, &note.conversation, &id, &shown.text, shown.outgoing);
     let tag = bugle::wire_tag(note.wire, carrier_of(account, &note.conversation));
     if !tag.is_empty() {
         let mut line = Message::plain(format!("{}:kind", note.id), String::new(), tag, note.sent, false);
@@ -1083,6 +1163,83 @@ fn show(account: &Account, note: &bugle::Note, page: &[bugle::Note]) {
         let _ = account.ctx.history(&note.conversation, &[line]);
     }
     receipt(account, &note.conversation, note, &id);
+}
+
+fn should_unfurl(
+    chat: Option<&Chat>,
+    known_contact: bool,
+    link_previews: bool,
+    allow_unknown: bool,
+) -> bool {
+    if !link_previews {
+        return false;
+    }
+    if chat.is_some_and(|c| bugle::place(c.status) == bugle::Place::Request) {
+        return false;
+    }
+    known_contact || allow_unknown
+}
+
+fn is_known_contact(account: &Account, chat: Option<&Chat>, outgoing: bool) -> bool {
+    if outgoing {
+        return true;
+    }
+    let Some(chat) = chat else {
+        return false;
+    };
+    if !chat.group {
+        // A saved contact has a display name that is not just their raw phone number.
+        if !chat.title.is_empty() && !looks_like_number(&chat.title) && !bugle::is_alphanumeric_sender(peer_number_raw(chat).unwrap_or("")) {
+            return true;
+        }
+        let peer_num = peer_number_raw(chat).map(digits_only).unwrap_or_default();
+        if !peer_num.is_empty() {
+            let contacts = account
+                .contacts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if contacts.iter().any(|c| digits_only(&c.number) == peer_num) {
+                return true;
+            }
+        }
+        return false;
+    }
+    true
+}
+
+fn maybe_unfurl(account: &Account, conversation: &str, message_id: &str, text: &str, outgoing: bool) {
+    let Some(url) = crate::unfurl::extract_url(text) else {
+        return;
+    };
+    let chat = account
+        .chats
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(conversation)
+        .cloned();
+    let settings = account.ctx.hub.settings();
+    let link_previews = settings.on(protocol::settings::LINK_PREVIEWS);
+    let allow_unknown = settings.on(protocol::settings::LINK_PREVIEWS_UNKNOWN);
+    let known = is_known_contact(account, chat.as_ref(), outgoing);
+    if !should_unfurl(chat.as_ref(), known, link_previews, allow_unknown) {
+        return;
+    }
+    let ctx = account.ctx.clone();
+    let conversation = conversation.to_owned();
+    let message_id = message_id.to_owned();
+    let _ = std::thread::Builder::new()
+        .name("messages-unfurl".into())
+        .spawn(move || {
+            let Some(preview) = crate::unfurl::fetch(&url) else {
+                return;
+            };
+            if let Ok(Some(mut stored)) = ctx.stored_message(&conversation, &message_id) {
+                if stored.previews.is_empty() {
+                    stored.previews.push(preview);
+                    let _ = ctx.message(&conversation, &stored);
+                }
+            }
+        });
 }
 
 fn message(account: &Account, note: &bugle::Note, page: &[bugle::Note]) -> Message {
@@ -1107,6 +1264,9 @@ fn message(account: &Account, note: &bugle::Note, page: &[bugle::Note]) -> Messa
         outgoing,
     );
     message.sender.id = author.to_owned();
+    message.edited = note.edited;
+    message.edited_at = note.edited_at;
+    message.starred = note.starred;
     if !note.reply.is_empty() {
         message.reply_to = Some(quoted(account, &note.conversation, &note.reply, page));
     }
@@ -1499,21 +1659,40 @@ fn wanted(account: &Account, ids: &[String]) {
 
 /// The pictures of the people whose chats are on screen (rows, people, the open conversation):
 /// each asked of the phone once a connection, together, off the command thread since the phone
-/// may be slow to answer. What lands is the row's and the person's avatar. Groups have none:
-/// the shell draws their faces.
+/// may be slow to answer. What lands is the person's avatar and, for 1:1 chats, the row's avatar.
+/// When a group conversation is open, its participants' thumbnails are requested too.
 fn pictures(account: &Arc<Account>, watching: &protocol::Watching) {
     let on_screen = watching.rows.iter().chain(&watching.people).chain(&watching.conversation);
     let ours: Vec<String> = on_screen.filter(|key| key.account() == account.ctx.account).map(|key| key.id.clone()).collect();
-    let wanted: Vec<(String, String)> = {
+    let open_group: Option<String> = watching
+        .conversation
+        .as_ref()
+        .filter(|key| key.account() == account.ctx.account)
+        .map(|key| key.id.clone());
+    let wanted: Vec<(Option<String>, String)> = {
         let peers = account.peers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let chats = account.chats.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut pictured = account.pictured.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut wanted = Vec::new();
         for id in ours {
-            let Some(peer) = peers.get(&id) else {
-                continue;
-            };
-            if wanted.len() < PICTURES && pictured.insert(peer.clone()) {
-                wanted.push((id, peer.clone()));
+            if let Some(peer) = peers.get(&id) {
+                if wanted.len() < PICTURES && pictured.insert(peer.clone()) {
+                    wanted.push((Some(id), peer.clone()));
+                }
+            } else if let Some(conv_id) = peers.iter().find_map(|(c, p)| (p == &id).then(|| c.clone())) {
+                if wanted.len() < PICTURES && pictured.insert(id.clone()) {
+                    wanted.push((Some(conv_id), id));
+                }
+            }
+        }
+        if let Some(group_id) = open_group {
+            if let Some(chat) = chats.get(&group_id).filter(|c| c.group) {
+                for p in &chat.participants {
+                    if !p.is_me && !p.id.is_empty() && wanted.len() < PICTURES && pictured.insert(p.id.clone()) {
+                        let direct = peers.iter().find_map(|(c, peer)| (peer == &p.id).then(|| c.clone()));
+                        wanted.push((direct, p.id.clone()));
+                    }
+                }
             }
         }
         wanted
@@ -1539,7 +1718,11 @@ fn pictures(account: &Arc<Account>, watching: &protocol::Watching) {
                             pictured.remove(peer);
                         }
                     }
-                    remember_pictures(&account, &wanted);
+                    let retry_pairs: Vec<(String, String)> = wanted
+                        .iter()
+                        .filter_map(|(conv, peer)| conv.as_ref().map(|c| (c.clone(), peer.clone())))
+                        .collect();
+                    remember_pictures(&account, &retry_pairs);
                     lost_phone(&account);
                 }
                 return tracing::warn!("chatd: Messages: pictures: {why}");
@@ -1552,8 +1735,13 @@ fn pictures(account: &Arc<Account>, watching: &protocol::Watching) {
             if account.ctx.landed(&file, &format!("messages://avatar/{participant}"), &bytes).is_none() {
                 continue;
             }
+            let _ = account.ctx.avatar(&participant, &id);
             for (conversation, _) in wanted.iter().filter(|(_, peer)| *peer == participant) {
-                let _ = account.ctx.avatar(conversation, &id);
+                if let Some(conversation) = conversation {
+                    if conversation != &participant {
+                        let _ = account.ctx.avatar(conversation, &id);
+                    }
+                }
             }
         }
     });
@@ -1674,6 +1862,41 @@ fn serve(account: &Arc<Account>, command: Command) {
                 let _ = account.drive.typing(&conversation_id);
             }
         }
+        Command::Edit {
+            conversation_id,
+            message_id,
+            text,
+            spans: _,
+            reply,
+        } => {
+            let answer = edit_message(account, &conversation_id, &message_id, text);
+            let _ = reply.send(answer);
+        }
+        Command::StarMessage {
+            conversation_id,
+            message_id,
+            starred,
+            reply,
+        } => {
+            let answer = star_message(account, &conversation_id, &message_id, starred);
+            let _ = reply.send(answer);
+        }
+        Command::Pinned {
+            conversation_id,
+            reply,
+        } => {
+            let answer = account
+                .ctx
+                .hub
+                .store()
+                .starred_messages(
+                    &account.ctx.account,
+                    Some(&conversation_id),
+                    protocol::PINNED_LIMIT as u32,
+                )
+                .map_err(|err| Refusal::Refused(err.to_string()));
+            let _ = reply.send(answer);
+        }
         Command::Delete {
             conversation_id,
             message_id,
@@ -1731,6 +1954,20 @@ fn serve(account: &Arc<Account>, command: Command) {
         } => {
             let _ = reply.send(members(account, &conversation_id, offset, limit));
         }
+        Command::Profile { person_id, reply } => {
+            let _ = reply.send(profile(account, &person_id));
+        }
+        Command::StartDirect { person_id, reply } => {
+            let _ = reply.send(start_direct(account, &person_id));
+        }
+        Command::CreateGroup {
+            members,
+            name,
+            reply,
+        } => {
+            let _ = reply.send(create_group(account, &members, name.as_deref()));
+        }
+        Command::SearchPeople(query) => search_people(account, &query),
         Command::ConversationInfo {
             conversation_id,
             reply,
@@ -1768,6 +2005,56 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         other => other.unsupported(ctx),
     }
+}
+
+fn edit_message(
+    account: &Account,
+    conversation: &str,
+    message_id: &str,
+    text: String,
+) -> Result<(), Refusal> {
+    if !bugle::allows_edit(carrier_of(account, conversation)) {
+        return Err(Refusal::Refused("Only RCS messages can be edited.".into()));
+    }
+    let Some(mut stored) = account.ctx.stored_message(conversation, message_id).ok().flatten() else {
+        return Err(Refusal::Refused("Messages could not find that message.".into()));
+    };
+    if !stored.outgoing {
+        return Err(Refusal::Refused("You can only edit your own messages.".into()));
+    }
+    let now = crate::hub::now();
+    if now.saturating_sub(stored.sent) > i64::from(bugle::EDIT_WINDOW_SECS) {
+        return Err(Refusal::Refused("This message can no longer be edited.".into()));
+    }
+    let remote_id = phone_copy(account, message_id).unwrap_or_else(|| message_id.to_owned());
+    account
+        .drive
+        .edit_message(conversation, &remote_id, &text)
+        .map_err(Refusal::Refused)?;
+    stored.text = text;
+    stored.edited = true;
+    stored.edited_at = Some(now);
+    let _ = account.ctx.message(conversation, &stored);
+    Ok(())
+}
+
+fn star_message(
+    account: &Account,
+    conversation: &str,
+    message_id: &str,
+    starred: bool,
+) -> Result<(), Refusal> {
+    let Some(mut stored) = account.ctx.stored_message(conversation, message_id).ok().flatten() else {
+        return Err(Refusal::Refused("Messages could not find that message.".into()));
+    };
+    let remote_id = phone_copy(account, message_id).unwrap_or_else(|| message_id.to_owned());
+    account
+        .drive
+        .star_message(conversation, &remote_id, starred)
+        .map_err(Refusal::Refused)?;
+    stored.starred = starred;
+    let _ = account.ctx.message(conversation, &stored);
+    Ok(())
 }
 
 fn warn_mms(account: &Account, conversation: &str, client_id: &str) {
@@ -2669,7 +2956,12 @@ fn members(
             } else {
                 "Messages".to_owned()
             };
-            protocol::Person::new(account.ctx.key(&id), name)
+            let key = account.ctx.key(&id);
+            let mut person = protocol::Person::new(key.clone(), name);
+            if let Ok(Some(stored)) = account.ctx.hub.store().person(&key) {
+                person.avatar = stored.avatar;
+            }
+            person
         })
         .collect();
     Ok(Members {
@@ -2677,6 +2969,315 @@ fn members(
         sections: Vec::new(),
         members,
     })
+}
+
+fn ensure_contacts(account: &Account) -> Vec<bugle::ContactEntry> {
+    if !account.contacts_loaded.load(std::sync::atomic::Ordering::Acquire) {
+        match account.drive.contacts() {
+            Ok(list) => {
+                let mut rows = Vec::new();
+                for c in &list {
+                    let pid = if !c.participant_id.is_empty() {
+                        c.participant_id.clone()
+                    } else if !c.id.is_empty() {
+                        c.id.clone()
+                    } else {
+                        c.number.clone()
+                    };
+                    if pid.is_empty() {
+                        continue;
+                    }
+                    let name = if !c.name.is_empty() {
+                        c.name.clone()
+                    } else if !c.formatted_number.is_empty() {
+                        c.formatted_number.clone()
+                    } else {
+                        c.number.clone()
+                    };
+                    rows.push(PersonRow {
+                        id: pid.clone(),
+                        name,
+                        handle: String::new(),
+                        avatar: account.ctx.avatar_of(&pid),
+                        bot: false,
+                        status: String::new(),
+                        link: String::new(),
+                    });
+                }
+                if !rows.is_empty() {
+                    let _ = account.ctx.people(&rows);
+                    let owned: Vec<(String, Relation)> = rows
+                        .iter()
+                        .map(|p| (p.id.clone(), Relation::Contact))
+                        .collect();
+                    let _ = account.ctx.relations(&owned);
+                }
+                *account
+                    .contacts
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = list;
+                account
+                    .contacts_loaded
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            Err(why) => {
+                tracing::warn!("chatd: Messages: contacts: {}", protocol::redact(&why));
+            }
+        }
+    }
+    account
+        .contacts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+fn search_people(account: &Account, query: &str) {
+    let q = query.trim().to_lowercase();
+    let q_digits = digits_only(&q);
+    let list = ensure_contacts(account);
+    let mut matched = Vec::new();
+    for c in list {
+        let hit = q.is_empty()
+            || c.name.to_lowercase().contains(&q)
+            || (!q_digits.is_empty() && digits_only(&c.number).contains(&q_digits));
+        if !hit {
+            continue;
+        }
+        let pid = if !c.participant_id.is_empty() {
+            c.participant_id.clone()
+        } else if !c.id.is_empty() {
+            c.id.clone()
+        } else {
+            c.number.clone()
+        };
+        if pid.is_empty() {
+            continue;
+        }
+        let name = if !c.name.is_empty() {
+            c.name.clone()
+        } else if !c.formatted_number.is_empty() {
+            c.formatted_number.clone()
+        } else {
+            c.number.clone()
+        };
+        matched.push(PersonRow {
+            id: pid.clone(),
+            name,
+            handle: String::new(),
+            avatar: account.ctx.avatar_of(&pid),
+            bot: false,
+            status: String::new(),
+            link: String::new(),
+        });
+        if matched.len() >= 25 {
+            break;
+        }
+    }
+    if !matched.is_empty() {
+        let _ = account.ctx.people(&matched);
+    }
+}
+
+fn profile(account: &Account, person_id: &str) -> Result<super::About, Refusal> {
+    let mut found_number = String::new();
+    let mut found_color = None;
+    {
+        let chats = account
+            .chats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for chat in chats.values() {
+            for p in &chat.participants {
+                if p.id == person_id || (!chat.group && !p.is_me && chat.id == person_id) {
+                    if !p.number.is_empty() {
+                        found_number = p.number.clone();
+                    }
+                    if p.color.is_some() {
+                        found_color = p.color;
+                    }
+                    break;
+                }
+            }
+            if !found_number.is_empty() {
+                break;
+            }
+        }
+    }
+    if found_number.is_empty() {
+        let contacts = account
+            .contacts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(c) = contacts
+            .iter()
+            .find(|c| c.participant_id == person_id || c.id == person_id || c.number == person_id)
+        {
+            found_number = if !c.formatted_number.is_empty() {
+                c.formatted_number.clone()
+            } else {
+                c.number.clone()
+            };
+        }
+    }
+    if found_number.is_empty() && found_color.is_none() {
+        return Err(Refusal::Refused("no such person".into()));
+    }
+    let mut about = super::About {
+        accent: found_color,
+        ..super::About::default()
+    };
+    if !found_number.is_empty() {
+        about.contacts.push(protocol::Contact {
+            kind: protocol::ContactKind::Phone,
+            value: found_number,
+            masked: true,
+        });
+    }
+    Ok(about)
+}
+
+fn default_country_code(account: &Account) -> String {
+    let chats = account
+        .chats
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for chat in chats.values() {
+        for p in &chat.participants {
+            if p.is_me && p.number.starts_with('+') {
+                let digits: String = p.number.chars().filter(char::is_ascii_digit).collect();
+                if digits.len() == 11 && digits.starts_with('1') {
+                    return "+1".to_owned();
+                }
+            }
+        }
+    }
+    "+1".to_owned()
+}
+
+fn resolve_number(account: &Account, person_id: &str) -> Option<String> {
+    {
+        let chats = account
+            .chats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for chat in chats.values() {
+            for p in &chat.participants {
+                if p.id == person_id && !p.number.is_empty() {
+                    return Some(p.number.clone());
+                }
+            }
+        }
+    }
+    let contacts = ensure_contacts(account);
+    if let Some(c) = contacts
+        .iter()
+        .find(|c| c.participant_id == person_id || c.id == person_id || c.number == person_id)
+    {
+        if !c.number.is_empty() {
+            return Some(c.number.clone());
+        }
+    }
+    Some(person_id.to_owned())
+}
+
+fn record_started_chat(account: &Account, chat: Chat) -> String {
+    let kept = remember(account, &[chat]);
+    let chat = &kept[0];
+    if !chat.peer.is_empty() {
+        account
+            .peers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(chat.id.clone(), chat.peer.clone());
+    }
+    let _ = account.ctx.conversation(&row(chat));
+    let mut people = Vec::new();
+    for p in &chat.participants {
+        if p.is_me || p.id.is_empty() {
+            continue;
+        }
+        people.push(PersonRow {
+            id: p.id.clone(),
+            name: if !p.name.is_empty() { p.name.clone() } else { chat.title.clone() },
+            handle: String::new(),
+            avatar: account.ctx.avatar_of(&p.id),
+            bot: false,
+            status: String::new(),
+            link: String::new(),
+        });
+    }
+    if !people.is_empty() {
+        let _ = account.ctx.people(&people);
+    }
+    chat.id.clone()
+}
+
+fn start_direct(account: &Account, person_id: &str) -> Result<String, Refusal> {
+    // Check if an existing 1:1 chat already matches this chat id or participant id.
+    {
+        let chats = account
+            .chats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(chat) = chats
+            .values()
+            .find(|c| !c.group && (c.id == person_id || c.peer == person_id))
+        {
+            if peer_is_emergency(chat) {
+                return Err(Refusal::Refused(EMERGENCY_REASON.to_owned()));
+            }
+            return Ok(chat.id.clone());
+        }
+    }
+    let raw = resolve_number(account, person_id)
+        .ok_or_else(|| Refusal::Refused("Enter a valid phone number.".into()))?;
+    if bugle::is_emergency_number(&raw) {
+        return Err(Refusal::Refused(EMERGENCY_REASON.to_owned()));
+    }
+    let cc = default_country_code(account);
+    let e164 = bugle::normalize_e164(&raw, &cc)
+        .ok_or_else(|| Refusal::Refused("Enter a valid phone number.".into()))?;
+    let chat = account
+        .drive
+        .get_or_create_conversation(&[e164], None)
+        .map_err(Refusal::Refused)?;
+    Ok(record_started_chat(account, chat))
+}
+
+fn create_group(
+    account: &Account,
+    members: &[String],
+    name: Option<&str>,
+) -> Result<String, Refusal> {
+    let cc = default_country_code(account);
+    let mut numbers = Vec::new();
+    for member in members {
+        let trimmed = member.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let raw = resolve_number(account, trimmed)
+            .ok_or_else(|| Refusal::Refused("Enter valid phone numbers for each group member.".into()))?;
+        if bugle::is_emergency_number(&raw) {
+            return Err(Refusal::Refused(EMERGENCY_REASON.to_owned()));
+        }
+        let e164 = bugle::normalize_e164(&raw, &cc)
+            .ok_or_else(|| Refusal::Refused("Enter valid phone numbers for each group member.".into()))?;
+        if !numbers.contains(&e164) {
+            numbers.push(e164);
+        }
+    }
+    if numbers.len() < 2 {
+        return Err(Refusal::Refused(
+            "A group conversation needs at least two people.".into(),
+        ));
+    }
+    let chat = account
+        .drive
+        .get_or_create_conversation(&numbers, name)
+        .map_err(Refusal::Refused)?;
+    Ok(record_started_chat(account, chat))
 }
 
 fn conversation_info(

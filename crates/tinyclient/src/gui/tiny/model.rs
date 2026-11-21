@@ -7,9 +7,11 @@
 //! nothing that needs a newer server is offered.
 
 use protocol::{
-    TinyCommunity, TinyLayoutGroup, TinyMember, TinyRole, TinyRoom, TinySeat, TINY_FEATURE_BANS, TINY_FEATURE_CATEGORIES, TINY_FEATURE_INVITE_OPTIONS, TINY_FEATURE_ROLES,
-    TINY_FEATURE_SERVER, TINY_FEATURE_TIMEOUTS, TINY_FEATURE_VOICE_MODERATION, TINY_DEAFEN_MEMBERS, TINY_DISCONNECT_MEMBERS, TINY_MOVE_MEMBERS,
-    TINY_MUTE_MEMBERS,
+    AccountKey, Call, TinyChannel, TinyCommunity, TinyLayoutGroup, TinyLayoutItem, TinyLayoutItemKind,
+    TinyMember, TinyRole, TinyRoom, TinySeat, TINY_DEAFEN_MEMBERS, TINY_DISCONNECT_MEMBERS,
+    TINY_FEATURE_BANS, TINY_FEATURE_CATEGORIES, TINY_FEATURE_CHANNEL_LAYOUT,
+    TINY_FEATURE_DIRECT_CALLS, TINY_FEATURE_INVITE_OPTIONS, TINY_FEATURE_ROLES, TINY_FEATURE_SERVER,
+    TINY_FEATURE_TIMEOUTS, TINY_FEATURE_VOICE_MODERATION, TINY_MOVE_MEMBERS, TINY_MUTE_MEMBERS,
 };
 use std::collections::HashSet;
 
@@ -249,9 +251,10 @@ pub fn draw_role(roles: &mut Vec<String>, role_id: &str) {
 /// One row of the channel list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Line {
-    /// A category's header. `None` is the rooms in no category, headed only when there are
+    /// A category's header. `None` is the channels in no category, headed only when there are
     /// categories too. `key` is what folding remembers.
-    Category { id: Option<String>, name: String, folded: bool, key: String, rooms: usize },
+    Category { id: Option<String>, name: String, folded: bool, key: String, channels: usize },
+    Channel { id: String },
     Room { id: String },
     Seat { room: String, user: String },
 }
@@ -259,90 +262,188 @@ pub enum Line {
 /// The key under which an uncategorized group folds.
 pub const LOOSE: &str = "";
 
-/// The channel list in order: rooms in no category first, then each category by its place,
-/// each room by its place and then name; under a room, who is in its call. A folded category
-/// keeps a room someone is in visible only when it is ours, as Discord keeps the connected one.
-pub fn lines(community: &TinyCommunity, folded: &HashSet<String>, mine: Option<&str>) -> Vec<Line> {
-    let mut rooms: Vec<&TinyRoom> = community.rooms.iter().collect();
-    rooms.sort_by(|a, b| a.position.cmp(&b.position).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+enum Entry<'a> {
+    Channel(&'a TinyChannel),
+    Room(&'a TinyRoom),
+}
+
+impl<'a> Entry<'a> {
+    fn position(&self) -> i32 {
+        match self {
+            Entry::Channel(ch) => ch.position,
+            Entry::Room(room) => room.position,
+        }
+    }
+
+    fn is_room(&self) -> bool {
+        matches!(self, Entry::Room(_))
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Entry::Channel(ch) => &ch.name,
+            Entry::Room(room) => &room.name,
+        }
+    }
+
+    fn category_id(&self) -> &Option<String> {
+        match self {
+            Entry::Channel(ch) => &ch.category_id,
+            Entry::Room(room) => &room.category_id,
+        }
+    }
+}
+
+/// The channel list in order: channels in no category first, then each category by its place.
+/// On a server with `channel_layout`, text and voice channels share one position order (text
+/// first on a tie, then name); without it, text channels sit above voice channels in each
+/// category. A folded category keeps a voice room we sit in and any text channel with unread
+/// messages visible.
+pub fn lines(community: &TinyCommunity, folded: &HashSet<String>, mine: Option<&str>, unread: &HashSet<String>) -> Vec<Line> {
+    let mixed = community.has(TINY_FEATURE_CHANNEL_LAYOUT);
+    let mut entries: Vec<Entry<'_>> = community
+        .channels
+        .iter()
+        .map(Entry::Channel)
+        .chain(community.rooms.iter().map(Entry::Room))
+        .collect();
+    entries.sort_by(|a, b| {
+        if mixed {
+            a.position()
+                .cmp(&b.position())
+                .then_with(|| a.is_room().cmp(&b.is_room()))
+                .then_with(|| a.name().to_lowercase().cmp(&b.name().to_lowercase()))
+        } else {
+            a.is_room()
+                .cmp(&b.is_room())
+                .then_with(|| a.position().cmp(&b.position()))
+                .then_with(|| a.name().to_lowercase().cmp(&b.name().to_lowercase()))
+        }
+    });
     let mut categories: Vec<_> = community.categories.iter().collect();
     categories.sort_by_key(|category| category.position);
     let known = |id: &Option<String>| id.as_ref().is_some_and(|id| categories.iter().any(|category| &category.id == id));
     let mut out = Vec::new();
-    let mut group = |id: Option<String>, name: String, members: Vec<&TinyRoom>, headed: bool| {
+    let mut group = |id: Option<String>, name: String, members: Vec<&Entry<'_>>, headed: bool| {
         let key = id.clone().unwrap_or_else(|| LOOSE.to_owned());
         let is_folded = folded.contains(&key);
         if headed {
-            out.push(Line::Category { id: id.clone(), name, folded: is_folded, key, rooms: members.len() });
+            out.push(Line::Category { id: id.clone(), name, folded: is_folded, key, channels: members.len() });
         }
-        for room in members {
-            let ours = mine.is_some_and(|me| room.participants.iter().any(|seat| seat.user_id == me));
-            if is_folded && !ours {
-                continue;
-            }
-            out.push(Line::Room { id: room.id.clone() });
-            for seat in &room.participants {
-                out.push(Line::Seat { room: room.id.clone(), user: seat.user_id.clone() });
+        for entry in members {
+            match entry {
+                Entry::Channel(ch) => {
+                    if is_folded && !unread.contains(&ch.id) {
+                        continue;
+                    }
+                    out.push(Line::Channel { id: ch.id.clone() });
+                }
+                Entry::Room(room) => {
+                    let ours = mine.is_some_and(|me| room.participants.iter().any(|seat| seat.user_id == me));
+                    if is_folded && !ours {
+                        continue;
+                    }
+                    out.push(Line::Room { id: room.id.clone() });
+                    for seat in &room.participants {
+                        out.push(Line::Seat { room: room.id.clone(), user: seat.user_id.clone() });
+                    }
+                }
             }
         }
     };
-    let loose: Vec<&TinyRoom> = rooms.iter().copied().filter(|room| !known(&room.category_id)).collect();
+    let loose: Vec<&Entry<'_>> = entries.iter().filter(|entry| !known(entry.category_id())).collect();
     if categories.is_empty() {
-        // An older server has no categories: one header over all of its rooms.
-        group(None, "Voice channels".to_owned(), loose, true);
+        // A server with no categories: one header over everything.
+        group(None, "Channels".to_owned(), loose, true);
         return out;
     }
     if !loose.is_empty() {
         group(None, String::new(), loose, false);
     }
     for category in categories {
-        let inside: Vec<&TinyRoom> = rooms.iter().copied().filter(|room| room.category_id.as_deref() == Some(category.id.as_str())).collect();
+        let inside: Vec<&Entry<'_>> = entries.iter().filter(|entry| entry.category_id().as_deref() == Some(category.id.as_str())).collect();
         group(Some(category.id.clone()), category.name.clone(), inside, true);
     }
     out
 }
 
-/// The channel list's order as the server keeps it: the rooms in no category, then each
+/// The channel list's order as the server keeps it: the channels in no category, then each
 /// category's, top first. What `TinyLayout` sends, whole.
 pub fn layout_of(community: &TinyCommunity) -> Vec<TinyLayoutGroup> {
-    let order: Vec<String> = lines(community, &HashSet::new(), None)
+    let empty = HashSet::new();
+    let order: Vec<TinyLayoutItem> = lines(community, &empty, None, &empty)
         .into_iter()
         .filter_map(|line| match line {
-            Line::Room { id } => Some(id),
+            Line::Channel { id } => Some(TinyLayoutItem { kind: TinyLayoutItemKind::Channel, id }),
+            Line::Room { id } => Some(TinyLayoutItem { kind: TinyLayoutItemKind::Room, id }),
             _ => None,
         })
         .collect();
     let mut categories: Vec<_> = community.categories.iter().collect();
     categories.sort_by_key(|category| category.position);
     let known = |id: &Option<String>| id.as_ref().is_some_and(|id| categories.iter().any(|category| &category.id == id));
-    let in_group = |category: Option<&str>| -> Vec<String> {
-        order
+    let matches_group = |cat_id: &Option<String>, category: Option<&str>| match category {
+        None => !known(cat_id),
+        Some(category) => cat_id.as_deref() == Some(category),
+    };
+    let in_group = |category: Option<&str>| -> (Vec<String>, Vec<TinyLayoutItem>) {
+        let items: Vec<TinyLayoutItem> = order
             .iter()
-            .filter(|id| {
-                community.rooms.iter().find(|room| &room.id == *id).is_some_and(|room| match category {
-                    None => !known(&room.category_id),
-                    Some(category) => room.category_id.as_deref() == Some(category),
-                })
+            .filter(|item| match item.kind {
+                TinyLayoutItemKind::Channel => community.channels.iter().find(|ch| ch.id == item.id).is_some_and(|ch| matches_group(&ch.category_id, category)),
+                TinyLayoutItemKind::Room => community.rooms.iter().find(|room| room.id == item.id).is_some_and(|room| matches_group(&room.category_id, category)),
             })
             .cloned()
-            .collect()
+            .collect();
+        let room_ids = items
+            .iter()
+            .filter(|item| item.kind == TinyLayoutItemKind::Room)
+            .map(|item| item.id.clone())
+            .collect();
+        (room_ids, items)
     };
-    let mut groups = vec![TinyLayoutGroup { category_id: None, room_ids: in_group(None) }];
-    groups.extend(categories.iter().map(|category| TinyLayoutGroup { category_id: Some(category.id.clone()), room_ids: in_group(Some(&category.id)) }));
+    let (loose_rooms, loose_items) = in_group(None);
+    let mut groups = vec![TinyLayoutGroup { category_id: None, room_ids: loose_rooms, items: loose_items }];
+    groups.extend(categories.iter().map(|category| {
+        let (room_ids, items) = in_group(Some(&category.id));
+        TinyLayoutGroup { category_id: Some(category.id.clone()), room_ids, items }
+    }));
+    groups
+}
+
+/// Where a dragged text channel or voice room lands: just above `before`, or at the end of
+/// `category` (`None` is the channels in no category).
+pub fn move_item(
+    mut groups: Vec<TinyLayoutGroup>,
+    item: &TinyLayoutItem,
+    category: Option<&str>,
+    before: Option<&TinyLayoutItem>,
+) -> Vec<TinyLayoutGroup> {
+    for group in &mut groups {
+        group.items.retain(|existing| existing != item);
+        if item.kind == TinyLayoutItemKind::Room {
+            group.room_ids.retain(|id| id != &item.id);
+        }
+    }
+    if let Some(group) = groups.iter_mut().find(|group| group.category_id.as_deref() == category) {
+        let at = before.and_then(|before| group.items.iter().position(|existing| existing == before)).unwrap_or(group.items.len());
+        group.items.insert(at, item.clone());
+        group.room_ids = group
+            .items
+            .iter()
+            .filter(|entry| entry.kind == TinyLayoutItemKind::Room)
+            .map(|entry| entry.id.clone())
+            .collect();
+    }
     groups
 }
 
 /// Where a dragged room lands: just above `before`, or at the end of `category` (`None` is the
 /// rooms in no category).
-pub fn move_room(mut groups: Vec<TinyLayoutGroup>, room: &str, category: Option<&str>, before: Option<&str>) -> Vec<TinyLayoutGroup> {
-    for group in &mut groups {
-        group.room_ids.retain(|id| id != room);
-    }
-    if let Some(group) = groups.iter_mut().find(|group| group.category_id.as_deref() == category) {
-        let at = before.and_then(|before| group.room_ids.iter().position(|id| id == before)).unwrap_or(group.room_ids.len());
-        group.room_ids.insert(at, room.to_owned());
-    }
-    groups
+pub fn move_room(groups: Vec<TinyLayoutGroup>, room: &str, category: Option<&str>, before: Option<&str>) -> Vec<TinyLayoutGroup> {
+    let item = TinyLayoutItem { kind: TinyLayoutItemKind::Room, id: room.to_owned() };
+    let before = before.map(|id| TinyLayoutItem { kind: TinyLayoutItemKind::Room, id: id.to_owned() });
+    move_item(groups, &item, category, before.as_ref())
 }
 
 /// A dragged category lands just above `before`. The rooms in no category stay first.
@@ -359,10 +460,29 @@ pub fn move_category(mut groups: Vec<TinyLayoutGroup>, category: &str, before: &
 /// The page in a new order, before the server confirms it.
 pub fn apply_layout(community: &mut TinyCommunity, groups: &[TinyLayoutGroup]) {
     for group in groups {
-        for (position, id) in group.room_ids.iter().enumerate() {
-            if let Some(room) = community.rooms.iter_mut().find(|room| &room.id == id) {
-                room.category_id = group.category_id.clone();
-                room.position = position as i32;
+        if !group.items.is_empty() {
+            for (position, item) in group.items.iter().enumerate() {
+                match item.kind {
+                    TinyLayoutItemKind::Channel => {
+                        if let Some(ch) = community.channels.iter_mut().find(|ch| ch.id == item.id) {
+                            ch.category_id = group.category_id.clone();
+                            ch.position = position as i32;
+                        }
+                    }
+                    TinyLayoutItemKind::Room => {
+                        if let Some(room) = community.rooms.iter_mut().find(|room| room.id == item.id) {
+                            room.category_id = group.category_id.clone();
+                            room.position = position as i32;
+                        }
+                    }
+                }
+            }
+        } else {
+            for (position, id) in group.room_ids.iter().enumerate() {
+                if let Some(room) = community.rooms.iter_mut().find(|room| &room.id == id) {
+                    room.category_id = group.category_id.clone();
+                    room.position = position as i32;
+                }
             }
         }
     }
@@ -447,6 +567,8 @@ pub struct RoleChoice {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PersonMenu {
     pub me: bool,
+    /// Direct call from the person menu: server advertises `direct_calls`, not me, not a bot.
+    pub call: bool,
     /// Volume and Mute for me: anyone but ourselves.
     pub local: bool,
     /// Where they sit, if they do.
@@ -493,6 +615,14 @@ fn legacy_role_change(caller: &str, target: &str, next: &str, owners: usize) -> 
     same(caller, "admin") && same(target, "member") && same(next, "admin")
 }
 
+/// True while this account is already in a call with `user_id`.
+pub fn in_call_with(call: Option<&Call>, account: &AccountKey, user_id: &str) -> bool {
+    call.is_some_and(|call| {
+        call.conversation.account() == *account
+            && call.participants.iter().any(|who| who.id == user_id)
+    })
+}
+
 /// The person menu for `user_id`, from where this account stands.
 pub fn person_menu(community: &TinyCommunity, user_id: &str) -> PersonMenu {
     let Some(target) = community.member(user_id) else {
@@ -504,7 +634,8 @@ pub fn person_menu(community: &TinyCommunity, user_id: &str) -> PersonMenu {
     let seated = seat_of(community, user_id);
     let moderation = community.has(TINY_FEATURE_VOICE_MODERATION);
     let in_room = |room: &TinyRoom, bits: u64| community.access.as_ref().is_some_and(|access| access.has_in(room, bits));
-    let mut menu = PersonMenu { me, local: !me, room: seated.map(|(room, _)| room.id.clone()), ..PersonMenu::default() };
+    let call = !me && !target.role.eq_ignore_ascii_case("bot") && community.has(TINY_FEATURE_DIRECT_CALLS);
+    let mut menu = PersonMenu { me, call, local: !me, room: seated.map(|(room, _)| room.id.clone()), ..PersonMenu::default() };
     if let Some((room, seat)) = seated.filter(|_| above) {
         if moderation && in_room(room, TINY_MUTE_MEMBERS) {
             menu.server_mute = Some(seat.server_muted);
@@ -643,6 +774,7 @@ mod tests {
             audit: vec![],
             origin: "https://tiny.example".into(),
             rooms: vec![seated("lounge", &["mem", "me"]), seated("games", &[])],
+            channels: Vec::new(),
             online: vec![],
             media: "up".into(),
             capabilities: TinyCapabilities::default(),
@@ -716,11 +848,13 @@ mod tests {
     #[test]
     fn the_channel_list_puts_loose_rooms_first_then_categories_in_order_and_seats_under_rooms() {
         let community = modern();
-        let lines = lines(&community, &HashSet::new(), Some("me"));
+        let empty = HashSet::new();
+        let lines = lines(&community, &empty, Some("me"), &empty);
         let shape: Vec<String> = lines
             .iter()
             .map(|line| match line {
                 Line::Category { name, .. } => format!("# {name}"),
+                Line::Channel { id } => format!("#{id}"),
                 Line::Room { id } => id.clone(),
                 Line::Seat { user, .. } => format!("  {user}"),
             })
@@ -728,7 +862,7 @@ mod tests {
         assert_eq!(shape, ["loose", "# Play", "games", "  mod", "# Talk", "quiet", "lounge", "  mem", "  me"]);
         // Folded, a category keeps only the room we sit in.
         let folded = HashSet::from(["talk".to_owned(), "play".to_owned()]);
-        let lines = super::lines(&community, &folded, Some("me"));
+        let lines = super::lines(&community, &folded, Some("me"), &empty);
         assert!(lines.iter().any(|line| *line == Line::Room { id: "lounge".into() }));
         assert!(!lines.iter().any(|line| *line == Line::Room { id: "games".into() }));
         assert!(!lines.iter().any(|line| *line == Line::Room { id: "quiet".into() }));
@@ -737,9 +871,74 @@ mod tests {
     #[test]
     fn an_older_server_has_one_header_over_every_room() {
         let community = legacy("member");
-        let lines = lines(&community, &HashSet::new(), None);
-        assert!(matches!(&lines[0], Line::Category { id: None, name, .. } if name == "Voice channels"));
+        let empty = HashSet::new();
+        let lines = lines(&community, &empty, None, &empty);
+        assert!(matches!(&lines[0], Line::Category { id: None, name, .. } if name == "Channels"));
         assert_eq!(lines.iter().filter(|line| matches!(line, Line::Room { .. })).count(), 2);
+    }
+
+    #[test]
+    fn text_and_voice_channels_merge_under_categories_respecting_tie_rule_and_folding() {
+        let mut community = modern();
+        community.capabilities.features.push(TINY_FEATURE_CHANNEL_LAYOUT.into());
+        community.channels = vec![
+            TinyChannel { category_id: None, position: 0, ..TinyChannel::new("ch-loose", "announcements") },
+            TinyChannel { category_id: Some("talk".into()), position: 1, ..TinyChannel::new("ch-tie", "general") },
+            TinyChannel { category_id: Some("talk".into()), position: 2, ..TinyChannel::new("ch-after", "notes") },
+            TinyChannel { category_id: Some("unknown-cat".into()), position: 5, ..TinyChannel::new("ch-orphan", "orphan") },
+        ];
+        let empty = HashSet::new();
+        let out = lines(&community, &empty, Some("me"), &empty);
+        let shape: Vec<String> = out
+            .iter()
+            .filter_map(|line| match line {
+                Line::Category { name, channels, .. } => Some(format!("[{name}:{channels}]")),
+                Line::Channel { id } => Some(format!("#{id}")),
+                Line::Room { id } => Some(id.clone()),
+                Line::Seat { .. } => None,
+            })
+            .collect();
+        // Loose: ch-loose (pos 0, text) before loose (pos 0, room), then ch-orphan (pos 5, unknown cat).
+        // Talk: quiet (pos 0, room), ch-tie (pos 1, text) before lounge (pos 1, room), ch-after (pos 2, text).
+        assert_eq!(shape, ["#ch-loose", "loose", "#ch-orphan", "[Play:1]", "games", "[Talk:4]", "quiet", "#ch-tie", "lounge", "#ch-after"]);
+
+        // Without channel_layout, text channels sit above voice channels in each category.
+        let mut legacy_layout = community.clone();
+        legacy_layout.capabilities.features.retain(|f| f != TINY_FEATURE_CHANNEL_LAYOUT);
+        let out_legacy = lines(&legacy_layout, &empty, Some("me"), &empty);
+        let talk_only: Vec<String> = out_legacy
+            .iter()
+            .skip_while(|line| !matches!(line, Line::Category { name, .. } if name == "Talk"))
+            .skip(1)
+            .filter_map(|line| match line {
+                Line::Channel { id } => Some(format!("#{id}")),
+                Line::Room { id } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(talk_only, ["#ch-tie", "#ch-after", "quiet", "lounge"]);
+
+        // Folded category keeps joined room ("lounge") AND unread text channel ("ch-after"), hiding read "ch-tie" and empty "quiet".
+        let folded = HashSet::from(["talk".to_owned()]);
+        let unread = HashSet::from(["ch-after".to_owned()]);
+        let out_folded = lines(&community, &folded, Some("me"), &unread);
+        assert!(out_folded.contains(&Line::Room { id: "lounge".into() }));
+        assert!(out_folded.contains(&Line::Channel { id: "ch-after".into() }));
+        assert!(!out_folded.contains(&Line::Channel { id: "ch-tie".into() }));
+        assert!(!out_folded.contains(&Line::Room { id: "quiet".into() }));
+
+        // Mixed layout_of, move_item, and apply_layout.
+        let groups = layout_of(&community);
+        let ch = TinyLayoutItem { kind: TinyLayoutItemKind::Channel, id: "ch-after".into() };
+        let before = TinyLayoutItem { kind: TinyLayoutItemKind::Room, id: "games".into() };
+        let moved = move_item(groups, &ch, Some("play"), Some(&before));
+        let play = moved.iter().find(|g| g.category_id.as_deref() == Some("play")).unwrap();
+        assert_eq!(play.items, vec![ch.clone(), before.clone()]);
+        assert_eq!(play.room_ids, vec!["games".to_owned()]);
+        apply_layout(&mut community, &moved);
+        let updated = community.channels.iter().find(|c| c.id == "ch-after").unwrap();
+        assert_eq!(updated.category_id.as_deref(), Some("play"));
+        assert_eq!(updated.position, 0);
     }
 
     #[test]
@@ -876,5 +1075,32 @@ mod tests {
         assert_eq!(channel_occupancy(&busy), "3 in call");
         busy.user_limit = 12;
         assert_eq!(channel_occupancy(&busy), "3 of 12");
+    }
+
+    #[test]
+    fn person_menu_offers_call_only_with_direct_calls_for_non_bot_others() {
+        let mut c = modern();
+        assert!(!person_menu(&c, "mem").call, "no direct_calls feature yet");
+        c.capabilities.features.push(TINY_FEATURE_DIRECT_CALLS.into());
+        assert!(person_menu(&c, "mem").call, "other member on capable server");
+        assert!(!person_menu(&c, "me").call, "never self");
+        c.members.push(member("bot1", "Helper", "bot", &[]));
+        assert!(!person_menu(&c, "bot1").call, "never a bot");
+
+        let account = AccountKey { network: protocol::Network::Tiny, account: "srv".into() };
+        let call: Call = serde_json::from_value(serde_json::json!({
+            "conversation": protocol::Key::new(&account, "d1"),
+            "state": "joined",
+            "participants": [{"id": "mem", "name": "Member", "muted": false, "deafened": false, "speaking": false}],
+            "muted": false,
+            "deafened": false,
+            "joined": 0,
+            "engine_linked": false,
+            "video": []
+        }))
+        .expect("call");
+        assert!(in_call_with(Some(&call), &account, "mem"));
+        assert!(!in_call_with(Some(&call), &account, "other"));
+        assert!(!in_call_with(None, &account, "mem"));
     }
 }

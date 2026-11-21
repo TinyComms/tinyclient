@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 
 /// The permissions a channel's override can change, in the order the editor lists them.
-pub(in crate::gui) const SCOPED: [u64; 12] = [
+pub(in crate::gui) const SCOPED: [u64; 13] = [
     TINY_VIEW_CHANNEL,
     TINY_CONNECT,
     TINY_SPEAK,
@@ -39,7 +39,26 @@ pub(in crate::gui) const SCOPED: [u64; 12] = [
     TINY_MOVE_MEMBERS,
     TINY_DISCONNECT_MEMBERS,
     TINY_MANAGE_CHANNELS,
+    TINY_MANAGE_MESSAGES,
 ];
+
+/// The permissions a text channel's override can change, in the order the editor lists them.
+pub(in crate::gui) const TEXT_SCOPED: [u64; 3] = [
+    TINY_VIEW_CHANNEL,
+    TINY_SPEAK,
+    TINY_MANAGE_CHANNELS,
+];
+
+const TEXT_SCOPED_MASK: u64 = TINY_VIEW_CHANNEL | TINY_SPEAK | TINY_MANAGE_CHANNELS;
+
+fn text_permission(bit: u64) -> (&'static str, &'static str) {
+    match bit {
+        TINY_VIEW_CHANNEL => ("View channel", "See this channel and read its messages."),
+        TINY_SPEAK => ("Send messages", "Post messages, add reactions and type in this channel."),
+        TINY_MANAGE_CHANNELS => ("Manage channel", "Rename it, change its topic, edit permissions and delete it."),
+        _ => ("", ""),
+    }
+}
 
 /// The most people a channel can be limited to here.
 const LIMIT_MAX: u32 = 99;
@@ -49,6 +68,7 @@ const TRACK: f32 = 280.;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::gui) enum Sel {
     Room(String),
+    Channel(String),
     Category(String),
 }
 
@@ -93,27 +113,41 @@ pub(in crate::gui) fn set_tri((allow, deny): (u64, u64), bit: u64, tri: Tri) -> 
     }
 }
 
-/// A role's override in a room: as changed here, else as the server has it, else none.
-pub(in crate::gui) fn override_of(room: &TinyRoom, draft: &Draft, role_id: &str) -> (u64, u64) {
-    draft.overrides.get(role_id).copied().unwrap_or_else(|| room.overrides.iter().find(|over| over.role_id == role_id).map_or((0, 0), |over| (over.allow, over.deny)))
+/// A role's override in an override list: as changed here, else as the server has it, else none.
+pub(in crate::gui) fn override_of_list(existing: &[TinyOverride], draft: &Draft, role_id: &str) -> (u64, u64) {
+    draft
+        .overrides
+        .get(role_id)
+        .copied()
+        .unwrap_or_else(|| existing.iter().find(|over| over.role_id == role_id).map_or((0, 0), |over| (over.allow, over.deny)))
 }
 
-/// The room's overrides with the changes made here.
-pub(in crate::gui) fn overrides_with(room: &TinyRoom, draft: &Draft) -> Vec<TinyOverride> {
-    let mut all: Vec<TinyOverride> = room.overrides.iter().filter(|over| !draft.overrides.contains_key(&over.role_id)).cloned().collect();
+/// A role's override in a room: as changed here, else as the server has it, else none.
+pub(in crate::gui) fn override_of(room: &TinyRoom, draft: &Draft, role_id: &str) -> (u64, u64) {
+    override_of_list(&room.overrides, draft, role_id)
+}
+
+/// An override list with the changes made here.
+pub(in crate::gui) fn overrides_with_list(existing: &[TinyOverride], draft: &Draft) -> Vec<TinyOverride> {
+    let mut all: Vec<TinyOverride> = existing.iter().filter(|over| !draft.overrides.contains_key(&over.role_id)).cloned().collect();
     all.extend(draft.overrides.iter().map(|(role_id, (allow, deny))| TinyOverride { role_id: role_id.clone(), allow: *allow, deny: *deny }));
     all
 }
 
-/// What Save sends for the overrides: per role, the new bits, or `None` to clear one that
-/// allows and denies nothing. Unchanged roles are left out.
-pub(in crate::gui) fn override_changes(room: &TinyRoom, draft: &Draft) -> Vec<(String, Option<(u64, u64)>)> {
+/// The room's overrides with the changes made here.
+pub(in crate::gui) fn overrides_with(room: &TinyRoom, draft: &Draft) -> Vec<TinyOverride> {
+    overrides_with_list(&room.overrides, draft)
+}
+
+/// What Save sends for overrides, masked to `mask`: per role, the new bits, or `None` to clear one
+/// that allows and denies nothing. Unchanged roles are left out.
+pub(in crate::gui) fn override_changes_for(existing: &[TinyOverride], draft: &Draft, mask: u64) -> Vec<(String, Option<(u64, u64)>)> {
     draft
         .overrides
         .iter()
         .filter_map(|(role_id, bits)| {
-            let now = room.overrides.iter().find(|over| over.role_id == *role_id).map(|over| (over.allow, over.deny));
-            let bits = (bits.0 & TINY_CHANNEL_SCOPED, bits.1 & TINY_CHANNEL_SCOPED);
+            let now = existing.iter().find(|over| over.role_id == *role_id).map(|over| (over.allow & mask, over.deny & mask));
+            let bits = (bits.0 & mask, bits.1 & mask);
             match (now, bits) {
                 (None, (0, 0)) => None,
                 (Some(now), bits) if now == bits => None,
@@ -122,6 +156,25 @@ pub(in crate::gui) fn override_changes(room: &TinyRoom, draft: &Draft) -> Vec<(S
             }
         })
         .collect()
+}
+
+/// What Save sends for a room's overrides.
+pub(in crate::gui) fn override_changes(room: &TinyRoom, draft: &Draft) -> Vec<(String, Option<(u64, u64)>)> {
+    override_changes_for(&room.overrides, draft, TINY_CHANNEL_SCOPED)
+}
+
+/// What Save sends for a text channel's overrides (limited to view, speak, manage).
+pub(in crate::gui) fn channel_override_changes(channel: &TinyChannel, draft: &Draft) -> Vec<(String, Option<(u64, u64)>)> {
+    override_changes_for(&channel.overrides, draft, TEXT_SCOPED_MASK)
+}
+
+/// The text channel edit Save sends: only what differs from the server. Never sends `e2ee`.
+pub(in crate::gui) fn channel_edit(channel: &TinyChannel, name: &str, topic: &str) -> TinyChannelEdit {
+    TinyChannelEdit {
+        name: (name.trim() != channel.name).then(|| name.trim().to_owned()),
+        topic: (topic.trim() != channel.topic).then(|| topic.trim().to_owned()),
+        ..TinyChannelEdit::default()
+    }
 }
 
 /// The room edit Save sends: only what differs from the server.
@@ -152,6 +205,13 @@ impl Shell {
         self.tiny_state.community.as_ref()?.rooms.iter().find(|room| room.id == id).cloned()
     }
 
+    fn tiny_channels_text(&self) -> Option<TinyChannel> {
+        let Some(Sel::Channel(id)) = self.tiny_state.settings.as_ref()?.channels.sel.clone() else {
+            return None;
+        };
+        self.tiny_state.community.as_ref()?.channels.iter().find(|ch| ch.id == id).cloned()
+    }
+
     fn tiny_channels_category(&self) -> Option<TinyCategory> {
         let Some(Sel::Category(id)) = self.tiny_state.settings.as_ref()?.channels.sel.clone() else {
             return None;
@@ -171,6 +231,19 @@ impl Shell {
             let name = fields.category_name.read(cx).text().trim().to_owned();
             if name != category.name {
                 out.push(Request::TinyCategoryRename { account, category_id: category.id, name });
+            }
+            return out;
+        }
+        if let Some(channel) = self.tiny_channels_text() {
+            let edit = channel_edit(&channel, fields.room_name.read(cx).text(), fields.room_topic.read(cx).text());
+            if edit != TinyChannelEdit::default() {
+                out.push(Request::TinyChannelUpdate { account: account.clone(), channel_id: channel.id.clone(), channel: edit });
+            }
+            for (role_id, bits) in channel_override_changes(&channel, draft) {
+                out.push(match bits {
+                    Some((allow, deny)) => Request::TinyChannelOverrideSet { account: account.clone(), channel_id: channel.id.clone(), role_id, allow, deny },
+                    None => Request::TinyChannelOverrideClear { account: account.clone(), channel_id: channel.id.clone(), role_id },
+                });
             }
             return out;
         }
@@ -204,11 +277,23 @@ impl Shell {
         let bad_name = requests.iter().any(|request| match request {
             Request::TinyCategoryRename { name, .. } | Request::TinyRoomRename { name, .. } => named(name),
             Request::TinyRoomUpdate { room, .. } => room.name.as_deref().is_some_and(named),
+            Request::TinyChannelUpdate { channel, .. } => channel.name.as_deref().is_some_and(named),
             _ => false,
         });
         if bad_name {
             if let Some(overlay) = self.tiny_state.settings.as_mut() {
                 overlay.error = Some("A name is 1 to 80 characters.".to_owned());
+            }
+            cx.notify();
+            return;
+        }
+        let bad_topic = requests.iter().any(|request| match request {
+            Request::TinyChannelUpdate { channel, .. } => channel.topic.as_deref().is_some_and(|t| t.chars().count() > TINY_CHANNEL_TOPIC_MAX),
+            _ => false,
+        });
+        if bad_topic {
+            if let Some(overlay) = self.tiny_state.settings.as_mut() {
+                overlay.error = Some("A topic is at most 1024 characters.".to_owned());
             }
             cx.notify();
             return;
@@ -223,12 +308,16 @@ impl Shell {
     /// picked.
     pub(in crate::gui) fn tiny_channels_reset(&mut self, cx: &mut Context<Self>) {
         let room = self.tiny_channels_room();
+        let text = self.tiny_channels_text();
         let category = self.tiny_channels_category();
         let fields = &self.tiny_state.settings_fields;
         let (name, topic, category_name) = (fields.room_name.clone(), fields.room_topic.clone(), fields.category_name.clone());
-        let (room_name, room_topic) = room.map(|room| (room.name, room.topic)).unwrap_or_default();
-        name.update(cx, |input, cx| input.set_text(&room_name, cx));
-        topic.update(cx, |input, cx| input.set_text(&room_topic, cx));
+        let (chan_name, chan_topic) = room
+            .map(|room| (room.name, room.topic))
+            .or_else(|| text.map(|ch| (ch.name, ch.topic)))
+            .unwrap_or_default();
+        name.update(cx, |input, cx| input.set_text(&chan_name, cx));
+        topic.update(cx, |input, cx| input.set_text(&chan_topic, cx));
         let category_now = category.map(|category| category.name).unwrap_or_default();
         category_name.update(cx, |input, cx| input.set_text(&category_now, cx));
         if let Some(overlay) = self.tiny_state.settings.as_mut() {
@@ -260,11 +349,27 @@ impl Shell {
         };
         let exists = |sel: &Sel| match sel {
             Sel::Room(id) => community.rooms.iter().any(|room| room.id == *id),
+            Sel::Channel(id) => community.channels.iter().any(|ch| ch.id == *id),
             Sel::Category(id) => community.categories.iter().any(|category| category.id == *id),
         };
-        let wanted = overlay.channel.clone().map(Sel::Room).filter(|sel| exists(sel));
+        let wanted = overlay.channel.clone().and_then(|id| {
+            if community.channels.iter().any(|ch| ch.id == id) {
+                Some(Sel::Channel(id))
+            } else if community.rooms.iter().any(|room| room.id == id) {
+                Some(Sel::Room(id))
+            } else {
+                None
+            }
+        });
         let kept = overlay.channels.sel.clone().filter(|sel| exists(sel));
-        let first = || model::lines(community, &HashSet::new(), None).into_iter().find_map(|line| if let Line::Room { id } = line { Some(Sel::Room(id)) } else { None });
+        let first = || {
+            let empty = HashSet::new();
+            model::lines(community, &empty, None, &empty).into_iter().find_map(|line| match line {
+                Line::Channel { id } => Some(Sel::Channel(id)),
+                Line::Room { id } => Some(Sel::Room(id)),
+                _ => None,
+            })
+        };
         let pick = kept.clone().or(wanted).or_else(first);
         if let Some(overlay) = self.tiny_state.settings.as_mut() {
             overlay.channel = None;
@@ -313,17 +418,18 @@ pub(in crate::gui::tiny) fn channels(shell: &Shell, facts: &Facts, window: &mut 
         .flex()
         .flex_col()
         .gap(px(24.))
-        .child(page_head("Channels", if facts.may.layout { "Voice channels and the categories that hold them. Drag to change the order." } else { "The server's voice channels." }));
+        .child(page_head("Channels", if facts.may.layout { "Channels and the categories that hold them. Drag to change the order." } else { "The server's channels." }));
     let mut tools = div().flex().items_center().gap(px(8.));
     if facts.may.make_room {
         let category = match &draft.sel {
             Some(Sel::Category(id)) => Some(id.clone()),
             Some(Sel::Room(id)) => community.rooms.iter().find(|room| room.id == *id).and_then(|room| room.category_id.clone()),
+            Some(Sel::Channel(id)) => community.channels.iter().find(|ch| ch.id == *id).and_then(|ch| ch.category_id.clone()),
             None => None,
         };
         tools = tools.child(
             button_with_icon("tiny-channels-new-room", ButtonKind::Primary, "icons/plus.svg", "Create channel")
-                .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_modal(Modal::NewRoom(category.clone()), window, cx))),
+                .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_modal(Modal::NewChannel { category: category.clone(), kind: crate::gui::tiny::NewChannelKind::Text, e2ee: false }, window, cx))),
         );
     }
     if facts.may.categories {
@@ -335,6 +441,7 @@ pub(in crate::gui::tiny) fn channels(shell: &Shell, facts: &Facts, window: &mut 
     page = page.child(tools);
     let editor = match &draft.sel {
         Some(Sel::Room(_)) => shell.tiny_channels_room().map(|room| room_editor(shell, facts, &room, window, cx).into_any_element()),
+        Some(Sel::Channel(_)) => shell.tiny_channels_text().map(|ch| channel_editor(shell, facts, &ch, window, cx).into_any_element()),
         Some(Sel::Category(_)) => shell.tiny_channels_category().map(|category| category_editor(shell, facts, &category, window, cx).into_any_element()),
         None => None,
     }
@@ -342,21 +449,54 @@ pub(in crate::gui::tiny) fn channels(shell: &Shell, facts: &Facts, window: &mut 
     page.child(div().flex().items_start().gap(px(24.)).child(tree(facts, draft, cx)).child(div().flex_1().min_w_0().child(editor))).into_any_element()
 }
 
-/// The categories and rooms, in order, each a drag handle and a drop target where the layout may
-/// change.
+fn channel_tree_row(facts: &Facts, draft: &Draft, ch: &TinyChannel, cx: &mut Context<Shell>) -> Stateful {
+    let community = facts.community;
+    let on = draft.sel == Some(Sel::Channel(ch.id.clone()));
+    let pick = ch.id.clone();
+    let mut row = div()
+        .id(SharedString::from(format!("tiny-channels-text-{}", ch.id)))
+        .h(px(32.))
+        .pl(px(if community.categories.is_empty() { 8. } else { 16. }))
+        .pr(px(8.))
+        .rounded(px(theme::R_CONTROL))
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .cursor_pointer()
+        .when(on, |row| row.bg(theme::selected()))
+        .when(!on, |row| row.hover(|style| style.bg(theme::hover())))
+        .on_click(cx.listener(move |this, _, _, cx| this.tiny_channels_select(Some(Sel::Channel(pick.clone())), cx)))
+        .child(glyph("icons/hash.svg", 14., theme::text_faint()))
+        .child(div().flex_1().min_w_0().truncate().type_ui().text_color(if on { theme::text() } else { theme::text_soft() }).child(ch.name.clone()))
+        .when(!ch.overrides.is_empty(), |row| row.child(glyph("icons/lock.svg", 12., theme::text_faint())));
+    if facts.may.layout && community.has(TINY_FEATURE_CHANNEL_LAYOUT) {
+        let target = ch.id.clone();
+        row = row
+            .on_drag(Dragged::Channel { channel_id: ch.id.clone(), name: ch.name.clone() }, |dragged, _, _, cx| cx.new(|_| crate::gui::tiny::column::Ghost(dragged.label())))
+            .drag_over::<Dragged>(|style, _, _, _| style.bg(theme::accent_soft()))
+            .on_drop(cx.listener(move |this, dragged: &Dragged, _, cx| this.tiny_dropped_on_channel(target.clone(), dragged, cx)));
+    }
+    row
+}
+
+/// The categories, text channels and voice rooms, in order, each a drag handle and a drop target
+/// where the layout may change.
 fn tree(facts: &Facts, draft: &Draft, cx: &mut Context<Shell>) -> Div {
     let community = facts.community;
     let mut tree = div().w(px(232.)).flex_none().flex().flex_col().gap(px(1.));
-    let lines = model::lines(community, &HashSet::new(), None);
+    let empty = HashSet::new();
+    let lines = model::lines(community, &empty, None, &empty);
     let headed_loose = !community.categories.is_empty() && lines.iter().any(|line| matches!(line, Line::Category { id: None, .. }));
     if !community.categories.is_empty() && !headed_loose {
-        // The rooms in no category still take a drop.
+        // The channels in no category still take a drop.
         tree = tree.child(loose_header(facts, cx));
     }
     for line in lines {
         match line {
-            Line::Category { id: None, .. } => tree = tree.child(loose_header(facts, cx)),
-            Line::Category { id: Some(id), name, rooms, .. } => {
+            Line::Category { id: None, .. } => {
+                tree = tree.child(loose_header(facts, cx));
+            }
+            Line::Category { id: Some(id), name, channels, .. } => {
                 let on = draft.sel == Some(Sel::Category(id.clone()));
                 let pick = id.clone();
                 let mut row = div()
@@ -374,7 +514,7 @@ fn tree(facts: &Facts, draft: &Draft, cx: &mut Context<Shell>) -> Div {
                     .on_click(cx.listener(move |this, _, _, cx| this.tiny_channels_select(Some(Sel::Category(pick.clone())), cx)))
                     .when(facts.may.layout, |row| row.child(glyph("icons/grip-vertical.svg", 12., theme::text_faint())))
                     .child(div().flex_1().min_w_0().truncate().type_micro().text_color(if on { theme::text() } else { theme::text_soft() }).child(name.to_uppercase()))
-                    .child(div().type_micro().text_color(theme::text_faint()).child(rooms.to_string()));
+                    .child(div().type_micro().text_color(theme::text_faint()).child(channels.to_string()));
                 if facts.may.layout {
                     let target = id.clone();
                     row = row
@@ -383,6 +523,12 @@ fn tree(facts: &Facts, draft: &Draft, cx: &mut Context<Shell>) -> Div {
                         .on_drop(cx.listener(move |this, dragged: &Dragged, _, cx| this.tiny_dropped_on_category(Some(target.clone()), dragged, cx)));
                 }
                 tree = tree.child(row);
+            }
+            Line::Channel { id } => {
+                let Some(ch) = community.channels.iter().find(|ch| ch.id == id) else {
+                    continue;
+                };
+                tree = tree.child(channel_tree_row(facts, draft, ch, cx));
             }
             Line::Room { id } => {
                 let Some(room) = community.rooms.iter().find(|room| room.id == id) else {
@@ -419,8 +565,8 @@ fn tree(facts: &Facts, draft: &Draft, cx: &mut Context<Shell>) -> Div {
             Line::Seat { .. } => {}
         }
     }
-    if community.rooms.is_empty() {
-        tree = tree.child(div().px(px(8.)).py(px(8.)).type_small().text_color(theme::text_faint()).child("No voice channels yet."));
+    if community.rooms.is_empty() && community.channels.is_empty() {
+        tree = tree.child(div().px(px(8.)).py(px(8.)).type_small().text_color(theme::text_faint()).child("No channels yet."));
     }
     tree
 }
@@ -438,7 +584,8 @@ type Stateful = gpui::Stateful<Div>;
 
 fn category_editor(shell: &Shell, facts: &Facts, category: &TinyCategory, window: &mut Window, cx: &mut Context<Shell>) -> Div {
     let fields = &shell.tiny_state.settings_fields;
-    let rooms = facts.community.rooms.iter().filter(|room| room.category_id.as_deref() == Some(category.id.as_str())).count();
+    let count = facts.community.rooms.iter().filter(|room| room.category_id.as_deref() == Some(category.id.as_str())).count()
+        + facts.community.channels.iter().filter(|ch| ch.category_id.as_deref() == Some(category.id.as_str())).count();
     let mut column = div().flex().flex_col().gap(px(24.)).child(
         div()
             .flex()
@@ -446,7 +593,7 @@ fn category_editor(shell: &Shell, facts: &Facts, category: &TinyCategory, window
             .gap(px(10.))
             .child(glyph("icons/list.svg", 16., theme::text_faint()))
             .child(div().type_title().text_color(theme::text()).child(category.name.clone()))
-            .child(kit::count(rooms)),
+            .child(kit::count(count)),
     );
     column = column.child(if facts.may.categories {
         section("Category name").child(kit::input(&fields.category_name, Some(360.), window, cx))
@@ -612,7 +759,8 @@ fn room_editor(shell: &Shell, facts: &Facts, room: &TinyRoom, window: &mut Windo
             );
         }
         if community.has(TINY_FEATURE_ROLES) {
-            column = column.child(overrides(facts, room, draft, cx));
+            let may = community.allowed("community.rooms.overrides");
+            column = column.child(overrides_table(facts, &room.overrides, &SCOPED, super::roles::permission, may, draft, cx));
         }
     }
     if facts.may.delete_room {
@@ -635,10 +783,80 @@ fn room_editor(shell: &Shell, facts: &Facts, room: &TinyRoom, window: &mut Windo
     column
 }
 
-/// Per role, allow / inherit / deny for each permission a channel can change.
-fn overrides(facts: &Facts, room: &TinyRoom, draft: &Draft, cx: &mut Context<Shell>) -> Div {
+fn channel_editor(shell: &Shell, facts: &Facts, channel: &TinyChannel, window: &mut Window, cx: &mut Context<Shell>) -> Div {
     let community = facts.community;
-    let may = community.allowed("community.rooms.overrides");
+    let Some(overlay) = shell.tiny_state.settings.as_ref() else {
+        return div();
+    };
+    let draft = &overlay.channels;
+    let fields = &shell.tiny_state.settings_fields;
+    let can_manage = community
+        .access
+        .as_ref()
+        .map(|access| access.has_in_channel(channel, TINY_MANAGE_CHANNELS))
+        .unwrap_or(facts.may.edit_room);
+    let can_override = community
+        .access
+        .as_ref()
+        .map(|access| access.has(TINY_MANAGE_ROLES) && access.has_in_channel(channel, TINY_MANAGE_CHANNELS))
+        .unwrap_or_else(|| community.allowed("community.channels.overrides"));
+    let mut column = div().flex().flex_col().gap(px(24.)).child(
+        div()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .child(glyph("icons/hash.svg", 16., theme::text_faint()))
+            .child(div().type_title().text_color(theme::text()).child(channel.name.clone()))
+            .child(div().type_small().text_color(theme::text_faint()).child(if channel.e2ee {
+                "End-to-end encrypted"
+            } else {
+                "Not encrypted"
+            })),
+    );
+    column = column.child(if can_manage {
+        section("Channel name").child(kit::input(&fields.room_name, Some(360.), window, cx))
+    } else {
+        section("Channel name").child(div().type_ui().child(channel.name.clone()))
+    });
+    column = column.child(section("Topic").child(if can_manage {
+        kit::input(&fields.room_topic, None, window, cx)
+    } else {
+        div().type_ui().text_color(theme::text_soft()).child(if channel.topic.is_empty() { "No topic".to_owned() } else { channel.topic.clone() })
+    }));
+    if community.has(TINY_FEATURE_ROLES) {
+        column = column.child(overrides_table(facts, &channel.overrides, &TEXT_SCOPED, text_permission, can_override, draft, cx));
+    }
+    if can_manage {
+        let id = channel.id.clone();
+        column = column.child(div().h(px(1.)).bg(theme::hairline())).child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(12.))
+                .child(div().flex_1().min_w_0().whitespace_normal().type_small().text_color(theme::text_soft()).child("Deleting a channel removes its messages and files for everyone."))
+                .child(if shell.tiny_state.busy {
+                    button_disabled("Delete channel").into_any_element()
+                } else {
+                    button("tiny-channels-delete-text", ButtonKind::Danger, "Delete channel")
+                        .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_modal(Modal::DeleteChannel(id.clone()), window, cx)))
+                        .into_any_element()
+                }),
+        );
+    }
+    column
+}
+
+/// Per role, allow / inherit / deny for each permission in `scoped`.
+fn overrides_table(
+    facts: &Facts,
+    existing: &[TinyOverride],
+    scoped: &[u64],
+    label_of: fn(u64) -> (&'static str, &'static str),
+    may: bool,
+    draft: &Draft,
+    cx: &mut Context<Shell>,
+) -> Div {
+    let community = facts.community;
     let roles = super::roles::ordered(community);
     let role = draft.role.as_ref().and_then(|id| roles.iter().find(|role| role.id == *id).copied()).or_else(|| roles.iter().find(|role| role.default).copied()).or_else(|| roles.first().copied());
     let Some(role) = role else {
@@ -647,7 +865,7 @@ fn overrides(facts: &Facts, room: &TinyRoom, draft: &Draft, cx: &mut Context<She
     let mut chips = div().flex().flex_wrap().gap(px(6.));
     for (ix, each) in roles.iter().enumerate() {
         let on = each.id == role.id;
-        let has = override_of(room, draft, &each.id) != (0, 0);
+        let has = override_of_list(existing, draft, &each.id) != (0, 0);
         let dot = each.color.as_deref().and_then(model::hex).map(gpui::rgb).unwrap_or(theme::text_faint());
         let id = each.id.clone();
         chips = chips.child(
@@ -674,12 +892,12 @@ fn overrides(facts: &Facts, room: &TinyRoom, draft: &Draft, cx: &mut Context<She
         );
     }
     let editable = may && super::roles::editable(community, role);
-    let bits = override_of(room, draft, &role.id);
-    let after = effective(community, &role.id, &overrides_with(room, draft));
+    let bits = override_of_list(existing, draft, &role.id);
+    let after = effective(community, &role.id, &overrides_with_list(existing, draft));
     let mut table = card();
-    for (ix, bit) in SCOPED.iter().enumerate() {
+    for (ix, bit) in scoped.iter().enumerate() {
         let bit = *bit;
-        let (name, help) = super::roles::permission(bit);
+        let (name, help) = label_of(bit);
         let state = tri_of(bits, bit);
         let mut control = div().flex_none().p(px(2.)).rounded(px(theme::R_CONTROL)).bg(theme::field()).border_1().border_color(theme::border()).flex().gap(px(2.));
         for (cell_ix, tri) in [Tri::Deny, Tri::Inherit, Tri::Allow].into_iter().enumerate() {
@@ -711,7 +929,7 @@ fn overrides(facts: &Facts, room: &TinyRoom, draft: &Draft, cx: &mut Context<She
                 .flex()
                 .items_center()
                 .gap(px(14.))
-                .when(ix + 1 < SCOPED.len(), |row| row.border_b_1().border_color(theme::hairline()))
+                .when(ix + 1 < scoped.len(), |row| row.border_b_1().border_color(theme::hairline()))
                 .when(!editable, |row| row.opacity(0.6))
                 .child(
                     div()
@@ -799,5 +1017,31 @@ mod tests {
         let overrides = [TinyOverride { role_id: "everyone".into(), allow: 0, deny: TINY_SPEAK }, TinyOverride { role_id: "mod".into(), allow: TINY_SPEAK, deny: 0 }];
         assert_eq!(effective(&community, "everyone", &overrides) & TINY_SPEAK, 0);
         assert_eq!(effective(&community, "mod", &overrides) & (TINY_SPEAK | TINY_MUTE_MEMBERS), TINY_SPEAK | TINY_MUTE_MEMBERS);
+    }
+
+    #[test]
+    fn channel_override_changes_limits_to_text_bits_and_sets_or_clears() {
+        let channel = TinyChannel {
+            overrides: vec![
+                TinyOverride { role_id: "a".into(), allow: TINY_SPEAK, deny: 0 },
+                TinyOverride { role_id: "b".into(), allow: 0, deny: TINY_VIEW_CHANNEL },
+            ],
+            ..TinyChannel::new("ch-1", "general")
+        };
+        let mut draft = Draft::default();
+        draft.overrides.insert("a".into(), (TINY_SPEAK | TINY_VIDEO, 0)); // TINY_VIDEO masked out -> unchanged
+        draft.overrides.insert("b".into(), (0, 0)); // cleared
+        draft.overrides.insert("c".into(), (TINY_MANAGE_CHANNELS | TINY_CONNECT, TINY_SPEAK)); // TINY_CONNECT masked out
+        assert_eq!(
+            channel_override_changes(&channel, &draft),
+            vec![
+                ("b".to_owned(), None),
+                ("c".to_owned(), Some((TINY_MANAGE_CHANNELS, TINY_SPEAK))),
+            ]
+        );
+        let edit = channel_edit(&channel, "general ", "New topic");
+        assert_eq!(edit.name, None);
+        assert_eq!(edit.topic.as_deref(), Some("New topic"));
+        assert_eq!(edit.e2ee, None);
     }
 }

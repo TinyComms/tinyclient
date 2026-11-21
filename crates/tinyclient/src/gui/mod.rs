@@ -1024,6 +1024,7 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, a
         for url in urls {
             if (url.starts_with("tinyclient://join#") && protocol::parse_invite_link(&url).is_some())
                 || protocol::parse_room_link(&url).is_some()
+                || protocol::parse_message_link(&url).is_some()
             {
                 let mut queue = received.borrow_mut();
                 if queue.len() < 8 && !queue.contains(&url) { queue.push_back(url); }
@@ -1171,6 +1172,12 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, a
                             links.borrow_mut().pop_front();
                             let _ = window.update(cx, |shell, _, cx| {
                                 shell.tiny_open_room_link(&server, &room_id, cx);
+                            });
+                            cx.update(|cx| { cx.refresh_windows(); cx.activate(true); });
+                        } else if let Some((origin, conv_id, msg_id)) = protocol::parse_message_link(&next) {
+                            links.borrow_mut().pop_front();
+                            let _ = window.update(cx, |shell, _, cx| {
+                                shell.tiny_open_message_link(&origin, &conv_id, &msg_id, cx);
                             });
                             cx.update(|cx| { cx.refresh_windows(); cx.activate(true); });
                         } else if cx.update(|cx| signin::open_invite(&next, cx)) {

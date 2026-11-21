@@ -26,6 +26,7 @@ pub mod ipc;
 pub mod launch;
 pub mod link;
 mod message;
+pub mod otp;
 mod play;
 mod record;
 pub mod quarantine;
@@ -534,6 +535,12 @@ pub struct Conversation {
     /// Disappearing-messages timer in seconds (`None` or `Some(0)` means off).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disappearing: Option<u32>,
+    /// This account may delete other members' messages in this conversation (Tiny `manage_messages`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub moderate: bool,
+    /// This account may pin and unpin messages in this conversation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_pin: bool,
 }
 
 /// What became of my newest message, as its mark says it (`design/06-live-signals.md` §4).
@@ -599,6 +606,8 @@ impl Conversation {
             spam: false,
             rights: ConversationRights::default(),
             disappearing: None,
+            moderate: false,
+            can_pin: false,
         }
     }
 
@@ -1182,6 +1191,10 @@ impl DeleteScope {
     }
 }
 
+fn default_starred_limit() -> u32 {
+    50
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -1249,6 +1262,21 @@ pub enum Request {
         folder_add: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         folder_remove: Option<String>,
+    },
+    /// Star or unstar one message on the network (Google Messages).
+    StarMessage {
+        conversation: Key,
+        message_id: String,
+        starred: bool,
+    },
+    /// Starred messages across an account (or one conversation when set), newest first.
+    /// Answers `Response::Pinned { messages }`.
+    StarredMessages {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation: Option<Key>,
+        #[serde(default = "default_starred_limit")]
+        limit: u32,
     },
     /// Puts a reminder on one message, to be told about it when the time comes, or takes it
     /// back with `remind_at: None`. Local: nothing goes to any network. A time already past is
@@ -1432,6 +1460,14 @@ pub enum Request {
         private: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         group: Option<String>,
+    },
+    /// Starts a new group conversation with two or more members (by person id or phone number)
+    /// and an optional group name. Answers `Response::Conversation`.
+    CreateGroup {
+        account: AccountKey,
+        members: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
     },
     /// The thread a channel message starts. Discord only: its thread is a new channel, so this
     /// creates it and answers with that conversation. Slack and Teams name a thread from the
@@ -2078,6 +2114,22 @@ pub enum Request {
         account: AccountKey,
         room: TinyRoomEdit,
     },
+    /// Makes a text channel on a Tiny server. Answers `TinyChannelCreated`.
+    TinyChannelCreate {
+        account: AccountKey,
+        channel: TinyChannelEdit,
+    },
+    /// Changes a text channel's name, topic, category or position. Never sends `e2ee`.
+    TinyChannelUpdate {
+        account: AccountKey,
+        channel_id: String,
+        channel: TinyChannelEdit,
+    },
+    /// Deletes a text channel and its messages for everyone.
+    TinyChannelDelete {
+        account: AccountKey,
+        channel_id: String,
+    },
     /// Changes a room's name, category, place, topic, limit, bitrate, push-to-talk or video.
     TinyRoomUpdate {
         account: AccountKey,
@@ -2096,6 +2148,19 @@ pub enum Request {
     TinyOverrideClear {
         account: AccountKey,
         room_id: String,
+        role_id: String,
+    },
+    /// One role's allow and deny bits in one text channel (manage_roles and manage_channels).
+    TinyChannelOverrideSet {
+        account: AccountKey,
+        channel_id: String,
+        role_id: String,
+        allow: u64,
+        deny: u64,
+    },
+    TinyChannelOverrideClear {
+        account: AccountKey,
+        channel_id: String,
         role_id: String,
     },
     /// An invite with roles, a label, a use limit and an expiry (`invite_options`). Answers
@@ -2589,6 +2654,12 @@ pub enum Response {
     /// An invite that was just created. `code.token` is not kept.
     TinyCode {
         code: TinyCode,
+    },
+    /// A text channel that was just created, so the UI can open it.
+    TinyChannelCreated {
+        id: String,
+        #[serde(default)]
+        name: String,
     },
     /// One page of a Tiny server's audit, newest first. Fewer rows than the limit: the end.
     TinyAudit {

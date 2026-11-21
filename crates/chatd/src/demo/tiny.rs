@@ -17,7 +17,7 @@ use super::{Fallible, Seeder, Who};
 use crate::hub::Hub;
 use protocol::{
     AccountKey, Change, MediaKind, Network, Request, Response, TinyAccess, TinyAudit, TinyBan,
-    TinyCapabilities, TinyCategory, TinyCode, TinyCommunity, TinyInvite, TinyMember, TinyOverride,
+    TinyCapabilities, TinyCategory, TinyChannel, TinyCode, TinyCommunity, TinyInvite, TinyMember, TinyOverride,
     TinyBot, TinyRole, TinyRoleEdit, TinyRoom, TinySeat, TinyServerInfo, TINY_ALL, TINY_BAN_MEMBERS,
     TINY_CREATE_INVITES, TINY_DEAFEN_MEMBERS, TINY_DISCONNECT_MEMBERS, TINY_EVERYONE_DEFAULT,
     TINY_KICK_MEMBERS, TINY_MOVE_MEMBERS, TINY_MUTE_MEMBERS, TINY_PRIORITY_SPEAKER, TINY_SPEAK,
@@ -537,11 +537,46 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
         audit: audit_rows(),
         origin: ORIGIN.to_owned(),
         rooms: vec![lounge, music, raid, squad, afk],
+        channels: vec![
+            TinyChannel {
+                id: "chan-general".into(),
+                name: "general".into(),
+                topic: "Everything Night Shift.".into(),
+                category_id: Some("cat-hangout".into()),
+                position: 0,
+                e2ee: false,
+                overrides: Vec::new(),
+                my_permissions: Some(TINY_ALL),
+            },
+            TinyChannel {
+                id: "chan-music".into(),
+                name: "playlists".into(),
+                topic: "Drop tracks for Friday music night.".into(),
+                category_id: Some("cat-hangout".into()),
+                position: 1,
+                e2ee: false,
+                overrides: Vec::new(),
+                my_permissions: Some(TINY_ALL),
+            },
+            TinyChannel {
+                id: "chan-raid".into(),
+                name: "raid-plans".into(),
+                topic: "Tuesday strat notes.".into(),
+                category_id: Some("cat-games".into()),
+                position: 0,
+                e2ee: true,
+                overrides: vec![
+                    TinyOverride { role_id: EVERYONE.into(), allow: 0, deny: protocol::TINY_VIEW_CHANNEL },
+                    TinyOverride { role_id: RAID.into(), allow: protocol::TINY_VIEW_CHANNEL, deny: 0 },
+                ],
+                my_permissions: Some(TINY_ALL),
+            },
+        ],
         online: vec![OWNER, ME, DEV, LEILA, THEO, SAM, LENA, KOFI].into_iter().map(str::to_owned).collect(),
         media: "up".to_owned(),
         capabilities: TinyCapabilities {
             version: "0.4.0".to_owned(),
-            features: ["server", "roles", "categories", "bans", "timeouts", "invite_options", "audit_query", "voice_moderation", "upload_limits"]
+            features: ["server", "roles", "categories", "channel_layout", "bans", "timeouts", "invite_options", "audit_query", "voice_moderation", "upload_limits"]
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
@@ -1091,11 +1126,30 @@ pub fn answer(hub: &Hub, request: &Request) -> Option<Response> {
         }
         Request::TinyLayout { account, groups } if ours(account) => {
             for group in groups {
-                for (position, room_id) in group.room_ids.iter().enumerate() {
-                    if let Some(room) = community.rooms.iter_mut().find(|room| room.id == *room_id)
-                    {
-                        room.category_id = group.category_id.clone();
-                        room.position = position as i32;
+                if !group.items.is_empty() {
+                    for (position, item) in group.items.iter().enumerate() {
+                        match item.kind {
+                            protocol::TinyLayoutItemKind::Channel => {
+                                if let Some(ch) = community.channels.iter_mut().find(|ch| ch.id == item.id) {
+                                    ch.category_id = group.category_id.clone();
+                                    ch.position = position as i32;
+                                }
+                            }
+                            protocol::TinyLayoutItemKind::Room => {
+                                if let Some(room) = community.rooms.iter_mut().find(|room| room.id == item.id) {
+                                    room.category_id = group.category_id.clone();
+                                    room.position = position as i32;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    for (position, room_id) in group.room_ids.iter().enumerate() {
+                        if let Some(room) = community.rooms.iter_mut().find(|room| room.id == *room_id)
+                        {
+                            room.category_id = group.category_id.clone();
+                            room.position = position as i32;
+                        }
                     }
                 }
             }
@@ -1135,6 +1189,67 @@ pub fn answer(hub: &Hub, request: &Request) -> Option<Response> {
                 category_id: room.category_id.clone(),
                 ..TinyRoom::new(&id, room.name.as_deref().unwrap_or("New channel"))
             });
+            changed(community)
+        }
+        Request::TinyChannelCreate { account, channel } if ours(account) => {
+            let id = format!("chan-{}", community.channels.len() + 1);
+            let name = channel.name.as_deref().unwrap_or("new-channel").to_owned();
+            let target_cat = channel.category_id.as_deref().filter(|c| !c.is_empty()).map(str::to_owned);
+            let position = channel.position.unwrap_or_else(|| {
+                community
+                    .channels
+                    .iter()
+                    .filter(|ch| ch.category_id == target_cat)
+                    .map(|ch| ch.position)
+                    .max()
+                    .map(|m| m + 1)
+                    .unwrap_or(0)
+            });
+            community.channels.push(TinyChannel {
+                id: id.clone(),
+                name: name.clone(),
+                topic: channel.topic.clone().unwrap_or_default(),
+                category_id: target_cat,
+                position,
+                e2ee: channel.e2ee.unwrap_or(false),
+                overrides: Vec::new(),
+                my_permissions: Some(TINY_ALL),
+            });
+            let _ = changed(community);
+            Some(Response::TinyChannelCreated { id, name })
+        }
+        Request::TinyChannelUpdate { account, channel_id, channel: edit } if ours(account) => {
+            if let Some(ch) = community.channels.iter_mut().find(|ch| ch.id == *channel_id) {
+                if let Some(name) = &edit.name {
+                    ch.name = name.clone();
+                }
+                if let Some(topic) = &edit.topic {
+                    ch.topic = topic.clone();
+                }
+                if let Some(category_id) = &edit.category_id {
+                    ch.category_id = (!category_id.is_empty()).then(|| category_id.clone());
+                }
+                if let Some(position) = edit.position {
+                    ch.position = position;
+                }
+            }
+            changed(community)
+        }
+        Request::TinyChannelDelete { account, channel_id } if ours(account) => {
+            community.channels.retain(|ch| ch.id != *channel_id);
+            changed(community)
+        }
+        Request::TinyChannelOverrideSet { account, channel_id, role_id, allow, deny } if ours(account) => {
+            if let Some(ch) = community.channels.iter_mut().find(|ch| ch.id == *channel_id) {
+                ch.overrides.retain(|over| over.role_id != *role_id);
+                ch.overrides.push(TinyOverride { role_id: role_id.clone(), allow: *allow, deny: *deny });
+            }
+            changed(community)
+        }
+        Request::TinyChannelOverrideClear { account, channel_id, role_id } if ours(account) => {
+            if let Some(ch) = community.channels.iter_mut().find(|ch| ch.id == *channel_id) {
+                ch.overrides.retain(|over| over.role_id != *role_id);
+            }
             changed(community)
         }
         Request::TinyRoomDelete { account, room_id } if ours(account) => {

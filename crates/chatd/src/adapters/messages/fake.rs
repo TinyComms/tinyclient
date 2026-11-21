@@ -16,7 +16,7 @@
 //! WHO is `grace` or `alan`. `status` reports that code on the last text this computer sent.
 
 use super::{Drive, Event, Saved};
-use crate::adapters::messages::bugle::{Chat, Mark, MediaPart, Note, Participant, Piece, MESSAGE_PAGE, PHONE_QUIET, UNPAIRED};
+use crate::adapters::messages::bugle::{Chat, ContactEntry, Mark, MediaPart, Note, Participant, Piece, MESSAGE_PAGE, PHONE_QUIET, UNPAIRED};
 use crate::adapters::script;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -97,18 +97,24 @@ impl Fake {
                 updated: 0,
                 phones: false,
                 status: 1,
+                read_only: false,
+                verified: false,
                 participants: vec![
                     Participant {
                         id: ME.into(),
                         name: "Ada Quill".into(),
+                        first_name: "Ada".into(),
                         number: "+15550100001".into(),
                         is_me: true,
+                        color: Some(0x4285F4),
                     },
                     Participant {
                         id: GRACE_PARTICIPANT.into(),
                         name: "Grace Ombra".into(),
+                        first_name: "Grace".into(),
                         number: "+15550100002".into(),
                         is_me: false,
+                        color: Some(0x34A853),
                     },
                 ],
             },
@@ -123,24 +129,32 @@ impl Fake {
                 updated: 0,
                 phones: false,
                 status: 1,
+                read_only: false,
+                verified: false,
                 participants: vec![
                     Participant {
                         id: ME.into(),
                         name: "Ada Quill".into(),
+                        first_name: "Ada".into(),
                         number: "+15550100001".into(),
                         is_me: true,
+                        color: Some(0x4285F4),
                     },
                     Participant {
                         id: GRACE_PARTICIPANT.into(),
                         name: "Grace Ombra".into(),
+                        first_name: "Grace".into(),
                         number: "+15550100002".into(),
                         is_me: false,
+                        color: Some(0x34A853),
                     },
                     Participant {
                         id: "participant-alan".into(),
                         name: "Alan Ferro".into(),
+                        first_name: "Alan".into(),
                         number: "+15550100003".into(),
                         is_me: false,
+                        color: Some(0xEA4335),
                     },
                 ],
             },
@@ -326,6 +340,9 @@ fn note(
         wire: 0,
         phones: None,
         reply: String::new(),
+        edited: false,
+        edited_at: None,
+        starred: false,
     }
 }
 
@@ -408,6 +425,8 @@ fn listed(id: &str, title: &str, status: u64) -> Chat {
         updated: 0,
         phones: false,
         status,
+        read_only: false,
+        verified: false,
         participants: Vec::new(),
     }
 }
@@ -546,6 +565,40 @@ fn steer(line: &str) -> Vec<Event> {
             sent.reply = original;
             vec![Event::Message(sent)]
         }
+        "edited" => {
+            let Some((author, name)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let id = words.next().unwrap_or("").to_owned();
+            let text = rest(3);
+            let mut updated = note(author, name, author, &id, &text, false, Vec::new(), Vec::new());
+            updated.edited = true;
+            updated.edited_at = Some(crate::hub::now());
+            vec![Event::Message(updated)]
+        }
+        "starred" => {
+            let Some((author, name)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let id = words.next().unwrap_or("m-starred").to_owned();
+            let text = rest(3);
+            let mut starred = note(author, name, author, &id, &text, false, Vec::new(), Vec::new());
+            starred.starred = true;
+            vec![Event::Message(starred)]
+        }
+        "old-mine" => {
+            let Some((author, _)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let id = words.next().unwrap_or("m-old").to_owned();
+            let age: i64 = words.next().and_then(|s| s.parse().ok()).unwrap_or(1800);
+            let text = rest(4);
+            let mut old = note(ME, "Ada Quill", author, &id, &text, false, Vec::new(), Vec::new());
+            old.outgoing = true;
+            old.status = 2;
+            old.sent = crate::hub::now() - age;
+            vec![Event::Message(old)]
+        }
         "react" => {
             let Some((author, name)) = who(words.next().unwrap_or("")) else {
                 return Vec::new();
@@ -623,6 +676,8 @@ fn steer(line: &str) -> Vec<Event> {
                 updated: 0,
                 phones,
                 status: 0,
+                read_only: false,
+                verified: false,
                 participants: Vec::new(),
             }])]
         }
@@ -699,6 +754,8 @@ fn steer(line: &str) -> Vec<Event> {
                 updated: 0,
                 phones: false,
                 status: 3,
+                read_only: false,
+                verified: false,
                 participants: Vec::new(),
             }])]
         }
@@ -722,8 +779,166 @@ fn steer(line: &str) -> Vec<Event> {
                 updated: 0,
                 phones: false,
                 status: 1,
+                read_only: false,
+                verified: false,
                 participants: Vec::new(),
             }])]
+        }
+        "noreply" => {
+            let id = words.next().unwrap_or("phone-bank");
+            let sender = words.next().unwrap_or("BANKOTP");
+            vec![Event::Chats(vec![Chat {
+                id: id.into(),
+                title: sender.into(),
+                mine: ME.into(),
+                peer: format!("participant-{id}"),
+                status: 1,
+                participants: vec![
+                    Participant {
+                        id: ME.into(),
+                        name: "Ada Quill".into(),
+                        number: "+15550100001".into(),
+                        is_me: true,
+                        ..Participant::default()
+                    },
+                    Participant {
+                        id: format!("participant-{id}"),
+                        name: sender.into(),
+                        number: sender.into(),
+                        is_me: false,
+                        ..Participant::default()
+                    },
+                ],
+                ..Chat::default()
+            }])]
+        }
+        "shortcode" => {
+            let id = words.next().unwrap_or("phone-short");
+            let code = words.next().unwrap_or("89203");
+            vec![Event::Chats(vec![Chat {
+                id: id.into(),
+                title: code.into(),
+                mine: ME.into(),
+                peer: format!("participant-{id}"),
+                status: 1,
+                participants: vec![
+                    Participant {
+                        id: ME.into(),
+                        name: "Ada Quill".into(),
+                        number: "+15550100001".into(),
+                        is_me: true,
+                        ..Participant::default()
+                    },
+                    Participant {
+                        id: format!("participant-{id}"),
+                        name: code.into(),
+                        number: code.into(),
+                        is_me: false,
+                        ..Participant::default()
+                    },
+                ],
+                ..Chat::default()
+            }])]
+        }
+        "verified" => {
+            let id = words.next().unwrap_or("phone-biz");
+            let name = rest(2);
+            let title = if name.is_empty() { "Acme Bank".into() } else { name };
+            vec![Event::Chats(vec![Chat {
+                id: id.into(),
+                title: title.clone(),
+                mine: ME.into(),
+                peer: format!("participant-{id}"),
+                carrier: 3,
+                status: 1,
+                verified: true,
+                participants: vec![
+                    Participant {
+                        id: ME.into(),
+                        name: "Ada Quill".into(),
+                        number: "+15550100001".into(),
+                        is_me: true,
+                        ..Participant::default()
+                    },
+                    Participant {
+                        id: format!("participant-{id}"),
+                        name: title,
+                        number: "+18005550199".into(),
+                        is_me: false,
+                        ..Participant::default()
+                    },
+                ],
+                ..Chat::default()
+            }])]
+        }
+        "emergency" => {
+            let id = words.next().unwrap_or("phone-911");
+            let number = words.next().unwrap_or("911");
+            vec![Event::Chats(vec![Chat {
+                id: id.into(),
+                title: number.into(),
+                mine: ME.into(),
+                peer: format!("participant-{id}"),
+                status: 1,
+                participants: vec![
+                    Participant {
+                        id: ME.into(),
+                        name: "Ada Quill".into(),
+                        number: "+15550100001".into(),
+                        is_me: true,
+                        ..Participant::default()
+                    },
+                    Participant {
+                        id: format!("participant-{id}"),
+                        name: number.into(),
+                        number: number.into(),
+                        is_me: false,
+                        ..Participant::default()
+                    },
+                ],
+                ..Chat::default()
+            }])]
+        }
+        "unknown-link" => {
+            let number = words.next().unwrap_or("+15550199888");
+            let text = rest(2);
+            let conv_id = format!("phone-unk-{}", number.trim_start_matches('+'));
+            vec![
+                Event::Chats(vec![Chat {
+                    id: conv_id.clone(),
+                    title: number.into(),
+                    mine: ME.into(),
+                    peer: format!("participant-{conv_id}"),
+                    status: 1,
+                    participants: vec![
+                        Participant {
+                            id: ME.into(),
+                            name: "Ada Quill".into(),
+                            number: "+15550100001".into(),
+                            is_me: true,
+                            ..Participant::default()
+                        },
+                        Participant {
+                            id: format!("participant-{conv_id}"),
+                            name: number.into(),
+                            number: number.into(),
+                            is_me: false,
+                            ..Participant::default()
+                        },
+                    ],
+                    ..Chat::default()
+                }]),
+                Event::Message(note(
+                    &format!("participant-{conv_id}"),
+                    number,
+                    &conv_id,
+                    &format!("m-unk-{}", text.len()),
+                    &text,
+                    false,
+                    Vec::new(),
+                    Vec::new(),
+                )),
+            ]
         }
         _ => Vec::new(),
     }
@@ -847,9 +1062,114 @@ impl Drive for Fake {
         record(&format!("thumbnails {}", participants.join(" ")));
         Ok(participants
             .iter()
-            .filter(|participant| *participant == GRACE_PARTICIPANT)
+            .filter(|participant| *participant == GRACE_PARTICIPANT || *participant == "participant-alan")
             .map(|participant| (participant.clone(), png()))
             .collect())
+    }
+    fn contacts(&self) -> Result<Vec<ContactEntry>, String> {
+        self.unanswered()?;
+        record("contacts");
+        Ok(vec![
+            ContactEntry {
+                id: "contact-grace".into(),
+                participant_id: GRACE_PARTICIPANT.into(),
+                name: "Grace Ombra".into(),
+                number: "+15550100002".into(),
+                formatted_number: "(555) 010-0002".into(),
+            },
+            ContactEntry {
+                id: "contact-alan".into(),
+                participant_id: "participant-alan".into(),
+                name: "Alan Ferro".into(),
+                number: "+15550100003".into(),
+                formatted_number: "(555) 010-0003".into(),
+            },
+            ContactEntry {
+                id: "contact-linnea".into(),
+                participant_id: "participant-linnea".into(),
+                name: "Linnea Sol".into(),
+                number: "+15550100004".into(),
+                formatted_number: "(555) 010-0004".into(),
+            },
+        ])
+    }
+    fn get_or_create_conversation(
+        &self,
+        numbers: &[String],
+        group_name: Option<&str>,
+    ) -> Result<Chat, String> {
+        self.unanswered()?;
+        if let Some(words) = self.refusal() {
+            return Err(words);
+        }
+        let line = match group_name.filter(|n| !n.trim().is_empty()) {
+            Some(name) => format!("create {} {}", numbers.join(","), name.trim()),
+            None => format!("create {}", numbers.join(",")),
+        };
+        record(&line);
+        let group = numbers.len() > 1;
+        let id = if !group && numbers.first().map(String::as_str) == Some("+15550100002") {
+            GRACE.to_owned()
+        } else if group {
+            format!("phone-group-{}", numbers.len())
+        } else {
+            format!("phone-new-{}", numbers.first().map(|s| s.trim_start_matches('+')).unwrap_or("x"))
+        };
+        let mut participants = vec![Participant {
+            id: ME.into(),
+            name: "Ada Quill".into(),
+            first_name: "Ada".into(),
+            number: "+15550100001".into(),
+            is_me: true,
+            color: Some(0x4285F4),
+        }];
+        let mut names = Vec::new();
+        for num in numbers {
+            let (pid, name) = match num.as_str() {
+                "+15550100002" => (GRACE_PARTICIPANT.to_owned(), "Grace Ombra".to_owned()),
+                "+15550100003" => ("participant-alan".to_owned(), "Alan Ferro".to_owned()),
+                "+15550100004" => ("participant-linnea".to_owned(), "Linnea Sol".to_owned()),
+                other => (format!("participant-{}", other.trim_start_matches('+')), other.to_owned()),
+            };
+            names.push(name.clone());
+            participants.push(Participant {
+                id: pid,
+                name,
+                first_name: String::new(),
+                number: num.clone(),
+                is_me: false,
+                color: None,
+            });
+        }
+        let title = if let Some(name) = group_name.filter(|n| !n.trim().is_empty()) {
+            name.trim().to_owned()
+        } else if names.len() == 1 {
+            names[0].clone()
+        } else {
+            names.join(", ")
+        };
+        let peer = if !group {
+            participants.iter().find(|p| !p.is_me).map(|p| p.id.clone()).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let chat = Chat {
+            id,
+            title,
+            group,
+            unread: false,
+            mine: ME.into(),
+            peer,
+            carrier: 2, // RCS reachable
+            updated: crate::hub::now(),
+            phones: false,
+            status: 1,
+            read_only: false,
+            verified: false,
+            participants,
+        };
+        let _ = self.events.send(Event::Chats(vec![chat.clone()]));
+        Ok(chat)
     }
     fn mark_read(&self, conversation: &str, message: &str) -> Result<(), String> {
         record(&format!("read {conversation} {message}"));
@@ -861,6 +1181,22 @@ impl Drive for Fake {
     }
     fn delete_message(&self, message: &str) -> Result<(), String> {
         record(&format!("delete {message}"));
+        Ok(())
+    }
+    fn edit_message(&self, conversation: &str, message: &str, text: &str) -> Result<(), String> {
+        self.unanswered()?;
+        if let Some(words) = self.refusal() {
+            return Err(words);
+        }
+        record(&format!("edit {conversation} {message} {text}"));
+        Ok(())
+    }
+    fn star_message(&self, conversation: &str, message: &str, starred: bool) -> Result<(), String> {
+        self.unanswered()?;
+        if let Some(words) = self.refusal() {
+            return Err(words);
+        }
+        record(&format!("star {conversation} {message} {}", u8::from(starred)));
         Ok(())
     }
     fn delete_conversation(&self, conversation: &str) -> Result<(), String> {

@@ -55,6 +55,7 @@ impl Bus {
         follow(proxy.clone(), "ActionInvoked", ids.clone(), |id, action| match action.as_str() {
             "default" => Some(Activation::Open(id)),
             "read" => Some(Activation::MarkRead(id)),
+            "copy" => Some(Activation::CopyCode(id)),
             "accept" => Some(Activation::Accept(id)),
             "decline" => Some(Activation::Decline(id)),
             _ => None,
@@ -70,13 +71,16 @@ impl Sink for Bus {
             return Err(self.broken.clone());
         };
         let replaces = lock(&self.ids).server.get(&note.id).copied().unwrap_or(0);
-        let actions: Vec<&str> = match note.kind {
+        let mut actions: Vec<&str> = match note.kind {
             Kind::Message => vec!["default", "Open", "inline-reply", "Reply", "read", "Mark as read"],
             Kind::ReadOnly => vec!["default", "Open", "read", "Mark as read"],
             Kind::Call => vec!["default", "Open", "accept", "Accept", "decline", "Decline"],
             Kind::CallOnPhone => vec!["default", "Answer on your phone"],
             Kind::Plain => vec!["default", "Open"],
         };
+        if note.copy_code.is_some() && matches!(note.kind, Kind::Message | Kind::ReadOnly) {
+            actions.extend_from_slice(&["copy", "Copy code"]);
+        }
         let mut hints: HashMap<&str, Value> = HashMap::new();
         hints.insert("suppress-sound", Value::from(true));
         hints.insert("desktop-entry", Value::from(self.app.id.as_str()));

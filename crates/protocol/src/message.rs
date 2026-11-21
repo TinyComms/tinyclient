@@ -557,6 +557,9 @@ pub struct Message {
     /// is gone; the row stays so the thread has somewhere to hang.
     #[serde(default, skip_serializing_if = "is_false")]
     pub deleted: bool,
+    /// Removed by a moderator rather than the author (Tiny `deleted_by`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub moderated: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub edited: bool,
     /// Unix seconds of the last edit, from a network that hands one over. `None`: never
@@ -570,6 +573,9 @@ pub struct Message {
     pub prior_text: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub pinned: bool,
+    /// Starred on the network (Google Messages).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub starred: bool,
     /// How many people saw a channel's post, when the network counts them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub views: Option<u32>,
@@ -690,10 +696,12 @@ impl Message {
             card: None,
             poll: None,
             deleted: false,
+            moderated: false,
             edited: false,
             edited_at: None,
             prior_text: None,
             pinned: false,
+            starred: false,
             views: None,
             mentions_me: false,
             kind: MessageKind::Normal,

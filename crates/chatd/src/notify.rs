@@ -242,7 +242,9 @@ pub fn decide_ring(values: &Values, conversation: &Key, moment: &Moment) -> Opti
 }
 
 /// `direct` is a one-to-one conversation. A Tiny direct rings even when Tiny server
-/// notifications are off, the same way a Tiny direct message does.
+/// notifications are off, the same way a Tiny direct message does. A muted direct message
+/// (conversation-scoped `NOTIFY_ABOUT = "off"`) still rings for calls; only silencing the whole
+/// account or turning incoming calls off stops it.
 pub fn decide_ring_in(
     values: &Values,
     conversation: &Key,
@@ -250,7 +252,12 @@ pub fn decide_ring_in(
     direct: bool,
 ) -> Option<Verdict> {
     let calls = values.word(GLOBAL, settings::CALLS);
-    if calls == "off" || level(values, conversation) == "off" || moment.dnd {
+    let silenced = if direct {
+        values.stored(&settings::account_scope(&conversation.account()), settings::NOTIFY_ABOUT) == Some("off")
+    } else {
+        level(values, conversation) == "off"
+    };
+    if calls == "off" || silenced || moment.dnd {
         return None;
     }
     if conversation.network == Network::Tiny && !direct && !values.on(settings::NOTIFY_TINY) {
@@ -328,6 +335,8 @@ pub struct Notes {
     groups: HashMap<Key, Group>,
     /// Note ids back to their conversations, for what the user does with one.
     ids: HashMap<String, Key>,
+    /// Detected one-time code for a currently posted notification, when previews are shown.
+    codes: HashMap<String, String>,
     ringing: Option<Key>,
     ringing_busy: bool,
     sounded: Option<Instant>,
@@ -335,12 +344,17 @@ pub struct Notes {
 
 impl Notes {
     pub fn new(sink: Box<dyn Sink>) -> Notes {
-        Notes { sink, groups: HashMap::new(), ids: HashMap::new(), ringing: None, ringing_busy: false, sounded: None }
+        Notes { sink, groups: HashMap::new(), ids: HashMap::new(), codes: HashMap::new(), ringing: None, ringing_busy: false, sounded: None }
     }
 
     /// The conversation a note is about.
     pub fn conversation(&self, id: &str) -> Option<&Key> {
         self.ids.get(id)
+    }
+
+    /// The detected one-time code for a note, if previews were shown.
+    pub fn code(&self, id: &str) -> Option<&str> {
+        self.codes.get(id).map(String::as_str)
     }
 
     /// The parts of `Moment` this keeps: whether a sound was heard lately.
@@ -378,6 +392,11 @@ impl Notes {
         let locked = app_locked();
         let (title, subtitle, body, can_reply) = redact_for_app_lock(title, subtitle, body, !conversation.read_only, locked);
         let id = note_id(key);
+        let copy_code = if verdict.preview == Preview::Full && !locked && !message.outgoing {
+            protocol::otp::extract_code(&message.text)
+        } else {
+            None
+        };
         let note = Note {
             id: id.clone(),
             title,
@@ -391,10 +410,16 @@ impl Notes {
             },
             sound: verdict.sound.as_deref().filter(|word| system_plays(word)).and_then(sound_file),
             locked_body: if locked { "New message".to_owned() } else { what.to_owned() },
+            copy_code: copy_code.clone(),
         };
         if let Err(err) = self.sink.post(&note) {
             tracing::warn!("chatd: notification not shown: {err}");
             return None;
+        }
+        if let Some(code) = copy_code {
+            self.codes.insert(id.clone(), code);
+        } else {
+            self.codes.remove(&id);
         }
         self.ids.insert(id, key.clone());
         let sound = verdict.sound.clone()?;
@@ -438,6 +463,7 @@ impl Notes {
             reply_hint: String::new(),
             sound: verdict.sound.as_deref().filter(|word| system_plays(word)).and_then(sound_file),
             locked_body: "New reaction".to_owned(),
+            copy_code: None,
         };
         if let Err(err) = self.sink.post(&note) {
             tracing::warn!("chatd: reaction notification not shown: {err}");
@@ -460,6 +486,7 @@ impl Notes {
             let id = note_id(conversation);
             self.sink.withdraw(&id);
             self.ids.remove(&id);
+            self.codes.remove(&id);
         }
     }
 
@@ -482,6 +509,7 @@ impl Notes {
             reply_hint: String::new(),
             sound: None,
             locked_body: "Reminder".to_owned(),
+            copy_code: None,
         };
         if let Err(err) = self.sink.post(&note) {
             tracing::warn!("chatd: reminder not shown: {err}");
@@ -530,6 +558,7 @@ impl Notes {
                     reply_hint: String::new(),
                     sound: verdict.sound.as_deref().filter(|word| system_plays(word)).and_then(sound_file),
                     locked_body: "Incoming call".to_owned(),
+                    copy_code: None,
                 };
                 if let Err(err) = self.sink.post(&note) {
                     tracing::warn!("chatd: ring not shown: {err}");
@@ -571,6 +600,7 @@ impl Notes {
             reply_hint: String::new(),
             sound: verdict.sound.as_deref().filter(|word| system_plays(word)).and_then(sound_file),
             locked_body: "Incoming call".to_owned(),
+            copy_code: None,
         };
         if let Err(err) = self.sink.post(&note) {
             tracing::warn!("chatd: ring not shown: {err}");
@@ -619,6 +649,7 @@ impl Notes {
             reply_hint: String::new(),
             sound: sound.as_deref().filter(|word| system_plays(word)).and_then(sound_file),
             locked_body: "New message".to_owned(),
+            copy_code: None,
         };
         match self.sink.post(&note) {
             Ok(()) => {
@@ -865,6 +896,18 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
                 let Ok(Some(row)) = hub.store().conversation(&conversation) else {
                     continue;
                 };
+                // Never notify for messages from a blocked person (channels or directs, including mentions).
+                let sender_id = if !message.sender.id.is_empty() {
+                    Some(message.sender.id.as_str())
+                } else {
+                    row.peer.as_deref()
+                };
+                if let Some(id) = sender_id {
+                    let person_key = Key::new(&conversation.account(), id);
+                    if hub.store().person(&person_key).ok().flatten().is_some_and(|p| p.relation == protocol::Relation::Blocked) {
+                        continue;
+                    }
+                }
                 let at = Instant::now();
                 let mut moment = moment(hub, &conversation, &notes, at);
                 if decide(&values, &row, &message, &moment).is_none() {
@@ -930,6 +973,17 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
                 let (verdict, place) = match &ringing {
                     Some(key) => {
                         let row = hub.store().conversation(key).ok().flatten();
+                        let blocked_peer = row
+                            .as_ref()
+                            .and_then(|row| row.peer.as_deref())
+                            .is_some_and(|peer| {
+                                let person_key = Key::new(&key.account(), peer);
+                                hub.store()
+                                    .person(&person_key)
+                                    .ok()
+                                    .flatten()
+                                    .is_some_and(|p| p.relation == protocol::Relation::Blocked)
+                            });
                         let direct = row.as_ref().is_some_and(|row| row.kind.is_direct());
                         let place = row
                             .filter(|row| row.kind != ConversationKind::Direct)
@@ -939,7 +993,12 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
                             dnd: dnd(hub, key),
                             ..moment(hub, key, &notes, Instant::now())
                         };
-                        (decide_ring_in(&values, key, &moment, direct), place)
+                        let verdict = if blocked_peer {
+                            None
+                        } else {
+                            decide_ring_in(&values, key, &moment, direct)
+                        };
+                        (verdict, place)
                     }
                     None => (None, String::new()),
                 };
@@ -1075,7 +1134,11 @@ fn open(hub: &Hub, conversation: &Key) {
 fn act(hub: &Hub, chat: &Weak<Chat>, notes: &Notes, done: Activation) {
     let Some(chat) = chat.upgrade() else { return };
     let id = match &done {
-        Activation::Open(id) | Activation::MarkRead(id) | Activation::Accept(id) | Activation::Decline(id) => id,
+        Activation::Open(id)
+        | Activation::MarkRead(id)
+        | Activation::CopyCode(id)
+        | Activation::Accept(id)
+        | Activation::Decline(id) => id,
         Activation::Reply { id, .. } => id,
     };
     // The test notification is about nothing.
@@ -1091,6 +1154,16 @@ fn act(hub: &Hub, chat: &Weak<Chat>, notes: &Notes, done: Activation) {
     match done {
         Activation::Open(_) => open(hub, &conversation),
         Activation::MarkRead(_) => read(&chat),
+        Activation::CopyCode(id) => {
+            if app_locked() {
+                return;
+            }
+            if let Some(code) = notes.code(&id) {
+                if let Err(err) = notifier::copy_text(code) {
+                    tracing::warn!("chatd: could not copy code from notification: {err}");
+                }
+            }
+        }
         Activation::Reply { text, .. } => {
             if app_locked() {
                 tracing::warn!("chatd: reply from a notification not sent: tinyclient is locked");

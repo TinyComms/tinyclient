@@ -387,6 +387,12 @@ pub enum Command {
         group: Option<String>,
         reply: Reply<String>,
     },
+    /// Create a group conversation with two or more members (person ids or phone numbers) and an optional name.
+    CreateGroup {
+        members: Vec<String>,
+        name: Option<String>,
+        reply: Reply<String>,
+    },
     /// The id of the thread a channel message starts. Discord only: create the thread channel,
     /// record it, and answer with its id. `name` is already one line, at most 100 characters.
     StartThread {
@@ -432,6 +438,13 @@ pub enum Command {
         archived: Option<bool>,
         folder_add: Option<String>,
         folder_remove: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Star or unstar one message on the network (Google Messages).
+    StarMessage {
+        conversation_id: String,
+        message_id: String,
+        starred: bool,
         reply: Reply<()>,
     },
     /// Accept or decline/ignore a message request (Discord).
@@ -595,6 +608,7 @@ impl Command {
             | Command::StartDirectCall { reply, .. }
             | Command::StartGroup { reply, .. }
             | Command::CreateChannel { reply, .. }
+            | Command::CreateGroup { reply, .. }
             | Command::StartThread { reply, .. }
             | Command::Handoff { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
@@ -608,7 +622,8 @@ impl Command {
             | Command::CloseDirect { reply, .. }
             | Command::ClearHistory { reply, .. }
             | Command::Star { reply, .. }
-            | Command::File { reply, .. } => {
+            | Command::File { reply, .. }
+            | Command::StarMessage { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::Pinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1126,6 +1141,16 @@ impl Context {
     pub fn deleted(&self, conversation_id: &str, message_id: &str) -> Stores {
         let conversation = self.key(conversation_id);
         if self.hub.store().delete_message(&conversation, message_id)? {
+            self.hub.changed(Change::Messages { conversation });
+        }
+        Ok(())
+    }
+
+    /// A moderator removed another member's message. Kept as a tombstone with `moderated = true`
+    /// and its text, attachments, and reactions cleared.
+    pub fn deleted_by_moderator(&self, conversation_id: &str, message_id: &str) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().delete_message_moderated(&conversation, message_id)? {
             self.hub.changed(Change::Messages { conversation });
         }
         Ok(())
