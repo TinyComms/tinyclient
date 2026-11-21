@@ -166,6 +166,7 @@ pub struct State {
     pub switcher: Option<switcher::Switcher>,
     pub create_channel: Option<CreateChannelModal>,
     pub join_server: Option<JoinServerModal>,
+    pub create_server: Option<CreateServerModal>,
     /// Confirmation modal before leaving a Space (`(space_key, space_name)`).
     pub leave_space: Option<(Key, String)>,
 }
@@ -174,6 +175,15 @@ pub struct JoinServerModal {
     pub account: AccountKey,
     pub input: Entity<crate::gui::input::TextInput>,
     pub preview: Option<protocol::InvitePreview>,
+    pub error: Option<String>,
+    pub busy: bool,
+}
+
+pub struct CreateServerModal {
+    pub account: AccountKey,
+    pub name: Entity<crate::gui::input::TextInput>,
+    pub icon_path: Option<String>,
+    pub template: String,
     pub error: Option<String>,
     pub busy: bool,
 }
@@ -299,6 +309,7 @@ impl State {
             switcher: None,
             create_channel: None,
             join_server: None,
+            create_server: None,
             leave_space: None,
         }
     }
@@ -2384,6 +2395,225 @@ impl Shell {
                 .justify_center()
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                     this.sidebar_state.join_server = None;
+                    cx.notify();
+                }))
+                .child(card),
+        )
+    }
+
+    pub(super) fn open_create_server(&mut self, account: AccountKey, cx: &mut Context<Self>) {
+        let name = cx.new(|cx| crate::gui::input::TextInput::new("Server name", cx));
+        self.sidebar_state.create_server = Some(CreateServerModal {
+            account,
+            name,
+            icon_path: None,
+            template: String::new(),
+            error: None,
+            busy: false,
+        });
+        cx.notify();
+    }
+
+    fn pick_create_server_icon(&mut self, cx: &mut Context<Self>) {
+        let asked = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose server picture".into()),
+        });
+        cx.spawn(async move |shell, cx| {
+            if let Ok(Ok(Some(paths))) = asked.await {
+                if let Some(path) = paths.into_iter().next() {
+                    let _ = shell.update(cx, |this, cx| {
+                        if let Some(modal) = this.sidebar_state.create_server.as_mut() {
+                            modal.icon_path = Some(path.to_string_lossy().into_owned());
+                            modal.error = None;
+                            cx.notify();
+                        }
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn submit_create_server(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.sidebar_state.create_server.as_mut() else {
+            return;
+        };
+        if modal.busy {
+            return;
+        }
+        let name = modal.name.read(cx).text().trim().to_owned();
+        if !(2..=100).contains(&name.chars().count()) {
+            modal.error = Some("Server name must be between 2 and 100 characters.".to_owned());
+            cx.notify();
+            return;
+        }
+        modal.busy = true;
+        modal.error = None;
+        let account = modal.account.clone();
+        let icon = modal.icon_path.clone();
+        let template = (!modal.template.is_empty()).then(|| modal.template.clone());
+        cx.notify();
+        let req = Request::CreateSpace { account, name, icon, template };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| match answer {
+                Ok(Response::SpaceCreated { space, .. }) => {
+                    this.sidebar_state.create_server = None;
+                    this.go(Mode::Space(space), cx);
+                    this.toast(Some(("icons/check.svg", theme::text_soft())), "Server created", cx);
+                    cx.notify();
+                }
+                Ok(Response::Error { detail, .. }) => {
+                    if let Some(modal) = this.sidebar_state.create_server.as_mut() {
+                        modal.busy = false;
+                        modal.error = Some(detail);
+                    }
+                    cx.notify();
+                }
+                Ok(_) => {
+                    if let Some(modal) = this.sidebar_state.create_server.as_mut() {
+                        modal.busy = false;
+                        modal.error = Some("Could not create server.".to_owned());
+                    }
+                    cx.notify();
+                }
+                Err(err) => {
+                    if let Some(modal) = this.sidebar_state.create_server.as_mut() {
+                        modal.busy = false;
+                        modal.error = Some(err.to_string());
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(in crate::gui) fn create_server_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let modal = self.sidebar_state.create_server.as_ref()?;
+        let trimmed = modal.name.read(cx).text().trim().chars().count();
+        let ready = (2..=100).contains(&trimmed) && !modal.busy;
+        let icon_label = modal
+            .icon_path
+            .as_deref()
+            .and_then(|p| std::path::Path::new(p).file_name())
+            .map(|n| n.to_string_lossy().into_owned());
+        let templates = [
+            ("", "Blank"),
+            ("gaming", "Gaming"),
+            ("study", "Study Group"),
+            ("friends", "Friends"),
+            ("community", "Community"),
+        ];
+        let mut template_bar = div().flex().flex_wrap().gap(px(6.));
+        for (ix, (id, label)) in templates.into_iter().enumerate() {
+            let selected = modal.template == id;
+            let value = id.to_owned();
+            template_bar = template_bar.child(
+                segment(("create-server-tpl", ix), label, selected)
+                    .px(px(8.))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(modal) = this.sidebar_state.create_server.as_mut() {
+                            modal.template = value.clone();
+                            cx.notify();
+                        }
+                    })),
+            );
+        }
+        let icon_row = div()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .child(
+                button("create-server-icon", ButtonKind::Secondary, "Choose picture…").on_click(
+                    cx.listener(|this, _, _, cx| this.pick_create_server_icon(cx)),
+                ),
+            )
+            .children(icon_label.map(|name| {
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .type_small()
+                    .text_color(theme::text_soft())
+                    .child(name)
+            }))
+            .when(modal.icon_path.is_some(), |row| {
+                row.child(button("create-server-icon-clear", ButtonKind::Ghost, "Clear").on_click(
+                    cx.listener(|this, _, _, cx| {
+                        if let Some(modal) = this.sidebar_state.create_server.as_mut() {
+                            modal.icon_path = None;
+                            cx.notify();
+                        }
+                    }),
+                ))
+            });
+        let card = div()
+            .id("create-server-card")
+            .w(px(400.))
+            .max_w_full()
+            .p(px(16.))
+            .rounded(px(theme::R_FLOAT))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().type_title().text_color(theme::text()).child("Create a server"))
+            .child(div().type_small().text_color(theme::text_soft()).child("Name"))
+            .child(
+                div()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::canvas())
+                    .border_1()
+                    .border_color(theme::border())
+                    .type_ui()
+                    .child(modal.name.clone()),
+            )
+            .child(div().type_small().text_color(theme::text_soft()).child("Picture (optional)"))
+            .child(icon_row)
+            .child(div().type_small().text_color(theme::text_soft()).child("Template"))
+            .child(template_bar)
+            .children(modal.error.as_ref().map(|err| div().type_small().text_color(theme::danger()).child(err.clone())))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(button("create-server-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_state.create_server = None;
+                        cx.notify();
+                    })))
+                    .child(
+                        button(
+                            "create-server-submit",
+                            ButtonKind::Primary,
+                            if modal.busy { "Creating…" } else { "Create" },
+                        )
+                        .when(ready, |b| {
+                            b.on_click(cx.listener(|this, _, _, cx| this.submit_create_server(cx)))
+                        }),
+                    ),
+            );
+        Some(
+            div()
+                .id("create-server-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(gpui::rgba(0x0000_0066))
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.sidebar_state.create_server = None;
                     cx.notify();
                 }))
                 .child(card),

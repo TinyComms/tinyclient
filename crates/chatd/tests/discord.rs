@@ -5121,3 +5121,79 @@ fn space_info_shows_banner_boosts_verified_mark_description_and_updates_on_guild
         other => panic!("expected updated Response::SpaceInfo, got {other:?}"),
     }
 }
+
+#[test]
+fn create_space_posts_guild_handles_templates_icon_and_refusals() {
+    let world = World::start();
+    let account = AccountKey { network: Network::Discord, account: "1000".into() };
+
+    // Capability is advertised for Discord accounts.
+    match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => {
+            let discord = accounts.iter().find(|a| a.key == account).expect("discord account");
+            assert!(discord.can.create_space);
+        }
+        other => panic!("expected Response::Status, got {other:?}"),
+    }
+
+    // 1. Short name (1 char) is refused locally before hitting Discord.
+    match world.ask(Request::CreateSpace {
+        account: account.clone(),
+        name: "x".into(),
+        icon: None,
+        template: None,
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("2 and 100"), "got: {detail}"),
+        other => panic!("expected local refusal for short name, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("POST", "/guilds").is_empty());
+
+    // 2. Create a server with a template and a staged PNG icon inside outbox.
+    let outbox = world.dir.join("outbox");
+    std::fs::create_dir_all(&outbox).unwrap();
+    let icon_path = outbox.join("server-icon.png");
+    std::fs::write(&icon_path, b"\x89PNG\r\n\x1a\nfake-png-bytes").unwrap();
+    world.discord.script(
+        "/guilds",
+        201,
+        json!({"id": "7700", "name": "Game Night", "system_channel_id": "7701"}),
+    );
+    match world.ask(Request::CreateSpace {
+        account: account.clone(),
+        name: "Game Night".into(),
+        icon: Some(icon_path.to_string_lossy().into_owned()),
+        template: Some("gaming".into()),
+    }) {
+        Response::SpaceCreated { space, conversation } => {
+            assert_eq!(space.id, "7700");
+            assert_eq!(conversation.map(|k| k.id), Some("7701".into()));
+        }
+        other => panic!("expected Response::SpaceCreated, got {other:?}"),
+    }
+    let posts = world.discord.requests_to("POST", "/guilds");
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].body["name"], "Game Night");
+    assert!(posts[0].body["icon"].as_str().unwrap().starts_with("data:image/png;base64,"));
+    assert!(posts[0].body["channels"].as_array().unwrap().len() >= 4);
+    assert_eq!(posts[0].body["system_channel_id"], "2");
+
+    // 3. Error translations: server limit (30001), unverified email (40002), rate limit (429).
+    for (status, code, expected) in [
+        (400, 30001, "server limit"),
+        (403, 40002, "Verify your Discord email"),
+        (429, 0, "Too many server creation requests"),
+    ] {
+        world.discord.script("/guilds", status, json!({"code": code, "message": "err", "retry_after": 5.0}));
+        match world.ask(Request::CreateSpace {
+            account: account.clone(),
+            name: "Another Club".into(),
+            icon: None,
+            template: None,
+        }) {
+            Response::Error { detail, .. } => {
+                assert!(detail.contains(expected), "code {code} expected '{expected}', got '{detail}'");
+            }
+            other => panic!("expected error for code {code}, got {other:?}"),
+        }
+    }
+}

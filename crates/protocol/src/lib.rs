@@ -1732,6 +1732,15 @@ pub enum Request {
         account: AccountKey,
         code: String,
     },
+    /// Create a new Space on this account (e.g. Discord `POST /guilds`).
+    CreateSpace {
+        account: AccountKey,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        template: Option<String>,
+    },
     Watch(Watching),
 
     /// A page of one conversation, oldest first. Reading is not marking read.
@@ -2927,6 +2936,12 @@ pub enum Response {
     InviteJoined {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         space: Option<Key>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation: Option<Key>,
+    },
+    /// Answers `CreateSpace`: the created Space and landing conversation, when reported.
+    SpaceCreated {
+        space: Key,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conversation: Option<Key>,
     },

@@ -808,21 +808,40 @@ impl Shell {
                             }))
                             .into_any_element(),
                     );
-                } else if let Some(account) = snapshot
-                    .accounts
-                    .iter()
-                    .find(|a| a.key.network == network && a.link == Link::Connected && a.can.join_space_by_invite)
-                    .map(|a| a.key.clone())
-                {
-                    items.push(menu_separator().into_any_element());
-                    items.push(
-                        menu_item("join-server-invite", Some("icons/log-in.svg"), "Join a server…", None)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.close_menu(cx);
-                                this.open_join_server(account.clone(), cx);
-                            }))
-                            .into_any_element(),
-                    );
+                } else {
+                    let join_account = snapshot
+                        .accounts
+                        .iter()
+                        .find(|a| a.key.network == network && a.link == Link::Connected && a.can.join_space_by_invite)
+                        .map(|a| a.key.clone());
+                    let create_account = snapshot
+                        .accounts
+                        .iter()
+                        .find(|a| a.key.network == network && a.link == Link::Connected && a.can.create_space)
+                        .map(|a| a.key.clone());
+                    if join_account.is_some() || create_account.is_some() {
+                        items.push(menu_separator().into_any_element());
+                    }
+                    if let Some(account) = join_account {
+                        items.push(
+                            menu_item("join-server-invite", Some("icons/log-in.svg"), "Join a server…", None)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.open_join_server(account.clone(), cx);
+                                }))
+                                .into_any_element(),
+                        );
+                    }
+                    if let Some(account) = create_account {
+                        items.push(
+                            menu_item("create-server", Some("icons/plus.svg"), "Create a server…", None)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.open_create_server(account.clone(), cx);
+                                }))
+                                .into_any_element(),
+                        );
+                    }
                 }
             }
             // CONTRACT: of the Space menu in `02-layout-navigation.md` pinning and mark-as-read
@@ -1598,6 +1617,7 @@ impl Render for Shell {
             .children(self.switcher(window, cx))
             .children(self.create_channel_modal(cx))
             .children(self.join_server_modal(cx))
+            .children(self.create_server_modal(cx))
             .children(self.leave_space_modal(cx))
             .children(self.tiny_layer(window, cx))
             .children(self.menu_layer(snapshot, plan.sidebar.unwrap_or(state.sidebar_width), overview, window, cx))

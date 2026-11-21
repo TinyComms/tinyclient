@@ -538,6 +538,13 @@ pub enum Command {
         code: String,
         reply: Reply<(Option<String>, Option<String>)>,
     },
+    /// Create a new Space; returns `(space_id, landing_channel_id)`.
+    CreateSpace {
+        name: String,
+        icon: Option<String>,
+        template: Option<String>,
+        reply: Reply<(String, Option<String>)>,
+    },
     /// Set the network's notification setting. `until` is when a mute ends, as Unix seconds.
     /// Absent means muted until it is turned off, or not muted. An adapter with no timed mute
     /// ignores it. Report the new mute through [`Context::muted`] before answering.
@@ -850,6 +857,7 @@ impl Command {
             Command::SpaceInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetMute { reply, .. }
             | Command::SetDisappearing { reply, .. }
             | Command::Leave { reply, .. }

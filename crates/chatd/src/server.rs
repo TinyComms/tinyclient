@@ -1707,6 +1707,23 @@ impl Chat {
         }
     }
 
+    fn create_space(&self, account: AccountKey, name: String, icon: Option<String>, template: Option<String>) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let name = name.trim().to_owned();
+        if name.is_empty() {
+            return error(ErrorCode::Refused, "Enter a server name.");
+        }
+        match self.ask(&account, |reply| Command::CreateSpace { name, icon, template, reply }) {
+            Ok((space_id, channel_id)) => Response::SpaceCreated {
+                space: Key::new(&account, space_id),
+                conversation: channel_id.map(|id| Key::new(&account, id)),
+            },
+            Err(refused) => *refused,
+        }
+    }
+
     fn leave_space(&self, space: Key) -> Response {
         let account = space.account();
         if let Err(refused) = self.online(&account) {
@@ -3284,6 +3301,7 @@ impl Chat {
             Request::SetFriendNickname { person, nickname } => self.set_friend_nickname(person, nickname),
             Request::InvitePreview { account, code } => self.invite_preview(account, code),
             Request::InviteJoin { account, code } => self.invite_join(account, code),
+            Request::CreateSpace { account, name, icon, template } => self.create_space(account, name, icon, template),
             Request::Watch(watching) => self.watch(watching),
 
             Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),

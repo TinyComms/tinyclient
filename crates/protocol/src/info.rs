@@ -681,6 +681,9 @@ pub struct Capabilities {
     /// This account supports leaving a Space (`Request::LeaveSpace`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub leave_space: bool,
+    /// This account supports creating a new Space (`Request::CreateSpace`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub create_space: bool,
     /// This account supports sharing contact cards (`Outgoing::contact`, Telegram/Signal).
     #[serde(default, skip_serializing_if = "is_false")]
     pub share_contact: bool,
@@ -1257,5 +1260,32 @@ mod tests {
         let wire = serde_json::to_string(&full).unwrap();
         let back: SpaceInfo = serde_json::from_str(&wire).unwrap();
         assert_eq!(back, full);
+    }
+
+    #[test]
+    fn create_space_request_response_and_capability_round_trip() {
+        use crate::Response;
+        let mut can = Capabilities::default();
+        assert!(!can.create_space);
+        can.create_space = true;
+        let back_can: Capabilities = serde_json::from_str(&serde_json::to_string(&can).unwrap()).unwrap();
+        assert!(back_can.create_space);
+
+        let account = AccountKey { network: Network::Discord, account: "1000".into() };
+        let req = Request::CreateSpace {
+            account: account.clone(),
+            name: "Book Club".into(),
+            icon: Some("/tmp/icon.png".into()),
+            template: Some("friends".into()),
+        };
+        let back_req: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(back_req, req);
+
+        let resp = Response::SpaceCreated {
+            space: Key::new(&account, "8800"),
+            conversation: Some(Key::new(&account, "8801")),
+        };
+        let back_resp: Response = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(back_resp, resp);
     }
 }
