@@ -4519,6 +4519,7 @@ mod tests {
                 spoiler: false,
                 as_file: false,
                 original: false,
+                view_once: false,
                 media: None,
             }],
             ..Outgoing::default()

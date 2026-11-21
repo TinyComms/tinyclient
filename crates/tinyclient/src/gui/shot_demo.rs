@@ -148,7 +148,7 @@ fn account(key: AccountKey, name: &str, attention: u32, unread: bool, presence: 
             threads: true,
             pins: true,
             forward: true,
-            polls: true,
+            polls: Some(protocol::PollCapabilities::default()),
             reactions: true,
             ..Capabilities::default()
         },

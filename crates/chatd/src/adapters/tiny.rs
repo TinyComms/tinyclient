@@ -425,7 +425,16 @@ fn saved_for(session: &str, user_id: &str) -> Result<Saved, String> {
 /// connect and the TLS handshake, slow on Windows) is made once and kept for the next request.
 /// The pool is per host inside it, and an idle connection is let go after [`IDLE`].
 fn agent() -> ureq::Agent {
-    crate::adapters::net::apply_proxy(ureq::Agent::config_builder())
+    static SHARED: std::sync::Mutex<Option<(protocol::settings::ProxyConfig, ureq::Agent)>> =
+        std::sync::Mutex::new(None);
+    let cfg = crate::adapters::net::proxy_config();
+    let mut guard = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((saved, agent)) = guard.as_ref() {
+        if *saved == cfg {
+            return agent.clone();
+        }
+    }
+    let built: ureq::Agent = crate::adapters::net::apply_proxy(ureq::Agent::config_builder())
         .tls_config(crate::tls::config())
         .timeout_global(Some(TIMEOUT))
         .max_idle_age(IDLE)
@@ -434,7 +443,9 @@ fn agent() -> ureq::Agent {
         .max_redirects_will_error(false)
         .user_agent("tinyclient")
         .build()
-        .into()
+        .into();
+    *guard = Some((cfg, built.clone()));
+    built
 }
 
 /// A bespoke agent for a request with its own long timeout (an upload). It keeps no pool.

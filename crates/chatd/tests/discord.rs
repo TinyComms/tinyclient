@@ -3783,7 +3783,7 @@ fn send_with(world: &World, conversation: &str, client_id: &str, text: &str, rep
 }
 
 fn file(path: &str, spoiler: bool) -> protocol::OutgoingFile {
-    protocol::OutgoingFile { path: path.to_owned(), name: String::new(), spoiler, as_file: false, original: false, media: None }
+    protocol::OutgoingFile { path: path.to_owned(), name: String::new(), spoiler, as_file: false, original: false, view_once: false, media: None }
 }
 
 #[test]
@@ -4044,7 +4044,7 @@ fn upload_limit_honors_server_boost_tier() {
             spoiler: false,
             as_file: false,
             original: false,
-            media: None,
+            view_once: false, media: None,
         }],
         ..Default::default()
     };

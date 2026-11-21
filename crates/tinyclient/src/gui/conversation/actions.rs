@@ -18,7 +18,7 @@ use gpui::{
     anchored, deferred, div, point, prelude::*, px, AnyElement, Bounds, ClipboardItem, Context, Div, ElementId, Entity,
     KeyDownEvent, MouseButton, Pixels, Point, SharedString, Stateful, Subscription, Window,
 };
-use protocol::{Capabilities, ConversationKind, ConversationRights, ErrorCode, Message, MessageKind, ReactionRules, Request, Response, SendState};
+use protocol::{Capabilities, ConversationKind, ConversationRights, ErrorCode, Message, MessageKind, Network, ReactionRules, Request, Response, SendState};
 use std::rc::Rc;
 
 /// How far the toolbar rises above its row, and how wide the strip it can occupy is.
@@ -2346,7 +2346,7 @@ mod tests {
             threads: true,
             pins: true,
             forward: true,
-            polls: true,
+            polls: Some(protocol::PollCapabilities::default()),
             reactions: true,
             ..Capabilities::default()
         }
@@ -2386,7 +2386,7 @@ mod tests {
             edit_window: 48 * 3_600,
             pins: true,
             forward: true,
-            polls: true,
+            polls: Some(protocol::PollCapabilities::default()),
             reactions: true,
             ..Capabilities::default()
         }
@@ -2471,7 +2471,7 @@ mod tests {
         assert!(!can(&theirs, &discord_caps(), none, ConversationKind::Forum, false, 1_100).thread);
 
         // Moderator rights grant delete on others' messages and pin.
-        let mod_rights = ConversationRights { pin: true, delete_others: true, manage_members: true };
+        let mod_rights = ConversationRights { pin: true, delete_others: true, manage_members: true, ..ConversationRights::default() };
         let moderated = can(&theirs, &discord_caps(), mod_rights, channel, false, 1_100);
         assert!(moderated.delete && moderated.pin && !moderated.edit);
 

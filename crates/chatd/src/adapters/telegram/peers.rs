@@ -232,6 +232,7 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                 pin: active && (chat.creator || admin.is_some_and(|r| r.pin_messages) || !pin_banned),
                 delete_others: active && (chat.creator || admin.is_some_and(|r| r.delete_messages)),
                 manage_members: active && (chat.creator || admin.is_some_and(|r| r.ban_users || r.invite_users)),
+                ..protocol::ConversationRights::default()
             };
             let known = Known {
                 name: chat.title.clone(),
@@ -279,6 +280,7 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                     },
                 delete_others: active && (channel.creator || admin.is_some_and(|r| r.delete_messages)),
                 manage_members: active && (channel.creator || admin.is_some_and(|r| r.ban_users || r.invite_users)),
+                ..protocol::ConversationRights::default()
             };
             let known = Known {
                 hash: channel.access_hash.filter(|_| !channel.min),

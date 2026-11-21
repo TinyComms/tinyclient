@@ -832,6 +832,7 @@ mod tests {
             spoiler: false,
             as_file: false,
             original: false,
+            view_once: false,
             media: None,
         };
         assert_eq!(shown(&staged("/a/b/cat.PNG", "")), "cat.PNG");

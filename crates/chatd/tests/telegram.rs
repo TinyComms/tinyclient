@@ -2426,7 +2426,7 @@ fn pickers_and_sending_with_files_options_and_picks() {
         std::fs::write(&path, vec![7u8; bytes]).unwrap();
         path.to_string_lossy().into_owned()
     };
-    let one = |path: String, spoiler: bool, as_file: bool| protocol::OutgoingFile { path, name: String::new(), spoiler, as_file, original: false, media: None };
+    let one = |path: String, spoiler: bool, as_file: bool| protocol::OutgoingFile { path, name: String::new(), spoiler, as_file, original: false, view_once: false, media: None };
     let photo = file("ridge.jpg", 700 * 1024);
     let sent = send("8105", "the ridge", protocol::Outgoing { files: vec![one(photo.clone(), true, false)], ..Default::default() });
     assert_eq!(sent.state, SendState::Sent, "{:?}", world.calls());
@@ -2518,7 +2518,7 @@ fn a_recorded_voice_message_is_sent_as_a_telegram_voice_note() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("voice-1234.opus");
     std::fs::write(&path, vec![7u8; 2048]).unwrap();
-    let one = protocol::OutgoingFile { path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: false, as_file: false, original: false, media: None };
+    let one = protocol::OutgoingFile { path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: false, as_file: false, original: false, view_once: false, media: None };
     // Bars at the widest and shut: both are exact through Telegram's five bits a bar.
     let voice = protocol::VoiceNote { duration: 7_500, waveform: vec![255, 0, 255, 0, 255, 0, 255, 0] };
     let sent = send("8201", "", protocol::Outgoing { files: vec![one], voice: Some(voice), ..Default::default() });
@@ -2720,7 +2720,7 @@ fn conversation_search_asks_telegram_with_the_query_and_maps_its_hits() {
     let world = World::signed_in();
     world.connected();
     let search = |query: &str| match world.ask(Request::SearchNetwork {
-        conversation: Some(key("g8001")), space: None, query: query.into(),, account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None 
+        conversation: Some(key("g8001")), space: None, query: query.into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None 
     }) {
         Response::MessageHits { hits, .. } => hits,
         other => panic!("{other:?}"),
@@ -2742,7 +2742,7 @@ fn conversation_search_keeps_the_telegram_forum_topic_scope() {
     let world = World::signed_in();
     world.connected();
     let Response::MessageHits { hits, .. } = world.ask(Request::SearchNetwork {
-        conversation: Some(key("c9002_31")), space: None, query: "wrench".into(),, account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None 
+        conversation: Some(key("c9002_31")), space: None, query: "wrench".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None 
     }) else { panic!("no search hits") };
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].conversation, key("c9002_31"));

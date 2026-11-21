@@ -1080,6 +1080,12 @@ impl Store {
         store.migrate_reminders()?;
         // The revision table is new and must not wipe a cache that is already at this schema.
         store.ensure_revisions()?;
+        if !column(&store.db, "conversation", "rights")? {
+            store.db.execute_batch("ALTER TABLE conversation ADD COLUMN rights INTEGER NOT NULL DEFAULT 0")?;
+        }
+        if !column(&store.db, "conversation", "disappearing")? {
+            store.db.execute_batch("ALTER TABLE conversation ADD COLUMN disappearing INTEGER")?;
+        }
         if !column(&store.db, "space", "can_create_channels")? {
             store.db.execute_batch("ALTER TABLE space ADD COLUMN can_create_channels INTEGER NOT NULL DEFAULT 0")?;
         }
@@ -1913,7 +1919,7 @@ impl Store {
         let counts = self.db.query_row(
             &format!(
                 "SELECT COUNT(*), COALESCE(SUM({IS_UNREAD}), 0), COALESCE(SUM({IS_MENTION}), 0),
-                        COALESCE(SUM({IS_APP}), 0)
+                        COALESCE(SUM({IS_APP}), 0), COALESCE(SUM({IS_ACTIVITY}), 0)
                    FROM conversation c WHERE {belongs}"
             ),
             key,

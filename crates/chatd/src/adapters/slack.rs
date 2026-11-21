@@ -2030,7 +2030,7 @@ fn capabilities() -> protocol::Capabilities {
         direct_threads: true,
         pins: true,
         forward: true,
-        polls: false,
+        polls: None,
         reactions: true,
         mention_format: protocol::MentionFormat::Slack,
         mention_spans: false,

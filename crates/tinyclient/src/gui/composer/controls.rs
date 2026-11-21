@@ -141,25 +141,25 @@ mod tests {
             polls: Some(protocol::PollCapabilities { max_options: 10, max_duration_secs: 86_400, multiple: true, anonymous: false }),
             ..Capabilities::default()
         };
-        assert!(controls(Network::Discord, &with_polls, false).poll);
-        assert!(!controls(Network::Discord, &with_polls, true).poll);
-        assert!(!controls(Network::Slack, &Capabilities::default(), false).poll);
+        assert!(controls(&with_polls, false).poll);
+        assert!(!controls(&with_polls, true).poll);
+        assert!(!controls(&Capabilities::default(), false).poll);
     }
 
     #[test]
     fn send_option_controls_follow_capabilities_and_hide_when_editing() {
         let teams = Capabilities { importance: true, ..Capabilities::default() };
-        let m = controls(Network::Teams, &teams, false);
+        let m = controls(&teams, false);
         assert!(m.importance && !m.broadcast && !m.effects && !m.view_once);
-        assert!(!controls(Network::Teams, &teams, true).importance);
+        assert!(!controls(&teams, true).importance);
 
         let slack = Capabilities { thread_broadcast: true, ..Capabilities::default() };
-        let s = controls(Network::Slack, &slack, false);
+        let s = controls(&slack, false);
         assert!(s.broadcast && !s.importance && !s.effects && !s.view_once);
 
         let telegram = Capabilities { effects: true, view_once: true, ..Capabilities::default() };
-        let t = controls(Network::Telegram, &telegram, false);
+        let t = controls(&telegram, false);
         assert!(t.effects && t.view_once && !t.importance && !t.broadcast);
-        assert!(!controls(Network::Telegram, &telegram, true).effects);
+        assert!(!controls(&telegram, true).effects);
     }
 }

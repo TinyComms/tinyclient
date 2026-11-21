@@ -758,7 +758,7 @@ fn a_file_is_sent_with_its_attachment_and_the_phones_copy_does_not_replace_it() 
                 spoiler: false,
                 as_file: false,
                 original: false,
-                media: None,
+                view_once: false, media: None,
             }],
             ..protocol::Outgoing::default()
         },
@@ -1205,7 +1205,7 @@ fn a_group_poll_shows_its_counts_and_a_vote_reaches_the_wire() {
         reply_to: None,
         with: Outgoing {
             poll: Some(PollDraft { question: "Dinner?".into(), options: vec!["Thai".into(), "Pizza".into()], multiple: false, ..PollDraft::default() }),
-            files: vec![OutgoingFile { path: "missing.txt".into(), name: String::new(), spoiler: false, as_file: false, original: false, media: None }],
+            files: vec![OutgoingFile { path: "missing.txt".into(), name: String::new(), spoiler: false, as_file: false, original: false, view_once: false, media: None }],
             ..Outgoing::default()
         },
     };

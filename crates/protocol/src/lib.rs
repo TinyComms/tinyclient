@@ -3117,7 +3117,9 @@ mod tests {
         assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&pic).unwrap()).unwrap(), pic);
 
         let all = ConversationRights {
+            pin: true,
             delete_others: true,
+            manage_members: true,
             add_members: true,
             remove_members: true,
             rename: true,
