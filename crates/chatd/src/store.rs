@@ -794,6 +794,9 @@ fn person_from(row: &Row) -> rusqlite::Result<Person> {
         mark: mark_from(row.get(18)?)?,
         emoji: String::new(),
         activity: None,
+        role_color: None,
+        role_icon: None,
+        role_emoji: None,
     })
 }
 
@@ -1417,15 +1420,16 @@ impl Store {
             key,
         )?;
         drop_orphan_threads(&tx, &account)?;
-        let collapsed: Vec<String> = tx
+        let existing: std::collections::HashMap<String, bool> = tx
             .prepare(
-                "SELECT id FROM section
-                  WHERE network = ?1 AND account = ?2 AND space = ?3 AND collapsed",
+                "SELECT id, collapsed FROM section
+                  WHERE network = ?1 AND account = ?2 AND space = ?3",
             )?
-            .query_map(key, |row| row.get(0))?
+            .query_map(key, |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
         tx.execute("DELETE FROM section WHERE network = ?1 AND account = ?2 AND space = ?3", key)?;
         for group in groups {
+            let is_collapsed = existing.get(&group.id).copied().unwrap_or(group.collapsed);
             tx.execute(
                 "INSERT OR REPLACE INTO section
                      (network, account, space, id, name, position, collapsed, kind, muted, unread_only)
@@ -1437,7 +1441,7 @@ impl Store {
                     group.id,
                     group.name,
                     group.position,
-                    collapsed.contains(&group.id),
+                    is_collapsed,
                     word(&group.kind),
                     group.muted,
                     group.unread_only,
@@ -2959,25 +2963,55 @@ impl Store {
     /// Every conversation with a badge. The message id is the newest known, for the ack.
     /// The bool is a message request: read here, and not told to the network. `network` limits
     /// it to one network; `space` to one Space's conversations, which are that Space's account's.
-    pub fn unread_marks(&self, network: Option<Network>, space: Option<&Key>) -> rusqlite::Result<Vec<(Key, String, bool)>> {
+    pub fn unread_marks(
+        &self,
+        network: Option<Network>,
+        space: Option<&Key>,
+        folder: Option<&Key>,
+    ) -> rusqlite::Result<Vec<(Key, String, bool)>> {
         let mut stmt = self.db.prepare(
-            "SELECT network, account, id, preview_id, last_read, special FROM conversation
-              WHERE (unread > 0 OR mentions > 0) AND (?1 IS NULL OR network = ?1)
-                AND (?2 IS NULL OR (network = ?3 AND account = ?4 AND space = ?2))",
+            "SELECT c.network, c.account, c.id, c.preview_id, c.last_read, c.special FROM conversation c
+              WHERE (c.unread > 0 OR c.mentions > 0)
+                AND (?1 IS NULL OR c.network = ?1)
+                AND (?2 IS NULL OR (c.network = ?3 AND c.account = ?4
+                     AND (c.space = ?2
+                          OR (c.parent != '' AND EXISTS (
+                              SELECT 1 FROM conversation p
+                               WHERE p.network = ?3 AND p.account = ?4 AND p.id = c.parent AND p.space = ?2
+                          )))))
+                AND (?5 IS NULL OR EXISTS (
+                    SELECT 1 FROM folder f
+                     WHERE f.network = ?6 AND f.account = ?7 AND f.id = ?5
+                       AND c.network = f.network AND c.account = f.account AND NOT c.hidden
+                       AND (instr(c.folders, ',' || f.id || ',') > 0
+                            OR (c.space != '' AND instr(f.spaces, ',' || c.space || ',') > 0)
+                            OR (c.parent != '' AND EXISTS (
+                                SELECT 1 FROM conversation p
+                                 WHERE p.network = f.network AND p.account = f.account AND p.id = c.parent
+                                   AND p.space != '' AND instr(f.spaces, ',' || p.space || ',') > 0
+                            )))
+                ))",
         )?;
         let network = network.map(|network| word(&network));
         let (space_id, space_network, space_account) = match space {
             Some(space) => (Some(space.id.as_str()), Some(word(&space.network)), Some(space.account.as_str())),
             None => (None, None, None),
         };
-        let rows = stmt.query_map(params![network, space_id, space_network, space_account], |row| {
-            let key = Key {
-                network: from_word(row.get(0)?)?,
-                account: row.get(1)?,
-                id: row.get(2)?,
-            };
-            Ok((key, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)? == "request"))
-        })?;
+        let (folder_id, folder_network, folder_account) = match folder {
+            Some(folder) => (Some(folder.id.as_str()), Some(word(&folder.network)), Some(folder.account.as_str())),
+            None => (None, None, None),
+        };
+        let rows = stmt.query_map(
+            params![network, space_id, space_network, space_account, folder_id, folder_network, folder_account],
+            |row| {
+                let key = Key {
+                    network: from_word(row.get(0)?)?,
+                    account: row.get(1)?,
+                    id: row.get(2)?,
+                };
+                Ok((key, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)? == "request"))
+            },
+        )?;
         let rows: Vec<_> = rows.collect::<rusqlite::Result<_>>()?;
         drop(stmt);
         // The statement has to finish before cursor checks read message times.
@@ -5043,7 +5077,7 @@ mod tests {
             store.ingest(&key, &earlier, true).unwrap();
             assert!(store.mark_read(&key, &earlier.id).unwrap());
             store.ingest(&key, &later, true).unwrap();
-            let marks = store.unread_marks(Some(Network::Discord), None).unwrap();
+            let marks = store.unread_marks(Some(Network::Discord), None, None).unwrap();
             assert!(marks.iter().any(|(found, marker, _)| found == &key && marker == &later.id));
             store.set_counts(&key, 0, 0, None, 20).unwrap();
             assert_eq!(store.conversation(&key).unwrap().unwrap().unread, 1);
@@ -5209,7 +5243,7 @@ mod tests {
         let row = store.conversation(&key).unwrap().unwrap();
         assert_eq!((row.unread, row.last_read.as_deref()), (1, Some(earlier)));
         assert_eq!(store.preview_id(&key).unwrap(), later);
-        let marks = store.unread_marks(Some(Network::Discord), None).unwrap();
+        let marks = store.unread_marks(Some(Network::Discord), None, None).unwrap();
         assert!(
             marks.iter().any(|(found, marker, request)| found == &key && marker == later && !request),
             "the ack is the newer message, not the uuid that sorts first"
@@ -5244,7 +5278,7 @@ mod tests {
 
         // A newer live message is unread again; a stale network count must not invent that.
         store.ingest(&dm, &said("30", "again", 30), true).unwrap();
-        let marks = store.unread_marks(Some(Network::Discord), None).unwrap();
+        let marks = store.unread_marks(Some(Network::Discord), None, None).unwrap();
         assert!(marks.iter().any(|(found, marker, request)| found == &dm && marker == "30" && !request));
         assert!(store.forget_conversation(&dm).unwrap());
         let row = store.conversation(&dm).unwrap().unwrap();
@@ -5273,15 +5307,56 @@ mod tests {
         store.ingest(&key, &said("9", "dm hello", 20), true).unwrap();
 
         let space = Key::new(&account, "4000");
-        let marks = store.unread_marks(None, Some(&space)).unwrap();
+        let marks = store.unread_marks(None, Some(&space), None).unwrap();
         assert_eq!(marks.len(), 1, "only the space's conversations are named");
         assert_eq!(marks[0].0, in_space);
         // Without a space everything with a badge is named, as before.
-        let all = store.unread_marks(None, None).unwrap();
+        let all = store.unread_marks(None, None, None).unwrap();
         assert!(all.iter().any(|(found, _, _)| found == &in_space));
         assert!(all.iter().any(|(found, _, _)| found == &key));
-        let discord = store.unread_marks(Some(Network::Discord), None).unwrap();
+        let discord = store.unread_marks(Some(Network::Discord), None, None).unwrap();
         assert_eq!(discord.len(), 2);
+
+        // Forum posts (parent in space, space = None) and Discord server folders are included.
+        let mut forum = ConversationRow::new("forum1", ConversationKind::Forum, "#forum");
+        forum.space = Some("4000".into());
+        store.upsert_conversation(&account, &forum).unwrap();
+        let mut post = ConversationRow::new("post1", ConversationKind::Thread, "Post 1");
+        post.parent = Some("forum1".into());
+        store.upsert_conversation(&account, &post).unwrap();
+        let post_key = Key::new(&account, "post1");
+        store.ingest(&post_key, &said("10", "forum post", 30), true).unwrap();
+
+        let mut other_space_ch = ConversationRow::new("other_ch", ConversationKind::Channel, "#other");
+        other_space_ch.space = Some("5000".into());
+        store.upsert_conversation(&account, &other_space_ch).unwrap();
+        let other_key = Key::new(&account, "other_ch");
+        store.ingest(&other_key, &said("11", "other", 40), true).unwrap();
+
+        let space_marks = store.unread_marks(None, Some(&space), None).unwrap();
+        assert_eq!(space_marks.len(), 2, "space includes both channel and forum post");
+        assert!(space_marks.iter().any(|(k, _, _)| k == &post_key));
+
+        store
+            .replace_folders(
+                &account,
+                &[FolderRow {
+                    id: "f1".into(),
+                    name: "Work".into(),
+                    position: 0,
+                    color: None,
+                    spaces: vec!["4000".into(), "5000".into()],
+                    pinned: Vec::new(),
+                }],
+            )
+            .unwrap();
+        let folder = Key::new(&account, "f1");
+        let folder_marks = store.unread_marks(None, None, Some(&folder)).unwrap();
+        assert_eq!(folder_marks.len(), 3, "folder covers both spaces and forum post, excluding DM");
+        assert!(folder_marks.iter().any(|(k, _, _)| k == &in_space));
+        assert!(folder_marks.iter().any(|(k, _, _)| k == &post_key));
+        assert!(folder_marks.iter().any(|(k, _, _)| k == &other_key));
+        assert!(!folder_marks.iter().any(|(k, _, _)| k == &key));
     }
 
     #[test]

@@ -126,6 +126,8 @@ pub enum Menu {
     Own,
     Network(Network),
     Space(Key),
+    /// A server folder's context menu, where the pointer was.
+    Folder(Key, Point<Pixels>),
     /// A conversation row's context menu, where the pointer was.
     Row(Rc<Conversation>, Point<Pixels>),
 }
@@ -746,6 +748,10 @@ impl Shell {
                 let items = menu().w(px(200.)).children(self.menu_items(open, snapshot, cx));
                 placed("menu-space-at", Place::Below(menu_anchor), Layer::Menu, window, fade_in("menu-space", 120, items))
             }
+            Menu::Folder(_, position) => {
+                let items = menu().w(px(200.)).children(self.menu_items(open, snapshot, cx));
+                placed("menu-folder-at", Place::Pointer(*position), Layer::Menu, window, fade_in("menu-folder", 120, items))
+            }
             Menu::Row(_, position) => {
                 let items = menu().w(px(220.)).children(self.menu_items(open, snapshot, cx));
                 placed("menu-row-at", Place::Pointer(*position), Layer::Menu, window, fade_in("menu-row", 120, items))
@@ -861,11 +867,25 @@ impl Shell {
                         }))
                         .into_any_element(),
                 );
+                let has_badge = self.spaces.iter().any(|s| &s.key == space && (s.unread || s.attention > 0));
+                if has_badge {
+                    items.push(
+                        menu_item("space-read", Some("icons/check.svg"), "Mark as read", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.mark_space_read(read.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
+            }
+            Menu::Folder(folder, _) => {
+                let read = folder.clone();
                 items.push(
-                    menu_item("space-read", Some("icons/check.svg"), "Mark as read", None)
+                    menu_item("folder-read", Some("icons/check.svg"), "Mark as read", None)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.close_menu(cx);
-                            this.mark_space_read(read.clone(), cx);
+                            this.mark_folder_read(read.clone(), cx);
                         }))
                         .into_any_element(),
                 );
@@ -956,6 +976,40 @@ impl Shell {
                     .as_ref()
                     .and_then(|s| s.accounts.iter().find(|a| a.key == conversation.key.account()).map(|a| a.can))
                     .unwrap_or_default();
+                if can.timed_mute {
+                    if conversation.muted {
+                        let unmute = conversation.key.clone();
+                        items.push(
+                            menu_item("unmute", Some("icons/bell.svg"), "Unmute notifications", None)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.set_row_mute(unmute.clone(), false, cx);
+                                }))
+                                .into_any_element(),
+                        );
+                    } else {
+                        const PRESETS: &[(&str, &str, Option<i64>)] = &[
+                            ("mute-15m", "Mute for 15 minutes", Some(15 * 60)),
+                            ("mute-1h", "Mute for 1 hour", Some(60 * 60)),
+                            ("mute-3h", "Mute for 3 hours", Some(3 * 60 * 60)),
+                            ("mute-8h", "Mute for 8 hours", Some(8 * 60 * 60)),
+                            ("mute-24h", "Mute for 24 hours", Some(24 * 60 * 60)),
+                            ("mute-forever", "Mute until I turn it back on", None),
+                        ];
+                        for &(id, label, secs) in PRESETS {
+                            let target = conversation.key.clone();
+                            items.push(
+                                menu_item(id, Some("icons/bell-off.svg"), label, None)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.close_menu(cx);
+                                        let until = secs.map(|s| crate::view::now() + s);
+                                        this.set_row_mute_until(target.clone(), true, until, cx);
+                                    }))
+                                    .into_any_element(),
+                            );
+                        }
+                    }
+                }
                 if super::people::can_pin_on_network(conversation, &can) {
                     let net_pin_key = conversation.key.clone();
                     let next_pin = conversation.pin.is_none();
@@ -1093,6 +1147,18 @@ impl Shell {
                     .child(div().min_w_0().truncate().phone_title().child(name));
                 column().child(head).children(self.menu_items(open, snapshot, cx)).into_any_element()
             }
+            Menu::Folder(folder, _) => {
+                let name = self
+                    .sidebar_state
+                    .home
+                    .folders
+                    .iter()
+                    .find(|f| &f.key == folder)
+                    .map(|f| if f.name.is_empty() { "Folder".to_owned() } else { f.name.clone() })
+                    .unwrap_or_else(|| "Folder".to_owned());
+                let head = div().flex().items_center().gap(px(10.)).px(px(8.)).h(px(44.)).child(glyph("icons/folder.svg", 20., theme::text_soft())).child(div().min_w_0().truncate().phone_title().child(name));
+                column().child(head).children(self.menu_items(open, snapshot, cx)).into_any_element()
+            }
             Menu::Row(conversation, _) => {
                 // What the sheet is about: the row's own face and title, and where it lives.
                 let place = conversation.space_title.trim();
@@ -1158,9 +1224,38 @@ impl Shell {
         items.push(act("row-star", "icons/pin.svg", words.into(), Box::new(move |this, cx| this.star(star.clone(), !starred, cx))));
         // CONTRACT: muting has a request on Discord, Slack, Teams and Telegram, and is kept locally on Tiny.
         if matches!(network, Network::Discord | Network::Slack | Network::Teams | Network::Telegram | Network::Tiny) {
-            let (muted, mute) = (row.muted, key.clone());
-            let (icon, words) = if muted { ("icons/bell.svg", "Unmute notifications") } else { ("icons/bell-off.svg", "Mute notifications") };
-            items.push(act("row-mute", icon, words.into(), Box::new(move |this, cx| this.set_row_mute(mute.clone(), !muted, cx))));
+            let timed_mute = self
+                .snapshot
+                .as_ref()
+                .and_then(|s| s.accounts.iter().find(|a| a.key == key.account()).map(|a| a.can.timed_mute))
+                .unwrap_or(false);
+            let muted = row.muted;
+            if !muted && timed_mute {
+                const PRESETS: &[(&str, &str, Option<i64>)] = &[
+                    ("row-mute-15m", "Mute for 15 minutes", Some(15 * 60)),
+                    ("row-mute-1h", "Mute for 1 hour", Some(60 * 60)),
+                    ("row-mute-3h", "Mute for 3 hours", Some(3 * 60 * 60)),
+                    ("row-mute-8h", "Mute for 8 hours", Some(8 * 60 * 60)),
+                    ("row-mute-24h", "Mute for 24 hours", Some(24 * 60 * 60)),
+                    ("row-mute-forever", "Mute until I turn it back on", None),
+                ];
+                for &(id, label, secs) in PRESETS {
+                    let mute = key.clone();
+                    items.push(act(
+                        id,
+                        "icons/bell-off.svg",
+                        label.into(),
+                        Box::new(move |this, cx| {
+                            let until = secs.map(|s| crate::view::now() + s);
+                            this.set_row_mute_until(mute.clone(), true, until, cx);
+                        }),
+                    ));
+                }
+            } else {
+                let mute = key.clone();
+                let (icon, words) = if muted { ("icons/bell.svg", "Unmute notifications") } else { ("icons/bell-off.svg", "Mute notifications") };
+                items.push(act("row-mute", icon, words.into(), Box::new(move |this, cx| this.set_row_mute(mute.clone(), !muted, cx))));
+            }
         }
         let details = key.clone();
         let person = row.kind == protocol::ConversationKind::Direct;

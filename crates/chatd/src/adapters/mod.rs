@@ -285,6 +285,8 @@ pub enum Command {
     HistoryAround { conversation_id: String, around: String },
     /// The user opened a Space: bring its tree up to date if the network needs asking.
     OpenSpace(String),
+    /// The user collapsed or expanded a Space group (Discord category sync).
+    Collapse { space_id: String, group_id: String, collapsed: bool },
     /// Tell the network the conversation has been read up to this message.
     MarkRead { conversation_id: String, message_id: String },
     /// Tell the network the marker moved back. `message_id` is the last message that still
@@ -533,6 +535,21 @@ pub enum Command {
     InviteJoin {
         code: String,
         reply: Reply<(Option<String>, Option<String>)>,
+    },
+    /// Moderate a member in a Space (kick, ban, timeout, untimeout, nickname).
+    Moderate {
+        space_id: String,
+        person_id: String,
+        action: protocol::ModerateAction,
+        reason: String,
+        reply: Reply<()>,
+    },
+    /// Lift a member ban in a Space.
+    Unban {
+        space_id: String,
+        person_id: String,
+        reason: String,
+        reply: Reply<()>,
     },
     /// Set the network's notification setting. `until` is when a mute ends, as Unix seconds.
     /// Absent means muted until it is turned off, or not muted. An adapter with no timed mute
@@ -847,6 +864,8 @@ impl Command {
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetMute { reply, .. }
+            | Command::Moderate { reply, .. }
+            | Command::Unban { reply, .. }
             | Command::SetDisappearing { reply, .. }
             | Command::Leave { reply, .. }
             | Command::LeaveSpace { reply, .. }
@@ -1064,6 +1083,15 @@ impl Context {
         let space = self.key(space_id);
         self.hub.store().upsert_group(&space, group)?;
         self.hub.changed(Change::Tree { space });
+        Ok(())
+    }
+
+    /// Updates a group's collapsed state from the network (e.g. Discord category settings).
+    pub fn set_collapsed(&self, space_id: &str, group_id: &str, collapsed: bool) -> Stores {
+        let space = self.key(space_id);
+        if self.hub.store().set_collapsed(&space, group_id, collapsed)? {
+            self.hub.changed(Change::Tree { space });
+        }
         Ok(())
     }
 

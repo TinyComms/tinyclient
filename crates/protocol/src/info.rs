@@ -681,6 +681,9 @@ pub struct Capabilities {
     /// This account supports following and unfollowing threads (`Request::FollowThread`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub follow_threads: bool,
+    /// This account supports muting a conversation for a chosen duration (`SetMute` with `until`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub timed_mute: bool,
 }
 
 /// Preview of a Space invite (`Request::InvitePreview`).
