@@ -135,7 +135,7 @@ impl Shell {
             .truncate()
             .type_title()
             .tooltip(tip(title_tip, direct.then_some("⌘.")))
-            .when_some(role.as_ref().and_then(|role| role.color), |title, color| title.text_color(gpui::rgb(color)))
+            .when_some(role.as_ref().and_then(|role| role.color), |title, color| title.text_color(theme::role_color(color)))
             .child(open.title.clone());
         let title = if direct {
             title

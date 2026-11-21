@@ -998,6 +998,10 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, a
     LAUNCHED.get_or_init(std::time::Instant::now);
     app::crash::install();
     app::read_reduce_motion();
+    theme::read_system_contrast();
+    if let Some(word) = flag("--theme") {
+        theme::set_override(Some(&word));
+    }
     attention::read_launch();
     time::read_clock_preference();
     // Read before the window opens, so its first frame draws where the user was.
@@ -1069,6 +1073,13 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, a
             #[cfg(windows)]
             let tray = prefs.choices.tray;
             let opened = cx.open_window(options, |window, cx| {
+                theme::set_system_appearance(window.appearance());
+                window
+                    .observe_window_appearance(|window, cx| {
+                        theme::set_system_appearance(window.appearance());
+                        cx.refresh_windows();
+                    })
+                    .detach();
                 // The launcher entry and the flash's urgency hint are this window's from now.
                 #[cfg(target_os = "linux")]
                 attention::note_window(window.window_handle());

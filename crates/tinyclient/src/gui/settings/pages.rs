@@ -374,7 +374,7 @@ impl SettingsWindow {
             }
             Section::Appearance => vec![
                 // A phone's rows keep a thumb's height whatever the density: it has no Density.
-                self.group(if phone::active() { &["A2", "A4"] } else { &["A2", "A3", "A4"] }, None, window, cx)
+                self.group(if phone::active() { &["A1", "A2", "A4", "A5"] } else { &["A1", "A2", "A3", "A4", "A5"] }, None, window, cx)
                     // The caption is about keyboard shortcuts, which a phone has none of.
                     .when(!phone::active(), |group| group.child(caption(crate::host::APPEARANCE_CAPTION))),
             ],
@@ -644,6 +644,21 @@ impl SettingsWindow {
                     .on_click(cx.listener(|this, _, _, cx| this.play_test_sound(cx)));
                 wide_row(label, None, div().flex().items_center().child(self.slider_control(id, cx)).child(play))
             }
+            "A1" => {
+                let at = match choices.appearance {
+                    theme::Appearance::System => 0,
+                    theme::Appearance::Light => 1,
+                    theme::Appearance::Dark => 2,
+                };
+                self.segmented_row(id, &["System", "Light", "Dark"], at, 0, None, |this, ix, cx| {
+                    let choice = match ix {
+                        1 => theme::Appearance::Light,
+                        2 => theme::Appearance::Dark,
+                        _ => theme::Appearance::System,
+                    };
+                    this.choose(|c| c.appearance = choice, cx);
+                }, cx)
+            }
             "A2" => wide_row(label, None, self.slider_control(id, cx)),
             "A3" => {
                 let second = choices.compact.then(|| "List rows are 40 instead of 48.".to_owned());
@@ -652,6 +667,11 @@ impl SettingsWindow {
             "A4" => {
                 let second = (!choices.previews).then(|| "Rows show names and times only.".to_owned());
                 self.switch_row(id, choices.previews, true, second, |this, on, cx| this.choose(|c| c.previews = on, cx), cx)
+            }
+            "A5" => {
+                let second = theme::system_high_contrast()
+                    .then(|| "System Increase Contrast is on, so high contrast is active.".to_owned());
+                self.switch_row(id, choices.high_contrast, false, second, |this, on, cx| this.choose(|c| c.high_contrast = on, cx), cx)
             }
             "M1" => {
                 let second = crate::gui::shortcuts::label(if choices.command_return { "Return adds a line." } else { "⇧Return adds a line." });

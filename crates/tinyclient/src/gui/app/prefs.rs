@@ -10,6 +10,7 @@ use super::super::anim::Autoplay;
 use super::super::layout;
 use super::super::settings::Section;
 use super::super::sidebar::Mode;
+use super::super::theme::Appearance;
 use protocol::link::Trusted;
 use protocol::settings::Values;
 use protocol::{Key, Network};
@@ -21,6 +22,10 @@ pub const FILE: &str = "shell.prefs";
 /// Only what differs from these defaults is written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Choices {
+    /// A1: System (default), Light, or Dark.
+    pub appearance: Appearance,
+    /// A5: high-contrast palette (in addition to the OS Increase Contrast setting).
+    pub high_contrast: bool,
     /// A3: list rows 40 instead of 48.
     pub compact: bool,
     /// A4: list rows show the last message.
@@ -56,12 +61,14 @@ pub struct Choices {
 
 impl Default for Choices {
     fn default() -> Choices {
-        Choices { compact: false, previews: true, command_return: false, newest: false, typing: true, emoticons: false, images: true, updates: true, open_at_login: false, tray: false, confirm_links: true, strip_tracking: false, spell: true, section: Section::Accounts }
+        Choices { appearance: Appearance::System, high_contrast: false, compact: false, previews: true, command_return: false, newest: false, typing: true, emoticons: false, images: true, updates: true, open_at_login: false, tray: false, confirm_links: true, strip_tracking: false, spell: true, section: Section::Accounts }
     }
 }
 
 // One window, one value each, read while drawing: globals, as the text step is.
 static CHOICES: Mutex<Choices> = Mutex::new(Choices {
+    appearance: Appearance::System,
+    high_contrast: false,
     compact: false,
     previews: true,
     command_return: false,
@@ -122,6 +129,8 @@ pub fn set_trusted_links(trusted: Trusted) {
 pub fn set_choices(choices: Choices) {
     *CHOICES.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = choices;
     super::super::theme::set_compact(choices.compact);
+    super::super::theme::set_appearance(choices.appearance);
+    super::super::theme::set_high_contrast(choices.high_contrast);
 }
 
 /// chatd's settings as last read (`Request::Settings`). Defaults until the first answer.
@@ -272,6 +281,8 @@ pub fn parse(text: &str) -> Prefs {
                 prefs.text_step = fields.next().and_then(|n| n.parse::<i32>().ok()).unwrap_or(0).clamp(-1, 3);
             }
             // A value that does not parse reads as the default.
+            "appearance" => prefs.choices.appearance = fields.next().and_then(Appearance::from_word).unwrap_or_default(),
+            "high_contrast" => prefs.choices.high_contrast = fields.next() == Some("on"),
             "density" => prefs.choices.compact = fields.next() == Some("compact"),
             "previews" => prefs.choices.previews = fields.next() != Some("off"),
             "send" => prefs.choices.command_return = fields.next() == Some("cmd-return"),
@@ -336,7 +347,9 @@ pub fn write(prefs: &Prefs) -> String {
     text.push_str(&format!("details\t{}\t{}\n", word(prefs.details_channels), word(prefs.details_directs)));
     text.push_str(&format!("text\t{}\n", prefs.text_step));
     let (choices, default) = (prefs.choices, Choices::default());
-    let lines: [(&str, bool, &str); 14] = [
+    let lines: [(&str, bool, &str); 16] = [
+        ("appearance", choices.appearance != default.appearance, choices.appearance.word()),
+        ("high_contrast", choices.high_contrast != default.high_contrast, "on"),
         ("density", choices.compact != default.compact, "compact"),
         ("previews", choices.previews != default.previews, "off"),
         ("send", choices.command_return != default.command_return, "cmd-return"),
@@ -420,7 +433,7 @@ mod tests {
             details_channels: true,
             details_directs: false,
             text_step: 2,
-            choices: Choices { compact: true, previews: false, command_return: true, newest: true, typing: false, emoticons: true, images: false, updates: false, open_at_login: true, tray: true, confirm_links: false, strip_tracking: true, spell: false, section: Section::Audio },
+            choices: Choices { appearance: Appearance::Light, high_contrast: true, compact: true, previews: false, command_return: true, newest: true, typing: false, emoticons: true, images: false, updates: false, open_at_login: true, tray: true, confirm_links: false, strip_tracking: true, spell: false, section: Section::Audio },
             kept: Vec::new(),
             autoplay: Autoplay::Hover,
             tiny_members: false,

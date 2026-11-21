@@ -60,9 +60,11 @@ pub const ROWS: &[Row] = &[
     row("SV", Sounds, "Notification sounds", "Notification volume", &[], &["volume", "loud", "quiet", "sound"]),
     row("S13", Sounds, "Your sounds", "Add a sound…", &[], &["custom", "custom sound", "custom sounds", "sound file", "import", "add", "my sound", "audio"]),
     row("S14", Sounds, "Calls", "Ring back while I'm calling someone", &[], &["ringback", "ring back", "calling", "dial", "tone"]),
+    row("A1", Appearance, "", "Appearance", &["System", "Light", "Dark"], &["theme", "light", "dark", "dark mode", "light mode", "system", "colour", "color"]),
     row("A2", Appearance, "", "Text size", &["13 pt", "14 pt", "15 pt", "16 pt", "17 pt"], &["font", "bigger", "smaller", "zoom", "large"]),
     row("A3", Appearance, "", "Density", &["Comfortable", "Compact"], &["rows", "dense", "spacing", "compact"]),
     row("A4", Appearance, "", "Show message previews in the list", &[], &["preview", "screen sharing", "privacy", "list"]),
+    row("A5", Appearance, "", "Increase contrast", &[], &["contrast", "high contrast", "accessibility", "vision", "legible"]),
     row("M1", Messages, "", "Send with", &["Return", "⌘Return"], &["enter", "return", "newline", "send key", "cmd"]),
     row("M2", Messages, "", "Open conversations at", &["First unread", "Newest message"], &["scroll", "unread", "bottom", "jump"]),
     row("M3", Messages, "", "Show when others are typing", &[], &["typing", "indicator"]),
@@ -119,9 +121,6 @@ pub const NOT_YET: &[(&str, &str)] = &[
     ("proxy", "tinyclient has no proxy setting yet."),
     ("socks", "tinyclient has no proxy setting yet."),
     ("reaction", "tinyclient does not notify about reactions yet."),
-    ("theme", "tinyclient is dark only for now."),
-    ("light", "tinyclient is dark only for now."),
-    ("dark mode", "tinyclient is dark only for now."),
     ("accent", "tinyclient keeps one accent colour."),
     ("font", "tinyclient keeps the system font. Text size is in Appearance."),
     ("language", crate::host::FOLLOWS_LANGUAGE),
@@ -382,6 +381,14 @@ mod tests {
         assert_eq!(not_yet("custom sound"), None);
         assert_eq!(not_yet("sound file"), None);
         assert!(search("custom sound").iter().any(|row| row.id == "S13"));
+        // Appearance (light/dark/system) and high contrast are built now.
+        assert!(search("light").iter().any(|row| row.id == "A1"));
+        assert!(search("dark mode").iter().any(|row| row.id == "A1"));
+        assert!(search("theme").iter().any(|row| row.id == "A1"));
+        assert!(search("contrast").iter().any(|row| row.id == "A5"));
+        assert_eq!(not_yet("theme"), None);
+        assert_eq!(not_yet("light"), None);
+        assert_eq!(not_yet("dark mode"), None);
         assert_eq!(not_yet("zzz"), None);
     }
 
