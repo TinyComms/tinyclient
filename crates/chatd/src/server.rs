@@ -4005,6 +4005,18 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::ActiveSessions { account } => {
+                match self.ask(&account, |reply| Command::ActiveSessions { reply }) {
+                    Ok(sessions) => Response::ActiveSessions { sessions },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::EndSession { account, session_id } => {
+                match self.ask(&account, |reply| Command::EndSession { session_id, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
                     Some(id) => self.hub.settings().custom_sound(id).is_some(),

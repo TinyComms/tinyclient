@@ -4002,3 +4002,47 @@ fn saved_messages_dialogs_history_and_reaction_tags() {
         world.calls()
     );
 }
+
+#[test]
+fn active_sessions_list_and_end_non_current() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.active_sessions, "Telegram must advertise active_sessions capability");
+
+    // List all active sessions (3 seeded: 1 current + 2 other devices).
+    let sessions = match world.ask(Request::ActiveSessions { account: account() }) {
+        Response::ActiveSessions { sessions } => sessions,
+        other => panic!("expected ActiveSessions, got {other:?}"),
+    };
+    assert_eq!(sessions.len(), 3, "expected 3 active sessions, got {sessions:?}");
+    assert!(sessions.iter().any(|s| s.current && s.id == "0"));
+    assert!(sessions.iter().any(|s| !s.current && s.id == "91001" && s.device.contains("iPhone")));
+
+    // Refuses ending the current session (hash 0).
+    let refuse = world.ask(Request::EndSession {
+        account: account(),
+        session_id: "0".into(),
+    });
+    assert!(matches!(refuse, Response::Error { .. }), "ending current session must be refused, got {refuse:?}");
+
+    // End a non-current session (91001).
+    let ok = world.ask(Request::EndSession {
+        account: account(),
+        session_id: "91001".into(),
+    });
+    assert!(matches!(ok, Response::Ok), "expected Ok ending session 91001, got {ok:?}");
+    assert!(
+        world.calls().iter().any(|c| c == "ResetAuthorization 91001"),
+        "expected ResetAuthorization 91001 on wire, got: {:#?}",
+        world.calls()
+    );
+
+    // Re-listing sessions should no longer contain 91001.
+    let after = match world.ask(Request::ActiveSessions { account: account() }) {
+        Response::ActiveSessions { sessions } => sessions,
+        other => panic!("expected ActiveSessions, got {other:?}"),
+    };
+    assert_eq!(after.len(), 2);
+    assert!(!after.iter().any(|s| s.id == "91001"));
+}

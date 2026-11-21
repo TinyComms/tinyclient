@@ -1253,6 +1253,43 @@ pub(super) fn saved_history(
     Ok(out)
 }
 
+/// List active signed-in devices/sessions (`account.getAuthorizations`).
+pub(super) fn active_sessions(account: &Account) -> Result<Vec<protocol::ActiveSession>, Fault> {
+    let tl::enums::account::Authorizations::Authorizations(found) =
+        account.ask(&tl::functions::account::GetAuthorizations {})?;
+    let mut out = Vec::new();
+    for tl::enums::Authorization::Authorization(a) in found.authorizations {
+        let app = format!("{} {}", a.app_name, a.app_version).trim().to_owned();
+        let platform = format!("{} {}", a.platform, a.system_version).trim().to_owned();
+        let location = match (a.region.is_empty(), a.country.is_empty()) {
+            (false, false) => format!("{}, {}", a.region, a.country),
+            (false, true) => a.region,
+            (true, false) => a.country,
+            (true, true) => String::new(),
+        };
+        out.push(protocol::ActiveSession {
+            id: a.hash.to_string(),
+            app,
+            device: a.device_model,
+            platform,
+            location,
+            last_active: i64::from(a.date_active),
+            current: a.current,
+        });
+    }
+    Ok(out)
+}
+
+/// Terminate another active session (`account.resetAuthorization`). Never ends the current session (`hash == 0`).
+pub(super) fn end_session(account: &Account, session_id: &str) -> Result<(), Fault> {
+    let hash: i64 = session_id.trim().parse().map_err(|_| invalid("HASH_INVALID"))?;
+    if hash == 0 {
+        return Err(invalid("CURRENT_SESSION_FORBIDDEN"));
+    }
+    account.ask(&tl::functions::account::ResetAuthorization { hash })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

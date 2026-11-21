@@ -696,6 +696,9 @@ pub struct Capabilities {
     /// This account supports browsing Saved Messages grouped by source chat and reaction tags (Telegram).
     #[serde(default, skip_serializing_if = "is_false")]
     pub saved_subdialogs: bool,
+    /// This account supports listing active signed-in devices/sessions and ending another session (Telegram).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub active_sessions: bool,
 }
 
 /// Scope of an account-wide notification default (Telegram `InputNotifyUsers` / `Chats` / `Broadcasts`).
@@ -753,6 +756,25 @@ pub struct SavedTag {
     pub title: String,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub count: u32,
+}
+
+/// One active signed-in device/session on an account (`account.getAuthorizations`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveSession {
+    /// Opaque session identifier (`"0"` for the current session on Telegram).
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub app: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub device: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub platform: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub location: String,
+    #[serde(default)]
+    pub last_active: i64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub current: bool,
 }
 
 /// Preview of a Space invite (`Request::InvitePreview`).

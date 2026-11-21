@@ -566,6 +566,8 @@ struct World {
     notify_defaults: [bool; 3],
     /// Per-peer notification exceptions (`account.getNotifyExceptions`).
     notify_exceptions: Vec<(Who, bool)>,
+    /// Active sessions (`hash`, `app`, `device`, `region`, `country`, `current`).
+    sessions: Vec<(i64, &'static str, &'static str, &'static str, &'static str, bool)>,
 }
 
 fn key(peer: Who, topic: Option<i32>) -> String {
@@ -637,6 +639,11 @@ impl World {
             saved_gifs: vec![6_200],
             notify_defaults: [false, false, false],
             notify_exceptions: vec![(Who::Channel(NOTES), true)],
+            sessions: vec![
+                (0, "TinyClient", "Desktop", "Seattle", "US", true),
+                (91_001, "Telegram iOS", "iPhone 15", "Seattle", "US", false),
+                (91_002, "Telegram Desktop", "MacBook Pro", "Portland", "US", false),
+            ],
         };
         let odalys = Who::User(ODALYS);
         world.store(None, message(odalys, 10, ODALYS, t0() - 300, "Are you coming to the ridge on Saturday?"));
@@ -2204,6 +2211,47 @@ impl World {
             self.log("ResetNotifySettings");
             self.notify_defaults = [false; 3];
             self.notify_exceptions.clear();
+            return answer(true);
+        }
+        if asked::<f::account::GetAuthorizations>(body).is_some() {
+            self.log("GetAuthorizations");
+            let authorizations: Vec<tl::enums::Authorization> = self
+                .sessions
+                .iter()
+                .map(|&(hash, app, device, region, country, current)| {
+                    tl::types::Authorization {
+                        current,
+                        official_app: !current,
+                        password_pending: false,
+                        encrypted_requests_disabled: false,
+                        call_requests_disabled: false,
+                        unconfirmed: false,
+                        hash,
+                        device_model: device.to_owned(),
+                        platform: "Desktop".to_owned(),
+                        system_version: "1.0".to_owned(),
+                        api_id: 1,
+                        app_name: app.to_owned(),
+                        app_version: "1.0".to_owned(),
+                        date_created: t0() - 86_400 * 10,
+                        date_active: t0() - 60,
+                        ip: "127.0.0.1".to_owned(),
+                        country: country.to_owned(),
+                        region: region.to_owned(),
+                    }
+                    .into()
+                })
+                .collect();
+            return answer(tl::enums::account::Authorizations::Authorizations(
+                tl::types::account::Authorizations {
+                    authorization_ttl_days: 180,
+                    authorizations,
+                },
+            ));
+        }
+        if let Some(request) = asked::<f::account::ResetAuthorization>(body) {
+            self.log(&format!("ResetAuthorization {}", request.hash));
+            self.sessions.retain(|s| s.0 != request.hash || s.5);
             return answer(true);
         }
         if asked::<f::messages::GetSavedDialogs>(body).is_some() {

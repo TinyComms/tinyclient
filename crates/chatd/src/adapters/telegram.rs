@@ -727,6 +727,8 @@ fn offline(ctx: &Context, command: Command) {
         | Command::ResetNotifyDefaults { reply } => drop(reply.send(Err(down()))),
         Command::SavedDialogs { reply } => drop(reply.send(Err(down()))),
         Command::SavedHistory { reply, .. } => drop(reply.send(Err(down()))),
+        Command::ActiveSessions { reply } => drop(reply.send(Err(down()))),
+        Command::EndSession { reply, .. } => drop(reply.send(Err(down()))),
         Command::SendWith { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
         Command::StartDirect { reply, .. } | Command::Handoff { reply, .. } => drop(reply.send(Err(down()))),
         Command::OpenForum { reply, .. } => drop(reply.send(Err(down()))),
@@ -904,6 +906,21 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::SavedHistory { peer_id, tag, limit, reply } => {
             let _ = reply.send(info::saved_history(account, peer_id.as_deref(), tag.as_deref(), limit).map_err(refused));
+        }
+        Command::ActiveSessions { reply } => {
+            let _ = reply.send(info::active_sessions(account).map_err(refused));
+        }
+        Command::EndSession { session_id, reply } => {
+            let res = info::end_session(account, &session_id).map_err(|fault| match &fault {
+                Fault::Rpc { name, .. } if name == "CURRENT_SESSION_FORBIDDEN" => {
+                    Refusal::Refused("Use Sign out to end this device's session.".to_owned())
+                }
+                Fault::Rpc { name, .. } if name == "FRESH_RESET_AUTHORISATION_FORBIDDEN" => {
+                    Refusal::Refused("Telegram requires a session to be at least 24 hours old before ending other devices.".to_owned())
+                }
+                _ => refused(fault),
+            });
+            let _ = reply.send(res);
         }
         Command::Handoff { conversation_id, reply } => {
             let link = Who::parse(&conversation_id).map(|(who, _)| {

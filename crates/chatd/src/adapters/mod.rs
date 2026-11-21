@@ -696,6 +696,15 @@ pub enum Command {
         limit: u32,
         reply: Reply<Vec<protocol::Message>>,
     },
+    /// Lists active signed-in devices/sessions for this account.
+    ActiveSessions {
+        reply: Reply<Vec<protocol::ActiveSession>>,
+    },
+    /// Terminates another active session by id.
+    EndSession {
+        session_id: String,
+        reply: Reply<()>,
+    },
     /// Forwards one or more messages to target conversations on the same account.
     /// Answers with `(target_conversation_id, Ok(()) | Err(reason))` per target.
     Forward {
@@ -929,6 +938,8 @@ impl Command {
             | Command::ResetNotifyDefaults { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SavedDialogs { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SavedHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ActiveSessions { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::EndSession { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Forward { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SaveGif { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

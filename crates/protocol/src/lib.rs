@@ -2696,6 +2696,17 @@ pub enum Request {
         #[serde(default)]
         limit: u32,
     },
+    /// List active signed-in devices/sessions for an account (Telegram `account.getAuthorizations`).
+    /// Answers `Response::ActiveSessions`.
+    ActiveSessions {
+        account: AccountKey,
+    },
+    /// Terminate another active session (Telegram `account.resetAuthorization`). Never ends the current session.
+    /// Answers `Response::Ok`.
+    EndSession {
+        account: AccountKey,
+        session_id: String,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -3230,6 +3241,10 @@ pub enum Response {
     /// Saved Messages filtered by source peer or reaction tag (`Request::SavedHistory`).
     SavedHistory {
         messages: Vec<Message>,
+    },
+    /// Active signed-in devices/sessions (`Request::ActiveSessions`).
+    ActiveSessions {
+        sessions: Vec<ActiveSession>,
     },
 }
 

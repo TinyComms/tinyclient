@@ -1046,6 +1046,8 @@ impl Demo {
             | Command::ResetNotifyDefaults { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SavedDialogs { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SavedHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ActiveSessions { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::EndSession { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Backfill(_)
             | Command::Warm(_)
             | Command::History { .. }

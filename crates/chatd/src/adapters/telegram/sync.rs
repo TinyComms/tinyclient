@@ -381,6 +381,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         save_gif: true,
         notify_defaults: true,
         saved_subdialogs: true,
+        active_sessions: true,
         ..Capabilities::default()
     }
 }
