@@ -1990,9 +1990,13 @@ impl Chat {
             nickname: about.nickname,
             roles: about.roles,
             notify: about.notify,
+            domain: about.domain,
+            url: about.url,
         };
         clip(&mut info.description, 4_000);
         clip(&mut info.nickname, 100);
+        clip(&mut info.domain, 128);
+        clip(&mut info.url, 512);
         info.roles.truncate(protocol::PROFILE_ROLES);
         info.roles.iter_mut().for_each(|role| clip(role, 100));
         self.hub.space_infos.keep(space, info.clone());
@@ -3915,6 +3919,63 @@ impl Chat {
                 values,
                 reply,
             }),
+            Request::InviteMember { account, email, channels, real_name } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::InviteMember { email, channels, real_name, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::AddCustomEmoji { account, name, path } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::AddCustomEmoji { name, path, reply }) {
+                    Ok(()) => {
+                        self.hub.catalogs.forget_where(|(acct, kind, ..)| acct == &account && *kind == CatalogKind::Emoji);
+                        Response::Ok
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::UserGroups { account } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::UserGroups { reply }) {
+                    Ok(groups) => Response::UserGroups { groups },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::UserGroupCreate { account, name, handle, description } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::UserGroupCreate { name, handle, description, reply }) {
+                    Ok(group) => Response::UserGroup { group },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::UserGroupUpdate { account, group_id, name, handle, description } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::UserGroupUpdate { group_id, name, handle, description, reply }) {
+                    Ok(group) => Response::UserGroup { group },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::UserGroupMembers { account, group_id, users } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::UserGroupMembers { group_id, users, reply }) {
+                    Ok(group) => Response::UserGroup { group },
+                    Err(refused) => *refused,
+                }
+            }
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
                     Some(id) => self.hub.settings().custom_sound(id).is_some(),

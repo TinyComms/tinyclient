@@ -1933,8 +1933,10 @@ impl Pane {
         let picker = cx.new(|cx| Picker::new(custom, rules, account, space, window, cx));
         let listening = cx.subscribe_in(&picker, window, |this, _, event: &PickerEvent, window, cx| {
             let target = this.picker.as_ref().map(|picking| picking.message.clone());
-            if let (PickerEvent::Picked(emoji), Some(target)) = (event, target) {
-                this.react_toggle(&target, emoji, cx);
+            match (event, target) {
+                (PickerEvent::Picked(emoji), Some(target)) => this.react_toggle(&target, emoji, cx),
+                (PickerEvent::OpenUrl(url), _) => this.open_external_link(url, window, cx),
+                _ => {}
             }
             this.close_picker(cx);
             window.focus(&this.focus, cx);

@@ -393,6 +393,7 @@ impl Demo {
             nickname: if self.ctx.account.network == Network::Discord { "Robin 🍄".to_owned() } else { String::new() },
             roles: if self.ctx.account.network == Network::Discord { vec!["Member".to_owned(), "Trail lead".to_owned()] } else { Vec::new() },
             notify: Notify::Mentions,
+            ..SpaceAbout::default()
         })
     }
 
@@ -1008,7 +1009,13 @@ impl Demo {
             Command::PreviewChannel { reply, .. }
             | Command::Join { reply, .. }
             | Command::DeleteFile { reply, .. }
-            | Command::MessageAction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            | Command::MessageAction { reply, .. }
+            | Command::InviteMember { reply, .. }
+            | Command::AddCustomEmoji { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::UserGroups { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::UserGroupCreate { reply, .. }
+            | Command::UserGroupUpdate { reply, .. }
+            | Command::UserGroupMembers { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::AccountFiles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallRing { reply, .. } | Command::CallStopRinging { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)));

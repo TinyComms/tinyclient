@@ -218,6 +218,16 @@ fn reason(fault: Fault) -> String {
             "external_email" => return info::EXTERNAL_EMAIL.to_owned(),
             "action_not_found" | "invalid_action" | "invalid_blocks" => "That app action is no longer available.",
             "trigger_expired" => "That app interaction expired. Try clicking again.",
+            "already_in_team" => "That person is already in this workspace.",
+            "already_invited" | "sent_recently" => "An invite was already sent to that address.",
+            "invalid_email" => "That does not look like a valid email address.",
+            "error_name_taken" => "A custom emoji with that name already exists.",
+            "error_bad_name_i18n" | "error_name_bad_characters" => "Emoji names may only contain lowercase letters, numbers, hyphens, and underscores.",
+            "error_invalid_image" | "error_no_image" | "error_too_big" => "That image cannot be used as a custom emoji.",
+            "handle_already_exists" => "A user group with that handle already exists.",
+            "name_already_exists" => "A user group with that name already exists.",
+            "paid_teams_only" | "paid_only" => "This feature requires a paid Slack plan.",
+            "no_permission" => "You do not have permission to do that in this workspace.",
             "restricted_action" => "This workspace does not let you do that.",
             error if error.starts_with("restricted_action_") => "This workspace does not let you post here.",
             error => return format!("Slack refused ({error})."),
@@ -340,7 +350,12 @@ fn per_minute(method: &str) -> f64 {
         "users.setPresence"
         | "reactions.remove"
         | "emoji.list"
+        | "emoji.add"
+        | "users.admin.invite"
         | "usergroups.list"
+        | "usergroups.create"
+        | "usergroups.update"
+        | "usergroups.users.update"
         | "dnd.setSnooze"
         | "dnd.endSnooze"
         | "stars.add"
@@ -833,6 +848,89 @@ impl Slack {
             let retry = response.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok());
             let limited = response.status().as_u16() == 429;
             let body: Value = if limited { Value::Null } else { response.body_mut().read_json().map_err(net)? };
+            if !limited && body["error"] != "ratelimited" {
+                return self.checked(method, body);
+            }
+            wait = retry.unwrap_or(5);
+            if attempt > 0 || wait > PATIENCE {
+                break;
+            }
+            if self.ctx.pause(Duration::from_secs(wait)) {
+                return Err(stopped());
+            }
+        }
+        Err(Fault::Limited(wait))
+    }
+
+    /// Multipart form POST to a Slack web API method (used by `emoji.add`).
+    /// Reuses the same session token, cookie, rate-limit handling, and cookie reissue as `api()`.
+    fn api_multipart(
+        &self,
+        method: &str,
+        fields: &[(&str, &str)],
+        file_field: &str,
+        filename: &str,
+        mime: &str,
+        bytes: &[u8],
+    ) -> Result<Value, Fault> {
+        self.halted(method)?;
+        let url = format!("{}api/{method}", self.api);
+        let boundary = format!("----tinyclient{:x}", fnv(filename) ^ (crate::hub::now() as u64));
+        let mut payload = Vec::with_capacity(bytes.len() + 512);
+        let push_field = |buf: &mut Vec<u8>, name: &str, value: &str| {
+            buf.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            buf.extend_from_slice(
+                format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").as_bytes(),
+            );
+        };
+        push_field(&mut payload, "token", self.session.token.as_str());
+        for &(k, v) in fields {
+            if !v.is_empty() {
+                push_field(&mut payload, k, v);
+            }
+        }
+        let safe_name: String = filename
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+            .collect();
+        let safe_name = if safe_name.is_empty() { "emoji.png" } else { safe_name.as_str() };
+        payload.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        payload.extend_from_slice(
+            format!(
+                "Content-Disposition: form-data; name=\"{file_field}\"; filename=\"{safe_name}\"\r\nContent-Type: {mime}\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        payload.extend_from_slice(bytes);
+        payload.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        let content_type = format!("multipart/form-data; boundary={boundary}");
+        let net = |err: ureq::Error| Fault::Net(format!("{method}: {err}"));
+        let stopped = || Fault::Net(format!("{method}: stopped"));
+        let mut wait = 0;
+        for attempt in 0..2 {
+            if self.pace(method) {
+                return Err(stopped());
+            }
+            let sent = self
+                .agent
+                .post(&url)
+                .header("Cookie", self.cookie())
+                .header("Content-Type", &content_type)
+                .send(payload.as_slice());
+            let mut response = sent.map_err(net)?;
+            self.reissued(response.headers());
+            let retry = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok());
+            let limited = response.status().as_u16() == 429;
+            let body: Value = if limited {
+                Value::Null
+            } else {
+                response.body_mut().read_json().map_err(net)?
+            };
             if !limited && body["error"] != "ratelimited" {
                 return self.checked(method, body);
             }
@@ -1525,6 +1623,26 @@ impl Slack {
             }
             Command::CancelSend { client_id, .. } => crate::blobs::upload::cancel(&self.ctx.account, &client_id),
             Command::ConversationInfo { conversation_id, reply } => answer(reply, self.conversation_info(&conversation_id)),
+            Command::SpaceInfo { space_id, reply } => answer(reply, self.space_info(&space_id)),
+            Command::InviteMember { email, channels, real_name, reply } => {
+                answer(reply, self.invite_member(&email, &channels, &real_name))
+            }
+            Command::AddCustomEmoji { name, path, reply } => {
+                answer(reply, self.add_custom_emoji(&name, &path))
+            }
+            Command::UserGroups { reply } => answer(reply, self.user_groups()),
+            Command::UserGroupCreate { name, handle, description, reply } => {
+                answer(reply, self.user_group_create(&name, &handle, &description))
+            }
+            Command::UserGroupUpdate { group_id, name, handle, description, reply } => {
+                answer(
+                    reply,
+                    self.user_group_update(&group_id, name.as_deref(), handle.as_deref(), description.as_deref()),
+                )
+            }
+            Command::UserGroupMembers { group_id, users, reply } => {
+                answer(reply, self.user_group_members(&group_id, &users))
+            }
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
             Command::Star { conversation_id, starred, reply } => answer(reply, self.star(&conversation_id, starred)),
             Command::StarMessage { conversation_id, message_id, starred, reply } => {

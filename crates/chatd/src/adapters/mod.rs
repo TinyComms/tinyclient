@@ -209,6 +209,8 @@ pub struct SpaceAbout {
     pub nickname: String,
     pub roles: Vec<String>,
     pub notify: Notify,
+    pub domain: String,
+    pub url: String,
 }
 
 /// A page of what was shared, from the network's own search.
@@ -815,6 +817,44 @@ pub enum Command {
     /// The user signed out: end the session on the network, best effort, then answer. chatd
     /// waits five seconds for the answer and forgets the account either way.
     SignOut(Reply<()>),
+    /// Invite a member by email to a workspace (`users.admin.invite`).
+    InviteMember {
+        email: String,
+        channels: Vec<String>,
+        real_name: String,
+        reply: Reply<()>,
+    },
+    /// Upload a custom emoji (`emoji.add`).
+    AddCustomEmoji {
+        name: String,
+        path: String,
+        reply: Reply<()>,
+    },
+    /// List active workspace user groups (`usergroups.list`).
+    UserGroups {
+        reply: Reply<Vec<protocol::UserGroup>>,
+    },
+    /// Create a workspace user group (`usergroups.create`).
+    UserGroupCreate {
+        name: String,
+        handle: String,
+        description: String,
+        reply: Reply<protocol::UserGroup>,
+    },
+    /// Update a workspace user group (`usergroups.update`).
+    UserGroupUpdate {
+        group_id: String,
+        name: Option<String>,
+        handle: Option<String>,
+        description: Option<String>,
+        reply: Reply<protocol::UserGroup>,
+    },
+    /// Update members of a workspace user group (`usergroups.users.update`).
+    UserGroupMembers {
+        group_id: String,
+        users: Vec<String>,
+        reply: Reply<protocol::UserGroup>,
+    },
     /// The adapter is being dropped. `serve_commands` returns on it; an adapter never sees it.
     Stop,
 }
@@ -908,6 +948,12 @@ impl Command {
             Command::ReportReasons { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             // Nothing to end on the network: the session is simply forgotten.
             Command::SignOut(reply) => drop(reply.send(Ok(()))),
+            Command::InviteMember { reply, .. }
+            | Command::AddCustomEmoji { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::UserGroups { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::UserGroupCreate { reply, .. }
+            | Command::UserGroupUpdate { reply, .. }
+            | Command::UserGroupMembers { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Download { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Search { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Send { conversation_id, client_id, .. } => {

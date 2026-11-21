@@ -1933,6 +1933,20 @@ impl Shell {
         }
     }
 
+    /// Routes external HTTP/HTTPS link opens through `Pane::open_external_link` (which validates
+    /// via `Destination::parse`, enforces http/https only, strips tracking, and honors link
+    /// confirmation preferences).
+    pub(in crate::gui) fn open_external_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(pane) = self.conversation_state.pane.get().cloned() {
+            pane.update(cx, |pane, cx| pane.open_external_link(url, window, cx));
+            return;
+        }
+        if let Some(dest) = protocol::link::Destination::parse(url) {
+            let strip = crate::gui::app::prefs::choices().strip_tracking;
+            cx.open_url(&dest.target(strip));
+        }
+    }
+
     /// Back on a phone: what a pane of messages has over it (the viewer, a message's sheet, the
     /// picker, the delete question) closes first, the thread's before the conversation's.
     pub(in crate::gui) fn panes_back(&mut self, cx: &mut Context<Self>) -> bool {

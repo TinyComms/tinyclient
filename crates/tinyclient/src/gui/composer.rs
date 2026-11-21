@@ -2115,6 +2115,10 @@ impl Composer {
                 PickerEvent::Picked(text) => this.insert_text(text, cx),
                 PickerEvent::Custom { name, id, animated } => this.insert_custom(name, id, *animated, cx),
                 PickerEvent::Send(pick) => this.send_pick(pick.clone(), cx),
+                PickerEvent::OpenUrl(url) => {
+                    let url = url.clone();
+                    let _ = this.shell.update(cx, |shell, cx| shell.open_external_link(&url, window, cx));
+                }
                 PickerEvent::Kept(_) | PickerEvent::Closed => {}
             }
             if !keep {

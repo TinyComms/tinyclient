@@ -116,7 +116,7 @@ pub(super) fn network_link_chip(url: &str, conversations: &[protocol::Conversati
 
 impl Pane {
     /// Opens a link externally (in the system browser), asking for confirmation per preferences.
-    pub(super) fn open_external_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(in crate::gui) fn open_external_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
         // An e-mail address Telegram or Slack made a link of: the mail app's, not a site.
         if is_mailto(url) {
             cx.open_url(url);

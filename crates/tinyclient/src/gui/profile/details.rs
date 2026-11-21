@@ -655,6 +655,9 @@ pub fn space(pane: &InfoPane, key: &Key, cx: &mut Context<InfoPane>) -> Div {
             _ => None,
         },
         (Network::Teams, Some(info)) => info.members.map(|members| div().child(format!("Team · {} members", facts::thousands(members)))),
+        (Network::Slack, Some(info)) if !info.domain.is_empty() => {
+            Some(div().child(format!("{}.slack.com", info.domain)))
+        }
         _ => None,
     };
     let top = div()
@@ -709,11 +712,46 @@ pub fn space(pane: &InfoPane, key: &Key, cx: &mut Context<InfoPane>) -> Div {
     } else if waiting && late {
         body = body.child(draw::rule().mt(px(16.))).child(div().px(px(theme::PANE_PAD)).pt(px(16.)).child(draw::skeleton()));
     }
-    let link = facts::space_link(key);
-    body.child(
+    let link = match (key.network, info.as_ref()) {
+        (Network::Slack, Some(info)) if !info.url.is_empty() => Some(info.url.clone()),
+        _ => facts::space_link(key),
+    };
+    let domain_or_url = info
+        .as_ref()
+        .map(|i| if !i.url.is_empty() { i.url.as_str() } else { i.domain.as_str() })
+        .unwrap_or("");
+    let slack_links = (key.network == Network::Slack).then(|| {
+        let mut group = div()
+            .px(px(theme::PANE_PAD))
+            .pt(px(12.))
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(draw::label("Workspace settings · Opens in your browser", true));
+        for (ix, &(label, rel)) in facts::SLACK_WORKSPACE_LINKS.iter().enumerate() {
+            let url = facts::slack_workspace_url(domain_or_url, &key.id, rel);
+            let shell = pane.shell_weak();
+            group = group.child(
+                button_with_icon(("space-slack-link", ix), ButtonKind::Secondary, "icons/external-link.svg", label)
+                    .tooltip(tip(format!("{label} · Opens in your browser"), None))
+                    .on_click(move |_, window, cx| {
+                        let url = url.clone();
+                        let _ = shell.update(cx, |shell, cx| shell.open_external_link(&url, window, cx));
+                    }),
+            );
+        }
+        group
+    });
+    let shell = pane.shell_weak();
+    body.children(slack_links).child(
         div()
             .px(px(theme::PANE_PAD))
             .pt(px(16.))
-            .children(link.map(|url| draw::open_in("space-open", key.network).on_click(move |_, _, cx| cx.open_url(&url)))),
+            .children(link.map(|url| {
+                let shell = shell.clone();
+                draw::open_in("space-open", key.network).on_click(move |_, window, cx| {
+                    let _ = shell.update(cx, |shell, cx| shell.open_external_link(&url, window, cx));
+                })
+            })),
     )
 }

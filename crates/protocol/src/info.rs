@@ -333,6 +333,26 @@ pub struct SpaceInfo {
     pub roles: Vec<String>,
     #[serde(default)]
     pub notify: Notify,
+    /// Workspace subdomain (e.g. `acme` for `acme.slack.com`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub domain: String,
+    /// Canonical HTTPS workspace URL (e.g. `https://acme.slack.com`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+}
+
+/// One workspace user group (e.g. Slack `@oncall`, `@design`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserGroup {
+    pub id: String,
+    pub name: String,
+    pub handle: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub member_count: u32,
 }
 
 /// Which of a custom emoji set this account may send.

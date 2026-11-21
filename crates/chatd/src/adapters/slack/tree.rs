@@ -406,6 +406,9 @@ impl Slack {
         // Looked up once: `-` when the workspace has only Slack's default picture.
         let icon = self.ctx.note("icon").or_else(|| {
             let info = self.api("team.info", &[]).ok()?;
+            if let Some(domain) = info["team"]["domain"].as_str().filter(|d| !d.is_empty()) {
+                self.ctx.set_note("team:domain", domain);
+            }
             let icon = &info["team"]["icon"];
             let urls = [&icon["image_88"], &icon["image_68"], &icon["image_132"]];
             let url = urls.into_iter().filter_map(Value::as_str).find(|url| self.hosted(url));

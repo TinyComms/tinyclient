@@ -1980,6 +1980,32 @@ impl Shell {
         }
         let account = current.as_ref().map(Key::account);
         let name = current.as_ref().and_then(|key| self.spaces.iter().find(|s| &s.key == key)).map_or_else(String::new, |s| s.name.clone());
+        if let Some(space_key) = current.clone() {
+            let team_id = space_key.id.clone();
+            let info_key = space_key.clone();
+            menu = menu.child(
+                super::components::menu_item("slack-workspace-info", Some("icons/info.svg"), "Workspace info", None).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        this.sidebar_state.slack_menu = false;
+                        this.details_space(info_key.clone(), cx);
+                    }),
+                ),
+            );
+            menu = menu.child(super::components::menu_separator());
+            menu = menu.child(super::components::menu_label("Workspace settings · Opens in your browser"));
+            for (ix, &(label, rel)) in super::profile::facts::SLACK_WORKSPACE_LINKS.iter().enumerate() {
+                let url = super::profile::facts::slack_workspace_url("", &team_id, rel);
+                menu = menu.child(
+                    super::components::menu_item(("slack-admin-link", ix), Some("icons/external-link.svg"), label, None)
+                        .tooltip(tip(format!("{label} · Opens in your browser"), None))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.sidebar_state.slack_menu = false;
+                            this.open_external_link(&url, window, cx);
+                        })),
+                );
+            }
+            menu = menu.child(super::components::menu_separator());
+        }
         menu = menu.child(super::components::menu_item_danger("slack-sign-out", Some("icons/log-out.svg"), format!("Sign out of {name}")).on_click(cx.listener(move |this, _, _, cx| {
             this.sidebar_state.slack_menu = false;
             if let Some(account) = account.clone() {

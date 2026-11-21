@@ -134,6 +134,10 @@ struct Fake {
     drafts_list: Mutex<Option<Value>>,
     /// Scheduled messages keyed by scheduled_message_id.
     scheduled: Mutex<Vec<Value>>,
+    /// Custom emoji uploaded via `emoji.add` (name -> url).
+    added_emoji: Mutex<HashMap<String, String>>,
+    /// Mutable user groups for `usergroups.list` / `create` / `update` / `users.update`.
+    usergroups: Mutex<Option<Vec<Value>>>,
 }
 
 fn unescape(text: &str) -> String {
@@ -159,6 +163,36 @@ fn form(body: &[u8]) -> HashMap<String, String> {
     let body = std::str::from_utf8(body).unwrap();
     let pairs = body.split('&').filter_map(|pair| pair.split_once('='));
     pairs.map(|(name, value)| (unescape(name), unescape(value))).collect()
+}
+
+fn multipart(body: &[u8], boundary: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let delim = format!("--{boundary}");
+    let text = String::from_utf8_lossy(body);
+    for part in text.split(&delim) {
+        let Some((head, rest)) = part.split_once("\r\n\r\n") else {
+            continue;
+        };
+        let value = rest.strip_suffix("\r\n").unwrap_or(rest);
+        let Some(name_start) = head.find("name=\"") else {
+            continue;
+        };
+        let after = &head[name_start + 6..];
+        let Some(name_end) = after.find('"') else {
+            continue;
+        };
+        let name = &after[..name_end];
+        if let Some(fn_start) = head.find("filename=\"") {
+            let fn_after = &head[fn_start + 10..];
+            if let Some(fn_end) = fn_after.find('"') {
+                out.insert(format!("{name}:filename"), fn_after[..fn_end].to_owned());
+            }
+            out.insert(format!("{name}:len"), value.len().to_string());
+        } else {
+            out.insert(name.to_owned(), value.to_owned());
+        }
+    }
+    out
 }
 
 impl Fake {
@@ -187,6 +221,8 @@ impl Fake {
             )])),
             drafts_list: Mutex::default(),
             scheduled: Mutex::default(),
+            added_emoji: Mutex::default(),
+            usergroups: Mutex::default(),
         });
         let socket_url = format!("ws://{}/", socket.local_addr().unwrap());
         for (listener, serve) in [(http, Fake::http as fn(Arc<Fake>, TcpStream)), (socket, Fake::socket)] {
@@ -282,7 +318,12 @@ impl Fake {
         };
         if let Some(method) = path.strip_prefix("/api/") {
             call.method = method.to_owned();
-            call.params = form(body);
+            let ct = header("content-type");
+            if let Some(boundary) = ct.split("boundary=").nth(1) {
+                call.params = multipart(body, boundary.trim());
+            } else {
+                call.params = form(body);
+            }
             call.token = call.params.get("token").cloned().unwrap_or_default();
             self.calls.lock().unwrap().push(call.clone());
             return self.api(&call);
@@ -555,14 +596,122 @@ impl Fake {
                 }
                 Some(json!({"ok": true}))
             }
-            "usergroups.list" => Some(json!({
-                "ok": true,
-                "usergroups": [
-                    {"id": "S0MINE", "handle": "oncall", "name": "On Call", "date_delete": 0, "users": [me(token), "U0ANA"]},
-                    {"id": "S0OTHER", "handle": "design", "name": "Design", "date_delete": 0, "users": ["U0ANA", "U0BEN"]},
-                    {"id": "S0OFF", "handle": "legacy", "name": "Legacy", "date_delete": 1700000000, "users": [me(token)]},
-                ],
-            })),
+            "usergroups.list" => {
+                let groups = self.usergroups.lock().unwrap().clone().unwrap_or_else(|| {
+                    vec![
+                        json!({"id": "S0MINE", "handle": "oncall", "name": "On Call", "description": "On-call rotation", "date_delete": 0, "users": [me(token), "U0ANA"]}),
+                        json!({"id": "S0OTHER", "handle": "design", "name": "Design", "description": "Design team", "date_delete": 0, "users": ["U0ANA", "U0BEN"]}),
+                        json!({"id": "S0OFF", "handle": "legacy", "name": "Legacy", "date_delete": 1700000000, "users": [me(token)]}),
+                    ]
+                });
+                Some(json!({"ok": true, "usergroups": groups}))
+            }
+            "usergroups.create" => {
+                let name = param("name");
+                let handle = param("handle");
+                if name.is_empty() || handle.is_empty() {
+                    return refused("invalid_arguments");
+                }
+                let mut guard = self.usergroups.lock().unwrap();
+                let list = guard.get_or_insert_with(|| {
+                    vec![
+                        json!({"id": "S0MINE", "handle": "oncall", "name": "On Call", "description": "On-call rotation", "date_delete": 0, "users": [me(token), "U0ANA"]}),
+                        json!({"id": "S0OTHER", "handle": "design", "name": "Design", "description": "Design team", "date_delete": 0, "users": ["U0ANA", "U0BEN"]}),
+                    ]
+                });
+                if list.iter().any(|g| g["handle"] == handle) {
+                    return refused("handle_already_exists");
+                }
+                let id = format!("S0NEW{}", list.len() + 1);
+                let created = json!({
+                    "id": id,
+                    "handle": handle,
+                    "name": name,
+                    "description": param("description"),
+                    "date_delete": 0,
+                    "users": [],
+                    "user_count": 0,
+                });
+                list.push(created.clone());
+                Some(json!({"ok": true, "usergroup": created}))
+            }
+            "usergroups.update" => {
+                let id = param("usergroup");
+                let mut guard = self.usergroups.lock().unwrap();
+                let list = guard.get_or_insert_with(|| {
+                    vec![
+                        json!({"id": "S0MINE", "handle": "oncall", "name": "On Call", "description": "On-call rotation", "date_delete": 0, "users": [me(token), "U0ANA"]}),
+                        json!({"id": "S0OTHER", "handle": "design", "name": "Design", "description": "Design team", "date_delete": 0, "users": ["U0ANA", "U0BEN"]}),
+                    ]
+                });
+                let Some(found) = list.iter_mut().find(|g| g["id"] == id) else {
+                    return refused("no_such_subteam");
+                };
+                if !param("name").is_empty() {
+                    found["name"] = param("name").into();
+                }
+                if !param("handle").is_empty() {
+                    found["handle"] = param("handle").into();
+                }
+                if call.params.contains_key("description") {
+                    found["description"] = param("description").into();
+                }
+                Some(json!({"ok": true, "usergroup": found.clone()}))
+            }
+            "usergroups.users.update" => {
+                let id = param("usergroup");
+                let users: Vec<String> = param("users")
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                let mut guard = self.usergroups.lock().unwrap();
+                let list = guard.get_or_insert_with(|| {
+                    vec![
+                        json!({"id": "S0MINE", "handle": "oncall", "name": "On Call", "description": "On-call rotation", "date_delete": 0, "users": [me(token), "U0ANA"]}),
+                        json!({"id": "S0OTHER", "handle": "design", "name": "Design", "description": "Design team", "date_delete": 0, "users": ["U0ANA", "U0BEN"]}),
+                    ]
+                });
+                let Some(found) = list.iter_mut().find(|g| g["id"] == id) else {
+                    return refused("no_such_subteam");
+                };
+                found["user_count"] = (users.len() as u64).into();
+                found["users"] = json!(users);
+                Some(json!({"ok": true, "usergroup": found.clone()}))
+            }
+            "users.admin.invite" => {
+                let email = param("email");
+                if email == "already@acme.example" {
+                    return refused("already_in_team");
+                }
+                if email.is_empty() || !email.contains('@') {
+                    return refused("invalid_email");
+                }
+                Some(json!({"ok": true}))
+            }
+            "emoji.add" => {
+                let name = param("name");
+                if name.is_empty() || param("mode") != "data" {
+                    return refused("error_no_image");
+                }
+                let mut added = self.added_emoji.lock().unwrap();
+                if added.contains_key(name) {
+                    return refused("error_name_taken");
+                }
+                added.insert(name.to_owned(), format!("{}/emoji/{name}.png", self.base));
+                Some(json!({"ok": true}))
+            }
+            "emoji.list" => {
+                let mut base = self.fixture(token, "emoji.list")?;
+                let added = self.added_emoji.lock().unwrap().clone();
+                if let Some(map) = base["emoji"].as_object_mut() {
+                    for (k, v) in added {
+                        map.insert(k, v.into());
+                    }
+                }
+                Some(base)
+            }
             "dnd.info" => self.dnd_info.lock().unwrap().clone().or_else(|| Some(json!({
                 "ok": true,
                 "dnd_enabled": false,
@@ -5740,4 +5889,122 @@ fn slack_follow_unfollow_thread_and_unread_reply_counting() {
     world.until("live thread_unsubscribed sets followed=false", || {
         world.conversation(&thread).filter(|c| !c.followed).map(|_| ())
     });
+}
+
+#[test]
+fn slack_workspace_info_invites_custom_emoji_and_user_groups() {
+    let world = World::start();
+    world.ready();
+
+    // 1. SpaceInfo returns workspace domain, canonical HTTPS URL, and own user role.
+    let Response::SpaceInfo { info } = world.ask(Request::SpaceInfo { space: alpha("T01ALPHA") }) else {
+        panic!("expected SpaceInfo");
+    };
+    assert_eq!(info.space.name, "Acme");
+    assert_eq!(info.domain, "acme");
+    assert_eq!(info.url, "https://acme.slack.com");
+    assert!(!info.roles.is_empty(), "should report own workspace role: {:?}", info.roles);
+
+    // 2. InviteMember calls users.admin.invite and surfaces refusals clearly.
+    let acct = alpha("T01ALPHA").account();
+    assert_eq!(
+        world.ask(Request::InviteMember {
+            account: acct.clone(),
+            email: "newcomer@acme.example".into(),
+            channels: vec!["C0GEN".into(), "C0DEP".into()],
+            real_name: "New Comer".into(),
+        }),
+        Response::Ok
+    );
+    let invite_call = world.fake.calls(ALPHA, "users.admin.invite").pop().expect("users.admin.invite");
+    assert_eq!(invite_call.params["email"], "newcomer@acme.example");
+    assert_eq!(invite_call.params["channels"], "C0GEN,C0DEP");
+    assert_eq!(invite_call.params["real_name"], "New Comer");
+
+    let dup = world.ask(Request::InviteMember {
+        account: acct.clone(),
+        email: "already@acme.example".into(),
+        channels: Vec::new(),
+        real_name: String::new(),
+    });
+    assert!(matches!(dup, Response::Error { code: ErrorCode::Refused, .. }), "{dup:?}");
+
+    // 3. AddCustomEmoji validates file path & type, uploads multipart to emoji.add, and refreshes catalog.
+    let dir = world.dir.with_extension("emoji");
+    std::fs::create_dir_all(&dir).unwrap();
+    let img = dir.join("shipit_tiny.png");
+    std::fs::write(&img, b"\x89PNG\r\n\x1a\nfake-png-bytes").unwrap();
+    let bad = dir.join("not_an_image.txt");
+    std::fs::write(&bad, b"hello").unwrap();
+
+    let bad_resp = world.ask(Request::AddCustomEmoji {
+        account: acct.clone(),
+        name: "bad_txt".into(),
+        path: bad.to_string_lossy().into_owned(),
+    });
+    assert!(matches!(bad_resp, Response::Error { .. }), "non-image rejected: {bad_resp:?}");
+
+    assert_eq!(
+        world.ask(Request::AddCustomEmoji {
+            account: acct.clone(),
+            name: "shipit_tiny".into(),
+            path: img.to_string_lossy().into_owned(),
+        }),
+        Response::Ok
+    );
+    let add_call = world.fake.calls(ALPHA, "emoji.add").pop().expect("emoji.add");
+    assert_eq!(add_call.params["mode"], "data");
+    assert_eq!(add_call.params["name"], "shipit_tiny");
+    assert_eq!(add_call.params["image:filename"], "shipit_tiny.png");
+
+    let Response::Catalog { items, .. } = world.ask(Request::Catalog {
+        account: acct.clone(),
+        kind: protocol::CatalogKind::Emoji,
+        space: None,
+        query: "shipit_tiny".into(),
+        cursor: None,
+    }) else {
+        panic!("expected emoji catalog");
+    };
+    assert!(items.iter().any(|item| item.name == ":shipit_tiny:"), "{items:?}");
+
+    // 4. User groups: list, create, update, and update members.
+    let Response::UserGroups { groups } = world.ask(Request::UserGroups { account: acct.clone() }) else {
+        panic!("expected UserGroups");
+    };
+    assert_eq!(groups.len(), 2, "disabled S0OFF is excluded: {groups:?}");
+    assert_eq!(groups[0].handle, "oncall");
+    assert!(groups[0].members.contains(&"U0ME".to_owned()));
+
+    let Response::UserGroup { group: created } = world.ask(Request::UserGroupCreate {
+        account: acct.clone(),
+        name: "Release".into(),
+        handle: "release".into(),
+        description: "Release engineers".into(),
+    }) else {
+        panic!("expected UserGroup");
+    };
+    assert_eq!((created.name.as_str(), created.handle.as_str()), ("Release", "release"));
+
+    let Response::UserGroup { group: updated } = world.ask(Request::UserGroupUpdate {
+        account: acct.clone(),
+        group_id: created.id.clone(),
+        name: Some("Release Crew".into()),
+        handle: None,
+        description: Some("Ships weekly".into()),
+    }) else {
+        panic!("expected updated UserGroup");
+    };
+    assert_eq!(updated.name, "Release Crew");
+    assert_eq!(updated.description, "Ships weekly");
+
+    let Response::UserGroup { group: with_members } = world.ask(Request::UserGroupMembers {
+        account: acct.clone(),
+        group_id: created.id.clone(),
+        users: vec!["U0ME".into(), "U0ANA".into()],
+    }) else {
+        panic!("expected UserGroup with members");
+    };
+    assert_eq!(with_members.members, vec!["U0ME".to_owned(), "U0ANA".to_owned()]);
+    assert_eq!(with_members.member_count, 2);
 }

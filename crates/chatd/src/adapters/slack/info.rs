@@ -4,9 +4,9 @@
 //! user opened or clicked something, or (previews) because the rows are on screen, paced.
 
 use super::{emoji, fnv, seconds, thread_id, thread_of, Fault, Slack};
-use crate::adapters::{AccountFilesPage, ActivityPage, CatalogPage, ConversationAbout, Failure, SharedPage};
+use crate::adapters::{AccountFilesPage, ActivityPage, CatalogPage, ConversationAbout, Failure, SharedPage, SpaceAbout};
 use crate::store::Filing;
-use protocol::{ActivityItem, ActivityItemKind, Bookmark, BookmarkKind, CatalogItem, ConversationKind, MediaFile, MediaKind, Message, Notify, SharedItem, SharedKind};
+use protocol::{ActivityItem, ActivityItemKind, Bookmark, BookmarkKind, CatalogItem, ConversationKind, MediaFile, MediaKind, Message, Notify, SharedItem, SharedKind, UserGroup};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1005,5 +1005,271 @@ impl Slack {
         let channel = channel_of(conversation);
         self.api("bookmarks.remove", &[("channel_id", channel), ("bookmark_id", bookmark_id)])?;
         Ok(())
+    }
+
+    /// Workspace info for `Request::SpaceInfo`: calls `team.info` for name/domain/email_domain
+    /// and reads our own user record for workspace role (`Primary owner`, `Owner`, `Workspace admin`,
+    /// `Guest`, or `Member`).
+    pub(super) fn space_info(&self, _space_id: &str) -> Result<SpaceAbout, Fault> {
+        let info = self.api("team.info", &[])?;
+        let team = &info["team"];
+        let domain = team["domain"]
+            .as_str()
+            .filter(|d| !d.is_empty())
+            .map(str::to_owned)
+            .or_else(|| self.ctx.note("team:domain"))
+            .unwrap_or_default();
+        if !domain.is_empty() {
+            self.ctx.set_note("team:domain", &domain);
+        }
+        let url = if !domain.is_empty() && domain.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            format!("https://{domain}.slack.com")
+        } else {
+            team["url"]
+                .as_str()
+                .map(str::trim)
+                .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+                .map(|u| u.trim_end_matches('/').to_owned())
+                .unwrap_or_default()
+        };
+        let email_domain = team["email_domain"].as_str().unwrap_or("").trim();
+        let description = if email_domain.is_empty() {
+            String::new()
+        } else {
+            format!("Email domain: {email_domain}")
+        };
+        let mut nickname = String::new();
+        let mut roles = Vec::new();
+        if let Some(me) = self.me.get().filter(|id| !id.is_empty()) {
+            if let Ok(resp) = self.api("users.info", &[("user", me.as_str())]) {
+                let u = &resp["user"];
+                nickname = u["profile"]["display_name"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| u["profile"]["real_name"].as_str().filter(|s| !s.is_empty()))
+                    .or_else(|| u["name"].as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let role = if u["is_primary_owner"] == true {
+                    "Primary owner"
+                } else if u["is_owner"] == true {
+                    "Owner"
+                } else if u["is_admin"] == true {
+                    "Workspace admin"
+                } else if u["is_ultra_restricted"] == true {
+                    "Single-channel guest"
+                } else if u["is_restricted"] == true {
+                    "Multi-channel guest"
+                } else {
+                    "Member"
+                };
+                roles.push(role.to_owned());
+            }
+        }
+        Ok(SpaceAbout {
+            description,
+            members: None,
+            online: None,
+            nickname,
+            roles,
+            notify: Notify::All,
+            domain,
+            url,
+        })
+    }
+
+    /// Invites someone by email to this workspace (`users.admin.invite`, private web-client call).
+    pub(super) fn invite_member(&self, email: &str, channels: &[String], real_name: &str) -> Result<(), Fault> {
+        let email = email.trim();
+        if email.is_empty() || !email.contains('@') {
+            return Err(Fault::Slack("invalid_email".to_owned()));
+        }
+        let channels_csv: String = channels
+            .iter()
+            .map(|c| c.trim())
+            .filter(|c| !c.is_empty())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut params = vec![("email", email), ("resend", "true")];
+        if !channels_csv.is_empty() {
+            params.push(("channels", channels_csv.as_str()));
+        }
+        let real_name = real_name.trim();
+        if !real_name.is_empty() {
+            params.push(("real_name", real_name));
+        }
+        self.api("users.admin.invite", &params)?;
+        Ok(())
+    }
+
+    /// Uploads a custom emoji (`emoji.add`, multipart upload). Validates the local path through
+    /// `crate::upload::allowed` and rejects non-image or oversized (> 1 MiB) files.
+    pub(super) fn add_custom_emoji(&self, name: &str, path: &str) -> Result<(), Fault> {
+        let clean = name.trim().trim_matches(':').to_ascii_lowercase();
+        if clean.is_empty()
+            || clean.len() > 100
+            || !clean
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+        {
+            return Err(Fault::Slack("error_name_bad_characters".to_owned()));
+        }
+        let (real, _) = crate::upload::allowed(path.trim()).map_err(|why| Fault::Net(format!("emoji: {why}")))?;
+        let ext = real
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        let mime = match ext.as_str() {
+            "png" => "image/png",
+            "gif" => "image/gif",
+            "jpg" | "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            _ => return Err(Fault::Slack("error_invalid_image".to_owned())),
+        };
+        let meta = std::fs::metadata(&real).map_err(|err| Fault::Net(format!("emoji: {err}")))?;
+        const MAX_EMOJI_BYTES: u64 = 1024 * 1024;
+        if meta.len() == 0 || meta.len() > MAX_EMOJI_BYTES {
+            return Err(Fault::Slack("error_too_big".to_owned()));
+        }
+        let bytes = std::fs::read(&real).map_err(|err| Fault::Net(format!("emoji: {err}")))?;
+        let filename = real
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("emoji.png");
+        self.api_multipart(
+            "emoji.add",
+            &[("mode", "data"), ("name", clean.as_str())],
+            "image",
+            filename,
+            mime,
+            &bytes,
+        )?;
+        // Force next emoji catalog fetch to pick up the new custom emoji.
+        self.ctx.set_note("emoji", "0");
+        Ok(())
+    }
+
+    fn map_user_group(raw: &Value) -> Option<UserGroup> {
+        let id = raw["id"].as_str().filter(|s| !s.is_empty())?.to_owned();
+        let disabled = raw["date_delete"].as_i64().unwrap_or(0) > 0
+            || raw["deleted_by"].as_str().is_some_and(|by| !by.is_empty());
+        if disabled {
+            return None;
+        }
+        let name = raw["name"].as_str().unwrap_or("").to_owned();
+        let handle = raw["handle"].as_str().unwrap_or("").to_owned();
+        let description = raw["description"].as_str().unwrap_or("").to_owned();
+        let members: Vec<String> = raw["users"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|u| u.as_str().filter(|s| !s.is_empty()).map(str::to_owned))
+            .collect();
+        let member_count = raw["user_count"]
+            .as_u64()
+            .map(|n| n as u32)
+            .unwrap_or(members.len() as u32);
+        Some(UserGroup { id, name, handle, description, members, member_count })
+    }
+
+    /// Lists active workspace user groups (`usergroups.list` with `include_users=true`).
+    pub(super) fn user_groups(&self) -> Result<Vec<UserGroup>, Fault> {
+        let listed = self.api("usergroups.list", &[("include_users", "true"), ("include_count", "true")])?;
+        let me = self.me.get().map_or("", String::as_str);
+        let mut out = Vec::new();
+        let mut mine = std::collections::HashSet::new();
+        for raw in listed["usergroups"].as_array().into_iter().flatten() {
+            let Some(group) = Self::map_user_group(raw) else {
+                continue;
+            };
+            if !group.handle.is_empty() {
+                self.ctx.set_note(&format!("g:{}", group.id), &group.handle);
+            }
+            if !me.is_empty() && group.members.iter().any(|u| u == me) {
+                mine.insert(group.id.clone());
+            }
+            out.push(group);
+        }
+        self.state().my_groups = mine;
+        Ok(out)
+    }
+
+    /// Creates a user group (`usergroups.create`).
+    pub(super) fn user_group_create(&self, name: &str, handle: &str, description: &str) -> Result<UserGroup, Fault> {
+        let name = name.trim();
+        let handle = handle.trim().trim_start_matches('@');
+        if name.is_empty() || handle.is_empty() {
+            return Err(Fault::Slack("invalid_arguments".to_owned()));
+        }
+        let mut params = vec![("name", name), ("handle", handle)];
+        let description = description.trim();
+        if !description.is_empty() {
+            params.push(("description", description));
+        }
+        let resp = self.api("usergroups.create", &params)?;
+        let group = Self::map_user_group(&resp["usergroup"])
+            .ok_or_else(|| Fault::Slack("invalid_arguments".to_owned()))?;
+        if !group.handle.is_empty() {
+            self.ctx.set_note(&format!("g:{}", group.id), &group.handle);
+        }
+        Ok(group)
+    }
+
+    /// Updates a user group's name, handle, or description (`usergroups.update`).
+    pub(super) fn user_group_update(
+        &self,
+        group_id: &str,
+        name: Option<&str>,
+        handle: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<UserGroup, Fault> {
+        let group_id = group_id.trim();
+        if group_id.is_empty() {
+            return Err(Fault::Slack("no_such_subteam".to_owned()));
+        }
+        let mut params = vec![("usergroup", group_id)];
+        if let Some(n) = name.map(str::trim).filter(|s| !s.is_empty()) {
+            params.push(("name", n));
+        }
+        if let Some(h) = handle.map(|s| s.trim().trim_start_matches('@')).filter(|s| !s.is_empty()) {
+            params.push(("handle", h));
+        }
+        if let Some(d) = description {
+            params.push(("description", d.trim()));
+        }
+        let resp = self.api("usergroups.update", &params)?;
+        let group = Self::map_user_group(&resp["usergroup"])
+            .ok_or_else(|| Fault::Slack("no_such_subteam".to_owned()))?;
+        if !group.handle.is_empty() {
+            self.ctx.set_note(&format!("g:{}", group.id), &group.handle);
+        }
+        Ok(group)
+    }
+
+    /// Replaces the members of a user group (`usergroups.users.update`).
+    pub(super) fn user_group_members(&self, group_id: &str, users: &[String]) -> Result<UserGroup, Fault> {
+        let group_id = group_id.trim();
+        if group_id.is_empty() {
+            return Err(Fault::Slack("no_such_subteam".to_owned()));
+        }
+        let csv: String = users
+            .iter()
+            .map(|u| u.trim())
+            .filter(|u| !u.is_empty())
+            .collect::<Vec<_>>()
+            .join(",");
+        let resp = self.api("usergroups.users.update", &[("usergroup", group_id), ("users", csv.as_str())])?;
+        let group = Self::map_user_group(&resp["usergroup"])
+            .ok_or_else(|| Fault::Slack("no_such_subteam".to_owned()))?;
+        if let Some(me) = self.me.get().filter(|id| !id.is_empty()) {
+            let mut state = self.state();
+            if group.members.iter().any(|u| u == me) {
+                state.my_groups.insert(group.id.clone());
+            } else {
+                state.my_groups.remove(&group.id);
+            }
+        }
+        Ok(group)
     }
 }

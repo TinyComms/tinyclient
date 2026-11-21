@@ -2594,6 +2594,52 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         values: Vec<String>,
     },
+    /// Invite someone by email to a workspace (Slack `users.admin.invite`). Answers `Response::Ok`.
+    InviteMember {
+        account: AccountKey,
+        email: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        channels: Vec<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        real_name: String,
+    },
+    /// Upload a custom emoji to a workspace (Slack `emoji.add`). Answers `Response::Ok`.
+    AddCustomEmoji {
+        account: AccountKey,
+        name: String,
+        path: String,
+    },
+    /// List active workspace user groups (Slack `usergroups.list`). Answers `Response::UserGroups`.
+    UserGroups {
+        account: AccountKey,
+    },
+    /// Create a workspace user group (Slack `usergroups.create`). Answers `Response::UserGroup`.
+    UserGroupCreate {
+        account: AccountKey,
+        name: String,
+        handle: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        description: String,
+    },
+    /// Update a workspace user group's name, handle, or description (Slack `usergroups.update`).
+    /// Answers `Response::UserGroup`.
+    UserGroupUpdate {
+        account: AccountKey,
+        group_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handle: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+    },
+    /// Replace a workspace user group's members (Slack `usergroups.users.update`).
+    /// Answers `Response::UserGroup`.
+    UserGroupMembers {
+        account: AccountKey,
+        group_id: String,
+        users: Vec<String>,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -3106,6 +3152,14 @@ pub enum Response {
     /// One updated/rescheduled message (`Request::RescheduleMessage`).
     ScheduledMessage {
         message: ScheduledMessage,
+    },
+    /// Active workspace user groups (`Request::UserGroups`).
+    UserGroups {
+        groups: Vec<UserGroup>,
+    },
+    /// One created or updated workspace user group.
+    UserGroup {
+        group: UserGroup,
     },
 }
 
