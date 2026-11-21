@@ -197,6 +197,8 @@ fn quiet_hours_cross_midnight_and_a_pause_holds_until_its_time() {
 fn the_networks_own_do_not_disturb_is_followed() {
     let values = Values::default();
     assert!(!posts(&values, &dm(), &message("Ines", "hi"), &Moment { dnd: true, ..moment() }));
+    assert!(!posts(&values, &channel(), &mention("Tom", "@me look"), &Moment { dnd: true, ..moment() }));
+    assert!(posts(&values, &channel(), &mention("Tom", "@me look"), &Moment { dnd: false, ..moment() }));
 }
 
 #[test]

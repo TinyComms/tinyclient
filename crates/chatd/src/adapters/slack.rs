@@ -234,6 +234,12 @@ struct State {
     groups_listed: bool,
     /// User groups I belong to, learned once per connection and kept current on the socket.
     my_groups: HashSet<String>,
+    /// Do Not Disturb state per user id (`dnd.info`, `dnd.teamInfo`, `dnd_updated`, `dnd_updated_user`).
+    dnd: HashMap<String, people::DndState>,
+    /// Underlying Slack presence (`Online`, `Idle`, `Offline`) before DND overlay.
+    raw_presence: HashMap<String, Presence>,
+    /// Earliest Unix timestamp at which any tracked DND window starts or ends.
+    dnd_next: Option<i64>,
     partners_read: bool,
     /// When the followed threads were last asked for.
     threads_at: Option<Instant>,
@@ -855,6 +861,7 @@ impl Slack {
                     self.event(&event)?;
                 }
             }
+            self.tick_dnd();
             if heard.elapsed() > SILENCE {
                 return Err(Failure::Dropped("socket went quiet".to_owned()));
             }
@@ -911,6 +918,10 @@ impl Slack {
             }
             "manual_presence_change" => {
                 self.own_presence(event["presence"].as_str().unwrap_or(""));
+                Ok(())
+            }
+            "dnd_updated" | "dnd_updated_user" => {
+                self.dnd_updated(event);
                 Ok(())
             }
             "pref_change" => self.muted(event["name"].as_str().unwrap_or(""), &event["value"]),
@@ -1426,6 +1437,7 @@ impl Slack {
             self.partners();
             self.tell_partners();
             self.load_usergroups();
+            self.load_dnd();
             return match self.ctx.note("tree") {
                 Some(_) => self.resync(),
                 None => self.load_tree(),
@@ -1695,7 +1707,14 @@ impl Slack {
             (Some(user), _) => user.status,
             (None, status) => status.unwrap_or_default(),
         };
-        self.ctx.presence(&me, presence, &shown, true);
+        self.state().raw_presence.insert(me.clone(), presence);
+        let now = crate::hub::now();
+        let effective = if self.state().dnd.get(&me).is_some_and(|dnd| dnd.active(now)) {
+            Presence::Dnd
+        } else {
+            presence
+        };
+        self.ctx.presence(&me, effective, &shown, true);
         Ok(())
     }
 
