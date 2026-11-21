@@ -235,6 +235,7 @@ impl Fake {
             ("https://teams.microsoft.com/api/mt/emea", "/api/mt/emea"),
             ("https://presence.teams.microsoft.com", "/presence"),
             ("https://eu-api.asm.skype.com", "/ams"),
+            ("https://urlp.asm.skype.com", "/urlp"),
         ] {
             text = text.replace(host, &format!("{}{at}", self.base));
         }
@@ -357,12 +358,31 @@ impl Fake {
             },
             _ if path.starts_with("/graph/") && bearer("graph") => self.graph(call, &path["/graph".len()..]),
             _ if path.starts_with("/upload/") => self.upload(call),
-            _ if path.starts_with("/ams/") || path.contains("/profilepicturev2") => Reply {
+            _ if path.starts_with("/ams/") || path.contains("/profilepicturev2") || path == "/urlp/v1/url/content" => Reply {
                 status: "200 OK",
                 headers: Vec::new(),
                 kind: "image/png",
                 body: PNG.to_vec(),
             },
+            "/urlp/v1/url/info" if header("authentication") == format!("skypetoken={skype}") => {
+                let target_url = call
+                    .query
+                    .split('&')
+                    .find_map(|p| p.strip_prefix("url="))
+                    .map(unescape)
+                    .unwrap_or_default();
+                ok(json!({
+                    "url": target_url,
+                    "siteName": "Example Docs",
+                    "title": "Unfurled by Teams",
+                    "description": "Server-side preview from urlp",
+                    "previewImage": {
+                        "url": format!("{}/urlp/v1/url/content?img=unfurled", self.base),
+                        "width": 600,
+                        "height": 300
+                    }
+                }))
+            }
             "/api/authsvc/v1.0/authz" | "/api/csa/api/v1/teams/users/me" | "/v4/a" | "/socket.io/1/" | "/registrar/prod/V2/registrations" => unauthorized(),
             _ => answer("404 Not Found", json!({"errorCode": 404, "message": "not here"})),
         }
@@ -1970,4 +1990,72 @@ fn important_and_urgent_messages_are_parsed_and_sent_with_properties_importance(
         .find(|c| c.json()["clientmessageid"] == "1760000999000628")
         .expect("urgent POST");
     assert_eq!(urg_call.json()["properties"]["importance"].as_str(), Some("urgent"));
+}
+
+#[test]
+fn link_previews_are_parsed_from_properties_links_and_unfurled_via_teams_on_send() {
+    let world = World::start();
+    world.ready();
+    let ana = key(CHAT_ANA);
+    world.open(&ana, 3);
+
+    // 1. Account advertises suppress_embeds so the composer enables its preview-remove chip.
+    assert!(world.account(HOME).can.suppress_embeds);
+
+    // 2. Received message with web preview + M365 file link populates Message::previews.
+    let fixture = world.fake.fixture("links").expect("links fixture");
+    world.fake.push("NewMessage", fixture, false);
+    let received = world.until("link preview message to arrive", || world.message(&ana, "1760000840001"));
+    assert_eq!(received.previews.len(), 2);
+    assert_eq!(received.previews[0].url, "https://example.com/guide");
+    assert_eq!(received.previews[0].site, "Example Docs");
+    assert_eq!(received.previews[0].title, "Operations Guide");
+    assert_eq!(received.previews[0].description, "Runbook for weekly releases");
+    assert!(received.previews[0].image.is_some(), "Teams-hosted preview image registered");
+    assert_eq!(received.previews[1].title, "Q4 Architecture.docx");
+    assert_eq!(received.previews[1].site, "SharePoint");
+    assert_eq!(received.previews[1].description, "Word document");
+    assert!(received.previews[1].image.is_none(), "external preview image ignored");
+
+    // 3. Sending a link asks Teams' urlp service (never the external URL) and attaches properties.links.
+    let unfurl_id = "1760000999000631";
+    world.send(&ana, unfurl_id, "Read https://docs.example/release-notes");
+    let sent = world.until("unfurled send accepted", || {
+        world.messages(&ana).into_iter().find(|m| m.client_id.as_deref() == Some(unfurl_id) && m.state == SendState::Sent)
+    });
+    assert_eq!(sent.previews.len(), 1);
+    assert_eq!(sent.previews[0].title, "Unfurled by Teams");
+    assert_eq!(world.fake.calls("GET", "/urlp/v1/url/info").len(), 1);
+    let post = world
+        .fake
+        .calls("POST", &format!("/chat/v1/users/ME/conversations/{CHAT_ANA}/messages"))
+        .into_iter()
+        .find(|c| c.json()["clientmessageid"] == unfurl_id)
+        .expect("unfurled POST");
+    let links_json: Vec<Value> = serde_json::from_str(post.json()["properties"]["links"].as_str().expect("properties.links")).unwrap();
+    assert_eq!(links_json[0]["url"].as_str(), Some("https://docs.example/release-notes"));
+    assert_eq!(links_json[0]["title"].as_str(), Some("Unfurled by Teams"));
+
+    // 4. Sending with suppress_embeds: true skips urlp and omits properties.links.
+    let suppressed_id = "1760000999000632";
+    let req = Request::Send {
+        conversation: ana.clone(),
+        client_id: suppressed_id.to_owned(),
+        text: "No card for https://docs.example/private".to_owned(),
+        reply_to: None,
+        with: protocol::Outgoing { suppress_embeds: true, ..protocol::Outgoing::default() },
+    };
+    assert!(matches!(world.ask(req), Response::Sent { .. }));
+    let suppressed = world.until("suppressed send accepted", || {
+        world.messages(&ana).into_iter().find(|m| m.client_id.as_deref() == Some(suppressed_id) && m.state == SendState::Sent)
+    });
+    assert!(suppressed.previews.is_empty());
+    assert_eq!(world.fake.calls("GET", "/urlp/v1/url/info").len(), 1, "suppress_embeds must not call urlp");
+    let post2 = world
+        .fake
+        .calls("POST", &format!("/chat/v1/users/ME/conversations/{CHAT_ANA}/messages"))
+        .into_iter()
+        .find(|c| c.json()["clientmessageid"] == suppressed_id)
+        .expect("suppressed POST");
+    assert!(post2.json()["properties"]["links"].is_null());
 }

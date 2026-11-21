@@ -160,10 +160,10 @@ mod tests {
 
     #[test]
     fn send_option_controls_follow_capabilities_and_hide_when_editing() {
-        let teams = Capabilities { importance: true, ..Capabilities::default() };
+        let teams = Capabilities { importance: true, suppress_embeds: true, channel_subject: true, ..Capabilities::default() };
         let m = controls(&teams, false);
-        assert!(m.importance && !m.broadcast && !m.effects && !m.view_once);
-        assert!(!controls(&teams, true).importance);
+        assert!(m.importance && m.link_chip && m.subject && !m.broadcast && !m.effects && !m.view_once);
+        assert!(!controls(&teams, true).importance && !controls(&teams, true).link_chip && !controls(&teams, true).subject);
 
         let slack = Capabilities { thread_broadcast: true, ..Capabilities::default() };
         let s = controls(&slack, false);

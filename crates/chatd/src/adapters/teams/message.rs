@@ -5,7 +5,7 @@ use super::html::{self, Lookup};
 use super::{chain_id, chain_of, escaped, id_of, millis, now_ms, seconds, thread_of, Body, Fault, Teams, CHAIN, PAGE, TEAMS, TYPING_SHOWN};
 use protocol::{
     Attachment, ConversationKind, Forwarded, MediaFile, MediaKind, MentionKind, Message,
-    MessageKind, Reaction, ReplyTo, Span, Style, ThreadSummary,
+    MessageKind, Preview, Reaction, ReplyTo, Span, Style, ThreadSummary,
 };
 use serde_json::{json, Value};
 
@@ -115,6 +115,146 @@ fn set(value: &Value) -> bool {
     }
 }
 
+/// Friendly file-type label for Microsoft 365 file links in `properties.links`.
+fn m365_file_kind(ext: &str) -> String {
+    match ext.trim().trim_start_matches('.').to_ascii_lowercase().as_str() {
+        "doc" | "docx" => "Word document".to_owned(),
+        "xls" | "xlsx" | "csv" => "Excel spreadsheet".to_owned(),
+        "ppt" | "pptx" => "PowerPoint presentation".to_owned(),
+        "pdf" => "PDF document".to_owned(),
+        "one" => "OneNote notebook".to_owned(),
+        "loop" | "fluid" => "Loop component".to_owned(),
+        "" => String::new(),
+        other => format!("{} file", other.to_ascii_uppercase()),
+    }
+}
+
+/// Maps `properties.links` entries (web previews and Microsoft 365 file links) into [`Preview`]
+/// cards. Preview images are registered only when served by Teams' own media hosts.
+fn parse_link_previews(
+    entries: &[Value],
+    message_id: &str,
+    hosted: impl Fn(&str) -> bool,
+    media: &mut Vec<(MediaFile, String)>,
+) -> Vec<Preview> {
+    let mut out = Vec::new();
+    for (idx, entry) in entries.iter().enumerate() {
+        if out.len() >= 4 {
+            break;
+        }
+        let url = [&entry["url"], &entry["originalUrl"], &entry["link"], &entry["fileInfo"]["shareUrl"]]
+            .into_iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .find(|u| u.starts_with("https://") || u.starts_with("http://"))
+            .unwrap_or("");
+        if url.is_empty() {
+            continue;
+        }
+        let file_info = &entry["fileInfo"];
+        let file_name = [&entry["fileName"], &file_info["fileName"]]
+            .into_iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .unwrap_or("");
+        let file_type = [&entry["fileType"], &file_info["fileType"]]
+            .into_iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .or_else(|| file_name.rsplit_once('.').map(|(_, ext)| ext))
+            .unwrap_or("");
+        let is_m365 = !file_name.is_empty()
+            || !file_type.is_empty()
+            || entry["itemType"].as_str().is_some_and(|t| t.eq_ignore_ascii_case("file"))
+            || url.contains(".sharepoint.com/");
+
+        let title = [&entry["title"], &entry["displayName"]]
+            .into_iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .unwrap_or(file_name)
+            .to_owned();
+        let mut description = [&entry["description"], &entry["previewText"]]
+            .into_iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .unwrap_or("")
+            .to_owned();
+        if description.is_empty() && is_m365 {
+            description = m365_file_kind(file_type);
+        }
+        if title.is_empty() && description.is_empty() {
+            continue;
+        }
+        let mut site = [&entry["siteName"], &entry["site"]]
+            .into_iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .find(|s| !s.is_empty())
+            .unwrap_or("")
+            .to_owned();
+        if site.is_empty() && is_m365 {
+            let ext_upper = file_type.trim().trim_start_matches('.').to_ascii_uppercase();
+            site = if ext_upper.is_empty() {
+                "Microsoft 365".to_owned()
+            } else {
+                format!("Microsoft 365 · {ext_upper}")
+            };
+        }
+        // Only register preview images hosted on Teams' own media hosts.
+        let img_obj = entry.get("previewImage").filter(|v| v.is_object());
+        let img_url = img_obj
+            .and_then(|o| o["url"].as_str())
+            .or_else(|| entry["previewImage"].as_str())
+            .or_else(|| entry["previewImageUrl"].as_str())
+            .or_else(|| entry["thumbnailUrl"].as_str())
+            .or_else(|| entry["image"].as_str())
+            .map(str::trim)
+            .filter(|u| hosted(u));
+        let image = img_url.map(|img_url| {
+            let width = img_obj.and_then(|o| o["width"].as_u64()).unwrap_or(0).min(u32::MAX as u64) as u32;
+            let height = img_obj.and_then(|o| o["height"].as_u64()).unwrap_or(0).min(u32::MAX as u64) as u32;
+            let file = MediaFile {
+                width,
+                height,
+                ..MediaFile::new(format!("linkimg:{message_id}:{idx}"), MediaKind::Image)
+            };
+            media.push((file.clone(), img_url.to_owned()));
+            file
+        });
+        out.push(Preview {
+            url: url.to_owned(),
+            site,
+            title,
+            description,
+            image,
+        });
+    }
+    out
+}
+
+/// Extracts unique `http(s)://` URLs from outgoing message text for Teams' server-side unfurler.
+fn extract_urls(text: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    for token in text.split_whitespace() {
+        let candidate = token.trim_matches(|c: char| matches!(c, '(' | ')' | '[' | ']' | '<' | '>' | '"' | '\''));
+        let candidate = candidate.trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | '!' | '?'));
+        let valid = (candidate.starts_with("https://") || candidate.starts_with("http://"))
+            && candidate.len() > 10
+            && !candidate.starts_with("https://teams.microsoft.com/l/");
+        if valid && !urls.iter().any(|u| u == candidate) {
+            urls.push(candidate.to_owned());
+            if urls.len() >= 3 {
+                break;
+            }
+        }
+    }
+    urls
+}
 /// Maps Teams' `properties.importance` (`high` / `urgent`) into [`protocol::Importance`].
 fn importance_of(value: &Value) -> protocol::Importance {
     match value.as_str().map(str::trim).unwrap_or("").to_ascii_lowercase().as_str() {
@@ -659,6 +799,10 @@ impl Teams {
                 parsed.text.push_str(named);
                 parsed.spans.push(Span { start, end: parsed.text.len() as u32, style: Style::Link { url: url.to_owned() } });
             }
+        }
+        let link_entries = listed(&props["links"]);
+        if !link_entries.is_empty() {
+            message.previews = parse_link_previews(&link_entries, &id, |url| self.pictures(url), &mut media);
         }
         if let Err(err) = self.ctx.media(&media) {
             tracing::warn!("chatd: Teams: {err}");
@@ -1230,6 +1374,57 @@ impl Teams {
         self.ctx.sent(conversation, client_id, outcome);
     }
 
+    /// Asks Teams' own URL preview service (`regionGtms.urlp`) to unfurl URLs for an outgoing
+    /// message. Never fetches arbitrary URLs directly from chatd.
+    fn unfurl_links(&self, text: &str) -> Vec<Value> {
+        let urls = extract_urls(text);
+        if urls.is_empty() {
+            return Vec::new();
+        }
+        let Ok(place) = self.place() else {
+            return Vec::new();
+        };
+        let Some(urlp) = place.urlp.as_deref() else {
+            return Vec::new();
+        };
+        let mut entries = Vec::new();
+        for (idx, link) in urls.into_iter().enumerate() {
+            let endpoint = format!("{urlp}/v1/url/info?url={}", escaped(&link));
+            let Ok(answer) = self.call("GET", &endpoint, super::Auth::Skype, Body::None, false) else {
+                continue;
+            };
+            let info = &answer.body;
+            let title = info["title"].as_str().or(info["fileName"].as_str()).map(str::trim).unwrap_or("");
+            let desc = info["description"].as_str().or(info["previewText"].as_str()).map(str::trim).unwrap_or("");
+            if title.is_empty() && desc.is_empty() {
+                continue;
+            }
+            let mut item = json!({
+                "@type": "http://schema.skype.com/Link",
+                "itemid": idx.to_string(),
+                "url": info["url"].as_str().filter(|s| !s.is_empty()).unwrap_or(&link),
+                "title": title,
+                "description": desc,
+            });
+            if let Some(site) = info["siteName"].as_str().or(info["site"].as_str()).filter(|s| !s.trim().is_empty()) {
+                item["siteName"] = Value::String(site.trim().to_owned());
+            }
+            if let Some(file_name) = info["fileName"].as_str().filter(|s| !s.trim().is_empty()) {
+                item["fileName"] = Value::String(file_name.trim().to_owned());
+            }
+            if let Some(file_type) = info["fileType"].as_str().filter(|s| !s.trim().is_empty()) {
+                item["fileType"] = Value::String(file_type.trim().to_owned());
+            }
+            if let Some(img) = info.get("previewImage").filter(|v| v.is_object() || v.is_string()) {
+                item["previewImage"] = img.clone();
+            } else if let Some(img) = info["thumbnailUrl"].as_str().filter(|s| self.pictures(s)) {
+                item["previewImage"] = json!({"url": img});
+            }
+            entries.push(item);
+        }
+        entries
+    }
+
     /// The same, with `properties` (the files a message names) beside the body.
     pub(super) fn posted_with(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: &protocol::Outgoing, mut properties: Option<Value>) -> Result<Message, Fault> {
         let mention_spans = &with.spans;
@@ -1274,6 +1469,13 @@ impl Teams {
             let props = properties.get_or_insert_with(|| json!({}));
             if let Some(map) = props.as_object_mut() {
                 map.insert("importance".to_owned(), Value::String(level.to_owned()));
+            }
+        }
+        let unfurled = if !with.suppress_embeds { self.unfurl_links(text) } else { Vec::new() };
+        if !unfurled.is_empty() {
+            let props = properties.get_or_insert_with(|| json!({}));
+            if let Some(map) = props.as_object_mut() {
+                map.insert("links".to_owned(), Value::String(Value::Array(unfurled.clone()).to_string()));
             }
         }
         match (reply_to, &quote) {
@@ -1321,9 +1523,18 @@ impl Teams {
                 OwnMeta { subject: Some(subject.clone()), images_html: String::new() },
             );
         }
-        let mut message = Message::plain(id, name.clone(), shown, sent, true);
+        let mut message = Message::plain(id.clone(), name.clone(), shown, sent, true);
         message.spans = spans;
         message.importance = with.importance;
+        if !unfurled.is_empty() {
+            let mut preview_media = Vec::new();
+            message.previews = parse_link_previews(&unfurled, &id, |url| self.pictures(url), &mut preview_media);
+            if !preview_media.is_empty() {
+                if let Err(err) = self.ctx.media(&preview_media) {
+                    tracing::warn!("chatd: Teams: {err}");
+                }
+            }
+        }
         message.sender.avatar = self.picture(&me, &name);
         message.sender.id = me;
         if let Some((channel, root)) = chain_of(&target) {
@@ -1766,5 +1977,44 @@ mod tests {
         assert_eq!(importance_wire(protocol::Importance::Normal), None);
         assert_eq!(importance_wire(protocol::Importance::Important), Some("high"));
         assert_eq!(importance_wire(protocol::Importance::Urgent), Some("urgent"));
+    }
+
+    #[test]
+    fn link_previews_and_m365_file_links_parse_safely() {
+        let entries = json!([
+            {
+                "@type": "http://schema.skype.com/Link",
+                "url": "https://example.com/post",
+                "siteName": "Example Blog",
+                "title": "Shipping faster",
+                "description": "Notes on CI caching",
+                "previewImage": {"url": "https://urlp.asm.skype.com/v1/url/content?img=1", "width": 600, "height": 315}
+            },
+            {
+                "@type": "http://schema.skype.com/Link",
+                "url": "https://contoso.sharepoint.com/:w:/s/Platform/Doc1",
+                "fileName": "Q4 Architecture.docx",
+                "fileType": "docx",
+                "previewImage": {"url": "https://evil.example/pixel.png"}
+            }
+        ]);
+        let mut media = Vec::new();
+        let previews = parse_link_previews(
+            entries.as_array().unwrap(),
+            "1760000840001",
+            |u| u.starts_with("https://urlp.asm.skype.com/"),
+            &mut media,
+        );
+        assert_eq!(previews.len(), 2);
+        assert_eq!(previews[0].title, "Shipping faster");
+        assert_eq!(previews[0].site, "Example Blog");
+        assert_eq!(previews[0].description, "Notes on CI caching");
+        assert_eq!(previews[0].image.as_ref().map(|i| (i.width, i.height)), Some((600, 315)));
+        assert_eq!(previews[1].title, "Q4 Architecture.docx");
+        assert_eq!(previews[1].site, "Microsoft 365 · DOCX");
+        assert_eq!(previews[1].description, "Word document");
+        assert!(previews[1].image.is_none(), "external image must never be registered");
+        assert_eq!(media.len(), 1);
+        assert_eq!(extract_urls("check https://example.com/a and https://teams.microsoft.com/l/chat/1"), vec!["https://example.com/a"]);
     }
 }

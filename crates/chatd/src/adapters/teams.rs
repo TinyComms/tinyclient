@@ -289,6 +289,7 @@ struct Place {
     chat: String,
     middle: String,
     presence: String,
+    urlp: Option<String>,
 }
 
 struct Token {
@@ -751,6 +752,7 @@ impl Teams {
                 chat,
                 middle,
                 presence: named("unifiedPresence").unwrap_or_else(|| PRESENCE.to_owned()),
+                urlp: named("urlp"),
             });
             let life = body["tokens"]["expiresIn"].as_u64().unwrap_or(3600).clamp(60, 86_400);
             let me = claim(token, "skypeid").map(|id| format!("8:{id}")).or_else(|| {
@@ -900,6 +902,7 @@ impl Teams {
             pins: false,
             forward: true,
             reactions: true,
+            suppress_embeds: true,
             mention_format: protocol::MentionFormat::Teams,
             mention_spans: true,
             importance: true,
