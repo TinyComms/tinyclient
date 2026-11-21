@@ -350,6 +350,48 @@ pub(super) fn cancel_scheduled(account: &Account, conversation: &str, scheduled_
     Ok(())
 }
 
+/// Deletes all messages from one participant in a supergroup/channel (`channels.deleteParticipantHistory`).
+pub(super) fn delete_participant_history(account: &Account, conversation: &str, person_id: &str) -> Result<(), Fault> {
+    let (who @ Who::Channel(_), _) = Who::parse(conversation).ok_or_else(|| invalid("CHANNEL_INVALID"))? else {
+        return Err(invalid("CHANNEL_INVALID"));
+    };
+    let (person, _) = Who::parse(person_id).ok_or_else(|| invalid("USER_ID_INVALID"))?;
+    let channel = account.input_channel(who)?;
+    let participant = account.input(person)?;
+    for _ in 0..64 {
+        let tl::enums::messages::AffectedHistory::History(affected) =
+            account.ask(&tl::functions::channels::DeleteParticipantHistory {
+                channel: channel.clone(),
+                participant: participant.clone(),
+            })?;
+        if affected.offset == 0 {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Reports specific messages from a participant in a supergroup/channel as spam (`channels.reportSpam`).
+pub(super) fn report_spam_messages(
+    account: &Account,
+    conversation: &str,
+    person_id: &str,
+    message_ids: &[String],
+) -> Result<(), Fault> {
+    let (who @ Who::Channel(_), _) = Who::parse(conversation).ok_or_else(|| invalid("CHANNEL_INVALID"))? else {
+        return Err(invalid("CHANNEL_INVALID"));
+    };
+    let (person, _) = Who::parse(person_id).ok_or_else(|| invalid("USER_ID_INVALID"))?;
+    let ids: Vec<i32> = message_ids.iter().filter_map(|id| id.parse::<i32>().ok()).collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let channel = account.input_channel(who)?;
+    let participant = account.input(person)?;
+    account.ask(&tl::functions::channels::ReportSpam { channel, participant, id: ids })?;
+    Ok(())
+}
+
 /// Edits and/or reschedules a pending scheduled message (`messages.editMessage` with `schedule_date`).
 pub(super) fn reschedule(
     account: &Account,

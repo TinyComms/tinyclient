@@ -706,7 +706,12 @@ fn offline(ctx: &Context, command: Command) {
     let down = || Refusal::Refused("Telegram is offline.".to_owned());
     match command {
         Command::Send { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
-        Command::React { reply, .. } | Command::Edit { reply, .. } | Command::Delete { reply, .. } => drop(reply.send(Err(down()))),
+        Command::React { reply, .. }
+        | Command::Edit { reply, .. }
+        | Command::Delete { reply, .. }
+        | Command::DeleteMany { reply, .. }
+        | Command::DeleteParticipantHistory { reply, .. }
+        | Command::ReportSpamMessages { reply, .. } => drop(reply.send(Err(down()))),
         Command::Members { reply, .. } => drop(reply.send(Err(down()))),
         Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(down()))),
         Command::ConversationInfo { reply, .. } => drop(reply.send(Err(down()))),
@@ -828,6 +833,15 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::Delete { conversation_id, message_id, scope, reply } => {
             let _ = reply.send(delete(account, &conversation_id, &message_id, scope).map_err(refused));
+        }
+        Command::DeleteMany { conversation_id, message_ids, scope, reply } => {
+            let _ = reply.send(delete_many(account, &conversation_id, &message_ids, scope).map_err(refused));
+        }
+        Command::DeleteParticipantHistory { conversation_id, person_id, reply } => {
+            let _ = reply.send(info::delete_participant_history(account, &conversation_id, &person_id).map_err(refused));
+        }
+        Command::ReportSpamMessages { conversation_id, person_id, message_ids, reply } => {
+            let _ = reply.send(info::report_spam_messages(account, &conversation_id, &person_id, &message_ids).map_err(refused));
         }
         Command::Typing { conversation_id, activity } => typing(account, &conversation_id, activity),
         Command::FollowLink { conversation_id, message_id } => sync::followed(account, &conversation_id, &message_id),
@@ -1193,8 +1207,20 @@ fn edit(account: &Account, conversation: &str, message: &str, text: &str, spans:
 }
 
 fn delete(account: &Account, conversation: &str, message: &str, scope: protocol::DeleteScope) -> Result<(), Fault> {
+    delete_many(account, conversation, &[message.to_owned()], scope)
+}
+
+fn delete_many(account: &Account, conversation: &str, message_ids: &[String], scope: protocol::DeleteScope) -> Result<(), Fault> {
     let invalid = || Fault::Rpc { code: 400, name: "MESSAGE_ID_INVALID".to_owned(), value: None };
-    let ((who, _), id) = (Who::parse(conversation).ok_or_else(invalid)?, message.parse::<i32>().map_err(|_| invalid())?);
+    let (who, _) = Who::parse(conversation).ok_or_else(invalid)?;
+    let mut parsed: Vec<(String, i32)> = Vec::with_capacity(message_ids.len());
+    for raw in message_ids {
+        let id = raw.parse::<i32>().map_err(|_| invalid())?;
+        parsed.push((raw.clone(), id));
+    }
+    if parsed.is_empty() {
+        return Ok(());
+    }
     match who {
         Who::Channel(_) => {
             if scope == protocol::DeleteScope::Me {
@@ -1205,19 +1231,27 @@ fn delete(account: &Account, conversation: &str, message: &str, scope: protocol:
                 });
             }
             let channel = account.input_channel(who)?;
-            account.ask(&tl::functions::channels::DeleteMessages { channel, id: vec![id] })?;
+            for chunk in parsed.chunks(100) {
+                let ids: Vec<i32> = chunk.iter().map(|(_, id)| *id).collect();
+                account.ask(&tl::functions::channels::DeleteMessages { channel: channel.clone(), id: ids })?;
+            }
         }
         _ => {
             let revoke = scope == protocol::DeleteScope::Everyone;
-            account.ask(&tl::functions::messages::DeleteMessages { revoke, id: vec![id] })?;
+            for chunk in parsed.chunks(100) {
+                let ids: Vec<i32> = chunk.iter().map(|(_, id)| *id).collect();
+                account.ask(&tl::functions::messages::DeleteMessages { revoke, id: ids })?;
+            }
         }
     }
-    let _ = account.ctx.deleted(conversation, message);
     let noted = match who {
         Who::Channel(_) => Some(who),
         _ => None,
     };
-    account.forget_placed(noted, id);
+    for (raw, id) in parsed {
+        let _ = account.ctx.deleted(conversation, &raw);
+        account.forget_placed(noted, id);
+    }
     Ok(())
 }
 

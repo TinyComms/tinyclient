@@ -1049,6 +1049,9 @@ impl Demo {
             Command::SendScheduledNow { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::JumpToDate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchCalendar { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DeleteMany { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DeleteParticipantHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ReportSpamMessages { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::FollowThread { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Backfill(_)

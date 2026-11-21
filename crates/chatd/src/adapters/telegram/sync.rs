@@ -83,7 +83,11 @@ fn row(account: &Account, who: Who, known: &Known) -> ConversationRow {
     row.avatar = known.avatar();
     row.read_only = known.read_only;
     row.rights = if matches!(who, Who::User(_)) {
-        protocol::ConversationRights { pin: !known.read_only, ..protocol::ConversationRights::default() }
+        protocol::ConversationRights {
+            pin: !known.read_only,
+            delete_others: !known.read_only && who != Who::User(SERVICE),
+            ..protocol::ConversationRights::default()
+        }
     } else {
         known.rights
     };

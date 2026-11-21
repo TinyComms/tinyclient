@@ -2510,14 +2510,28 @@ impl Pane {
         if targets.is_empty() {
             return;
         }
-        // Send deletes paced off-thread so we never burst the network.
+        // Batch deletes by scope so networks like Telegram delete all selected messages in one RPC.
+        let mut everyone: Vec<String> = Vec::new();
+        let mut me_only: Vec<String> = Vec::new();
+        for (message_id, scope) in targets {
+            match scope {
+                protocol::DeleteScope::Everyone => everyone.push(message_id),
+                protocol::DeleteScope::Me => me_only.push(message_id),
+            }
+        }
         cx.spawn(async move |_, cx| {
-            for (ix, (message_id, scope)) in targets.into_iter().enumerate() {
-                if ix > 0 {
-                    cx.background_executor().timer(std::time::Duration::from_millis(120)).await;
+            for (scope, ids) in [(protocol::DeleteScope::Everyone, everyone), (protocol::DeleteScope::Me, me_only)] {
+                if ids.is_empty() {
+                    continue;
                 }
-                let req = Request::Delete { conversation: conversation.clone(), message_id, scope };
-                let _ = cx.background_executor().spawn(async move { crate::client::ask(&req) }).await;
+                for chunk in ids.chunks(100) {
+                    let req = Request::DeleteMany {
+                        conversation: conversation.clone(),
+                        message_ids: chunk.to_vec(),
+                        scope,
+                    };
+                    let _ = cx.background_executor().spawn(async move { crate::client::ask(&req) }).await;
+                }
             }
         })
         .detach();

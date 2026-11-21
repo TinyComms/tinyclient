@@ -3534,6 +3534,48 @@ impl Chat {
             }
             Request::Edit { conversation, message_id, text, spans } => self.rewrite(conversation, message_id, Some(text), spans, protocol::DeleteScope::Everyone),
             Request::Delete { conversation, message_id, scope } => self.rewrite(conversation, message_id, None, Vec::new(), scope),
+            Request::DeleteMany { conversation, message_ids, scope } => {
+                if message_ids.is_empty() {
+                    return Response::Ok;
+                }
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::DeleteMany {
+                    conversation_id: conversation.id.clone(),
+                    message_ids: message_ids.clone(),
+                    scope,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) if matches!(*refused, Response::Error { code: ErrorCode::Unsupported, .. }) => {
+                        for message_id in message_ids {
+                            let res = self.rewrite(conversation.clone(), message_id, None, Vec::new(), scope);
+                            if !matches!(res, Response::Ok) {
+                                return res;
+                            }
+                        }
+                        Response::Ok
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::DeleteParticipantHistory { conversation, person } => {
+                self.act(&conversation, |conversation_id, reply| Command::DeleteParticipantHistory {
+                    conversation_id,
+                    person_id: person.id,
+                    reply,
+                })
+            }
+            Request::ReportSpamMessages { conversation, person, message_ids } => {
+                self.act(&conversation, |conversation_id, reply| Command::ReportSpamMessages {
+                    conversation_id,
+                    person_id: person.id,
+                    message_ids,
+                    reply,
+                })
+            }
             Request::Forward { from, message_ids, to, note } => self.forward(from, message_ids, to, note),
 
             Request::Poll { conversation, message_id, votes } => self.poll(conversation, message_id, votes),

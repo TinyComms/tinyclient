@@ -197,7 +197,17 @@ fn chats() -> Vec<tl::enums::Chat> {
             notes.verified = true;
             notes
         }),
-        tl::enums::Chat::Channel(a_channel(WORKSHOP, "Workshop", false, true, "")),
+        tl::enums::Chat::Channel({
+            let mut workshop = a_channel(WORKSHOP, "Workshop", false, true, "");
+            if std::env::var("TINYCLIENT_TELEGRAM_ADMIN").ok().as_deref() == Some("1") {
+                let mut rights: tl::types::ChatAdminRights = blank(&[&put(0u32)]);
+                rights.delete_messages = true;
+                rights.pin_messages = true;
+                rights.manage_topics = true;
+                workshop.admin_rights = Some(rights.into());
+            }
+            workshop
+        }),
     ]
 }
 
@@ -2938,10 +2948,61 @@ impl World {
         }
         if let Some(request) = asked::<f::messages::DeleteMessages>(body) {
             self.log(&format!("DeleteMessages {:?} revoke {}", request.id, request.revoke));
+            if request.revoke && request.id.contains(&20) && std::env::var("TINYCLIENT_TELEGRAM_OLD_GROUP").ok().as_deref() == Some("1") {
+                return Err(rpc(403, "MESSAGE_DELETE_FORBIDDEN", None));
+            }
             for held in self.messages.values_mut() {
                 request.id.iter().for_each(|id| drop(held.remove(id)));
             }
             return answer(tl::enums::messages::AffectedMessages::Messages(tl::types::messages::AffectedMessages { pts: 2, pts_count: 1 }));
+        }
+        if let Some(request) = asked::<f::channels::DeleteMessages>(body) {
+            let tl::enums::InputChannel::Channel(channel) = &request.channel else {
+                return Err(rpc(400, "CHANNEL_INVALID", None));
+            };
+            self.log(&format!("channels.DeleteMessages c{} {:?}", channel.channel_id, request.id));
+            let is_admin = std::env::var("TINYCLIENT_TELEGRAM_ADMIN").ok().as_deref() == Some("1");
+            let prefix = format!("c{}", channel.channel_id);
+            for (place, held) in self.messages.iter_mut() {
+                if place == &prefix || place.starts_with(&format!("{prefix}_")) {
+                    for id in &request.id {
+                        if let Some(tl::enums::Message::Message(msg)) = held.get(id) {
+                            if !msg.out && !is_admin {
+                                return Err(rpc(403, "MESSAGE_DELETE_FORBIDDEN", None));
+                            }
+                        }
+                        held.remove(id);
+                    }
+                }
+            }
+            return answer(tl::enums::messages::AffectedMessages::Messages(tl::types::messages::AffectedMessages { pts: 2, pts_count: 1 }));
+        }
+        if let Some(request) = asked::<f::channels::DeleteParticipantHistory>(body) {
+            let tl::enums::InputChannel::Channel(channel) = &request.channel else {
+                return Err(rpc(400, "CHANNEL_INVALID", None));
+            };
+            let who = input_who(&request.participant);
+            self.log(&format!("channels.DeleteParticipantHistory c{} {}", channel.channel_id, who.text()));
+            let prefix = format!("c{}", channel.channel_id);
+            for (place, held) in self.messages.iter_mut() {
+                if place == &prefix || place.starts_with(&format!("{prefix}_")) {
+                    held.retain(|_, msg| match msg {
+                        tl::enums::Message::Message(m) => m.from_id.as_ref().is_none_or(|p| Who::of(p) != who),
+                        _ => true,
+                    });
+                }
+            }
+            return answer(tl::enums::messages::AffectedHistory::History(
+                tl::types::messages::AffectedHistory { pts: 2, pts_count: 1, offset: 0 },
+            ));
+        }
+        if let Some(request) = asked::<f::channels::ReportSpam>(body) {
+            let tl::enums::InputChannel::Channel(channel) = &request.channel else {
+                return Err(rpc(400, "CHANNEL_INVALID", None));
+            };
+            let who = input_who(&request.participant);
+            self.log(&format!("channels.ReportSpam c{} {} {:?}", channel.channel_id, who.text(), request.id));
+            return answer(true);
         }
         if asked::<f::messages::GetAvailableReactions>(body).is_some() {
             self.log("GetAvailableReactions");

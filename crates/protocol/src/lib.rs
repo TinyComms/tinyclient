@@ -1972,6 +1972,24 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "DeleteScope::is_everyone")]
         scope: DeleteScope,
     },
+    /// Deletes several messages in one conversation in a single network batch where supported.
+    DeleteMany {
+        conversation: Key,
+        message_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "DeleteScope::is_everyone")]
+        scope: DeleteScope,
+    },
+    /// Deletes all messages sent by `person` in a supergroup/channel (Telegram `channels.deleteParticipantHistory`).
+    DeleteParticipantHistory {
+        conversation: Key,
+        person: Key,
+    },
+    /// Reports specific messages from `person` in a supergroup/channel as spam (Telegram `channels.reportSpam`).
+    ReportSpamMessages {
+        conversation: Key,
+        person: Key,
+        message_ids: Vec<String>,
+    },
     /// Forwards one or more messages to up to [`FORWARD_LIMIT`] conversations on the same account.
     /// Cross-account targets are refused; callers use a separate re-send for "Copy to…".
     Forward {
@@ -3621,6 +3639,17 @@ mod tests {
         let me_json = serde_json::to_string(&mine).unwrap();
         assert!(me_json.contains(r#""scope":"me""#), "{me_json}");
         assert_eq!(serde_json::from_str::<Request>(&me_json).unwrap(), mine);
+
+        let batch = Request::DeleteMany {
+            conversation: key.clone(),
+            message_ids: vec!["9".into(), "10".into()],
+            scope: DeleteScope::Me,
+        };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&batch).unwrap()).unwrap(), batch);
+        let dph = Request::DeleteParticipantHistory { conversation: key.clone(), person: key.clone() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&dph).unwrap()).unwrap(), dph);
+        let rsm = Request::ReportSpamMessages { conversation: key.clone(), person: key.clone(), message_ids: vec!["9".into()] };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&rsm).unwrap()).unwrap(), rsm);
 
         // Older shell request without `scope` decodes as `Everyone`.
         let legacy: Request = serde_json::from_str(&format!(

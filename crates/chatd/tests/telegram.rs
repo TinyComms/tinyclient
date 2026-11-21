@@ -4338,3 +4338,95 @@ fn chat_search_filters_paging_hashtags_jump_to_date_calendar_and_shared_tabs() {
         }
     }
 }
+
+#[test]
+fn delete_modes_admin_batch_participant_history_and_report_spam() {
+    let world = World::with(
+        Some(SESSION),
+        "30",
+        &[("TINYCLIENT_TELEGRAM_ADMIN", "1"), ("TINYCLIENT_TELEGRAM_OLD_GROUP", "1")],
+    );
+    world.connected();
+    world.until("odalys history", || world.message("u7002", "12"));
+
+    // Private 1:1 chat allows deleting the other person's messages.
+    let odalys = world.conversation("u7002").expect("Odalys row");
+    assert!(odalys.rights.delete_others, "private chat must set delete_others: {:?}", odalys.rights);
+
+    // Delete for me only sends revoke=false.
+    assert_eq!(
+        world.ask(Request::Delete {
+            conversation: key("u7002"),
+            message_id: "11".into(),
+            scope: protocol::DeleteScope::Me,
+        }),
+        Response::Ok
+    );
+    assert!(world.calls().iter().any(|c| c == "DeleteMessages [11] revoke false"));
+    world.until("message 11 deleted locally", || world.message("u7002", "11").is_none().then_some(()));
+
+    // Batch DeleteMany sends a single DeleteMessages RPC with both IDs (including peer's messages).
+    assert_eq!(
+        world.ask(Request::DeleteMany {
+            conversation: key("u7002"),
+            message_ids: vec!["10".into(), "12".into()],
+            scope: protocol::DeleteScope::Everyone,
+        }),
+        Response::Ok
+    );
+    assert!(world.calls().iter().any(|c| c == "DeleteMessages [10, 12] revoke true"));
+    world.until("batch deleted locally", || {
+        (world.message("u7002", "10").is_none() && world.message("u7002", "12").is_none()).then_some(())
+    });
+
+    // Basic group past 48h revoke returns a clear error mentioning 48-hour limit.
+    match world.ask(Request::Delete {
+        conversation: key("g8001"),
+        message_id: "20".into(),
+        scope: protocol::DeleteScope::Everyone,
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("48-hour"), "{detail}"),
+        other => panic!("expected 48-hour error, got {other:?}"),
+    }
+
+    // Supergroup/forum with admin rights advertises delete_others, refuses DeleteScope::Me,
+    // and deletes another member's message via channels.deleteMessages.
+    let workshop = world.conversation("c9002").expect("Workshop row");
+    assert!(workshop.rights.delete_others, "admin forum must set delete_others: {:?}", workshop.rights);
+    match world.ask(Request::Delete {
+        conversation: key("c9002_31"),
+        message_id: "41".into(),
+        scope: protocol::DeleteScope::Me,
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("everyone"), "{detail}"),
+        other => panic!("expected channel delete-for-everyone error, got {other:?}"),
+    }
+    assert_eq!(
+        world.ask(Request::Delete {
+            conversation: key("c9002_31"),
+            message_id: "41".into(),
+            scope: protocol::DeleteScope::Everyone,
+        }),
+        Response::Ok
+    );
+    assert!(world.calls().iter().any(|c| c == "channels.DeleteMessages c9002 [41]"));
+
+    // Report spam and delete all messages from a participant in a supergroup.
+    assert_eq!(
+        world.ask(Request::ReportSpamMessages {
+            conversation: key("c9002"),
+            person: key("u7003"),
+            message_ids: vec!["55".into()],
+        }),
+        Response::Ok
+    );
+    assert!(world.calls().iter().any(|c| c == "channels.ReportSpam c9002 u7003 [55]"));
+    assert_eq!(
+        world.ask(Request::DeleteParticipantHistory {
+            conversation: key("c9002"),
+            person: key("u7003"),
+        }),
+        Response::Ok
+    );
+    assert!(world.calls().iter().any(|c| c == "channels.DeleteParticipantHistory c9002 u7003"));
+}

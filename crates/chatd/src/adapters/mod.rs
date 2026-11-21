@@ -375,6 +375,26 @@ pub enum Command {
         scope: protocol::DeleteScope,
         reply: Reply<()>,
     },
+    /// Delete several messages in one conversation in one batch (`messages.deleteMessages` / `channels.deleteMessages`).
+    DeleteMany {
+        conversation_id: String,
+        message_ids: Vec<String>,
+        scope: protocol::DeleteScope,
+        reply: Reply<()>,
+    },
+    /// Delete all messages from one participant in a supergroup/channel (`channels.deleteParticipantHistory`).
+    DeleteParticipantHistory {
+        conversation_id: String,
+        person_id: String,
+        reply: Reply<()>,
+    },
+    /// Report specific messages from one participant in a supergroup/channel as spam (`channels.reportSpam`).
+    ReportSpamMessages {
+        conversation_id: String,
+        person_id: String,
+        message_ids: Vec<String>,
+        reply: Reply<()>,
+    },
     /// Vote on a poll, retract a vote (`Some(vec![])`), or end a poll (`None`). Report the
     /// updated message through [`Context::message`] before answering.
     Vote {
@@ -1002,6 +1022,9 @@ impl Command {
             Command::React { reply, .. }
             | Command::Edit { reply, .. }
             | Command::Delete { reply, .. }
+            | Command::DeleteMany { reply, .. }
+            | Command::DeleteParticipantHistory { reply, .. }
+            | Command::ReportSpamMessages { reply, .. }
             | Command::Vote { reply, .. }
             | Command::Relate { reply, .. }
             | Command::AddFriend { reply, .. }
