@@ -2305,6 +2305,28 @@ impl Pane {
                 row = row.child(div().type_small().text_color(theme::text_faint()).child(card.footer.clone()));
             }
             Some(row.into_any_element())
+        } else if !card.footer.is_empty() && !card.title_link.is_empty() && card.footer.starts_with("Open in ") {
+            let url = card.title_link.clone();
+            Some(
+                div()
+                    .mt(px(4.))
+                    .flex()
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("card-open-{}-{ix}", message.id)))
+                            .cursor_pointer()
+                            .type_small()
+                            .font_weight(theme::MEDIUM)
+                            .text_color(theme::accent())
+                            .hover(|s| s.underline())
+                            .child(card.footer.clone())
+                            .on_click(move |_, _, cx| {
+                                cx.stop_propagation();
+                                cx.open_url(&url);
+                            }),
+                    )
+                    .into_any_element(),
+            )
         } else if !card.footer.is_empty() {
             Some(div().mt(px(2.)).type_small().text_color(theme::text_faint()).child(card.footer.clone()).into_any_element())
         } else {

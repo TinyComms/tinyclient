@@ -54,6 +54,146 @@ fn pixels(value: &Value) -> u32 {
     value.as_u64().unwrap_or(0).min(u64::from(u32::MAX)) as u32
 }
 
+/// True when a Slack file entry represents a Canvas (`quip`, `canvas`, `slack_canvas`).
+pub(super) fn is_canvas(file: &Value) -> bool {
+    if file["is_canvas"] == true {
+        return true;
+    }
+    let ft = file["filetype"].as_str().unwrap_or("").to_ascii_lowercase();
+    if matches!(ft.as_str(), "quip" | "canvas" | "slack_canvas") {
+        return true;
+    }
+    let mime = file["mimetype"].as_str().unwrap_or("").to_ascii_lowercase();
+    matches!(mime.as_str(), "application/vnd.slack-docs" | "application/vnd.slack.canvas")
+}
+
+/// True when a Slack file entry represents a Slack List (`list`, `slack_list`).
+pub(super) fn is_list(file: &Value) -> bool {
+    if file["is_list"] == true {
+        return true;
+    }
+    let ft = file["filetype"].as_str().unwrap_or("").to_ascii_lowercase();
+    if matches!(ft.as_str(), "list" | "slack_list") {
+        return true;
+    }
+    let mime = file["mimetype"].as_str().unwrap_or("").to_ascii_lowercase();
+    matches!(mime.as_str(), "application/vnd.slack-list" | "application/vnd.slack.list")
+}
+
+/// Decodes common HTML entities and strips HTML markup into clean, readable plain text.
+pub(super) fn strip_html(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    let mut skip_until: Option<&str> = None;
+    while !rest.is_empty() {
+        if let Some(end_tag) = skip_until {
+            if let Some(pos) = rest.to_ascii_lowercase().find(end_tag) {
+                rest = &rest[pos + end_tag.len()..];
+            } else {
+                break;
+            }
+            skip_until = None;
+            continue;
+        }
+        if let Some(lt) = rest.find('<') {
+            push_entities(&mut out, &rest[..lt]);
+            let after = &rest[lt + 1..];
+            let Some(gt) = after.find('>') else {
+                // Unclosed angle bracket: keep text without raw partial tag if it looks like a tag.
+                break;
+            };
+            let tag_raw = after[..gt].trim();
+            let tag_lower = tag_raw.to_ascii_lowercase();
+            let name = tag_lower
+                .trim_start_matches('/')
+                .split(|c: char| c.is_whitespace() || c == '/')
+                .next()
+                .unwrap_or("");
+            if !tag_lower.starts_with('/') && matches!(name, "script" | "style") {
+                skip_until = Some(if name == "script" { "</script>" } else { "</style>" });
+            } else if name == "input" && tag_lower.contains("checkbox") {
+                if tag_lower.contains("checked") {
+                    out.push_str("☑ ");
+                } else {
+                    out.push_str("☐ ");
+                }
+            } else if name == "li" && !tag_lower.starts_with('/') {
+                if !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str("• ");
+            } else if matches!(name, "br" | "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "tr" | "section" | "hr") {
+                if !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            rest = &after[gt + 1..];
+        } else {
+            push_entities(&mut out, rest);
+            break;
+        }
+    }
+    // Collapse excess blank lines and trim each line.
+    let mut lines: Vec<String> = Vec::new();
+    let mut prev_blank = false;
+    for line in out.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if !prev_blank && !lines.is_empty() {
+                lines.push(String::new());
+                prev_blank = true;
+            }
+        } else {
+            lines.push(trimmed.to_owned());
+            prev_blank = false;
+        }
+    }
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+fn push_entities(out: &mut String, text: &str) {
+    let mut rest = text;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        if let Some(semi) = after.find(';').filter(|&i| i > 0 && i <= 10) {
+            let entity = &after[..semi];
+            let decoded = match entity {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" | "#39" | "#x27" | "#X27" => Some('\''),
+                "nbsp" => Some(' '),
+                s if s.starts_with("#x") || s.starts_with("#X") => {
+                    u32::from_str_radix(&s[2..], 16).ok().and_then(char::from_u32)
+                }
+                s if s.starts_with('#') => s[1..].parse::<u32>().ok().and_then(char::from_u32),
+                _ => None,
+            };
+            if let Some(ch) = decoded {
+                out.push(ch);
+                rest = &after[semi + 1..];
+                continue;
+            }
+        }
+        out.push('&');
+        rest = after;
+    }
+    out.push_str(rest);
+}
+
+fn push_card(framed: &mut Option<Box<Card>>, extra: &mut Vec<Card>, card: Card) {
+    if framed.is_none() {
+        *framed = Some(Box::new(card));
+    } else {
+        extra.push(card);
+    }
+}
+
 /// What a stored custom-emoji note stands for: `=glyph` is an alias of a standard emoji.
 pub(super) fn custom_picture(name: &str, known: &str) -> Custom {
     if let Some(emoji) = known.strip_prefix('=') {
@@ -864,6 +1004,197 @@ impl Slack {
         Some(framed)
     }
 
+    /// Maps a Slack Canvas file (`filetype` `quip` / `canvas` / `slack_canvas`) into a structured
+    /// readable card with an "Open in Slack" link instead of a bare download chip.
+    fn canvas_card(&self, file: &Value, fallback_link: &str) -> Card {
+        let title = first(&[&file["title"], &file["name"]]).unwrap_or("Untitled Canvas").trim().to_owned();
+        let title = if title.is_empty() { "Untitled Canvas".to_owned() } else { title };
+        let link = first(&[&file["permalink"], &file["url_private"]])
+            .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+            .unwrap_or(fallback_link)
+            .to_owned();
+        let creator = file["user"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .and_then(|id| self.cached(id))
+            .map(|u| u.name);
+        let author = match creator {
+            Some(who) if !who.is_empty() => format!("Slack Canvas · {who}"),
+            _ => "Slack Canvas".to_owned(),
+        };
+
+        let mut text = String::new();
+        let mut fields: Vec<(String, String)> = Vec::new();
+
+        // Structured sections when present in the payload.
+        if let Some(sections) = file["sections"].as_array() {
+            for sec in sections {
+                if fields.len() >= CARD_FIELDS {
+                    break;
+                }
+                let heading = first(&[&sec["title"], &sec["heading"]]).map(strip_html).unwrap_or_default();
+                let body = first(&[&sec["text"], &sec["content"], &sec["markdown"], &sec["body"]])
+                    .map(|raw| {
+                        if raw.contains('<') && raw.contains('>') {
+                            strip_html(raw)
+                        } else {
+                            self.words(raw)
+                        }
+                    })
+                    .unwrap_or_default();
+                if !heading.is_empty() || !body.is_empty() {
+                    fields.push((heading, body));
+                }
+            }
+        }
+
+        // Canvas Block Kit document content when present.
+        if let Some(blocks) = file["blocks"].as_array().filter(|b| !b.is_empty()) {
+            let mut inner = Rich::new(self);
+            inner.blocks(blocks);
+            inner.finish();
+            if !inner.text.is_empty() {
+                text = inner.text;
+            }
+        }
+
+        // Plain/HTML preview text from Slack's file payload.
+        if text.is_empty() {
+            if let Some(raw) = first(&[
+                &file["preview_plain_text"],
+                &file["plain_text"],
+                &file["document_content"],
+                &file["preview"],
+                &file["preview_highlight"],
+            ]) {
+                let cleaned = if raw.contains('<') && raw.contains('>') {
+                    strip_html(raw)
+                } else {
+                    self.words(raw)
+                };
+                if !cleaned.is_empty() {
+                    text = cleaned;
+                }
+            }
+        }
+
+        if text.is_empty() && fields.is_empty() {
+            text = if file["is_huddle_notes"] == true || title.to_ascii_lowercase().contains("huddle") {
+                "Huddle notes canvas".to_owned()
+            } else {
+                "Shared Slack canvas".to_owned()
+            };
+        }
+
+        Card {
+            author,
+            title,
+            title_link: link,
+            text,
+            fields,
+            footer: "Open in Slack".to_owned(),
+            image: None,
+            thumbnail: None,
+            color: Some(0x4a_154b),
+            sponsored: false,
+        }
+    }
+
+    /// Maps a Slack List file (`filetype` `list` / `slack_list`) into a structured readable card
+    /// with columns/items summary and an "Open in Slack" link instead of a bare download chip.
+    fn list_card(&self, file: &Value, fallback_link: &str) -> Card {
+        let title = first(&[&file["title"], &file["name"]]).unwrap_or("Untitled List").trim().to_owned();
+        let title = if title.is_empty() { "Untitled List".to_owned() } else { title };
+        let link = first(&[&file["permalink"], &file["url_private"]])
+            .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+            .unwrap_or(fallback_link)
+            .to_owned();
+        let creator = file["user"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .and_then(|id| self.cached(id))
+            .map(|u| u.name);
+        let author = match creator {
+            Some(who) if !who.is_empty() => format!("Slack List · {who}"),
+            _ => "Slack List".to_owned(),
+        };
+
+        let meta = &file["list_metadata"];
+        let mut text = first(&[
+            &meta["description"],
+            &file["preview_plain_text"],
+            &file["plain_text"],
+            &file["preview"],
+        ])
+        .map(|raw| if raw.contains('<') && raw.contains('>') { strip_html(raw) } else { self.words(raw) })
+        .unwrap_or_default();
+
+        let mut fields: Vec<(String, String)> = Vec::new();
+        let items = meta["items"]
+            .as_array()
+            .or_else(|| file["items"].as_array())
+            .or_else(|| file["rows"].as_array());
+        if let Some(items) = items {
+            for item in items.iter().take(CARD_FIELDS) {
+                let item_title = first(&[&item["title"], &item["name"], &item["text"]])
+                    .map(strip_html)
+                    .unwrap_or_default();
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(status) = first(&[&item["status"], &item["state"]]) {
+                    parts.push(strip_html(status));
+                }
+                if let Some(assignee) = first(&[&item["assignee"], &item["owner"]]) {
+                    let who = self.cached(assignee).map(|u| u.name).unwrap_or_else(|| strip_html(assignee));
+                    if !who.is_empty() {
+                        parts.push(who);
+                    }
+                }
+                if let Some(due) = first(&[&item["due_date"], &item["due"]]) {
+                    parts.push(format!("Due {}", strip_html(due)));
+                }
+                if !item_title.is_empty() || !parts.is_empty() {
+                    let label = if item_title.is_empty() { "Item".to_owned() } else { item_title };
+                    fields.push((label, parts.join(" · ")));
+                }
+            }
+        }
+
+        if let Some(schema) = meta["schema"].as_array().filter(|s| !s.is_empty()) {
+            let cols: Vec<String> = schema
+                .iter()
+                .filter_map(|c| first(&[&c["name"], &c["label"], &c["key"]]).map(strip_html))
+                .filter(|s| !s.is_empty())
+                .take(8)
+                .collect();
+            if !cols.is_empty() {
+                let col_line = format!("Columns: {}", cols.join(", "));
+                if text.is_empty() {
+                    text = col_line;
+                } else {
+                    text.push('\n');
+                    text.push_str(&col_line);
+                }
+            }
+        }
+
+        if text.is_empty() && fields.is_empty() {
+            text = "Shared Slack list".to_owned();
+        }
+
+        Card {
+            author,
+            title,
+            title_link: link,
+            text,
+            fields,
+            footer: "Open in Slack".to_owned(),
+            image: None,
+            thumbnail: None,
+            color: Some(0x2e_7d6f),
+            sponsored: false,
+        }
+    }
+
     /// Extracts hosted image blocks, section image accessories, and video blocks from Block Kit.
     fn block_media(&self, blocks: &[Value], media: &mut Registered, attachments: &mut Vec<Attachment>, previews: &mut Vec<Preview>) {
         for block in blocks {
@@ -1069,6 +1400,14 @@ impl Slack {
                 }
                 _ => {}
             }
+            if is_canvas(file) {
+                push_card(&mut framed, &mut extra_cards, self.canvas_card(file, &link));
+                continue;
+            }
+            if is_list(file) {
+                push_card(&mut framed, &mut extra_cards, self.list_card(file, &link));
+                continue;
+            }
             match self.file(file, &mut media, &mut variants) {
                 Some(attachment) => attachments.push(attachment),
                 // Kept somewhere Slack does not serve (Drive, Dropbox): a link to it.
@@ -1078,6 +1417,9 @@ impl Slack {
                     rich.link(target, Some(name));
                 }
             }
+        }
+        if subtype == Some("channel_canvas_updated") && rich.text.trim().is_empty() {
+            rich.text = "Updated the channel canvas".to_owned();
         }
         if rich.undrawn && !rich.text.is_empty() {
             // Buttons and menus are not drawn; the official app has them.

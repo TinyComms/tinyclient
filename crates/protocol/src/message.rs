@@ -818,8 +818,10 @@ impl Message {
         if let Some(prior) = &mut self.prior_text {
             clip(prior, PRIOR_LIMIT);
         }
-        if let Some(card) = &mut self.card {
+        let bound_card = |card: &mut Card| {
+            clip(&mut card.author, 256);
             clip(&mut card.title, 256);
+            clip(&mut card.title_link, 2_000);
             clip(&mut card.text, 4_000);
             clip(&mut card.footer, 256);
             card.fields.truncate(CARD_FIELDS);
@@ -827,6 +829,13 @@ impl Message {
                 clip(label, 256);
                 clip(value, 1_000);
             }
+        };
+        if let Some(card) = &mut self.card {
+            bound_card(card);
+        }
+        self.cards.truncate(20);
+        for card in &mut self.cards {
+            bound_card(card);
         }
         if let Some(poll) = &mut self.poll {
             clip(&mut poll.question, 100);

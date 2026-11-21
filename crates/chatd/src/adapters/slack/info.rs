@@ -156,7 +156,28 @@ impl Slack {
                 description.push_str(&handoff);
             }
         }
-        let bookmarks = self.bookmarks(channel_of(conversation));
+        let mut bookmarks = self.bookmarks(channel_of(conversation));
+        // Surface the channel canvas from `conversations.info` (`properties.canvas`) when not
+        // already present in bookmarks.list.
+        let canvas = &channel["properties"]["canvas"];
+        if let Some(file_id) = canvas["file_id"].as_str().filter(|id| !id.is_empty() && canvas["is_empty"] != true) {
+            let already = bookmarks.iter().any(|b| {
+                b.kind == BookmarkKind::Canvas && (b.id == file_id || b.link.contains(file_id))
+            });
+            if !already {
+                let link = format!("{}docs/{}/{file_id}", self.session.url, self.session.team_id);
+                bookmarks.insert(
+                    0,
+                    Bookmark {
+                        id: file_id.to_owned(),
+                        title: "Channel canvas".to_owned(),
+                        link,
+                        emoji: String::new(),
+                        kind: BookmarkKind::Canvas,
+                    },
+                );
+            }
+        }
         let pinned = self
             .api("pins.list", &[("channel", channel_of(conversation))])
             .ok()

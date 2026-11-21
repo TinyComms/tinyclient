@@ -578,6 +578,11 @@ impl Fake {
                     if token == ALPHA && channel == "C0GEN" {
                         known["shared_team_ids"] = json!(["T01ALPHA", "T0SOUTH"]);
                     }
+                    if token == ALPHA && channel == "C0RND" {
+                        known["properties"] = json!({
+                            "canvas": {"file_id": "F0CHANCANVAS", "is_empty": false}
+                        });
+                    }
                     json!({"ok": true, "channel": known})
                 })
             }
@@ -4382,4 +4387,123 @@ fn slack_rich_status_emoji_expiration_and_custom_emoji_read() {
         let ana = people.into_iter().find(|p| p.key.id == "U0ANA")?;
         (ana.emoji == ":partyparrot:" && ana.status.contains("Deploying")).then_some(())
     });
+}
+
+#[test]
+fn slack_canvases_and_lists_render_structured_cards_without_file_chips() {
+    let world = World::start();
+    world.ready();
+
+    let general = alpha("C0GEN");
+
+    // 1. Canvas file (`filetype: "quip"`) with HTML preview & sections -> Message::card, no file chip, no raw HTML.
+    let ts_canvas = "1760000901.000901";
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "channel": "C0GEN",
+        "user": "U0ANA",
+        "text": "",
+        "ts": ts_canvas,
+        "event_ts": ts_canvas,
+        "files": [{
+            "id": "F0CANVAS1",
+            "name": "Q4 Launch Plan",
+            "title": "Q4 Launch Plan",
+            "filetype": "quip",
+            "mimetype": "application/vnd.slack-docs",
+            "user": "U0ANA",
+            "permalink": "https://acme.slack.com/docs/T01ALPHA/F0CANVAS1",
+            "url_private": "https://files.slack.com/files-pri/T01ALPHA-F0CANVAS1/canvas",
+            "preview": "<h1>Overview</h1><p>Ship &amp; verify all items.</p><ul><li><input type=\"checkbox\" checked>Build</li><li><input type=\"checkbox\">Deploy</li></ul>",
+            "sections": [
+                {"heading": "Goals", "content": "<p>Zero downtime</p>"}
+            ]
+        }]
+    }));
+    let canvas_msg = world.until("canvas message stored", || world.message(&general, ts_canvas));
+    assert!(canvas_msg.attachments.is_empty(), "canvas must not render as a bare file chip");
+    assert_eq!(canvas_msg.kind, MessageKind::Normal);
+    let card = canvas_msg.card.as_deref().expect("canvas card");
+    assert_eq!(card.title, "Q4 Launch Plan");
+    assert_eq!(card.title_link, "https://acme.slack.com/docs/T01ALPHA/F0CANVAS1");
+    assert_eq!(card.footer, "Open in Slack");
+    assert!(card.author.starts_with("Slack Canvas"), "author: {}", card.author);
+    assert!(card.text.contains("Overview") && card.text.contains("Ship & verify"), "text: {}", card.text);
+    assert!(card.text.contains("☑ Build") && card.text.contains("☐ Deploy"), "checklist text: {}", card.text);
+    assert!(!card.text.contains("<h1>") && !card.text.contains("<p>"), "must strip raw HTML: {}", card.text);
+    assert_eq!(card.fields, vec![("Goals".to_owned(), "Zero downtime".to_owned())]);
+
+    // 2. Canvas with no preview falls back cleanly (never blank, never file chip).
+    let ts_empty_canvas = "1760000902.000902";
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "channel": "C0GEN",
+        "user": "U0ANA",
+        "text": "",
+        "ts": ts_empty_canvas,
+        "event_ts": ts_empty_canvas,
+        "files": [{
+            "id": "F0CANVAS2",
+            "title": "Huddle Notes",
+            "filetype": "canvas",
+            "permalink": "https://acme.slack.com/docs/T01ALPHA/F0CANVAS2"
+        }]
+    }));
+    let empty_canvas = world.until("minimal canvas stored", || world.message(&general, ts_empty_canvas));
+    assert!(empty_canvas.attachments.is_empty());
+    let fallback_card = empty_canvas.card.as_deref().expect("fallback canvas card");
+    assert_eq!(fallback_card.title, "Huddle Notes");
+    assert!(!fallback_card.text.is_empty(), "fallback canvas card must not be blank");
+    assert_eq!(fallback_card.footer, "Open in Slack");
+
+    // 3. List file (`filetype: "list"`) with schema and items -> structured Card, no file chip.
+    let ts_list = "1760000903.000903";
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "channel": "C0GEN",
+        "user": "U0BEN",
+        "text": "",
+        "ts": ts_list,
+        "event_ts": ts_list,
+        "files": [{
+            "id": "F0LIST1",
+            "title": "Release Tracker",
+            "filetype": "list",
+            "mimetype": "application/vnd.slack-list",
+            "permalink": "https://acme.slack.com/lists/T01ALPHA/F0LIST1",
+            "list_metadata": {
+                "description": "<b>Wave 6B</b> tasks",
+                "schema": [{"name": "Task"}, {"name": "Status"}, {"name": "Assignee"}],
+                "items": [
+                    {"title": "Canvas reader", "status": "Done", "assignee": "U0ANA", "due_date": "2026-11-22"},
+                    {"title": "GIF picker", "status": "In progress", "assignee": "U0BEN"}
+                ]
+            }
+        }]
+    }));
+    let list_msg = world.until("list message stored", || world.message(&general, ts_list));
+    assert!(list_msg.attachments.is_empty(), "list must not render as a bare file chip");
+    let list_card = list_msg.card.as_deref().expect("list card");
+    assert_eq!(list_card.title, "Release Tracker");
+    assert_eq!(list_card.title_link, "https://acme.slack.com/lists/T01ALPHA/F0LIST1");
+    assert!(list_card.author.starts_with("Slack List"), "author: {}", list_card.author);
+    assert!(list_card.text.contains("Wave 6B tasks") && !list_card.text.contains("<b>"));
+    assert!(list_card.text.contains("Columns: Task, Status, Assignee"));
+    assert_eq!(list_card.fields.len(), 2);
+    assert_eq!(list_card.fields[0].0, "Canvas reader");
+    assert!(list_card.fields[0].1.contains("Done") && list_card.fields[0].1.contains("Due 2026-11-22"));
+    assert_eq!(list_card.footer, "Open in Slack");
+
+    // 4. Channel canvas from conversations.info (`properties.canvas`) appears in ConversationInfo::bookmarks.
+    let random = alpha("C0RND");
+    let Response::ConversationInfo { info } = world.ask(Request::ConversationInfo { conversation: random }) else {
+        panic!("expected ConversationInfo for C0RND");
+    };
+    let canvas_bm = info
+        .bookmarks
+        .iter()
+        .find(|b| b.kind == protocol::BookmarkKind::Canvas && b.id == "F0CHANCANVAS")
+        .expect("channel canvas surfaced in bookmarks");
+    assert_eq!(canvas_bm.title, "Channel canvas");
+    assert!(canvas_bm.link.contains("F0CHANCANVAS"));
 }
