@@ -2459,3 +2459,92 @@ fn shared_channels_are_distinguished_from_private_and_external_orgs_marked() {
     assert!(!same_org_shared.private, "same-org shared channel must not set private=true");
     assert_eq!(same_org_shared.mark, None, "same-org shared channel should not be marked External");
 }
+
+#[test]
+fn channels_can_be_shown_hidden_and_pinned_with_filing_updates() {
+    let world = World::start();
+    world.ready();
+
+    // 1. All channels of Platform (including hidden `Hidden one`) are listed, with hidden flagged opted_out.
+    let deploys = key(DEPLOYS);
+    let hidden = key("19:platform0hidden@thread.tacv2");
+    assert!(!world.conversation(&deploys).unwrap().opted_out);
+    assert!(world.conversation(&hidden).unwrap().opted_out);
+    assert_eq!(world.conversation(&deploys).unwrap().pin, None);
+
+    // 2. Pin Deploys channel -> PUT properties?name=pinned and Filing::pin updated.
+    assert_eq!(
+        world.ask(Request::File {
+            conversation: deploys.clone(),
+            pinned: Some(true),
+            archived: None,
+            folder_add: None,
+            folder_remove: None,
+        }),
+        Response::Ok
+    );
+    assert!(
+        world
+            .fake
+            .calls("PUT", &format!("/{DEPLOYS}/properties"))
+            .iter()
+            .any(|c| c.query == "name=pinned" && c.json()["pinned"] == "true"),
+        "expected PUT pinned=true for Deploys channel"
+    );
+    assert_eq!(world.conversation(&deploys).unwrap().pin, Some(0));
+
+    // 3. Unpin Deploys channel -> PUT properties?name=pinned=false and Filing::pin cleared.
+    assert_eq!(
+        world.ask(Request::File {
+            conversation: deploys.clone(),
+            pinned: Some(false),
+            archived: None,
+            folder_add: None,
+            folder_remove: None,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.conversation(&deploys).unwrap().pin, None);
+
+    // 4. Hide Deploys channel (`archived: Some(true)`) -> PUT channelSettings isFavorite=false, opted_out=true.
+    assert_eq!(
+        world.ask(Request::File {
+            conversation: deploys.clone(),
+            pinned: None,
+            archived: Some(true),
+            folder_add: None,
+            folder_remove: None,
+        }),
+        Response::Ok
+    );
+    assert!(
+        world
+            .fake
+            .calls("PUT", &format!("/{DEPLOYS}/properties"))
+            .iter()
+            .any(|c| c.query == "name=channelSettings" && c.json()["channelSettings"]["isFavorite"] == false),
+        "expected PUT channelSettings isFavorite=false when hiding channel"
+    );
+    assert!(world.conversation(&deploys).unwrap().opted_out, "hidden channel should have opted_out=true");
+
+    // 5. Show Hidden one (`archived: Some(false)`) -> PUT channelSettings isFavorite=true, opted_out=false.
+    assert_eq!(
+        world.ask(Request::File {
+            conversation: hidden.clone(),
+            pinned: None,
+            archived: Some(false),
+            folder_add: None,
+            folder_remove: None,
+        }),
+        Response::Ok
+    );
+    assert!(
+        world
+            .fake
+            .calls("PUT", &format!("/19:platform0hidden@thread.tacv2/properties"))
+            .iter()
+            .any(|c| c.query == "name=channelSettings" && c.json()["channelSettings"]["isFavorite"] == true),
+        "expected PUT channelSettings isFavorite=true when showing channel"
+    );
+    assert!(!world.conversation(&hidden).unwrap().opted_out, "shown channel should have opted_out=false");
+}

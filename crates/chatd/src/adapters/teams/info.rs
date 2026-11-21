@@ -239,18 +239,74 @@ impl Teams {
         Ok(())
     }
 
-    /// Pins or unpins a Teams chat and updates local `Filing::pin`.
-    pub(super) fn file_chat(&self, conversation: &str, pinned: Option<bool>) -> Result<(), Fault> {
+    /// Pins/unpins a Teams chat or channel, and shows/hides a Teams channel (`isFavorite` /
+    /// `channelSettings`), updating local `Filing` and `opted_out` cleanly.
+    pub(super) fn file_conversation(&self, conversation: &str, pinned: Option<bool>, archived: Option<bool>) -> Result<(), Fault> {
+        let thread = thread_of(conversation);
+        if thread.starts_with("48:") {
+            return Err(Fault::Refused {
+                status: 400,
+                message: "System streams cannot be filed here.".to_owned(),
+            });
+        }
+        if super::tree::is_channel(thread) {
+            if let Some(pin) = pinned {
+                let path = format!("/v1/users/ME/conversations/{}/properties?name=pinned", escaped(thread));
+                self.chat("PUT", &path, Body::Json(&json!({"pinned": if pin { "true" } else { "false" }})), false)?;
+                let pin_pos = {
+                    let mut state = self.state();
+                    if pin {
+                        if let Some(pos) = state.pinned_channels.iter().position(|id| id == thread) {
+                            Some(pos as i32)
+                        } else {
+                            state.pinned_channels.push(thread.to_owned());
+                            Some((state.pinned_channels.len() - 1) as i32)
+                        }
+                    } else {
+                        state.pinned_channels.retain(|id| id != thread);
+                        None
+                    }
+                };
+                let existing = self.ctx.known(thread)?;
+                let filing = crate::store::Filing {
+                    hidden: existing.as_ref().is_some_and(|row| row.hidden),
+                    pin: pin_pos,
+                    ..crate::store::Filing::default()
+                };
+                self.ctx.filing(thread, &filing)?;
+            }
+            if let Some(hide) = archived {
+                let path = format!("/v1/users/ME/conversations/{}/properties?name=channelSettings", escaped(thread));
+                let body = json!({"channelSettings": {"isFavorite": !hide}});
+                self.chat("PUT", &path, Body::Json(&body), false)?;
+                if hide {
+                    self.state().pinned_channels.retain(|id| id != thread);
+                }
+                if let Some(existing) = self.ctx.known(thread)? {
+                    let pin = if hide { None } else { existing.pin };
+                    let mut row = crate::store::ConversationRow::new(thread, existing.kind, existing.title);
+                    row.space = existing.space;
+                    row.group = existing.group;
+                    row.position = existing.position;
+                    row.call = existing.call;
+                    row.private = existing.private;
+                    row.shared = existing.shared;
+                    row.mark = existing.mark;
+                    row.read_only = existing.read_only;
+                    row.opted_out = hide;
+                    row.filing = Some(crate::store::Filing {
+                        hidden: existing.hidden,
+                        pin,
+                        ..crate::store::Filing::default()
+                    });
+                    self.ctx.conversation(&row)?;
+                }
+            }
+            return Ok(());
+        }
         let Some(pin) = pinned else {
             return Ok(());
         };
-        let thread = thread_of(conversation);
-        if super::tree::is_channel(thread) || thread.starts_with("48:") {
-            return Err(Fault::Refused {
-                status: 400,
-                message: "Only Teams chats can be pinned here.".to_owned(),
-            });
-        }
         if pin {
             let state = self.state();
             if !state.pinned_chats.iter().any(|id| id == thread) && state.pinned_chats.len() >= 15 {

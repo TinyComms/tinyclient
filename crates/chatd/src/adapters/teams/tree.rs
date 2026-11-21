@@ -89,6 +89,59 @@ pub(super) fn pinned_chat_order(listed: &Value, chats: &[Value]) -> Vec<String> 
     order
 }
 
+/// Parses Teams' pinned channel ids in their Teams order from user-level properties
+/// (`pinnedChannels`, `userDetails.pinnedChannels`, `userProperties.pinnedChannels`) and
+/// per-channel `isPinned` / `properties.pinned` flags.
+pub(super) fn pinned_channel_order(listed: &Value, teams: &[Value], shared_channels: &[Value]) -> Vec<String> {
+    let mut order = Vec::new();
+    let mut push = |id: &str| {
+        if !id.is_empty() && !order.iter().any(|existing: &String| existing == id) {
+            order.push(id.to_owned());
+        }
+    };
+    let sources = [
+        &listed["pinnedChannels"],
+        &listed["userDetails"]["pinnedChannels"],
+        &listed["userProperties"]["pinnedChannels"],
+    ];
+    for source in sources {
+        match source {
+            Value::Array(items) => {
+                for item in items {
+                    if let Some(id) = item.as_str() {
+                        push(id);
+                    }
+                }
+            }
+            Value::String(raw) => {
+                if let Ok(items) = serde_json::from_str::<Vec<String>>(raw) {
+                    for id in items {
+                        push(&id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let check_channel = |ch: &Value, push: &mut dyn FnMut(&str)| {
+        let pinned = ch["isPinned"] == true
+            || ch["properties"]["pinned"] == true
+            || ch["properties"]["pinned"].as_str().is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        if pinned {
+            push(text(ch, "id"));
+        }
+    };
+    for team in teams {
+        for ch in team["channels"].as_array().into_iter().flatten() {
+            check_channel(ch, &mut push);
+        }
+    }
+    for ch in shared_channels {
+        check_channel(ch, &mut push);
+    }
+    order
+}
+
 /// What Teams says of how far a channel or chat was read.
 struct Counted {
     unread: bool,
@@ -184,7 +237,9 @@ impl Teams {
             taken(&mut listed, "sharedChannels"),
         );
         let pinned_order = pinned_chat_order(&listed, &chats);
+        let pinned_channels = pinned_channel_order(&listed, &teams, &shared_channels);
         drop(listed);
+        self.state().pinned_channels = pinned_channels.clone();
         let me = self.me();
         let own_tenant = self.session.tenant.clone();
         // The chats first: written with no Space, they leave the one an earlier build kept them
@@ -272,7 +327,9 @@ impl Teams {
                 .iter()
                 .enumerate()
                 .map(|(position, channel)| {
+                    let chan_id = text(channel, "id");
                     let (private, shared, mark) = channel_flags(channel, team_tenant, &own_tenant);
+                    let pin = pinned_channels.iter().position(|p| p == chan_id).map(|ix| ix as i32);
                     ConversationRow {
                         space: Some(id.to_owned()),
                         position: position as i32,
@@ -282,7 +339,8 @@ impl Teams {
                         mark,
                         read_only: team["isArchived"] == true || channel["isArchived"] == true,
                         opted_out: hidden(channel),
-                        ..ConversationRow::new(text(channel, "id"), ConversationKind::Channel, text(channel, "displayName"))
+                        filing: Some(Filing { pin, ..Filing::default() }),
+                        ..ConversationRow::new(chan_id, ConversationKind::Channel, text(channel, "displayName"))
                     }
                 })
                 .collect();

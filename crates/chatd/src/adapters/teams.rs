@@ -329,6 +329,8 @@ struct State {
     own_meta: HashMap<(String, String), message::OwnMeta>,
     /// Chat ids pinned in Teams, in Teams' own order.
     pinned_chats: Vec<String>,
+    /// Channel ids pinned in Teams, in Teams' own order.
+    pinned_channels: Vec<String>,
     /// Per-conversation notification level as reported by Teams.
     notify: HashMap<String, protocol::Notify>,
     /// Pending scheduled messages: raw Teams message id -> scheduled unix seconds.
@@ -1021,8 +1023,8 @@ impl Teams {
             Command::Leave { conversation_id, reply } => {
                 let _ = reply.send(self.leave(&conversation_id).map_err(refuse));
             }
-            Command::File { conversation_id, pinned, archived: _, folder_add: _, folder_remove: _, reply } => {
-                let _ = reply.send(self.file_chat(&conversation_id, pinned).map_err(refuse));
+            Command::File { conversation_id, pinned, archived, folder_add: _, folder_remove: _, reply } => {
+                let _ = reply.send(self.file_conversation(&conversation_id, pinned, archived).map_err(refuse));
             }
             Command::CloseDirect { conversation_id, reply } => {
                 let _ = reply.send(self.hide_chat(&conversation_id).map_err(refuse));

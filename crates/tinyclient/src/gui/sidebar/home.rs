@@ -357,10 +357,18 @@ pub fn signal(home: &Home) -> Vec<Item> {
 /// teams, collapsed, each showing the channels that need me (rule 3) or all when opened.
 pub fn teams(home: &Home, spaces: &[Space], channels: &dyn Fn(&Key) -> Vec<Rc<Conversation>>, open: Option<&Key>, now: i64) -> Vec<Item> {
     let mut out = Vec::new();
-    let pinned: Vec<&Rc<Conversation>> = home.chats.iter().filter(|c| c.starred || c.pin.is_some()).collect();
-    if !pinned.is_empty() {
+    let pinned_chats: Vec<&Rc<Conversation>> = home.chats.iter().filter(|c| c.starred || c.pin.is_some()).collect();
+    let mut pinned_channels: Vec<Rc<Conversation>> = spaces
+        .iter()
+        .filter(|s| s.key.network == Network::Teams)
+        .flat_map(|team| channels(&team.key))
+        .filter(|c| c.pin.is_some())
+        .collect();
+    pinned_channels.sort_by_key(|c| c.pin.unwrap_or(i32::MAX));
+    if !pinned_chats.is_empty() || !pinned_channels.is_empty() {
         header(&mut out, "Pinned");
-        out.extend(pinned.iter().map(|c| Item::Chat(Rc::clone(c))));
+        out.extend(pinned_chats.iter().map(|c| Item::Chat(Rc::clone(c))));
+        out.extend(pinned_channels.into_iter().map(Item::Channel));
     }
     let rest: Vec<&Rc<Conversation>> = home.chats.iter().filter(|c| !(c.starred || c.pin.is_some())).collect();
     let quiet_meeting = |c: &Conversation| c.meeting && now - c.updated > MEETING_QUIET && c.badge() == Badge::None && open != Some(&c.key);
