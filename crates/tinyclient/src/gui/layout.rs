@@ -1216,7 +1216,8 @@ impl Shell {
         }
         if close {
             let closed = key.clone();
-            items.push(act("row-close", "icons/x.svg", "Close conversation".into(), Box::new(move |this, cx| this.close_direct(closed.clone(), cx))));
+            let words = if network == Network::Teams { "Hide chat" } else { "Close conversation" };
+            items.push(act("row-close", "icons/x.svg", words.into(), Box::new(move |this, cx| this.close_direct(closed.clone(), cx))));
         }
         if clear {
             let cleared = row.clone();

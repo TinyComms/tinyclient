@@ -642,8 +642,8 @@ impl Teams {
             return Ok(());
         }
         // A chat the user hid comes back with a new message, as it does in Teams.
-        if self.ctx.known(place)?.is_some_and(|row| row.hidden) {
-            let filing = crate::store::Filing { hidden: false, ..crate::store::Filing::default() };
+        if let Some(row) = self.ctx.known(place)?.filter(|row| row.hidden) {
+            let filing = crate::store::Filing { hidden: false, pin: row.pin, ..crate::store::Filing::default() };
             self.ctx.filing(place, &filing)?;
         }
         let Some(root) = root.filter(|root| *root != message.id) else {

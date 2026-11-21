@@ -645,14 +645,18 @@ pub fn person_menu(person: &Person, seen: &Seen, alt: bool, pane: bool) -> Vec<I
     tidy(items)
 }
 
-/// A direct conversation whose account serves `CloseDirect` (Discord, Messages).
+/// A conversation whose account serves `CloseDirect` (Discord, Messages, Teams chats).
 pub fn can_close_direct(conversation: &Conversation, can: &protocol::Capabilities) -> bool {
-    conversation.kind == ConversationKind::Direct && can.close_direct
+    can.close_direct
+        && (conversation.kind == ConversationKind::Direct
+            || (conversation.key.network == Network::Teams && conversation.space.is_none()))
 }
 
-/// A conversation whose account serves `ClearHistory` (Telegram) and is not read-only.
+/// A conversation whose account serves `ClearHistory` (Telegram, Teams chats) and is not read-only.
 pub fn can_clear_history(conversation: &Conversation, can: &protocol::Capabilities) -> bool {
-    can.clear_history && !conversation.read_only
+    can.clear_history
+        && !conversation.read_only
+        && !(conversation.key.network == Network::Teams && conversation.space.is_some())
 }
 
 /// A conversation whose account lets the user pin/unpin it on the network (`Request::File`).

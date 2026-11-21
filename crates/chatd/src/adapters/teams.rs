@@ -323,6 +323,8 @@ struct State {
     away: HashMap<String, (String, Option<i64>)>,
     /// Subject and inline image HTML remembered for our own messages so edits keep them.
     own_meta: HashMap<(String, String), message::OwnMeta>,
+    /// Chat ids pinned in Teams, in Teams' own order.
+    pinned_chats: Vec<String>,
 }
 
 /// What a call presents.
@@ -888,6 +890,9 @@ impl Teams {
             delete: true,
             threads: true,
             pins: false,
+            pin_chats: 15,
+            close_direct: true,
+            clear_history: true,
             forward: false,
             reactions: true,
             mention_format: protocol::MentionFormat::Teams,
@@ -963,6 +968,15 @@ impl Teams {
             }
             Command::Leave { conversation_id, reply } => {
                 let _ = reply.send(self.leave(&conversation_id).map_err(refuse));
+            }
+            Command::File { conversation_id, pinned, archived: _, folder_add: _, folder_remove: _, reply } => {
+                let _ = reply.send(self.file_chat(&conversation_id, pinned).map_err(refuse));
+            }
+            Command::CloseDirect { conversation_id, reply } => {
+                let _ = reply.send(self.hide_chat(&conversation_id).map_err(refuse));
+            }
+            Command::ClearHistory { conversation_id, delete_chat, revoke: _, reply } => {
+                let _ = reply.send(self.delete_chat(&conversation_id, delete_chat).map_err(refuse));
             }
             Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
                 self.send_with(&conversation_id, &client_id, &text, reply_to.as_deref(), *with);

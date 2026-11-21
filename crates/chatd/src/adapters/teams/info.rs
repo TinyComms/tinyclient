@@ -117,6 +117,93 @@ impl Teams {
         Ok(())
     }
 
+    /// Pins or unpins a Teams chat and updates local `Filing::pin`.
+    pub(super) fn file_chat(&self, conversation: &str, pinned: Option<bool>) -> Result<(), Fault> {
+        let Some(pin) = pinned else {
+            return Ok(());
+        };
+        let thread = thread_of(conversation);
+        if super::tree::is_channel(thread) || thread.starts_with("48:") {
+            return Err(Fault::Refused {
+                status: 400,
+                message: "Only Teams chats can be pinned here.".to_owned(),
+            });
+        }
+        let path = format!("/v1/users/ME/conversations/{}/properties?name=pinned", escaped(thread));
+        self.chat("PUT", &path, Body::Json(&json!({"pinned": if pin { "true" } else { "false" }})), false)?;
+        let pin_pos = {
+            let mut state = self.state();
+            if pin {
+                if let Some(pos) = state.pinned_chats.iter().position(|id| id == thread) {
+                    Some(pos as i32)
+                } else {
+                    if state.pinned_chats.len() >= 15 {
+                        return Err(Fault::Refused {
+                            status: 400,
+                            message: "Teams allows at most 15 pinned chats.".to_owned(),
+                        });
+                    }
+                    state.pinned_chats.push(thread.to_owned());
+                    Some((state.pinned_chats.len() - 1) as i32)
+                }
+            } else {
+                state.pinned_chats.retain(|id| id != thread);
+                None
+            }
+        };
+        let existing = self.ctx.known(thread)?;
+        let filing = crate::store::Filing {
+            hidden: existing.as_ref().is_some_and(|row| row.hidden),
+            pin: pin_pos,
+            ..crate::store::Filing::default()
+        };
+        self.ctx.filing(thread, &filing)?;
+        Ok(())
+    }
+
+    /// Hides a Teams chat (`properties?name=hidden`) until a new message arrives.
+    pub(super) fn hide_chat(&self, conversation: &str) -> Result<(), Fault> {
+        let thread = thread_of(conversation);
+        if super::tree::is_channel(thread) || thread.starts_with("48:") {
+            return Err(Fault::Refused {
+                status: 400,
+                message: "Only Teams chats can be hidden here.".to_owned(),
+            });
+        }
+        let path = format!("/v1/users/ME/conversations/{}/properties?name=hidden", escaped(thread));
+        self.chat("PUT", &path, Body::Json(&json!({"hidden": "true"})), false)?;
+        let existing = self.ctx.known(thread)?;
+        let filing = crate::store::Filing {
+            hidden: true,
+            pin: existing.as_ref().and_then(|row| row.pin),
+            ..crate::store::Filing::default()
+        };
+        self.ctx.filing(thread, &filing)?;
+        Ok(())
+    }
+
+    /// Deletes a Teams chat for the current user only and removes it from the local store.
+    pub(super) fn delete_chat(&self, conversation: &str, delete_chat: bool) -> Result<(), Fault> {
+        let thread = thread_of(conversation);
+        if super::tree::is_channel(thread) || thread.starts_with("48:") {
+            return Err(Fault::Refused {
+                status: 400,
+                message: "Teams channels cannot be deleted here.".to_owned(),
+            });
+        }
+        if !delete_chat {
+            return Err(Fault::Refused {
+                status: 400,
+                message: "Teams only supports deleting the entire chat for yourself.".to_owned(),
+            });
+        }
+        let path = format!("/v1/users/ME/conversations/{}", escaped(thread));
+        self.chat("DELETE", &path, Body::None, false)?;
+        self.state().pinned_chats.retain(|id| id != thread);
+        self.ctx.conversation_gone(thread)?;
+        Ok(())
+    }
+
     /// After a chat's newest page: when my message is the newest, whether everyone else has
     /// read up to it, from their read markers. Not for channels, nor for large chats.
     pub(super) fn seen_by(&self, conversation: &str) -> Result<(), Fault> {

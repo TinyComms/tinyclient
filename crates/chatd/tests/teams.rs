@@ -453,6 +453,7 @@ impl Fake {
             }
             ("POST", "messages") => self.post(call, conversation),
             ("PUT", "properties") => ok(json!({})),
+            ("DELETE", "") => ok(json!({})),
             ("PUT" | "DELETE", _) if tail.starts_with("messages/") => ok(json!({})),
             _ => answer("404 Not Found", json!({"errorCode": 404, "message": "not here"})),
         }
@@ -1685,4 +1686,75 @@ fn reply_to_my_channel_post_marks_chain_and_channel_unread_while_untouched_post_
         world.message(&deploys, &mine.id).filter(|post| post.thread.as_ref().is_some_and(|thread| thread.unread == 0))
     });
     assert_eq!(read_post.thread.unwrap().unread, 0);
+}
+
+#[test]
+fn chat_pin_hide_and_delete_sync_with_teams() {
+    let world = World::start();
+    world.ready();
+
+    // Capabilities advertise chat pinning, hiding (close_direct), and deleting (clear_history).
+    let caps = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key.account == HOME).unwrap().can,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert!(caps.pin_chats > 0 && caps.close_direct && caps.clear_history);
+
+    let grp1 = key("19:grp1@thread.v2");
+    let grp2 = key("19:grp2@thread.v2");
+    assert_eq!(world.conversation(&grp1).unwrap().pin, None);
+
+    // Pin grp1 and grp2 in order.
+    assert_eq!(
+        world.ask(Request::File { conversation: grp1.clone(), pinned: Some(true), archived: None, folder_add: None, folder_remove: None }),
+        Response::Ok
+    );
+    let pinned_call = world.fake.calls("PUT", "19:grp1@thread.v2/properties").pop().unwrap();
+    assert_eq!((pinned_call.query.as_str(), pinned_call.json()), ("name=pinned", json!({"pinned": "true"})));
+    assert_eq!(world.conversation(&grp1).unwrap().pin, Some(0));
+
+    assert_eq!(
+        world.ask(Request::File { conversation: grp2.clone(), pinned: Some(true), archived: None, folder_add: None, folder_remove: None }),
+        Response::Ok
+    );
+    assert_eq!(world.conversation(&grp2).unwrap().pin, Some(1));
+
+    // Unpin grp1.
+    assert_eq!(
+        world.ask(Request::File { conversation: grp1.clone(), pinned: Some(false), archived: None, folder_add: None, folder_remove: None }),
+        Response::Ok
+    );
+    let unpinned_call = world.fake.calls("PUT", "19:grp1@thread.v2/properties").pop().unwrap();
+    assert_eq!((unpinned_call.query.as_str(), unpinned_call.json()), ("name=pinned", json!({"pinned": "false"})));
+    assert_eq!(world.conversation(&grp1).unwrap().pin, None);
+
+    // Hide grp1 via CloseDirect; it becomes hidden and writes hidden=true.
+    assert_eq!(world.ask(Request::CloseDirect { conversation: grp1.clone() }), Response::Ok);
+    let hidden_call = world.fake.calls("PUT", "19:grp1@thread.v2/properties").pop().unwrap();
+    assert_eq!((hidden_call.query.as_str(), hidden_call.json()), ("name=hidden", json!({"hidden": "true"})));
+    assert!(world.conversation(&grp1).unwrap().hidden);
+
+    // A ConversationUpdate from another device unhides grp1 and pins it.
+    world.fake.push(
+        "ConversationUpdate",
+        json!({"id": "19:grp1@thread.v2", "properties": {"hidden": "false", "pinned": "true"}}),
+        false,
+    );
+    world.until("grp1 unhidden and pinned by push", || {
+        world.conversation(&grp1).filter(|row| !row.hidden && row.pin.is_some())
+    });
+
+    // Delete grp1 for me only via ClearHistory { delete_chat: true }.
+    assert_eq!(
+        world.ask(Request::ClearHistory { conversation: grp1.clone(), delete_chat: true, revoke: false }),
+        Response::Ok
+    );
+    assert!(!world.fake.calls("DELETE", "19:grp1@thread.v2").is_empty());
+    assert!(world.conversation(&grp1).is_none());
+
+    // Channels cannot be deleted as chats.
+    assert!(matches!(
+        world.ask(Request::ClearHistory { conversation: key(GENERAL), delete_chat: true, revoke: false }),
+        Response::Error { .. }
+    ));
 }

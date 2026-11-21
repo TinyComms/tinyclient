@@ -216,14 +216,52 @@ impl Teams {
         self.report(handled.map_err(Failure::from));
     }
 
-    /// `ConversationUpdate`: the read marker moved on another device. Unverified: no client
-    /// read handles it; the shape is the conversation object the read marker is written to.
+    /// `ConversationUpdate`: the read marker or conversation properties (hidden, pinned) changed
+    /// on another device.
     fn read_elsewhere(&self, conversation: &Value) -> Result<(), Fault> {
-        let horizon = conversation["properties"]["consumptionhorizon"].as_str().and_then(|horizon| horizon.split(';').next());
-        let (Some(id), Some(read)) = (conversation["id"].as_str(), horizon.filter(|read| super::millis(read) > 0)) else {
+        let Some(id) = conversation["id"].as_str() else {
             return Ok(());
         };
         let Some(row) = self.ctx.known(id)? else {
+            return Ok(());
+        };
+        let props = &conversation["properties"];
+        let parse_flag = |val: &Value| -> Option<bool> {
+            match val {
+                Value::Bool(b) => Some(*b),
+                Value::String(s) if s.eq_ignore_ascii_case("true") => Some(true),
+                Value::String(s) if s.eq_ignore_ascii_case("false") => Some(false),
+                _ => None,
+            }
+        };
+        let hidden_upd = parse_flag(&props["hidden"]);
+        let pinned_upd = parse_flag(&props["pinned"]);
+        if hidden_upd.is_some() || pinned_upd.is_some() {
+            let pin = match pinned_upd {
+                Some(true) => {
+                    let mut state = self.state();
+                    if let Some(pos) = state.pinned_chats.iter().position(|p| p == id) {
+                        Some(pos as i32)
+                    } else {
+                        state.pinned_chats.push(id.to_owned());
+                        Some((state.pinned_chats.len() - 1) as i32)
+                    }
+                }
+                Some(false) => {
+                    self.state().pinned_chats.retain(|p| p != id);
+                    None
+                }
+                None => row.pin,
+            };
+            let filing = crate::store::Filing {
+                hidden: hidden_upd.unwrap_or(row.hidden),
+                pin,
+                ..crate::store::Filing::default()
+            };
+            self.ctx.filing(id, &filing)?;
+        }
+        let horizon = props["consumptionhorizon"].as_str().and_then(|horizon| horizon.split(';').next());
+        let Some(read) = horizon.filter(|read| super::millis(read) > 0) else {
             return Ok(());
         };
         let newest = match conversation["lastMessage"]["id"].as_str() {
