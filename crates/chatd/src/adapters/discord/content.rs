@@ -906,6 +906,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
             name: who,
             avatar: Some(avatar),
             bot: author.bot || posted.webhook_id.is_some(),
+            ..Sender::default()
         },
         sent,
         seq: 0,

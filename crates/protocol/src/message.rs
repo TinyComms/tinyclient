@@ -412,6 +412,15 @@ pub struct Sender {
     pub avatar: Option<MediaFile>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub bot: bool,
+    /// Highest coloured role's RGB (`0xRRGGBB`) in this Space (Discord).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_color: Option<u32>,
+    /// Highest role icon image in this Space (Discord).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_icon: Option<MediaFile>,
+    /// Highest role unicode emoji badge in this Space (Discord).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_emoji: Option<String>,
 }
 
 /// One person a message was sent to, and what their phone has said about it. Times are

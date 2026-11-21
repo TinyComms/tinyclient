@@ -1297,11 +1297,23 @@ impl Pane {
                             .type_body()
                             .when(phone, |name| name.text_size(px(tokens_phone::scaled(15.))).line_height(px(tokens_phone::scaled(20.))))
                             .font_weight(theme::SEMIBOLD)
+                            .when_some(message.sender.role_color, |name, color| name.text_color(theme::role_color(color)))
                             .child(name),
                         "author-name",
                         message,
                         cx,
                     ))
+                    .children(message.sender.role_icon.as_ref().and_then(|f| f.path.as_deref()).filter(|p| !p.is_empty()).map(|path| {
+                        gpui::img(std::path::PathBuf::from(path))
+                            .size(px(14.))
+                            .rounded(px(3.))
+                            .flex_none()
+                    }))
+                    .children(message.sender.role_icon.is_none().then(|| {
+                        message.sender.role_emoji.as_deref().filter(|e| !e.is_empty()).map(|emoji| {
+                            div().flex_none().text_size(px(13.)).line_height(px(14.)).child(emoji.to_owned())
+                        })
+                    }).flatten())
                     .child(
                         div()
                             .flex_none()
