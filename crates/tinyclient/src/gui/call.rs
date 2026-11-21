@@ -296,6 +296,47 @@ pub struct State {
     /// `(conversation, peer_id)` that `call_auto_watch` already asked to watch, so we ask once
     /// per start and respect a manual "Stop watching" until the peer stops and starts again.
     pub(in crate::gui) auto_watch: Option<(Key, String)>,
+    /// The Discord participant whose camera we last asked mediad to paint (`MediaRequest::Speaker`),
+    /// and when we switched to them (for 800 ms speaker debounce).
+    pub(in crate::gui) discord_speaker: Option<(String, Instant)>,
+}
+
+const DISCORD_SPEAKER_DEBOUNCE: Duration = Duration::from_millis(800);
+
+/// Pure camera-speaker selection for Discord calls (where the shell names whose camera to paint).
+/// Returns `Some(Some(id))` to switch camera speaker, `Some(None)` to clear, or `None` for no change.
+fn discord_speaker_step(
+    call: &Call,
+    focused: Option<&str>,
+    current: Option<(&str, Instant)>,
+    now: Instant,
+) -> Option<Option<String>> {
+    if call.state != CallState::Joined || call.conversation.network != Network::Discord {
+        return None;
+    }
+    let cur_id = current.map(|(id, _)| id);
+    let cur_still_camera = cur_id.is_some_and(|id| call.participants.iter().any(|p| p.id == id && p.camera));
+    let target = if let Some(foc) = focused.filter(|id| call.participants.iter().any(|p| p.id == *id && p.camera)) {
+        Some(foc)
+    } else if let Some(speaker) = call.participants.iter().find(|p| p.camera && p.speaking) {
+        if cur_id == Some(speaker.id.as_str()) {
+            return None;
+        }
+        if cur_still_camera && current.is_some_and(|(_, at)| now.saturating_duration_since(at) < DISCORD_SPEAKER_DEBOUNCE) {
+            return None;
+        }
+        Some(speaker.id.as_str())
+    } else if cur_still_camera {
+        return None;
+    } else {
+        call.participants.iter().find(|p| p.camera).map(|p| p.id.as_str())
+    };
+    match target {
+        Some(id) if cur_id == Some(id) => None,
+        Some(id) => Some(Some(id.to_owned())),
+        None if cur_id.is_some() => Some(None),
+        None => None,
+    }
 }
 
 /// A decode of this person was asked for, or their picture is on screen.
@@ -674,6 +715,7 @@ impl Shell {
                 state.metering = None;
                 state.cued = None;
                 state.auto_watch = None;
+                state.discord_speaker = None;
                 // A call that was up and went without our asking: the other side ended it.
                 let was = state.was.take();
                 if let Some(was) = was.filter(|_| !std::mem::take(&mut state.leaving)) {
@@ -705,6 +747,7 @@ impl Shell {
                 self.call_watch_muted_talk(call, cx);
                 self.call_cue_join(call, cx);
                 self.call_auto_watch(call, cx);
+                self.call_discord_speaker(call, cx);
                 if !in_call(call) {
                     // Ringing, connecting or failed: not a call that can end.
                     self.call_state.was = None;
@@ -1132,6 +1175,17 @@ impl Shell {
         let is_room = self.tiny_room(&call.conversation).is_some();
         if let Some(source) = auto_watch_step(call, is_room, &mut self.call_state.auto_watch) {
             self.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source }), cx);
+        }
+    }
+
+    /// For a joined Discord call, tell mediad whose camera to paint (`MediaRequest::Speaker`),
+    /// debouncing active-speaker switches by 800 ms.
+    fn call_discord_speaker(&mut self, call: &Call, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let current = self.call_state.discord_speaker.as_ref().map(|(id, at)| (id.as_str(), *at));
+        if let Some(next) = discord_speaker_step(call, None, current, now) {
+            self.call_state.discord_speaker = next.clone().map(|id| (id, now));
+            self.call_ask(Request::Media(protocol::MediaRequest::Speaker { source: next }), cx);
         }
     }
 
@@ -2081,5 +2135,33 @@ mod tests {
         // When peer turns on camera, auto-watch triggers again.
         call.participants[0].camera = true;
         assert_eq!(auto_watch_step(&call, false, &mut prev), Some(Some("peer-1".into())));
+    }
+
+    #[test]
+    fn discord_speaker_picks_focused_then_debounced_speaker_then_first_camera_and_clears() {
+        let mut call: Call = serde_json::from_value(serde_json::json!({
+            "conversation": { "network": "discord", "account": "acc", "id": "vc-1" },
+            "state": "joined",
+            "participants": [
+                { "id": "u1", "name": "Ada", "camera": true, "speaking": false },
+                { "id": "u2", "name": "Bea", "camera": true, "speaking": true }
+            ],
+            "muted": false, "deafened": false, "joined": 1, "engine_linked": true, "video": []
+        })).unwrap();
+        let t0 = Instant::now();
+        // Focused person with camera wins immediately.
+        assert_eq!(discord_speaker_step(&call, Some("u1"), None, t0), Some(Some("u1".into())));
+        // Otherwise speaking person with camera wins.
+        assert_eq!(discord_speaker_step(&call, None, None, t0), Some(Some("u2".into())));
+        // Switching speakers within 800 ms is debounced while current still has camera.
+        call.participants[0].speaking = true;
+        call.participants[1].speaking = false;
+        assert_eq!(discord_speaker_step(&call, None, Some(("u2", t0)), t0 + Duration::from_millis(300)), None);
+        // After 800 ms, switches to new speaker.
+        assert_eq!(discord_speaker_step(&call, None, Some(("u2", t0)), t0 + Duration::from_millis(900)), Some(Some("u1".into())));
+        // When nobody has camera on, clears speaker to None.
+        call.participants[0].camera = false;
+        call.participants[1].camera = false;
+        assert_eq!(discord_speaker_step(&call, None, Some(("u1", t0)), t0 + Duration::from_secs(2)), Some(None));
     }
 }

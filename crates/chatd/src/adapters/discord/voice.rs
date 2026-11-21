@@ -175,7 +175,8 @@ pub struct Heard {
     name: String,
     muted: bool,
     deafened: bool,
-    streaming: bool,
+    camera: bool,
+    sharing: bool,
     /// On a stage's platform (`suppress` false there): who the channel hears. A voice
     /// channel's states never have it true, whatever `suppress` says there.
     live: bool,
@@ -329,6 +330,8 @@ impl Discord {
                     speaking: false,
                     muted: heard.muted,
                     deafened: heard.deafened,
+                    camera: heard.camera,
+                    sharing: heard.sharing,
                     ..Participant::default()
                 })
                 .collect();
@@ -383,7 +386,7 @@ impl Discord {
                     name: heard.name.clone(),
                     muted: heard.muted,
                     deafened: heard.deafened,
-                    streaming: heard.streaming,
+                    streaming: heard.sharing || heard.camera,
                     speaking: heard.live,
                 });
                 let people: Vec<Occupant> = people.collect();
@@ -472,7 +475,8 @@ impl Discord {
                     name: named.or(before.map(|before| before.name)).or(me).unwrap_or_default(),
                     muted: voice.self_mute || voice.mute,
                     deafened: voice.self_deaf || voice.deaf,
-                    streaming: voice.self_stream || voice.self_video,
+                    camera: voice.self_video,
+                    sharing: voice.self_stream,
                     live: stages.contains(channel.as_str()) && !voice.suppress,
                 };
                 changed.insert(channel.clone());
@@ -1313,5 +1317,22 @@ mod tests {
         assert_eq!(stream_key(None, "3001", "111"), "call:3001:111");
         assert!(owned_by("guild:81:900:111", "111"));
         assert!(!owned_by("call:3001:222", "111"));
+    }
+
+    #[test]
+    fn heard_keeps_camera_and_sharing_separate() {
+        let cam_only = Heard {
+            guild: Some("g".into()),
+            channel: "c".into(),
+            name: "Ada".into(),
+            muted: false,
+            deafened: false,
+            camera: true,
+            sharing: false,
+            live: false,
+        };
+        let share_only = Heard { camera: false, sharing: true, ..cam_only };
+        assert!(!share_only.camera && share_only.sharing);
+        assert!(share_only.sharing || share_only.camera);
     }
 }
