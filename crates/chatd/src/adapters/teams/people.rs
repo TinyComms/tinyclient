@@ -37,6 +37,68 @@ pub(super) struct Known {
     pub guest: bool,
 }
 
+/// Extracts the Entra object id from a Teams user MRI (`8:orgid:<oid>`).
+pub(super) fn oid_of(mri: &str) -> Option<&str> {
+    let oid = mri.strip_prefix("8:orgid:")?;
+    (!oid.is_empty() && !oid.contains(['/', '?', '#', ' '])).then_some(oid)
+}
+
+/// Maps common Microsoft Windows and IANA timezone names (plus `UTC±H[:MM]`) to standard UTC
+/// offsets in seconds east of UTC, so a colleague's local time can be drawn on their card.
+pub(super) fn timezone_offset_secs(tz: &str) -> Option<i32> {
+    let trimmed = tz.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix("UTC").or_else(|| trimmed.strip_prefix("GMT")) {
+        if rest.is_empty() {
+            return Some(0);
+        }
+        let sign = match rest.as_bytes().first() {
+            Some(b'+') => 1,
+            Some(b'-') => -1,
+            _ => 0,
+        };
+        if sign != 0 {
+            let digits = &rest[1..];
+            let (h, m) = match digits.split_once(':') {
+                Some((h, m)) => (h.parse::<i32>().ok()?, m.parse::<i32>().ok()?),
+                None => (digits.parse::<i32>().ok()?, 0),
+            };
+            if h <= 14 && m < 60 {
+                return Some(sign * (h * 3600 + m * 60));
+            }
+        }
+    }
+    let hours = match trimmed {
+        "UTC" | "Etc/UTC" | "GMT Standard Time" | "Greenwich Standard Time" | "Europe/London" | "Europe/Lisbon" | "Europe/Dublin" | "Atlantic/Reykjavik" => 0.0,
+        "W. Europe Standard Time" | "Central Europe Standard Time" | "Central European Standard Time" | "Romance Standard Time"
+        | "Europe/Berlin" | "Europe/Paris" | "Europe/Madrid" | "Europe/Rome" | "Europe/Amsterdam" | "Europe/Zurich" | "Europe/Stockholm" | "Europe/Warsaw" => 1.0,
+        "E. Europe Standard Time" | "FLE Standard Time" | "GTB Standard Time" | "Israel Standard Time" | "South Africa Standard Time"
+        | "Europe/Helsinki" | "Europe/Athens" | "Europe/Bucharest" | "Asia/Jerusalem" | "Africa/Johannesburg" => 2.0,
+        "Turkey Standard Time" | "Arab Standard Time" | "Russian Standard Time" | "Europe/Istanbul" | "Europe/Moscow" | "Asia/Riyadh" => 3.0,
+        "Arabian Standard Time" | "Asia/Dubai" => 4.0,
+        "Pakistan Standard Time" | "Asia/Karachi" => 5.0,
+        "India Standard Time" | "Asia/Kolkata" | "Asia/Calcutta" => 5.5,
+        "SE Asia Standard Time" | "Asia/Bangkok" | "Asia/Jakarta" => 7.0,
+        "China Standard Time" | "Singapore Standard Time" | "Taipei Standard Time" | "W. Australia Standard Time"
+        | "Asia/Shanghai" | "Asia/Hong_Kong" | "Asia/Singapore" | "Asia/Taipei" | "Australia/Perth" => 8.0,
+        "Tokyo Standard Time" | "Korea Standard Time" | "Asia/Tokyo" | "Asia/Seoul" => 9.0,
+        "AUS Eastern Standard Time" | "E. Australia Standard Time" | "Australia/Sydney" | "Australia/Melbourne" | "Australia/Brisbane" => 10.0,
+        "New Zealand Standard Time" | "Pacific/Auckland" => 12.0,
+        "Hawaiian Standard Time" | "Pacific/Honolulu" => -10.0,
+        "Alaskan Standard Time" | "America/Anchorage" => -9.0,
+        "Pacific Standard Time" | "America/Los_Angeles" | "America/Vancouver" => -8.0,
+        "Mountain Standard Time" | "US Mountain Standard Time" | "America/Denver" | "America/Phoenix" => -7.0,
+        "Central Standard Time" | "Central Standard Time (Mexico)" | "America/Chicago" | "America/Mexico_City" => -6.0,
+        "Eastern Standard Time" | "US Eastern Standard Time" | "America/New_York" | "America/Toronto" => -5.0,
+        "Atlantic Standard Time" | "America/Halifax" => -4.0,
+        "E. South America Standard Time" | "Argentina Standard Time" | "America/Sao_Paulo" | "America/Argentina/Buenos_Aires" => -3.0,
+        _ => return None,
+    };
+    Some((hours * 3600.0) as i32)
+}
+
 /// Extracts an active out-of-office `(message, until_unix)` from a Teams unified presence
 /// payload. Checks both `outOfOfficeNote` (legacy / web presence) and `outOfOfficeSettings`
 /// (Graph / unified presence), as well as `calendarData.isOutOfOffice` and `activity == "OutOfOffice"`.
@@ -505,22 +567,195 @@ impl Teams {
         }
     }
 
-    /// One person's card: what their organization says of them.
+    /// Forces a fresh profile picture fetch the next time the avatar is requested (Teams keeps
+    /// the same URL even after someone changes their photo).
+    fn refresh_picture(&self, person: &str, name: &str) {
+        if !person.starts_with("8:") {
+            return;
+        }
+        let id = format!("avatar:{person}");
+        self.ctx.media_evict(&id);
+        self.state().noted.remove(&id);
+        let _ = self.picture(person, name);
+    }
+
+    /// Learns a Microsoft Graph user object (`manager` or `directReports` entry) into the local
+    /// store so clicking them in the org chart opens their card cleanly.
+    fn learn_graph_person(&self, user: &Value) -> Option<protocol::ProfilePerson> {
+        let oid = user["id"].as_str().filter(|s| !s.is_empty())?;
+        let mri = format!("8:orgid:{oid}");
+        let name = user["displayName"].as_str().unwrap_or("").trim().to_owned();
+        if name.is_empty() {
+            return None;
+        }
+        let title = user["jobTitle"].as_str().unwrap_or("").trim().to_owned();
+        let mail = user["mail"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .or_else(|| user["userPrincipalName"].as_str())
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        let department = user["department"].as_str().unwrap_or("").trim().to_owned();
+        let known = Known {
+            name: name.clone(),
+            mail,
+            title: title.clone(),
+            department,
+            bot: false,
+            guest: user["userType"].as_str().is_some_and(|k| k.eq_ignore_ascii_case("guest")),
+        };
+        let row = self.row(&mri, &known);
+        let _ = self.ctx.people(&[row]);
+        let _ = self.ctx.details(&[(
+            mri.clone(),
+            PersonDetails { title: known.title.clone(), mark: known.guest.then_some(Mark::Guest), ..PersonDetails::default() },
+        )]);
+        self.ctx.set_note(&format!("u:{mri}"), &serde_json::to_string(&known).unwrap_or_default());
+        self.state().people.insert(mri.clone(), known);
+        Some(protocol::ProfilePerson {
+            key: self.ctx.key(&mri),
+            name,
+            title,
+        })
+    }
+
+    /// One person's card: what their organization says of them, enriched from Microsoft Graph
+    /// (phones, office, pronouns, local time, manager, direct reports) with graceful fallback
+    /// for guests and tenants where Graph user/org calls are restricted.
     pub(super) fn profile(&self, person: &str) -> Result<About, Fault> {
         let path = "/beta/users/fetchShortProfile?isMailAddress=false&canBeSmtpAddress=false&enableGuest=true\
                     &includeIBBarredUsers=true&skypeTeamsInfo=true&includeBots=true";
         let found = self.middle(path, Body::Json(&json!([person])))?;
-        let learned = self.learn(Teams::listed(&found));
+        let short_entries = Teams::listed(&found);
+        let raw_short = short_entries.iter().find(|u| u["mri"].as_str() == Some(person));
+        let learned = self.learn(short_entries);
         let known = learned.into_iter().find(|(id, _)| id == person).map(|(_, known)| known).or_else(|| self.cached(person));
-        let known = known.unwrap_or_default();
+        let mut known = known.unwrap_or_default();
+        self.refresh_picture(person, &known.name);
         self.fetch_presence_for(&[person.to_owned()]);
         let (away, away_until) = self.away_of(person);
+
+        let mut office = raw_short
+            .and_then(|u| u["userLocation"].as_str().or_else(|| u["officeLocation"].as_str()))
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        let mut pronouns = raw_short
+            .and_then(|u| u["pronouns"].as_str())
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        let mut time_zone = String::new();
+        let mut phones: Vec<String> = Vec::new();
+        let mut push_phone = |raw: &str| {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() && !phones.iter().any(|p| p == trimmed) {
+                phones.push(trimmed.to_owned());
+            }
+        };
+        if let Some(u) = raw_short {
+            for field in ["telephoneNumber", "mobile", "phoneNumber"] {
+                if let Some(val) = u[field].as_str() {
+                    push_phone(val);
+                }
+            }
+        }
+
+        let mut manager = None;
+        let mut reports = Vec::new();
+        if let Some(oid) = oid_of(person) {
+            let user_url = format!(
+                "{}/v1.0/users/{}?$select=displayName,mail,userPrincipalName,jobTitle,department,officeLocation,businessPhones,mobilePhone,mailboxSettings,userType",
+                self.graph,
+                escaped(oid)
+            );
+            if let Ok(answer) = self.call("GET", &user_url, Auth::Bearer(GRAPH), Body::None, true) {
+                let u = &answer.body;
+                if let Some(v) = u["jobTitle"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    if known.title.is_empty() {
+                        known.title = v.to_owned();
+                    }
+                }
+                if let Some(v) = u["department"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    if known.department.is_empty() {
+                        known.department = v.to_owned();
+                    }
+                }
+                if let Some(v) = u["mail"].as_str().or_else(|| u["userPrincipalName"].as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                    if known.mail.is_empty() {
+                        known.mail = v.to_owned();
+                    }
+                }
+                if let Some(v) = u["officeLocation"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    office = v.to_owned();
+                }
+                if let Some(v) = u["pronouns"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    pronouns = v.to_owned();
+                }
+                if let Some(arr) = u["businessPhones"].as_array() {
+                    for p in arr.iter().filter_map(Value::as_str) {
+                        push_phone(p);
+                    }
+                }
+                if let Some(p) = u["mobilePhone"].as_str() {
+                    push_phone(p);
+                }
+                if let Some(tz) = u["mailboxSettings"]["timeZone"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    time_zone = tz.to_owned();
+                }
+            }
+            let mgr_url = format!(
+                "{}/v1.0/users/{}/manager?$select=id,displayName,jobTitle,mail,userPrincipalName,department",
+                self.graph,
+                escaped(oid)
+            );
+            if let Ok(answer) = self.call("GET", &mgr_url, Auth::Bearer(GRAPH), Body::None, true) {
+                manager = self.learn_graph_person(&answer.body);
+            }
+            let rep_url = format!(
+                "{}/v1.0/users/{}/directReports?$top=10&$select=id,displayName,jobTitle,mail,userPrincipalName,department",
+                self.graph,
+                escaped(oid)
+            );
+            if let Ok(answer) = self.call("GET", &rep_url, Auth::Bearer(GRAPH), Body::None, true) {
+                for entry in answer.body["value"].as_array().into_iter().flatten().take(10) {
+                    if let Some(rp) = self.learn_graph_person(entry) {
+                        reports.push(rp);
+                    }
+                }
+            }
+        }
+
+        let utc_offset = timezone_offset_secs(&time_zone);
+        if utc_offset.is_some() || !known.title.is_empty() {
+            let mark = known.guest.then_some(Mark::Guest);
+            let _ = self.ctx.details(&[(
+                person.to_owned(),
+                PersonDetails { title: known.title.clone(), mark, utc_offset },
+            )]);
+        }
+
+        let mut contacts = Vec::new();
+        if !known.mail.is_empty() {
+            contacts.push(Contact { kind: ContactKind::Email, value: known.mail, masked: false });
+        }
+        for phone in phones {
+            contacts.push(Contact { kind: ContactKind::Phone, value: phone, masked: true });
+        }
+
         Ok(About {
             title: known.title,
             department: known.department,
-            contacts: Some(known.mail).filter(|mail| !mail.is_empty()).map(|value| Contact { kind: ContactKind::Email, value, masked: false }).into_iter().collect(),
+            office,
+            pronouns,
+            time_zone,
+            utc_offset,
+            contacts,
             away,
             away_until,
+            manager,
+            reports,
             ..About::default()
         })
     }
@@ -757,5 +992,19 @@ mod tests {
         assert_eq!(parsed.external_message, "External reply");
         assert_eq!(parsed.start, Some(1_792_396_800));
         assert_eq!(parsed.end, Some(1_792_774_800));
+    }
+
+    #[test]
+    fn oid_and_timezone_offsets_are_parsed_for_windows_and_iana_names() {
+        assert_eq!(oid_of("8:orgid:00000000-0000-4000-8000-0000000000a1"), Some("00000000-0000-4000-8000-0000000000a1"));
+        assert_eq!(oid_of("28:bot-id"), None);
+        assert_eq!(oid_of("8:orgid:bad/path"), None);
+        assert_eq!(timezone_offset_secs("GMT Standard Time"), Some(0));
+        assert_eq!(timezone_offset_secs("Eastern Standard Time"), Some(-5 * 3600));
+        assert_eq!(timezone_offset_secs("India Standard Time"), Some(5 * 3600 + 1800));
+        assert_eq!(timezone_offset_secs("Europe/Berlin"), Some(3600));
+        assert_eq!(timezone_offset_secs("UTC+05:30"), Some(5 * 3600 + 1800));
+        assert_eq!(timezone_offset_secs("UTC-8"), Some(-8 * 3600));
+        assert_eq!(timezone_offset_secs("Mars/Olympus"), None);
     }
 }

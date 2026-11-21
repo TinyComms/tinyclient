@@ -37,6 +37,15 @@ fn yes() -> bool {
     true
 }
 
+/// A lightweight person reference on a profile (e.g. a Teams manager or direct report).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfilePerson {
+    pub key: Key,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+}
+
 /// Automatic replies / out-of-office settings for an account (`Request::GetOutOfOffice`, `Request::SetOutOfOffice`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutOfOffice {

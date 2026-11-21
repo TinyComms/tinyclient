@@ -519,8 +519,47 @@ impl Fake {
         answer("201 Created", json!({"OriginalArrivalTime": arrived}))
     }
 
-    /// Microsoft Graph: OneDrive chat uploads + per-member `/invite`, channel SharePoint `filesFolder`, and mailbox OOO.
+    /// Microsoft Graph: OneDrive chat uploads + per-member `/invite`, channel SharePoint `filesFolder`, mailbox OOO, and user org/profile.
     fn graph(&self, call: &Call, path: &str) -> Reply {
+        if call.method == "GET" && path == "/v1.0/users/00000000-0000-4000-8000-0000000000a1" {
+            return ok(json!({
+                "id": "00000000-0000-4000-8000-0000000000a1",
+                "displayName": "Ana Ruiz",
+                "mail": "ana@contoso.com",
+                "userPrincipalName": "ana@contoso.com",
+                "jobTitle": "Staff Engineer",
+                "department": "Platform",
+                "officeLocation": "Lisbon — Floor 4",
+                "pronouns": "she/her",
+                "businessPhones": ["+351 21 555 0100"],
+                "mobilePhone": "+351 91 555 0199",
+                "mailboxSettings": {"timeZone": "GMT Standard Time"},
+                "userType": "Member",
+            }));
+        }
+        if call.method == "GET" && path == "/v1.0/users/00000000-0000-4000-8000-0000000000a1/manager" {
+            return ok(json!({
+                "id": "00000000-0000-4000-8000-0000000000b2",
+                "displayName": "Ben Okafor",
+                "jobTitle": "SRE",
+                "mail": "ben@contoso.com",
+                "department": "Platform",
+            }));
+        }
+        if call.method == "GET" && path == "/v1.0/users/00000000-0000-4000-8000-0000000000a1/directReports" {
+            return ok(json!({
+                "value": [{
+                    "id": "00000000-0000-4000-8000-0000000000c3",
+                    "displayName": "Cy Tran",
+                    "jobTitle": "Designer",
+                    "mail": "cy@contoso.com",
+                    "department": "Design",
+                }]
+            }));
+        }
+        if call.method == "GET" && path.starts_with("/v1.0/users/00000000-0000-4000-8000-0000000000d4") {
+            return answer("403 Forbidden", json!({"error": {"code": "Authorization_RequestDenied"}}));
+        }
         if call.method == "GET" && path == "/v1.0/me/mailboxSettings/automaticRepliesSetting" {
             return ok(self.mailbox_ooo.lock().unwrap().clone());
         }
@@ -2612,5 +2651,41 @@ fn out_of_office_profile_fetches_presence_and_mailbox_settings_round_trip() {
         panic!("expected Response::OutOfOffice on re-read");
     };
     assert_eq!(reread, wanted);
+}
+
+#[test]
+fn rich_org_card_populates_phones_office_local_time_org_chart_and_refreshes_avatar() {
+    let world = World::start();
+    world.ready();
+
+    // 1. Ana's profile pulls Graph user details, manager, and direct reports.
+    let Response::Profile { profile } = world.ask(Request::Profile { person: key(ANA), space: None }) else {
+        panic!("expected Response::Profile for Ana");
+    };
+    assert_eq!(profile.office, "Lisbon — Floor 4");
+    assert_eq!(profile.pronouns, "she/her");
+    assert_eq!(profile.time_zone, "GMT Standard Time");
+    assert_eq!(profile.utc_offset, Some(0));
+    let phones: Vec<(&str, bool)> = profile
+        .contacts
+        .iter()
+        .filter(|c| c.kind == protocol::ContactKind::Phone)
+        .map(|c| (c.value.as_str(), c.masked))
+        .collect();
+    assert_eq!(phones, [("+351 21 555 0100", true), ("+351 91 555 0199", true)]);
+    let manager = profile.manager.as_ref().expect("manager populated");
+    assert_eq!(manager.key, key(BEN));
+    assert_eq!(manager.name, "Ben Okafor");
+    assert_eq!(profile.reports.len(), 1);
+    assert_eq!(profile.reports[0].key, key("8:orgid:00000000-0000-4000-8000-0000000000c3"));
+    assert_eq!(profile.reports[0].name, "Cy Tran");
+
+    // 2. Guest whose Graph user endpoint returns 403 still returns short-profile fields cleanly.
+    let Response::Profile { profile: dee } = world.ask(Request::Profile { person: key(DEE), space: None }) else {
+        panic!("expected Response::Profile for guest Dee");
+    };
+    assert_eq!(dee.title, "Product Manager");
+    assert_eq!(dee.office, "Lisbon");
+    assert!(dee.manager.is_none());
 }
 

@@ -268,7 +268,12 @@ pub fn handle_line(person: &Person, profile: Option<&Profile>) -> String {
     if person.key.network == Network::Teams || handle.is_empty() {
         let title = profile.map(|profile| profile.title.as_str()).filter(|title| !title.is_empty()).unwrap_or(&person.title);
         if person.key.network == Network::Teams {
-            return title.to_owned();
+            return match (title, pronouns) {
+                ("", "") => String::new(),
+                (t, "") => t.to_owned(),
+                ("", p) => p.to_owned(),
+                (t, p) => format!("{t} · {p}"),
+            };
         }
         return pronouns.to_owned();
     }

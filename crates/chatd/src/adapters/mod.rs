@@ -166,6 +166,9 @@ pub struct About {
     pub pronouns: String,
     pub title: String,
     pub department: String,
+    pub office: String,
+    pub manager: Option<protocol::ProfilePerson>,
+    pub reports: Vec<protocol::ProfilePerson>,
     /// Role names in that Space, colours left out.
     pub roles: Vec<String>,
     /// Email and phone; chatd masks phone numbers.
@@ -1856,6 +1859,12 @@ impl Context {
 
     pub fn set_note(&self, key: &str, value: &str) {
         let _ = self.hub.store().set_name(&self.account, key, value);
+    }
+
+    /// Marks a cached media file as evicted so the next fetch downloads a fresh copy (e.g. a
+    /// Teams profile picture whose URL never changes when the photo is updated).
+    pub fn media_evict(&self, id: &str) {
+        let _ = self.hub.store().media_evicted(&self.account, id);
     }
 }
 

@@ -4124,8 +4124,17 @@ fn typed_profile(person: Person, mut about: About) -> Profile {
         clip(label, 40);
         clip(value, 200);
     }
-    for text in [&mut about.nickname, &mut about.pronouns, &mut about.title, &mut about.department, &mut about.away] {
+    for text in [&mut about.nickname, &mut about.pronouns, &mut about.title, &mut about.department, &mut about.office, &mut about.away] {
         clip(text, 200);
+    }
+    if let Some(manager) = &mut about.manager {
+        clip(&mut manager.name, 100);
+        clip(&mut manager.title, 120);
+    }
+    about.reports.truncate(10);
+    for report in &mut about.reports {
+        clip(&mut report.name, 100);
+        clip(&mut report.title, 120);
     }
     clip(&mut about.bio, 1_000);
     clip(&mut about.note, 1_000);
@@ -4155,6 +4164,9 @@ fn typed_profile(person: Person, mut about: About) -> Profile {
     profile.pronouns = about.pronouns;
     profile.title = about.title;
     profile.department = about.department;
+    profile.office = about.office;
+    profile.manager = about.manager;
+    profile.reports = about.reports;
     profile.roles = about.roles;
     profile.contacts = about.contacts;
     profile.mutual_total = about.mutual_total;

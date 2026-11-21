@@ -841,6 +841,15 @@ pub struct Profile {
     pub title: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub department: String,
+    /// Office / work location (Teams / Graph `officeLocation`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub office: String,
+    /// Who this person reports to in their organization (Teams / Graph `/manager`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manager: Option<ProfilePerson>,
+    /// People who report directly to this person (Teams / Graph `/directReports`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reports: Vec<ProfilePerson>,
     /// Their roles in that Space, names only (colours are left out), at most [`PROFILE_ROLES`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<String>,
@@ -891,6 +900,9 @@ impl Profile {
             pronouns: String::new(),
             title: String::new(),
             department: String::new(),
+            office: String::new(),
+            manager: None,
+            reports: Vec::new(),
             roles: Vec::new(),
             contacts: Vec::new(),
             mutual_total: 0,
