@@ -107,6 +107,50 @@ fn summary(scene: &Scene) -> String {
     }
 }
 
+/// Quick-pick status emojis offered in the rich status editor.
+const STATUS_EMOJIS: [&str; 6] = ["📅", "🌴", "🤒", "🏠", "🚌", "💬"];
+
+/// Preset expiration choices for "Clear after" in the rich status editor.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ClearAfter {
+    #[default]
+    Never,
+    Minutes30,
+    Hour1,
+    Today,
+    ThisWeek,
+}
+
+impl ClearAfter {
+    const ALL: [ClearAfter; 5] = [
+        ClearAfter::Never,
+        ClearAfter::Minutes30,
+        ClearAfter::Hour1,
+        ClearAfter::Today,
+        ClearAfter::ThisWeek,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            ClearAfter::Never => "Don't clear",
+            ClearAfter::Minutes30 => "30m",
+            ClearAfter::Hour1 => "1h",
+            ClearAfter::Today => "Today",
+            ClearAfter::ThisWeek => "This week",
+        }
+    }
+
+    pub fn until(self, now: i64) -> Option<i64> {
+        match self {
+            ClearAfter::Never => None,
+            ClearAfter::Minutes30 => Some(now + 30 * 60),
+            ClearAfter::Hour1 => Some(now + 3600),
+            ClearAfter::Today => Some(now + 24 * 3600 - (now.rem_euclid(24 * 3600))),
+            ClearAfter::ThisWeek => Some(now + 7 * 24 * 3600),
+        }
+    }
+}
+
 pub struct StatusMenu {
     shell: WeakEntity<Shell>,
     hub: Hub,
@@ -114,6 +158,9 @@ pub struct StatusMenu {
     /// The account whose states and status text are showing.
     open: Option<AccountKey>,
     field: Entity<TextInput>,
+    /// Selected status emoji (empty means none / default) and clear-after preset for rich status.
+    emoji: String,
+    clear_after: ClearAfter,
     refused: Option<String>,
     /// The head is editing our name and picture on this device.
     editing: bool,
@@ -181,7 +228,18 @@ impl StatusMenu {
             }
         })
         .detach();
-        StatusMenu { shell, hub, scene: Scene::default(), open: None, field, refused: None, editing: false, name }
+        StatusMenu {
+            shell,
+            hub,
+            scene: Scene::default(),
+            open: None,
+            field,
+            emoji: String::new(),
+            clear_after: ClearAfter::Never,
+            refused: None,
+            editing: false,
+            name,
+        }
     }
 
     /// The menu opened again: it starts as it was first seen, nothing half edited.
@@ -272,12 +330,22 @@ impl StatusMenu {
         } else {
             let said = self.own(account).map(|own| own.status.clone()).unwrap_or_default();
             self.field.update(cx, |field, cx| field.set_text(&said, cx));
+            self.emoji.clear();
+            self.clear_after = ClearAfter::Never;
             self.open = Some(account.clone());
         }
         cx.notify();
     }
 
-    fn send(&mut self, account: AccountKey, presence: Presence, status: Option<String>, cx: &mut Context<Self>) {
+    fn send(
+        &mut self,
+        account: AccountKey,
+        presence: Presence,
+        status: Option<String>,
+        status_emoji: Option<String>,
+        clear_at: Option<i64>,
+        cx: &mut Context<Self>,
+    ) {
         self.refused = None;
         cx.notify();
         if only_draws() {
@@ -285,17 +353,21 @@ impl StatusMenu {
         }
         let this = cx.weak_entity();
         // chatd reports the new state as a `Status` change, which is what redraws the rows.
-        super::ask_later(cx, Request::SetPresence { account, presence, status, clear_at: None }, move |answer, cx| {
-            let refused = match answer {
-                Ok(Response::Error { detail, .. }) => Some(detail),
-                Ok(_) => None,
-                Err(err) => Some(crate::client::trouble_words("people", &err)),
-            };
-            let _ = this.update(cx, |this, cx| {
-                this.refused = refused;
-                cx.notify();
-            });
-        });
+        super::ask_later(
+            cx,
+            Request::SetPresence { account, presence, status, status_emoji, clear_at },
+            move |answer, cx| {
+                let refused = match answer {
+                    Ok(Response::Error { detail, .. }) => Some(detail),
+                    Ok(_) => None,
+                    Err(err) => Some(crate::client::trouble_words("people", &err)),
+                };
+                let _ = this.update(cx, |this, cx| {
+                    this.refused = refused;
+                    cx.notify();
+                });
+            },
+        );
     }
 
     /// The status text of the open account: what is in the field, and empty clears it.
@@ -312,7 +384,24 @@ impl StatusMenu {
             return;
         }
         let text = self.field.read(cx).text().trim().to_owned();
-        self.send(own.key, own.presence, Some(text), cx);
+        let (status_emoji, clear_at) = if own.can.rich_status {
+            let em = if text.is_empty() && self.emoji.is_empty() {
+                Some(String::new())
+            } else if !self.emoji.is_empty() {
+                Some(self.emoji.clone())
+            } else {
+                None
+            };
+            let until = if text.is_empty() && self.emoji.is_empty() {
+                None
+            } else {
+                self.clear_after.until(crate::view::now())
+            };
+            (em, until)
+        } else {
+            (None, None)
+        };
+        self.send(own.key, own.presence, Some(text), status_emoji, clear_at, cx);
     }
 
     fn account_row(&self, ix: usize, own: &Own, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -363,7 +452,7 @@ impl StatusMenu {
                     .children(Shape::of(state).map(|shape| presence::inline(shape, 10., theme::overlay())))
                     .child(div().flex_1().min_w_0().truncate().child(state_word(state, network)))
                     .when(own.presence == state, |row| row.child(glyph("icons/check.svg", 14., theme::text_soft())))
-                    .on_click(cx.listener(move |this, _, _, cx| this.send(account.clone(), state, None, cx))),
+                    .on_click(cx.listener(move |this, _, _, cx| this.send(account.clone(), state, None, None, None, cx))),
             );
         }
         if !has_status_text(network, &own.can) {
@@ -384,23 +473,78 @@ impl StatusMenu {
                 .hover(|style| style.bg(theme::hover()))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.field.update(cx, |field, cx| field.set_text("", cx));
+                    this.emoji.clear();
+                    this.clear_after = ClearAfter::Never;
                     this.say(cx);
                 }))
                 .child(glyph("icons/x.svg", 14., theme::text_soft()))
         });
-        let unsent = self.field.read(cx).text().trim() != own.status.trim();
-        choices.child(
-            div().mt(px(4.)).px(px(8.)).flex().flex_col().gap(px(4.)).child(
-                field(focused)
-                    .line_height(px(18.))
-                    .child(glyph("icons/smile.svg", 14., theme::text_faint()))
-                    .child(div().flex_1().min_w_0().child(self.field.clone()))
-                    .children(clear),
-            )
-            .when(unsent, |status| {
-                status.child(div().type_small().text_color(theme::text_faint()).child(crate::gui::shortcuts::label("Return sets it.")))
-            }),
-        )
+        let unsent = self.field.read(cx).text().trim() != own.status.trim() || !self.emoji.is_empty();
+        let leading = if !self.emoji.is_empty() {
+            div().type_small().child(self.emoji.clone()).into_any_element()
+        } else {
+            glyph("icons/smile.svg", 14., theme::text_faint()).into_any_element()
+        };
+        let mut status_box = div().mt(px(4.)).px(px(8.)).flex().flex_col().gap(px(4.)).child(
+            field(focused)
+                .line_height(px(18.))
+                .child(leading)
+                .child(div().flex_1().min_w_0().child(self.field.clone()))
+                .children(clear),
+        );
+        if own.can.rich_status {
+            let emoji_row = div()
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .children(STATUS_EMOJIS.iter().enumerate().map(|(eix, &em)| {
+                    let chosen = self.emoji == em;
+                    div()
+                        .id(("own-status-emoji", eix))
+                        .px(px(5.))
+                        .py(px(2.))
+                        .rounded(px(theme::R_CHIP))
+                        .cursor_pointer()
+                        .when(chosen, |el| el.bg(theme::selected()))
+                        .hover(|el| el.bg(theme::hover()))
+                        .child(em)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if this.emoji == em {
+                                this.emoji.clear();
+                            } else {
+                                this.emoji = em.to_owned();
+                            }
+                            cx.notify();
+                        }))
+                }));
+            let clear_row = div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(4.))
+                .children(ClearAfter::ALL.iter().enumerate().map(|(cix, &preset)| {
+                    let chosen = self.clear_after == preset;
+                    div()
+                        .id(("own-status-clear-after", cix))
+                        .px(px(6.))
+                        .py(px(2.))
+                        .rounded(px(theme::R_CHIP))
+                        .type_micro()
+                        .text_color(if chosen { theme::text() } else { theme::text_soft() })
+                        .when(chosen, |el| el.bg(theme::selected()))
+                        .cursor_pointer()
+                        .hover(|el| el.bg(theme::hover()))
+                        .child(preset.label())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.clear_after = preset;
+                            cx.notify();
+                        }))
+                }));
+            status_box = status_box.child(emoji_row).child(clear_row);
+        }
+        choices.child(status_box.when(unsent, |status| {
+            status.child(div().type_small().text_color(theme::text_faint()).child(crate::gui::shortcuts::label("Return sets it.")))
+        }))
     }
 }
 

@@ -822,6 +822,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
                 Some(message) if !channel.is_empty() => jump_link(origin.guild_id.as_deref(), channel, message),
                 _ => String::new(),
             },
+            ..Forwarded::default()
         })
     });
 
@@ -940,6 +941,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         effect: None,
         contacts: Vec::new(),
         sent_via: None,
+        permalink: String::new(),
     };
     (message, rich.files)
 }

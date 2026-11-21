@@ -393,9 +393,17 @@ impl Fake {
                 let asked: Value = serde_json::from_str(param("profile")).unwrap();
                 let mut profile = self.user(token, me(token)).unwrap()["profile"].clone();
                 profile["status_text"] = asked["status_text"].clone();
-                // Slack's default for a status with words and no emoji.
-                let emoji = if asked["status_text"] == "" { "" } else { ":speech_balloon:" };
+                // Slack echoes the requested emoji, or defaults to speech_balloon when words have no emoji.
+                let requested_emoji = asked["status_emoji"].as_str().unwrap_or("");
+                let emoji = if !requested_emoji.is_empty() {
+                    requested_emoji
+                } else if asked["status_text"] == "" {
+                    ""
+                } else {
+                    ":speech_balloon:"
+                };
                 profile["status_emoji"] = emoji.into();
+                profile["status_expiration"] = asked["status_expiration"].clone();
                 Some(json!({"ok": true, "username": "justin", "profile": profile}))
             }
             "client.counts" if busy => {
@@ -468,10 +476,41 @@ impl Fake {
                 "snooze_endtime": 0,
             }))),
             "dnd.teamInfo" => Some(json!({"ok": true, "users": {}})),
-            // A conversation star is the channel alone. A timestamp would star a message.
             "stars.add" | "stars.remove" => {
-                if channel.is_empty() || !param("timestamp").is_empty() {
+                if channel.is_empty() {
                     return refused("invalid_arguments");
+                }
+                Some(json!({"ok": true}))
+            }
+            "stars.list" => {
+                Some(json!({
+                    "ok": true,
+                    "items": [{
+                        "type": "message",
+                        "channel": "C0GEN",
+                        "message": {"type": "message", "ts": ROOT, "user": "U0ANA", "text": "Saved item"},
+                        "date_create": 1760000500
+                    }]
+                }))
+            }
+            "reminders.add" => {
+                if param("text").is_empty() || param("time").is_empty() {
+                    return refused("cannot_parse");
+                }
+                Some(json!({
+                    "ok": true,
+                    "reminder": {
+                        "id": "Rm01SAVE",
+                        "text": param("text"),
+                        "time": param("time").parse::<i64>().unwrap_or(0),
+                        "complete_ts": 0
+                    }
+                }))
+            }
+            "reminders.list" => Some(json!({"ok": true, "reminders": []})),
+            "reminders.complete" | "reminders.delete" => {
+                if param("reminder").is_empty() {
+                    return refused("not_found");
                 }
                 Some(json!({"ok": true}))
             }
@@ -2197,7 +2236,7 @@ fn presence_a_profile_and_signing_out() {
     let account = AccountKey { network: Network::Slack, account: "T01ALPHA".to_owned() };
 
     // Away with a status: both reach Slack, and the account shows what Slack now shows others.
-    let away = Request::SetPresence { account: account.clone(), presence: Presence::Idle, status: Some("Lunch".to_owned()), clear_at: None };
+    let away = Request::SetPresence { account: account.clone(), presence: Presence::Idle, status: Some("Lunch".to_owned()), status_emoji: None, clear_at: None };
     assert_eq!(world.ask(away), Response::Ok);
     assert_eq!(world.fake.calls(ALPHA, "users.setPresence").pop().unwrap().params["presence"], "away");
     let set = world.fake.calls(ALPHA, "users.profile.set").pop().unwrap();
@@ -2206,18 +2245,18 @@ fn presence_a_profile_and_signing_out() {
     let shown = world.account("T01ALPHA");
     assert_eq!((shown.presence, shown.status.as_str()), (Presence::Idle, "💬 Lunch"));
     // Back, with the status left alone: one call, and the text stays.
-    let back = Request::SetPresence { account: account.clone(), presence: Presence::Online, status: None, clear_at: None };
+    let back = Request::SetPresence { account: account.clone(), presence: Presence::Online, status: None, status_emoji: None, clear_at: None };
     assert_eq!(world.ask(back), Response::Ok);
     assert_eq!(world.fake.calls(ALPHA, "users.setPresence").pop().unwrap().params["presence"], "auto");
     assert_eq!(world.fake.calls(ALPHA, "users.profile.set").len(), 1);
     let shown = world.account("T01ALPHA");
     assert_eq!((shown.presence, shown.status.as_str()), (Presence::Online, "💬 Lunch"));
     // Clearing the status.
-    let clear = Request::SetPresence { account: account.clone(), presence: Presence::Online, status: Some(String::new()), clear_at: None };
+    let clear = Request::SetPresence { account: account.clone(), presence: Presence::Online, status: Some(String::new()), status_emoji: None, clear_at: None };
     assert_eq!(world.ask(clear), Response::Ok);
     assert_eq!(world.account("T01ALPHA").status, "");
     // Do Not Disturb is not built: it is refused in words and nothing is shown as set.
-    let quiet = world.ask(Request::SetPresence { account: account.clone(), presence: Presence::Dnd, status: None, clear_at: None });
+    let quiet = world.ask(Request::SetPresence { account: account.clone(), presence: Presence::Dnd, status: None, status_emoji: None, clear_at: None });
     assert!(matches!(&quiet, Response::Error { code: ErrorCode::Refused, detail } if detail.contains("Do Not Disturb")), "{quiet:?}");
     assert_eq!(world.account("T01ALPHA").presence, Presence::Online);
     assert_eq!(world.fake.calls(ALPHA, "users.setPresence").len(), 3);
@@ -3969,5 +4008,378 @@ fn slack_pin_unpin_socket_events_and_pinned_files() {
     }));
     world.until("pin_removed clears pinned=false", || {
         (!world.message(&general, &target)?.pinned).then_some(())
+    });
+}
+
+#[test]
+fn slack_share_forward_with_note_and_distinct_received_share() {
+    let world = World::start();
+    world.ready();
+    let general = alpha("C0GEN");
+    let dm = alpha("D0ANA");
+    let thread = alpha(&format!("C0GEN:{ROOT}"));
+
+    // Ensure history is loaded so the message exists locally.
+    let _ = world.ask(Request::Messages { conversation: general.clone(), page: Page::Newest, limit: 20 });
+
+    // Forward a message from #general to a DM and a thread with a note.
+    let reply = world.ask(Request::Forward {
+        from: general.clone(),
+        message_ids: vec![ROOT.to_owned()],
+        to: vec![dm.clone(), thread.clone()],
+        note: "Please take a look".into(),
+    });
+    let Response::Forwarded { results } = reply else {
+        panic!("expected Forwarded, got {reply:?}");
+    };
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|r| r.ok), "results: {results:?}");
+
+    let posts = world.fake.calls(ALPHA, "chat.postMessage");
+    let dm_post = posts.iter().find(|c| c.params.get("channel").map(String::as_str) == Some("D0ANA")).expect("DM post");
+    assert!(dm_post.params["text"].starts_with("Please take a look\n"), "got: {}", dm_post.params["text"]);
+    assert!(dm_post.params["text"].contains("archives/C0GEN/p1760000200000200"), "got: {}", dm_post.params["text"]);
+    assert_eq!(dm_post.params.get("unfurl_links").map(String::as_str), Some("true"));
+
+    let thread_post = posts.iter().find(|c| c.params.get("channel").map(String::as_str) == Some("C0GEN")).expect("thread post");
+    assert_eq!(thread_post.params.get("thread_ts").map(String::as_str), Some(ROOT));
+
+    // Received `is_share` with BOTH forwarder note and forwarded text keeps them distinct.
+    let ts = "1760000700.000700";
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "channel": "C0GEN",
+        "user": "U0ANA",
+        "text": "Check this out",
+        "ts": ts,
+        "event_ts": ts,
+        "attachments": [{
+            "is_share": true,
+            "channel_name": "buying",
+            "author_name": "Nia",
+            "text": "The order shipped",
+            "fallback": "The order shipped",
+            "from_url": "https://alpha.slack.com/archives/C0BUY/p1760000100000100",
+        }],
+    }));
+    let arrived = world.until("shared message with note", || world.message(&general, ts));
+    assert_eq!(arrived.text, "Check this out");
+    let shared = arrived.forwarded.as_ref().expect("forwarded metadata");
+    assert_eq!(shared.from_title, "#buying");
+    assert_eq!(shared.author, "Nia");
+    assert_eq!(shared.text, "The order shipped");
+    assert_eq!(shared.link, "https://alpha.slack.com/archives/C0BUY/p1760000100000100");
+}
+
+#[test]
+fn slack_save_for_later_and_reminders() {
+    let world = World::start();
+    world.ready();
+
+    let general = alpha("C0GEN");
+    let msgs = world.until("general history loaded", || {
+        let m = world.messages(&general);
+        (!m.is_empty()).then_some(m)
+    });
+    let target = msgs[0].id.clone();
+
+    // Save for later -> stars.add with channel + timestamp, flips message.starred = true.
+    assert_eq!(
+        world.ask(Request::StarMessage {
+            conversation: general.clone(),
+            message_id: target.clone(),
+            starred: true,
+        }),
+        Response::Ok
+    );
+    assert!(
+        world.fake.calls(ALPHA, "stars.add").iter().any(|c| {
+            c.params.get("channel").map(String::as_str) == Some("C0GEN")
+                && c.params.get("timestamp").map(String::as_str) == Some(target.as_str())
+        }),
+        "expected stars.add with channel and timestamp"
+    );
+    assert!(world.message(&general, &target).unwrap().starred);
+
+    // Listing Later items fetches stars.list and returns saved messages.
+    let Response::Pinned { messages: saved, .. } = world.ask(Request::StarredMessages {
+        account: general.account(),
+        conversation: None,
+        limit: 50,
+    }) else {
+        panic!("expected Pinned response for StarredMessages");
+    };
+    assert!(!saved.is_empty(), "expected saved items from stars.list");
+    assert!(saved.iter().all(|m| m.starred));
+
+    // Remove from Later -> stars.remove with channel + timestamp, flips message.starred = false.
+    assert_eq!(
+        world.ask(Request::StarMessage {
+            conversation: general.clone(),
+            message_id: target.clone(),
+            starred: false,
+        }),
+        Response::Ok
+    );
+    assert!(
+        world.fake.calls(ALPHA, "stars.remove").iter().any(|c| {
+            c.params.get("channel").map(String::as_str) == Some("C0GEN")
+                && c.params.get("timestamp").map(String::as_str) == Some(target.as_str())
+        }),
+        "expected stars.remove with channel and timestamp"
+    );
+    assert!(!world.message(&general, &target).unwrap().starred);
+
+    // Set a reminder on a message -> calls reminders.add and stores reminder.
+    let future = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64 + 3600;
+    assert_eq!(
+        world.ask(Request::Remind {
+            conversation: general.clone(),
+            message_id: target.clone(),
+            remind_at: Some(future),
+        }),
+        Response::Ok
+    );
+    let added = world.fake.calls(ALPHA, "reminders.add");
+    assert_eq!(added.len(), 1, "expected reminders.add call");
+    assert_eq!(added[0].params.get("time").map(String::as_str), Some(future.to_string().as_str()));
+
+    // Cancel the reminder -> calls reminders.delete.
+    assert_eq!(
+        world.ask(Request::Remind {
+            conversation: general.clone(),
+            message_id: target.clone(),
+            remind_at: None,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.fake.calls(ALPHA, "reminders.delete").len(), 1, "expected reminders.delete call");
+}
+
+#[test]
+fn slack_permalinks_and_in_app_link_resolution() {
+    let world = World::start();
+    world.ready();
+
+    let general = alpha("C0GEN");
+    let msgs = world.until("general history loaded", || {
+        let m = world.messages(&general);
+        (!m.is_empty()).then_some(m)
+    });
+    let root = msgs.iter().find(|m| m.id == ROOT).expect("root message");
+    assert!(
+        root.permalink.ends_with("/archives/C0GEN/p1760000200000200"),
+        "expected HTTPS channel permalink, got: {}",
+        root.permalink
+    );
+    assert!(!root.permalink.starts_with("slack://"));
+
+    // Thread reply carries `?thread_ts=...&cid=...`.
+    let thread = alpha(&format!("C0GEN:{ROOT}"));
+    let reply_ts = "1760000250.000250";
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "channel": "C0GEN",
+        "user": "U0ANA",
+        "text": "Thread reply",
+        "ts": reply_ts,
+        "thread_ts": ROOT,
+        "event_ts": reply_ts,
+    }));
+    let reply = world.until("thread reply stored", || world.message(&thread, reply_ts));
+    assert!(
+        reply.permalink.ends_with(&format!("/archives/C0GEN/p1760000250000250?thread_ts={ROOT}&cid=C0GEN")),
+        "expected thread permalink, got: {}",
+        reply.permalink
+    );
+
+    // Resolving an HTTPS Slack archive link for a matching workspace jumps in-app.
+    let Response::Resolved { conversation, message_id, .. } = world.ask(Request::Resolve {
+        url: "https://alpha.slack.com/archives/C0GEN/p1760000200000200".into(),
+    }) else {
+        panic!("expected Resolved");
+    };
+    assert_eq!(conversation, Some(general.clone()));
+    assert_eq!(message_id.as_deref(), Some(ROOT));
+
+    // Resolving a thread reply link prefers the thread conversation when cached.
+    let Response::Resolved { conversation: t_conv, message_id: t_mid, .. } = world.ask(Request::Resolve {
+        url: format!("https://alpha.slack.com/archives/C0GEN/p1760000250000250?thread_ts={ROOT}&cid=C0GEN"),
+    }) else {
+        panic!("expected Resolved for thread");
+    };
+    assert_eq!(t_conv, Some(thread.clone()));
+    assert_eq!(t_mid.as_deref(), Some(reply_ts));
+
+    // A link for a different workspace does not hijack our workspace's channel.
+    let Response::Resolved { conversation: other_conv, .. } = world.ask(Request::Resolve {
+        url: "https://unrelated-workspace.slack.com/archives/C0GEN/p1760000200000200".into(),
+    }) else {
+        panic!("expected Resolved");
+    };
+    assert_eq!(other_conv, None);
+}
+
+#[test]
+fn slack_notification_prefs_keywords_and_live_pref_change() {
+    let world = World::start();
+    world.ready();
+
+    let general = alpha("C0GEN");
+    // Live pref_change for `all_notifications_prefs`: C0GEN -> mentions_dms + suppress_at_channel.
+    world.fake.push(ALPHA, json!({
+        "type": "pref_change",
+        "name": "all_notifications_prefs",
+        "value": json!({
+            "global": {"desktop": "all"},
+            "channels": {
+                "C0GEN": {
+                    "desktop": "mentions_dms",
+                    "muted": false,
+                    "suppress_at_channel": true
+                }
+            }
+        }).to_string()
+    }));
+    // Live pref_change for `highlight_words`.
+    world.fake.push(ALPHA, json!({
+        "type": "pref_change",
+        "name": "highlight_words",
+        "value": "deploy, incident"
+    }));
+
+    // Details pane surfaces Mentions level for C0GEN.
+    world.until("C0GEN notify becomes Mentions", || {
+        let Response::ConversationInfo { info } = world.ask(Request::ConversationInfo { conversation: general.clone() }) else {
+            return None;
+        };
+        (info.notify == protocol::Notify::Mentions).then_some(())
+    });
+
+    // @channel broadcast is suppressed because suppress_at_channel is true.
+    let ts_bc = "1760000801.000801";
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "channel": "C0GEN",
+        "user": "U0ANA",
+        "text": "<!channel> heads up",
+        "ts": ts_bc,
+        "event_ts": ts_bc,
+    }));
+    let bc = world.until("broadcast message stored", || world.message(&general, ts_bc));
+    assert!(!bc.mentions_me, "suppress_at_channel should suppress @channel mention");
+
+    // Keyword match (case-insensitive word boundary) triggers mentions_me.
+    let ts_kw = "1760000802.000802";
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "channel": "C0GEN",
+        "user": "U0ANA",
+        "text": "Ready to DEPLOY now!",
+        "ts": ts_kw,
+        "event_ts": ts_kw,
+    }));
+    let kw = world.until("keyword message stored", || world.message(&general, ts_kw));
+    assert!(kw.mentions_me, "highlight_words match should set mentions_me");
+
+    // Substring match without word boundary does NOT trigger mentions_me.
+    let ts_non = "1760000803.000803";
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "channel": "C0GEN",
+        "user": "U0ANA",
+        "text": "deployment finished cleanly",
+        "ts": ts_non,
+        "event_ts": ts_non,
+    }));
+    let non = world.until("non-boundary message stored", || world.message(&general, ts_non));
+    assert!(!non.mentions_me, "substring without word boundary should not set mentions_me");
+}
+
+#[test]
+fn slack_rich_status_emoji_expiration_and_custom_emoji_read() {
+    let world = World::start();
+    world.ready();
+
+    let account = alpha("C0GEN").account();
+    let expiry = 1_900_000_000_i64;
+
+    // Set status with emoji and clear-after expiration -> sent to users.profile.set.
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Online,
+            status: Some("Vacation".into()),
+            status_emoji: Some("🌴".into()),
+            clear_at: Some(expiry),
+        }),
+        Response::Ok
+    );
+    let set_call = world.fake.calls(ALPHA, "users.profile.set").pop().expect("users.profile.set call");
+    let sent_profile: Value = serde_json::from_str(&set_call.params["profile"]).unwrap();
+    assert_eq!(sent_profile["status_text"], "Vacation");
+    assert_eq!(sent_profile["status_emoji"], ":palm_tree:");
+    assert_eq!(sent_profile["status_expiration"], expiry);
+
+    // Updating only text (status_emoji: None) preserves existing emoji instead of clearing it.
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Online,
+            status: Some("Still on vacation".into()),
+            status_emoji: None,
+            clear_at: Some(expiry),
+        }),
+        Response::Ok
+    );
+    let set_call2 = world.fake.calls(ALPHA, "users.profile.set").pop().expect("second users.profile.set");
+    let sent_profile2: Value = serde_json::from_str(&set_call2.params["profile"]).unwrap();
+    assert_eq!(sent_profile2["status_text"], "Still on vacation");
+    assert_eq!(sent_profile2["status_emoji"], ":palm_tree:");
+    assert_eq!(sent_profile2["status_expiration"], expiry);
+
+    // Clearing status clears text, emoji, and expiration.
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Online,
+            status: Some(String::new()),
+            status_emoji: Some(String::new()),
+            clear_at: None,
+        }),
+        Response::Ok
+    );
+    let clear_call = world.fake.calls(ALPHA, "users.profile.set").pop().expect("clear users.profile.set");
+    let cleared: Value = serde_json::from_str(&clear_call.params["profile"]).unwrap();
+    assert_eq!(cleared["status_text"], "");
+    assert_eq!(cleared["status_emoji"], "");
+    assert_eq!(cleared["status_expiration"], 0);
+
+    // Reading another user's custom emoji status preserves `:custom_name:`.
+    world.fake.push(ALPHA, json!({
+        "type": "user_status_changed",
+        "user": {
+            "id": "U0ANA",
+            "name": "ana",
+            "profile": {
+                "display_name": "Ana",
+                "status_text": "Deploying",
+                "status_emoji": ":partyparrot:",
+                "status_expiration": expiry
+            }
+        }
+    }));
+    world.until("custom emoji status preserved on U0ANA", || {
+        let Response::People { people, .. } = world.ask(Request::People {
+            network: Some(Network::Slack),
+            relation: None,
+            query: Some("Ana".into()),
+            offset: 0,
+            limit: 10,
+        }) else {
+            return None;
+        };
+        let ana = people.into_iter().find(|p| p.key.id == "U0ANA")?;
+        (ana.emoji == ":partyparrot:" && ana.status.contains("Deploying")).then_some(())
     });
 }

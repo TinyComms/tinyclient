@@ -30,10 +30,13 @@ impl LinkAsk {
     }
 }
 
-/// Where a message leads in the network's own app, for "Copy link" and "Open in <network>".
-/// An unsupported message names its own; Discord's and Slack's are built from ids, as the
-/// conversation's are (`profile/facts.rs`).
+/// Where a message leads for "Copy link". Prefers the canonical HTTPS `Message::permalink`
+/// when supplied by the adapter (e.g. Slack `https://<workspace>.slack.com/archives/...`),
+/// falling back to `Unsupported { link }` or per-network constructed addresses.
 pub fn message_link(conversation: &protocol::Key, space: Option<&str>, message: &protocol::Message) -> Option<String> {
+    if !message.permalink.is_empty() {
+        return Some(message.permalink.clone());
+    }
     if let protocol::MessageKind::Unsupported { link } = &message.kind {
         if !link.is_empty() {
             return Some(link.clone());
@@ -52,6 +55,17 @@ pub fn message_link(conversation: &protocol::Key, space: Option<&str>, message: 
         protocol::Network::Tiny => space.and_then(|origin| protocol::message_link(origin, channel, id)),
         protocol::Network::Telegram | protocol::Network::Teams | protocol::Network::Signal | protocol::Network::Messages => None,
     }
+}
+
+/// Where "Open in <network>" opens a message in the network's native app (keeps `slack://`
+/// for Slack when a team id is known so the desktop app handles it directly).
+pub fn open_in_app_link(conversation: &protocol::Key, space: Option<&str>, message: &protocol::Message) -> Option<String> {
+    if conversation.network == protocol::Network::Slack && message.state == protocol::SendState::Sent && !message.deleted {
+        if let Some(team) = space {
+            return Some(format!("slack://channel?team={team}&id={}&message={}", conversation.id, message.id));
+        }
+    }
+    message_link(conversation, space, message)
 }
 
 /// Chooses the channel key for `message_link`: a Slack thread's replies link into their parent

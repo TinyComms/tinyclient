@@ -924,6 +924,26 @@ impl Pane {
             };
             let attached = self.attachments(message, window, cx);
             sent = match &message.forwarded {
+                // When the forwarder wrote a note of their own, render it above the quoted original.
+                Some(from) if !from.text.is_empty() && !message.text.is_empty() && from.text != message.text => {
+                    let mut quoted = div().pl(px(12.)).min_w_0().flex_1().flex().flex_col();
+                    if !from.author.is_empty() {
+                        quoted = quoted.child(
+                            div().type_small().font_weight(theme::MEDIUM).text_color(theme::text_soft()).child(from.author.clone()),
+                        );
+                    }
+                    quoted = quoted
+                        .child(div().type_body().text_color(theme::text()).child(from.text.clone()))
+                        .children(attached);
+                    sent.children(said)
+                        .child(div().mt(px(4.)).child(forwarded_line(from)))
+                        .child(
+                            div()
+                                .flex()
+                                .child(div().w(px(2.)).flex_none().rounded(px(1.)).bg(tokens::border_strong()))
+                                .child(quoted),
+                        )
+                }
                 // What was forwarded is the message itself, set behind a bar under where it came from.
                 Some(from) => sent.child(forwarded_line(from)).child(
                     div()

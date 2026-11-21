@@ -1692,13 +1692,10 @@ impl Store {
     /// signed-in accounts. Never creates or joins a conversation.
     pub fn resolve_link(&self, link: &protocol::link::NetworkLink) -> rusqlite::Result<Option<Conversation>> {
         let net = word(&link.network);
-        let mut stmt = self.db.prepare(&format!(
-            "{CONVERSATION} WHERE c.network = ?1 AND c.id = ?2 ORDER BY c.updated DESC LIMIT 16"
-        ))?;
-        let candidates: Vec<Conversation> = stmt
-            .query_map(params![net, link.channel], conversation_from)?
-            .collect::<rusqlite::Result<_>>()?;
-        if !candidates.is_empty() {
+        let pick = |candidates: Vec<Conversation>| -> Option<Conversation> {
+            if candidates.is_empty() {
+                return None;
+            }
             if let Some(space) = &link.space {
                 let lower = space.to_ascii_lowercase();
                 if let Some(hit) = candidates.iter().find(|c| {
@@ -1706,24 +1703,34 @@ impl Store {
                         || c.space_title.to_ascii_lowercase().contains(&lower)
                         || c.key.account.to_ascii_lowercase().contains(&lower)
                 }) {
-                    return Ok(Some(hit.clone()));
+                    return Some(hit.clone());
+                }
+                if link.network == Network::Slack {
+                    return None;
                 }
             }
-            return Ok(Some(candidates.into_iter().next().unwrap()));
-        }
+            candidates.into_iter().next()
+        };
         if let Some(thread_id) = &link.thread_id {
             let threaded = format!("{}:{thread_id}", link.channel);
-            if let Some(hit) = self
-                .db
-                .query_row(
-                    &format!("{CONVERSATION} WHERE c.network = ?1 AND c.id = ?2 LIMIT 1"),
-                    params![net, threaded],
-                    conversation_from,
-                )
-                .optional()?
-            {
+            let mut stmt = self.db.prepare(&format!(
+                "{CONVERSATION} WHERE c.network = ?1 AND c.id = ?2 ORDER BY c.updated DESC LIMIT 16"
+            ))?;
+            let candidates: Vec<Conversation> = stmt
+                .query_map(params![net, threaded], conversation_from)?
+                .collect::<rusqlite::Result<_>>()?;
+            if let Some(hit) = pick(candidates) {
                 return Ok(Some(hit));
             }
+        }
+        let mut stmt = self.db.prepare(&format!(
+            "{CONVERSATION} WHERE c.network = ?1 AND c.id = ?2 ORDER BY c.updated DESC LIMIT 16"
+        ))?;
+        let candidates: Vec<Conversation> = stmt
+            .query_map(params![net, link.channel], conversation_from)?
+            .collect::<rusqlite::Result<_>>()?;
+        if let Some(hit) = pick(candidates) {
+            return Ok(Some(hit));
         }
         if link.network == Network::Telegram {
             let bare = link.channel.trim_start_matches('@');

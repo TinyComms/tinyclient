@@ -565,7 +565,7 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
                 live.ask(Ask::Type { conversation_id });
             }
         }
-        Command::SetPresence { presence, status, clear_at, reply } => {
+        Command::SetPresence { presence, status, status_emoji: _, clear_at, reply } => {
             let known = super::manage::known(saved);
             let supported = if known.checked {
                 known.capabilities.has(protocol::TINY_FEATURE_PRESENCE_STATUS)
