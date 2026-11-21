@@ -87,8 +87,14 @@ impl Teams {
         if question.is_empty() {
             return Err("Poll question cannot be empty.".to_owned());
         }
+        if question.chars().count() > 200 {
+            return Err("Poll question must be 200 characters or fewer.".to_owned());
+        }
         if options.len() < 2 || options.len() > 10 {
             return Err("Teams polls require between 2 and 10 options.".to_owned());
+        }
+        if options.iter().any(|opt| opt.chars().count() > 100) {
+            return Err("Each poll option must be 100 characters or fewer.".to_owned());
         }
         let cleaned = protocol::PollDraft {
             question: question.to_owned(),
@@ -102,7 +108,13 @@ impl Teams {
         let mut message = self
             .posted_with(conversation, client_id, question, reply_to, with, Some(props))
             .map_err(super::reason)?;
-        self.state().polls.insert((conversation.to_owned(), message.id.clone()), invoke);
+        {
+            let mut state = self.state();
+            if state.polls.len() >= super::REMEMBERED {
+                state.polls.clear();
+            }
+            state.polls.insert((conversation.to_owned(), message.id.clone()), invoke);
+        }
         let mut poll = protocol::Poll::open(question, options, draft.multiple);
         poll.anonymous = draft.anonymous;
         message.poll = Some(Box::new(poll));
@@ -221,13 +233,21 @@ impl Teams {
     /// Uploads one file (to the channel's SharePoint folder, or to OneDrive with per-member
     /// `/invite` sharing for chats) and returns the `properties.files` entry + local attachment.
     fn one_file(&self, conversation: &str, up: &mut Upload, at: usize) -> Result<(Value, Attachment), String> {
-        let (name, bytes) = (up.files()[at].name.clone(), up.files()[at].bytes);
+        let (raw_name, bytes) = (up.files()[at].name.clone(), up.files()[at].bytes);
+        let name = sanitize_filename(&raw_name);
         let failed = |fault: Fault| format!("{name} could not be sent: {}", super::reason(fault));
         if bytes == 0 {
             return Err(format!("{name} is empty."));
         }
         let thread = super::thread_of(conversation);
         let is_channel = super::tree::is_channel(thread);
+        // Resolve chat recipients BEFORE uploading to OneDrive so a missing recipient never leaves
+        // an orphaned file behind.
+        let chat_emails = if is_channel {
+            Vec::new()
+        } else {
+            self.chat_recipients(thread)?
+        };
         let session_path = if is_channel {
             let (drive_id, folder_id) = self.channel_folder(thread)?;
             format!(
@@ -275,9 +295,8 @@ impl Teams {
         let (permission_scope, service_name) = if is_channel {
             ("channel", "sharepoint")
         } else {
-            let emails = self.chat_recipients(thread)?;
-            if !emails.is_empty() {
-                let recipients: Vec<Value> = emails.iter().map(|email| json!({"email": email})).collect();
+            if !chat_emails.is_empty() {
+                let recipients: Vec<Value> = chat_emails.iter().map(|email| json!({"email": email})).collect();
                 let invite_url = format!("{}/v1.0/me/drive/items/{}/invite", self.graph, escaped(id));
                 let body = json!({
                     "recipients": recipients,
@@ -286,6 +305,11 @@ impl Teams {
                     "roles": ["read"],
                 });
                 if let Err(fault) = self.call("POST", &invite_url, Auth::Bearer(GRAPH), Body::Json(&body), true) {
+                    // Best-effort cleanup so an unshared upload is not left orphaned in OneDrive.
+                    let item_url = format!("{}/v1.0/me/drive/items/{}", self.graph, escaped(id));
+                    if let Err(del_fault) = self.call("DELETE", &item_url, Auth::Bearer(GRAPH), Body::None, false) {
+                        tracing::warn!("chatd: Teams: failed to clean up unshared OneDrive file: {}", super::reason(del_fault));
+                    }
                     return match fault {
                         Fault::Refused { status: 400 | 403, message } => {
                             let detail = if message.is_empty() { String::new() } else { format!(" ({message})") };
@@ -323,9 +347,43 @@ impl Teams {
     }
 }
 
+/// Sanitizes an attachment filename for SharePoint / OneDrive upload session paths:
+/// strips any directory prefix, replaces SharePoint-disallowed and control characters with `_`,
+/// trims leading/trailing spaces and dots, and enforces a safe length limit.
+pub(super) fn sanitize_filename(raw: &str) -> String {
+    let leaf = raw.rsplit(['/', '\\']).next().unwrap_or("");
+    let cleaned: String = leaf
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '"' | '*' | ':' | '<' | '>' | '?' | '/' | '\\' | '|') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed: String = cleaned.trim_matches(|c: char| c == ' ' || c == '.').chars().take(200).collect();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        "file".to_owned()
+    } else {
+        trimmed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{iso_utc, seconds};
+    use super::sanitize_filename;
+
+    #[test]
+    fn sanitize_filename_strips_paths_and_sharepoint_illegal_chars() {
+        assert_eq!(sanitize_filename("report.txt"), "report.txt");
+        assert_eq!(sanitize_filename("../../secret:file?.pdf"), "secret_file_.pdf");
+        assert_eq!(sanitize_filename("C:\\Users\\a\\b*c|d.png"), "b_c_d.png");
+        assert_eq!(sanitize_filename("  ...  "), "file");
+        assert_eq!(sanitize_filename(".."), "file");
+        assert_eq!(sanitize_filename(""), "file");
+    }
 
     #[test]
     fn iso_utc_round_trips_with_seconds() {

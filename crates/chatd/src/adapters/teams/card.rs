@@ -120,17 +120,23 @@ fn app_id_of(entry: &Value, content: &Value) -> String {
     .to_ascii_lowercase()
 }
 
-/// Recursively collects all elements matching `pred` inside an Adaptive Card body tree.
-fn walk_body<'a>(items: &'a [Value], out: &mut Vec<&'a Value>) {
+/// Maximum Adaptive Card container recursion depth.
+const MAX_WALK_DEPTH: usize = 16;
+
+/// Recursively collects all elements inside an Adaptive Card body tree, bounded by depth.
+fn walk_body<'a>(items: &'a [Value], out: &mut Vec<&'a Value>, depth: usize) {
+    if depth >= MAX_WALK_DEPTH {
+        return;
+    }
     for item in items {
         out.push(item);
         if let Some(sub) = item["items"].as_array() {
-            walk_body(sub, out);
+            walk_body(sub, out, depth + 1);
         }
         if let Some(cols) = item["columns"].as_array() {
             for col in cols {
                 if let Some(sub) = col["items"].as_array() {
-                    walk_body(sub, out);
+                    walk_body(sub, out, depth + 1);
                 }
             }
         }
@@ -139,7 +145,7 @@ fn walk_body<'a>(items: &'a [Value], out: &mut Vec<&'a Value>) {
                 if let Some(cells) = row["cells"].as_array() {
                     for cell in cells {
                         if let Some(sub) = cell["items"].as_array() {
-                            walk_body(sub, out);
+                            walk_body(sub, out, depth + 1);
                         }
                     }
                 }
@@ -148,7 +154,7 @@ fn walk_body<'a>(items: &'a [Value], out: &mut Vec<&'a Value>) {
         if let Some(actions) = item["actions"].as_array() {
             for act in actions {
                 if let Some(sub) = act["card"]["body"].as_array() {
-                    walk_body(sub, out);
+                    walk_body(sub, out, depth + 1);
                 }
             }
         }
@@ -190,7 +196,7 @@ fn try_parse_poll(entry: &Value, content: &Value, message_id: &str) -> Option<(P
     let app_id = app_id_of(entry, content);
     let body = content["body"].as_array()?;
     let mut nodes = Vec::new();
-    walk_body(body, &mut nodes);
+    walk_body(body, &mut nodes, 0);
     let actions = collect_actions(content, &nodes);
 
     let choice_set = nodes
@@ -414,7 +420,7 @@ fn try_parse_praise(
     let app_id = app_id_of(entry, content);
     let body = content["body"].as_array()?;
     let mut nodes = Vec::new();
-    walk_body(body, &mut nodes);
+    walk_body(body, &mut nodes, 0);
 
     let mut links = Vec::new();
     let texts: Vec<String> = nodes
@@ -506,18 +512,13 @@ fn try_parse_approval(
     media_index: &mut usize,
 ) -> Option<(Card, Vec<MessageControl>)> {
     let app_id = app_id_of(entry, content);
-    let body = content["body"].as_array()?;
-    let mut nodes = Vec::new();
-    walk_body(body, &mut nodes);
-    let actions = collect_actions(content, &nodes);
-
-    let has_approve_reject = actions.iter().any(|a| {
-        let t = a["title"].as_str().unwrap_or("").to_ascii_lowercase();
-        t == "approve" || t == "reject"
-    });
-    if app_id != APP_APPROVALS && !has_approve_reject {
+    if app_id != APP_APPROVALS {
         return None;
     }
+    let body = content["body"].as_array()?;
+    let mut nodes = Vec::new();
+    walk_body(body, &mut nodes, 0);
+    let actions = collect_actions(content, &nodes);
 
     let mut card = Card {
         author: "Approval".to_owned(),
@@ -577,7 +578,7 @@ fn try_parse_approval(
         _ => 0x2563EB,
     });
 
-    let block = if app_id.is_empty() { APP_APPROVALS.to_owned() } else { app_id };
+    let block = app_id;
     let mut controls = Vec::new();
     for action in &actions {
         let kind = action["type"].as_str().unwrap_or("");
@@ -590,6 +591,9 @@ fn try_parse_approval(
                 push_action(&mut card, title, url);
             }
         } else if kind.eq_ignore_ascii_case("Action.Submit") || kind.eq_ignore_ascii_case("Action.Execute") {
+            if controls.len() >= CARD_ACTIONS {
+                continue;
+            }
             let lower = title.to_ascii_lowercase();
             let style = if lower.contains("approve") {
                 ControlStyle::Primary
@@ -1543,5 +1547,18 @@ mod tests {
         assert!(matches!(parsed.controls[0].kind, ControlKind::Button { style: ControlStyle::Primary, .. }));
         assert_eq!(parsed.controls[1].label, "Reject");
         assert!(matches!(parsed.controls[1].kind, ControlKind::Button { style: ControlStyle::Danger, .. }));
+
+        // 4. Non-Approvals card with an "Approve" button must NOT produce Approvals invoke controls.
+        let untrusted = json!([{
+            "contentType": ADAPTIVE,
+            "content": json!({
+                "type": "AdaptiveCard",
+                "version": "1.5",
+                "body": [{"type": "TextBlock", "text": "Untrusted bot"}],
+                "actions": [{"type": "Action.Submit", "id": "approve", "title": "Approve", "data": {"x": 1}}]
+            }).to_string()
+        }]);
+        let parsed = parse_cards(untrusted.as_array().unwrap(), "", "103", MSG_LINK, hosted_teams);
+        assert!(parsed.controls.is_empty(), "unknown card must not synthesize Approvals invoke controls");
     }
 }

@@ -490,8 +490,12 @@ impl StatusMenu {
             return;
         }
         let this = cx.weak_entity();
+        let req_account = account.clone();
         super::ask_later(cx, Request::GetOutOfOffice { account }, move |answer, cx| {
             let _ = this.update(cx, |this, cx| {
+                if this.ooo_open.as_ref() != Some(&req_account) {
+                    return;
+                }
                 this.ooo_loading = false;
                 match answer {
                     Ok(Response::OutOfOffice { ooo }) => {

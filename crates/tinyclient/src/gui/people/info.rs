@@ -591,7 +591,7 @@ impl InfoPane {
                     sections = sections.child(draw::label("Role", true));
                 }
                 any = true;
-                sections = sections.child(draw::fact_inline("info-office", "icons/building-2.svg", profile.office.clone(), true));
+                sections = sections.child(draw::fact_inline("info-office", "icons/building-2.svg", profile.office.clone(), String::new()));
             }
             if profile.manager.is_some() || !profile.reports.is_empty() {
                 sections = sections.child(draw::label("Organization", !any));
@@ -605,7 +605,7 @@ impl InfoPane {
                         format!("Reports to {} · {}", manager.name, manager.title)
                     };
                     org = org.child(
-                        draw::fact_inline("info-manager", "icons/user.svg", label, false)
+                        draw::fact_inline("info-manager", "icons/user.svg", label, String::new())
                             .cursor_pointer()
                             .hover(|row| row.bg(theme::hover()))
                             .on_click(cx.listener(move |this, _, _, cx| this.show(mgr_key.clone(), cx))),
@@ -627,7 +627,7 @@ impl InfoPane {
                             format!("{} · {}", report.name, report.title)
                         };
                         org = org.child(
-                            draw::fact_inline(("info-report", rix), "icons/users.svg", label, false)
+                            draw::fact_inline(("info-report", rix), "icons/users.svg", label, String::new())
                                 .cursor_pointer()
                                 .hover(|row| row.bg(theme::hover()))
                                 .on_click(cx.listener(move |this, _, _, cx| this.show(rep_key.clone(), cx))),

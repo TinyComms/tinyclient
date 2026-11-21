@@ -358,13 +358,13 @@ impl Floating {
             }
             if !profile.office.is_empty() {
                 any = true;
-                body = body.child(draw::fact_inline("card-office", "icons/building-2.svg", profile.office.clone(), true));
+                body = body.child(draw::fact_inline("card-office", "icons/building-2.svg", profile.office.clone(), String::new()));
             }
             let ours = own_offset(crate::view::now());
             for (ix, fact) in facts::right_now(person, Some(profile), &line, crate::view::now(), ours).into_iter().enumerate() {
                 if fact.glyph == "icons/clock.svg" {
                     any = true;
-                    body = body.child(draw::fact_inline(("card-time", ix), fact.glyph, fact.words, true));
+                    body = body.child(draw::fact_inline(("card-time", ix), fact.glyph, fact.words, fact.soft));
                 }
             }
             if let Some(manager) = profile.manager.as_ref() {
@@ -373,7 +373,7 @@ impl Floating {
                 let space = self.place.as_ref().map(|(key, _)| key.clone());
                 let label = format!("Reports to {}", manager.name);
                 body = body.child(
-                    draw::fact_inline("card-manager", "icons/user.svg", label, true)
+                    draw::fact_inline("card-manager", "icons/user.svg", label, String::new())
                         .cursor_pointer()
                         .hover(|row| row.bg(theme::hover()))
                         .on_click(cx.listener(move |this, _, _, cx| {

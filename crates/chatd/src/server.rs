@@ -2336,7 +2336,10 @@ impl Chat {
             return *refused;
         }
         match self.ask(&account, |reply| Command::SetOutOfOffice { ooo, reply }) {
-            Ok(ooo) => Response::OutOfOffice { ooo },
+            Ok(ooo) => {
+                self.forget_own_profile(&account, None);
+                Response::OutOfOffice { ooo }
+            }
             Err(refused) => *refused,
         }
     }

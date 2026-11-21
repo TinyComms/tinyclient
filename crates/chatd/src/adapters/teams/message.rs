@@ -354,16 +354,47 @@ struct Refs<'a> {
     mentions: &'a [Value],
 }
 
+/// Resolves one HTML mention `item` against `properties.mentions`.
+/// Teams writes the index as `itemid` or, on tag mentions, as `id`.
+fn resolved_mention(mentions: &[Value], item: &str) -> Option<(MentionKind, String)> {
+    if item.is_empty() {
+        return None;
+    }
+    let named = mentions
+        .iter()
+        .find(|mention| {
+            let itemid = id_of(&mention["itemid"]);
+            !itemid.is_empty() && itemid == item
+        })
+        .or_else(|| {
+            mentions.iter().find(|mention| {
+                let id = id_of(&mention["id"]);
+                !id.is_empty() && id == item
+            })
+        })?;
+    let mri = named["mri"].as_str().unwrap_or("").trim();
+    let tag_id = named["mentioned"]["tag"]["id"].as_str().unwrap_or("").trim();
+    let mention_type = named["mentionType"].as_str().unwrap_or("");
+    let role_id = if !mri.is_empty() {
+        mri.to_owned()
+    } else if !tag_id.is_empty() {
+        tag_id.to_owned()
+    } else {
+        let raw = id_of(&named["id"]);
+        if raw != item { raw } else { String::new() }
+    };
+    Some(match mention_type {
+        "person" | "bot" => (MentionKind::User, mri.to_owned()),
+        "tag" => (MentionKind::Role, role_id),
+        "" if !tag_id.is_empty() => (MentionKind::Role, tag_id.to_owned()),
+        // A channel, a team or everyone in a chat: all of them call on whoever is in it.
+        _ => (MentionKind::Everyone, if mri.is_empty() { role_id } else { mri.to_owned() }),
+    })
+}
+
 impl Lookup for Refs<'_> {
     fn mention(&self, item: &str) -> Option<(MentionKind, String)> {
-        let named = self.mentions.iter().find(|mention| id_of(&mention["itemid"]) == item)?;
-        let id = named["mri"].as_str().unwrap_or("").to_owned();
-        Some(match named["mentionType"].as_str().unwrap_or("person") {
-            "person" | "bot" => (MentionKind::User, id),
-            "tag" => (MentionKind::Role, id),
-            // A channel, a team or everyone in a chat: all of them call on whoever is in it.
-            _ => (MentionKind::Everyone, id),
-        })
+        resolved_mention(self.mentions, item)
     }
 
     fn hosted(&self, url: &str) -> bool {
@@ -989,90 +1020,175 @@ impl Teams {
         message.client_id = echoed_client_id(raw, message.outgoing, &id);
         Read::Message(Box::new(message))
     }
+}
 
-    /// Submits a vote on a Teams Polls Adaptive Card via the chat service's `/invoke` endpoint,
-    /// and optimistically updates the stored poll until the `MessageUpdate` push arrives.
-    pub(super) fn vote(&self, conversation: &str, message_id: &str, votes: Option<&[u32]>) -> Result<(), Fault> {
-        let choices: Vec<u32> = votes.map(|v| v.to_vec()).unwrap_or_default();
-        let invoke = self
-            .state()
-            .polls
-            .get(&(conversation.to_owned(), message_id.to_owned()))
-            .cloned();
-        let selected_values: Vec<String> = if let Some(ref meta) = invoke {
-            choices
-                .iter()
-                .filter_map(|&idx| meta.option_values.get(idx as usize).cloned())
-                .collect()
-        } else {
-            choices.iter().map(u32::to_string).collect()
-        };
-        let mut data = invoke
-            .as_ref()
-            .map(|m| m.submit_data.clone())
-            .filter(Value::is_object)
-            .unwrap_or_else(|| json!({"action": "vote", "pollId": message_id}));
-        let input_id = invoke.as_ref().map_or("pollChoice", |m| m.input_id.as_str());
-        data[input_id] = Value::String(selected_values.join(","));
-        let app_id = invoke.as_ref().map_or("", |m| m.app_id.as_str());
-        let body = json!({
-            "type": "invoke",
-            "name": "adaptiveCard/action",
-            "value": {
-                "appId": app_id,
-                "action": {
-                    "type": "Action.Submit",
-                    "id": "submitVote",
-                    "data": data,
-                }
-            }
-        });
-        let path = format!(
-            "/v1/users/ME/conversations/{}/messages/{}/invoke",
-            escaped(conversation),
-            escaped(message_id)
-        );
-        self.chat("POST", &path, Body::Json(&body), false)?;
-        if let Some(mut msg) = self.ctx.stored_message(conversation, message_id)? {
-            if let Some(poll) = msg.poll.as_deref_mut() {
-                let me = self.me();
-                poll.apply_vote(&me, choices, &me);
-                self.ctx.history(conversation, &[msg])?;
+/// Checks a vote against the poll stored on the message and the option values kept for invoke.
+/// `None` when an index is outside the poll or a single-choice poll is given several choices.
+fn checked_poll_votes(poll: &protocol::Poll, option_count: usize, votes: &[u32]) -> Option<Vec<u32>> {
+    if poll.closed {
+        return None;
+    }
+    let mut choices = Vec::new();
+    for &idx in votes {
+        if choices.contains(&idx) {
+            continue;
+        }
+        if idx as usize >= poll.choices.len() || idx as usize >= option_count {
+            return None;
+        }
+        choices.push(idx);
+    }
+    if !poll.multiple && choices.len() > 1 {
+        return None;
+    }
+    Some(choices)
+}
+
+/// Moves this person's selection by one count per choice. Other people's totals stay.
+fn apply_poll_delta(poll: &mut protocol::Poll, next: &[u32], me: &str) {
+    let prev = std::mem::take(&mut poll.mine);
+    for &idx in &prev {
+        if next.contains(&idx) {
+            continue;
+        }
+        if let Some(choice) = poll.choices.get_mut(idx as usize) {
+            choice.count = choice.count.saturating_sub(1);
+            if !poll.anonymous {
+                choice.voters.retain(|voter| voter != me);
             }
         }
-        Ok(())
     }
-
-    /// Invokes an interactive Adaptive Card action button (e.g. Approval Approve / Reject).
-    pub(super) fn invoke_card_action(
-        &self,
-        conversation: &str,
-        message_id: &str,
-        block_id: &str,
-        action_id: &str,
-        value: &str,
-    ) -> Result<(), Fault> {
-        let data: Value = serde_json::from_str(value).unwrap_or_else(|_| json!({"value": value}));
-        let body = json!({
-            "type": "invoke",
-            "name": "adaptiveCard/action",
-            "value": {
-                "appId": block_id,
-                "action": {
-                    "type": "Action.Submit",
-                    "id": action_id,
-                    "data": data,
-                }
+    for &idx in next {
+        if prev.contains(&idx) {
+            continue;
+        }
+        if let Some(choice) = poll.choices.get_mut(idx as usize) {
+            choice.count = choice.count.saturating_add(1);
+            if !poll.anonymous && !choice.voters.iter().any(|voter| voter == me) && choice.voters.len() < protocol::POLL_VOTERS {
+                choice.voters.push(me.to_owned());
             }
-        });
-        let path = format!(
-            "/v1/users/ME/conversations/{}/messages/{}/invoke",
-            escaped(conversation),
-            escaped(message_id)
-        );
-        self.chat("POST", &path, Body::Json(&body), false)?;
-        Ok(())
+        }
     }
+    if let Some(total) = poll.total.as_mut() {
+        let delta = next.len() as i32 - prev.len() as i32;
+        if delta > 0 {
+            *total = total.saturating_add(delta as u32);
+        } else if delta < 0 {
+            *total = total.saturating_sub((-delta) as u32);
+        }
+    }
+    if let Some(existing) = poll.ballots.iter_mut().find(|ballot| ballot.person == me) {
+        existing.choices = next.to_vec();
+        existing.serial = existing.serial.saturating_add(1);
+    } else if !next.is_empty() {
+        poll.ballots.push(protocol::PollBallot { person: me.to_owned(), choices: next.to_vec(), serial: 1 });
+    }
+    poll.ballots.retain(|ballot| !ballot.choices.is_empty());
+    poll.mine = next.to_vec();
+}
+
+fn refused(message: &str) -> Fault {
+    Fault::Refused { status: 400, message: message.to_owned() }
+}
+
+impl Teams {
+/// Submits a vote on a Teams Polls Adaptive Card via the chat service's `/invoke` endpoint,
+/// and optimistically updates the stored poll until the `MessageUpdate` push arrives.
+pub(super) fn vote(&self, conversation: &str, message_id: &str, votes: Option<&[u32]>) -> Result<(), Fault> {
+    let Some(votes) = votes else {
+        return Err(refused("Teams polls cannot be ended from here."));
+    };
+    let invoke = self
+        .state()
+        .polls
+        .get(&(conversation.to_owned(), message_id.to_owned()))
+        .cloned()
+        .ok_or_else(|| refused("That poll cannot be voted on from here."))?;
+    let stored = self.ctx.stored_message(conversation, message_id)?;
+    let Some(poll) = stored.as_ref().and_then(|message| message.poll.as_deref()) else {
+        return Err(refused("That message is not a poll."));
+    };
+    let Some(choices) = checked_poll_votes(poll, invoke.option_values.len(), votes) else {
+        return Err(refused("That choice is not on this poll."));
+    };
+    let selected_values: Vec<String> = choices.iter().map(|&idx| invoke.option_values[idx as usize].clone()).collect();
+    let mut data = if invoke.submit_data.is_object() {
+        invoke.submit_data.clone()
+    } else {
+        json!({"action": "vote", "pollId": invoke.poll_id})
+    };
+    data[invoke.input_id.as_str()] = Value::String(selected_values.join(","));
+    let body = json!({
+        "type": "invoke",
+        "name": "adaptiveCard/action",
+        "value": {
+            "appId": invoke.app_id,
+            "action": {
+                "type": "Action.Submit",
+                "id": "submitVote",
+                "data": data,
+            }
+        }
+    });
+    let path = format!(
+        "/v1/users/ME/conversations/{}/messages/{}/invoke",
+        escaped(conversation),
+        escaped(message_id)
+    );
+    self.chat("POST", &path, Body::Json(&body), false)?;
+    if let Some(mut msg) = self.ctx.stored_message(conversation, message_id)? {
+        if msg.poll.is_some() {
+            if let Some(poll) = msg.poll.as_deref_mut() {
+                apply_poll_delta(poll, &choices, &self.me());
+            }
+            self.ctx.history(conversation, &[msg])?;
+        }
+    }
+    Ok(())
+}
+}
+
+/// The stored control whose block, action, and value are exactly what the shell submitted.
+fn matching_control<'a>(message: &'a Message, block_id: &str, action_id: &str, value: &str) -> Option<&'a protocol::MessageControl> {
+    message.controls.iter().find(|control| control.block_id == block_id && control.action_id == action_id && control.value == value)
+}
+
+impl Teams {
+/// Invokes an interactive Adaptive Card action button (e.g. Approval Approve / Reject).
+pub(super) fn invoke_card_action(
+    &self,
+    conversation: &str,
+    message_id: &str,
+    block_id: &str,
+    action_id: &str,
+    value: &str,
+) -> Result<(), Fault> {
+    let stored = self.ctx.stored_message(conversation, message_id)?;
+    let Some(control) = stored.as_ref().and_then(|message| matching_control(message, block_id, action_id, value)) else {
+        return Err(refused("That action is not on this message."));
+    };
+    let stored_value = control.value.clone();
+    let data: Value = serde_json::from_str(&stored_value).unwrap_or_else(|_| json!({"value": stored_value}));
+    let body = json!({
+        "type": "invoke",
+        "name": "adaptiveCard/action",
+        "value": {
+            "appId": block_id,
+            "action": {
+                "type": "Action.Submit",
+                "id": action_id,
+                "data": data,
+            }
+        }
+    });
+    let path = format!(
+        "/v1/users/ME/conversations/{}/messages/{}/invoke",
+        escaped(conversation),
+        escaped(message_id)
+    );
+    self.chat("POST", &path, Body::Json(&body), false)?;
+    Ok(())
+}
 
     /// `properties.emotions`: one entry per reaction, each with everyone who gave it. Teams
     /// keeps every time someone did, so people are counted once.
@@ -2194,5 +2310,69 @@ mod tests {
         assert_eq!(count_unread_against_horizon(&msgs, Some("1760000008000")), (0, 0));
         // No horizon -> counts only non-outgoing messages newer than latest outgoing (9000) -> 0.
         assert_eq!(count_unread_against_horizon(&msgs, None), (0, 0));
+    }
+
+    #[test]
+    fn a_tag_mention_matches_itemid_or_id() {
+        let by_item = json!([{"itemid": 0, "mentionType": "tag", "mri": "tag-eng", "displayName": "Eng"}]);
+        assert_eq!(
+            resolved_mention(by_item.as_array().unwrap(), "0"),
+            Some((MentionKind::Role, "tag-eng".to_owned()))
+        );
+        let by_id = json!([{"id": 0, "mentionType": "tag", "mri": "tag-design"}]);
+        assert_eq!(
+            resolved_mention(by_id.as_array().unwrap(), "0"),
+            Some((MentionKind::Role, "tag-design".to_owned()))
+        );
+        let nested = json!([{"itemid": "1", "mentionType": "tag", "mentioned": {"tag": {"id": "tag-ops"}}}]);
+        assert_eq!(
+            resolved_mention(nested.as_array().unwrap(), "1"),
+            Some((MentionKind::Role, "tag-ops".to_owned()))
+        );
+        let person = json!([{"itemid": "0", "mentionType": "person", "mri": "8:orgid:ana"}]);
+        assert_eq!(
+            resolved_mention(person.as_array().unwrap(), "0"),
+            Some((MentionKind::User, "8:orgid:ana".to_owned()))
+        );
+        assert_eq!(resolved_mention(person.as_array().unwrap(), "1"), None);
+    }
+
+    #[test]
+    fn a_vote_moves_counts_and_leaves_everyone_elses_totals() {
+        let mut poll = protocol::Poll::open("Where?", ["A", "B", "C"], false);
+        poll.choices[0].count = 4;
+        poll.choices[1].count = 2;
+        poll.total = Some(6);
+        poll.mine = vec![0];
+        poll.choices[0].voters.push("8:orgid:ana".to_owned());
+        apply_poll_delta(&mut poll, &[1], "8:orgid:me");
+        assert_eq!((poll.choices[0].count, poll.choices[1].count, poll.choices[2].count), (3, 3, 0));
+        assert_eq!(poll.total, Some(6));
+        assert_eq!(poll.mine, vec![1]);
+        assert_eq!(poll.choices[0].voters, ["8:orgid:ana".to_owned()]);
+        assert_eq!(poll.choices[1].voters, ["8:orgid:me".to_owned()]);
+
+        let mut wide = protocol::Poll::open("Pick", ["A", "B", "C"], true);
+        wide.choices[0].count = 5;
+        assert_eq!(checked_poll_votes(&wide, 3, &[0, 9]), None);
+        assert_eq!(checked_poll_votes(&poll, 3, &[0, 1]), None);
+        assert_eq!(checked_poll_votes(&wide, 3, &[2, 0, 2]), Some(vec![2, 0]));
+    }
+
+    #[test]
+    fn a_card_action_must_match_the_stored_control() {
+        let mut message = Message::plain("1", "Bot", "", 1, false);
+        message.controls.push(protocol::MessageControl {
+            block_id: "app".to_owned(),
+            action_id: "approve".to_owned(),
+            element_type: "adaptive_invoke".to_owned(),
+            label: "Approve".to_owned(),
+            value: r#"{"action":"approve"}"#.to_owned(),
+            confirm: None,
+            kind: protocol::ControlKind::Button { url: String::new(), style: protocol::ControlStyle::Primary },
+        });
+        assert!(matching_control(&message, "app", "approve", r#"{"action":"approve"}"#).is_some());
+        assert!(matching_control(&message, "app", "approve", r#"{"action":"reject"}"#).is_none());
+        assert!(matching_control(&message, "other", "approve", r#"{"action":"approve"}"#).is_none());
     }
 }

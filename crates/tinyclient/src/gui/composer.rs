@@ -80,6 +80,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use typing::TypingRow;
 
+/// How long a peer's cached out-of-office banner stays fresh before re-querying.
+const PEER_AWAY_TTL: Duration = Duration::from_secs(5 * 60);
+
 /// Drafts remembered by this window, one per conversation visited. chatd keeps every draft;
 /// these are the ones newer than the rows the lists hold.
 const DRAFTS: usize = 64;
@@ -602,9 +605,12 @@ pub struct Composer {
     importance: protocol::Importance,
     broadcast: bool,
     effect: Option<String>,
-    /// Cached out-of-office `(note, until)` for 1:1 direct chat peers (Key = person key).
-    peer_away: HashMap<Key, Option<(String, Option<i64>)>>,
+    /// Cached out-of-office `(fetched_at, Option<(note, until)>)` for 1:1 direct chat peers.
+    peer_away: HashMap<Key, (Instant, Option<(String, Option<i64>)>)>,
+    /// Peers whose out-of-office profile fetch is currently in flight.
     peer_away_asked: HashSet<Key>,
+    /// Bumped when a peer's cache is dropped, so an older profile answer cannot write it back.
+    peer_away_gen: HashMap<Key, u64>,
     /// Cached mentionable team tags per Space (Teams `@tag` completion).
     space_tags: HashMap<Key, Vec<protocol::TeamTag>>,
     space_tags_asked: HashSet<Key>,
@@ -714,6 +720,7 @@ impl Composer {
             effect: None,
             peer_away: HashMap::new(),
             peer_away_asked: HashSet::new(),
+            peer_away_gen: HashMap::new(),
             space_tags: HashMap::new(),
             space_tags_asked: HashSet::new(),
         }
@@ -785,29 +792,85 @@ impl Composer {
             input.set_alt_submits(silent);
             input.set_format_discord(discord, cx);
         });
-        if target.kind == ConversationKind::Direct && target.link == Link::Connected && live() {
-            if let Some(peer_id) = target.peer.as_deref().filter(|id| !id.is_empty()) {
-                let peer_key = Key::new(&target.key.account(), peer_id);
-                if self.peer_away_asked.insert(peer_key.clone()) {
-                    let this = cx.weak_entity();
-                    let asked_key = peer_key.clone();
-                    ask_later(cx, Request::Profile { person: peer_key, space: None }, move |answer, cx| {
-                        let away = match answer {
-                            Ok(Response::Profile { profile }) if !profile.away.is_empty() => {
-                                Some((profile.away, profile.away_until))
-                            }
-                            _ => None,
-                        };
-                        let _ = this.update(cx, |this, cx| {
-                            this.peer_away.insert(asked_key, away);
-                            cx.notify();
-                        });
-                    });
-                }
-            }
-        }
+        self.maybe_fetch_peer_away(&target, cx);
         self.target = Some(target);
         cx.notify();
+    }
+
+    fn maybe_fetch_peer_away(&mut self, target: &Target, cx: &mut Context<Self>) {
+        if target.kind != ConversationKind::Direct
+            || target.link != Link::Connected
+            || !live()
+            || !(target.key.network == Network::Teams || target.can.out_of_office)
+        {
+            return;
+        }
+        let Some(peer_id) = target.peer.as_deref().filter(|id| !id.is_empty()) else {
+            return;
+        };
+        let peer_key = Key::new(&target.key.account(), peer_id);
+        if self.peer_away.get(&peer_key).is_some_and(|(at, _)| at.elapsed() < PEER_AWAY_TTL) {
+            return;
+        }
+        if !self.peer_away_asked.insert(peer_key.clone()) {
+            return;
+        }
+        let this = cx.weak_entity();
+        let asked_key = peer_key.clone();
+        let gen = self.peer_away_gen.get(&peer_key).copied().unwrap_or(0);
+        ask_later(cx, Request::Profile { person: peer_key, space: None }, move |answer, cx| {
+            let _ = this.update(cx, |this, cx| {
+                if this.peer_away_gen.get(&asked_key).copied().unwrap_or(0) != gen {
+                    return;
+                }
+                this.peer_away_asked.remove(&asked_key);
+                if let Ok(Response::Profile { profile }) = answer {
+                    let away = (!profile.away.is_empty()).then_some((profile.away, profile.away_until));
+                    this.peer_away.insert(asked_key, (Instant::now(), away));
+                    cx.notify();
+                }
+            });
+        });
+    }
+
+    fn bump_peer_away(&mut self, person: &Key) {
+        let entry = self.peer_away_gen.entry(person.clone()).or_insert(0);
+        *entry = entry.wrapping_add(1);
+    }
+
+    fn forget_peer_away_account(&mut self, account: &AccountKey, cx: &mut Context<Self>) {
+        let mut keys: HashSet<Key> = self.peer_away.keys().filter(|key| key.account() == *account).cloned().collect();
+        keys.extend(self.peer_away_asked.iter().filter(|key| key.account() == *account).cloned());
+        for key in &keys {
+            self.bump_peer_away(key);
+        }
+        let had = self.peer_away.keys().any(|key| key.account() == *account);
+        self.peer_away.retain(|key, _| key.account() != *account);
+        self.peer_away_asked.retain(|key| key.account() != *account);
+        if had {
+            cx.notify();
+        }
+        if let Some(target) = self.target.take() {
+            if target.key.account() == *account {
+                self.maybe_fetch_peer_away(&target, cx);
+            }
+            self.target = Some(target);
+        }
+    }
+
+    fn forget_peer_away_person(&mut self, person: &Key, cx: &mut Context<Self>) {
+        self.bump_peer_away(person);
+        self.peer_away_asked.remove(person);
+        let had = self.peer_away.remove(person).is_some();
+        if had {
+            cx.notify();
+        }
+        if let Some(target) = self.target.take() {
+            if target.peer.as_deref().is_some_and(|id| Key::new(&target.key.account(), id) == *person) {
+                self.maybe_fetch_peer_away(&target, cx);
+            }
+            self.target = Some(target);
+        }
     }
 
     /// Leaving a conversation: an edit ends, and the draft is saved and kept for the way back,
@@ -3953,7 +4016,8 @@ impl Composer {
         }
         let peer_id = target.peer.as_deref().filter(|id| !id.is_empty())?;
         let peer_key = Key::new(&target.key.account(), peer_id);
-        let (away, until) = self.peer_away.get(&peer_key)?.as_ref()?;
+        let (_, away) = self.peer_away.get(&peer_key)?;
+        let (away, until) = away.as_ref()?;
         let (head, note) = ooo_banner_text(&target.title, away, *until);
         Some(
             div()
@@ -4469,6 +4533,18 @@ impl Shell {
                     cx.defer(move |cx| composer.update(cx, |composer, cx| composer.recording_changed(&recording, cx)));
                 }
                 self.recording_ticking(cx);
+            }
+            Change::People { account } => {
+                for composer in [self.composer_state.main.get(), self.composer_state.thread.get()].into_iter().flatten() {
+                    let (composer, account) = (composer.clone(), account.clone());
+                    cx.defer(move |cx| composer.update(cx, |composer, cx| composer.forget_peer_away_account(&account, cx)));
+                }
+            }
+            Change::Presence { person, .. } => {
+                for composer in [self.composer_state.main.get(), self.composer_state.thread.get()].into_iter().flatten() {
+                    let (composer, person) = (composer.clone(), person.clone());
+                    cx.defer(move |cx| composer.update(cx, |composer, cx| composer.forget_peer_away_person(&person, cx)));
+                }
             }
             _ => {}
         }

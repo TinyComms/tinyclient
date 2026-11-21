@@ -144,6 +144,15 @@ impl WatchSet {
         false
     }
 
+    /// Time remaining before a focused active window becomes idle, or `None` if already unfocused/idle.
+    pub fn idle_remaining(&self, now: Instant) -> Option<Duration> {
+        if !self.focused || !self.active {
+            return None;
+        }
+        let elapsed = self.last_input.map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
+        Some(IDLE_AFTER.saturating_sub(elapsed))
+    }
+
     pub fn conversation(&mut self, conversation: Option<Key>, now: Instant) -> bool {
         if self.conversation == conversation {
             return false;
@@ -294,6 +303,7 @@ type Notify = Rc<dyn Fn(&mut App)>;
 struct Inner {
     watch: WatchSet,
     watch_pending: bool,
+    idle_pending: bool,
     presence: HashMap<Key, Seen>,
     /// Counts the times anyone's presence changed, for lists that group by it.
     presence_rev: u64,
@@ -352,16 +362,7 @@ impl Hub {
             self.schedule(cx);
         }
         if focused {
-            let hub = self.clone();
-            cx.spawn(async move |cx| {
-                cx.background_executor().timer(IDLE_AFTER + Duration::from_secs(1)).await;
-                let _ = cx.update(|cx| {
-                    if hub.0.borrow_mut().watch.check_idle(Instant::now()) {
-                        hub.schedule(cx);
-                    }
-                });
-            })
-            .detach();
+            self.ensure_idle_timer(cx);
         }
     }
 
@@ -370,6 +371,42 @@ impl Hub {
         if self.0.borrow_mut().watch.touch_input(Instant::now()) {
             self.schedule(cx);
         }
+        self.ensure_idle_timer(cx);
+    }
+
+    /// Keeps at most one idle timer task running while the window is focused and active.
+    fn ensure_idle_timer(&self, cx: &mut App) {
+        {
+            let mut inner = self.0.borrow_mut();
+            if inner.idle_pending || inner.watch.idle_remaining(Instant::now()).is_none() {
+                return;
+            }
+            inner.idle_pending = true;
+        }
+        let hub = self.clone();
+        cx.spawn(async move |cx| {
+            loop {
+                let wait = {
+                    let mut inner = hub.0.borrow_mut();
+                    let now = Instant::now();
+                    if inner.watch.check_idle(now) {
+                        inner.idle_pending = false;
+                        drop(inner);
+                        let _ = cx.update(|cx| hub.schedule(cx));
+                        return;
+                    }
+                    match inner.watch.idle_remaining(now) {
+                        Some(rem) => rem + Duration::from_secs(1),
+                        None => {
+                            inner.idle_pending = false;
+                            return;
+                        }
+                    }
+                };
+                cx.background_executor().timer(wait).await;
+            }
+        })
+        .detach();
     }
 
     /// The open conversation, for its typing and member list.

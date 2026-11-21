@@ -61,12 +61,14 @@ pub(super) fn timezone_offset_secs(tz: &str) -> Option<i32> {
         };
         if sign != 0 {
             let digits = &rest[1..];
-            let (h, m) = match digits.split_once(':') {
-                Some((h, m)) => (h.parse::<i32>().ok()?, m.parse::<i32>().ok()?),
-                None => (digits.parse::<i32>().ok()?, 0),
-            };
-            if h <= 14 && m < 60 {
-                return Some(sign * (h * 3600 + m * 60));
+            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit() || b == b':') {
+                let (h, m) = match digits.split_once(':') {
+                    Some((h, m)) => (h.parse::<u32>().ok()?, m.parse::<u32>().ok()?),
+                    None => (digits.parse::<u32>().ok()?, 0),
+                };
+                if (h < 14 && m < 60) || (h == 14 && m == 0) {
+                    return Some(sign * (h as i32 * 3600 + m as i32 * 60));
+                }
             }
         }
     }
@@ -106,16 +108,22 @@ pub(super) fn parse_out_of_office(presence: &Value) -> Option<(String, Option<i6
     let doing_now = presence["activity"].as_str().unwrap_or("");
     let note_obj = &presence["outOfOfficeNote"];
     let settings_obj = &presence["outOfOfficeSettings"];
-    let raw_msg = [
-        note_obj["message"].as_str(),
-        settings_obj["message"].as_str(),
-        settings_obj["outOfOfficeMessage"].as_str(),
-    ]
-    .into_iter()
-    .flatten()
-    .map(|raw| super::html::parse(raw, &Nobody, "").text.trim().to_owned())
-    .find(|s| !s.is_empty());
-    let is_ooo = settings_obj["isOutOfOffice"] == true
+    let settings_active = settings_obj["isOutOfOffice"] == true;
+    let note_msg = note_obj["message"]
+        .as_str()
+        .map(|raw| super::html::parse(raw, &Nobody, "").text.trim().to_owned())
+        .filter(|s| !s.is_empty());
+    let settings_msg = if settings_active {
+        [settings_obj["message"].as_str(), settings_obj["outOfOfficeMessage"].as_str()]
+            .into_iter()
+            .flatten()
+            .map(|raw| super::html::parse(raw, &Nobody, "").text.trim().to_owned())
+            .find(|s| !s.is_empty())
+    } else {
+        None
+    };
+    let raw_msg = note_msg.or(settings_msg);
+    let is_ooo = settings_active
         || presence["calendarData"]["isOutOfOffice"] == true
         || doing_now == "OutOfOffice"
         || raw_msg.is_some();
@@ -124,9 +132,11 @@ pub(super) fn parse_out_of_office(presence: &Value) -> Option<(String, Option<i6
     }
     let until = [
         note_obj["expiry"].as_str(),
-        settings_obj["expirationDateTime"].as_str(),
-        settings_obj["scheduledEndDateTime"]["dateTime"].as_str(),
-        settings_obj["expiry"].as_str(),
+        settings_active.then(|| settings_obj["expirationDateTime"].as_str()).flatten(),
+        settings_active
+            .then(|| settings_obj["scheduledEndDateTime"]["dateTime"].as_str())
+            .flatten(),
+        settings_active.then(|| settings_obj["expiry"].as_str()).flatten(),
     ]
     .into_iter()
     .flatten()
@@ -582,7 +592,15 @@ impl Teams {
     /// Learns a Microsoft Graph user object (`manager` or `directReports` entry) into the local
     /// store so clicking them in the org chart opens their card cleanly.
     fn learn_graph_person(&self, user: &Value) -> Option<protocol::ProfilePerson> {
-        let oid = user["id"].as_str().filter(|s| !s.is_empty())?;
+        if let Some(odata) = user["@odata.type"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            let name = odata.rsplit(['.', '#']).next().unwrap_or(odata);
+            if !name.eq_ignore_ascii_case("user") {
+                return None;
+            }
+        }
+        let oid = user["id"].as_str().map(str::trim).filter(|s| {
+            !s.is_empty() && !s.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '?' | '#'))
+        })?;
         let mri = format!("8:orgid:{oid}");
         let name = user["displayName"].as_str().unwrap_or("").trim().to_owned();
         if name.is_empty() {
@@ -774,6 +792,23 @@ impl Teams {
 
     /// Writes our Exchange/Teams automatic replies setting via Microsoft Graph `PATCH /v1.0/me/mailboxSettings`.
     pub(super) fn set_out_of_office(&self, ooo: &protocol::OutOfOffice) -> Result<protocol::OutOfOffice, Fault> {
+        if ooo.enabled {
+            match (ooo.start, ooo.end) {
+                (Some(_), None) | (None, Some(_)) => {
+                    return Err(Fault::Refused {
+                        status: 400,
+                        message: "Scheduled out-of-office requires both a start and an end time.".to_owned(),
+                    });
+                }
+                (Some(start), Some(end)) if start <= 0 || end <= start => {
+                    return Err(Fault::Refused {
+                        status: 400,
+                        message: "Out-of-office end time must be after start time.".to_owned(),
+                    });
+                }
+                _ => {}
+            }
+        }
         let status = if !ooo.enabled {
             "disabled"
         } else if ooo.start.is_some() && ooo.end.is_some() {
@@ -781,17 +816,23 @@ impl Teams {
         } else {
             "alwaysEnabled"
         };
-        let external_audience = if ooo.enabled && ooo.send_external { "all" } else { "none" };
-        let external_msg = if ooo.send_external {
-            if ooo.external_message.is_empty() { ooo.message.as_str() } else { ooo.external_message.as_str() }
+        let internal_plain: String = ooo.message.trim().chars().take(2000).collect();
+        let external_raw = if ooo.send_external {
+            if ooo.external_message.trim().is_empty() {
+                internal_plain.as_str()
+            } else {
+                ooo.external_message.trim()
+            }
         } else {
             ""
         };
+        let external_plain: String = external_raw.chars().take(2000).collect();
+        let external_audience = if ooo.enabled && ooo.send_external { "all" } else { "none" };
         let mut setting = json!({
             "status": status,
-            "internalReplyMessage": ooo.message,
+            "internalReplyMessage": escape_ooo_html(&internal_plain),
             "externalAudience": external_audience,
-            "externalReplyMessage": external_msg,
+            "externalReplyMessage": escape_ooo_html(&external_plain),
         });
         if let (Some(start), Some(end)) = (ooo.start, ooo.end) {
             if status == "scheduled" {
@@ -805,7 +846,12 @@ impl Teams {
         let saved = if answer["automaticRepliesSetting"].is_object() {
             parse_automatic_replies(&answer["automaticRepliesSetting"])
         } else {
-            ooo.clone()
+            let mut saved = ooo.clone();
+            saved.message = internal_plain;
+            if ooo.send_external {
+                saved.external_message = external_plain;
+            }
+            saved
         };
         let me = self.me();
         if !me.is_empty() {
@@ -957,6 +1003,22 @@ impl super::html::Lookup for Nobody {
     }
 }
 
+/// Escapes plain text before writing Exchange/Graph HTML automatic reply fields.
+fn escape_ooo_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1009,6 +1071,16 @@ mod tests {
         let not_ooo = json!({"activity": "Available", "outOfOfficeSettings": {"isOutOfOffice": false}});
         assert_eq!(parse_out_of_office(&not_ooo), None);
 
+        let disabled_with_saved_msg = json!({
+            "activity": "Available",
+            "outOfOfficeSettings": {
+                "isOutOfOffice": false,
+                "message": "Old saved vacation reply",
+                "expirationDateTime": "2026-10-23T17:00:00Z"
+            }
+        });
+        assert_eq!(parse_out_of_office(&disabled_with_saved_msg), None);
+
         let graph = json!({
             "status": "scheduled",
             "externalAudience": "all",
@@ -1036,6 +1108,10 @@ mod tests {
         assert_eq!(timezone_offset_secs("Europe/Berlin"), Some(3600));
         assert_eq!(timezone_offset_secs("UTC+05:30"), Some(5 * 3600 + 1800));
         assert_eq!(timezone_offset_secs("UTC-8"), Some(-8 * 3600));
+        assert_eq!(timezone_offset_secs("UTC+14:00"), Some(14 * 3600));
+        assert_eq!(timezone_offset_secs("UTC+14:30"), None);
+        assert_eq!(timezone_offset_secs("UTC+-5"), None);
+        assert_eq!(timezone_offset_secs("UTC++5"), None);
         assert_eq!(timezone_offset_secs("Mars/Olympus"), None);
     }
 }

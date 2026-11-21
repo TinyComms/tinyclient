@@ -1021,6 +1021,9 @@ impl Demo {
             Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::GetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetOutOfOffice { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetOutOfOffice { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SpaceTags { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StarredMessages { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)));
             }

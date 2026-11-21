@@ -233,19 +233,22 @@ impl Teams {
     }
 
     /// Best-effort removal of this device's trouter push registration on sign-out.
-    /// Uses a short 3-second timeout so it never stalls chatd's sign-out window.
+    /// Uses a short 3-second timeout and only already-cached tokens so it never stalls sign-out.
     pub(super) fn unregister_push(&self) {
-        let endpoint = {
+        let (endpoint, cached_auth) = {
             let mut state = self.state();
             if state.expired.is_some() {
                 state.endpoint = None;
-                None
-            } else {
-                state.endpoint.take()
+                drop(state);
+                self.ctx.set_note("endpoint", "");
+                return;
             }
-        }
-        .or_else(|| self.ctx.note("endpoint"))
-        .filter(|id| !id.is_empty());
+            let endpoint = state.endpoint.take();
+            let bearer = state.access.get(SPACES).map(|t| t.value.clone());
+            let skype = state.skype.as_ref().map(|t| t.value.clone());
+            (endpoint, bearer.zip(skype))
+        };
+        let endpoint = endpoint.or_else(|| self.ctx.note("endpoint")).filter(|id| !id.is_empty());
         self.ctx.set_note("endpoint", "");
         let Some(endpoint) = endpoint else {
             return;
@@ -254,9 +257,13 @@ impl Teams {
         if !self.ours(&url) {
             return;
         }
-        let Ok(headers) = self.headers(Auth::Both(SPACES)) else {
+        let Some((bearer, skype)) = cached_auth else {
             return;
         };
+        let headers = [
+            ("Authorization", format!("Bearer {bearer}")),
+            ("X-Skypetoken", skype),
+        ];
         let fast: ureq::Agent = crate::adapters::net::apply_proxy(ureq::Agent::config_builder())
             .tls_config(crate::tls::config())
             .timeout_global(Some(Duration::from_secs(3)))

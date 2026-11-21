@@ -5,7 +5,6 @@
 use super::{escaped, id_of, Auth, Body, Fault, Teams, GRAPH, SPACES};
 use protocol::{Key, ProfilePerson, TeamTag};
 use serde_json::{json, Value};
-use std::collections::HashSet;
 
 /// Parses tags from either Teams middle-tier (`/beta/teams/{id}/tags`) or Microsoft Graph
 /// (`/v1.0/teams/{groupId}/tags?$expand=members`) JSON payloads.
@@ -152,15 +151,30 @@ impl Teams {
         };
         let persisted_mine: Vec<String> = {
             let mut state = self.state();
-            state.tags.insert(space.to_owned(), tags.clone());
-            let mut all_mine: HashSet<String> = HashSet::new();
-            for list in state.tags.values() {
-                for tag in list.iter().filter(|t| t.mine) {
-                    all_mine.insert(tag.id.clone());
+            if state.my_tags.is_empty() {
+                if let Some(raw) = self.ctx.note("my_tags").filter(|s| !s.is_empty()) {
+                    if let Ok(ids) = serde_json::from_str::<Vec<String>>(&raw) {
+                        state.my_tags.extend(ids);
+                    }
                 }
             }
-            state.my_tags = all_mine;
-            state.my_tags.iter().cloned().collect()
+            // Only reconcile tags that belong to this team so persisted `my_tags` from other
+            // teams are never wiped before those teams are fetched.
+            if let Some(previous) = state.tags.insert(space.to_owned(), tags.clone()) {
+                for old in previous {
+                    state.my_tags.remove(&old.id);
+                }
+            }
+            for tag in &tags {
+                if tag.mine {
+                    state.my_tags.insert(tag.id.clone());
+                } else {
+                    state.my_tags.remove(&tag.id);
+                }
+            }
+            let mut sorted: Vec<String> = state.my_tags.iter().cloned().collect();
+            sorted.sort();
+            sorted
         };
         self.ctx.set_note("my_tags", &serde_json::to_string(&persisted_mine).unwrap_or_default());
         Ok(tags)
