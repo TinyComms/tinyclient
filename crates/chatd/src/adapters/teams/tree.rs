@@ -708,7 +708,7 @@ impl Teams {
     pub(super) fn mark_activity_for_conversation(&self, thread: &str, message_id: &str) {
         const MAX_ACTIVITY_MARK_BATCH: usize = 10;
         let read_ms = millis(message_id);
-        let matching: Vec<String> = {
+        let mut matching: Vec<(i64, String)> = {
             let state = self.state();
             state
                 .activity_targets
@@ -718,12 +718,31 @@ impl Teams {
                         && !state.activity_read_ids.contains(*act_id)
                         && (mid == message_id || (read_ms > 0 && millis(mid) > 0 && millis(mid) <= read_ms))
                 })
-                .map(|(act_id, _)| act_id.clone())
-                .take(MAX_ACTIVITY_MARK_BATCH)
+                .map(|(act_id, (_, mid))| (millis(mid), act_id.clone()))
                 .collect()
         };
-        for act_id in matching {
-            let _ = self.activity_mark_read(Some(&act_id));
+        matching.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let truncated = matching.len() > MAX_ACTIVITY_MARK_BATCH;
+        for (_, act_id) in matching.iter().take(MAX_ACTIVITY_MARK_BATCH) {
+            let _ = self.activity_mark_read(Some(act_id));
+        }
+        if truncated && read_ms > 0 {
+            let ts = now_ms();
+            let path = format!(
+                "/v1/users/ME/conversations/{}/properties?name=consumptionhorizon",
+                escaped(ACTIVITY)
+            );
+            let body = json!({"consumptionhorizon": format!("{read_ms};{ts};{read_ms}")});
+            let _ = self.chat("PUT", &path, Body::Json(&body), false);
+            let persisted = {
+                let mut state = self.state();
+                state.activity_read_horizon = state.activity_read_horizon.max(read_ms);
+                for (_, act_id) in matching.into_iter().skip(MAX_ACTIVITY_MARK_BATCH) {
+                    state.activity_read_ids.insert(act_id);
+                }
+                state.activity_read_horizon
+            };
+            self.ctx.set_note("activity_read_horizon", &persisted.to_string());
         }
     }
 

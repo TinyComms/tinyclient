@@ -243,16 +243,17 @@ impl Teams {
         let external = if shared {
             "Shared channel".to_owned()
         } else if let Some(peer) = row.as_ref().and_then(|r| r.peer.as_deref()) {
-            self.cached(peer)
-                .filter(|k| k.external)
-                .map(|k| {
+            match self.cached(peer) {
+                Some(k) if k.external => {
                     if !k.tenant_name.is_empty() && !k.tenant_name.eq_ignore_ascii_case("Shared channel") {
                         k.tenant_name
                     } else {
                         "External".to_owned()
                     }
-                })
-                .unwrap_or_default()
+                }
+                Some(k) if k.guest => "Guest".to_owned(),
+                _ => String::new(),
+            }
         } else {
             String::new()
         };
@@ -841,7 +842,7 @@ impl Teams {
     /// Lists saved messages from Teams' personal `48:saved` stream, newest first.
     pub(super) fn saved_messages(&self, conversation: Option<&str>, limit: u32) -> Result<Vec<Message>, Fault> {
         let count = limit.clamp(1, protocol::PAGE_LIMIT);
-        let (items, _) = self.page(SAVED_STREAM, count, "startTime=1")?;
+        let (items, cursor) = self.page(SAVED_STREAM, count, "startTime=1")?;
         let filter_thread = conversation.map(thread_of);
         let mut out = Vec::new();
         let mut saved_ids = Vec::new();
@@ -894,7 +895,10 @@ impl Teams {
         }
         {
             let mut state = self.state();
-            if filter_thread.is_none() {
+            // One page is not the whole Later list. Replace the saved-id set only when
+            // Teams says this page is the entire stream.
+            let complete = cursor.is_empty() && (items.len() as u32) < count;
+            if filter_thread.is_none() && complete {
                 state.saved_ids = saved_ids.into_iter().collect();
             } else {
                 for id in saved_ids {
