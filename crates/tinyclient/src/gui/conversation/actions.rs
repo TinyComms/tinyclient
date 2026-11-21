@@ -115,6 +115,8 @@ pub struct Can {
     pub thread: bool,
     pub edit: bool,
     pub delete: bool,
+    /// Google Messages: message can be starred/unstarred.
+    pub star: bool,
     /// Never left: deleting it is local, and it can be sent again.
     pub unsent: bool,
 }
@@ -177,6 +179,7 @@ pub fn can_in(
         thread: !in_thread && ((sent && message.thread.is_some()) || starts_thread(message, network, kind)),
         edit: sent && own && !message.saved_history && messages_rcs && in_window,
         delete: own && network != Network::Messages,
+        star: act && network == Network::Messages,
         unsent: !sent && message.outgoing,
     }
 }
@@ -253,6 +256,8 @@ enum MenuAct {
     SaveAs,
     /// This message becomes the first unread one.
     Unread,
+    /// Star or unstar a message (Google Messages).
+    Star,
     /// A sent message: ask, unless the click held Shift.
     Delete,
 }
@@ -305,6 +310,9 @@ fn menu_acts(
     }
     if !can.unsent {
         acts.push(MenuAct::Unread);
+    }
+    if can.star {
+        acts.push(MenuAct::Star);
     }
     if can.delete {
         acts.push(MenuAct::Delete);
@@ -835,6 +843,16 @@ impl Pane {
                 }
             }
             MenuAct::Unread => self.mark_message_unread(&message, cx),
+            MenuAct::Star => {
+                if let Some(conversation) = self.key().cloned() {
+                    let request = Request::StarMessage {
+                        conversation,
+                        message_id: message.id.clone(),
+                        starred: !message.starred,
+                    };
+                    cx.background_executor().spawn(async move { let _ = ask(&request); }).detach();
+                }
+            }
             MenuAct::Delete => self.delete(&message, at_once, window, cx),
         }
     }
@@ -1191,6 +1209,14 @@ impl Pane {
                     menu_item("unread", Some("icons/mail.svg"), "Mark unread", None)
                         .when(lit(MenuAct::Unread), |row| row.bg(theme::selected()))
                         .on_click(go(MenuAct::Unread)),
+                );
+            }
+            if can.star {
+                let label = if message.starred { "Unstar message" } else { "Star message" };
+                items = items.child(
+                    menu_item("star", Some("icons/star.svg"), label, None)
+                        .when(lit(MenuAct::Star), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::Star)),
                 );
             }
             if can.delete {

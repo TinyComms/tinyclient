@@ -370,6 +370,13 @@ pub enum Command {
     /// before answering, and only after the network has it. Answer `Err` to leave the local flag
     /// as it was. Networks that do not serve this never receive it: their star stays local.
     Star { conversation_id: String, starred: bool, reply: Reply<()> },
+    /// Star or unstar one message on the network (Google Messages).
+    StarMessage {
+        conversation_id: String,
+        message_id: String,
+        starred: bool,
+        reply: Reply<()>,
+    },
     /// Accept or decline/ignore a message request (Discord).
     AnswerMessageRequest { conversation_id: String, accept: bool, reply: Reply<()> },
     /// Leave a group conversation. Report it gone through [`Context::conversation_gone`].
@@ -486,7 +493,8 @@ impl Command {
             | Command::Leave { reply, .. }
             | Command::CloseDirect { reply, .. }
             | Command::ClearHistory { reply, .. }
-            | Command::Star { reply, .. } => {
+            | Command::Star { reply, .. }
+            | Command::StarMessage { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::Pinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

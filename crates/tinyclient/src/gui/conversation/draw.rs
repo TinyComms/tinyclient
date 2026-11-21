@@ -1083,6 +1083,17 @@ impl Pane {
                     .child(icon(Icon::Pin, 12., theme::text_faint()))
                     .child("Pinned")
             }))
+            .children(message.starred.then(|| {
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .type_micro()
+                    .text_color(theme::text_faint())
+                    .child("★")
+                    .child("Starred")
+            }))
     }
 
     // Words.

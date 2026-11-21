@@ -2574,6 +2574,32 @@ impl Chat {
                 self.act(&conversation, |conversation_id, reply| Command::AnswerMessageRequest { conversation_id, accept, reply })
             }
             Request::Pinned { conversation } => self.pinned(conversation),
+            Request::StarMessage { conversation, message_id, starred } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::StarMessage {
+                    conversation_id: conversation.id.clone(),
+                    message_id,
+                    starred,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::StarredMessages { account, conversation, limit } => {
+                let conv_id = conversation.as_ref().map(|c| c.id.clone());
+                let key = conversation.unwrap_or_else(|| Key::new(&account, ""));
+                match self.hub.store().starred_messages(&account, conv_id.as_deref(), limit) {
+                    Ok(mut messages) => {
+                        messages.iter_mut().for_each(Message::bound);
+                        Response::Pinned { conversation: key, messages }
+                    }
+                    Err(err) => internal(err),
+                }
+            }
             Request::Shared { conversation, kind, before, limit, search } => self.shared(conversation, kind, before, limit, search),
             Request::Relate { person, action } => self.relate(person, action),
             Request::SetPresence { account, presence, status } => self.set_presence(account, presence, status),

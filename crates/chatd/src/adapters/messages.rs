@@ -167,6 +167,7 @@ trait Drive: Send + Sync {
     fn typing(&self, conversation: &str) -> Result<(), String>;
     fn delete_message(&self, message: &str) -> Result<(), String>;
     fn edit_message(&self, conversation: &str, message: &str, text: &str) -> Result<(), String>;
+    fn star_message(&self, conversation: &str, message: &str, starred: bool) -> Result<(), String>;
     fn delete_conversation(&self, conversation: &str) -> Result<(), String>;
     fn unpair(&self) -> Result<(), String>;
     fn block(&self, conversation: &str) -> Result<(), String>;
@@ -258,6 +259,9 @@ impl Drive for LiveDrive {
     }
     fn edit_message(&self, conversation: &str, message: &str, text: &str) -> Result<(), String> {
         self.inner.edit_message(conversation, message, text)
+    }
+    fn star_message(&self, conversation: &str, message: &str, starred: bool) -> Result<(), String> {
+        self.inner.star_message(conversation, message, starred)
     }
     fn delete_conversation(&self, conversation: &str) -> Result<(), String> {
         self.inner.delete_conversation(conversation)
@@ -1259,6 +1263,7 @@ fn message(account: &Account, note: &bugle::Note, page: &[bugle::Note]) -> Messa
     message.sender.id = author.to_owned();
     message.edited = note.edited;
     message.edited_at = note.edited_at;
+    message.starred = note.starred;
     if !note.reply.is_empty() {
         message.reply_to = Some(quoted(account, &note.conversation, &note.reply, page));
     }
@@ -1863,6 +1868,31 @@ fn serve(account: &Arc<Account>, command: Command) {
             let answer = edit_message(account, &conversation_id, &message_id, text);
             let _ = reply.send(answer);
         }
+        Command::StarMessage {
+            conversation_id,
+            message_id,
+            starred,
+            reply,
+        } => {
+            let answer = star_message(account, &conversation_id, &message_id, starred);
+            let _ = reply.send(answer);
+        }
+        Command::Pinned {
+            conversation_id,
+            reply,
+        } => {
+            let answer = account
+                .ctx
+                .hub
+                .store()
+                .starred_messages(
+                    &account.ctx.account,
+                    Some(&conversation_id),
+                    protocol::PINNED_LIMIT as u32,
+                )
+                .map_err(|err| Refusal::Refused(err.to_string()));
+            let _ = reply.send(answer);
+        }
         Command::Delete {
             conversation_id,
             message_id,
@@ -1994,6 +2024,25 @@ fn edit_message(
     stored.text = text;
     stored.edited = true;
     stored.edited_at = Some(now);
+    let _ = account.ctx.message(conversation, &stored);
+    Ok(())
+}
+
+fn star_message(
+    account: &Account,
+    conversation: &str,
+    message_id: &str,
+    starred: bool,
+) -> Result<(), Refusal> {
+    let Some(mut stored) = account.ctx.stored_message(conversation, message_id).ok().flatten() else {
+        return Err(Refusal::Refused("Messages could not find that message.".into()));
+    };
+    let remote_id = phone_copy(account, message_id).unwrap_or_else(|| message_id.to_owned());
+    account
+        .drive
+        .star_message(conversation, &remote_id, starred)
+        .map_err(Refusal::Refused)?;
+    stored.starred = starred;
     let _ = account.ctx.message(conversation, &stored);
     Ok(())
 }

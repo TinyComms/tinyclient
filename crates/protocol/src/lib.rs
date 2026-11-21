@@ -1068,6 +1068,10 @@ pub struct MessageReminder {
     pub due: i64,
 }
 
+fn default_starred_limit() -> u32 {
+    50
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -1121,6 +1125,21 @@ pub enum Request {
     Star {
         conversation: Key,
         starred: bool,
+    },
+    /// Star or unstar one message on the network (Google Messages).
+    StarMessage {
+        conversation: Key,
+        message_id: String,
+        starred: bool,
+    },
+    /// Starred messages across an account (or one conversation when set), newest first.
+    /// Answers `Response::Pinned { messages }`.
+    StarredMessages {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation: Option<Key>,
+        #[serde(default = "default_starred_limit")]
+        limit: u32,
     },
     /// Puts a reminder on one message, to be told about it when the time comes, or takes it
     /// back with `remind_at: None`. Local: nothing goes to any network. A time already past is

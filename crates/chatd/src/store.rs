@@ -3049,6 +3049,58 @@ impl Store {
             .optional()
     }
 
+    /// Starred messages for an account (or one conversation when set), newest first.
+    pub fn starred_messages(
+        &self,
+        account: &AccountKey,
+        conversation: Option<&str>,
+        limit: u32,
+    ) -> rusqlite::Result<Vec<Message>> {
+        let cap = limit.clamp(1, 200) as i64;
+        let now = crate::hub::now();
+        let mut out = Vec::new();
+        if let Some(conv) = conversation {
+            let mut stmt = self.db.prepare(
+                "SELECT id, text, body FROM message
+                 WHERE network = ?1 AND account = ?2 AND conversation = ?3
+                   AND body LIKE '%\"starred\":true%'
+                   AND (expires IS NULL OR expires > ?4)
+                 ORDER BY sent DESC, id DESC
+                 LIMIT ?5",
+            )?;
+            let rows = stmt.query_map(
+                params![word(&account.network), &account.account, conv, now, cap],
+                message_from,
+            )?;
+            for row in rows {
+                let msg = row?;
+                if msg.starred && !msg.deleted {
+                    out.push(msg);
+                }
+            }
+        } else {
+            let mut stmt = self.db.prepare(
+                "SELECT id, text, body FROM message
+                 WHERE network = ?1 AND account = ?2
+                   AND body LIKE '%\"starred\":true%'
+                   AND (expires IS NULL OR expires > ?3)
+                 ORDER BY sent DESC, id DESC
+                 LIMIT ?4",
+            )?;
+            let rows = stmt.query_map(
+                params![word(&account.network), &account.account, now, cap],
+                message_from,
+            )?;
+            for row in rows {
+                let msg = row?;
+                if msg.starred && !msg.deleted {
+                    out.push(msg);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// True if it was there. A message with a thread hanging off it stays as a tombstone, and
     /// every stored reply to the message says its original is gone. The preview is left to the
     /// next message.

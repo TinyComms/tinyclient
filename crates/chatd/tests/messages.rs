@@ -2012,3 +2012,78 @@ fn link_previews_unfurl_for_known_contacts_and_skip_unknown_numbers_and_spam() {
     sleep(Duration::from_millis(250));
     assert_eq!(hits.load(Ordering::SeqCst), hits_after_known, "spam conversation must never unfurl links");
 }
+
+#[test]
+fn messages_can_be_starred_unstarred_and_listed_under_starred() {
+    let world = World::linked();
+    world.connected();
+
+    // 1. Incoming starred message carries `starred == true` and appears in Pinned (Starred tab)
+    //    and account-wide StarredMessages.
+    world.steer("starred grace m-star-1 Gate code is 1234");
+    let incoming = world.arrived(GRACE, "Gate code is 1234");
+    assert!(incoming.starred, "incoming starred message must set starred=true");
+
+    match world.ask(Request::Pinned {
+        conversation: key(GRACE),
+    }) {
+        Response::Pinned { messages, .. } => {
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].id, "m-star-1");
+            assert!(messages[0].starred);
+        }
+        other => panic!("expected Pinned/Starred response, got {other:?}"),
+    }
+
+    match world.ask(Request::StarredMessages {
+        account: account(),
+        conversation: None,
+        limit: 50,
+    }) {
+        Response::Pinned { messages, .. } => {
+            assert!(messages.iter().any(|m| m.id == "m-star-1"));
+        }
+        other => panic!("expected StarredMessages response, got {other:?}"),
+    }
+
+    // 2. Starring an ordinary message via Request::StarMessage calls the phone and adds it to Starred.
+    world.steer("incoming grace Remember milk");
+    let plain = world.arrived(GRACE, "Remember milk");
+    assert!(!plain.starred);
+    assert_eq!(
+        world.ask(Request::StarMessage {
+            conversation: key(GRACE),
+            message_id: plain.id.clone(),
+            starred: true,
+        }),
+        Response::Ok
+    );
+    world.heard(&format!("star {GRACE} {} 1", plain.id));
+    let starred_plain = world.until("starred flag persisted", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == plain.id && m.starred)
+    });
+    assert!(starred_plain.starred);
+
+    // 3. Unstarring removes it from Starred.
+    assert_eq!(
+        world.ask(Request::StarMessage {
+            conversation: key(GRACE),
+            message_id: plain.id.clone(),
+            starred: false,
+        }),
+        Response::Ok
+    );
+    world.heard(&format!("star {GRACE} {} 0", plain.id));
+    match world.ask(Request::Pinned {
+        conversation: key(GRACE),
+    }) {
+        Response::Pinned { messages, .. } => {
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].id, "m-star-1");
+        }
+        other => panic!("expected Pinned/Starred response, got {other:?}"),
+    }
+}

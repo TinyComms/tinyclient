@@ -342,6 +342,7 @@ fn note(
         reply: String::new(),
         edited: false,
         edited_at: None,
+        starred: false,
     }
 }
 
@@ -574,6 +575,16 @@ fn steer(line: &str) -> Vec<Event> {
             updated.edited = true;
             updated.edited_at = Some(crate::hub::now());
             vec![Event::Message(updated)]
+        }
+        "starred" => {
+            let Some((author, name)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let id = words.next().unwrap_or("m-starred").to_owned();
+            let text = rest(3);
+            let mut starred = note(author, name, author, &id, &text, false, Vec::new(), Vec::new());
+            starred.starred = true;
+            vec![Event::Message(starred)]
         }
         "old-mine" => {
             let Some((author, _)) = who(words.next().unwrap_or("")) else {
@@ -1178,6 +1189,14 @@ impl Drive for Fake {
             return Err(words);
         }
         record(&format!("edit {conversation} {message} {text}"));
+        Ok(())
+    }
+    fn star_message(&self, conversation: &str, message: &str, starred: bool) -> Result<(), String> {
+        self.unanswered()?;
+        if let Some(words) = self.refusal() {
+            return Err(words);
+        }
+        record(&format!("star {conversation} {message} {}", u8::from(starred)));
         Ok(())
     }
     fn delete_conversation(&self, conversation: &str) -> Result<(), String> {

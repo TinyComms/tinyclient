@@ -1259,6 +1259,8 @@ pub struct Note {
     pub edited: bool,
     /// Unix seconds when the message was edited, if reported by the phone.
     pub edited_at: Option<i64>,
+    /// `Message.isStarred`, field 24.
+    pub starred: bool,
 }
 
 /// What the other side did with one of my messages, as far as the phone knows.
@@ -2200,6 +2202,11 @@ impl Session {
         refused(&bytes)
     }
 
+    pub fn star_message(&self, conversation: &str, message: &str, starred: bool) -> Result<(), String> {
+        let bytes = self.rpc(48, &star_message_request(conversation, message, starred), 2)?;
+        refused(&bytes)
+    }
+
     pub fn delete_conversation(&self, conversation: &str) -> Result<(), String> {
         let bytes = self.rpc(15, &delete_conversation_request(conversation), 2)?;
         refused(&bytes)
@@ -3051,6 +3058,7 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
             .map(|field| field_text(&fields(&field.bytes), 1))
             .unwrap_or_default();
         let (edited, edited_at) = decode_edit_status(&msg);
+        let starred = field_int(&msg, 24) != 0;
         if text.is_empty()
             && file
             && pieces
@@ -3086,6 +3094,7 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
             reply,
             edited,
             edited_at,
+            starred,
         });
     }
     notes
@@ -3130,6 +3139,14 @@ fn edit_message_request(conversation: &str, message: &str, text: &str) -> Vec<u8
     req.text(1, conversation);
     req.text(2, message);
     req.msg(3, &info.0);
+    req.0
+}
+
+fn star_message_request(conversation: &str, message: &str, starred: bool) -> Vec<u8> {
+    let mut req = Buf::new();
+    req.text(1, conversation);
+    req.text(2, message);
+    req.int(3, u64::from(starred));
     req.0
 }
 
@@ -3836,5 +3853,28 @@ mod tests {
         ));
         assert_eq!(field_text(&group, 3), "Weekend");
         assert_eq!(field_int(&group, 4), 1);
+    }
+
+    #[test]
+    fn starred_flag_decodes_and_star_request_encodes() {
+        let mut msg = Buf::new();
+        msg.text(1, "m-star");
+        msg.text(7, "c1");
+        msg.int(24, 1);
+        let mut words = Buf::new();
+        words.text(1, "Keep this");
+        let mut info = Buf::new();
+        info.msg(2, &words.0);
+        msg.msg(10, &info.0);
+        let mut wrap = Buf::new();
+        wrap.msg(1, &msg.0);
+        let notes = decode_messages(&wrap.0);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].starred);
+
+        let req = fields(&star_message_request("c1", "m-star", true));
+        assert_eq!(field_text(&req, 1), "c1");
+        assert_eq!(field_text(&req, 2), "m-star");
+        assert_eq!(field_int(&req, 3), 1);
     }
 }
