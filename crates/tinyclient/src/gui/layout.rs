@@ -908,6 +908,57 @@ impl Shell {
                     .as_ref()
                     .and_then(|s| s.accounts.iter().find(|a| a.key == conversation.key.account()).map(|a| a.can))
                     .unwrap_or_default();
+                if super::people::can_pin_on_network(conversation, &can) {
+                    let net_pin_key = conversation.key.clone();
+                    let next_pin = conversation.pin.is_none();
+                    let words = super::people::network_pin_label(conversation);
+                    items.push(
+                        menu_item("network-pin", Some("icons/pin.svg"), words, None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.file_conversation(net_pin_key.clone(), Some(next_pin), None, None, None, cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
+                if super::people::can_archive(conversation, &can) {
+                    let arch_key = conversation.key.clone();
+                    let next_archived = !conversation.archived;
+                    let words = if conversation.archived { "Unarchive" } else { "Archive" };
+                    items.push(
+                        menu_item("archive", Some("icons/folder.svg"), words, None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.file_conversation(arch_key.clone(), None, Some(next_archived), None, None, cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
+                if super::people::can_edit_folders(conversation, &can) {
+                    let acct = conversation.key.account();
+                    for (ix, folder) in self.sidebar_state.home.folders.iter().filter(|f| f.key.account() == acct).enumerate() {
+                        let in_folder = conversation.folders.contains(&folder.key.id);
+                        let folder_id = folder.key.id.clone();
+                        let row_key = conversation.key.clone();
+                        let label = if in_folder {
+                            format!("Remove from {}", folder.name)
+                        } else {
+                            format!("Add to {}", folder.name)
+                        };
+                        items.push(
+                            menu_item(SharedString::from(format!("folder-toggle-{ix}")), Some("icons/folder.svg"), label, None)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    if in_folder {
+                                        this.file_conversation(row_key.clone(), None, None, None, Some(folder_id.clone()), cx);
+                                    } else {
+                                        this.file_conversation(row_key.clone(), None, None, Some(folder_id.clone()), None, cx);
+                                    }
+                                }))
+                                .into_any_element(),
+                        );
+                    }
+                }
                 if super::people::can_close_direct(conversation, &can) {
                     let closed = conversation.key.clone();
                     items.push(
@@ -1099,6 +1150,53 @@ impl Shell {
             .as_ref()
             .and_then(|s| s.accounts.iter().find(|a| a.key == key.account()).map(|a| a.can))
             .unwrap_or_default();
+        if super::people::can_pin_on_network(&row, &can) {
+            let net_pin_key = key.clone();
+            let next_pin = row.pin.is_none();
+            let words = super::people::network_pin_label(&row);
+            items.push(act(
+                "row-network-pin",
+                "icons/pin.svg",
+                words.into(),
+                Box::new(move |this, cx| this.file_conversation(net_pin_key.clone(), Some(next_pin), None, None, None, cx)),
+            ));
+        }
+        if super::people::can_archive(&row, &can) {
+            let arch_key = key.clone();
+            let next_archived = !row.archived;
+            let words = if row.archived { "Unarchive" } else { "Archive" };
+            items.push(act(
+                "row-archive",
+                "icons/folder.svg",
+                words.into(),
+                Box::new(move |this, cx| this.file_conversation(arch_key.clone(), None, Some(next_archived), None, None, cx)),
+            ));
+        }
+        if super::people::can_edit_folders(&row, &can) {
+            let acct = key.account();
+            for (ix, folder) in self.sidebar_state.home.folders.iter().filter(|f| f.key.account() == acct).enumerate() {
+                let in_folder = row.folders.contains(&folder.key.id);
+                let folder_id = folder.key.id.clone();
+                let row_key = key.clone();
+                let label = if in_folder {
+                    format!("Remove from {}", folder.name)
+                } else {
+                    format!("Add to {}", folder.name)
+                };
+                items.push(
+                    menu_item(SharedString::from(format!("row-folder-toggle-{ix}")), Some("icons/folder.svg"), label, None)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            if in_folder {
+                                this.file_conversation(row_key.clone(), None, None, None, Some(folder_id.clone()), cx);
+                            } else {
+                                this.file_conversation(row_key.clone(), None, None, Some(folder_id.clone()), None, cx);
+                            }
+                        }))
+                        .into_any_element(),
+                );
+            }
+        }
         let close = super::people::can_close_direct(&row, &can);
         let clear = super::people::can_clear_history(&row, &can);
         if close || clear || leave {

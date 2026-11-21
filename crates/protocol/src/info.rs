@@ -351,6 +351,16 @@ pub struct Capabilities {
     /// (`Request::ClearHistory`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub clear_history: bool,
+    /// Most chats this account may pin on the network (`Request::File`). 0: cannot pin.
+    /// Telegram allows 5 without Premium and 10 with Premium.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pin_chats: u32,
+    /// This account supports archiving and unarchiving conversations on the network (`Request::File`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub archive: bool,
+    /// This account supports adding and removing conversations from folders (`Request::File`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub folders_edit: bool,
 }
 
 impl Capabilities {

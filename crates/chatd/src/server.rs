@@ -2463,6 +2463,19 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
+            Request::File { conversation, pinned, archived, folder_add, folder_remove } => {
+                if pinned.is_none() && archived.is_none() && folder_add.is_none() && folder_remove.is_none() {
+                    return Response::Ok;
+                }
+                self.act(&conversation, |conversation_id, reply| Command::File {
+                    conversation_id,
+                    pinned,
+                    archived,
+                    folder_add,
+                    folder_remove,
+                    reply,
+                })
+            }
             Request::Remind { conversation, message_id, remind_at } => {
                 if !self.shows(&conversation.account()) {
                     return error(ErrorCode::NotFound, "signed out");
@@ -4055,5 +4068,116 @@ mod tests {
     #[test]
     fn a_text_sent_while_offline_waits_and_a_late_one_fails_instead_of_going() {
         assert_eq!(super::prove_offline_queue(), Ok(()));
+    }
+
+    #[test]
+    fn filing_a_conversation_moves_it_to_archive_and_back() {
+        use crate::adapters::{self, Command};
+        use crate::hub::lock;
+        use crate::store::{ConversationRow, Filing, Store};
+        use protocol::{AccountKey, ConversationKind, Key, Link, Network, Request, Response, Shelf};
+        use std::sync::Arc;
+
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let chat = Arc::new(super::Chat::new(store));
+        let account = AccountKey { network: Network::Telegram, account: "tg".into() };
+        let conv = Key::new(&account, "u:42");
+        let (adapter, ctx, rx) = adapters::local(account.clone(), Arc::clone(&chat.hub));
+        lock(&chat.adapters).insert(account.clone(), adapter);
+        chat.hub.set_link(&account, Link::Connected, "");
+        ctx.conversation(&ConversationRow::new("u:42", ConversationKind::Direct, "Mara"))
+        .unwrap();
+
+        let worker_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || {
+            for cmd in rx {
+                match cmd {
+                    Command::File { conversation_id, pinned, archived, folder_add, folder_remove, reply } => {
+                        let row = worker_ctx.known(&conversation_id).unwrap().unwrap();
+                        let mut folders = row.folders;
+                        if let Some(f) = folder_add {
+                            if !folders.contains(&f) {
+                                folders.push(f);
+                            }
+                        }
+                        if let Some(f) = folder_remove {
+                            folders.retain(|x| x != &f);
+                        }
+                        let filing = Filing {
+                            folders,
+                            archived: archived.unwrap_or(row.archived),
+                            pin: match pinned {
+                                Some(true) => Some(0),
+                                Some(false) => None,
+                                None => row.pin,
+                            },
+                            hidden: row.hidden,
+                            followed: row.followed,
+                        };
+                        worker_ctx.filing(&conversation_id, &filing).unwrap();
+                        let _ = reply.send(Ok(()));
+                    }
+                    Command::Stop => break,
+                    other => other.unsupported(&worker_ctx),
+                }
+            }
+        });
+
+        // Archive moves the chat from Main to Archive shelf.
+        assert_eq!(
+            chat.handle(Request::File {
+                conversation: conv.clone(),
+                pinned: None,
+                archived: Some(true),
+                folder_add: None,
+                folder_remove: None,
+            }),
+            Response::Ok
+        );
+        let Response::Conversations { conversations: main_rows, .. } = chat.handle(Request::Home {
+            network: Network::Telegram,
+            account: Some(account.clone()),
+            folder: None,
+            shelf: Shelf::Main,
+            offset: 0,
+            limit: 50,
+        }) else {
+            panic!("expected Conversations");
+        };
+        assert!(main_rows.is_empty(), "archived chat must leave Main shelf");
+        let Response::Conversations { conversations: arch_rows, .. } = chat.handle(Request::Home {
+            network: Network::Telegram,
+            account: Some(account.clone()),
+            folder: None,
+            shelf: Shelf::Archive,
+            offset: 0,
+            limit: 50,
+        }) else {
+            panic!("expected Conversations");
+        };
+        assert_eq!(arch_rows.len(), 1);
+        assert!(arch_rows[0].archived);
+
+        // Unarchive + pin + add to folder brings it back pinned and filed.
+        assert_eq!(
+            chat.handle(Request::File {
+                conversation: conv.clone(),
+                pinned: Some(true),
+                archived: Some(false),
+                folder_add: Some("work".into()),
+                folder_remove: None,
+            }),
+            Response::Ok
+        );
+        let Response::Conversation { conversation: row } = chat.handle(Request::Conversation { conversation: conv }) else {
+            panic!("expected Conversation");
+        };
+        assert!(!row.archived);
+        assert_eq!(row.pin, Some(0));
+        assert_eq!(row.folders, vec!["work".to_owned()]);
+
+        lock(&chat.adapters).remove(&account);
+        drop(ctx);
+        let _ = worker.join();
     }
 }

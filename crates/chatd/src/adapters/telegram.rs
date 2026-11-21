@@ -820,6 +820,12 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::ClearHistory { conversation_id, delete_chat, revoke, reply } => {
             let _ = reply.send(info::clear_history(account, &conversation_id, delete_chat, revoke).map_err(refused));
         }
+        Command::File { conversation_id, pinned, archived, folder_add, folder_remove, reply } => {
+            let _ = reply.send(
+                filing::file(account, &conversation_id, pinned, archived, folder_add.as_deref(), folder_remove.as_deref())
+                    .map_err(refused),
+            );
+        }
         Command::Pinned { conversation_id, reply } => {
             let _ = reply.send(info::pinned(account, &conversation_id).map_err(refused));
         }

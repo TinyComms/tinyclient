@@ -336,6 +336,9 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         revisions: false,
         close_direct: false,
         clear_history: true,
+        pin_chats: if premium { 10 } else { 5 },
+        archive: true,
+        folders_edit: true,
     }
 }
 

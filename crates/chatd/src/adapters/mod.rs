@@ -364,6 +364,16 @@ pub enum Command {
     /// before answering, and only after the network has it. Answer `Err` to leave the local flag
     /// as it was. Networks that do not serve this never receive it: their star stays local.
     Star { conversation_id: String, starred: bool, reply: Reply<()> },
+    /// File a conversation on the network: pin/unpin, archive/unarchive, or add/remove a folder.
+    /// Report the new filing through [`Context::filing`] before answering.
+    File {
+        conversation_id: String,
+        pinned: Option<bool>,
+        archived: Option<bool>,
+        folder_add: Option<String>,
+        folder_remove: Option<String>,
+        reply: Reply<()>,
+    },
     /// Accept or decline/ignore a message request (Discord).
     AnswerMessageRequest { conversation_id: String, accept: bool, reply: Reply<()> },
     /// Leave a group conversation. Report it gone through [`Context::conversation_gone`].
@@ -476,7 +486,8 @@ impl Command {
             | Command::Leave { reply, .. }
             | Command::CloseDirect { reply, .. }
             | Command::ClearHistory { reply, .. }
-            | Command::Star { reply, .. } => {
+            | Command::Star { reply, .. }
+            | Command::File { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::Pinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

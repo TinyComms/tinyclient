@@ -638,6 +638,31 @@ pub fn can_clear_history(conversation: &Conversation, can: &protocol::Capabiliti
     can.clear_history && !conversation.read_only
 }
 
+/// A conversation whose account lets the user pin/unpin it on the network (`Request::File`).
+pub fn can_pin_on_network(conversation: &Conversation, can: &protocol::Capabilities) -> bool {
+    can.pin_chats > 0 && conversation.space.is_none()
+}
+
+/// A conversation whose account lets the user archive/unarchive it on the network (`Request::File`).
+pub fn can_archive(conversation: &Conversation, can: &protocol::Capabilities) -> bool {
+    can.archive && conversation.space.is_none()
+}
+
+/// A conversation whose account lets the user add/remove it from network folders (`Request::File`).
+pub fn can_edit_folders(conversation: &Conversation, can: &protocol::Capabilities) -> bool {
+    can.folders_edit && conversation.space.is_none()
+}
+
+/// Menu label for the network-side pin action, kept distinct from Inbox Star.
+pub fn network_pin_label(conversation: &Conversation) -> String {
+    let label = conversation.key.network.label();
+    if conversation.pin.is_some() {
+        format!("Unpin on {label}")
+    } else {
+        format!("Pin on {label}")
+    }
+}
+
 /// A group DM, or a Telegram group or channel: the user can leave it from the pane.
 pub fn can_leave(conversation: &Conversation) -> bool {
     // A linked Signal device and paired Messages cannot leave a group. The item stays off until they can.
@@ -1103,6 +1128,20 @@ mod tests {
         assert!(can_close_direct(&row(Network::Discord, ConversationKind::Direct), &dc_caps));
         assert!(can_clear_history(&row(Network::Telegram, ConversationKind::Direct), &tg_caps));
         assert!(!can_clear_history(&row(Network::Discord, ConversationKind::Direct), &dc_caps));
+
+        let tg_file = protocol::Capabilities { pin_chats: 5, archive: true, folders_edit: true, ..Default::default() };
+        let tg_dm = row(Network::Telegram, ConversationKind::Direct);
+        let mut tg_pinned = tg_dm.clone();
+        tg_pinned.pin = Some(0);
+        let mut dc_chan = row(Network::Discord, ConversationKind::Channel);
+        dc_chan.space = Some("srv".into());
+        assert!(can_pin_on_network(&tg_dm, &tg_file));
+        assert!(can_archive(&tg_dm, &tg_file));
+        assert!(can_edit_folders(&tg_dm, &tg_file));
+        assert!(!can_pin_on_network(&tg_dm, &dc_caps));
+        assert!(!can_archive(&dc_chan, &tg_file), "channel inside a space is not archived via home filing");
+        assert_eq!(network_pin_label(&tg_dm), "Pin on Telegram");
+        assert_eq!(network_pin_label(&tg_pinned), "Unpin on Telegram");
     }
 
     #[test]

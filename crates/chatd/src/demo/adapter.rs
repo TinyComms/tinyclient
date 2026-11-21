@@ -741,6 +741,35 @@ impl Demo {
             Command::Source { reply, .. } => {
                 let _ = reply.send(Err(Refusal::Unsupported));
             }
+            Command::File { conversation_id, pinned, archived, folder_add, folder_remove, reply } => {
+                let outcome = match demo.ctx.known(&conversation_id) {
+                    Ok(Some(row)) => {
+                        let mut folders = row.folders;
+                        if let Some(f) = folder_add {
+                            if !folders.contains(&f) {
+                                folders.push(f);
+                            }
+                        }
+                        if let Some(f) = folder_remove {
+                            folders.retain(|x| x != &f);
+                        }
+                        let filing = crate::store::Filing {
+                            folders,
+                            archived: archived.unwrap_or(row.archived),
+                            pin: match pinned {
+                                Some(true) => Some(0),
+                                Some(false) => None,
+                                None => row.pin,
+                            },
+                            hidden: row.hidden,
+                            followed: row.followed,
+                        };
+                        demo.ctx.filing(&conversation_id, &filing).map_err(|err| Refusal::Refused(err.to_string()))
+                    }
+                    _ => Err(Refusal::Refused("no such conversation".to_owned())),
+                };
+                let _ = reply.send(outcome);
+            }
             // Nothing is behind these: what is stored is all there is.
             Command::Backfill(_)
             | Command::Warm(_)

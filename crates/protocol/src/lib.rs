@@ -1121,6 +1121,20 @@ pub enum Request {
         conversation: Key,
         starred: bool,
     },
+    /// Files a conversation on the network: pins or unpins it, archives or unarchives it,
+    /// or adds or removes it from a folder. Unset fields are left alone. The new filing is
+    /// reported back through the row's `Conversation` change and `Folders` change.
+    File {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pinned: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        archived: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder_add: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder_remove: Option<String>,
+    },
     /// Puts a reminder on one message, to be told about it when the time comes, or takes it
     /// back with `remind_at: None`. Local: nothing goes to any network. A time already past is
     /// refused, and a message that is not in the cache has nothing to remind about.
@@ -2720,6 +2734,39 @@ mod tests {
             assert!(!json.contains(absent), "{absent} in {json}");
         }
         assert_eq!(serde_json::from_str::<Message>(&json).unwrap(), message);
+    }
+
+    #[test]
+    fn file_request_and_capabilities_round_trip() {
+        let key = Key::new(&AccountKey { network: Network::Telegram, account: "a".into() }, "u:1");
+        let req = Request::File {
+            conversation: key.clone(),
+            pinned: Some(true),
+            archived: Some(false),
+            folder_add: Some("2".into()),
+            folder_remove: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("folder_remove"), "{json}");
+        assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), req);
+
+        // Minimal request with only archived set leaves other fields None.
+        let minimal: Request = serde_json::from_str(&format!(
+            r#"{{"op":"file","conversation":{},"archived":true}}"#,
+            serde_json::to_string(&key).unwrap()
+        ))
+        .unwrap();
+        assert_eq!(
+            minimal,
+            Request::File { conversation: key, pinned: None, archived: Some(true), folder_add: None, folder_remove: None }
+        );
+
+        let can = Capabilities { pin_chats: 5, archive: true, folders_edit: true, ..Capabilities::default() };
+        let cjson = serde_json::to_string(&can).unwrap();
+        assert_eq!(serde_json::from_str::<Capabilities>(&cjson).unwrap(), can);
+        // Older capabilities JSON without these fields defaults to 0 / false.
+        let old: Capabilities = serde_json::from_str("{}").unwrap();
+        assert_eq!((old.pin_chats, old.archive, old.folders_edit), (0, false, false));
     }
 }
 
