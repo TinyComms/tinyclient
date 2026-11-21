@@ -52,6 +52,7 @@ pub const MOVE_MEMBERS: u64 = 1 << 24;
 #[allow(dead_code)]
 pub const USE_VAD: u64 = 1 << 25;
 pub const MANAGE_ROLES: u64 = 1 << 28;
+pub const SEND_VOICE_MESSAGES: u64 = 1 << 46;
 pub const PIN_MESSAGES: u64 = 1 << 51;
 
 /// Where Discord's own app, or its site when the app is not installed, shows a person.

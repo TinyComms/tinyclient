@@ -6,18 +6,30 @@
 //! is answered with an address per file; each file is `PUT` there straight from its path; the
 //! message then names the uploaded files. A cancelled send deletes what it already uploaded.
 
-use super::model::Posted;
+use super::model::{self, Posted};
 use super::Discord;
 use crate::blobs::upload::{Target, Upload};
-use protocol::{CatalogKind, Message, Outgoing};
+use base64::Engine;
+use protocol::{CatalogKind, Message, Outgoing, VoiceNote};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 /// Discord's own message flags.
 const SUPPRESS_EMBEDS: u64 = 1 << 2;
 const SUPPRESS_NOTIFICATIONS: u64 = 1 << 12;
+const IS_VOICE_MESSAGE: u64 = 1 << 13;
 /// Most files one message carries.
 const FILES: usize = 10;
+/// Filename Discord's clients use for Ogg/Opus voice messages.
+const VOICE_FILENAME: &str = "voice-message.ogg";
+
+/// Encodes a voice message's loudness bars (capped at `protocol::WAVEFORM_LIMIT` = 256 bytes)
+/// as base64, matching the format `content::waveform()` decodes.
+pub(super) fn encode_waveform(bars: &[u8]) -> String {
+    let capped = &bars[..bars.len().min(protocol::WAVEFORM_LIMIT)];
+    let slice = if capped.is_empty() { &[0u8][..] } else { capped };
+    base64::engine::general_purpose::STANDARD.encode(slice)
+}
 
 #[derive(Deserialize)]
 struct Slot {
@@ -64,6 +76,30 @@ pub(super) fn upload_limit(premium: u8, tier: u8) -> u64 {
 }
 
 impl Discord {
+    /// Whether this account has Discord's `SEND_VOICE_MESSAGES` permission in `channel`.
+    /// Direct and group messages always allow voice messages; for a server channel (or thread
+    /// under one), check the kept channel's computed permissions.
+    fn can_send_voice_messages(&self, channel: &str, guild: Option<&str>, parent: Option<&str>) -> bool {
+        let Some(guild) = guild else {
+            return true;
+        };
+        let me = self.me();
+        let kept: Vec<model::Kept> = self
+            .ctx
+            .note(&format!("kept:{guild}"))
+            .and_then(|kept| serde_json::from_str(&kept).ok())
+            .unwrap_or_default();
+        let state = crate::hub::lock(&self.state);
+        let Some(info) = state.guilds.get(guild) else {
+            return true;
+        };
+        let wanted = |id: &str| id == channel || parent == Some(id);
+        let Some(found) = kept.into_iter().filter(|kept| wanted(&kept.id)).min_by_key(|kept| kept.id != channel) else {
+            return true;
+        };
+        info.permissions(guild, &me, &found.channel()) & model::SEND_VOICE_MESSAGES != 0
+    }
+
     /// The work of one `SendWith`, run by the upload helper on a thread of its own, which reads
     /// the files and ends the send through `Context::sent`.
     pub(super) fn send_with(&self, channel: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: &Outgoing, up: &mut Upload) -> Result<Message, String> {
@@ -89,16 +125,27 @@ impl Discord {
             return Err(format!("{} is too big for Discord (limit {} MB).", big.name, most >> 20));
         }
 
-        let mut content = text.to_owned();
-        let mut stickers = Vec::new();
-        match &with.pick {
-            Some(pick) if pick.kind == CatalogKind::Gifs => {
-                content = if content.is_empty() { pick.id.clone() } else { format!("{content}\n{}", pick.id) };
+        if with.voice.is_some() {
+            if up.files().len() != 1 {
+                return Err("A Discord voice message must carry exactly one audio recording.".to_owned());
             }
-            Some(pick) if pick.kind == CatalogKind::Stickers => stickers.push(pick.id.clone()),
-            _ => {}
+            if !self.can_send_voice_messages(channel, guild.as_deref(), conversation.parent.as_deref()) {
+                return Err("You don't have permission to send voice messages in this channel.".to_owned());
+            }
         }
-        let attachments = self.upload(channel, up)?;
+
+        let mut content = if with.voice.is_some() { String::new() } else { text.to_owned() };
+        let mut stickers = Vec::new();
+        if with.voice.is_none() {
+            match &with.pick {
+                Some(pick) if pick.kind == CatalogKind::Gifs => {
+                    content = if content.is_empty() { pick.id.clone() } else { format!("{content}\n{}", pick.id) };
+                }
+                Some(pick) if pick.kind == CatalogKind::Stickers => stickers.push(pick.id.clone()),
+                _ => {}
+            }
+        }
+        let attachments = self.upload(channel, up, with.voice.as_ref())?;
         up.check()?;
 
         let mut flags = 0;
@@ -107,6 +154,9 @@ impl Discord {
         }
         if with.suppress_embeds {
             flags |= SUPPRESS_EMBEDS;
+        }
+        if with.voice.is_some() {
+            flags |= IS_VOICE_MESSAGE;
         }
         let mut body = json!({
             "content": content,
@@ -140,11 +190,21 @@ impl Discord {
     /// Uploads each file to the address Discord hands out for it and answers what the message
     /// names them by. Nothing is asked when there are no files. What already went up is taken
     /// back when a later file fails or the send is cancelled, as the web client does.
-    fn upload(&self, channel: &str, up: &mut Upload) -> Result<Vec<Value>, String> {
+    fn upload(&self, channel: &str, up: &mut Upload, voice: Option<&VoiceNote>) -> Result<Vec<Value>, String> {
         if up.files().is_empty() {
             return Ok(Vec::new());
         }
-        let names: Vec<String> = up.files().iter().map(|file| shown_name(&file.name, file.spoiler)).collect();
+        let names: Vec<String> = up
+            .files()
+            .iter()
+            .map(|file| {
+                if voice.is_some() {
+                    VOICE_FILENAME.to_owned()
+                } else {
+                    shown_name(&file.name, file.spoiler)
+                }
+            })
+            .collect();
         let named: Vec<Value> = up
             .files()
             .iter()
@@ -158,17 +218,23 @@ impl Discord {
             return Err("Discord did not take every file.".to_owned());
         }
         let agent = self.rest.identity().user_agent.clone();
+        let content_type = if voice.is_some() { "audio/ogg" } else { "application/octet-stream" };
         let mut attachments = Vec::with_capacity(names.len());
         for (at, (slot, name)) in slots.attachments.iter().zip(&names).enumerate() {
             // The address is the storage bucket's own: the session's headers do not go there.
-            let target = Target::put(&slot.upload_url).header("Content-Type", "application/octet-stream").header("User-Agent", &agent);
+            let target = Target::put(&slot.upload_url).header("Content-Type", content_type).header("User-Agent", &agent);
             if let Err(why) = up.send(at, &target) {
                 for gone in &slots.attachments[..at] {
                     let _ = self.call("DELETE", &format!("/attachments/{}", gone.upload_filename), None);
                 }
                 return Err(why);
             }
-            attachments.push(json!({"id": at.to_string(), "filename": name, "uploaded_filename": slot.upload_filename}));
+            let mut entry = json!({"id": at.to_string(), "filename": name, "uploaded_filename": slot.upload_filename});
+            if let Some(voice) = voice {
+                entry["duration_secs"] = json!(f64::from(voice.duration) / 1000.0);
+                entry["waveform"] = json!(encode_waveform(&voice.waveform));
+            }
+            attachments.push(entry);
         }
         Ok(attachments)
     }
@@ -188,5 +254,16 @@ mod tests {
         assert_eq!(upload_limit(3, 3), 100 << 20);
         assert_eq!(upload_limit(2, 0), 500 << 20);
         assert_eq!(upload_limit(2, 3), 500 << 20);
+    }
+
+    #[test]
+    fn encode_waveform_caps_at_256_bytes_and_handles_empty() {
+        let encoded = encode_waveform(&[12, 128, 255]);
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(&encoded).unwrap(), vec![12, 128, 255]);
+        let long = vec![42u8; 300];
+        let capped = encode_waveform(&long);
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(&capped).unwrap().len(), protocol::WAVEFORM_LIMIT);
+        let empty = encode_waveform(&[]);
+        assert_eq!(base64::engine::general_purpose::STANDARD.decode(&empty).unwrap(), vec![0]);
     }
 }

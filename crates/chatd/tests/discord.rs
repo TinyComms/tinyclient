@@ -377,8 +377,21 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
                 .iter()
                 .enumerate()
                 .map(|(at, file)| {
-                    json!({"id": format!("880{at}"), "filename": file["filename"], "size": 3, "url": format!("https://cdn.discordapp.com/attachments/1/880{at}/f"),
-                           "content_type": "text/plain"})
+                    let is_voice = file.get("waveform").and_then(Value::as_str).is_some();
+                    let mut entry = json!({
+                        "id": format!("880{at}"),
+                        "filename": file["filename"],
+                        "size": 3,
+                        "url": format!("https://cdn.discordapp.com/attachments/1/880{at}/f"),
+                        "content_type": if is_voice { "audio/ogg" } else { "text/plain" },
+                    });
+                    if let Some(secs) = file.get("duration_secs") {
+                        entry["duration_secs"] = secs.clone();
+                    }
+                    if let Some(wave) = file.get("waveform") {
+                        entry["waveform"] = wave.clone();
+                    }
+                    entry
                 })
                 .collect();
             message["attachments"] = json!(attached);
@@ -5044,4 +5057,75 @@ fn leave_space_sends_delete_refuses_owner_and_cleans_tree() {
         }
         other => panic!("expected Response::Spaces, got {other:?}"),
     }
+}
+
+#[test]
+fn voice_message_sends_with_flag_waveform_audio_ogg_and_respects_permission() {
+    let world = World::start();
+    // 1. Account advertises voice_notes capability.
+    let can = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key == world.account()).unwrap().can,
+        other => panic!("{other:?}"),
+    };
+    assert!(can.voice_notes, "Discord must advertise voice_notes");
+
+    let recording = staged(&world, "voice-12345.opus", 128);
+    let bars = vec![10u8, 80, 200, 140, 25];
+    let expected_wave = base64::engine::general_purpose::STANDARD.encode(&bars);
+
+    // 2. Sending a voice message in a DM (3001) succeeds with IS_VOICE_MESSAGE (8192),
+    //    filename voice-message.ogg, Content-Type: audio/ogg, empty content, duration_secs & waveform.
+    let with = protocol::Outgoing {
+        files: vec![file(&recording, false)],
+        voice: Some(protocol::VoiceNote { duration: 4_500, waveform: bars.clone() }),
+        ..Default::default()
+    };
+    send_with(&world, "3001", "88001", "ignored text", None, with);
+    let sent = world.outcome("3001", "88001");
+    assert_eq!(sent.state, SendState::Sent);
+    assert_eq!(sent.attachments.len(), 1);
+    assert_eq!(sent.attachments[0].file.kind, MediaKind::Audio);
+    assert_eq!(sent.attachments[0].waveform, bars);
+    assert_eq!(sent.attachments[0].duration, 5);
+
+    let named = world.discord.requests_to("POST", "/channels/3001/attachments");
+    assert_eq!(named.len(), 1);
+    assert_eq!(named[0].body["files"][0]["filename"], "voice-message.ogg");
+
+    let puts = world.discord.requests_to("PUT", "/upload/up/voice-message.ogg");
+    assert_eq!(puts.len(), 1);
+    assert_eq!(puts[0].headers.get("content-type").map(String::as_str), Some("audio/ogg"));
+
+    let posted = world.discord.requests_to("POST", "/channels/3001/messages");
+    assert_eq!(posted.len(), 1);
+    assert_eq!(posted[0].body["flags"], json!(8192));
+    assert_eq!(posted[0].body["content"], json!(""));
+    assert_eq!(posted[0].body["attachments"][0]["filename"], json!("voice-message.ogg"));
+    assert_eq!(posted[0].body["attachments"][0]["duration_secs"], json!(4.5));
+    assert_eq!(posted[0].body["attachments"][0]["waveform"], json!(expected_wave));
+
+    // 3. In server 4000 channel 4101, @everyone lacks SEND_VOICE_MESSAGES (bit 46): refused locally.
+    let with_denied = protocol::Outgoing {
+        files: vec![file(&recording, false)],
+        voice: Some(protocol::VoiceNote { duration: 2_000, waveform: vec![50, 100] }),
+        ..Default::default()
+    };
+    send_with(&world, "4101", "88002", "", None, with_denied);
+    let reason = world.failure("4101", "88002");
+    assert!(reason.contains("permission") && reason.contains("voice messages"), "got: {reason}");
+    assert!(world.discord.requests_to("POST", "/channels/4101/attachments").is_empty());
+    assert!(world.discord.requests_to("POST", "/channels/4101/messages").is_empty());
+
+    // 4. In owned server 5000 channel 5001, owner has all permissions: succeeds with flags 8192.
+    let with_owned = protocol::Outgoing {
+        files: vec![file(&recording, false)],
+        voice: Some(protocol::VoiceNote { duration: 3_000, waveform: vec![30, 90] }),
+        ..Default::default()
+    };
+    send_with(&world, "5001", "88003", "", None, with_owned);
+    let sent_owned = world.outcome("5001", "88003");
+    assert_eq!(sent_owned.state, SendState::Sent);
+    let posted_owned = world.discord.requests_to("POST", "/channels/5001/messages");
+    assert_eq!(posted_owned.len(), 1);
+    assert_eq!(posted_owned[0].body["flags"], json!(8192));
 }

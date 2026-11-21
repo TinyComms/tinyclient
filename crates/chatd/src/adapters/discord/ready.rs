@@ -812,7 +812,7 @@ impl Discord {
             edit_window: 0,
             file_scan: false,
             allow_archives: false,
-            voice_notes: false,
+            voice_notes: true,
             direct_calls: false,
             revisions: false,
             close_direct: true,
