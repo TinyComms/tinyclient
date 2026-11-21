@@ -1674,3 +1674,31 @@ fn shared_contact_arrives_as_structured_card_and_can_be_sent() {
     });
     assert_eq!(sent.contacts, vec![shared]);
 }
+
+#[test]
+fn creating_a_new_signal_group_reaches_the_wire_and_creates_the_row() {
+    let world = World::linked();
+    world.connected();
+
+    let (accounts, _) = world.status();
+    let signal = accounts.iter().find(|status| status.key == account()).expect("Signal account");
+    assert!(signal.can.groups > 0, "Signal should advertise group creation capability");
+
+    let Response::Conversation { conversation: group } = world.ask(Request::StartGroup {
+        account: account(),
+        people: vec![key(GRACE), key(ALAN)],
+        title: Some("Friday Bridge".into()),
+    }) else {
+        panic!("expected Conversation from StartGroup");
+    };
+    assert_eq!(group.kind, ConversationKind::Group);
+    assert_eq!(group.title, "Friday Bridge");
+    assert!(group.key.id.starts_with("g."), "group id should use g. prefix: {}", group.key.id);
+    world.heard(&format!("create-group Friday Bridge | {GRACE},{ALAN}"));
+
+    // The new group is stored and can be messaged.
+    let stored = world.conversation(&group.key.id).expect("new group should be stored");
+    assert_eq!(stored.title, "Friday Bridge");
+    world.send(&group.key.id, "grp-1", "Welcome everyone!", None);
+    world.heard(&format!("send {} text Welcome everyone!", group.key.id));
+}

@@ -401,6 +401,8 @@ pub trait Wire: Send + Sync {
     fn set_blocked(&self, peer: &Peer, blocked: bool) -> Result<(), Fault>;
     /// Responds to a message request (Accept, Delete, Block, Spam, etc.) and syncs to other devices.
     fn respond_message_request(&self, peer: &Peer, action: MessageRequestAction) -> Result<(), Fault>;
+    /// Creates a new Signal Groups v2 group with `title` and `members` (ACIs) and returns its info.
+    fn create_group(&self, title: &str, members: &[String]) -> Result<GroupInfo, Fault>;
     /// Ends the connection: the events end, and every later request fails.
     fn close(&self);
 }

@@ -743,6 +743,33 @@ impl Wire for Fake {
         Ok(())
     }
 
+    fn create_group(&self, title: &str, members: &[String]) -> Result<GroupInfo, Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        record(&format!("create-group {title} | {}", members.join(",")));
+        if let Some(words) = self.refuse.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
+            return Err(Fault::Refused(words));
+        }
+        let seq = self.clock.fetch_add(1, Ordering::Relaxed);
+        let id = format!("{seq:064x}");
+        let mut member_ids = vec![ME.to_owned()];
+        for aci in members {
+            if !member_ids.contains(aci) {
+                member_ids.push(aci.clone());
+            }
+        }
+        Ok(GroupInfo {
+            id,
+            title: title.to_owned(),
+            description: String::new(),
+            members: member_ids.len() as u32,
+            member: true,
+            member_ids,
+            timer_secs: 0,
+        })
+    }
+
     fn close(&self) {
         // The reader sees it within 20 ms and stops.
         self.closed.store(true, Ordering::Relaxed);

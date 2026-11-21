@@ -1733,7 +1733,7 @@ fn offline(ctx: &Context, command: Command) {
         | Command::Relate { reply, .. }
         | Command::AnswerMessageRequest { reply, .. }
         | Command::Report { reply, .. } => drop(reply.send(Err(down()))),
-        Command::StartDirect { reply, .. } => drop(reply.send(Err(down()))),
+        Command::StartDirect { reply, .. } | Command::StartGroup { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchPeople(query) => ctx.searched(&query),
         Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
         other => other.unsupported(ctx),
@@ -1776,6 +1776,7 @@ fn capabilities() -> protocol::Capabilities {
         profile_about: true,
         pin_chats: 4,
         archive: true,
+        groups: 1_000,
         ..protocol::Capabilities::default()
     }
 }
@@ -1923,6 +1924,52 @@ fn serve(account: &Arc<Account>, command: Command) {
                 person_id
             });
             let _ = reply.send(started.ok_or_else(|| Refusal::Refused("That person can't be messaged from here.".to_owned())));
+        }
+        Command::StartGroup { people, title, reply } => {
+            let outcome = (|| -> Result<String, Refusal> {
+                let mut members: Vec<String> = Vec::new();
+                for id in people {
+                    if id == account.me {
+                        continue;
+                    }
+                    if !wire::is_aci(&id) {
+                        return Err(Refusal::Refused("Every group member must be a Signal contact.".to_owned()));
+                    }
+                    if !members.contains(&id) {
+                        members.push(id);
+                    }
+                }
+                if members.is_empty() {
+                    return Err(Refusal::Refused("Pick at least one person to start a Signal group.".to_owned()));
+                }
+                let title = match title.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()) {
+                    Some(t) => t,
+                    None => {
+                        let live = account.live();
+                        let names: Vec<String> = members.iter().take(3).map(|id| live.name(id)).collect();
+                        names.join(", ")
+                    }
+                };
+                let created = account.wire.create_group(&title, &members).map_err(refused)?;
+                let peer = Peer::Group(created.id.clone());
+                let conv = peer.conversation();
+                {
+                    let mut live = account.live();
+                    live.groups.insert(conv.clone(), created.member_ids.clone());
+                    live.known_conversations.insert(conv.clone());
+                    live.accepted.insert(conv.clone());
+                }
+                let mut group_row = row(&peer, &created.title);
+                group_row.topic = created.description.chars().take(300).collect();
+                group_row.read_only = !created.member;
+                group_row.avatar = ctx.avatar_of(&group_row.id);
+                let _ = ctx.conversation(&group_row);
+                if !account.live().folders.is_empty() {
+                    sync_filing(account, &conv);
+                }
+                Ok(conv)
+            })();
+            let _ = reply.send(outcome);
         }
         Command::SearchPeople(query) => search_people(account, &query),
         Command::Watch(watching) => pictures(account, &watching),

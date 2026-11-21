@@ -11,9 +11,9 @@ use super::wire::{gift_badge_label, payment_label, view_once_label, Body, ChatFo
 use super::{group_delta, GroupRevisions, GroupSnap, MemberSnap, Saved};
 use futures::StreamExt;
 use presage::libsignal_service::content::ContentBody;
-use presage::libsignal_service::groups_v2::{AccessRequired, Role};
+use presage::libsignal_service::groups_v2::{AccessControl, AccessRequired, Member, Role};
 use presage::libsignal_service::master_key::StorageServiceKey;
-use presage::libsignal_service::prelude::{Content, GroupMasterKey, GroupSecretParams, PushService, ServiceCredentials, ServiceError, Uuid};
+use presage::libsignal_service::prelude::{Content, GroupMasterKey, GroupSecretParams, ProfileKey, PushService, ServiceCredentials, ServiceError, Uuid};
 use presage::libsignal_service::profile_name::ProfileName;
 use presage::libsignal_service::protocol::{Aci, ServiceId};
 use presage::libsignal_service::sender::{AttachmentSpec, AttachmentUploadError, MessageSenderError};
@@ -65,6 +65,7 @@ enum Ask {
     SetMarkedUnread { _to: Peer, _unread: bool, answer: Sender<Result<(), Fault>> },
     SetBlocked { peer: Peer, blocked: bool, answer: Sender<Result<(), Fault>> },
     RespondMessageRequest { peer: Peer, action: MessageRequestAction, answer: Sender<Result<(), Fault>> },
+    CreateGroup { title: String, members: Vec<String>, answer: Sender<Result<GroupInfo, Fault>> },
 }
 
 pub struct Real {
@@ -433,6 +434,10 @@ impl Wire for Real {
 
     fn respond_message_request(&self, peer: &Peer, action: MessageRequestAction) -> Result<(), Fault> {
         self.ask(|answer| Ask::RespondMessageRequest { peer: peer.clone(), action, answer })
+    }
+
+    fn create_group(&self, title: &str, members: &[String]) -> Result<GroupInfo, Fault> {
+        self.ask(|answer| Ask::CreateGroup { title: title.to_owned(), members: members.to_vec(), answer })
     }
 
     fn close(&self) {
@@ -1196,7 +1201,92 @@ impl Session {
             Ask::RespondMessageRequest { peer, action, answer } => {
                 let _ = answer.send(self.respond_message_request(&peer, action).await);
             }
+            Ask::CreateGroup { title, members, answer } => {
+                let _ = answer.send(self.create_group(&title, &members).await);
+            }
         }
+    }
+
+    async fn create_group(&mut self, title: &str, members: &[String]) -> Result<GroupInfo, Fault> {
+        let mut master_key = [0u8; 32];
+        getrandom::fill(&mut master_key).map_err(|err| Fault::Net(err.to_string()))?;
+        let id = group_id(&master_key);
+        let me_aci = Uuid::parse_str(&self.me).map_err(|_| Fault::Net("no account id".into()))?;
+        let mut group_members = vec![Member {
+            aci: Aci::from(me_aci),
+            role: Role::Administrator,
+            profile_key: self.manager.registration_data().profile_key(),
+            joined_at_version: 0,
+            label_emoji: None,
+            label: None,
+        }];
+        let mut member_ids = vec![self.me.clone()];
+        for aci_str in members {
+            let Ok(uuid) = Uuid::parse_str(aci_str) else {
+                continue;
+            };
+            if member_ids.iter().any(|existing| existing == aci_str) {
+                continue;
+            }
+            let pk = self
+                .manager
+                .store()
+                .profile_key(&ServiceId::Aci(Aci::from(uuid)))
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| ProfileKey::create([0u8; 32]));
+            group_members.push(Member {
+                aci: Aci::from(uuid),
+                role: Role::Default,
+                profile_key: pk,
+                joined_at_version: 0,
+                label_emoji: None,
+                label: None,
+            });
+            member_ids.push(aci_str.clone());
+        }
+        let group = Group {
+            title: title.to_owned(),
+            avatar: String::new(),
+            disappearing_messages_timer: None,
+            access_control: Some(AccessControl {
+                attributes: AccessRequired::Member,
+                members: AccessRequired::Member,
+                add_from_invite_link: AccessRequired::Unsatisfiable,
+                member_label: AccessRequired::Member,
+            }.into()),
+            revision: 0,
+            members: group_members.into_iter().map(Into::into).collect(),
+            pending_members: Vec::new(),
+            requesting_members: Vec::new(),
+            invite_link_password: Vec::new(),
+            description: None,
+        };
+        let snap = snap_of(&group);
+        self.vault.save_group(master_key, group).await.map_err(|err| Fault::Net(err.to_string()))?;
+        self.groups.insert(id.clone(), master_key);
+        self.known.seed(id.clone(), 0, snap);
+        let at = now_ms();
+        let update = ContentBody::DataMessage(DataMessage {
+            group_v2: Some(GroupContextV2 {
+                master_key: Some(master_key.to_vec()),
+                revision: Some(0),
+                group_change: None,
+            }),
+            timestamp: Some(at),
+            ..Default::default()
+        });
+        let _ = self.manager.send_message_to_group(&master_key, update, at).await;
+        Ok(GroupInfo {
+            id,
+            title: title.to_owned(),
+            description: String::new(),
+            members: member_ids.len() as u32,
+            member: true,
+            member_ids,
+            timer_secs: 0,
+        })
     }
 
     async fn set_blocked(&mut self, peer: &Peer, blocked: bool) -> Result<(), Fault> {
