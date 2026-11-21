@@ -417,6 +417,21 @@ impl MemberList {
         let (profile, shell) = (person.key.clone(), self.shell.clone());
         let (menu_of, menu_shell) = (person.key.clone(), self.shell.clone());
         let phone = crate::gui::phone::active();
+        let (can_remove, conv_key) = self
+            .conversation
+            .as_ref()
+            .and_then(|key| {
+                self.shell.upgrade().and_then(|s| {
+                    s.read(cx)
+                        .held_rows()
+                        .find(|r| &r.key == key)
+                        .map(|r| (crate::gui::profile::facts::can_remove_members(r), r.key.clone()))
+                })
+            })
+            .unwrap_or_else(|| (false, person.key.clone()));
+        let remove_shell = self.shell.clone();
+        let remove_id = person.key.id.clone();
+        let remove_name = person.name.clone();
         let tapped = (profile.clone(), shell.clone());
         div()
             .id(("member", ix))
@@ -457,6 +472,7 @@ impl MemberList {
                 )
                 .child(
                     div()
+                        .flex_1()
                         .min_w_0()
                         .truncate()
                         // A phone's names are the size the other pages' rows are (Details, a
@@ -466,7 +482,25 @@ impl MemberList {
                         .child(person.name.clone()),
                 )
                 .when(person.title == "Owner", |row| row.child(div().flex_none().type_small().text_color(theme::text_faint()).child("Owner")))
-                .when(person.bot, |row| row.child(super::list::bot_tag())),
+                .when(person.bot, |row| row.child(super::list::bot_tag()))
+                .when(can_remove && !phone, |row| {
+                    let conv_key = conv_key.clone();
+                    let remove_id = remove_id.clone();
+                    let remove_name = remove_name.clone();
+                    row.child(
+                        crate::gui::components::icon_button(("member-remove", ix), "icons/x.svg", false)
+                            .tooltip(crate::gui::components::tip("Remove from channel", None))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(move |_, _, cx| {
+                                let (conv_key, remove_id, remove_name) = (conv_key.clone(), remove_id.clone(), remove_name.clone());
+                                let _ = remove_shell.update(cx, |shell, cx| {
+                                    shell.details_conversation(conv_key.clone(), cx);
+                                    let info = shell.details_entity(cx);
+                                    info.update(cx, |info, cx| info.ask_remove_member(conv_key, remove_id, remove_name, cx));
+                                });
+                            }),
+                    )
+                }),
         )
     }
 }
@@ -499,11 +533,51 @@ fn waiting_row() -> Div {
 
 impl Render for MemberList {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let body = div().size_full().pt(px(4.)).flex().flex_col().when(
-            self.waiting_since.is_some_and(|at| at.elapsed() >= Duration::from_secs(1)) && !self.requests.waiting.is_empty(),
-            |body| body.child(div().flex_none().px(px(12.)).py(px(4.)).type_small().text_color(theme::text_soft())
-                .child("Waiting for Discord to send these members…")),
-        );
+        let can_add = self.conversation.as_ref().and_then(|key| {
+            self.shell.upgrade().and_then(|s| {
+                s.read(cx)
+                    .held_rows()
+                    .find(|r| &r.key == key && crate::gui::profile::facts::can_add_members(r))
+                    .map(|r| r.key.clone())
+            })
+        });
+        let add_shell = self.shell.clone();
+        let body = div()
+            .size_full()
+            .pt(px(4.))
+            .flex()
+            .flex_col()
+            .when_some(can_add, |body, key| {
+                body.child(
+                    div().flex_none().px(px(12.)).pb(px(6.)).child(
+                        button("members-add-people", ButtonKind::Secondary, "Add people…")
+                            .h(px(26.))
+                            .px(px(10.))
+                            .type_small()
+                            .on_click(move |_, _, cx| {
+                                let key = key.clone();
+                                let _ = add_shell.update(cx, |shell, cx| {
+                                    shell.details_conversation(key.clone(), cx);
+                                    let info = shell.details_entity(cx);
+                                    info.update(cx, |info, cx| {
+                                        info.start_manage(
+                                            key,
+                                            super::info::ManageKind::AddMembers,
+                                            "",
+                                            "Person IDs (comma-separated)",
+                                            cx,
+                                        );
+                                    });
+                                });
+                            }),
+                    ),
+                )
+            })
+            .when(
+                self.waiting_since.is_some_and(|at| at.elapsed() >= Duration::from_secs(1)) && !self.requests.waiting.is_empty(),
+                |body| body.child(div().flex_none().px(px(12.)).py(px(4.)).type_small().text_color(theme::text_soft())
+                    .child("Waiting for Discord to send these members…")),
+            );
         if let Some(refused) = &self.refused {
             return body.child(empty_state("icons/users.svg", "Couldn’t load members", refused).px(px(16.))).child(button("retry-members", ButtonKind::Ghost, "Try again").on_click(cx.listener(|this, _, _, cx| this.retry(cx))));
         }

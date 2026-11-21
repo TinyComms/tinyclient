@@ -420,6 +420,9 @@ impl Fake {
             }
             "conversations.history" if BUSY.contains(&channel) => Some(json!({"ok": true, "has_more": false, "messages": []})),
             "conversations.members" => {
+                if channel == "C0RND" {
+                    return ok(json!({"ok": true, "members": ["U0ME", "U0ANA"], "response_metadata": {"next_cursor": ""}}));
+                }
                 // Slack may answer fewer than asked for: two at a time here, so a list of four
                 // takes two calls and the cursor is seen at work.
                 let listed = self.fixture(token, &format!("conversations.members.{channel}"));
@@ -729,6 +732,35 @@ impl Fake {
             "conversations.unarchive" => {
                 if channel.is_empty() {
                     return refused("channel_not_found");
+                }
+                Some(json!({"ok": true}))
+            }
+            "conversations.invite" => {
+                let users = param("users");
+                if channel.is_empty() || users.is_empty() {
+                    return refused("invalid_arguments");
+                }
+                if users.split(',').any(|u| u == "U0ALREADY") {
+                    return refused("already_in_channel");
+                }
+                if users.split(',').any(|u| u == "U0RESTRICTED") {
+                    return refused("restricted_action");
+                }
+                Some(json!({"ok": true, "channel": {"id": channel}}))
+            }
+            "conversations.kick" => {
+                let user = param("user");
+                if channel.is_empty() || user.is_empty() {
+                    return refused("invalid_arguments");
+                }
+                if user == me(token) {
+                    return refused("cant_kick_self");
+                }
+                if channel == "C0GEN" {
+                    return refused("cant_kick_from_general");
+                }
+                if user == "U0RESTRICTED" {
+                    return refused("restricted_action");
                 }
                 Some(json!({"ok": true}))
             }
@@ -3496,4 +3528,113 @@ fn slack_leave_rename_archive_and_browse_archived_channels() {
         panic!("expected Conversation for archived channel preview");
     };
     assert!(preview.read_only && preview.archived, "previewed archived channel must be read-only and archived");
+}
+
+#[test]
+fn slack_invite_and_kick_channel_members() {
+    let world = World::start();
+    world.ready();
+
+    let rnd = alpha("C0RND");
+    let side = alpha("C0SIDE");
+    let general = alpha("C0GEN");
+    let row = world.conversation(&rnd).unwrap();
+    assert!(row.rights.add_members && row.rights.remove_members, "writable Slack channels must advertise add/remove member rights");
+    let ro = world.conversation(&side).unwrap();
+    assert!(!ro.rights.add_members && !ro.rights.remove_members, "read-only Slack channels must not advertise add/remove member rights");
+
+    // Load the member list first so roster is active.
+    let Response::Members { members, .. } = world.ask(Request::Members {
+        conversation: rnd.clone(),
+        offset: 0,
+        limit: 50,
+    }) else {
+        panic!("expected Members");
+    };
+    let initial_count = members.len();
+
+    // Invite people to the channel.
+    let added = world.ask(Request::MembersAdd {
+        conversation: rnd.clone(),
+        people: vec!["U0NEW1".into(), "U0NEW2".into()],
+    });
+    assert_eq!(added, Response::Ok);
+    let invites = world.fake.calls(ALPHA, "conversations.invite");
+    assert_eq!(invites.len(), 1);
+    assert_eq!(invites[0].params["channel"], "C0RND");
+    assert_eq!(invites[0].params["users"], "U0NEW1,U0NEW2");
+
+    // Roster reflects invited members immediately.
+    let Response::Members { members: after_add, .. } = world.ask(Request::Members {
+        conversation: rnd.clone(),
+        offset: 0,
+        limit: 50,
+    }) else {
+        panic!("expected Members after invite");
+    };
+    assert_eq!(after_add.len(), initial_count + 2);
+    assert!(after_add.iter().any(|p| p.key.id == "U0NEW1"));
+    assert!(after_add.iter().any(|p| p.key.id == "U0NEW2"));
+
+    // Invite refusal: already_in_channel translated clearly.
+    match world.ask(Request::MembersAdd {
+        conversation: rnd.clone(),
+        people: vec!["U0ALREADY".into()],
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.to_lowercase().contains("already"), "got: {detail}");
+        }
+        other => panic!("expected Refused for already_in_channel, got {other:?}"),
+    }
+
+    // Kick a member from the channel.
+    let kicked = world.ask(Request::MembersRemove {
+        conversation: rnd.clone(),
+        person: "U0NEW1".into(),
+    });
+    assert_eq!(kicked, Response::Ok);
+    let kicks = world.fake.calls(ALPHA, "conversations.kick");
+    assert_eq!(kicks.len(), 1);
+    assert_eq!(kicks[0].params["channel"], "C0RND");
+    assert_eq!(kicks[0].params["user"], "U0NEW1");
+
+    // Roster drops the kicked member immediately.
+    let Response::Members { members: after_kick, .. } = world.ask(Request::Members {
+        conversation: rnd.clone(),
+        offset: 0,
+        limit: 50,
+    }) else {
+        panic!("expected Members after kick");
+    };
+    assert_eq!(after_kick.len(), initial_count + 1);
+    assert!(!after_kick.iter().any(|p| p.key.id == "U0NEW1"));
+
+    // Kick refusals: cant_kick_self, cant_kick_from_general, restricted_action.
+    match world.ask(Request::MembersRemove {
+        conversation: rnd.clone(),
+        person: "U0ME".into(),
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.to_lowercase().contains("yourself") || detail.to_lowercase().contains("leave"), "got: {detail}");
+        }
+        other => panic!("expected Refused for cant_kick_self, got {other:?}"),
+    }
+    match world.ask(Request::MembersRemove {
+        conversation: general,
+        person: "U0ANA".into(),
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.to_lowercase().contains("general"), "got: {detail}");
+        }
+        other => panic!("expected Refused for cant_kick_from_general, got {other:?}"),
+    }
+    match world.ask(Request::MembersRemove {
+        conversation: rnd,
+        person: "U0RESTRICTED".into(),
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.to_lowercase().contains("workspace"), "got: {detail}");
+        }
+        other => panic!("expected Refused for restricted_action, got {other:?}"),
+    }
 }

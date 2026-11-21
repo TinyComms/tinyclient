@@ -177,6 +177,12 @@ fn reason(fault: Fault) -> String {
             "cant_archive_general" => "The #general channel cannot be archived.",
             "already_archived" => "This channel is already archived.",
             "not_archived" => "This channel is not archived.",
+            "cant_kick_self" => "To remove yourself from a channel, leave it instead.",
+            "cant_kick_from_general" => "Members cannot be removed from #general.",
+            "cant_invite_self" => "You are already in this channel.",
+            "cant_invite" => "This workspace does not let you invite people to this channel.",
+            "already_in_channel" => "That person is already in this channel.",
+            "user_not_in_channel" => "That person is not in this channel.",
             "name_taken" => "A channel with that name already exists.",
             "invalid_name_required"
             | "invalid_name_punctuation"
@@ -1454,6 +1460,12 @@ impl Slack {
             Command::SearchPeople(query) => self.search(&query),
             Command::Members { conversation_id, offset, limit, reply } => {
                 answer(reply, self.members(&conversation_id, offset, limit));
+            }
+            Command::MembersAdd { conversation_id, people, reply } => {
+                answer(reply, self.members_add(&conversation_id, &people));
+            }
+            Command::MembersRemove { conversation_id, person, reply } => {
+                answer(reply, self.members_remove(&conversation_id, &person));
             }
             Command::StartDirect { person_id, reply } => answer(reply, self.start_direct(&person_id)),
             Command::CloseDirect { conversation_id, reply } => {

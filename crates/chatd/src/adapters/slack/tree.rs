@@ -119,6 +119,9 @@ impl Slack {
         }
         row.rights.pin = !row.read_only;
         row.rights.rename = !row.read_only;
+        row.rights.add_members = !row.read_only;
+        row.rights.remove_members = !row.read_only;
+        row.rights.manage_members = !row.read_only;
         Some(row)
     }
 
@@ -241,6 +244,9 @@ impl Slack {
             row.read_only_reason = if archive { "This channel is archived.".to_owned() } else { String::new() };
             row.rights.pin = !archive;
             row.rights.rename = !archive;
+            row.rights.add_members = !archive;
+            row.rights.remove_members = !archive;
+            row.rights.manage_members = !archive;
             self.ctx.conversation(&row).map_err(|err| Fault::Net(err.to_string()))?;
         }
         Ok(())
