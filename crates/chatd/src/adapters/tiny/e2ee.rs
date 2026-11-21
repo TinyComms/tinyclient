@@ -604,6 +604,12 @@ pub(crate) struct OpenedFile {
     pub width: u32,
     #[serde(default)]
     pub height: u32,
+    #[serde(default)]
+    pub duration: u32,
+    #[serde(default)]
+    pub voice: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waveform: Vec<u8>,
 }
 
 impl OpenedFile {
@@ -617,6 +623,9 @@ impl OpenedFile {
             sha256: STANDARD.encode(file.sha256),
             width: file.width,
             height: file.height,
+            duration: file.duration,
+            voice: file.voice,
+            waveform: file.waveform.clone(),
         }
     }
 
@@ -632,6 +641,9 @@ impl OpenedFile {
             sha256,
             width: self.width,
             height: self.height,
+            duration: self.duration,
+            voice: self.voice,
+            waveform: self.waveform.clone(),
         })
     }
 

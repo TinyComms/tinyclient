@@ -14,6 +14,9 @@ fn attachment(n: u8) -> AttachmentRef {
         sha256: [n.wrapping_add(1); 32],
         width: 640,
         height: 480,
+        duration: 0,
+        voice: false,
+        waveform: Vec::new(),
     }
 }
 
@@ -291,4 +294,24 @@ fn the_kind_strings_are_the_servers() {
     assert_eq!(Kind::parse("edit").unwrap(), Kind::Edit);
     assert!(Kind::parse("Edit").is_err());
     assert!(Kind::parse("").is_err());
+}
+
+#[test]
+fn voice_attachment_fields_roundtrip_and_default_absent() {
+    let mut voice = attachment(3);
+    voice.name = "voice.ogg".into();
+    voice.mime = "audio/ogg".into();
+    voice.duration = 12;
+    voice.voice = true;
+    voice.waveform = vec![10, 80, 200, 150, 40];
+    let env = Envelope {
+        attachments: vec![voice.clone()],
+        ..Envelope::default()
+    };
+    let encoded = env.encode(Kind::Message).unwrap();
+    let decoded = Envelope::decode(Kind::Message, &encoded).unwrap();
+    assert_eq!(decoded.attachments.len(), 1);
+    assert_eq!(decoded.attachments[0].duration, 12);
+    assert!(decoded.attachments[0].voice);
+    assert_eq!(decoded.attachments[0].waveform, vec![10, 80, 200, 150, 40]);
 }

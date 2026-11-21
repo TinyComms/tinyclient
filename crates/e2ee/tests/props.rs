@@ -35,6 +35,9 @@ fn attachment_strategy() -> impl Strategy<Value = AttachmentRef> {
                 sha256,
                 width,
                 height,
+                duration: 0,
+                voice: false,
+                waveform: Vec::new(),
             },
         )
 }

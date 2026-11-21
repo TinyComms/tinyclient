@@ -26,7 +26,16 @@ pub const MAX_ATTACHMENTS: usize = 10;
 const MAX_ID: usize = 128;
 const MAX_NAME: usize = 255;
 const MAX_MIME: usize = 127;
+const MAX_WAVEFORM: usize = 100;
 const VERSION: u64 = 1;
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
+}
 
 /// Which row of the server's table a ciphertext is: a message, an edit of one, or a reaction to
 /// one. A reaction names its message only inside the ciphertext.
@@ -72,6 +81,12 @@ pub struct AttachmentRef {
     pub sha256: [u8; 32],
     pub width: u32,
     pub height: u32,
+    /// Duration in seconds for audio/video/voice attachments.
+    pub duration: u32,
+    /// True when this attachment is a recorded voice message.
+    pub voice: bool,
+    /// Voice message loudness bars (0..=255), at most 100 entries.
+    pub waveform: Vec<u8>,
 }
 
 /// A message or an edit.
@@ -101,6 +116,12 @@ struct WireAttachment {
     width: u32,
     #[serde(default)]
     height: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    duration: u32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    voice: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    waveform: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -167,6 +188,9 @@ impl Envelope {
                     sha256: STANDARD.encode(attachment.sha256),
                     width: attachment.width,
                     height: attachment.height,
+                    duration: attachment.duration,
+                    voice: attachment.voice,
+                    waveform: attachment.waveform.iter().copied().take(MAX_WAVEFORM).collect(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -235,6 +259,9 @@ impl Envelope {
                     bytes: attachment.bytes,
                     width: attachment.width,
                     height: attachment.height,
+                    duration: attachment.duration,
+                    voice: attachment.voice,
+                    waveform: attachment.waveform.iter().copied().take(MAX_WAVEFORM).collect(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;

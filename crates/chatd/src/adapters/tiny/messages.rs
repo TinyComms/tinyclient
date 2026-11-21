@@ -1068,6 +1068,7 @@ fn prove_rehydrate_attachment(text: &str, file_id: &str, name: &str) -> Result<(
                 sha256: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=".to_owned(),
                 width: 640,
                 height: 480,
+                ..e2ee::OpenedFile::default()
             }],
             ..e2ee::Opened::default()
         },
@@ -1708,12 +1709,43 @@ fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: S
     };
     let saved = saved.clone();
     let posting = ctx.clone();
-    let files = outgoing.files;
+    let mut files = outgoing.files;
+    let voice = outgoing.voice;
+    let voice_duration_secs = voice.as_ref().map(|v| {
+        if v.duration == 0 {
+            0
+        } else {
+            ((v.duration + 500) / 1000).max(1)
+        }
+    });
+    // tinyserver sniffs Ogg-Opus as `audio/ogg` and requires `.ogg`/`.oga` extension to match.
+    if voice.is_some() {
+        if let Some(last) = files.last_mut() {
+            let current = if last.name.is_empty() {
+                std::path::Path::new(&last.path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("voice.ogg")
+                    .to_owned()
+            } else {
+                last.name.clone()
+            };
+            if current.to_ascii_lowercase().ends_with(".opus") {
+                let stem = &current[..current.len() - 5];
+                last.name = format!("{}.ogg", if stem.is_empty() { "voice" } else { stem });
+            }
+        }
+    }
     let posting_id = conversation_id.clone();
     let posting_client = client_id.clone();
     if sealed {
         upload::spawn(ctx, &conversation_id, &client_id, &files, move |upload| {
-            let refs = super::sealing::upload_sealed(upload, &saved, &posting_id)?;
+            let mut refs = super::sealing::upload_sealed(upload, &saved, &posting_id)?;
+            if let (Some(voice), Some(last)) = (voice.as_ref(), refs.last_mut()) {
+                last.duration = voice_duration_secs.unwrap_or(0);
+                last.voice = true;
+                last.waveform = voice.waveform.clone();
+            }
             upload.check()?;
             let ids: Vec<String> = refs.iter().map(|file| file.id.clone()).collect();
             post_sealed(&posting, &saved, &posting_id, &posting_client, &text, reply_to.as_deref(), refs, &ids)
@@ -1722,10 +1754,13 @@ fn send_with(ctx: &Context, saved: &Saved, conversation_id: String, client_id: S
     }
     upload::spawn(ctx, &conversation_id, &client_id, &files, move |upload| {
         let mut ids = Vec::with_capacity(upload.files().len());
+        let last_ix = upload.files().len().saturating_sub(1);
         for at in 0..upload.files().len() {
             upload.check()?;
             let target = Target::post(super::endpoint(&saved.base_url, "/v1/media")).header("Authorization", &format!("Bearer {}", saved.token));
-            let answer = match upload.send_form(at, &target, "file", &[]) {
+            let dur_str = voice_duration_secs.filter(|&d| d > 0 && at == last_ix).map(|d| d.to_string());
+            let fields: Vec<(&str, &str)> = dur_str.as_deref().map(|d| vec![("duration", d)]).unwrap_or_default();
+            let answer = match upload.send_form(at, &target, "file", &fields) {
                 Ok(answer) => answer,
                 Err(why) => return Err(media_failure(&why)),
             };
@@ -2027,6 +2062,14 @@ fn map_message(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessag
             let mut attachment = Attachment::new(title_or(&file.name, &file.id), stored);
             attachment.mime = file.mime.clone();
             attachment.duration = file.duration;
+            if kind == MediaKind::Audio
+                && file.duration > 0
+                && (file.mime.eq_ignore_ascii_case("audio/ogg")
+                    || file.name.to_ascii_lowercase().ends_with(".ogg")
+                    || file.name.to_ascii_lowercase().ends_with(".opus"))
+            {
+                attachment.waveform = default_voice_waveform();
+            }
             media.push((attachment.file.clone(), fetched_url(saved, file)));
             message.attachments.push(attachment);
         }
@@ -2120,11 +2163,15 @@ fn sealed_attachments(saved: &Saved, opened: &e2ee::Opened, media: &mut Vec<(Med
         if !super::safe_id(&file.id) {
             continue;
         }
-        let kind = match media_kind("", &file.mime) {
-            // A picture is shown as one only in a format the cache checks; anything else is a file.
-            MediaKind::Image if matches!(file.mime.as_str(), "image/png" | "image/jpeg" | "image/webp") => MediaKind::Image,
-            MediaKind::Gif => MediaKind::Gif,
-            _ => MediaKind::File,
+        let kind = if file.voice || file.mime.to_ascii_lowercase().starts_with("audio/") {
+            MediaKind::Audio
+        } else {
+            match media_kind("", &file.mime) {
+                // A picture is shown as one only in a format the cache checks; anything else is a file.
+                MediaKind::Image if matches!(file.mime.as_str(), "image/png" | "image/jpeg" | "image/webp") => MediaKind::Image,
+                MediaKind::Gif => MediaKind::Gif,
+                _ => MediaKind::File,
+            }
         };
         let mut stored = MediaFile::new(&file.id, kind);
         stored.width = file.width;
@@ -2132,25 +2179,38 @@ fn sealed_attachments(saved: &Saved, opened: &e2ee::Opened, media: &mut Vec<(Med
         stored.bytes = file.bytes;
         let mut attachment = Attachment::new(title_or(&file.name, "file"), stored);
         attachment.mime = file.mime.clone();
+        attachment.duration = file.duration;
+        if file.voice {
+            attachment.waveform = if file.waveform.is_empty() { default_voice_waveform() } else { file.waveform.clone() };
+        }
         media.push((attachment.file.clone(), format!("{}/v1/media/{}", saved.base_url.trim_end_matches('/'), file.id)));
         out.push(attachment);
     }
     out
 }
 
+/// Subtle fallback waveform for plaintext Tiny voice messages (the server stores `duration`
+/// without a waveform array).
+fn default_voice_waveform() -> Vec<u8> {
+    vec![64, 96, 128, 160, 112, 144, 176, 128, 96, 144, 160, 112, 80, 128, 160, 144, 112, 96, 128, 96, 80, 64, 80, 64]
+}
+
 fn media_kind(kind: &str, mime: &str) -> MediaKind {
+    let mime_lower = mime.to_ascii_lowercase();
     match kind {
         "image" => MediaKind::Image,
         "gif" => MediaKind::Gif,
         "video" => MediaKind::Video,
+        "file" if mime_lower.starts_with("audio/") => MediaKind::Audio,
         "file" => MediaKind::File,
         _ => {
-            let mime = mime.to_ascii_lowercase();
-            if mime == "image/gif" {
+            if mime_lower == "image/gif" {
                 MediaKind::Gif
-            } else if mime.starts_with("video/") {
+            } else if mime_lower.starts_with("video/") {
                 MediaKind::Video
-            } else if mime.starts_with("image/") {
+            } else if mime_lower.starts_with("audio/") {
+                MediaKind::Audio
+            } else if mime_lower.starts_with("image/") {
                 MediaKind::Image
             } else {
                 MediaKind::File
@@ -2195,13 +2255,15 @@ fn account_caps(saved: &Saved) -> Capabilities {
     let limits = upload_limits(saved);
     let server_caps = super::manage::capabilities_of(saved);
     let scans = server_caps.has(protocol::TINY_FEATURE_FILE_SCAN);
+    let max_file_bytes = limits.image.max(limits.file);
     Capabilities {
-        max_file_bytes: limits.image.max(limits.file),
+        max_file_bytes,
         max_files: protocol::ATTACHMENTS_LIMIT as u32,
         direct_calls: directs_callable(saved),
         file_scan: scans,
         allow_archives: scans && limits.archives,
         abuse_reports: server_caps.has(protocol::TINY_FEATURE_ABUSE_REPORTS),
+        voice_notes: max_file_bytes > 0,
         reply: true,
         edit: true,
         delete: true,
@@ -4566,5 +4628,67 @@ mod tests {
         assert_eq!(failed.as_deref(), Some("Tiny blocked that file"));
         assert!(bearer.load(Ordering::Relaxed), "the upload keeps the bearer");
         assert!(!posted.load(Ordering::Relaxed), "a blocked upload must not post the message");
+    }
+
+    #[test]
+    fn voice_notes_capability_and_plaintext_and_sealed_receive() {
+        let (_adapter, _ctx, saved) = fixture(|request| {
+            if request.starts_with("GET /v1/server ") {
+                return Some(http(200, "OK", r#"{"name":"Tiny","image_max_bytes":8388608,"file_max_bytes":26214400}"#));
+            }
+            if request.starts_with("GET /v1/capabilities") {
+                return Some(http(200, "OK", r#"{"version":"0.6.0","features":["file_scan"]}"#));
+            }
+            None
+        });
+        assert!(account_caps(&saved).voice_notes, "voice_notes enabled when uploads are allowed");
+
+        // Plaintext voice attachment receives MediaKind::Audio, duration, and non-empty waveform.
+        let wire: WireMessage = serde_json::from_value(json!({
+            "id": "m-voice",
+            "author_id": ME,
+            "body": "",
+            "created_at": WHEN,
+            "attachments": [{
+                "id": "file-v1",
+                "name": "voice.ogg",
+                "mime": "audio/ogg",
+                "kind": "file",
+                "bytes": 4096,
+                "duration": 9
+            }]
+        }))
+        .unwrap();
+        let mut media = Vec::new();
+        let msg = map_message(&saved, &HashMap::new(), &wire, &HashMap::new(), &mut media).unwrap();
+        assert_eq!(msg.attachments.len(), 1);
+        assert_eq!(msg.attachments[0].file.kind, MediaKind::Audio);
+        assert_eq!(msg.attachments[0].duration, 9);
+        assert!(!msg.attachments[0].waveform.is_empty());
+
+        // Sealed voice attachment preserves exact waveform and duration from envelope.
+        let opened = e2ee::Opened {
+            text: String::new(),
+            attachments: vec![e2ee::OpenedFile {
+                id: "file-v2".into(),
+                key: "a".into(),
+                name: "voice.ogg".into(),
+                mime: "audio/ogg".into(),
+                bytes: 2048,
+                sha256: "b".into(),
+                width: 0,
+                height: 0,
+                duration: 14,
+                voice: true,
+                waveform: vec![20, 120, 240, 80],
+            }],
+            ..e2ee::Opened::default()
+        };
+        let mut sealed_media = Vec::new();
+        let atts = sealed_attachments(&saved, &opened, &mut sealed_media);
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].file.kind, MediaKind::Audio);
+        assert_eq!(atts[0].duration, 14);
+        assert_eq!(atts[0].waveform, vec![20, 120, 240, 80]);
     }
 }
