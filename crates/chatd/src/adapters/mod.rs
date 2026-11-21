@@ -358,6 +358,8 @@ pub enum Command {
     /// before answering, and only after the network has it. Answer `Err` to leave the local flag
     /// as it was. Networks that do not serve this never receive it: their star stays local.
     Star { conversation_id: String, starred: bool, reply: Reply<()> },
+    /// Accept or decline/ignore a message request (Discord).
+    AnswerMessageRequest { conversation_id: String, accept: bool, reply: Reply<()> },
     /// Leave a group conversation. Report it gone through [`Context::conversation_gone`].
     Leave { conversation_id: String, reply: Reply<()> },
     /// Close a direct conversation as the network's own × does. Report it through
@@ -482,6 +484,7 @@ impl Command {
             | Command::Delete { reply, .. }
             | Command::Relate { reply, .. }
             | Command::SetPresence { reply, .. }
+            | Command::AnswerMessageRequest { reply, .. }
             | Command::OpenForum { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             // Nothing to end on the network: the session is simply forgotten.
             Command::SignOut(reply) => drop(reply.send(Ok(()))),

@@ -176,6 +176,7 @@ const TABLES: &str = "
         icon INTEGER,
         max_file_bytes INTEGER NOT NULL DEFAULT 0,
         read_only_reason TEXT NOT NULL DEFAULT '',
+        spam INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (network, account, id)
     ) WITHOUT ROWID;
     CREATE INDEX conversation_threads ON conversation (network, account, parent) WHERE parent != '';
@@ -295,7 +296,7 @@ const CONVERSATION: &str = "
            (c.preview_mine AND c.delivered_to != '' AND (length(c.delivered_to), c.delivered_to) >= (length(c.preview_id), c.preview_id)),
            (c.preview_mine AND EXISTS (SELECT 1 FROM message f WHERE f.network = c.network AND f.account = c.account
                                          AND f.conversation = c.id AND f.id = c.preview_id AND f.pending = 1)),
-           c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason
+           c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason, c.spam
     FROM conversation c
     LEFT JOIN media m ON m.network = c.network AND m.account = c.account AND m.id = c.avatar
     LEFT JOIN space s ON s.network = c.network AND s.account = c.account AND s.id = c.space
@@ -387,6 +388,8 @@ pub struct ConversationRow {
     pub max_file_bytes: u64,
     /// Why this conversation is read-only (empty uses the default sentence).
     pub read_only_reason: String,
+    /// Flagged as spam by the network (e.g. Discord spam message request).
+    pub spam: bool,
     /// How the network files it. `None` leaves what is stored, so a tree that does not know
     /// (a Slack tree reload) never undoes a pin or a follow; `Some` replaces it.
     pub filing: Option<Filing>,
@@ -482,6 +485,7 @@ impl ConversationRow {
             icon: None,
             max_file_bytes: 0,
             read_only_reason: String::new(),
+            spam: false,
         }
     }
 }
@@ -717,6 +721,7 @@ fn conversation_from(row: &Row) -> rusqlite::Result<Conversation> {
         topic_icon: row.get(50)?,
         max_file_bytes: row.get::<_, i64>(51)? as u64,
         read_only_reason: row.get(52)?,
+        spam: row.get(53)?,
     })
 }
 
@@ -871,9 +876,9 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
         "INSERT INTO conversation
              (network, account, id, kind, title, space, section, position, avatar, peer, call, listed,
               topic, parent, root, read_only, private, bot, meeting, special, mark, opted_out,
-              folders, archived, pin, hidden, followed, voice_limit, encryption, icon, max_file_bytes, read_only_reason)
+              folders, archived, pin, hidden, followed, voice_limit, encryption, icon, max_file_bytes, read_only_reason, spam)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
+                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34)
          ON CONFLICT (network, account, id) DO UPDATE SET
              kind = excluded.kind, title = excluded.title, space = excluded.space,
              section = excluded.section, position = excluded.position, avatar = excluded.avatar,
@@ -886,6 +891,7 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
              icon = excluded.icon,
              max_file_bytes = excluded.max_file_bytes,
              read_only_reason = excluded.read_only_reason,
+             spam = excluded.spam,
              folders = CASE WHEN ?23 THEN excluded.folders ELSE folders END,
              archived = CASE WHEN ?23 THEN excluded.archived ELSE archived END,
              pin = CASE WHEN ?23 THEN excluded.pin ELSE pin END,
@@ -925,6 +931,7 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
             row.icon,
             row.max_file_bytes as i64,
             row.read_only_reason,
+            row.spam,
         ],
     )?;
     Ok(())
@@ -990,6 +997,9 @@ fn keep_added_columns(db: &Connection, version: i32) -> rusqlite::Result<bool> {
     }
     if !column(db, "conversation", "read_only_reason")? {
         db.execute_batch("ALTER TABLE conversation ADD COLUMN read_only_reason TEXT NOT NULL DEFAULT ''")?;
+    }
+    if !column(db, "conversation", "spam")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN spam INTEGER NOT NULL DEFAULT 0")?;
     }
     Ok(true)
 }

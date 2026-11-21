@@ -522,6 +522,9 @@ pub struct Conversation {
     /// Why this conversation is read-only, in words (e.g. a Discord server timeout). Empty uses the default sentence.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub read_only_reason: String,
+    /// Flagged as spam by the network (e.g. Discord spam message request).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub spam: bool,
 }
 
 /// What became of my newest message, as its mark says it (`design/06-live-signals.md` §4).
@@ -584,6 +587,7 @@ impl Conversation {
             sending: false,
             max_file_bytes: 0,
             read_only_reason: String::new(),
+            spam: false,
         }
     }
 
@@ -1289,6 +1293,11 @@ pub enum Request {
     /// message brings it back. Nothing is deleted.
     CloseDirect {
         conversation: Key,
+    },
+    /// Accept (`accept == true`) or decline/ignore (`accept == false`) a message request (Discord).
+    AnswerMessageRequest {
+        conversation: Key,
+        accept: bool,
     },
     /// The messages pinned in a conversation, asked of the network, newest first, at most
     /// [`PINNED_LIMIT`].

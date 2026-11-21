@@ -2539,6 +2539,9 @@ impl Chat {
             Request::CloseDirect { conversation } => {
                 self.act(&conversation, |conversation_id, reply| Command::CloseDirect { conversation_id, reply })
             }
+            Request::AnswerMessageRequest { conversation, accept } => {
+                self.act(&conversation, |conversation_id, reply| Command::AnswerMessageRequest { conversation_id, accept, reply })
+            }
             Request::Pinned { conversation } => self.pinned(conversation),
             Request::Shared { conversation, kind, before, limit, search } => self.shared(conversation, kind, before, limit, search),
             Request::Relate { person, action } => self.relate(person, action),

@@ -260,6 +260,7 @@ struct Target {
     space: Option<String>,
     read_only: bool,
     read_only_reason: String,
+    special: protocol::Special,
     /// What the account may send.
     can: Capabilities,
 }
@@ -269,6 +270,7 @@ enum Locked {
     SignedOut,
     Expired,
     ReadOnly(String),
+    MessageRequest,
 }
 
 impl Target {
@@ -276,6 +278,7 @@ impl Target {
         match (self.link, self.kind) {
             (Link::SignedOut, _) => Some(Locked::SignedOut),
             (Link::Expired, _) => Some(Locked::Expired),
+            _ if self.special == protocol::Special::Request => Some(Locked::MessageRequest),
             (_, ConversationKind::Forum) => Some(Locked::ReadOnly("Posts in a forum are started in the network's app.".to_owned())),
             _ if self.read_only => {
                 let why = if self.read_only_reason.is_empty() {
@@ -2144,6 +2147,38 @@ impl Composer {
 
     /// The 40 pt bar that stands where the card would be.
     fn bar(&self, locked: Locked, network: Network, cx: &mut Context<Self>) -> Div {
+        if matches!(locked, Locked::MessageRequest) {
+            let key = self.target.as_ref().map(|t| t.key.clone());
+            let (accept_key, decline_key) = (key.clone(), key);
+            return div()
+                .h(px(card_height()))
+                .pl(px(12.))
+                .pr(px(6.))
+                .rounded(px(theme::R_FLOAT))
+                .border_1()
+                .border_color(theme::border())
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .type_ui()
+                .text_color(theme::text_soft())
+                .child(glyph("icons/mail.svg", 16., theme::text_faint()))
+                .child(div().flex_1().min_w_0().truncate().child("Message request"))
+                .child(
+                    button("request-ignore", ButtonKind::Secondary, "Ignore").on_click(cx.listener(move |_, _, _, cx| {
+                        if let Some(conversation) = decline_key.clone() {
+                            ask_later(cx, Request::AnswerMessageRequest { conversation, accept: false }, |_, _| {});
+                        }
+                    })),
+                )
+                .child(
+                    button("request-accept", ButtonKind::Primary, "Accept").on_click(cx.listener(move |_, _, _, cx| {
+                        if let Some(conversation) = accept_key.clone() {
+                            ask_later(cx, Request::AnswerMessageRequest { conversation, accept: true }, |_, _| {});
+                        }
+                    })),
+                );
+        }
         let name = network.label();
         let (icon, words, action) = match locked {
             Locked::SignedOut => ("icons/lock.svg", format!("{name} is signed out."), Some("Sign in")),
@@ -2153,6 +2188,7 @@ impl Composer {
                 Some("Sign in again"),
             ),
             Locked::ReadOnly(sentence) => ("icons/lock.svg", sentence, None),
+            Locked::MessageRequest => unreachable!(),
         };
         let expired = action == Some("Sign in again");
         div()
@@ -3305,6 +3341,7 @@ impl Shell {
             space: open.space.clone(),
             read_only: open.read_only,
             read_only_reason: open.read_only_reason.clone(),
+            special: open.special,
             can,
         };
         let composer = self.composer_in(false, cx);
@@ -3332,6 +3369,7 @@ impl Shell {
             space: None,
             read_only: false,
             read_only_reason: String::new(),
+            special: protocol::Special::None,
             can: self.can_of(thread),
         };
         let composer = self.composer_in(true, cx);
@@ -3939,6 +3977,7 @@ mod tests {
             space: None,
             read_only,
             read_only_reason: String::new(),
+            special: protocol::Special::None,
             can: Capabilities::default(),
         }
     }

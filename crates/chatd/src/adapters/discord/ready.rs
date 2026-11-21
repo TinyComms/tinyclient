@@ -682,6 +682,7 @@ impl Discord {
         // and one Discord judged spam both wait behind Message Requests.
         if channel.is_message_request || channel.is_spam {
             row.special = Special::Request;
+            row.spam = channel.is_spam;
         }
         match (kind, recipients.first()) {
             (ConversationKind::Direct, Some(peer)) => {

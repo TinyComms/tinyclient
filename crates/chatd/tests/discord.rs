@@ -277,6 +277,7 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             (200, json!({"guild_id": guild_id, "muted": false, "suppress_everyone": false, "suppress_roles": false, "message_notifications": 0, "flags": 0, "channel_overrides": overrides}))
         }
         ("DELETE", ["channels", channel]) => (200, json!({"id": channel, "type": 1})),
+        ("PUT", ["channels", channel, "recipients", "@me"]) => (200, json!({"id": channel, "type": 1, "is_message_request": false})),
         ("GET", ["channels", channel, "messages", "pins"]) => {
             let pinned = json!({
                 "id": "1300000000000000700", "channel_id": channel, "type": 0, "author": me(), "content": "Read the rules first",
@@ -4236,4 +4237,44 @@ fn unblock_and_ignore_user_relationships() {
     assert_eq!(world.ask(Request::Relate { person: world.key("2006"), action: RelateAction::UnignoreUser }), Response::Ok);
     assert_eq!(world.discord.requests_to("DELETE", "/users/@me/relationships/2006/ignore").len(), 1);
     assert!(world.people(Some(Relation::Ignored), None).iter().all(|p| p.key.id != "2006"));
+}
+
+#[test]
+fn message_request_accept_decline_and_spam_flag() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    let privates = ready["private_channels"].as_array_mut().unwrap();
+    privates.push(json!({
+        "id": "3010", "type": 1, "last_message_id": "1300000000000009010",
+        "recipient_ids": ["2006"], "is_message_request": true, "is_spam": false
+    }));
+    privates.push(json!({
+        "id": "3011", "type": 1, "last_message_id": "1300000000000009011",
+        "recipient_ids": ["2005"], "is_message_request": true, "is_spam": true
+    }));
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    let normal = world.conversation("3010");
+    assert_eq!(normal.special, protocol::Special::Request);
+    assert!(!normal.spam);
+    let spam = world.conversation("3011");
+    assert_eq!(spam.special, protocol::Special::Request);
+    assert!(spam.spam, "is_spam must set Conversation::spam");
+
+    // Accept 3010: PUT /channels/3010/recipients/@me with consent_status 2 -> leaves Requests.
+    assert_eq!(world.ask(Request::AnswerMessageRequest { conversation: world.key("3010"), accept: true }), Response::Ok);
+    let accepts = world.discord.requests_to("PUT", "/channels/3010/recipients/@me");
+    assert_eq!(accepts.len(), 1);
+    assert_eq!(accepts[0].body, json!({"consent_status": 2}));
+    assert_eq!(world.conversation("3010").special, protocol::Special::None);
+
+    // Decline 3011: DELETE /channels/3011 -> conversation removed.
+    assert_eq!(world.ask(Request::AnswerMessageRequest { conversation: world.key("3011"), accept: false }), Response::Ok);
+    assert_eq!(world.discord.requests_to("DELETE", "/channels/3011").len(), 1);
+    assert!(matches!(
+        world.ask(Request::Conversation { conversation: world.key("3011") }),
+        Response::Error { code: ErrorCode::NotFound, .. }
+    ));
 }

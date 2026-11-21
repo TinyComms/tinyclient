@@ -304,6 +304,7 @@ pub(super) fn renamed(known: &protocol::Conversation, title: &str) -> crate::sto
     row.limit = known.limit;
     row.max_file_bytes = known.max_file_bytes;
     row.read_only_reason = known.read_only_reason.clone();
+    row.spam = known.spam;
     row
 }
 
@@ -1082,6 +1083,30 @@ impl Discord {
     /// Sends or answers a friend request, withdraws or ends a friendship, or blocks. One request:
     /// managing friends is what Discord's anti-abuse system watches most closely.
     ///
+    /// Accepts or declines/ignores a message request.
+    fn answer_message_request(&self, channel: &str, accept: bool) -> Result<(), Refusal> {
+        if accept {
+            self.call("PUT", &format!("/channels/{channel}/recipients/@me"), Some(json!({"consent_status": 2})))
+                .map_err(refusal)?;
+            if let Ok(Some(known)) = self.ctx.known(channel) {
+                let mut row = renamed(&known, &known.title);
+                row.special = protocol::Special::None;
+                row.spam = false;
+                self.ctx.conversation(&row).map_err(|err| Refusal::Refused(err.to_string()))?;
+            }
+            Ok(())
+        } else {
+            self.call("DELETE", &format!("/channels/{channel}"), None).map_err(refusal)?;
+            {
+                let mut state = crate::hub::lock(&self.state);
+                state.privates.remove(channel);
+                state.directs.retain(|_, id| id != channel);
+                state.covered.remove(channel);
+            }
+            self.ctx.conversation_gone(channel).map_err(|err| Refusal::Refused(err.to_string()))
+        }
+    }
+
     /// The bodies and the context header are the web client's as the community documents them,
     /// unconfirmed against a real account.
     fn relate(&self, person: &str, action: RelateAction) -> Result<(), Refusal> {
@@ -1588,6 +1613,9 @@ impl Discord {
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
             Command::Leave { conversation_id, reply } => answer(reply, self.leave(&conversation_id, false)),
             Command::CloseDirect { conversation_id, reply } => answer(reply, self.leave(&conversation_id, true)),
+            Command::AnswerMessageRequest { conversation_id, accept, reply } => {
+                answer(reply, self.answer_message_request(&conversation_id, accept))
+            }
             Command::Pinned { conversation_id, reply } => answer(reply, self.pinned(&conversation_id)),
             Command::SearchShared { conversation_id, kind, before, limit, reply } => {
                 answer(reply, self.search_shared(&conversation_id, kind, before.as_deref(), limit))
