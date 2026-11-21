@@ -112,8 +112,6 @@ impl Teams {
             Notify::Nothing
         } else if let Some(level) = remembered {
             level
-        } else if channel {
-            Notify::Mentions
         } else {
             Notify::All
         };

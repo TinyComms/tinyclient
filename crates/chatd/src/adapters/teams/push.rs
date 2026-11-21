@@ -266,14 +266,25 @@ impl Teams {
             self.ctx.muted(id, level == protocol::Notify::Nothing)?;
         }
         let horizon = props["consumptionhorizon"].as_str().and_then(|horizon| horizon.split(';').next());
-        let Some(read) = horizon.filter(|read| super::millis(read) > 0) else {
+        let Some(read) = horizon.filter(|read| *read == "0" || super::millis(read) > 0) else {
             return Ok(());
         };
         let newest = match conversation["lastMessage"]["id"].as_str() {
             Some(newest) => Some(newest.to_owned()),
             None => self.ctx.newest(id)?,
         };
-        if newest.is_some_and(|newest| super::millis(&newest) > super::millis(read)) {
+        let moved_back = row
+            .last_read
+            .as_deref()
+            .is_some_and(|prev| super::millis(read) < super::millis(prev));
+        let has_unread = newest.as_deref().is_some_and(|newest| super::millis(newest) > super::millis(read));
+        if moved_back || (has_unread && row.unread == 0) {
+            let marker = if read == "0" { "" } else { read };
+            self.ctx.manual_ack(id, marker, None)?;
+            if has_unread && self.ctx.known(id)?.is_some_and(|updated| updated.unread == 0) {
+                self.ctx.mark_unread(id)?;
+            }
+        } else if has_unread {
             self.ctx.counts(id, row.unread, row.mentions, Some(read), 0)?;
         } else {
             self.ctx.counts(id, 0, 0, Some(read), 0)?;

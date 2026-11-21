@@ -102,7 +102,18 @@ struct Counted {
 fn counted(entry: &Value, me: &str) -> Counted {
     let last = &entry["lastMessage"];
     let newest = id_of(&last["id"]);
-    let read = id_of(&entry["consumptionHorizon"]["originalArrivalTime"]);
+    let read = {
+        let from_obj = id_of(&entry["consumptionHorizon"]["originalArrivalTime"]);
+        if millis(&from_obj) > 0 {
+            from_obj
+        } else {
+            entry["properties"]["consumptionhorizon"]
+                .as_str()
+                .and_then(|h| h.split(';').next())
+                .unwrap_or("")
+                .to_owned()
+        }
+    };
     let from = text(last, "from");
     let mine = entry["isLastMessageFromMe"] == true || (!me.is_empty() && from.rsplit('/').next() == Some(me));
     let unread = if mine || millis(&newest) == 0 {
@@ -191,7 +202,7 @@ impl Teams {
                 let chan_id = text(channel, "id");
                 let level = super::info::parse_notify(channel, true)
                     .or_else(|| super::info::parse_notify(&channel["properties"], true))
-                    .unwrap_or(protocol::Notify::Mentions);
+                    .unwrap_or(protocol::Notify::All);
                 self.state().notify.insert(chan_id.to_owned(), level);
                 self.ctx.set_note(&format!("notify:{chan_id}"), super::info::notify_word(level));
                 self.count(chan_id, &counted(channel, &me), level == protocol::Notify::Nothing)?;

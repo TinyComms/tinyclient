@@ -445,6 +445,13 @@ impl Fake {
                     GENERAL => "messages.general",
                     DEPLOYS => "messages.deploys",
                     CHAT_ANA => "messages.ana",
+                    "19:grp1@thread.v2" => {
+                        let msgs: Vec<Value> = (1..=8u64)
+                            .rev()
+                            .map(|i| message("19:grp1@thread.v2", None, 1_759_500_000_000 + i * 100, BEN, "Ben Okafor", &format!("<p>update {i}</p>")))
+                            .collect();
+                        return ok(json!({"messages": msgs, "_metadata": {}}));
+                    }
                     chain if chain == format!("{GENERAL};messageid={ROOT}") => "messages.chain",
                     "48:notifications" => "messages.activity",
                     _ => return ok(json!({"messages": [], "_metadata": {}})),
@@ -1847,14 +1854,23 @@ fn notification_levels_read_write_and_live_update() {
     let general = key(GENERAL);
     let grp1 = key("19:grp1@thread.v2");
 
-    // Channel defaults to Mentions when unmuted and not followed.
+    // Unmuted channel with no explicit override starts at All; setting Mentions updates both alerts and channelNotificationSettings.
     let info = match world.ask(Request::ConversationInfo { conversation: general.clone() }) {
         Response::ConversationInfo { info } => info,
         other => panic!("unexpected: {other:?}"),
     };
-    assert_eq!(info.notify, protocol::Notify::Mentions);
+    assert_eq!(info.notify, protocol::Notify::All);
 
-    // Update channel to All: writes alerts=true and channelNotificationSettings.
+    assert_eq!(
+        world.ask(Request::SetMute { conversation: general.clone(), notify: protocol::Notify::Mentions, until: None }),
+        Response::Ok
+    );
+    let chan_calls = world.fake.calls("PUT", &format!("{GENERAL}/properties"));
+    assert!(chan_calls.iter().any(|c| c.query == "name=alerts" && c.json() == json!({"alerts": "false", "mentions": "true"})));
+    assert!(chan_calls.iter().any(|c| c.query == "name=channelNotificationSettings" && c.json()["channelNotificationSettings"]["allPosts"] == "off" && c.json()["channelNotificationSettings"]["mentions"] == "bannerAndFeed"));
+    assert!(!world.conversation(&general).unwrap().muted);
+
+    // Update channel back to All: writes alerts=true and channelNotificationSettings allPosts=bannerAndFeed.
     assert_eq!(
         world.ask(Request::SetMute { conversation: general.clone(), notify: protocol::Notify::All, until: None }),
         Response::Ok
@@ -1967,4 +1983,67 @@ fn scheduled_chat_message_send_edit_cancel_and_channel_refusal() {
     });
     assert!(matches!(failed.state, SendState::Failed { ref reason } if reason.contains("channels")));
     assert_eq!(world.fake.calls("POST", &format!("{GENERAL}/messages")).len(), posts_before);
+}
+
+#[test]
+fn unread_count_from_horizon_and_mark_unread_sync() {
+    let world = World::start();
+    world.ready();
+
+    let grp1 = key("19:grp1@thread.v2");
+
+    // 1. Set consumption horizon at msg 1 (1759500000100), then open grp1 (8 messages: 100..=800).
+    //    Backfill counts the 7 messages past the horizon instead of collapsing to 1.
+    world.fake.push(
+        "ConversationUpdate",
+        json!({
+            "id": "19:grp1@thread.v2",
+            "properties": {"consumptionhorizon": "1759500000100;1759500000150;1759500000100"},
+            "lastMessage": {"id": "1759500000800"}
+        }),
+        false,
+    );
+    world.until("grp1 horizon recorded", || {
+        world.conversation(&grp1).filter(|row| row.last_read.as_deref() == Some("1759500000100"))
+    });
+    world.open(&grp1, 8);
+    let counted = world.until("grp1 unread count refined to 7", || {
+        world.conversation(&grp1).filter(|row| row.unread == 7)
+    });
+    assert_eq!(counted.unread, 7);
+
+    // 2. Mark read at msg 8, then MarkUnread from msg 5 (1759500000500) -> writes prior msg (1759500000400) to Teams.
+    assert_eq!(world.ask(Request::MarkRead { conversation: grp1.clone(), message_id: "1759500000800".into() }), Response::Ok);
+    assert_eq!(world.conversation(&grp1).unwrap().unread, 0);
+    world.until("MarkRead PUT consumptionhorizon", || {
+        world.fake.calls("PUT", "19:grp1@thread.v2/properties").into_iter().find(|c| {
+            c.query == "name=consumptionhorizon"
+                && c.json()["consumptionhorizon"].as_str().unwrap_or("").starts_with("1759500000800;")
+        })
+    });
+    assert_eq!(world.ask(Request::MarkUnread { conversation: grp1.clone(), message_id: "1759500000500".into() }), Response::Ok);
+    let unread_call = world.until("MarkUnread PUT consumptionhorizon", || {
+        world.fake.calls("PUT", "19:grp1@thread.v2/properties").into_iter().find(|c| {
+            c.query == "name=consumptionhorizon"
+                && c.json()["consumptionhorizon"].as_str().unwrap_or("").starts_with("1759500000400;")
+        })
+    });
+    assert!(unread_call.json()["consumptionhorizon"].as_str().unwrap_or("").starts_with("1759500000400;"));
+
+    // 3. Another device moving consumptionhorizon backwards via ConversationUpdate rewinds last_read and unread count.
+    assert_eq!(world.ask(Request::MarkRead { conversation: grp1.clone(), message_id: "1759500000800".into() }), Response::Ok);
+    assert_eq!(world.conversation(&grp1).unwrap().unread, 0);
+    world.fake.push(
+        "ConversationUpdate",
+        json!({
+            "id": "19:grp1@thread.v2",
+            "properties": {"consumptionhorizon": "1759500000300;1759500000900;1759500000300"},
+            "lastMessage": {"id": "1759500000800"}
+        }),
+        false,
+    );
+    let rewound = world.until("grp1 rewound to 5 unread", || {
+        world.conversation(&grp1).filter(|row| row.last_read.as_deref() == Some("1759500000300") && row.unread == 5)
+    });
+    assert_eq!(rewound.unread, 5);
 }

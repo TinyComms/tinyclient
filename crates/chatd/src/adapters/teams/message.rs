@@ -452,6 +452,35 @@ pub(super) fn parse_link_previews(
     previews
 }
 
+/// Counts non-outgoing messages newer than the consumption horizon (`last_read`) and how many
+/// mention us. When no horizon is known, counts non-outgoing messages newer than our latest own
+/// message on the page.
+pub(super) fn count_unread_against_horizon(messages: &[Message], last_read: Option<&str>) -> (u32, u32) {
+    let horizon = last_read.map(millis).filter(|ms| *ms > 0).unwrap_or_else(|| {
+        messages
+            .iter()
+            .filter(|m| m.outgoing)
+            .map(|m| millis(&m.id))
+            .max()
+            .unwrap_or(0)
+    });
+    let mut unread = 0u32;
+    let mut mentions = 0u32;
+    for msg in messages {
+        if msg.outgoing || msg.deleted || msg.kind == MessageKind::System {
+            continue;
+        }
+        let ts = millis(&msg.id);
+        if ts > 0 && ts > horizon {
+            unread = unread.saturating_add(1);
+            if msg.mentions_me {
+                mentions = mentions.saturating_add(1);
+            }
+        }
+    }
+    (unread, mentions)
+}
+
 /// The header of a quoted reply, as Teams' own client writes it.
 fn quote_markup(reply: &ReplyTo) -> String {
     // A quote's name and preview are already plain text. Escaping them must not read markdown.
@@ -929,7 +958,7 @@ impl Teams {
     /// Records a page. In a channel the posts are its own and each reply goes to its chain; a
     /// chain, a chat and anything else holds every message itself. `more_before` is true when
     /// Teams gave a cursor for a still older page.
-    fn record(&self, conversation: &str, raws: &[Value], more_before: bool) -> Result<(), Fault> {
+    fn record(&self, conversation: &str, raws: &[Value], more_before: bool) -> Result<Vec<Message>, Fault> {
         let channel = chain_of(conversation).is_none() && self.ctx.known(conversation)?.is_some_and(|row| row.kind == ConversationKind::Channel);
         let (mut own, mut replies): (Vec<Message>, Vec<(String, Message)>) = (Vec::new(), Vec::new());
         for raw in raws {
@@ -980,7 +1009,7 @@ impl Teams {
                 self.bump(conversation, root, &of(root), false)?;
             }
         }
-        Ok(())
+        Ok(own)
     }
 
     /// The newest page. A reply chain keeps the cursor, the same way a chat does, so scrolling
@@ -993,11 +1022,27 @@ impl Teams {
             self.chain_known(channel, root)?;
             let (messages, older) = self.page(conversation, CHAIN, "startTime=1")?;
             self.remember_cursor(conversation, &messages, &older);
-            return self.record(conversation, &messages, !older.is_empty());
+            self.record(conversation, &messages, !older.is_empty())?;
+            return Ok(());
         }
         let (messages, older) = self.page(conversation, PAGE, "startTime=1")?;
         self.remember_cursor(conversation, &messages, &older);
-        self.record(conversation, &messages, !older.is_empty())?;
+        let own = self.record(conversation, &messages, !older.is_empty())?;
+        // Refine Teams' boolean unread flag into an exact count against the consumption horizon.
+        if let Some(row) = self.ctx.known(conversation)? {
+            if row.unread > 0 || row.last_read.is_some() {
+                let (unread, mentions) = count_unread_against_horizon(&own, row.last_read.as_deref());
+                if unread > row.unread || mentions > row.mentions {
+                    self.ctx.counts(
+                        conversation,
+                        unread.max(row.unread),
+                        mentions.max(row.mentions),
+                        row.last_read.as_deref(),
+                        row.updated,
+                    )?;
+                }
+            }
+        }
         self.seen_by(conversation)
     }
 
@@ -1055,7 +1100,8 @@ impl Teams {
         let note = self.ctx.note(&format!("older:{conversation}")).unwrap_or_default();
         let (messages, older) = self.page(conversation, history_limit(conversation), &older_window(&note, before))?;
         self.remember_cursor(conversation, &messages, &older);
-        self.record(conversation, &messages, !older.is_empty())
+        self.record(conversation, &messages, !older.is_empty())?;
+        Ok(())
     }
 
     /// True when a reply older than `before` is already stored, so this scroll was fetched.
@@ -1076,7 +1122,8 @@ impl Teams {
             return Ok(());
         }
         let (messages, _) = self.page(conversation, PAGE, &format!("startTime={}", millis(after)))?;
-        self.record(conversation, &messages, true)
+        self.record(conversation, &messages, true)?;
+        Ok(())
     }
 
     /// The page that ends just after `around`; what follows it is asked for as it is read.
@@ -1093,7 +1140,8 @@ impl Teams {
         if chain {
             self.remember_cursor(conversation, &messages, &older);
         }
-        self.record(conversation, &messages, !older.is_empty())
+        self.record(conversation, &messages, !older.is_empty())?;
+        Ok(())
     }
 
     // Acting on messages.
@@ -1653,5 +1701,26 @@ mod tests {
         assert_eq!((previews[2].title.as_str(), previews[2].site.as_str()), ("Q4 Budget.xlsx", "Excel · SharePoint"));
         assert_eq!(first_url("Check out https://example.com/release!"), Some("https://example.com/release".to_owned()));
         assert_eq!(first_url("no links here"), None);
+    }
+
+    #[test]
+    fn unread_count_counts_all_non_outgoing_messages_past_consumption_horizon() {
+        let mut msgs = Vec::new();
+        for i in 1..=8u64 {
+            let mut m = Message::plain(format!("{}", 1_760_000_000_000 + i * 1000), "Ana", format!("msg {i}"), 1_760_000_000 + i as i64, false);
+            if i == 5 || i == 7 {
+                m.mentions_me = true;
+            }
+            msgs.push(m);
+        }
+        // Add an outgoing message past the horizon — must not count as unread.
+        msgs.push(Message::plain("1760000009000", "Me", "ok", 1_760_000_009, true));
+
+        // Horizon at msg 1 -> 7 unread messages (2..=8), 2 mentions (5 and 7).
+        assert_eq!(count_unread_against_horizon(&msgs, Some("1760000001000")), (7, 2));
+        // Horizon at msg 8 -> 0 unread.
+        assert_eq!(count_unread_against_horizon(&msgs, Some("1760000008000")), (0, 0));
+        // No horizon -> counts only non-outgoing messages newer than latest outgoing (9000) -> 0.
+        assert_eq!(count_unread_against_horizon(&msgs, None), (0, 0));
     }
 }
