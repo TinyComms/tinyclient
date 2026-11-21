@@ -1387,6 +1387,9 @@ impl Chat {
         }
         for file in &with.files {
             let named = file_name(file);
+            if can.images_only && !crate::blobs::upload::mime_of(&named).starts_with("image/") {
+                return refuse(format!("{name} only supports sending images from tinyclient right now."));
+            }
             // The same rule the upload reads by: never chatd's own files, a device, a secret, or
             // a link in `outbox/`.
             let real = match crate::blobs::upload::allowed(&file.path) {
@@ -3968,6 +3971,17 @@ impl Chat {
                 }
                 self.hub.notify(crate::notify::Event::Play(sound));
                 Response::Ok
+            }
+            Request::ReadBy { conversation, message_id } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::ReadBy { conversation_id, message_id, reply }) {
+                    Ok(readers) => Response::ReadBy { readers },
+                    Err(refused) => *refused,
+                }
             }
         }
     }
