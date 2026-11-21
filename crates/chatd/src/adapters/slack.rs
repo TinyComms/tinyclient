@@ -356,6 +356,10 @@ fn per_minute(method: &str) -> f64 {
         | "usergroups.create"
         | "usergroups.update"
         | "usergroups.users.update"
+        | "apps.profile.get"
+        | "bots.info"
+        | "views.get"
+        | "apps.home.get"
         | "dnd.setSnooze"
         | "dnd.endSnooze"
         | "stars.add"
@@ -1643,6 +1647,9 @@ impl Slack {
             Command::UserGroupMembers { group_id, users, reply } => {
                 answer(reply, self.user_group_members(&group_id, &users))
             }
+            Command::AppView { conversation_id, include_home, reply } => {
+                answer(reply, self.app_view(&conversation_id, include_home))
+            }
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
             Command::Star { conversation_id, starred, reply } => answer(reply, self.star(&conversation_id, starred)),
             Command::StarMessage { conversation_id, message_id, starred, reply } => {
@@ -2354,13 +2361,21 @@ impl Slack {
             }
         }
         let actions = json!([action]).to_string();
-        let container = json!({
-            "type": "message",
-            "message_ts": ts,
-            "channel_id": channel,
-            "is_ephemeral": false,
-        })
-        .to_string();
+        let container = if let Some(view_id) = ts.strip_prefix("view:") {
+            json!({
+                "type": "view",
+                "view_id": view_id,
+            })
+            .to_string()
+        } else {
+            json!({
+                "type": "message",
+                "message_ts": ts,
+                "channel_id": channel,
+                "is_ephemeral": false,
+            })
+            .to_string()
+        };
         let client_token = format!("tiny-{now}");
         let service_id = self
             .state()

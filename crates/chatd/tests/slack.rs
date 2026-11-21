@@ -138,6 +138,12 @@ struct Fake {
     added_emoji: Mutex<HashMap<String, String>>,
     /// Mutable user groups for `usergroups.list` / `create` / `update` / `users.update`.
     usergroups: Mutex<Option<Vec<Value>>>,
+    /// Optional override for `users.channelSections.list`.
+    sections_override: Mutex<Option<Value>>,
+    /// Optional extra users for `users.info` / `edge:users/info`.
+    extra_users: Mutex<Vec<Value>>,
+    /// Optional extra channels returned by `users.conversations`.
+    extra_conversations: Mutex<Vec<Value>>,
 }
 
 fn unescape(text: &str) -> String {
@@ -223,6 +229,9 @@ impl Fake {
             scheduled: Mutex::default(),
             added_emoji: Mutex::default(),
             usergroups: Mutex::default(),
+            sections_override: Mutex::default(),
+            extra_users: Mutex::default(),
+            extra_conversations: Mutex::default(),
         });
         let socket_url = format!("ws://{}/", socket.local_addr().unwrap());
         for (listener, serve) in [(http, Fake::http as fn(Arc<Fake>, TcpStream)), (socket, Fake::socket)] {
@@ -258,7 +267,10 @@ impl Fake {
             }));
         }
         let users = self.fixture(token, "users")?;
-        users.as_array()?.iter().find(|user| user["id"] == id).cloned()
+        if let Some(found) = users.as_array()?.iter().find(|user| user["id"] == id) {
+            return Some(found.clone());
+        }
+        self.extra_users.lock().unwrap().iter().find(|user| user["id"] == id).cloned()
     }
 
     // HTTP.
@@ -512,6 +524,16 @@ impl Fake {
                 }
                 Some(listed)
             }
+            "users.conversations" => {
+                let mut listed = self.fixture(token, "users.conversations")?;
+                let extra = self.extra_conversations.lock().unwrap().clone();
+                if !extra.is_empty() {
+                    if let Some(arr) = listed["channels"].as_array_mut() {
+                        arr.extend(extra);
+                    }
+                }
+                Some(listed)
+            }
             "conversations.history" if BUSY.contains(&channel) => Some(json!({"ok": true, "has_more": false, "messages": []})),
             "conversations.members" => {
                 if channel == "C0RND" {
@@ -711,6 +733,84 @@ impl Fake {
                     }
                 }
                 Some(base)
+            }
+            "users.channelSections.list" => {
+                if let Some(over) = self.sections_override.lock().unwrap().clone() {
+                    Some(over)
+                } else {
+                    self.fixture(token, "users.channelSections.list")
+                }
+            }
+            "apps.profile.get" => {
+                let app = param("app");
+                if app == "A0DEP" || param("bot") == "B0DEP" {
+                    Some(json!({
+                        "ok": true,
+                        "app": {
+                            "id": "A0DEP",
+                            "name": "Deploy Bot",
+                            "long_description": "Deploys services to staging and production right from Slack.",
+                            "app_home_enabled": true,
+                            "installed_by": "U0ANA",
+                            "app_homepage_url": "https://deploybot.example.com",
+                            "help_url": "https://deploybot.example.com/help",
+                            "slash_commands": [
+                                {"command": "/deploy", "description": "Trigger a deploy", "usage_hint": "[service] [env]"},
+                                {"command": "/rollback", "description": "Roll back last deploy", "usage_hint": "[service]"}
+                            ]
+                        }
+                    }))
+                } else {
+                    return refused("app_not_found");
+                }
+            }
+            "bots.info" => {
+                let bot = param("bot");
+                if bot == "B0DEP" {
+                    Some(json!({
+                        "ok": true,
+                        "bot": {"id": "B0DEP", "app_id": "A0DEP", "name": "Deploy Bot"}
+                    }))
+                } else {
+                    return refused("bot_not_found");
+                }
+            }
+            "views.get" => {
+                let app = param("app_id");
+                if app == "A0DEP" && param("type") == "home" {
+                    Some(json!({
+                        "ok": true,
+                        "view": {
+                            "id": "V0HOME1",
+                            "type": "home",
+                            "blocks": [
+                                {"type": "header", "text": {"type": "plain_text", "text": "Deploy Dashboard"}},
+                                {"type": "section", "text": {"type": "mrkdwn", "text": "All *3* services healthy."}},
+                                {
+                                    "type": "actions",
+                                    "block_id": "home_actions",
+                                    "elements": [
+                                        {
+                                            "type": "button",
+                                            "action_id": "trigger_deploy",
+                                            "text": {"type": "plain_text", "text": "Deploy now"},
+                                            "value": "prod",
+                                            "style": "primary"
+                                        },
+                                        {
+                                            "type": "button",
+                                            "action_id": "open_docs",
+                                            "text": {"type": "plain_text", "text": "Docs"},
+                                            "url": "https://deploybot.example.com/docs"
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }))
+                } else {
+                    return refused("not_found");
+                }
             }
             "dnd.info" => self.dnd_info.lock().unwrap().clone().or_else(|| Some(json!({
                 "ok": true,
@@ -6007,4 +6107,92 @@ fn slack_workspace_info_invites_custom_emoji_and_user_groups() {
     };
     assert_eq!(with_members.members, vec!["U0ME".to_owned(), "U0ANA".to_owned()]);
     assert_eq!(with_members.member_count, 2);
+}
+
+#[test]
+fn slack_app_home_about_and_recent_apps_sidebar_group() {
+    let world = World::start_with(|fake| {
+        fake.extra_users.lock().unwrap().push(json!({
+            "id": "U0CI",
+            "name": "cibot",
+            "real_name": "CI Bot",
+            "is_bot": true,
+            "is_app_user": true,
+            "profile": {
+                "display_name": "CI Bot",
+                "real_name": "CI Bot",
+                "api_app_id": "A0DEP",
+                "bot_id": "B0DEP"
+            }
+        }));
+        fake.extra_conversations.lock().unwrap().push(json!({
+            "id": "D0CIAPP",
+            "created": 1760000000,
+            "is_im": true,
+            "is_org_shared": false,
+            "user": "U0CI"
+        }));
+        *fake.sections_override.lock().unwrap() = Some(json!({
+            "ok": true,
+            "channel_sections": [
+                {"channel_section_id": "S0SHIP", "name": "Shipping", "type": "standard", "next_channel_section_id": "S0CHAN", "channel_ids_page": {"channel_ids": ["C0DEP"]}},
+                {"channel_section_id": "S0CHAN", "name": "Channels", "type": "channels", "next_channel_section_id": "S0APPS", "channel_ids_page": {"channel_ids": ["C0GEN", "C0RND", "C0SIDE"]}},
+                {"channel_section_id": "S0APPS", "name": "Apps", "type": "recent_apps", "channel_ids_page": {"channel_ids": ["D0CIAPP"]}}
+            ]
+        }));
+    });
+    world.ready();
+
+    // 1. Neither apps.profile.get nor views.get was called at connect.
+    assert!(world.fake.calls(ALPHA, "apps.profile.get").is_empty());
+    assert!(world.fake.calls(ALPHA, "views.get").is_empty());
+
+    // 2. Installed app listed in recent_apps appears in the workspace tree even without a prior DM in client.counts.
+    let (_, rows) = world.tree(&alpha("T01ALPHA")).unwrap();
+    let ci_row = rows.iter().find(|r| r.key.id == "D0CIAPP").expect("recent_apps entry should appear in tree");
+    assert!(ci_row.bot, "app row must be flagged bot=true so Apps group lists it");
+    assert_eq!(ci_row.title, "CI Bot");
+
+    // 3. Opening the app's Home + About tabs fetches apps.profile.get and views.get on demand.
+    let Response::AppView { view } = world.ask(Request::AppView {
+        conversation: alpha("D0BOT"),
+        include_home: true,
+    }) else {
+        panic!("expected Response::AppView");
+    };
+    assert_eq!(view.profile.app_id, "A0DEP");
+    assert_eq!(view.profile.name, "Deploy Bot");
+    assert!(view.profile.description.contains("Deploys services"));
+    assert_eq!(view.profile.installed_by, "Ana");
+    assert_eq!(view.profile.commands.len(), 2);
+    assert_eq!(view.profile.commands[0].command, "/deploy");
+    assert_eq!(view.profile.links.len(), 2);
+    assert_eq!(view.profile.open_url, "https://app.slack.com/client/T01ALPHA/D0BOT");
+    assert_eq!(view.profile.directory_url, "https://acme.slack.com/apps");
+    assert!(view.profile.home_enabled);
+
+    let home = view.home.expect("published Home view");
+    assert_eq!(home.view_id, "V0HOME1");
+    assert!(home.text.contains("Deploy Dashboard"), "{}", home.text);
+    assert!(home.text.contains("3 services healthy"), "{}", home.text);
+    assert_eq!(home.controls.len(), 2);
+    assert_eq!(home.controls[0].action_id, "trigger_deploy");
+
+    // 4. Clicking an interactive button on the Home tab sends blocks.actions with container.type = "view".
+    assert_eq!(
+        world.ask(Request::MessageAction {
+            conversation: alpha("D0BOT"),
+            message_id: format!("view:{}", home.view_id),
+            block_id: "home_actions".into(),
+            action_id: "trigger_deploy".into(),
+            element_type: "button".into(),
+            value: "prod".into(),
+            values: Vec::new(),
+        }),
+        Response::Ok
+    );
+    let act = world.fake.calls(ALPHA, "blocks.actions").pop().expect("blocks.actions");
+    let container: Value = serde_json::from_str(&act.params["container"]).unwrap();
+    assert_eq!(container["type"], "view");
+    assert_eq!(container["view_id"], "V0HOME1");
 }

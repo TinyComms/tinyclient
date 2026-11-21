@@ -2640,6 +2640,13 @@ pub enum Request {
         group_id: String,
         users: Vec<String>,
     },
+    /// Fetch a Slack app's About profile and (when `include_home` is true) its published Home tab.
+    /// Fetched on open only; never at connect. Answers `Response::AppView`.
+    AppView {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "is_false")]
+        include_home: bool,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -3160,6 +3167,10 @@ pub enum Response {
     /// One created or updated workspace user group.
     UserGroup {
         group: UserGroup,
+    },
+    /// A Slack app's About profile and optional Home tab (`Request::AppView`).
+    AppView {
+        view: Box<AppView>,
     },
 }
 

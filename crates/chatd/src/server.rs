@@ -3976,6 +3976,17 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::AppView { conversation, include_home } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id;
+                match self.ask(&account, |reply| Command::AppView { conversation_id, include_home, reply }) {
+                    Ok(view) => Response::AppView { view: Box::new(view) },
+                    Err(refused) => *refused,
+                }
+            }
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
                     Some(id) => self.hub.settings().custom_sound(id).is_some(),

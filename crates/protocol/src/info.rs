@@ -355,6 +355,74 @@ pub struct UserGroup {
     pub member_count: u32,
 }
 
+/// One slash command exposed by a Slack app (shown in its About tab).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppSlashCommand {
+    pub command: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub usage: String,
+}
+
+/// One validated external link on a Slack app's About tab.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppLink {
+    pub label: String,
+    pub url: String,
+}
+
+/// A Slack app's About metadata, fetched on demand when its conversation opens.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppProfile {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub app_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bot_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<AppSlashCommand>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<AppLink>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub installed_by: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub open_url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub directory_url: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub home_enabled: bool,
+}
+
+/// A Slack app's published Home tab (Block Kit view), fetched on demand.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppHome {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub app_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub view_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spans: Vec<crate::Span>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cards: Vec<crate::Card>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub controls: Vec<crate::MessageControl>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub empty_reason: String,
+}
+
+/// Combined About + optional Home view for a Slack app conversation (`Request::AppView`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppView {
+    pub profile: AppProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<AppHome>,
+}
+
 /// Which of a custom emoji set this account may send.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -855,6 +855,12 @@ pub enum Command {
         users: Vec<String>,
         reply: Reply<protocol::UserGroup>,
     },
+    /// Fetch a Slack app's About profile and optional published Home tab on open.
+    AppView {
+        conversation_id: String,
+        include_home: bool,
+        reply: Reply<protocol::AppView>,
+    },
     /// The adapter is being dropped. `serve_commands` returns on it; an adapter never sees it.
     Stop,
 }
@@ -954,6 +960,7 @@ impl Command {
             Command::UserGroupCreate { reply, .. }
             | Command::UserGroupUpdate { reply, .. }
             | Command::UserGroupMembers { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AppView { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Download { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Search { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Send { conversation_id, client_id, .. } => {

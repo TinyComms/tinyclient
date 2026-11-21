@@ -528,6 +528,12 @@ impl Slack {
                 }
             })
             .collect();
+        let recent_apps: Vec<String> = sections
+            .iter()
+            .filter(|section| section.kind == "recent_apps")
+            .flat_map(|section| section.channels.iter().cloned())
+            .collect();
+        self.ctx.set_note("recent_apps", &recent_apps.join(","));
         sections.retain(|section| !matches!(section.kind.as_str(), "direct_messages" | "recent_apps"));
         // The built-in holds whatever no other section claims, so it must exist.
         if !sections.iter().any(|section| section.kind == "channels") {
@@ -547,6 +553,14 @@ impl Slack {
         // is what `client.counts` reports (unverified: taken from what the web client draws).
         let open: HashSet<&str> = listed("ims").chain(listed("mpims")).collect();
         let sections = self.sections();
+        let recent_app_channels: HashSet<String> = self
+            .ctx
+            .note("recent_apps")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .collect();
         // The mutes and the sidebar's "unreads only" are in the same prefs, read once here.
         let prefs = self.prefs()?;
         let unread_only = matches!(prefs["sidebar_behavior"].as_str(), Some("hide_read_channels" | "hide_read_channels_unless_starred"));
@@ -569,7 +583,11 @@ impl Slack {
             if let Some(Value::Array(found)) = page.get_mut("channels").map(Value::take) {
                 let direct = |channel: &Value| channel["is_im"] == true || channel["is_mpim"] == true;
                 let shown = |channel: &Value| {
-                    !direct(channel) || open.is_empty() || channel["id"].as_str().is_some_and(|id| open.contains(id))
+                    !direct(channel)
+                        || open.is_empty()
+                        || channel["id"]
+                            .as_str()
+                            .is_some_and(|id| open.contains(id) || recent_app_channels.contains(id))
                 };
                 channels.extend(found.into_iter().filter(shown));
             }

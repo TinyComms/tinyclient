@@ -6,7 +6,11 @@
 use super::{emoji, fnv, seconds, thread_id, thread_of, Fault, Slack};
 use crate::adapters::{AccountFilesPage, ActivityPage, CatalogPage, ConversationAbout, Failure, SharedPage, SpaceAbout};
 use crate::store::Filing;
-use protocol::{ActivityItem, ActivityItemKind, Bookmark, BookmarkKind, CatalogItem, ConversationKind, MediaFile, MediaKind, Message, Notify, SharedItem, SharedKind, UserGroup};
+use protocol::{
+    ActivityItem, ActivityItemKind, AppHome, AppLink, AppProfile, AppSlashCommand, AppView,
+    Bookmark, BookmarkKind, CatalogItem, ConversationKind, MediaFile, MediaKind, Message, Notify,
+    SharedItem, SharedKind, UserGroup,
+};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1271,5 +1275,232 @@ impl Slack {
             }
         }
         Ok(group)
+    }
+
+    /// Fetches a Slack app's About metadata and (optionally) its published Home tab.
+    /// Called only when the user opens an app's Home or About tab — never at connect.
+    ///
+    /// Unverified against a real workspace: `apps.profile.get` and `views.get` (`type=home`)
+    /// are web-client calls; falls back to `bots.info` for About details and `apps.home.get`
+    /// for Home blocks when unavailable.
+    pub(super) fn app_view(&self, conversation_id: &str, include_home: bool) -> Result<AppView, Fault> {
+        let channel = channel_of(conversation_id);
+        let stored = self.ctx.known(channel).map_err(|err| Fault::Net(err.to_string()))?;
+        let peer_id = stored
+            .as_ref()
+            .and_then(|row| row.peer.clone())
+            .filter(|id| !id.is_empty());
+        let mut name = stored.as_ref().map(|r| r.title.clone()).unwrap_or_default();
+        let (mut app_id, mut bot_id) = peer_id
+            .as_deref()
+            .and_then(|uid| self.ctx.note(&format!("app:{uid}")))
+            .map(|raw| {
+                let mut parts = raw.splitn(2, '|');
+                (
+                    parts.next().unwrap_or("").to_owned(),
+                    parts.next().unwrap_or("").to_owned(),
+                )
+            })
+            .unwrap_or_default();
+
+        if app_id.is_empty() && bot_id.is_empty() {
+            if let Some(uid) = peer_id.as_deref() {
+                if let Ok(info) = self.api("users.info", &[("user", uid)]) {
+                    let u = &info["user"];
+                    let prof = &u["profile"];
+                    app_id = prof["api_app_id"].as_str().unwrap_or("").to_owned();
+                    bot_id = prof["bot_id"]
+                        .as_str()
+                        .or_else(|| u["bot_id"].as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    if name.is_empty() {
+                        name = prof["real_name"]
+                            .as_str()
+                            .or_else(|| u["real_name"].as_str())
+                            .or_else(|| u["name"].as_str())
+                            .unwrap_or("")
+                            .to_owned();
+                    }
+                    if !app_id.is_empty() || !bot_id.is_empty() {
+                        self.ctx.set_note(&format!("app:{uid}"), &format!("{app_id}|{bot_id}"));
+                    }
+                }
+            }
+        }
+
+        let mut description = String::new();
+        let mut commands = Vec::new();
+        let mut links = Vec::new();
+        let mut installed_by = String::new();
+        let mut home_enabled = false;
+
+        let valid_url = |s: &str| -> Option<String> {
+            let trimmed = s.trim();
+            (trimmed.starts_with("https://") || trimmed.starts_with("http://")).then(|| trimmed.to_owned())
+        };
+
+        // 1. Try `apps.profile.get` when we know `app_id` (or `bot_id`).
+        let profile_resp = if !app_id.is_empty() {
+            self.api("apps.profile.get", &[("app", app_id.as_str())]).ok()
+        } else if !bot_id.is_empty() {
+            self.api("apps.profile.get", &[("bot", bot_id.as_str())]).ok()
+        } else {
+            None
+        };
+        if let Some(resp) = &profile_resp {
+            let app = if resp["app"].is_object() { &resp["app"] } else { resp };
+            if app_id.is_empty() {
+                if let Some(id) = app["id"].as_str().or_else(|| app["app_id"].as_str()).filter(|s| !s.is_empty()) {
+                    app_id = id.to_owned();
+                }
+            }
+            if let Some(n) = app["name"].as_str().filter(|s| !s.is_empty()) {
+                name = n.to_owned();
+            }
+            description = app["long_description"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| app["short_description"].as_str().filter(|s| !s.is_empty()))
+                .or_else(|| app["description"].as_str().filter(|s| !s.is_empty()))
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            home_enabled = app["app_home_enabled"] == true
+                || app["is_app_home_enabled"] == true
+                || app["home_tab_enabled"] == true;
+            if let Some(installer) = app["installed_by"].as_str().filter(|s| !s.is_empty()) {
+                installed_by = if installer.starts_with('U') || installer.starts_with('W') {
+                    self.user(installer).name
+                } else {
+                    installer.to_owned()
+                };
+            }
+            for cmd in app["slash_commands"]
+                .as_array()
+                .or_else(|| app["commands"].as_array())
+                .into_iter()
+                .flatten()
+                .take(32)
+            {
+                let Some(command) = cmd["command"].as_str().filter(|s| !s.is_empty()) else {
+                    continue;
+                };
+                commands.push(AppSlashCommand {
+                    command: command.to_owned(),
+                    description: cmd["description"].as_str().unwrap_or("").trim().to_owned(),
+                    usage: cmd["usage_hint"]
+                        .as_str()
+                        .or_else(|| cmd["usage"].as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_owned(),
+                });
+            }
+            for (field, label) in [
+                ("app_homepage_url", "Homepage"),
+                ("help_url", "Support"),
+                ("privacy_policy_url", "Privacy policy"),
+            ] {
+                if let Some(url) = app[field].as_str().and_then(valid_url) {
+                    links.push(AppLink { label: label.to_owned(), url });
+                }
+            }
+            for raw_link in app["links"].as_array().into_iter().flatten().take(12) {
+                if let Some(url) = raw_link["url"].as_str().and_then(valid_url) {
+                    let label = raw_link["label"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("Link")
+                        .to_owned();
+                    links.push(AppLink { label, url });
+                }
+            }
+        } else if !bot_id.is_empty() {
+            // Fallback to documented `bots.info`.
+            if let Ok(resp) = self.api("bots.info", &[("bot", bot_id.as_str())]) {
+                let bot = &resp["bot"];
+                if let Some(n) = bot["name"].as_str().filter(|s| !s.is_empty()) {
+                    name = n.to_owned();
+                }
+                if app_id.is_empty() {
+                    if let Some(id) = bot["app_id"].as_str().filter(|s| !s.is_empty()) {
+                        app_id = id.to_owned();
+                    }
+                }
+            }
+        }
+
+        let team = &self.ctx.account.account;
+        let domain = self.ctx.note("team:domain").unwrap_or_default();
+        let directory_url = if !domain.is_empty() && domain.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            format!("https://{domain}.slack.com/apps")
+        } else {
+            format!("https://app.slack.com/apps/{team}")
+        };
+        let open_url = format!("https://app.slack.com/client/{team}/{channel}");
+
+        // 2. Fetch published Home tab blocks when requested.
+        let home = if include_home {
+            let view_resp = if !app_id.is_empty() {
+                self.api("views.get", &[("type", "home"), ("app_id", app_id.as_str())])
+                    .or_else(|_| self.api("apps.home.get", &[("app_id", app_id.as_str())]))
+                    .ok()
+            } else if !bot_id.is_empty() {
+                self.api("views.get", &[("type", "home"), ("bot_id", bot_id.as_str())]).ok()
+            } else {
+                None
+            };
+            match view_resp {
+                Some(resp) => {
+                    let view = if resp["view"].is_object() { &resp["view"] } else { &resp };
+                    let view_id = view["id"].as_str().unwrap_or("").to_owned();
+                    let blocks = view["blocks"].as_array().map_or(&[][..], Vec::as_slice);
+                    if !blocks.is_empty() {
+                        home_enabled = true;
+                        let (text, spans, cards, controls) = self.parse_app_home_blocks(blocks);
+                        Some(AppHome {
+                            app_id: app_id.clone(),
+                            view_id,
+                            text,
+                            spans,
+                            cards,
+                            controls,
+                            empty_reason: String::new(),
+                        })
+                    } else {
+                        Some(AppHome {
+                            app_id: app_id.clone(),
+                            view_id,
+                            empty_reason: "This app has not published a Home view.".to_owned(),
+                            ..AppHome::default()
+                        })
+                    }
+                }
+                None => Some(AppHome {
+                    app_id: app_id.clone(),
+                    empty_reason: "This app's Home tab isn't available here. Open it in Slack to interact with it.".to_owned(),
+                    ..AppHome::default()
+                }),
+            }
+        } else {
+            None
+        };
+
+        Ok(AppView {
+            profile: AppProfile {
+                app_id,
+                bot_id,
+                name,
+                description,
+                commands,
+                links,
+                installed_by,
+                open_url,
+                directory_url,
+                home_enabled,
+            },
+            home,
+        })
     }
 }

@@ -158,8 +158,18 @@ struct Open {
     call: protocol::CallSupport,
     /// Conversation topic (e.g. "RCS message" / "Text message" for Google Messages).
     topic: String,
+    /// True when this conversation is with a bot/app (enables Home / Messages / About tabs on Slack).
+    bot: bool,
     #[cfg_attr(not(feature = "gui-shot"), allow(dead_code))]
     started: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum AppTab {
+    Home,
+    #[default]
+    Messages,
+    About,
 }
 
 #[derive(Default)]
@@ -432,6 +442,12 @@ pub struct Pane {
     opening: bool,
     /// Where each row drawn this frame is, for knowing what is on screen.
     seen: Seen,
+    /// Active tab for Slack app conversations (`Home`, `Messages`, `About`).
+    app_tab: AppTab,
+    /// Loaded About + Home tab view for the open Slack app conversation (fetched on demand only).
+    app_view: Option<(Key, protocol::AppView)>,
+    app_loading: bool,
+    app_error: Option<String>,
     #[cfg(feature = "gui-shot")]
     script: shot::Script,
 }
@@ -516,6 +532,10 @@ impl Pane {
             width: 0.,
             opening: false,
             seen: Rc::default(),
+            app_tab: AppTab::Messages,
+            app_view: None,
+            app_loading: false,
+            app_error: None,
             #[cfg(feature = "gui-shot")]
             script: if thread { shot::Script::default() } else { shot::Script::from_env() },
         }
@@ -587,6 +607,7 @@ impl Pane {
                 || open.can_pin != conversation.can_pin
                 || open.call != conversation.call
                 || open.topic != conversation.topic
+                || open.bot != conversation.bot
             {
                 open.title.clone_from(&conversation.title);
                 open.picture = picture;
@@ -595,8 +616,9 @@ impl Pane {
                 open.rights = conversation.rights;
                 open.moderate = conversation.moderate;
                 open.can_pin = conversation.can_pin;
-            open.call = conversation.call;
+                open.call = conversation.call;
                 open.topic.clone_from(&conversation.topic);
+                open.bot = conversation.bot;
                 cx.notify();
             }
             return;
@@ -617,6 +639,7 @@ impl Pane {
             open.can_pin = conversation.can_pin;
             open.call = conversation.call;
             open.topic.clone_from(&conversation.topic);
+            open.bot = conversation.bot;
         }
     }
 
@@ -672,8 +695,13 @@ impl Pane {
             can_pin: false,
             call: protocol::CallSupport::None,
             topic: String::new(),
+            bot: false,
             started: Instant::now(),
         });
+        self.app_tab = AppTab::Messages;
+        self.app_view = None;
+        self.app_loading = false;
+        self.app_error = None;
         self.window = pages::Window::default();
         self.items = Vec::new();
         self.list.reset(0);
@@ -1802,6 +1830,293 @@ impl Pane {
                 ),
         )
     }
+    fn is_slack_app(&self) -> bool {
+        !self.thread
+            && self
+                .open
+                .as_ref()
+                .is_some_and(|open| open.key.network == protocol::Network::Slack && open.bot)
+    }
+
+    fn select_app_tab(&mut self, tab: AppTab, cx: &mut Context<Self>) {
+        self.app_tab = tab;
+        if tab != AppTab::Messages {
+            self.load_app_view(tab == AppTab::Home, cx);
+        }
+        cx.notify();
+    }
+
+    fn load_app_view(&mut self, include_home: bool, cx: &mut Context<Self>) {
+        let Some(conversation) = self.key().cloned() else {
+            return;
+        };
+        let have = self
+            .app_view
+            .as_ref()
+            .is_some_and(|(k, v)| k == &conversation && (!include_home || v.home.is_some()));
+        if have || self.app_loading {
+            return;
+        }
+        self.app_loading = true;
+        self.app_error = None;
+        let expected = conversation.clone();
+        cx.spawn(async move |pane, cx| {
+            let answer = cx
+                .background_executor()
+                .spawn(async move {
+                    ask(&Request::AppView {
+                        conversation,
+                        include_home,
+                    })
+                })
+                .await;
+            let _ = pane.update(cx, |this, cx| {
+                if this.key() != Some(&expected) {
+                    return;
+                }
+                this.app_loading = false;
+                match answer {
+                    Ok(Response::AppView { view }) => {
+                        this.app_view = Some((expected, *view));
+                        this.app_error = None;
+                    }
+                    Ok(Response::Error { detail, .. }) => {
+                        this.app_error = Some(detail);
+                    }
+                    Ok(_) => {
+                        this.app_error = Some(crate::client::OTHER_ANSWER.to_owned());
+                    }
+                    Err(err) => {
+                        this.app_error = Some(crate::client::trouble_words("load app", &err));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn app_tabs_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if !self.is_slack_app() {
+            return None;
+        }
+        let open = self.open.as_ref()?;
+        let team_id = open.key.account.clone();
+        let channel_id = open.key.id.clone();
+        let open_url = self
+            .app_view
+            .as_ref()
+            .filter(|(k, _)| k == &open.key)
+            .map(|(_, v)| v.profile.open_url.clone())
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| format!("https://app.slack.com/client/{team_id}/{channel_id}"));
+        let dir_url = self
+            .app_view
+            .as_ref()
+            .filter(|(k, _)| k == &open.key)
+            .map(|(_, v)| v.profile.directory_url.clone())
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| format!("https://app.slack.com/apps/{team_id}"));
+        let tabs = [
+            (AppTab::Home, "Home"),
+            (AppTab::Messages, "Messages"),
+            (AppTab::About, "About"),
+        ];
+        let mut bar = super::components::segmented();
+        for (ix, (tab, label)) in tabs.into_iter().enumerate() {
+            bar = bar.child(
+                super::components::segment(("slack-app-tab", ix), label, self.app_tab == tab)
+                    .px(px(10.))
+                    .on_click(cx.listener(move |this, _, _, cx| this.select_app_tab(tab, cx))),
+            );
+        }
+        Some(
+            div()
+                .flex_none()
+                .px(px(theme::PANE_PAD))
+                .py(px(6.))
+                .border_b_1()
+                .border_color(theme::hairline())
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.))
+                .child(bar)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(
+                            super::components::button_with_icon(
+                                "slack-app-open",
+                                super::components::ButtonKind::Secondary,
+                                "icons/external-link.svg",
+                                "Open app in Slack",
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_external_link(&open_url, window, cx);
+                            })),
+                        )
+                        .child(
+                            super::components::button_with_icon(
+                                "slack-app-directory",
+                                super::components::ButtonKind::Secondary,
+                                "icons/plus.svg",
+                                "Add apps",
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_external_link(&dir_url, window, cx);
+                            })),
+                        ),
+                ),
+        )
+    }
+
+    fn app_tab_body(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let mut body = div()
+            .id("slack-app-tab-body")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .p(px(theme::PANE_PAD))
+            .flex()
+            .flex_col()
+            .gap(px(12.));
+        if self.app_loading {
+            return body
+                .child(div().type_ui().text_color(theme::text_soft()).child("Loading app…"))
+                .into_any_element();
+        }
+        if let Some(err) = &self.app_error {
+            return body
+                .child(div().type_ui().text_color(theme::danger()).child(err.clone()))
+                .into_any_element();
+        }
+        let Some((conv_key, view)) = self.app_view.as_ref().filter(|(k, _)| Some(k) == self.key()) else {
+            return body
+                .child(div().type_ui().text_color(theme::text_soft()).child("No app details loaded yet."))
+                .into_any_element();
+        };
+        match self.app_tab {
+            AppTab::Home => {
+                if let Some(home) = &view.home {
+                    if !home.text.trim().is_empty() {
+                        body = body.child(div().type_body().text_color(theme::text()).child(home.text.clone()));
+                    } else if !home.empty_reason.is_empty() {
+                        body = body.child(div().type_ui().text_color(theme::text_soft()).child(home.empty_reason.clone()));
+                    }
+                    if !home.controls.is_empty() {
+                        let mut row = div().flex().flex_wrap().gap(px(8.));
+                        for (ix, ctrl) in home.controls.iter().enumerate() {
+                            if let protocol::ControlKind::Button { url, style } = &ctrl.kind {
+                                let btn_kind = match style {
+                                    protocol::ControlStyle::Primary => super::components::ButtonKind::Primary,
+                                    protocol::ControlStyle::Danger => super::components::ButtonKind::Danger,
+                                    protocol::ControlStyle::Default => super::components::ButtonKind::Secondary,
+                                };
+                                let label = if ctrl.label.is_empty() { "Action".to_owned() } else { ctrl.label.clone() };
+                                if let Some(link) = url.clone() {
+                                    row = row.child(
+                                        super::components::button_with_icon(
+                                            ("app-home-btn", ix),
+                                            btn_kind,
+                                            "icons/external-link.svg",
+                                            label,
+                                        )
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.open_external_link(&link, window, cx);
+                                        })),
+                                    );
+                                } else {
+                                    let conv = conv_key.clone();
+                                    let msg_id = format!("view:{}", home.view_id);
+                                    let block_id = ctrl.block_id.clone();
+                                    let action_id = ctrl.action_id.clone();
+                                    let value = ctrl.value.clone();
+                                    row = row.child(
+                                        super::components::button(("app-home-btn", ix), btn_kind, label).on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.execute_control(
+                                                    conv.clone(),
+                                                    msg_id.clone(),
+                                                    block_id.clone(),
+                                                    action_id.clone(),
+                                                    "button".to_owned(),
+                                                    value.clone(),
+                                                    Vec::new(),
+                                                    cx,
+                                                );
+                                            }),
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                        body = body.child(row);
+                    }
+                } else {
+                    body = body.child(div().type_ui().text_color(theme::text_soft()).child("No Home view published."));
+                }
+            }
+            AppTab::About => {
+                let p = &view.profile;
+                body = body.child(div().type_title().text_color(theme::text()).child(p.name.clone()));
+                if !p.description.is_empty() {
+                    body = body.child(div().type_ui().text_color(theme::text_soft()).child(p.description.clone()));
+                }
+                if !p.installed_by.is_empty() {
+                    body = body.child(
+                        div()
+                            .type_small()
+                            .text_color(theme::text_faint())
+                            .child(format!("Installed by {}", p.installed_by)),
+                    );
+                }
+                if !p.commands.is_empty() {
+                    body = body.child(div().type_micro().text_color(theme::text_faint()).child("SLASH COMMANDS"));
+                    for cmd in &p.commands {
+                        let line = if cmd.usage.is_empty() {
+                            cmd.command.clone()
+                        } else {
+                            format!("{} {}", cmd.command, cmd.usage)
+                        };
+                        body = body.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(line))
+                                .when(!cmd.description.is_empty(), |el| {
+                                    el.child(div().type_small().text_color(theme::text_soft()).child(cmd.description.clone()))
+                                }),
+                        );
+                    }
+                }
+                if !p.links.is_empty() {
+                    body = body.child(div().type_micro().text_color(theme::text_faint()).child("LINKS"));
+                    let mut links_row = div().flex().flex_wrap().gap(px(6.));
+                    for (ix, link) in p.links.iter().enumerate() {
+                        let url = link.url.clone();
+                        links_row = links_row.child(
+                            super::components::button_with_icon(
+                                ("app-about-link", ix),
+                                super::components::ButtonKind::Secondary,
+                                "icons/external-link.svg",
+                                link.label.clone(),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_external_link(&url, window, cx);
+                            })),
+                        );
+                    }
+                    body = body.child(links_row);
+                }
+            }
+            AppTab::Messages => {}
+        }
+        body.into_any_element()
+    }
 }
 
 impl Render for Pane {
@@ -1850,9 +2165,13 @@ impl Render for Pane {
         )
         .absolute()
         .size_0();
+        let app_bar = self.app_tabs_bar(cx);
+        let showing_app_tab = self.is_slack_app() && self.app_tab != AppTab::Messages;
         div()
             .id("messages")
             .size_full()
+            .flex()
+            .flex_col()
             // A phone leaves 11 pt under the last row so it never touches the composer and the
             // last message's words sit 12–20 pt above the card.
             .when(self.metrics == Metrics::PHONE, |body| body.pb(px(11.)))
@@ -1891,12 +2210,22 @@ impl Render for Pane {
                     this.point_at(window.mouse_position(), cx);
                 }
             }))
-            .child(crate::gui::components::scroll_frame("message-scroll-frame", self.list.clone(), rows).keyboard(false))
-            .child(after)
-            .children(self.live_call_row(cx))
-            .children(self.history_banner(cx))
-            .children(self.away.then(|| self.jump_button(cx)))
-            .children(self.selection_bar(cx))
+            .children(app_bar)
+            .child(if showing_app_tab {
+                self.app_tab_body(cx)
+            } else {
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(crate::gui::components::scroll_frame("message-scroll-frame", self.list.clone(), rows).keyboard(false))
+                    .child(after)
+                    .children(self.live_call_row(cx))
+                    .children(self.history_banner(cx))
+                    .children(self.away.then(|| self.jump_button(cx)))
+                    .children(self.selection_bar(cx))
+                    .into_any_element()
+            })
             .children(self.action_layers(window, cx))
             .children(self.viewer_layer(window, cx))
     }
