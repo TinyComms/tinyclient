@@ -63,6 +63,39 @@ pub fn wire(text: &str, tokens: &[Token], network: Network) -> String {
     out
 }
 
+/// Structured mention spans for networks that carry mentions out-of-band (Telegram, Teams, Signal)
+/// rather than inline markup. Discord and Slack expand mentions inside `wire`; Messages has none.
+pub fn spans(text: &str, tokens: &[Token], network: Network) -> Vec<protocol::Span> {
+    if !matches!(network, Network::Telegram | Network::Teams | Network::Signal) {
+        return Vec::new();
+    }
+    let mut live: Vec<&Token> = tokens
+        .iter()
+        .filter(|token| text.get(token.range.clone()) == Some(token.label.as_str()))
+        .collect();
+    live.sort_by_key(|token| token.range.start);
+    let mut out = Vec::new();
+    let mut at = 0;
+    for token in live {
+        if token.range.start < at || token.id.is_empty() {
+            continue;
+        }
+        let kind = match token.kind {
+            Kind::Person => MentionKind::User,
+            Kind::Channel => MentionKind::Channel,
+            Kind::Role => MentionKind::Role,
+            Kind::Emoji => continue,
+        };
+        out.push(protocol::Span {
+            start: token.range.start as u32,
+            end: token.range.end as u32,
+            style: Style::Mention { kind, id: token.id.clone() },
+        });
+        at = token.range.end;
+    }
+    out
+}
+
 /// Moves the tokens to where they are after an edit turned `old` into `new`. A token the edit
 /// touched is dropped: it is text again.
 pub fn shift(tokens: &mut Vec<Token>, old: &str, new: &str) {
@@ -220,6 +253,27 @@ mod tests {
         let emoji = [token(text, ":mossparrot:", Kind::Emoji, "11"), token(text, ":party:", Kind::Emoji, "a:12")];
         assert_eq!(wire(text, &emoji, Network::Discord), "nice <:mossparrot:11> <a:party:12>");
         assert_eq!(wire(text, &emoji, Network::Slack), text);
+    }
+
+    #[test]
+    fn spans_extracts_structured_mentions_for_telegram_teams_and_signal() {
+        let text = "hi @Mara Okafor!";
+        let tokens = [token(text, "@Mara Okafor", Kind::Person, "u77")];
+        for network in [Network::Telegram, Network::Teams, Network::Signal] {
+            let out = spans(text, &tokens, network);
+            assert_eq!(
+                out,
+                vec![Span {
+                    start: 3,
+                    end: 15,
+                    style: Style::Mention { kind: MentionKind::User, id: "u77".into() },
+                }],
+                "expected mention span for {network:?}"
+            );
+        }
+        assert!(spans(text, &tokens, Network::Discord).is_empty());
+        assert!(spans(text, &tokens, Network::Slack).is_empty());
+        assert!(spans(text, &tokens, Network::Messages).is_empty());
     }
 
     #[test]

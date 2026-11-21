@@ -46,7 +46,7 @@ pub(super) fn send_with(account: &Arc<Account>, conversation: &str, client_id: &
                 Some(found) => send_place(account, conversation, client_id, reply_to, &found, opts),
                 None => match dice_emoticon(text) {
                     Some(emoticon) => send_dice(account, conversation, client_id, text, reply_to, emoticon, opts),
-                    None => super::send_text(account, conversation, client_id, text, reply_to, opts),
+                    None => super::send_text(account, conversation, client_id, text, reply_to, opts, &with.spans),
                 },
             },
         };
@@ -103,7 +103,7 @@ fn send_pick(account: &Account, conversation: &str, client_id: &str, text: &str,
         Pick::Inline { query_id, result } => {
             // A bot's result carries no caption: words typed with it go first, on their own.
             if !text.trim().is_empty() {
-                super::send_text(account, conversation, &format!("{client_id}1"), text, None, opts)?;
+                super::send_text(account, conversation, &format!("{client_id}1"), text, None, opts, &[])?;
             }
             remember_random(account, random, client_id);
             let sent = account.ask(&tl::functions::messages::SendInlineBotResult {
@@ -258,7 +258,7 @@ fn files(account: &Account, conversation: &str, client_id: &str, text: &str, rep
     let (plain, entities) = super::prepared(account, conversation, text);
     // A caption longer than Telegram takes goes first as a message of its own.
     let caption = if plain.chars().count() > limit {
-        super::send_text(account, conversation, &format!("{client_id}1"), text, reply_to, opts).map_err(words)?;
+        super::send_text(account, conversation, &format!("{client_id}1"), text, reply_to, opts, &[]).map_err(words)?;
         ""
     } else {
         plain.as_str()

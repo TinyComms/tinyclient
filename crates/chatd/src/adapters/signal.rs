@@ -1439,7 +1439,7 @@ fn serve(account: &Arc<Account>, command: Command) {
     match command {
         Command::MarkRead { conversation_id, message_id } => mark_read(account, &conversation_id, &message_id),
         Command::Send { conversation_id, client_id, text, reply_to } => {
-            let outcome = send_text(account, &conversation_id, &text, reply_to.as_deref());
+            let outcome = send_text(account, &conversation_id, &text, reply_to.as_deref(), &[]);
             ctx.sent(&conversation_id, &client_id, outcome.map_err(|fault| fault.words()));
         }
         Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
@@ -1459,10 +1459,10 @@ fn serve(account: &Arc<Account>, command: Command) {
             let _ = reply.send(react(account, &conversation_id, &message_id, &emoji, on).map_err(refused));
         }
         Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
-        Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
+        Command::Edit { conversation_id, message_id, text, spans, reply } => {
             let answered = match poll_action(&text) {
                 Some(act) => poll_act(account, &conversation_id, &message_id, act),
-                None => edit(account, &conversation_id, &message_id, &text),
+                None => edit(account, &conversation_id, &message_id, &text, &spans),
             };
             let _ = reply.send(answered.map_err(refused));
         }
@@ -1616,15 +1616,15 @@ fn quote_of(account: &Account, conversation: &str, reply_to: Option<&str>) -> Re
     })
 }
 
-fn send_text(account: &Account, conversation: &str, text: &str, reply_to: Option<&str>) -> Result<Message, Fault> {
+fn send_text(account: &Account, conversation: &str, text: &str, reply_to: Option<&str>, mention_spans: &[Span]) -> Result<Message, Fault> {
     let to = peer(conversation)?;
-    let (plain, ranges) = style::parse(text);
-    let spans = style::spans(&plain, &ranges);
+    let (wire_body, ranges) = style::parse_with_mentions(text, mention_spans);
+    let shown = style::apply(&wire_body, &ranges, &account.me);
     let quote = quote_of(account, conversation, reply_to)?;
     let timer = account.live().timer_of(conversation);
-    let sent = account.wire.send(&to, Body::Text { text: plain.clone(), quote: quote.clone(), ranges, timer })?;
+    let sent = account.wire.send(&to, Body::Text { text: wire_body, quote: quote.clone(), ranges, timer })?;
     account.live().sent(sent, conversation);
-    let words = Text { author: account.me.clone(), name: account.name.clone(), sent, text: plain, spans, quote, ..Text::default() };
+    let words = Text { author: account.me.clone(), name: account.name.clone(), sent, text: shown.text, spans: shown.spans, quote, ..Text::default() };
     let mut message = message(account, &words, true);
     if timer.seconds > 0 {
         message.expires_at = Some(crate::hub::now() + i64::from(timer.seconds));
@@ -1657,7 +1657,7 @@ fn send_with(account: &Arc<Account>, conversation: &str, client_id: &str, text: 
         return;
     }
     if with.files.is_empty() {
-        let outcome = send_text(account, conversation, text, reply_to).map_err(|fault| fault.words());
+        let outcome = send_text(account, conversation, text, reply_to, &with.spans).map_err(|fault| fault.words());
         account.ctx.sent(conversation, client_id, outcome);
         return;
     }
@@ -1775,19 +1775,19 @@ fn own(account: &Account, message_id: &str) -> Result<u64, Fault> {
     Ok(sent)
 }
 
-fn edit(account: &Account, conversation: &str, message_id: &str, text: &str) -> Result<(), Fault> {
+fn edit(account: &Account, conversation: &str, message_id: &str, text: &str, mention_spans: &[Span]) -> Result<(), Fault> {
     let to = peer(conversation)?;
     let sent = own(account, message_id)?;
     if !can(sent, now_ms(), true, conversation == account.me).edit {
         return Err(Fault::Refused("This message can no longer be edited.".to_owned()));
     }
-    let (plain, ranges) = style::parse(text);
-    let spans = style::spans(&plain, &ranges);
+    let (wire_body, ranges) = style::parse_with_mentions(text, mention_spans);
+    let shown = style::apply(&wire_body, &ranges, &account.me);
     let timer = account.live().timer_of(conversation);
-    account.wire.send(&to, Body::Edit { target: sent, text: plain.clone(), ranges, timer })?;
+    account.wire.send(&to, Body::Edit { target: sent, text: wire_body, ranges, timer })?;
     if let Ok(Some(mut message)) = account.ctx.stored_message(conversation, message_id) {
-        message.text = plain;
-        message.spans = spans;
+        message.text = shown.text;
+        message.spans = shown.spans;
         message.edited = true;
         let _ = account.ctx.message(conversation, &message);
     }

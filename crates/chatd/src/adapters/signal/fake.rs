@@ -411,9 +411,9 @@ fn describe(to: &Peer) -> String {
 fn noted(ranges: &[super::style::Range]) -> String {
     let parts: Vec<String> = ranges
         .iter()
-        .filter_map(|range| match range {
-            super::style::Range::Style { start, length, style } => Some(format!("{style:?}:{start}+{length}")),
-            super::style::Range::Mention { .. } => None,
+        .map(|range| match range {
+            super::style::Range::Style { start, length, style } => format!("{style:?}:{start}+{length}"),
+            super::style::Range::Mention { start, aci, .. } => format!("Mention({aci}):{start}+1"),
         })
         .collect();
     if parts.is_empty() {

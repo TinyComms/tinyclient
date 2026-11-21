@@ -1236,18 +1236,26 @@ fn span_ranges(text: &str, spans: &[protocol::Span]) -> Vec<Range> {
 fn proto_ranges(ranges: &[Range]) -> Vec<BodyRange> {
     ranges
         .iter()
-        .filter_map(|range| {
-            let Range::Style { start, length, style } = range else {
-                return None;
-            };
-            let style = match style {
-                Mark::Bold => RangeStyle::Bold,
-                Mark::Italic => RangeStyle::Italic,
-                Mark::Strike => RangeStyle::Strikethrough,
-                Mark::Monospace => RangeStyle::Monospace,
-                Mark::Spoiler => RangeStyle::Spoiler,
-            };
-            Some(BodyRange { start: Some(*start), length: Some(*length), associated_value: Some(AssociatedValue::Style(style as i32)) })
+        .filter_map(|range| match range {
+            Range::Style { start, length, style } => {
+                let style = match style {
+                    Mark::Bold => RangeStyle::Bold,
+                    Mark::Italic => RangeStyle::Italic,
+                    Mark::Strike => RangeStyle::Strikethrough,
+                    Mark::Monospace => RangeStyle::Monospace,
+                    Mark::Spoiler => RangeStyle::Spoiler,
+                };
+                Some(BodyRange {
+                    start: Some(*start),
+                    length: Some(*length),
+                    associated_value: Some(AssociatedValue::Style(style as i32)),
+                })
+            }
+            Range::Mention { start, aci, .. } => Some(BodyRange {
+                start: Some(*start),
+                length: Some(1),
+                associated_value: Some(AssociatedValue::MentionAci(aci.clone())),
+            }),
         })
         .collect()
 }

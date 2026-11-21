@@ -1320,3 +1320,49 @@ fn disappearing_messages_carry_timer_and_expire_after_read() {
     let _ = world.send(GRACE, "exp-3", "Permanent now", None);
     world.heard(&format!("send {GRACE} text Permanent now"));
 }
+
+#[test]
+fn sending_with_a_mention_span_sends_a_signal_mention_range() {
+    let world = World::linked();
+    world.connected();
+
+    let text = "hi @Grace Ombra!";
+    let start = text.find("@Grace Ombra").unwrap() as u32;
+    let end = start + "@Grace Ombra".len() as u32;
+    let asked = Request::Send {
+        conversation: key(CLUB),
+        client_id: "mention-1".into(),
+        text: text.into(),
+        reply_to: None,
+        with: Outgoing {
+            spans: vec![protocol::Span {
+                start,
+                end,
+                style: protocol::Style::Mention {
+                    kind: protocol::MentionKind::User,
+                    id: GRACE.into(),
+                },
+            }],
+            ..Outgoing::default()
+        },
+    };
+    let Response::Sent { .. } = world.ask(asked) else {
+        panic!("not sent");
+    };
+    let settled = world.until("settled mention message", || {
+        world
+            .messages(CLUB)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("mention-1") && m.id != "mention-1")
+    });
+    assert_eq!(settled.text, text);
+    assert!(
+        settled.spans.iter().any(|s| matches!(
+            &s.style,
+            protocol::Style::Mention { kind: protocol::MentionKind::User, id } if id == GRACE
+        )),
+        "stored message lost its mention span: {:?}",
+        settled.spans
+    );
+    world.heard(&format!("send {CLUB} text hi \u{FFFC}! ranges=Mention({GRACE}):3+1"));
+}

@@ -922,17 +922,28 @@ impl Teams {
     /// in that chain. A reply to a message in a chat quotes it, as Teams does; a reply to a
     /// post in a channel goes into the post's chain and is shown in the channel as a reply.
     pub(super) fn post(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>) {
-        let outcome = self.posted(conversation, client_id, text, reply_to).map_err(super::reason);
+        self.post_with_spans(conversation, client_id, text, reply_to, &[]);
+    }
+
+    pub(super) fn post_with_spans(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, spans: &[Span]) {
+        let outcome = self.posted_with(conversation, client_id, text, reply_to, spans, None).map_err(super::reason);
         self.ctx.sent(conversation, client_id, outcome);
     }
 
-    fn posted(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>) -> Result<Message, Fault> {
-        self.posted_with(conversation, client_id, text, reply_to, None)
-    }
-
     /// The same, with `properties` (the files a message names) beside the body.
-    pub(super) fn posted_with(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, properties: Option<Value>) -> Result<Message, Fault> {
-        let mut content = html::compose(text);
+    pub(super) fn posted_with(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, mention_spans: &[Span], mut properties: Option<Value>) -> Result<Message, Fault> {
+        let (mut content, mentions) = html::compose_with_mentions(text, mention_spans);
+        if !mentions.is_empty() {
+            let encoded = Value::Array(mentions).to_string();
+            match properties.as_mut().and_then(Value::as_object_mut) {
+                Some(map) => {
+                    map.insert("mentions".into(), Value::String(encoded));
+                }
+                None => {
+                    properties = Some(json!({"mentions": encoded}));
+                }
+            }
+        }
         let mut target = conversation.to_owned();
         let quote = match reply_to {
             Some(original) => self.quoted(conversation, original)?,
@@ -957,7 +968,10 @@ impl Teams {
         let me = self.me();
         let name = self.own_name();
         let sent = millis(&id) / 1000;
-        let (shown, spans) = html::styled(text);
+        let (shown, mut spans) = html::styled(text);
+        if !mention_spans.is_empty() && shown == text {
+            spans.extend(mention_spans.iter().cloned());
+        }
         let mut message = Message::plain(id, name.clone(), shown, sent, true);
         message.spans = spans;
         message.sender.avatar = self.picture(&me, &name);
@@ -977,17 +991,23 @@ impl Teams {
         format!("/v1/users/ME/conversations/{}/messages/{}", escaped(conversation), escaped(id))
     }
 
-    pub(super) fn edit(&self, conversation: &str, id: &str, text: &str) -> Result<(), Fault> {
+    pub(super) fn edit(&self, conversation: &str, id: &str, text: &str, mention_spans: &[Span]) -> Result<(), Fault> {
         let stored = self.ctx.stored_message(conversation, id)?;
-        let mut content = html::compose(text);
+        let (mut content, mentions) = html::compose_with_mentions(text, mention_spans);
         // The quote above a reply is part of the body, so it is written again.
         if let Some(quote) = stored.as_ref().and_then(|stored| stored.reply_to.as_ref()).filter(|_| chain_of(conversation).is_none()) {
             content = format!("{}{content}", quote_markup(quote));
         }
-        let body = self.body(&now_ms().to_string(), &content);
+        let mut body = self.body(&now_ms().to_string(), &content);
+        if !mentions.is_empty() {
+            body["properties"] = json!({"mentions": Value::Array(mentions).to_string()});
+        }
         self.chat("PUT", &self.message_path(conversation, id), Body::Json(&body), false)?;
         if let Some(mut edited) = stored {
-            let (shown, spans) = html::styled(text);
+            let (shown, mut spans) = html::styled(text);
+            if !mention_spans.is_empty() && shown == text {
+                spans.extend(mention_spans.iter().cloned());
+            }
             edited.text = shown;
             edited.spans = spans;
             edited.edited = true;
