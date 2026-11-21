@@ -878,17 +878,6 @@ impl Shell {
                             .into_any_element(),
                     );
                 }
-            }
-            Menu::Folder(folder, _) => {
-                let read = folder.clone();
-                items.push(
-                    menu_item("folder-read", Some("icons/check.svg"), "Mark as read", None)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.close_menu(cx);
-                            this.mark_folder_read(read.clone(), cx);
-                        }))
-                        .into_any_element(),
-                );
                 let can_leave = snapshot.accounts.iter().any(|a| {
                     a.key == space.account() && a.link == Link::Connected && a.can.leave_space
                 });
@@ -910,6 +899,17 @@ impl Shell {
                             .into_any_element(),
                     );
                 }
+            }
+            Menu::Folder(folder, _) => {
+                let read = folder.clone();
+                items.push(
+                    menu_item("folder-read", Some("icons/check.svg"), "Mark as read", None)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            this.mark_folder_read(read.clone(), cx);
+                        }))
+                        .into_any_element(),
+                );
             }
             Menu::Row(conversation, _) => {
                 let (key, starred) = (conversation.key.clone(), conversation.starred);
@@ -1156,7 +1156,7 @@ impl Shell {
                     .find(|f| &f.key == folder)
                     .map(|f| if f.name.is_empty() { "Folder".to_owned() } else { f.name.clone() })
                     .unwrap_or_else(|| "Folder".to_owned());
-                let head = div().flex().items_center().gap(px(10.)).px(px(8.)).h(px(44.)).child(glyph("icons/folder.svg", 20., theme::text_soft())).child(div().min_w_0().truncate().phone_title().child(name));
+                let head = div().flex().items_center().gap(px(10.)).px(px(8.)).h(px(44.)).child(super::components::glyph("icons/folder.svg", 20., theme::text_soft())).child(div().min_w_0().truncate().phone_title().child(name));
                 column().child(head).children(self.menu_items(open, snapshot, cx)).into_any_element()
             }
             Menu::Row(conversation, _) => {

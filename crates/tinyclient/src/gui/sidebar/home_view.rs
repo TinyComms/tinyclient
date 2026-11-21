@@ -540,7 +540,7 @@ impl Shell {
                         MouseButton::Right,
                         cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
                             cx.stop_propagation();
-                            this.open_menu(Menu::Folder(folder_key.clone(), event.position), cx);
+                            this.open_menu(super::Menu::Folder(folder_key.clone(), event.position), cx);
                         }),
                     );
                 }
