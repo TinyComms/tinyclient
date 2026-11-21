@@ -568,20 +568,27 @@ impl ContentsStore for Vault {
         Ok(None)
     }
 
-    async fn add_sticker_pack(&mut self, _pack: &StickerPack) -> Held<()> {
-        Ok(())
+    async fn add_sticker_pack(&mut self, pack: &StickerPack) -> Held<()> {
+        self.put_json(&format!("sticker_pack.{}", hex(&pack.id)), pack)
     }
 
-    async fn sticker_pack(&self, _id: &[u8]) -> Held<Option<StickerPack>> {
-        Ok(None)
+    async fn sticker_pack(&self, id: &[u8]) -> Held<Option<StickerPack>> {
+        self.json(&format!("sticker_pack.{}", hex(id)))
     }
 
-    async fn remove_sticker_pack(&mut self, _id: &[u8]) -> Held<bool> {
-        Ok(false)
+    async fn remove_sticker_pack(&mut self, id: &[u8]) -> Held<bool> {
+        let key = format!("sticker_pack.{}", hex(id));
+        let removed = self.db().execute("DELETE FROM kv WHERE k = ?1", params![key])?;
+        Ok(removed > 0)
     }
 
     async fn sticker_packs(&self) -> Held<Self::StickerPacksIter> {
-        Ok(Vec::new().into_iter())
+        let packs: Vec<Held<StickerPack>> = self
+            .values("sticker_pack.")?
+            .into_iter()
+            .map(|(_, bytes)| serde_json::from_slice(&bytes).map_err(VaultError::from))
+            .collect();
+        Ok(packs.into_iter())
     }
 }
 

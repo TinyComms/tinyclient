@@ -626,6 +626,94 @@ pub struct Text {
     pub previews: Vec<LinkPreview>,
     /// Encrypted media/file attachments carried on this message (`DataMessage.attachments`).
     pub attachments: Vec<Pointer>,
+    /// Optional Signal sticker (`DataMessage.sticker`).
+    pub sticker: Option<Sticker>,
+}
+
+/// One sticker carried on a Signal `DataMessage.sticker`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sticker {
+    /// 16-byte sticker pack id, lowercase hex (32 chars).
+    pub pack_id: String,
+    /// 32-byte sticker pack key, lowercase hex (64 chars).
+    pub pack_key: String,
+    pub sticker_id: u32,
+    pub emoji: String,
+    pub data: Pointer,
+}
+
+/// One sticker entry inside a Signal sticker pack manifest.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StickerEntry {
+    pub id: u32,
+    #[serde(default)]
+    pub emoji: String,
+    #[serde(default)]
+    pub content_type: String,
+}
+
+/// A decrypted Signal sticker pack manifest and installation state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StickerPackInfo {
+    /// 16-byte pack id, lowercase hex (32 chars).
+    pub id: String,
+    /// 32-byte pack key, lowercase hex (64 chars).
+    pub key: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub author: String,
+    #[serde(default)]
+    pub cover_id: Option<u32>,
+    #[serde(default)]
+    pub stickers: Vec<StickerEntry>,
+    #[serde(default)]
+    pub installed: bool,
+}
+
+fn is_hex_of_len(s: &str, len: usize) -> bool {
+    s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Formats a `https://signal.art/addstickers/#pack_id=...&pack_key=...` share link.
+pub fn format_sticker_pack_url(pack_id: &str, pack_key: &str) -> String {
+    format!(
+        "https://signal.art/addstickers/#pack_id={}&pack_key={}",
+        pack_id.to_ascii_lowercase(),
+        pack_key.to_ascii_lowercase()
+    )
+}
+
+/// Strictly parses an HTTPS Signal sticker pack link (`https://signal.art/addstickers/#pack_id=<32 hex>&pack_key=<64 hex>`).
+/// Rejects non-HTTPS schemes, other hosts, and invalid hex lengths.
+pub fn parse_sticker_pack_url(url: &str) -> Option<(String, String)> {
+    let trimmed = url.trim();
+    let frag = trimmed
+        .strip_prefix("https://signal.art/addstickers/#")
+        .or_else(|| trimmed.strip_prefix("https://signal.art/addstickers#"))?;
+    let mut pack_id: Option<String> = None;
+    let mut pack_key: Option<String> = None;
+    for pair in frag.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            match k {
+                "pack_id" if is_hex_of_len(v, 32) => pack_id = Some(v.to_ascii_lowercase()),
+                "pack_key" if is_hex_of_len(v, 64) => pack_key = Some(v.to_ascii_lowercase()),
+                _ => {}
+            }
+        }
+    }
+    Some((pack_id?, pack_key?))
+}
+
+/// Finds the first valid `https://signal.art/addstickers/#...` link in `text`.
+pub fn find_sticker_pack_url(text: &str) -> Option<(&str, String, String)> {
+    let start = text.find("https://signal.art/addstickers")?;
+    let rest = &text[start..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || matches!(c, ')' | ']' | '>' | '"' | '\''))
+        .unwrap_or(rest.len());
+    let candidate = rest[..end].trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | '!' | '?'));
+    parse_sticker_pack_url(candidate).map(|(id, key)| (candidate, id, key))
 }
 
 /// Longest payment note shown in its label: what a sender typed joins the words after an em dash.
@@ -779,6 +867,10 @@ pub enum Event {
     Pinned { peer: Peer, by: String, author: String, target: u64, duration_secs: Option<u32> },
     /// `by` unpinned `author`'s message sent at `target`.
     Unpinned { peer: Peer, by: String, author: String, target: u64 },
+    /// Initial list of installed Signal sticker packs loaded from the vault.
+    StickerPacks(Vec<StickerPackInfo>),
+    /// Another linked device installed or removed a sticker pack (`SyncMessage.stickerPackOperation`).
+    StickerPackOp { pack_id: String, pack_key: String, install: bool },
     /// Everything that waited while we were away has arrived.
     Caught,
     /// The connection is gone; a new wire is needed.
@@ -928,6 +1020,17 @@ pub enum Body {
     Pin { author: String, target: u64, duration_secs: Option<u32> },
     /// Unpin a message in a conversation.
     Unpin { author: String, target: u64 },
+    /// Send an encrypted Signal sticker from an installed pack.
+    Sticker {
+        pack_id: String,
+        pack_key: String,
+        sticker_id: u32,
+        emoji: String,
+        bytes: Vec<u8>,
+        content_type: String,
+        quote: Option<Quote>,
+        timer: Timer,
+    },
 }
 
 /// Why something failed.
@@ -1105,6 +1208,28 @@ pub trait Wire: Send + Sync {
     fn download_attachment(&self, _pointer: &Pointer, _dest: &std::path::Path) -> Result<u64, Fault> {
         Err(Fault::Refused("No longer available".to_owned()))
     }
+    /// Fetches and decrypts a Signal sticker pack manifest without installing it.
+    fn preview_sticker_pack(&self, _pack_id: &str, _pack_key: &str) -> Result<StickerPackInfo, Fault> {
+        Err(Fault::Refused("Sticker packs are not available.".to_owned()))
+    }
+    /// Installs a Signal sticker pack locally and syncs the install operation to other devices.
+    fn install_sticker_pack(&self, _pack_id: &str, _pack_key: &str) -> Result<StickerPackInfo, Fault> {
+        Err(Fault::Refused("Sticker packs are not available.".to_owned()))
+    }
+    /// Removes an installed Signal sticker pack locally and syncs the removal to other devices.
+    fn remove_sticker_pack(&self, _pack_id: &str, _pack_key: &str) -> Result<(), Fault> {
+        Err(Fault::Refused("Sticker packs are not available.".to_owned()))
+    }
+    /// Downloads and decrypts one sticker image (`pack_id`, `pack_key`, `sticker_id`) into `dest`.
+    fn download_sticker(
+        &self,
+        _pack_id: &str,
+        _pack_key: &str,
+        _sticker_id: u32,
+        _dest: &std::path::Path,
+    ) -> Result<u64, Fault> {
+        Err(Fault::Refused("No longer available".to_owned()))
+    }
     /// Ends the connection: the events end, and every later request fails.
     fn close(&self);
 }
@@ -1262,5 +1387,24 @@ mod tests {
         assert!(!preview_url_in_body("No links here", "https://example.org/post"));
         assert!(!preview_url_in_body("javascript:alert(1)", "javascript:alert(1)"));
         assert!(!preview_url_in_body("anything", ""));
+    }
+
+    #[test]
+    fn sticker_pack_url_strictly_validates_https_and_hex_lengths() {
+        let pack_id = "0123456789abcdef0123456789abcdef";
+        let pack_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let url = format_sticker_pack_url(pack_id, pack_key);
+        assert_eq!(parse_sticker_pack_url(&url), Some((pack_id.to_owned(), pack_key.to_owned())));
+        // Reversed fragment order also parses.
+        let reversed = format!("https://signal.art/addstickers/#pack_key={pack_key}&pack_id={pack_id}");
+        assert_eq!(parse_sticker_pack_url(&reversed), Some((pack_id.to_owned(), pack_key.to_owned())));
+        // Found inside a message sentence.
+        let msg = format!("Check out this pack: {url}!");
+        let (found, id, key) = find_sticker_pack_url(&msg).expect("sticker url");
+        assert_eq!((found, id.as_str(), key.as_str()), (url.as_str(), pack_id, pack_key));
+        // Non-HTTPS, wrong host, or bad hex lengths are rejected.
+        assert!(parse_sticker_pack_url(&url.replace("https://", "http://")).is_none());
+        assert!(parse_sticker_pack_url(&url.replace("signal.art", "evil.example")).is_none());
+        assert!(parse_sticker_pack_url("https://signal.art/addstickers/#pack_id=1234&pack_key=abcd").is_none());
     }
 }

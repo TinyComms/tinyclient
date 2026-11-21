@@ -39,8 +39,8 @@ pub fn refused(with: &Outgoing) -> Option<String> {
         return Some("A voice note needs one audio file.".into());
     }
     if let Some(pick) = &with.pick {
-        if pick.kind != protocol::CatalogKind::Gifs {
-            return Some("Signal can't send a chosen sticker from here.".into());
+        if !matches!(pick.kind, protocol::CatalogKind::Gifs | protocol::CatalogKind::Stickers) {
+            return Some("Signal can't send that item from here.".into());
         }
     }
     if with.files.iter().any(|file| file.spoiler) {
@@ -791,6 +791,29 @@ fn decrypt_verified_enc_file(
     Ok(written)
 }
 
+/// Derives the 64-byte AES-256 + HMAC-SHA256 key for a Signal sticker pack or sticker from its
+/// 32-byte `pack_key` using HKDF-SHA256 (`info = b"Sticker Pack"`).
+pub fn derive_sticker_key(pack_key: &[u8]) -> Result<[u8; 64], String> {
+    if pack_key.len() != 32 {
+        return Err("Invalid sticker pack key.".to_owned());
+    }
+    let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, pack_key);
+    let mut out = [0u8; 64];
+    hk.expand(b"Sticker Pack", &mut out)
+        .map_err(|_| "Could not derive sticker key.".to_owned())?;
+    Ok(out)
+}
+
+/// Streams and decrypts an encrypted Signal sticker manifest or sticker image using `pack_key`.
+pub fn decrypt_sticker_stream<R: std::io::Read>(
+    reader: R,
+    pack_key: &[u8],
+    dest: &std::path::Path,
+) -> Result<u64, String> {
+    let key = derive_sticker_key(pack_key)?;
+    decrypt_attachment_stream(reader, &key, &[], 0, dest)
+}
+
 /// Extracts `(duration_secs, waveform_bars)` from a decrypted voice note (WAV, Ogg/Opus, or
 /// MP4/M4A). Always returns a non-zero duration (>= 1 s) and non-empty waveform bars bounded to
 /// `protocol::WAVEFORM_LIMIT` so the UI renders every Signal voice note with a waveform player.
@@ -1178,5 +1201,20 @@ mod tests {
         let (mp4_dur, mp4_wave) = voice_facts("audio/mp4", &mp4);
         assert_eq!(mp4_dur, 7);
         assert!(!mp4_wave.is_empty() && mp4_wave.len() <= protocol::WAVEFORM_LIMIT);
+    }
+
+    #[test]
+    fn sticker_hkdf_derivation_and_decrypt_stream_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("sticker.webp");
+        let pack_key = [0x3cu8; 32];
+        let derived = derive_sticker_key(&pack_key).expect("64-byte derived key");
+        assert!(derive_sticker_key(&[0u8; 16]).is_err());
+
+        let plain = b"RIFF\x10\x00\x00\x00WEBPVP8 FAKE-STICKER";
+        let (ct, _) = encrypt_attachment([0x5au8; 16], derived, plain);
+        let len = decrypt_sticker_stream(std::io::Cursor::new(&ct), &pack_key, &dest).expect("decrypt sticker");
+        assert_eq!(len, plain.len() as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), plain);
     }
 }

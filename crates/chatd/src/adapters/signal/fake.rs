@@ -51,8 +51,8 @@ use super::wire::{
     parse_group_invite_link, payment_label, view_once_label, Body, CallKind, CallLink, CallLinkJoin, CallLogKind,
     CallOutcome, ChatFolder, ChatState, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo,
     GroupMember, GroupMembers, IdentityState, InviteLinkMode, LinkPreview, Linked, Linker, MessageRequestAction, OwnCard,
-    Peer, PersonProfile, Pointer, Quote, QuotedAttachment, SafetyNumber, StorageSnapshot, Text, Wire, FLAG_GIF,
-    FLAG_VOICE_MESSAGE,
+    Peer, PersonProfile, Pointer, Quote, QuotedAttachment, SafetyNumber, Sticker, StickerEntry, StickerPackInfo,
+    StorageSnapshot, Text, Wire, FLAG_GIF, FLAG_VOICE_MESSAGE,
 };
 use super::Saved;
 use crate::adapters::script;
@@ -217,6 +217,8 @@ pub struct Fake {
     identities: Arc<Mutex<HashMap<String, FakeIdentity>>>,
     /// Scripted decrypted profiles for other Signal accounts.
     profiles: Arc<Mutex<HashMap<String, PersonProfile>>>,
+    /// Known sticker packs (installed or available to preview/install in tests).
+    sticker_packs: Arc<Mutex<HashMap<String, StickerPackInfo>>>,
 }
 
 impl Fake {
@@ -259,6 +261,7 @@ impl Fake {
             call_links: Arc::default(),
             identities: Arc::new(Mutex::new(initial_identities())),
             profiles: Arc::new(Mutex::new(initial_profiles())),
+            sticker_packs: Arc::default(),
         };
         fake.listen();
         fake
@@ -266,7 +269,7 @@ impl Fake {
 
     /// Reads the test's lines for as long as this wire lives; closing the wire ends it.
     fn listen(&self) {
-        let (events, closed, refuse, fail_one, control, lookups, club, identities, profiles) = (
+        let (events, closed, refuse, fail_one, control, lookups, club, identities, profiles, sticker_packs) = (
             self.events.clone(),
             self.closed.clone(),
             self.refuse.clone(),
@@ -276,6 +279,7 @@ impl Fake {
             self.club.clone(),
             self.identities.clone(),
             self.profiles.clone(),
+            self.sticker_packs.clone(),
         );
         let _ = std::thread::Builder::new().name("signal-fake".into()).spawn(move || {
             script::follow(&control, |line| {
@@ -314,6 +318,39 @@ impl Fake {
                             .filter(|s| !s.is_empty())
                             .map(str::to_owned)
                             .collect();
+                    }
+                    return true;
+                }
+                if let Some(rest) = line.strip_prefix("sticker-pack-op ") {
+                    // Format: sticker-pack-op install|remove PACK_HEX KEY_HEX [TITLE|AUTHOR]
+                    let mut toks = rest.splitn(4, ' ');
+                    let op = toks.next().unwrap_or("");
+                    let pack_id = toks.next().unwrap_or("").to_ascii_lowercase();
+                    let pack_key = toks.next().unwrap_or("").to_ascii_lowercase();
+                    let meta = toks.next().unwrap_or("");
+                    let install = op == "install";
+                    if pack_id.len() == 32 {
+                        let (title, author) = meta.split_once('|').unwrap_or((if meta.is_empty() { "Synced Pack" } else { meta }, "Signal"));
+                        if install {
+                            sticker_packs.lock().unwrap_or_else(|p| p.into_inner()).insert(
+                                pack_id.clone(),
+                                StickerPackInfo {
+                                    id: pack_id.clone(),
+                                    key: pack_key.clone(),
+                                    title: title.trim().to_owned(),
+                                    author: author.trim().to_owned(),
+                                    cover_id: Some(0),
+                                    stickers: vec![
+                                        StickerEntry { id: 0, emoji: "👋".into(), content_type: "image/webp".into() },
+                                        StickerEntry { id: 1, emoji: "🎉".into(), content_type: "image/webp".into() },
+                                    ],
+                                    installed: true,
+                                },
+                            );
+                        } else {
+                            sticker_packs.lock().unwrap_or_else(|p| p.into_inner()).remove(&pack_id);
+                        }
+                        let _ = events.send(Event::StickerPackOp { pack_id, pack_key, install });
                     }
                     return true;
                 }
@@ -1217,6 +1254,50 @@ fn steer(line: &str, identities: &Mutex<HashMap<String, FakeIdentity>>) -> Vec<E
             };
             vec![Event::Message { peer: direct(author), text, outgoing: false }]
         }
+        "sticker" => {
+            // Format: sticker WHO SENT PACK_HEX KEY_HEX STICKER_ID EMOJI [URL ATT_KEY_HEX DIGEST_HEX]
+            let Some((author, name)) = who(next()) else {
+                return Vec::new();
+            };
+            let sent = next().parse().unwrap_or(T0);
+            let pack_id = next().to_ascii_lowercase();
+            let pack_key = next().to_ascii_lowercase();
+            let sticker_id: u32 = next().parse().unwrap_or(0);
+            let emoji = next().to_owned();
+            let url_or_key = next();
+            let att_key = unhex_bytes(next());
+            let digest = unhex_bytes(next());
+            let (url, cdn_key) = if url_or_key.starts_with("http://") {
+                (Some(url_or_key.to_owned()), None)
+            } else if !url_or_key.is_empty() {
+                (None, Some(url_or_key.to_owned()))
+            } else {
+                (None, Some(format!("fake-sticker-{pack_id}-{sticker_id}")))
+            };
+            let text = Text {
+                author: author.into(),
+                name: name.into(),
+                sent,
+                sticker: Some(Sticker {
+                    pack_id,
+                    pack_key,
+                    sticker_id,
+                    emoji,
+                    data: Pointer {
+                        cdn_key,
+                        content_type: "image/webp".to_owned(),
+                        key: att_key,
+                        digest,
+                        width: 512,
+                        height: 512,
+                        url,
+                        ..Pointer::default()
+                    },
+                }),
+                ..Text::default()
+            };
+            vec![Event::Message { peer: direct(author), text, outgoing: false }]
+        }
         "drop" => vec![Event::Closed("the fake dropped the connection".into())],
         "unlinked" => vec![Event::Ended("This computer was removed from your Signal account.".into())],
         _ => Vec::new(),
@@ -1314,6 +1395,9 @@ impl Wire for Fake {
                 format!("send {} pin {target}-{author} dur={dur}", describe(to))
             }
             Body::Unpin { author, target } => format!("send {} unpin {target}-{author}", describe(to)),
+            Body::Sticker { pack_id, sticker_id, emoji, timer, .. } => {
+                format!("send {} sticker {pack_id}:{sticker_id} {emoji}{}", describe(to), exp(*timer))
+            }
         };
         record(&line);
         if let Peer::Direct(aci) = to {
@@ -1983,6 +2067,76 @@ impl Wire for Fake {
             }
             None => Err(Fault::Refused("No longer available".to_owned())),
         }
+    }
+
+    fn preview_sticker_pack(&self, pack_id: &str, pack_key: &str) -> Result<StickerPackInfo, Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        let id = pack_id.to_ascii_lowercase();
+        let key = pack_key.to_ascii_lowercase();
+        if id.len() != 32 || key.len() != 64 {
+            return Err(Fault::Refused("Invalid sticker pack link.".to_owned()));
+        }
+        record(&format!("sticker-pack-preview {id}"));
+        let map = self.sticker_packs.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(existing) = map.get(&id) {
+            return Ok(existing.clone());
+        }
+        Ok(StickerPackInfo {
+            id,
+            key,
+            title: "Signal Cats".into(),
+            author: "Signal".into(),
+            cover_id: Some(0),
+            stickers: vec![
+                StickerEntry { id: 0, emoji: "😺".into(), content_type: "image/webp".into() },
+                StickerEntry { id: 1, emoji: "🐾".into(), content_type: "image/webp".into() },
+            ],
+            installed: false,
+        })
+    }
+
+    fn install_sticker_pack(&self, pack_id: &str, pack_key: &str) -> Result<StickerPackInfo, Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        let mut info = self.preview_sticker_pack(pack_id, pack_key)?;
+        info.installed = true;
+        record(&format!("sticker-pack-install {}", info.id));
+        self.sticker_packs.lock().unwrap_or_else(|p| p.into_inner()).insert(info.id.clone(), info.clone());
+        Ok(info)
+    }
+
+    fn remove_sticker_pack(&self, pack_id: &str, _pack_key: &str) -> Result<(), Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        let id = pack_id.to_ascii_lowercase();
+        record(&format!("sticker-pack-remove {id}"));
+        self.sticker_packs.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
+        Ok(())
+    }
+
+    fn download_sticker(
+        &self,
+        pack_id: &str,
+        _pack_key: &str,
+        sticker_id: u32,
+        dest: &std::path::Path,
+    ) -> Result<u64, Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        record(&format!("sticker-download {pack_id}:{sticker_id}"));
+        // Valid 1x1 PNG bytes for sticker preview/attachment in tests.
+        const PNG: &str = "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c4944415408d763f8cfc0000000020001e221bc330000000049454e44ae426082";
+        let bytes = unhex_bytes(PNG);
+        if let Some(parent) = dest.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(dest, &bytes).map_err(|err| Fault::Net(err.to_string()))?;
+        Ok(bytes.len() as u64)
     }
 
     fn close(&self) {

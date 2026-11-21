@@ -12,8 +12,8 @@ use super::wire::{
     parse_group_invite_link, payment_label, view_once_label, Body, CallKind, CallLink, CallLinkJoin, CallLogKind,
     CallOutcome, ChatFolder, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo,
     GroupMember, GroupMembers, IdentityState, InviteLinkMode, LinkPreview, Linked, Linker, MessageRequestAction, OwnCard,
-    Peer, PersonProfile, Pointer, Quote, QuotedAttachment, SafetyNumber, StorageAccount, StorageContact, StorageGroup,
-    StorageSnapshot, Text, Wire,
+    Peer, PersonProfile, Pointer, Quote, QuotedAttachment, SafetyNumber, Sticker, StickerEntry, StickerPackInfo,
+    StorageAccount, StorageContact, StorageGroup, StorageSnapshot, Text, Wire,
 };
 use super::{group_delta, GroupRevisions, GroupSnap, MemberSnap, Saved};
 use futures::StreamExt;
@@ -98,6 +98,16 @@ enum Ask {
     SetVerified { aci: String, state: IdentityState, answer: Sender<Result<(), Fault>> },
     PersonProfile { aci: String, answer: Sender<Result<PersonProfile, Fault>> },
     DownloadAttachment { pointer: Pointer, dest: std::path::PathBuf, answer: Sender<Result<u64, Fault>> },
+    PreviewStickerPack { pack_id: String, pack_key: String, answer: Sender<Result<StickerPackInfo, Fault>> },
+    InstallStickerPack { pack_id: String, pack_key: String, answer: Sender<Result<StickerPackInfo, Fault>> },
+    RemoveStickerPack { pack_id: String, pack_key: String, answer: Sender<Result<(), Fault>> },
+    DownloadSticker {
+        pack_id: String,
+        pack_key: String,
+        sticker_id: u32,
+        dest: std::path::PathBuf,
+        answer: Sender<Result<u64, Fault>>,
+    },
 }
 
 pub struct Real {
@@ -387,7 +397,10 @@ fn unsupported_label(message: &DataMessage) -> Option<String> {
             .to_owned(),
         );
     }
-    if message.sticker.is_some() {
+    if let Some(sticker) = message.sticker.as_ref() {
+        if sticker.data.as_ref().is_some_and(|p| p.attachment_identifier.is_some()) {
+            return None;
+        }
         return Some("Sticker".to_owned());
     }
     if let Some(payment) = message.payment.as_ref() {
@@ -726,6 +739,46 @@ impl Wire for Real {
             .map_err(|_| Fault::Net("no answer".into()))?
     }
 
+    fn preview_sticker_pack(&self, pack_id: &str, pack_key: &str) -> Result<StickerPackInfo, Fault> {
+        self.ask(|answer| Ask::PreviewStickerPack {
+            pack_id: pack_id.to_owned(),
+            pack_key: pack_key.to_owned(),
+            answer,
+        })
+    }
+
+    fn install_sticker_pack(&self, pack_id: &str, pack_key: &str) -> Result<StickerPackInfo, Fault> {
+        self.ask(|answer| Ask::InstallStickerPack {
+            pack_id: pack_id.to_owned(),
+            pack_key: pack_key.to_owned(),
+            answer,
+        })
+    }
+
+    fn remove_sticker_pack(&self, pack_id: &str, pack_key: &str) -> Result<(), Fault> {
+        self.ask(|answer| Ask::RemoveStickerPack {
+            pack_id: pack_id.to_owned(),
+            pack_key: pack_key.to_owned(),
+            answer,
+        })
+    }
+
+    fn download_sticker(
+        &self,
+        pack_id: &str,
+        pack_key: &str,
+        sticker_id: u32,
+        dest: &std::path::Path,
+    ) -> Result<u64, Fault> {
+        self.ask(|answer| Ask::DownloadSticker {
+            pack_id: pack_id.to_owned(),
+            pack_key: pack_key.to_owned(),
+            sticker_id,
+            dest: dest.to_path_buf(),
+            answer,
+        })
+    }
+
     fn close(&self) {
         if let Some(stop) = self.stop.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
             let _ = stop.send(());
@@ -812,6 +865,7 @@ impl Session {
 
     /// Once per link: ask the phone for the contacts and the settings it shares with devices.
     async fn first_run(&mut self) {
+        self.emit_sticker_packs().await;
         if self.vault.flag("asked") {
             self.tell(Event::Contacts(self.contacts().await));
             self.sync_storage().await;
@@ -1282,6 +1336,16 @@ impl Session {
                 .filter(Pointer::downloadable)
                 .collect()
         };
+        let sticker = message.sticker.as_ref().and_then(|st| {
+            let data = st.data.as_ref().map(pointer_of).filter(Pointer::downloadable)?;
+            Some(Sticker {
+                pack_id: hex(st.pack_id.as_deref().unwrap_or(&[])),
+                pack_key: hex(st.pack_key.as_deref().unwrap_or(&[])),
+                sticker_id: st.sticker_id.unwrap_or(0),
+                emoji: st.emoji.clone().unwrap_or_default(),
+                data,
+            })
+        });
         let name = if author == self.me { String::new() } else { self.name_of(author).await };
         let contacts = message.contact.iter().map(shared_contact_of).collect();
         let mut previews = Vec::new();
@@ -1328,6 +1392,7 @@ impl Session {
             contacts,
             previews,
             attachments,
+            sticker,
         }
     }
 
@@ -1645,6 +1710,15 @@ impl Session {
                 });
             }
         }
+        for op in sync.sticker_pack_operation {
+            let pack_id = hex(op.pack_id.as_deref().unwrap_or(&[]));
+            let pack_key = hex(op.pack_key.as_deref().unwrap_or(&[]));
+            if pack_id.len() != 32 {
+                continue;
+            }
+            let install = op.r#type != Some(sync_message::sticker_pack_operation::Type::Remove.into());
+            self.tell(Event::StickerPackOp { pack_id, pack_key, install });
+        }
     }
 
     fn call_peer_of(bytes: &[u8], is_group: bool) -> Option<Peer> {
@@ -1862,7 +1936,154 @@ impl Session {
             Ask::DownloadAttachment { pointer, dest, answer } => {
                 let _ = answer.send(self.download_attachment(&pointer, &dest).await);
             }
+            Ask::PreviewStickerPack { pack_id, pack_key, answer } => {
+                let _ = answer.send(self.preview_sticker_pack(&pack_id, &pack_key).await);
+            }
+            Ask::InstallStickerPack { pack_id, pack_key, answer } => {
+                let _ = answer.send(self.install_sticker_pack(&pack_id, &pack_key).await);
+            }
+            Ask::RemoveStickerPack { pack_id, pack_key, answer } => {
+                let _ = answer.send(self.remove_sticker_pack(&pack_id, &pack_key).await);
+            }
+            Ask::DownloadSticker { pack_id, pack_key, sticker_id, dest, answer } => {
+                let _ = answer.send(self.download_sticker(&pack_id, &pack_key, sticker_id, &dest).await);
+            }
         }
+    }
+
+    async fn emit_sticker_packs(&mut self) {
+        let Ok(iter) = self.vault.sticker_packs().await else {
+            return;
+        };
+        let packs: Vec<StickerPackInfo> = iter
+            .filter_map(Result::ok)
+            .map(sticker_pack_info_of)
+            .collect();
+        if !packs.is_empty() {
+            self.tell(Event::StickerPacks(packs));
+        }
+    }
+
+    async fn preview_sticker_pack(&mut self, pack_id: &str, pack_key: &str) -> Result<StickerPackInfo, Fault> {
+        use futures::AsyncReadExt;
+        use prost::Message as _;
+
+        let key_bytes = unhex(pack_key)
+            .filter(|b| b.len() == 32)
+            .ok_or_else(|| Fault::Refused("Invalid sticker pack key.".to_owned()))?;
+        if pack_id.len() != 32 || !pack_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(Fault::Refused("Invalid sticker pack id.".to_owned()));
+        }
+        let id_lower = pack_id.to_ascii_lowercase();
+        let mut push = PushService::new(SignalServers::Production, None, "tinyclient");
+        let mut ws = push
+            .ws::<presage::libsignal_service::websocket::Unidentified>("/v1/websocket/", "/v1/keepalive", &[], None)
+            .await
+            .map_err(|err| Fault::Net(err.to_string()))?;
+        let mut stream = ws
+            .get_sticker_pack_manifest(&id_lower)
+            .await
+            .map_err(|err| Fault::Net(err.to_string()))?;
+        let mut enc = Vec::new();
+        stream.read_to_end(&mut enc).await.map_err(|err| Fault::Net(err.to_string()))?;
+        let tmp = tempfile::NamedTempFile::new().map_err(|err| Fault::Net(err.to_string()))?;
+        super::files::decrypt_sticker_stream(std::io::Cursor::new(&enc), &key_bytes, tmp.path())
+            .map_err(Fault::Refused)?;
+        let plain = std::fs::read(tmp.path()).map_err(|err| Fault::Net(err.to_string()))?;
+        let pack = presage::proto::Pack::decode(plain.as_slice())
+            .map_err(|err| Fault::Refused(format!("Invalid sticker pack manifest: {err}")))?;
+        let installed = match unhex(&id_lower) {
+            Some(id) => self.vault.sticker_pack(&id).await.ok().flatten().is_some(),
+            None => false,
+        };
+        Ok(StickerPackInfo {
+            id: id_lower,
+            key: pack_key.to_ascii_lowercase(),
+            title: pack.title.unwrap_or_default(),
+            author: pack.author.unwrap_or_default(),
+            cover_id: pack.cover.and_then(|c| c.id),
+            stickers: pack
+                .stickers
+                .into_iter()
+                .filter_map(|s| {
+                    Some(StickerEntry {
+                        id: s.id?,
+                        emoji: s.emoji.unwrap_or_default(),
+                        content_type: s.content_type.unwrap_or_else(|| "image/webp".to_owned()),
+                    })
+                })
+                .collect(),
+            installed,
+        })
+    }
+
+    async fn install_sticker_pack(&mut self, pack_id: &str, pack_key: &str) -> Result<StickerPackInfo, Fault> {
+        let id_bytes = unhex(pack_id)
+            .filter(|b| b.len() == 16)
+            .ok_or_else(|| Fault::Refused("Invalid sticker pack id.".to_owned()))?;
+        let key_bytes = unhex(pack_key)
+            .filter(|b| b.len() == 32)
+            .ok_or_else(|| Fault::Refused("Invalid sticker pack key.".to_owned()))?;
+        self.manager
+            .install_sticker_pack(&id_bytes, &key_bytes)
+            .await
+            .map_err(fault)?;
+        if let Ok(Some(pack)) = self.vault.sticker_pack(&id_bytes).await {
+            return Ok(sticker_pack_info_of(pack));
+        }
+        let mut info = self.preview_sticker_pack(pack_id, pack_key).await?;
+        info.installed = true;
+        Ok(info)
+    }
+
+    async fn remove_sticker_pack(&mut self, pack_id: &str, pack_key: &str) -> Result<(), Fault> {
+        let id_bytes = unhex(pack_id)
+            .filter(|b| b.len() == 16)
+            .ok_or_else(|| Fault::Refused("Invalid sticker pack id.".to_owned()))?;
+        let key_bytes = unhex(pack_key).unwrap_or_default();
+        self.manager
+            .remove_sticker_pack(&id_bytes, &key_bytes)
+            .await
+            .map_err(fault)?;
+        Ok(())
+    }
+
+    async fn download_sticker(
+        &mut self,
+        pack_id: &str,
+        pack_key: &str,
+        sticker_id: u32,
+        dest: &std::path::Path,
+    ) -> Result<u64, Fault> {
+        use futures::AsyncReadExt;
+
+        let key_bytes = unhex(pack_key)
+            .filter(|b| b.len() == 32)
+            .ok_or_else(|| Fault::Refused("Invalid sticker pack key.".to_owned()))?;
+        let id_lower = pack_id.to_ascii_lowercase();
+        let mut push = PushService::new(SignalServers::Production, None, "tinyclient");
+        let mut ws = push
+            .ws::<presage::libsignal_service::websocket::Unidentified>("/v1/websocket/", "/v1/keepalive", &[], None)
+            .await
+            .map_err(|err| Fault::Net(err.to_string()))?;
+        let mut stream = match ws.get_sticker(&id_lower, sticker_id).await {
+            Ok(s) => s,
+            Err(ServiceError::UnhandledResponseCode { status, .. })
+                if matches!(status.as_u16(), 403 | 404 | 410) =>
+            {
+                return Err(Fault::Refused("No longer available".to_owned()));
+            }
+            Err(err) => return Err(Fault::Net(err.to_string())),
+        };
+        let mut enc = Vec::new();
+        stream.read_to_end(&mut enc).await.map_err(|err| Fault::Net(err.to_string()))?;
+        let dest = dest.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            super::files::decrypt_sticker_stream(std::io::Cursor::new(&enc), &key_bytes, &dest)
+        })
+        .await
+        .map_err(|err| Fault::Net(err.to_string()))?
+        .map_err(Fault::Refused)
     }
 
     async fn download_attachment(&mut self, pointer: &Pointer, dest: &std::path::Path) -> Result<u64, Fault> {
@@ -2982,6 +3203,37 @@ impl Session {
                     ..Default::default()
                 })
             }
+            Body::Sticker { pack_id, pack_key, sticker_id, emoji, bytes, content_type, quote, timer } => {
+                let id_bytes = unhex(&pack_id)
+                    .filter(|b| b.len() == 16)
+                    .ok_or_else(|| Fault::Refused("Invalid sticker pack id.".to_owned()))?;
+                let key_bytes = unhex(&pack_key)
+                    .filter(|b| b.len() == 32)
+                    .ok_or_else(|| Fault::Refused("Invalid sticker pack key.".to_owned()))?;
+                let spec = AttachmentSpec {
+                    content_type: if content_type.is_empty() { "image/webp".to_owned() } else { content_type },
+                    length: bytes.len(),
+                    file_name: Some("sticker.webp".to_owned()),
+                    ..AttachmentSpec::default()
+                };
+                let uploaded = self.manager.upload_attachment(spec, bytes).await.map_err(fault)?;
+                let pointer = uploaded.map_err(|err| attachment_refused("sticker", &err))?;
+                ContentBody::DataMessage(DataMessage {
+                    sticker: Some(data_message::Sticker {
+                        pack_id: Some(id_bytes),
+                        pack_key: Some(key_bytes),
+                        sticker_id: Some(sticker_id),
+                        data: Some(pointer),
+                        emoji: (!emoji.is_empty()).then_some(emoji),
+                    }),
+                    quote: quoted(quote),
+                    timestamp: Some(at),
+                    group_v2,
+                    expire_timer: (timer.seconds > 0).then_some(timer.seconds),
+                    expire_timer_version: (timer.version > 0).then_some(timer.version),
+                    ..Default::default()
+                })
+            }
         };
         self.deliver(to, content, at).await?;
         Ok(at)
@@ -3109,6 +3361,27 @@ fn mark_of(style: i32) -> Option<Mark> {
 fn aci_of(bytes: &[u8]) -> Option<String> {
     let bytes: [u8; 16] = bytes.try_into().ok()?;
     Some(Uuid::from_bytes(bytes).to_string())
+}
+
+fn sticker_pack_info_of(pack: presage::store::StickerPack) -> StickerPackInfo {
+    StickerPackInfo {
+        id: hex(&pack.id),
+        key: hex(&pack.key),
+        title: pack.manifest.title,
+        author: pack.manifest.author,
+        cover_id: pack.manifest.cover.map(|c| c.id),
+        stickers: pack
+            .manifest
+            .stickers
+            .into_iter()
+            .map(|s| StickerEntry {
+                id: s.id,
+                emoji: s.emoji.unwrap_or_default(),
+                content_type: s.content_type.unwrap_or_else(|| "image/webp".to_owned()),
+            })
+            .collect(),
+        installed: true,
+    }
 }
 
 fn shared_contact_of(contact: &data_message::Contact) -> protocol::SharedContact {

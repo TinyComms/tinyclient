@@ -123,6 +123,28 @@ const CALL_LINK_DELETE: &str = "\u{1}signal-call-link-delete\u{1}";
 const SAFETY_VERIFY: &str = "\u{1}signal-safety-verify\u{1}";
 const SAFETY_APPROVE: &str = "\u{1}signal-safety-approve\u{1}";
 const SAFETY_UNVERIFY: &str = "\u{1}signal-safety-unverify\u{1}";
+/// Signal sticker-pack actions packed into `Handoff.conversation_id`:
+/// - `\u{1}signal-sticker-preview\u{1}<url_or_id|key>` -> returns JSON of `StickerPackInfo`
+/// - `\u{1}signal-sticker-install\u{1}<url_or_id|key>` -> installs & syncs pack, returns JSON of `StickerPackInfo`
+/// - `\u{1}signal-sticker-remove\u{1}<pack_id>` -> removes & syncs pack, returns `"removed"`
+const STICKER_PACK_PREVIEW: &str = "\u{1}signal-sticker-preview\u{1}";
+const STICKER_PACK_INSTALL: &str = "\u{1}signal-sticker-install\u{1}";
+const STICKER_PACK_REMOVE: &str = "\u{1}signal-sticker-remove\u{1}";
+
+/// Packs a Signal sticker-pack preview request for `Request::Handoff`.
+pub fn sticker_pack_preview_command(url_or_pair: &str) -> String {
+    format!("{STICKER_PACK_PREVIEW}{url_or_pair}")
+}
+
+/// Packs a Signal sticker-pack install request for `Request::Handoff`.
+pub fn sticker_pack_install_command(url_or_pair: &str) -> String {
+    format!("{STICKER_PACK_INSTALL}{url_or_pair}")
+}
+
+/// Packs a Signal sticker-pack remove request for `Request::Handoff`.
+pub fn sticker_pack_remove_command(pack_id: &str) -> String {
+    format!("{STICKER_PACK_REMOVE}{pack_id}")
+}
 
 /// Packs a Signal safety-number verify request for `Request::Handoff`.
 pub fn safety_verify_command(aci: &str) -> String {
@@ -739,6 +761,22 @@ struct Live {
     /// Received encrypted attachment pointers waiting to be downloaded on `Command::Wanted`.
     held_attachments: HashMap<String, HeldAttachment>,
     held_order: VecDeque<String>,
+    /// Installed Signal sticker packs (persisted to `{support}/signal/{aci}.stickers`).
+    sticker_packs: Vec<wire::StickerPackInfo>,
+    stickers_path: PathBuf,
+    stickers_loaded: bool,
+    /// Sticker catalog preview tiles waiting to be downloaded on `Command::Wanted`.
+    held_stickers: HashMap<String, HeldSticker>,
+}
+
+/// One sticker catalog preview tile remembered for lazy download/decrypt on `Command::Wanted`.
+#[derive(Clone)]
+struct HeldSticker {
+    pack_id: String,
+    pack_key: String,
+    sticker_id: u32,
+    file: MediaFile,
+    address: String,
 }
 
 /// One received Signal attachment pointer remembered for lazy download/decrypt on `Command::Wanted`.
@@ -1090,6 +1128,35 @@ fn reactions_path(aci: &str) -> PathBuf {
     protocol::support_dir().join("signal").join(format!("{aci}.reactions"))
 }
 
+fn stickers_path(aci: &str) -> PathBuf {
+    protocol::support_dir().join("signal").join(format!("{aci}.stickers"))
+}
+
+fn read_sticker_packs(path: &Path) -> Vec<wire::StickerPackInfo> {
+    if path.as_os_str().is_empty() {
+        return Vec::new();
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    serde_json::from_slice::<Vec<wire::StickerPackInfo>>(&bytes).unwrap_or_default()
+}
+
+fn write_sticker_packs(path: &Path, packs: &[wire::StickerPackInfo]) {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec(packs) {
+        let temp = path.with_extension("tmp");
+        if std::fs::write(&temp, bytes).and_then(|()| std::fs::rename(&temp, path)).is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+    }
+}
+
 fn read_reactions(path: &Path) -> Vec<KeptReaction> {
     if path.as_os_str().is_empty() {
         return Vec::new();
@@ -1193,6 +1260,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
     let live = Arc::new(Mutex::new(Live {
         reactions_path: reactions_path(&saved.aci),
         pins_path: pins_path(&saved.aci),
+        stickers_path: stickers_path(&saved.aci),
         ..Live::default()
     }));
     let current: Arc<Mutex<Option<Arc<Account>>>> = Arc::default();
@@ -1437,6 +1505,34 @@ fn message(account: &Account, conversation: &str, text: &Text, outgoing: bool) -
             let _ = account.ctx.media(&to_register);
         }
     }
+    if let Some(st) = &text.sticker {
+        let media_id = format!("signal:att:{}:{}:sticker", text.sent, author);
+        let address = format!("signal://attachment/{media_id}");
+        let mut media = MediaFile::new(media_id.clone(), MediaKind::Image);
+        media.width = if st.data.width > 0 { st.data.width } else { 512 };
+        media.height = if st.data.height > 0 { st.data.height } else { 512 };
+        media.bytes = u64::from(st.data.size);
+        let _ = account.ctx.media(&[(media.clone(), address.clone())]);
+        account.live().remember_attachment(
+            media_id,
+            HeldAttachment {
+                pointer: st.data.clone(),
+                file: media.clone(),
+                address,
+                conversation: conversation.to_owned(),
+                message_id: msg_id.clone(),
+            },
+        );
+        let name = if !st.emoji.is_empty() { st.emoji.clone() } else { "sticker.webp".to_owned() };
+        let mut attachment = Attachment::new(name, media);
+        attachment.mime = if st.data.content_type.is_empty() {
+            "image/webp".to_owned()
+        } else {
+            st.data.content_type.clone()
+        };
+        attachment.sticker = true;
+        message.attachments.push(attachment);
+    }
     message.contacts = text.contacts.clone();
     for (idx, preview) in text.previews.iter().enumerate() {
         if !wire::preview_url_in_body(&text.text, &preview.url) {
@@ -1482,6 +1578,13 @@ fn message(account: &Account, conversation: &str, text: &Text, outgoing: bool) -
             title,
             text,
             footer: "Join call".to_owned(),
+            ..protocol::Card::default()
+        }));
+    } else if wire::find_sticker_pack_url(&message.text).is_some() {
+        message.card = Some(Box::new(protocol::Card {
+            title: "Signal sticker pack".to_owned(),
+            text: "Install this encrypted sticker pack on Signal.".to_owned(),
+            footer: "Install sticker pack".to_owned(),
             ..protocol::Card::default()
         }));
     }
@@ -2177,6 +2280,59 @@ fn apply(account: &Account, event: Event) {
                 let _ = ctx.message(&conv, &stored);
             }
         }
+        Event::StickerPacks(packs) => {
+            let mut live = account.live();
+            if !live.stickers_loaded {
+                live.sticker_packs = read_sticker_packs(&live.stickers_path);
+                live.stickers_loaded = true;
+            }
+            for pack in packs {
+                if let Some(existing) = live.sticker_packs.iter_mut().find(|p| p.id == pack.id) {
+                    *existing = pack;
+                } else if live.sticker_packs.len() < 128 {
+                    live.sticker_packs.push(pack);
+                }
+            }
+            write_sticker_packs(&live.stickers_path, &live.sticker_packs);
+            account.ctx.hub.catalogs.forget_matching(|(acct, kind, ..)| *acct == account.ctx.account && *kind == CatalogKind::Stickers);
+        }
+        Event::StickerPackOp { pack_id, pack_key, install } => {
+            if install {
+                let mut pack = account
+                    .wire
+                    .preview_sticker_pack(&pack_id, &pack_key)
+                    .unwrap_or_else(|_| wire::StickerPackInfo {
+                        id: pack_id.clone(),
+                        key: pack_key.clone(),
+                        title: "Sticker pack".to_owned(),
+                        author: String::new(),
+                        cover_id: Some(0),
+                        stickers: Vec::new(),
+                        installed: true,
+                    });
+                pack.installed = true;
+                let mut live = account.live();
+                if !live.stickers_loaded {
+                    live.sticker_packs = read_sticker_packs(&live.stickers_path);
+                    live.stickers_loaded = true;
+                }
+                if let Some(existing) = live.sticker_packs.iter_mut().find(|p| p.id == pack.id) {
+                    *existing = pack;
+                } else if live.sticker_packs.len() < 128 {
+                    live.sticker_packs.push(pack);
+                }
+                write_sticker_packs(&live.stickers_path, &live.sticker_packs);
+            } else {
+                let mut live = account.live();
+                if !live.stickers_loaded {
+                    live.sticker_packs = read_sticker_packs(&live.stickers_path);
+                    live.stickers_loaded = true;
+                }
+                live.sticker_packs.retain(|p| p.id != pack_id);
+                write_sticker_packs(&live.stickers_path, &live.sticker_packs);
+            }
+            account.ctx.hub.catalogs.forget_matching(|(acct, kind, ..)| *acct == account.ctx.account && *kind == CatalogKind::Stickers);
+        }
         Event::Caught => {
             prune_expired_pins(account);
         }
@@ -2794,6 +2950,7 @@ fn capabilities(link_previews: bool) -> protocol::Capabilities {
         max_files: files.max_files,
         voice_notes: true,
         gifs: true,
+        stickers: true,
         reply: true,
         edit: true,
         delete: true,
@@ -3748,6 +3905,68 @@ fn pin_message(account: &Account, conversation_id: &str, message_id: &str, pinne
 }
 
 fn catalog(account: &Account, kind: CatalogKind, query: &str, cursor: Option<&str>) -> Result<CatalogPage, Refusal> {
+    if kind == CatalogKind::Stickers {
+        let q = query.trim().to_ascii_lowercase();
+        let packs = {
+            let mut live = account.live();
+            if !live.stickers_loaded {
+                live.sticker_packs = read_sticker_packs(&live.stickers_path);
+                live.stickers_loaded = true;
+            }
+            live.sticker_packs.clone()
+        };
+        let mut items = Vec::new();
+        let mut media = Vec::new();
+        {
+            let mut live = account.live();
+            if live.held_stickers.len() > 2_048 {
+                live.held_stickers.clear();
+            }
+            for pack in packs {
+                let pack_matches = q.is_empty()
+                    || pack.title.to_ascii_lowercase().contains(&q)
+                    || pack.author.to_ascii_lowercase().contains(&q);
+                for entry in pack.stickers {
+                    if !pack_matches && !entry.emoji.to_ascii_lowercase().contains(&q) {
+                        continue;
+                    }
+                    let tile_id = format!("signal:sticker:{}:{}", pack.id, entry.id);
+                    let address = format!("signal://sticker/{}/{}", pack.id, entry.id);
+                    let mut file = MediaFile::new(tile_id.clone(), MediaKind::Image);
+                    file.width = 512;
+                    file.height = 512;
+                    media.push((file.clone(), address.clone()));
+                    live.held_stickers.insert(
+                        tile_id,
+                        HeldSticker {
+                            pack_id: pack.id.clone(),
+                            pack_key: pack.key.clone(),
+                            sticker_id: entry.id,
+                            file: file.clone(),
+                            address,
+                        },
+                    );
+                    items.push(CatalogItem {
+                        id: format!("{}:{}", pack.id, entry.id),
+                        name: entry.emoji,
+                        file: Some(file),
+                        pack: pack.title.clone(),
+                        animated: entry.content_type.contains("apng") || entry.content_type.contains("gif"),
+                    });
+                    if items.len() >= protocol::CATALOG_LIMIT {
+                        break;
+                    }
+                }
+                if items.len() >= protocol::CATALOG_LIMIT {
+                    break;
+                }
+            }
+        }
+        if !media.is_empty() {
+            let _ = account.ctx.media(&media);
+        }
+        return Ok(CatalogPage { items, cursor: None });
+    }
     if kind != CatalogKind::Gifs {
         return Err(Refusal::Unsupported);
     }
@@ -3832,7 +4051,70 @@ fn call_link_handoff(account: &Account, raw: &str) -> Result<String, Refusal> {
     if let Some(aci) = raw.strip_prefix(SAFETY_UNVERIFY) {
         return set_safety_state(account, aci.trim(), wire::IdentityState::Default);
     }
+    if let Some(arg) = raw.strip_prefix(STICKER_PACK_PREVIEW) {
+        let Some((pack_id, pack_key)) = parse_sticker_pack_arg(arg) else {
+            return Err(Refusal::Refused("That is not a valid Signal sticker pack link.".into()));
+        };
+        let info = account.wire.preview_sticker_pack(&pack_id, &pack_key).map_err(refused)?;
+        return serde_json::to_string(&info).map_err(|err| Refusal::Refused(err.to_string()));
+    }
+    if let Some(arg) = raw.strip_prefix(STICKER_PACK_INSTALL) {
+        let Some((pack_id, pack_key)) = parse_sticker_pack_arg(arg) else {
+            return Err(Refusal::Refused("That is not a valid Signal sticker pack link.".into()));
+        };
+        let mut info = account.wire.install_sticker_pack(&pack_id, &pack_key).map_err(refused)?;
+        info.installed = true;
+        {
+            let mut live = account.live();
+            if !live.stickers_loaded {
+                live.sticker_packs = read_sticker_packs(&live.stickers_path);
+                live.stickers_loaded = true;
+            }
+            if let Some(existing) = live.sticker_packs.iter_mut().find(|p| p.id == info.id) {
+                *existing = info.clone();
+            } else if live.sticker_packs.len() < 128 {
+                live.sticker_packs.push(info.clone());
+            }
+            write_sticker_packs(&live.stickers_path, &live.sticker_packs);
+        }
+        account.ctx.hub.catalogs.forget_matching(|(acct, kind, ..)| *acct == account.ctx.account && *kind == CatalogKind::Stickers);
+        return serde_json::to_string(&info).map_err(|err| Refusal::Refused(err.to_string()));
+    }
+    if let Some(pack_id) = raw.strip_prefix(STICKER_PACK_REMOVE) {
+        let id = pack_id.trim().to_ascii_lowercase();
+        let pack_key = {
+            let mut live = account.live();
+            if !live.stickers_loaded {
+                live.sticker_packs = read_sticker_packs(&live.stickers_path);
+                live.stickers_loaded = true;
+            }
+            live.sticker_packs.iter().find(|p| p.id == id).map(|p| p.key.clone()).unwrap_or_default()
+        };
+        account.wire.remove_sticker_pack(&id, &pack_key).map_err(refused)?;
+        {
+            let mut live = account.live();
+            live.sticker_packs.retain(|p| p.id != id);
+            write_sticker_packs(&live.stickers_path, &live.sticker_packs);
+        }
+        account.ctx.hub.catalogs.forget_matching(|(acct, kind, ..)| *acct == account.ctx.account && *kind == CatalogKind::Stickers);
+        return Ok("removed".to_owned());
+    }
     Err(Refusal::Unsupported)
+}
+
+fn parse_sticker_pack_arg(arg: &str) -> Option<(String, String)> {
+    let trimmed = arg.trim();
+    if let Some(pair) = wire::parse_sticker_pack_url(trimmed) {
+        return Some(pair);
+    }
+    let (id, key) = trimmed.split_once('|')?;
+    let id = id.trim();
+    let key = key.trim();
+    if id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) && key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some((id.to_ascii_lowercase(), key.to_ascii_lowercase()))
+    } else {
+        None
+    }
 }
 
 fn set_safety_state(account: &Account, aci: &str, state: wire::IdentityState) -> Result<String, Refusal> {
@@ -3910,15 +4192,98 @@ fn send_gif(account: &Account, conversation: &str, client_id: &str, text: &str, 
     Ok(message)
 }
 
-/// Streams and decrypts wanted Signal attachments off the command thread into chatd's media cache.
-fn wanted(account: &Arc<Account>, ids: &[String]) {
-    let jobs: Vec<(String, HeldAttachment)> = {
-        let live = account.live();
-        ids.iter()
-            .filter_map(|id| live.held_attachments.get(id).cloned().map(|h| (id.clone(), h)))
-            .collect()
+fn send_sticker(
+    account: &Account,
+    conversation: &str,
+    client_id: &str,
+    reply_to: Option<&str>,
+    pick_id: &str,
+) -> Result<Message, Fault> {
+    let to = peer(conversation)?;
+    let (pack_id, sticker_id_str) = pick_id
+        .split_once(':')
+        .ok_or_else(|| Fault::Refused("That sticker isn't installed.".to_owned()))?;
+    let sticker_id: u32 = sticker_id_str
+        .parse()
+        .map_err(|_| Fault::Refused("That sticker isn't installed.".to_owned()))?;
+    let pack = {
+        let mut live = account.live();
+        if !live.stickers_loaded {
+            live.sticker_packs = read_sticker_packs(&live.stickers_path);
+            live.stickers_loaded = true;
+        }
+        live.sticker_packs.iter().find(|p| p.id == pack_id).cloned()
+    }
+    .ok_or_else(|| Fault::Refused("That sticker pack isn't installed.".to_owned()))?;
+    let entry = pack.stickers.iter().find(|s| s.id == sticker_id);
+    let emoji = entry.map(|s| s.emoji.clone()).unwrap_or_default();
+    let content_type = entry
+        .map(|s| s.content_type.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "image/webp".to_owned());
+    let tmp = tempfile::NamedTempFile::new().map_err(|err| Fault::Net(err.to_string()))?;
+    account
+        .wire
+        .download_sticker(&pack.id, &pack.key, sticker_id, tmp.path())?;
+    let bytes = std::fs::read(tmp.path()).map_err(|err| Fault::Net(err.to_string()))?;
+    let quote = quote_of(account, conversation, reply_to)?;
+    let timer = account.live().timer_of(conversation);
+    let sent = account.wire.send(
+        &to,
+        Body::Sticker {
+            pack_id: pack.id.clone(),
+            pack_key: pack.key.clone(),
+            sticker_id,
+            emoji: emoji.clone(),
+            bytes: bytes.clone(),
+            content_type: content_type.clone(),
+            quote: quote.clone(),
+            timer,
+        },
+    )?;
+    account.live().echoed(sent);
+    account.live().sent(sent, conversation);
+    let mut media = MediaFile::new(format!("signal:{client_id}:sticker"), MediaKind::Image);
+    media.width = 512;
+    media.height = 512;
+    media.bytes = bytes.len() as u64;
+    if let Some(landed) = account.ctx.landed(&media, &format!("signal://sticker/{}/{sticker_id}", pack.id), &bytes) {
+        media = landed;
+    }
+    let name = if !emoji.is_empty() { emoji } else { "sticker.webp".to_owned() };
+    let mut attachment = Attachment::new(name, media);
+    attachment.mime = content_type;
+    attachment.sticker = true;
+    let words = Text {
+        author: account.me.clone(),
+        name: account.name.clone(),
+        sent,
+        quote,
+        ..Text::default()
     };
-    if jobs.is_empty() {
+    let mut message = message(account, conversation, &words, true);
+    if timer.seconds > 0 {
+        message.expires_at = Some(crate::hub::now() + i64::from(timer.seconds));
+    }
+    message.attachments = vec![attachment];
+    Ok(message)
+}
+
+/// Streams and decrypts wanted Signal attachments and sticker tiles off the command thread into chatd's media cache.
+fn wanted(account: &Arc<Account>, ids: &[String]) {
+    let (jobs, sticker_jobs): (Vec<(String, HeldAttachment)>, Vec<(String, HeldSticker)>) = {
+        let live = account.live();
+        let jobs = ids
+            .iter()
+            .filter_map(|id| live.held_attachments.get(id).cloned().map(|h| (id.clone(), h)))
+            .collect();
+        let sticker_jobs = ids
+            .iter()
+            .filter_map(|id| live.held_stickers.get(id).cloned().map(|h| (id.clone(), h)))
+            .collect();
+        (jobs, sticker_jobs)
+    };
+    if jobs.is_empty() && sticker_jobs.is_empty() {
         return;
     }
     let account = Arc::clone(account);
@@ -3954,6 +4319,22 @@ fn wanted(account: &Arc<Account>, ids: &[String]) {
                 Err(fault) => {
                     let _ = std::fs::remove_file(&dest);
                     tracing::warn!("chatd: Signal: attachment {id}: {}", super::net::redact(&fault.to_string()));
+                }
+            }
+        }
+        for (id, held) in sticker_jobs {
+            let dest = crate::blobs::path_of(&media_root, &account.ctx.account, &id).with_extension("sigpart");
+            match account.wire.download_sticker(&held.pack_id, &held.pack_key, held.sticker_id, &dest) {
+                Ok(bytes) => {
+                    let _ = account.ctx.landed_from_part(&held.file, &held.address, &dest, bytes);
+                }
+                Err(Fault::Refused(why)) => {
+                    let _ = std::fs::remove_file(&dest);
+                    account.ctx.media_failed(&id, &why);
+                }
+                Err(fault) => {
+                    let _ = std::fs::remove_file(&dest);
+                    tracing::warn!("chatd: Signal: sticker {id}: {}", super::net::redact(&fault.to_string()));
                 }
             }
         }
@@ -4151,8 +4532,12 @@ fn send_with(account: &Arc<Account>, conversation: &str, client_id: &str, text: 
         return;
     }
     if with.files.is_empty() {
-        if let Some(pick) = with.pick.filter(|p| p.kind == CatalogKind::Gifs) {
-            let outcome = send_gif(account, conversation, client_id, text, reply_to, &pick.id).map_err(|fault| fault.words());
+        if let Some(pick) = with.pick {
+            let outcome = match pick.kind {
+                CatalogKind::Gifs => send_gif(account, conversation, client_id, text, reply_to, &pick.id).map_err(|fault| fault.words()),
+                CatalogKind::Stickers => send_sticker(account, conversation, client_id, reply_to, &pick.id).map_err(|fault| fault.words()),
+                _ => Err("Signal can't send that item from here.".to_owned()),
+            };
             account.ctx.sent(conversation, client_id, outcome);
             return;
         }

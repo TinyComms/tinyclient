@@ -3100,3 +3100,156 @@ fn voice_messages_download_populate_waveform_send_viewed_receipt_and_can_be_sent
     assert_eq!(echoed.attachments[0].duration, 5);
     assert_eq!(echoed.attachments[0].waveform, vec![40, 120, 200, 90]);
 }
+
+#[test]
+fn stickers_render_inline_packs_install_sync_persist_and_stickers_send() {
+    let mut world = World::linked();
+    world.connected();
+
+    let (accounts, _) = world.status();
+    let signal = accounts.iter().find(|s| s.key == account()).expect("Signal account");
+    assert!(signal.can.stickers, "Signal should advertise Capabilities::stickers");
+
+    let pack_id = "0123456789abcdef0123456789abcdef";
+    let pack_key = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let pack_url = format!("https://signal.art/addstickers/#pack_id={pack_id}&pack_key={pack_key}");
+
+    // 1. Incoming encrypted sticker renders inline as Attachment { sticker: true } and decrypts on Fetch.
+    let sticker_plain = b"RIFF\x10\x00\x00\x00WEBPVP8 STICKER-744".to_vec();
+    let att_key = [0x99u8; 64];
+    let (st_enc, st_dig) = encrypt_signal_blob(&sticker_plain, &att_key, &[0x12u8; 16]);
+    let (base, stop_cdn) = spawn_cdn_stub(vec![("/st.enc".into(), st_enc)]);
+
+    world.steer(&format!(
+        "sticker grace {} {pack_id} {pack_key} 0 😺 {base}/st.enc {} {}",
+        T0 + 20_000,
+        hex_of(&att_key),
+        hex_of(&st_dig),
+    ));
+    let st_msg = world.arrived(GRACE, &id(T0 + 20_000, GRACE));
+    assert_eq!(st_msg.kind, MessageKind::Normal);
+    assert_eq!(st_msg.attachments.len(), 1);
+    assert!(st_msg.attachments[0].sticker, "incoming sticker must set attachment.sticker = true");
+    assert_eq!(st_msg.attachments[0].name, "😺");
+    let _ = world.ask(Request::Fetch {
+        account: account(),
+        ids: vec![st_msg.attachments[0].file.id.clone()],
+        size: None,
+        retry: false,
+    });
+    let st_path = world.until("sticker decrypted to disk", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == st_msg.id)
+            .and_then(|m| m.attachments.first()?.file.path.clone())
+    });
+    assert_eq!(std::fs::read(&st_path).unwrap(), sticker_plain);
+    stop_cdn.store(true, Ordering::Relaxed);
+
+    // 2. A signal.art/addstickers link attaches an install card; preview and install work via Handoff.
+    world.steer(&format!("incoming grace {} Check out {pack_url}", T0 + 21_000));
+    let link_msg = world.arrived(GRACE, &id(T0 + 21_000, GRACE));
+    assert_eq!(link_msg.card.as_deref().map(|c| c.footer.as_str()), Some("Install sticker pack"));
+
+    let preview_cmd = format!("\u{1}signal-sticker-preview\u{1}{pack_url}");
+    let Response::Link { url: preview_json } = world.ask(Request::Handoff { conversation: key(&preview_cmd) }) else {
+        panic!("expected preview JSON in Response::Link");
+    };
+    assert!(preview_json.contains("Signal Cats"), "preview json: {preview_json}");
+
+    let install_cmd = format!("\u{1}signal-sticker-install\u{1}{pack_url}");
+    let Response::Link { url: install_json } = world.ask(Request::Handoff { conversation: key(&install_cmd) }) else {
+        panic!("expected install JSON in Response::Link");
+    };
+    assert!(install_json.contains("\"installed\":true"), "install json: {install_json}");
+    world.heard(&format!("sticker-pack-install {pack_id}"));
+
+    // 3. Catalog { kind: Stickers } lists installed packs and stickers; fetching a catalog tile downloads it.
+    let Response::Catalog { items, .. } = world.ask(Request::Catalog {
+        account: account(),
+        space: None,
+        kind: protocol::CatalogKind::Stickers,
+        query: String::new(),
+        cursor: None,
+    }) else {
+        panic!("expected Response::Catalog");
+    };
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].pack, "Signal Cats");
+    assert_eq!(items[0].id, format!("{pack_id}:0"));
+    let tile_id = items[0].file.as_ref().expect("catalog sticker tile").id.clone();
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![tile_id], size: None, retry: false });
+    world.heard(&format!("sticker-download {pack_id}:0"));
+
+    // 4. Sending a picked sticker goes out on the wire and stores a local sticker attachment.
+    let send_resp = world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "sticker-send-1".into(),
+        text: String::new(),
+        reply_to: None,
+        with: Outgoing {
+            pick: Some(protocol::Pick { kind: protocol::CatalogKind::Stickers, id: format!("{pack_id}:0") }),
+            ..Outgoing::default()
+        },
+    });
+    assert!(matches!(send_resp, Response::Sent { .. }), "expected Sent, got {send_resp:?}");
+    world.heard(&format!("send {GRACE} sticker {pack_id}:0 😺"));
+    let sent_st = world.until("sent sticker echoed", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("sticker-send-1") && m.id != "sticker-send-1")
+    });
+    assert_eq!(sent_st.attachments.len(), 1);
+    assert!(sent_st.attachments[0].sticker);
+
+    // 5. Installed packs persist across restart, and phone sync install/remove updates the catalog.
+    world.restart();
+    world.connected();
+    let Response::Catalog { items: after_restart, .. } = world.ask(Request::Catalog {
+        account: account(),
+        space: None,
+        kind: protocol::CatalogKind::Stickers,
+        query: String::new(),
+        cursor: None,
+    }) else {
+        panic!("expected Response::Catalog after restart");
+    };
+    assert_eq!(after_restart.len(), 2, "installed sticker pack must persist across restart");
+
+    let pack2_id = "fedcba9876543210fedcba9876543210";
+    let pack2_key = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    world.steer(&format!("sticker-pack-op install {pack2_id} {pack2_key} Party Pack|Signal"));
+    world.until("synced pack appears in catalog", || {
+        let Response::Catalog { items, .. } = world.ask(Request::Catalog {
+            account: account(),
+            space: None,
+            kind: protocol::CatalogKind::Stickers,
+            query: "Party".into(),
+            cursor: None,
+        }) else {
+            return None;
+        };
+        (!items.is_empty()).then_some(())
+    });
+
+    world.steer(&format!("sticker-pack-op remove {pack2_id} {pack2_key}"));
+    world.until("removed pack disappears from catalog", || {
+        let Response::Catalog { items, .. } = world.ask(Request::Catalog {
+            account: account(),
+            space: None,
+            kind: protocol::CatalogKind::Stickers,
+            query: "Party".into(),
+            cursor: None,
+        }) else {
+            return None;
+        };
+        items.is_empty().then_some(())
+    });
+
+    // Local remove command removes pack_id and tells the wire.
+    let remove_cmd = format!("\u{1}signal-sticker-remove\u{1}{pack_id}");
+    assert_eq!(world.ask(Request::Handoff { conversation: key(&remove_cmd) }), Response::Link { url: "removed".into() });
+    world.heard(&format!("sticker-pack-remove {pack_id}"));
+}
