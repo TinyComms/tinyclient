@@ -4,7 +4,7 @@ use super::chat::Look;
 use super::home::{self, Act, Drill, Item};
 use super::{joins_from_list, on_screen, respliced, Mode};
 use crate::client::ask;
-use crate::gui::components::{badge_dot, empty_state, glyph, icon_button, list_row, rollup_badge, section_header, Avatar, Shape};
+use crate::gui::components::{badge_dot, empty_state, glyph, icon_button, list_row, rollup_badge, section_header, tip, Avatar, Shape};
 use crate::gui::state::{Shell, Snapshot};
 use crate::gui::theme::{self, Type};
 use crate::view::now;
@@ -400,7 +400,25 @@ impl Shell {
         let network = self.sidebar_state.home.network;
         let click = |row: Stateful<Div>, cx: &mut Context<Self>| self.tap(row, crate::gui::phone::token(&["home-item", &ix.to_string()]), None, move |this, cx| this.activate_home(ix, cx), cx);
         match item {
-            Item::Header { label, first } => section_header(label, first).into_any_element(),
+            Item::Header { label, first } => {
+                let mut row = section_header(label, first);
+                if label == "Direct messages" && network == Some(Network::Discord) {
+                    let can_group = self.snapshot.as_ref().is_some_and(|s| {
+                        s.accounts
+                            .iter()
+                            .any(|a| a.key.network == Network::Discord && a.link == protocol::Link::Connected && a.can.groups > 0)
+                    });
+                    if can_group {
+                        row = row.justify_between().child(
+                            icon_button("discord-new-group", "icons/plus.svg", false)
+                                .size(px(20.))
+                                .tooltip(tip("New group DM", None))
+                                .on_click(cx.listener(|this, _, window, cx| this.open_switcher("@", window, cx))),
+                        );
+                    }
+                }
+                row.into_any_element()
+            }
             Item::Chat(c) => {
                 let look = match network {
                     Some(Network::Discord) if self.sidebar_state.drill.is_none() => Look { status: true, ..Look::default() },

@@ -55,6 +55,8 @@ const WARM: usize = 5;
 const PAGE: usize = 50;
 /// Discord's own limit on a message. Nitro (`premium_type` 2) is twice this.
 const LONGEST: usize = 2000;
+/// Discord's limit on a group DM, including ourselves (at most 9 friends).
+const GROUP_DM_LIMIT: usize = 10;
 
 /// Characters one message may hold. Nitro is 4,000. Every other plan, including Nitro Basic,
 /// stays at 2,000. A server's boosts are not part of this.
@@ -304,6 +306,7 @@ pub(super) fn renamed(known: &protocol::Conversation, title: &str) -> crate::sto
     row.limit = known.limit;
     row.max_file_bytes = known.max_file_bytes;
     row.read_only_reason = known.read_only_reason.clone();
+    row.rights = known.rights;
     row.spam = known.spam;
     row
 }
@@ -637,6 +640,15 @@ impl Discord {
     /// A request, with the socket thread woken when it shows the session is over.
     fn call(&self, method: &str, path: &str, body: Option<Value>) -> Result<String, Refused> {
         let answer = self.rest.call(method, path, body);
+        if matches!(answer, Err(Refused::Expired)) {
+            self.wake();
+        }
+        answer
+    }
+
+    /// One-shot request (no 429 retry, per-request captcha failure), waking the socket on 401.
+    fn call_once(&self, method: &str, path: &str, body: Option<Value>) -> Result<String, Refused> {
+        let answer = self.rest.call_once_with(method, path, body, &[]);
         if matches!(answer, Err(Refused::Expired)) {
             self.wake();
         }
@@ -1587,6 +1599,151 @@ impl Discord {
         Ok(channel.id)
     }
 
+    /// Starts a new group DM with friends (`POST /users/@me/channels`). One-shot per click:
+    /// Discord watches group creation closely. Only friends may be added, up to 10 people total.
+    fn start_group(&self, people: &[String], title: Option<&str>) -> Result<String, Refusal> {
+        let refuse = |why: String| Refusal::Refused(why);
+        let recipients: Vec<String> = {
+            let state = crate::hub::lock(&self.state);
+            let mut out = Vec::new();
+            for id in people {
+                if id.is_empty() || id == &state.me || out.contains(id) {
+                    continue;
+                }
+                if state.relations.get(id) != Some(&Relation::Friend) {
+                    return Err(refuse("Only Discord friends can be added to a group DM.".to_owned()));
+                }
+                out.push(id.clone());
+            }
+            out
+        };
+        if recipients.is_empty() {
+            return Err(refuse("Choose at least one friend to start a group.".to_owned()));
+        }
+        if recipients.len() + 1 > GROUP_DM_LIMIT {
+            return Err(refuse(format!("A Discord group DM can have at most {GROUP_DM_LIMIT} people.")));
+        }
+        let created = self
+            .call_once("POST", "/users/@me/channels", Some(json!({ "recipients": recipients })))
+            .map_err(refusal)?;
+        let mut channel: model::Channel = serde_json::from_str(&created).map_err(|err| refuse(err.to_string()))?;
+        if let Some(name) = title.map(str::trim).filter(|t| !t.is_empty()) {
+            if channel.kind == model::GROUP_DM {
+                if let Ok(patched) = self.call("PATCH", &format!("/channels/{}", channel.id), Some(json!({ "name": name }))) {
+                    if let Ok(updated) = serde_json::from_str::<model::Channel>(&patched) {
+                        channel = updated;
+                    } else {
+                        channel.name = Some(name.to_owned());
+                    }
+                }
+            }
+        }
+        self.direct(&channel, &HashMap::new()).map_err(|err| refuse(err.to_string()))?;
+        Ok(channel.id)
+    }
+
+    /// Adds friends to a group DM (`PUT /channels/{id}/recipients/{user}`), or escalates a 1:1 DM
+    /// into a new group DM (`POST /users/@me/channels` with `[peer, ...added]`), as Discord does.
+    fn add_to_group(&self, channel: &str, people: &[String]) -> Result<(), Refusal> {
+        let refuse = |why: String| Refusal::Refused(why);
+        let known = self
+            .ctx
+            .known(channel)
+            .map_err(|err| refuse(err.to_string()))?
+            .ok_or_else(|| refuse("This conversation is gone.".to_owned()))?;
+        let (me, added, peer_for_direct) = {
+            let state = crate::hub::lock(&self.state);
+            let mut out = Vec::new();
+            for id in people {
+                if id.is_empty() || id == &state.me || out.contains(id) {
+                    continue;
+                }
+                if state.relations.get(id) != Some(&Relation::Friend) {
+                    return Err(refuse("Only Discord friends can be added to a group DM.".to_owned()));
+                }
+                out.push(id.clone());
+            }
+            let peer = known.peer.clone().or_else(|| {
+                state
+                    .directs
+                    .iter()
+                    .find(|(_, ch)| ch.as_str() == channel)
+                    .map(|(user, _)| user.clone())
+            });
+            (state.me.clone(), out, peer)
+        };
+        if added.is_empty() {
+            return Err(refuse("Choose at least one friend to add.".to_owned()));
+        }
+        match known.kind {
+            ConversationKind::Direct => {
+                let mut recipients = Vec::new();
+                if let Some(peer) = peer_for_direct.filter(|p| !p.is_empty() && p != &me) {
+                    recipients.push(peer);
+                }
+                for id in added {
+                    if !recipients.contains(&id) {
+                        recipients.push(id);
+                    }
+                }
+                if recipients.len() + 1 > GROUP_DM_LIMIT {
+                    return Err(refuse(format!("A Discord group DM can have at most {GROUP_DM_LIMIT} people.")));
+                }
+                let created = self
+                    .call_once("POST", "/users/@me/channels", Some(json!({ "recipients": recipients })))
+                    .map_err(refusal)?;
+                let new_channel: model::Channel = serde_json::from_str(&created).map_err(|err| refuse(err.to_string()))?;
+                self.direct(&new_channel, &HashMap::new()).map_err(|err| refuse(err.to_string()))?;
+                Ok(())
+            }
+            ConversationKind::Group => {
+                let (to_add, current_count) = {
+                    let state = crate::hub::lock(&self.state);
+                    let existing = state.groups.get(channel).map(|g| g.recipients.clone()).unwrap_or_default();
+                    let count = existing.len() + 1;
+                    let to_add: Vec<String> = added.into_iter().filter(|id| !existing.contains(id)).collect();
+                    (to_add, count)
+                };
+                if to_add.is_empty() {
+                    return Ok(());
+                }
+                if current_count + to_add.len() > GROUP_DM_LIMIT {
+                    return Err(refuse(format!("A Discord group DM can have at most {GROUP_DM_LIMIT} people.")));
+                }
+                for user in &to_add {
+                    self.call("PUT", &format!("/channels/{channel}/recipients/{user}"), None).map_err(refusal)?;
+                    let title = {
+                        let mut state = crate::hub::lock(&self.state);
+                        if let Some(group) = state.groups.get_mut(channel) {
+                            if !group.recipients.contains(user) {
+                                group.recipients.push(user.clone());
+                            }
+                            let named = group.named;
+                            let recs = group.recipients.clone();
+                            (!named).then(|| {
+                                recs.iter()
+                                    .filter_map(|id| state.users.get(id).map(String::as_str))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            })
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(title) = title.filter(|t| !t.is_empty()) {
+                        if let Ok(Some(current)) = self.ctx.known(channel) {
+                            let _ = self.ctx.conversation(&renamed(&current, &title));
+                        }
+                    }
+                    self.ctx.info_stale(channel);
+                    self.ctx.members_changed(channel);
+                }
+                Ok(())
+            }
+            _ => Err(Refusal::Unsupported),
+        }
+    }
+
     /// The thread a channel message starts. One request, and only when the user asked: Discord
     /// watches thread creation. A message that already has a thread answers with that channel.
     fn start_thread(&self, channel: &str, message_id: &str, name: &str) -> Result<String, Refusal> {
@@ -1895,6 +2052,8 @@ impl Discord {
                 self.members(conversation_id, offset, limit, reply)
             }
             Command::StartDirect { person_id, reply } => drop(reply.send(self.start_direct(&person_id))),
+            Command::StartGroup { people, title, reply } => answer(reply, self.start_group(&people, title.as_deref())),
+            Command::MembersAdd { conversation_id, people, reply } => answer(reply, self.add_to_group(&conversation_id, &people)),
             Command::StartThread { conversation_id, message_id, name, reply } => {
                 drop(reply.send(self.start_thread(&conversation_id, &message_id, &name)))
             }

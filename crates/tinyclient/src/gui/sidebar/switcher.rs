@@ -853,7 +853,8 @@ impl Shell {
                     .and_then(|sw| sw.group_people.first())
                     .is_none_or(|first| first.key.account() == account);
                 let picked = switcher.is_some_and(|sw| sw.group_people.iter().any(|p| p.key == person.key));
-                (cap > 0 && same_account).then(|| {
+                let discord_non_friend = person.key.network == Network::Discord && person.relation != protocol::Relation::Friend;
+                (cap > 0 && same_account && !discord_non_friend).then(|| {
                     let who = (**person).clone();
                     div()
                         .id(("add-grp", ix))
@@ -922,6 +923,9 @@ impl Shell {
         if let Some(pos) = switcher.group_people.iter().position(|p| p.key == person.key) {
             switcher.group_people.remove(pos);
         } else {
+            if person.key.network == Network::Discord && person.relation != protocol::Relation::Friend {
+                return;
+            }
             let cap = self
                 .snapshot
                 .as_ref()
@@ -1067,6 +1071,7 @@ impl Shell {
                             .child(div().text_color(theme::text_faint()).child("×")),
                     );
                 }
+                let discord_group = switcher.group_people.first().is_some_and(|p| p.key.network == Network::Discord);
                 sheet.child(
                     div()
                         .px(px(12.))
@@ -1077,6 +1082,14 @@ impl Shell {
                         .flex_col()
                         .gap(px(6.))
                         .child(chips)
+                        .when(discord_group, |box_| {
+                            box_.child(
+                                div()
+                                    .type_micro()
+                                    .text_color(theme::text_faint())
+                                    .child("Only Discord friends can join a group DM (up to 10 people including you)."),
+                            )
+                        })
                         .child(
                             div()
                                 .flex()

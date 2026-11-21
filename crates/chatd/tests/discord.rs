@@ -5045,3 +5045,196 @@ fn leave_space_sends_delete_refuses_owner_and_cleans_tree() {
         other => panic!("expected Response::Spaces, got {other:?}"),
     }
 }
+
+#[test]
+fn group_dm_start_add_friend_filter_limit_and_1to1_escalation() {
+    let world = World::start();
+    let account = AccountKey { network: Network::Discord, account: "1000".into() };
+
+    // 1. Capabilities advertise groups: 9 (up to 9 friends + me = 10 total).
+    let groups_cap = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts
+            .into_iter()
+            .find(|a| a.key == account)
+            .expect("discord account")
+            .can
+            .groups,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(groups_cap, 9);
+    assert!(world.conversation("3003").rights.add_members);
+
+    // 2. Non-friend (2006) is refused locally for StartGroup without touching Discord.
+    match world.ask(Request::StartGroup {
+        account: account.clone(),
+        people: vec![world.key("2001"), world.key("2006")],
+        title: None,
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("friends"), "expected friends error, got: {detail}");
+        }
+        other => panic!("expected Refused for non-friend, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("POST", "/users/@me/channels").is_empty());
+
+    // 3. StartGroup with 2 friends (2001, 2002) and optional title creates a group DM and renames it.
+    world.discord.script(
+        "/users/@me/channels",
+        200,
+        json!({
+            "id": "3100",
+            "type": 3,
+            "name": null,
+            "owner_id": "1000",
+            "recipients": [
+                {"id": "2001", "username": "mara", "global_name": "Mara Okafor"},
+                {"id": "2002", "username": "dev", "global_name": "Dev Patel"}
+            ]
+        }),
+    );
+    world.discord.script(
+        "/channels/3100",
+        200,
+        json!({
+            "id": "3100",
+            "type": 3,
+            "name": "Trail Crew",
+            "owner_id": "1000",
+            "recipients": [
+                {"id": "2001", "username": "mara", "global_name": "Mara Okafor"},
+                {"id": "2002", "username": "dev", "global_name": "Dev Patel"}
+            ]
+        }),
+    );
+    let created = match world.ask(Request::StartGroup {
+        account: account.clone(),
+        people: vec![world.key("2001"), world.key("2002")],
+        title: Some("Trail Crew".into()),
+    }) {
+        Response::Conversation { conversation } => conversation,
+        other => panic!("expected Response::Conversation, got {other:?}"),
+    };
+    assert_eq!(created.key.id, "3100");
+    assert_eq!(created.kind, ConversationKind::Group);
+    assert_eq!(created.title, "Trail Crew");
+    assert!(created.rights.add_members);
+    let post_reqs = world.discord.requests_to("POST", "/users/@me/channels");
+    assert_eq!(post_reqs.len(), 1);
+    assert_eq!(post_reqs[0].body, json!({"recipients": ["2001", "2002"]}));
+    let patch_reqs = world.discord.requests_to("PATCH", "/channels/3100");
+    assert_eq!(patch_reqs.len(), 1);
+    assert_eq!(patch_reqs[0].body, json!({"name": "Trail Crew"}));
+
+    // 4. Add a third friend (2003, promoted via RELATIONSHIP_ADD) to existing group 3003 -> PUT /channels/3003/recipients/2003.
+    world.discord.push(
+        "RELATIONSHIP_ADD",
+        json!({
+            "id": "2003",
+            "type": 1,
+            "user": {"id": "2003", "username": "asker", "global_name": "Asker"}
+        }),
+    );
+    wait("2003 becomes friend", || {
+        match world.ask(Request::People {
+            network: Some(Network::Discord),
+            relation: Some(Relation::Friend),
+            query: None,
+            offset: 0,
+            limit: 50,
+        }) {
+            Response::People { people, .. } if people.iter().any(|p| p.key.id == "2003") => Some(()),
+            _ => None,
+        }
+    });
+    world.discord.script("/channels/3003/recipients/2003", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::MembersAdd {
+            conversation: world.key("3003"),
+            people: vec!["2003".into()],
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("PUT", "/channels/3003/recipients/2003").len(), 1);
+    match world.ask(Request::Members {
+        conversation: world.key("3003"),
+        offset: 0,
+        limit: 50,
+    }) {
+        Response::Members { members, .. } => {
+            assert!(members.iter().any(|m| m.key.id == "2003"), "2003 should be in group members");
+        }
+        other => panic!("expected Response::Members, got {other:?}"),
+    }
+
+    // 5. Adding a non-friend to group 3003 is refused locally.
+    match world.ask(Request::MembersAdd {
+        conversation: world.key("3003"),
+        people: vec!["2006".into()],
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("friends"), "expected friends error, got: {detail}");
+        }
+        other => panic!("expected Refused for non-friend add, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("PUT", "/channels/3003/recipients/2006").is_empty());
+
+    // 6. Adding friend 2002 to 1:1 DM 3001 (with 2001) creates a new group DM with [2001, 2002].
+    world.discord.script(
+        "/users/@me/channels",
+        200,
+        json!({
+            "id": "3101",
+            "type": 3,
+            "name": null,
+            "owner_id": "1000",
+            "recipients": [
+                {"id": "2001", "username": "mara", "global_name": "Mara Okafor"},
+                {"id": "2002", "username": "dev", "global_name": "Dev Patel"}
+            ]
+        }),
+    );
+    assert_eq!(
+        world.ask(Request::MembersAdd {
+            conversation: world.key("3001"),
+            people: vec!["2002".into()],
+        }),
+        Response::Ok
+    );
+    let escalated = world.conversation("3101");
+    assert_eq!(escalated.kind, ConversationKind::Group);
+    let posts = world.discord.requests_to("POST", "/users/@me/channels");
+    assert_eq!(posts.len(), 2);
+    assert_eq!(posts[1].body, json!({"recipients": ["2001", "2002"]}));
+
+    // 7. Exceeding 10 people total (adding 9 more friends to a group that already has 4) is refused locally.
+    let mut extras = Vec::new();
+    for id in 2101..=2107 {
+        let sid = id.to_string();
+        world.discord.push(
+            "RELATIONSHIP_ADD",
+            json!({"id": sid, "type": 1, "user": {"id": sid, "username": format!("f{id}"), "global_name": format!("Friend {id}")}}),
+        );
+        extras.push(sid);
+    }
+    wait("extra friends recorded", || {
+        match world.ask(Request::People {
+            network: Some(Network::Discord),
+            relation: Some(Relation::Friend),
+            query: None,
+            offset: 0,
+            limit: 50,
+        }) {
+            Response::People { people, .. } if people.iter().any(|p| p.key.id == "2107") => Some(()),
+            _ => None,
+        }
+    });
+    match world.ask(Request::MembersAdd {
+        conversation: world.key("3003"),
+        people: extras,
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("10"), "expected 10-person limit error, got: {detail}");
+        }
+        other => panic!("expected Refused over 10-person cap, got {other:?}"),
+    }
+}

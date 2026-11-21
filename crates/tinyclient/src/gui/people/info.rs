@@ -547,6 +547,69 @@ impl InfoPane {
                 }
             }
         }
+        if network == Network::Discord && online && person.relation == protocol::Relation::Friend {
+            if let Some(row) = self.row.as_ref().filter(|r| r.kind == protocol::ConversationKind::Direct) {
+                let dm_key = row.key.clone();
+                top = top.child(
+                    div().mt(px(8.)).child(
+                        button("info-dm-add-people", ButtonKind::Secondary, "Add people…")
+                            .h(px(26.))
+                            .px(px(8.))
+                            .type_small()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.start_manage(
+                                    dm_key.clone(),
+                                    ManageKind::AddMembers,
+                                    "",
+                                    "Friend IDs (comma-separated)",
+                                    cx,
+                                );
+                            })),
+                    ),
+                );
+                if let Some((mkey, ManageKind::AddMembers, input)) = self.managing() {
+                    if mkey == &row.key {
+                        top = top.child(
+                            div()
+                                .mt(px(8.))
+                                .p(px(8.))
+                                .rounded(px(theme::R_CONTROL))
+                                .bg(theme::raised())
+                                .flex()
+                                .flex_col()
+                                .gap(px(6.))
+                                .child(
+                                    div()
+                                        .type_micro()
+                                        .text_color(theme::text_faint())
+                                        .child("Only Discord friends can be added (creates a group DM, up to 10 people)."),
+                                )
+                                .child(input.clone())
+                                .child(
+                                    div()
+                                        .flex()
+                                        .justify_end()
+                                        .gap(px(6.))
+                                        .child(
+                                            button("dm-manage-cancel", ButtonKind::Ghost, "Cancel")
+                                                .h(px(24.))
+                                                .px(px(8.))
+                                                .type_small()
+                                                .on_click(cx.listener(|this, _, _, cx| this.cancel_manage(cx))),
+                                        )
+                                        .child(
+                                            button("dm-manage-save", ButtonKind::Primary, "Create group")
+                                                .h(px(24.))
+                                                .px(px(10.))
+                                                .type_small()
+                                                .on_click(cx.listener(|this, _, _, cx| this.submit_manage(cx))),
+                                        ),
+                                ),
+                        );
+                    }
+                }
+            }
+        }
         if let Some(heads_up) = facts::heads_up(person, profile, online) {
             let words = facts::heads_up_words(&heads_up, &person.name, network, crate::view::now());
             // CONTRACT: `RelateAction` has no Unblock, so the Blocked banner offers none.
@@ -1132,6 +1195,41 @@ impl InfoPane {
                     cx.notify();
                     return;
                 }
+                if let Some(row) = self.row.as_ref().filter(|r| {
+                    r.key == conversation
+                        && r.kind == protocol::ConversationKind::Direct
+                        && r.key.network == Network::Discord
+                }) {
+                    let account = row.key.account();
+                    let mut keys: Vec<Key> = Vec::new();
+                    if let Some(peer) = row.peer.as_deref().filter(|p| !p.is_empty()) {
+                        keys.push(Key::new(&account, peer));
+                    }
+                    for id in people {
+                        let k = Key::new(&account, id);
+                        if !keys.contains(&k) {
+                            keys.push(k);
+                        }
+                    }
+                    let shell = self.shell.clone();
+                    super::ask_later(cx, Request::StartGroup { account, people: keys, title: None }, move |answer, cx| {
+                        match answer {
+                            Ok(Response::Conversation { conversation }) => {
+                                let _ = shell.update(cx, |shell, cx| {
+                                    shell.select(conversation.key, &conversation.title, cx);
+                                });
+                            }
+                            Ok(Response::Error { detail, .. }) => {
+                                let _ = shell.update(cx, |shell, cx| {
+                                    shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                                });
+                            }
+                            _ => {}
+                        }
+                    });
+                    cx.notify();
+                    return;
+                }
                 Request::MembersAdd { conversation, people }
             }
             _ => {
@@ -1139,7 +1237,14 @@ impl InfoPane {
                 return;
             }
         };
-        super::ask_later(cx, request, |_, _| {});
+        let shell = self.shell.clone();
+        super::ask_later(cx, request, move |answer, cx| {
+            if let Ok(Response::Error { detail, .. }) = answer {
+                let _ = shell.update(cx, |shell, cx| {
+                    shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                });
+            }
+        });
         cx.notify();
     }
 

@@ -321,8 +321,9 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
         }
         top = top.child(manage_bar);
     }
-    if let Some((mkey, _, input)) = pane.managing() {
+    if let Some((mkey, mkind, input)) = pane.managing() {
         if mkey == &row.key {
+            let discord_friends_hint = *mkind == ManageKind::AddMembers && row.key.network == Network::Discord;
             top = top.child(
                 div()
                     .mt(px(8.))
@@ -332,6 +333,14 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                     .flex()
                     .flex_col()
                     .gap(px(6.))
+                    .when(discord_friends_hint, |box_| {
+                        box_.child(
+                            div()
+                                .type_micro()
+                                .text_color(theme::text_faint())
+                                .child("Only Discord friends can be added (up to 10 people including you)."),
+                        )
+                    })
                     .child(input.clone())
                     .child(
                         div()

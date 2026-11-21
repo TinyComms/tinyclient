@@ -715,6 +715,7 @@ impl Discord {
                     row.avatar = Some(file.id.clone());
                     files.push((file, url));
                 }
+                row.rights.add_members = true;
                 // A create or update can carry recipient ids and no user objects. Resolving
                 // nobody must not replace the list READY already recorded.
                 if !recipients.is_empty() {
@@ -836,6 +837,7 @@ impl Discord {
             friend_nickname: true,
             join_space_by_invite: true,
             leave_space: true,
+            groups: 9,
             ..Default::default()
         });
         self.state.lock().unwrap().premium = premium;
