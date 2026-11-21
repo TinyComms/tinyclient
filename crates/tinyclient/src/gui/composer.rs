@@ -45,7 +45,7 @@ pub(in crate::gui) mod picker;
 mod tray;
 mod typing;
 
-pub use typing::preview as typing_preview;
+pub use typing::preview_for as typing_preview_for;
 
 use super::components::place::{max_height, placed, Layer, Place};
 use super::components::{button, glyph, menu, menu_item, menu_item_disabled, menu_label, menu_separator, tip, ButtonKind};

@@ -234,7 +234,7 @@ struct Live {
     /// Messages we sent and the id the shell knows each by, until the echo has passed.
     sent: VecDeque<(i32, String)>,
     random: VecDeque<(i64, String)>,
-    typed: HashMap<String, Instant>,
+    typed: HashMap<String, (Instant, protocol::Compose)>,
     here: Option<Instant>,
     /// Whether people, groups and channels are muted when a chat has no setting of its own.
     muted: [bool; 3],
@@ -1123,31 +1123,37 @@ fn delete(account: &Account, conversation: &str, message: &str, scope: protocol:
 }
 
 fn typing(account: &Account, conversation: &str, activity: protocol::Compose) {
-    // Keystrokes are paced. A recording or an upload is not: the other person should see it now.
-    deliver(account, conversation, activity_action(activity, 0), activity == protocol::Compose::Typing);
+    if activity == protocol::Compose::Cancel {
+        deliver_cancel(account, conversation);
+        return;
+    }
+    // Repeated signals for the same activity are paced at TYPING_EVERY (8 s); switching activities
+    // (e.g. typing -> recording a voice message) goes out right away.
+    deliver(account, conversation, activity_action(activity, 0), Some(activity));
 }
 
 /// An upload's progress, 0 to 100. Not paced: each new percent is one signal.
 pub(super) fn show_upload(account: &Account, conversation: &str, activity: protocol::Compose, progress: i32) {
-    deliver(account, conversation, activity_action(activity, progress), false);
+    deliver(account, conversation, activity_action(activity, progress), None);
 }
 
-/// The other person should see that an upload was abandoned.
+/// The other person should see that a recording or upload was abandoned.
 pub(super) fn deliver_cancel(account: &Account, conversation: &str) {
-    deliver(account, conversation, tl::enums::SendMessageAction::SendMessageCancelAction, false);
+    account.live().typed.remove(conversation);
+    deliver(account, conversation, tl::enums::SendMessageAction::SendMessageCancelAction, None);
 }
 
-fn deliver(account: &Account, conversation: &str, action: tl::enums::SendMessageAction, paced: bool) {
+fn deliver(account: &Account, conversation: &str, action: tl::enums::SendMessageAction, pace_as: Option<protocol::Compose>) {
     let Some((who, topic)) = Who::parse(conversation) else {
         return;
     };
-    if paced {
+    if let Some(activity) = pace_as {
         let mut live = account.live();
-        if live.typed.get(conversation).is_some_and(|told| told.elapsed() < TYPING_EVERY) {
+        if live.typed.get(conversation).is_some_and(|(told, prev)| *prev == activity && told.elapsed() < TYPING_EVERY) {
             return;
         }
-        live.typed.retain(|_, told| told.elapsed() < TYPING_EVERY);
-        live.typed.insert(conversation.to_owned(), Instant::now());
+        live.typed.retain(|_, (told, _)| told.elapsed() < TYPING_EVERY);
+        live.typed.insert(conversation.to_owned(), (Instant::now(), activity));
     }
     account.here();
     if let Ok(peer) = account.input(who) {
@@ -1163,13 +1169,15 @@ fn activity_action(activity: protocol::Compose, progress: i32) -> tl::enums::Sen
     match activity {
         protocol::Compose::Typing => SendMessageTypingAction,
         protocol::Compose::RecordingVoice => SendMessageRecordAudioAction,
-        protocol::Compose::RecordingVideo => SendMessageRecordVideoAction,
+        protocol::Compose::RecordingVideo => SendMessageRecordRoundAction,
         protocol::Compose::UploadingPhoto => SendMessageUploadPhotoAction(tl::types::SendMessageUploadPhotoAction { progress }),
         protocol::Compose::UploadingVideo => SendMessageUploadVideoAction(tl::types::SendMessageUploadVideoAction { progress }),
         protocol::Compose::UploadingAudio => SendMessageUploadAudioAction(tl::types::SendMessageUploadAudioAction { progress }),
         protocol::Compose::UploadingFile => SendMessageUploadDocumentAction(tl::types::SendMessageUploadDocumentAction { progress }),
         protocol::Compose::ChoosingSticker => SendMessageChooseStickerAction,
         protocol::Compose::PlayingGame => SendMessageGamePlayAction,
+        protocol::Compose::Speaking => SpeakingInGroupCallAction,
+        protocol::Compose::Cancel => SendMessageCancelAction,
     }
 }
 
@@ -1662,8 +1670,20 @@ pub fn prove_telegram_typing_activity() -> Result<(), String> {
     if live::noted(&SendMessageChooseStickerAction) != Some(protocol::Compose::ChoosingSticker) {
         return Err("choosing a sticker was read as typing".into());
     }
+    if live::noted(&SendMessageRecordRoundAction) != Some(protocol::Compose::RecordingVideo) {
+        return Err("recording a round video was read as typing".into());
+    }
+    if live::noted(&SpeakingInGroupCallAction) != Some(protocol::Compose::Speaking) {
+        return Err("speaking in a call was read as typing".into());
+    }
     if live::action_word(&activity_action(protocol::Compose::RecordingVoice, 0)) != "record-audio" {
         return Err("recording a voice note was not told as a recording".into());
+    }
+    if live::action_word(&activity_action(protocol::Compose::RecordingVideo, 0)) != "record-video" {
+        return Err("recording a video note was not told as a recording".into());
+    }
+    if live::action_word(&activity_action(protocol::Compose::Cancel, 0)) != "cancel" {
+        return Err("cancelling a recording was not told as cancel".into());
     }
     Ok(())
 }

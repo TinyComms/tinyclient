@@ -10,16 +10,20 @@
 
 use crate::hub::{lock, Hub};
 use crate::media::mediad_path;
-use protocol::{read_frame, Change, Key, RecordRequest, Recording, RecordState, RecEvent, WAVEFORM_LIMIT};
+use protocol::{read_frame, Change, Compose, Key, RecordRequest, Recording, RecordState, RecEvent, WAVEFORM_LIMIT};
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The word for a recording chatd itself could not start. mediad's own failures name themselves.
 pub const NO_RECORDER: &str = "Recording did not start. Try again.";
+/// How often chatd renews the recording status on the network while a recording runs.
+const RECORD_ACTIVITY_EVERY: Duration = Duration::from_secs(8);
+
+type OnActivity = Arc<dyn Fn(&Key, Compose) + Send + Sync>;
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
@@ -34,8 +38,16 @@ struct Active {
     keep: Arc<AtomicBool>,
     /// True once mediad said the file is made (or failed): anything of the send is told by it.
     said: Arc<AtomicBool>,
+    /// Signalled on stop, forget, or exit so the periodic recording-status renewer stops at once.
+    stop_renew: Arc<(Mutex<bool>, Condvar)>,
     recording: Recording,
     path: PathBuf,
+}
+
+fn finish_renew(stop_renew: &(Mutex<bool>, Condvar)) {
+    let mut done = lock(&stop_renew.0);
+    *done = true;
+    stop_renew.1.notify_all();
 }
 
 /// What mediad's word makes of `shown`. False when the word is stale: a recording replaced or
@@ -83,9 +95,23 @@ pub struct Recorder {
     shown: Mutex<Option<Recording>>,
     /// The mediad running, while there is one.
     active: Mutex<Option<Active>>,
+    /// Tells the network's adapter when a recording starts, renews, or is discarded.
+    on_activity: Mutex<Option<OnActivity>>,
 }
 
 impl Recorder {
+    /// Registers the callback that tells adapters about recording start, renewal, and cancel.
+    pub fn on_activity(&self, f: impl Fn(&Key, Compose) + Send + Sync + 'static) {
+        *lock(&self.on_activity) = Some(Arc::new(f));
+    }
+
+    fn emit_activity(&self, conversation: &Key, activity: Compose) {
+        let cb = lock(&self.on_activity).clone();
+        if let Some(cb) = cb {
+            cb(conversation, activity);
+        }
+    }
+
     /// The one recording, wherever the user has gone since.
     pub fn shown(&self) -> Option<Recording> {
         lock(&self.shown).clone()
@@ -108,7 +134,9 @@ impl Recorder {
     fn start(&self, hub: &Arc<Hub>, conversation: Key, input: Option<String>) {
         let since = now_ms();
         let path = crate::blobs::upload::outbox().join(format!("voice-{since}.opus"));
-        self.replace(hub, None);
+        let cancel_old = self.shown().is_some_and(|old| old.conversation != conversation);
+        self.replace(hub, None, cancel_old);
+        self.emit_activity(&conversation, Compose::RecordingVoice);
         let recording = Recording { conversation, since, device: None, notice: None, state: RecordState::Active };
         let _ = std::fs::create_dir_all(path.parent().expect("the outbox has a parent"));
         self.spawn_recording(hub, &recording, &path, input.as_deref());
@@ -148,10 +176,12 @@ impl Recorder {
     fn running(&self, hub: &Arc<Hub>, recording: &Recording, path: &Path, spawned: protocol::media_host::Spawned) {
         let protocol::media_host::Spawned { mut child, stdin, stdout } = spawned;
         let mut stdout = BufReader::new(stdout.expect("stdout is piped"));
+        let stop_renew = Arc::new((Mutex::new(false), Condvar::new()));
         let active = Active {
             stdin,
             keep: Arc::new(AtomicBool::new(true)),
             said: Arc::new(AtomicBool::new(false)),
+            stop_renew: stop_renew.clone(),
             recording: recording.clone(),
             path: path.to_owned(),
         };
@@ -160,6 +190,30 @@ impl Recorder {
         // Publish before reading events: even an immediate failure must have a current
         // recording to update, and the composer needs Active to make its next press Stop.
         *lock(&self.shown) = Some(recording.clone());
+        // Renew the recording activity while recording stays active; exits immediately on stop/forget.
+        {
+            let hub = hub.clone();
+            let conv = recording.conversation.clone();
+            let renew_stop = stop_renew.clone();
+            let _ = std::thread::Builder::new().name("recorder-activity".into()).stack_size(64 * 1024).spawn(move || {
+                let mut done = lock(&renew_stop.0);
+                while !*done {
+                    let (guard, timeout) = renew_stop
+                        .1
+                        .wait_timeout(done, RECORD_ACTIVITY_EVERY)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    done = guard;
+                    if *done {
+                        break;
+                    }
+                    if timeout.timed_out() {
+                        drop(done);
+                        hub.recorder.emit_activity(&conv, Compose::RecordingVoice);
+                        done = lock(&renew_stop.0);
+                    }
+                }
+            });
+        }
         // Ends when mediad exits, which it does when chatd closes our stdin.
         let hub = hub.clone();
         let recording = recording.clone();
@@ -168,6 +222,7 @@ impl Recorder {
             while let Ok(event) = read_frame::<RecEvent>(&mut stdout) {
                 hub.recorder.reported(&hub, &recording, &path, event);
             }
+            finish_renew(&stop_renew);
             let _ = child.wait();
             if !keep.load(Ordering::Relaxed) && !said.load(Ordering::Relaxed) {
                 // Best effort: a recording nobody kept (replaced or forgotten while running)
@@ -180,6 +235,7 @@ impl Recorder {
     /// Ends the recording. mediad finishes the file, says the facts, and exits.
     fn stop(&self, hub: &Hub) {
         if let Some(active) = lock(&self.active).as_mut() {
+            finish_renew(&active.stop_renew);
             active.stdin.take();
         }
         self.tell(hub);
@@ -187,20 +243,27 @@ impl Recorder {
 
     /// The composer is not holding a recording: the facts and the file go.
     fn forget(&self, hub: &Hub) {
-        self.replace(hub, None);
+        self.replace(hub, None, true);
     }
 
     /// Ends a recording so another can be. A replaced recording's facts never arrive: the running
     /// one alone answers for itself.
-    fn replace(&self, hub: &Hub, kept: Option<Recording>) {
-        if let Some(Recording { state: RecordState::Recorded { path, .. }, .. }) = self.shown() {
-            hub.player.stop_file(hub, Path::new(&path));
+    fn replace(&self, hub: &Hub, kept: Option<Recording>, cancel_activity: bool) {
+        let previous = self.shown();
+        if let Some(Recording { state: RecordState::Recorded { path, .. }, .. }) = &previous {
+            hub.player.stop_file(hub, Path::new(path));
         }
         if let Some(mut past) = lock(&self.active).take() {
+            finish_renew(&past.stop_renew);
             past.keep.store(false, Ordering::Relaxed);
             drop(past.stdin.take());
         }
         *lock(&self.shown) = kept;
+        if cancel_activity {
+            if let Some(prev) = previous {
+                self.emit_activity(&prev.conversation, Compose::Cancel);
+            }
+        }
         self.tell(hub);
     }
 
@@ -214,6 +277,7 @@ impl Recorder {
                 (Some(active), Some(shown)) if active.recording == *recording => {
                     if !matches!(event, RecEvent::Started { .. }) {
                         active.said.store(true, Ordering::Relaxed);
+                        finish_renew(&active.stop_renew);
                     }
                     heard(shown, active, &event)
                 }
@@ -299,6 +363,7 @@ mod tests {
             stdin: None,
             keep: Arc::new(AtomicBool::new(true)),
             said: Arc::new(AtomicBool::new(false)),
+            stop_renew: Arc::new((Mutex::new(false), Condvar::new())),
             recording: recording.clone(),
             path: PathBuf::from(path),
         }

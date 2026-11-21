@@ -46,7 +46,7 @@ pub use hub::{ask_later, Hub};
 
 use super::anim::Play;
 use super::components::Avatar;
-use super::composer::typing_preview;
+use super::composer::typing_preview_for;
 use super::layout::{RightKind, RightPane};
 use super::sidebar::Mode;
 use super::state::Shell;
@@ -262,13 +262,18 @@ pub fn presence_slot(shell: &Shell, person: &Key) -> Presence {
     shell.people_state.hub.presence_of(person)
 }
 
-/// The layout's typing slot: what a direct row says while someone is typing in it.
+/// The layout's typing slot: what a row says while someone is typing, recording, or uploading in it.
 pub fn typing_slot(shell: &Shell, conversation: &Key) -> Option<SharedString> {
     let typists = shell.people_state.hub.typists_in(conversation);
-    let names: Vec<&str> = typists.iter().map(|typist| typist.name.as_str()).collect();
     // CONTRACT: the slot is handed a key, not the row, so a group cannot be told from a direct
-    // conversation here; two typists can only be a group.
-    typing_preview(&names, names.len() > 1).map(SharedString::from)
+    // conversation here unless it is open; two typists can only be a group.
+    let group = typists.len() > 1
+        || shell
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.open.as_ref())
+            .is_some_and(|open| open.key == *conversation && open.kind != protocol::ConversationKind::Direct);
+    typing_preview_for(&typists, group).map(SharedString::from)
 }
 
 fn draw_members(shell: &Shell, _: &mut Window, cx: &mut Context<Shell>) -> AnyElement {

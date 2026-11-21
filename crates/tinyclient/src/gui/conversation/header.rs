@@ -148,6 +148,14 @@ impl Shell {
         };
         let space = open.space.clone().map(|id| Key { id, ..open.key.clone() });
         let line = beside.map(|beside| match beside {
+            Beside::Activity(words) => div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .type_ui()
+                .text_color(theme::accent_text())
+                .child(words)
+                .into_any_element(),
             Beside::Person(line) => person_line(&line).into_any_element(),
             Beside::Path(subtitle) => div()
                 .id("reveal")
@@ -272,9 +280,13 @@ impl Shell {
         )
     }
 
-    /// The line after the title (07 §1): beside a direct conversation the person's status or
-    /// presence; elsewhere where it is (`Space › group`) and its topic.
+    /// The line after the title (07 §1): active typing/recording status first, then beside a direct
+    /// conversation the person's status or presence; elsewhere where it is (`Space › group`) and its topic.
     fn beside(&self, open: &Conversation) -> Option<Beside> {
+        let typists = self.people_state.hub().typists_in(&open.key);
+        if let Some(words) = crate::gui::composer::typing_preview_for(&typists, open.kind != ConversationKind::Direct) {
+            return Some(Beside::Activity(words));
+        }
         if open.kind == ConversationKind::Direct {
             if let Some(mut line) = self.peer_line(&open.key) {
                 // The avatar's dot says it; the word is its tooltip. A call and Telegram's
@@ -301,6 +313,7 @@ fn title_floor(title: &str, window: &Window) -> gpui::Pixels {
 
 /// What follows the title. A person's presence is not a place, so it does not reveal the sidebar.
 enum Beside {
+    Activity(String),
     Person(crate::gui::people::PeerLine),
     Path(String),
 }

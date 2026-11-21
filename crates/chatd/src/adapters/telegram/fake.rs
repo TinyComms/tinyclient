@@ -1642,6 +1642,23 @@ impl World {
             "record-audio" => vec![update(
                 tl::types::UpdateUserTyping { user_id: ODALYS, top_msg_id: None, action: tl::enums::SendMessageAction::SendMessageRecordAudioAction }.into(),
             )],
+            "record-round" => vec![update(
+                tl::types::UpdateUserTyping { user_id: ODALYS, top_msg_id: None, action: tl::enums::SendMessageAction::SendMessageRecordRoundAction }.into(),
+            )],
+            "upload-photo" => vec![update(
+                tl::types::UpdateUserTyping {
+                    user_id: ODALYS,
+                    top_msg_id: None,
+                    action: tl::enums::SendMessageAction::SendMessageUploadPhotoAction(tl::types::SendMessageUploadPhotoAction { progress: 50 }),
+                }
+                .into(),
+            )],
+            "choose-sticker" => vec![update(
+                tl::types::UpdateUserTyping { user_id: ODALYS, top_msg_id: None, action: tl::enums::SendMessageAction::SendMessageChooseStickerAction }.into(),
+            )],
+            "speaking" => vec![update(
+                tl::types::UpdateUserTyping { user_id: ODALYS, top_msg_id: None, action: tl::enums::SendMessageAction::SpeakingInGroupCallAction }.into(),
+            )],
             "typing-stop" => vec![update(
                 tl::types::UpdateUserTyping { user_id: ODALYS, top_msg_id: None, action: tl::enums::SendMessageAction::SendMessageCancelAction }.into(),
             )],

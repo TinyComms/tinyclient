@@ -288,6 +288,19 @@ impl Chat {
                 adapter.command(Command::Tiny(adapters::tiny::live::Ask::Settled));
             }
         });
+        let adapters = chat.adapters.clone();
+        let hub_for_rec = chat.hub.clone();
+        chat.hub.recorder.on_activity(move |conversation, activity| {
+            if conversation.network != Network::Telegram {
+                return;
+            }
+            let account = conversation.account();
+            if hub_for_rec.link(&account) == Link::Connected && hub_for_rec.settings().typing(&account) {
+                if let Some(adapter) = lock(&adapters).get(&account) {
+                    adapter.command(Command::Typing { conversation_id: conversation.id.clone(), activity });
+                }
+            }
+        });
         let (searches, adapters) = (chat.searches.clone(), chat.adapters.clone());
         let spawned = std::thread::Builder::new().name("search".into()).stack_size(256 * 1024).spawn(move || searches.run(&adapters));
         if let Err(err) = spawned {
@@ -3338,6 +3351,9 @@ impl Chat {
                 self.drop_unsent(conversation, &client_id, &message)
             }
             Request::Typing { conversation, activity } => {
+                if activity == protocol::Compose::Cancel && conversation.network != Network::Telegram {
+                    return Response::Ok;
+                }
                 let account = conversation.account();
                 // P1: off, the network never hears it.
                 if self.hub.link(&account) == Link::Connected && self.hub.settings().typing(&account) {

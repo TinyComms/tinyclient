@@ -1430,7 +1430,8 @@ impl SettingsWindow {
             let network = account.key.network;
             // Fixed rows say what the network decides; Discord and Slack have no receipts.
             let (fixed, reason): (Option<&str>, Option<&str>) = match (id, network) {
-                ("P1", Network::Telegram) | ("P2", Network::Telegram) => (Some("Always on"), Some("Telegram does not let an app turn this off.")),
+                ("P1", Network::Telegram) => (Some("Always on"), Some("Telegram always shares typing and recording status and does not let an app turn this off.")),
+                ("P2", Network::Telegram) => (Some("Always on"), Some("Telegram does not let an app turn this off.")),
                 ("P1", Network::Messages) => (Some("Sent to the phone"), Some("Messages shows typing on your other devices.")),
                 ("P2", Network::Messages) => (Some("On your devices"), Some("Messages does not let tinyclient change read receipts.")),
                 ("P2", Network::Discord | Network::Slack) => continue,
