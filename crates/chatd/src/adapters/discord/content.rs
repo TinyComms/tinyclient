@@ -900,6 +900,8 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         edited_at: posted.edited_timestamp.as_deref().and_then(model::iso_seconds),
         prior_text: None,
         pinned: posted.pinned.unwrap_or(false),
+        pinned_by: None,
+        pinned_at: None,
         starred: false,
         mentions_me: false,
         kind: message_kind,

@@ -790,6 +790,26 @@ impl Fake {
                 }
                 Some(json!({"ok": true, "purpose": purpose}))
             }
+            "pins.add" => {
+                let ts = param("timestamp");
+                if channel.is_empty() || ts.is_empty() {
+                    return refused("invalid_arguments");
+                }
+                if ts == "1760000000.999999" {
+                    return refused("permission_denied");
+                }
+                Some(json!({"ok": true}))
+            }
+            "pins.remove" => {
+                let ts = param("timestamp");
+                if channel.is_empty() || ts.is_empty() {
+                    return refused("invalid_arguments");
+                }
+                if ts == "1760000000.999999" {
+                    return refused("no_pin");
+                }
+                Some(json!({"ok": true}))
+            }
             "conversations.join" => {
                 if channel.is_empty() {
                     return refused("channel_not_found");
@@ -2542,12 +2562,14 @@ fn info_mute_pins_files_emoji_threads_and_a_scheduled_send_ask_slack_once_each()
     assert!(set[1].params["prefs"].contains("mentions_dms") && set[1].params["channel_ids"] == "C0GEN");
     assert!(!world.conversation(&general).unwrap().muted);
 
-    // Pins: the pinned messages, not the file pinned on its own.
+    // Pins: includes both pinned messages and pinned files, newest first.
     let pinned = match world.ask(Request::Pinned { conversation: general.clone() }) {
         Response::Pinned { messages, .. } => messages,
         other => panic!("{other:?}"),
     };
-    assert_eq!(pinned.iter().map(|message| message.text.as_str()).collect::<Vec<_>>(), ["Release checklist lives in the wiki"]);
+    assert_eq!(pinned.len(), 2);
+    assert!(pinned.iter().any(|m| m.text == "Release checklist lives in the wiki"));
+    assert!(pinned.iter().any(|m| m.text == "logo.png"));
 
     // Files shared here, from Slack's list, because the user asked; links have no such list.
     let shared = |kind, search| world.ask(Request::Shared { conversation: general.clone(), kind, before: None, limit: 25, search });
@@ -3845,4 +3867,107 @@ fn slack_mark_unread_channel_and_thread() {
     assert_eq!(tmark.params["thread_ts"], ROOT);
     assert_eq!(tmark.params["ts"], t_prev);
     assert_eq!(tmark.params["read"], "0");
+}
+
+#[test]
+fn slack_pin_unpin_socket_events_and_pinned_files() {
+    let world = World::start();
+    world.ready();
+
+    let general = alpha("C0GEN");
+    let msgs = world.until("general history loaded", || {
+        let m = world.messages(&general);
+        (!m.is_empty()).then_some(m)
+    });
+    let target = msgs[0].id.clone();
+
+    // ConversationInfo includes pinned count from pins.list.
+    let Response::ConversationInfo { info } = world.ask(Request::ConversationInfo { conversation: general.clone() }) else {
+        panic!("expected ConversationInfo");
+    };
+    assert_eq!(info.pinned, Some(2), "ConversationAbout.pinned should count pinned messages and files");
+
+    // Pinned list returns both message pins and file pins with created_by and created preserved.
+    let Response::Pinned { messages: pins, .. } = world.ask(Request::Pinned { conversation: general.clone() }) else {
+        panic!("expected Pinned");
+    };
+    assert_eq!(pins.len(), 2, "expected message pin + file pin");
+    let msg_pin = pins.iter().find(|m| m.text == "Release checklist lives in the wiki").expect("message pin");
+    assert!(msg_pin.pinned);
+    assert_eq!(msg_pin.pinned_by.as_deref(), Some("Ana"));
+    assert_eq!(msg_pin.pinned_at, Some(1760000400));
+    let file_pin = pins.iter().find(|m| m.text == "logo.png").expect("file pin");
+    assert!(file_pin.pinned);
+    assert_eq!(file_pin.pinned_by.as_deref(), Some("Ana"));
+    assert_eq!(file_pin.pinned_at, Some(1760000300));
+
+    // Pin and unpin a message via Request::Pin -> pins.add / pins.remove.
+    assert_eq!(
+        world.ask(Request::Pin {
+            conversation: general.clone(),
+            message_id: target.clone(),
+            pinned: true,
+            notify: false,
+            me_only: false,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.fake.calls(ALPHA, "pins.add").len(), 1);
+    assert!(world.message(&general, &target).unwrap().pinned);
+
+    assert_eq!(
+        world.ask(Request::Pin {
+            conversation: general.clone(),
+            message_id: target.clone(),
+            pinned: false,
+            notify: false,
+            me_only: false,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.fake.calls(ALPHA, "pins.remove").len(), 1);
+    assert!(!world.message(&general, &target).unwrap().pinned);
+
+    // Permission refusal translates clearly.
+    match world.ask(Request::Pin {
+        conversation: general.clone(),
+        message_id: "1760000000.999999".into(),
+        pinned: true,
+        notify: false,
+        me_only: false,
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.to_lowercase().contains("pin"), "got: {detail}");
+        }
+        other => panic!("expected Refused for permission_denied, got {other:?}"),
+    }
+
+    // Live socket events pin_added and pin_removed flip the stored message's pinned flag without reloading history.
+    world.fake.push(ALPHA, json!({
+        "type": "pin_added",
+        "channel_id": "C0GEN",
+        "user": "U0ANA",
+        "item": {
+            "type": "message",
+            "channel": "C0GEN",
+            "message": {"ts": target}
+        }
+    }));
+    world.until("pin_added sets pinned=true", || {
+        world.message(&general, &target)?.pinned.then_some(())
+    });
+
+    world.fake.push(ALPHA, json!({
+        "type": "pin_removed",
+        "channel_id": "C0GEN",
+        "user": "U0ANA",
+        "item": {
+            "type": "message",
+            "channel": "C0GEN",
+            "message": {"ts": target}
+        }
+    }));
+    world.until("pin_removed clears pinned=false", || {
+        (!world.message(&general, &target)?.pinned).then_some(())
+    });
 }

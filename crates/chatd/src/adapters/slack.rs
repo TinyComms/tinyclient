@@ -191,6 +191,10 @@ fn reason(fault: Fault) -> String {
             | "invalid_name_reserved"
             | "invalid_name_nonmatching" => "That channel name is not valid for Slack.",
             "not_authorized" => "You do not have permission to do that in this workspace.",
+            "permission_denied" => "This workspace does not let you pin messages here.",
+            "already_pinned" => "This message is already pinned.",
+            "no_pin" => "This message is not pinned.",
+            "not_pinnable" => "This message cannot be pinned.",
             "too_long" => "That text is too long for Slack (250 character limit).",
             "msg_too_long" => "The message is too long for Slack.",
             "is_archived" => "This channel is archived.",
@@ -202,7 +206,8 @@ fn reason(fault: Fault) -> String {
             // takes. Slack's own search is one such: its web client may use an internal call.
             "not_allowed_token_type" => "Slack's own search isn't reachable with this session.",
             "external_email" => return info::EXTERNAL_EMAIL.to_owned(),
-            error if error.starts_with("restricted_action") => "This workspace does not let you do that.",
+            "restricted_action" => "This workspace does not let you do that.",
+            error if error.starts_with("restricted_action_") => "This workspace does not let you post here.",
             error => return format!("Slack refused ({error})."),
         },
     };
@@ -946,6 +951,7 @@ impl Slack {
             "pref_change" => self.muted(event["name"].as_str().unwrap_or(""), &event["value"]),
             // A conversation star. A message, file, or comment star is not the row's.
             "star_added" | "star_removed" => self.star_heard(event),
+            "pin_added" | "pin_removed" => self.pin_heard(event),
             "emoji_changed" => {
                 self.emoji_changed(event);
                 Ok(())
@@ -1825,7 +1831,29 @@ impl Slack {
         let channel = thread_of(conversation).map_or(conversation, |(channel, _)| channel);
         let method = if pinned { "pins.add" } else { "pins.remove" };
         self.api(method, &[("channel", channel), ("timestamp", ts)])?;
-        self.ctx.pinned(channel, ts, pinned).map_err(|err| Fault::Net(err.to_string()))
+        self.ctx.pinned(channel, ts, pinned).map_err(|err| Fault::Net(err.to_string()))?;
+        if conversation != channel {
+            self.ctx.pinned(conversation, ts, pinned).map_err(|err| Fault::Net(err.to_string()))?;
+        }
+        self.ctx.info_stale(channel);
+        Ok(())
+    }
+
+    /// `pin_added`, `pin_removed`: flips the stored message's pinned flag live without reloading history.
+    fn pin_heard(&self, event: &Value) -> Result<(), Failure> {
+        let added = event["type"] == "pin_added";
+        let item = &event["item"];
+        let Some(channel) = event["channel_id"].as_str().or_else(|| item["channel"].as_str()).filter(|c| !c.is_empty()) else {
+            return Ok(());
+        };
+        if let Some(ts) = item["message"]["ts"].as_str().or_else(|| item["ts"].as_str()).filter(|t| !t.is_empty()) {
+            self.ctx.pinned(channel, ts, added)?;
+            if let Some(root) = item["message"]["thread_ts"].as_str().filter(|r| !r.is_empty() && *r != ts) {
+                self.ctx.pinned(&thread_id(channel, root), ts, added)?;
+            }
+        }
+        self.ctx.info_stale(channel);
+        Ok(())
     }
 
     fn forward(
