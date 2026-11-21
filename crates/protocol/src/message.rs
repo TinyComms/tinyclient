@@ -181,6 +181,10 @@ pub struct Attachment {
     /// View-once media (Signal, Telegram): hidden until explicitly viewed.
     #[serde(default, skip_serializing_if = "is_false")]
     pub view_once: bool,
+    /// The page a GIF was picked from (a Tenor or Giphy address). Empty for every other file.
+    /// Favouriting a GIF someone else posted uses this, not the file's name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub page: String,
 }
 
 impl Attachment {
@@ -198,6 +202,7 @@ impl Attachment {
             waveform: Vec::new(),
             round: false,
             view_once: false,
+            page: String::new(),
         }
     }
 }

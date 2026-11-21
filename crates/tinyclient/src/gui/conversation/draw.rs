@@ -2098,6 +2098,11 @@ impl Pane {
         // are `video`'s (`Pane::moving`, where an inline player plugs in). A GIF that is a GIF
         // plays here in its tile, and opens in the viewer like a picture.
         let id = message.id.clone();
+        let page = attachment.page.clone();
+        let fav_file = attachment.file.id.clone();
+        let discord_gif = shape == MediaShape::Gif
+            && (page.starts_with("https://") || page.starts_with("http://"))
+            && self.open.as_ref().is_some_and(|open| open.key.network == protocol::Network::Discord);
         let tile = match shape {
             MediaShape::Video => self.moving(attachment, tile, cx),
             MediaShape::Gif if media::is_video(attachment) => self.moving(attachment, tile, cx),
@@ -2113,7 +2118,36 @@ impl Pane {
                 tile.on_click(cx.listener(move |this, _, window, cx| this.open_viewer(&id, index, window, cx)))
             }
         };
-        let tile = tile.child(edge_line()).children(more.map(|more| {
+        // The border covers the picture. The star is painted after it, so a click lands on the
+        // star and does not open the GIF. A "+N" cover, when there is one, stays on top.
+        let tile = tile.child(edge_line());
+        let tile = if discord_gif {
+            let star_id: SharedString = format!("gif-fav-{fav_file}").into();
+            tile.child(
+                div()
+                    .id(star_id)
+                    .absolute()
+                    .top(px(4.))
+                    .right(px(4.))
+                    .size(px(24.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(gpui::rgba(0x00000099))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .tooltip(tip("Favourite GIF", None))
+                    .child(glyph("icons/star.svg", 14., gpui::white()))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.favourite_posted_gif(&page, cx);
+                    })),
+            )
+        } else {
+            tile
+        };
+        let tile = tile.children(more.map(|more| {
             div()
                 .absolute()
                 .inset_0()

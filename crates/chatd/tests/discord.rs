@@ -337,6 +337,8 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             200,
             json!({"id": guild, "name": "Rustaceans", "description": "Crabs and their friends", "approximate_member_count": 1204, "approximate_presence_count": 230}),
         ),
+        ("GET", ["gifs", "trending"]) => (200, json!({"categories": []})),
+        ("GET", ["gifs", "suggest"]) => (200, json!([])),
         ("GET", ["gifs", "search" | "trending-gifs"]) => (
             200,
             json!([
@@ -3987,6 +3989,7 @@ fn a_voice_message_and_a_gif_from_tenor_are_attachments_fetched_only_from_discor
     let gif = &message.attachments[1];
     assert_eq!((gif.name.as_str(), gif.file.kind, gif.mime.as_str()), ("GIF", MediaKind::Gif, "video/mp4"));
     assert_eq!((gif.file.width, gif.file.height), (498, 280));
+    assert_eq!(gif.page, "https://tenor.com/view/otter-123");
     let thumb = gif.thumb.as_ref().unwrap();
     assert_eq!((thumb.id.clone(), thumb.kind), (format!("embed:{id}:0"), MediaKind::Image));
 
@@ -5495,15 +5498,15 @@ fn account_favourites_lead_the_picker_and_a_locked_emoji_is_a_public_link() {
     assert!(!sent.contains("ferris:5101"), "the unfavourited emoji leaves the list");
     assert!(sent.contains("🎉"), "frecency scores are not rewritten");
 
-    assert!(matches!(
+    assert_eq!(
         world.ask(Request::Favourite {
             account: world.account(),
             kind: protocol::CatalogKind::Gifs,
             id: "https://tenor.com/view/cat".into(),
             on: true,
         }),
-        Response::Error { code: ErrorCode::Unsupported, .. }
-    ));
+        Response::Ok
+    );
 
     let next = frecency_settings(&["🎉"], &[], None, None);
     world.discord.push("USER_SETTINGS_PROTO_UPDATE", json!({"settings": {"type": 2, "proto": next}, "partial": false}));
@@ -5572,4 +5575,141 @@ fn nitro_offers_standard_sticker_packs_once_and_animated_emoji() {
     assert_eq!(world.discord.requests_to("GET", "/users/@me/settings-proto/2").len(), 1);
     let _ = catalog_of(&world, protocol::CatalogKind::Stickers, "", Some("4000"));
     assert_eq!(world.discord.requests_to("GET", "/sticker-packs").len(), 1, "a pack list is asked once a session");
+}
+
+/// `FrecencyUserSettings` with one favourite GIF, `hide_tooltip`, unknown field 7, and field 99.
+fn gif_frecency() -> String {
+    let mut value = Vec::new();
+    proto_varint_field(&mut value, 1, 1);
+    proto_bytes(&mut value, 2, b"https://media.tenor.com/fav.gif");
+    proto_varint_field(&mut value, 3, 220);
+    proto_varint_field(&mut value, 4, 120);
+    proto_varint_field(&mut value, 5, 1);
+    let mut entry = Vec::new();
+    proto_bytes(&mut entry, 1, b"https://tenor.com/view/fav-1");
+    proto_bytes(&mut entry, 2, &value);
+    let mut gifs = Vec::new();
+    proto_varint_field(&mut gifs, 2, 1);
+    proto_bytes(&mut gifs, 1, &entry);
+    let mut whole = Vec::new();
+    proto_bytes(&mut whole, 2, &gifs);
+    proto_bytes(&mut whole, 7, b"keep-me");
+    proto_varint_field(&mut whole, 99, 77);
+    base64::engine::general_purpose::STANDARD.encode(whole)
+}
+
+fn gif_page(world: &World, query: &str, cursor: Option<&str>) -> (Vec<protocol::CatalogItem>, Option<String>) {
+    match world.ask(Request::Catalog {
+        account: world.account(),
+        kind: protocol::CatalogKind::Gifs,
+        space: None,
+        query: query.into(),
+        cursor: cursor.map(str::to_owned),
+    }) {
+        Response::Catalog { items, cursor } => (items, cursor),
+        other => panic!("{other:?}"),
+    }
+}
+
+fn holds(bytes: &[u8], needle: &[u8]) -> bool {
+    bytes.windows(needle.len()).any(|window| window == needle)
+}
+
+#[test]
+fn gif_favourites_lead_categories_and_search_pages_past_fifty() {
+    let world = World::start();
+    world.discord.script("/users/@me/settings-proto/2", 200, json!({"settings": gif_frecency()}));
+    world.discord.script(
+        "/gifs/trending",
+        200,
+        json!({"categories": [
+            {"name": "happy", "src": "https://media.tenor.com/happy.gif"},
+            {"name": "  ", "src": "https://media.tenor.com/skip.gif"}
+        ]}),
+    );
+    let page = |from: usize, count: usize| {
+        let gifs: Vec<Value> = (from..from + count)
+            .map(|n| {
+                json!({
+                    "id": n.to_string(),
+                    "title": format!("wave {n}"),
+                    "url": format!("https://tenor.com/view/wave-{n}"),
+                    "src": format!("https://media.tenor.com/wave-{n}.gif"),
+                    "width": 220,
+                    "height": 160,
+                })
+            })
+            .collect();
+        json!(gifs)
+    };
+    world.discord.script("/gifs/search", 200, page(0, 50));
+    world.discord.script("/gifs/search", 200, page(50, 1));
+    world.discord.script("/gifs/suggest", 200, json!(["otter"]));
+
+    let (home, _) = gif_page(&world, "", None);
+    let rows: Vec<(&str, &str)> = home.iter().map(|item| (item.id.as_str(), item.pack.as_str())).collect();
+    assert_eq!(
+        rows,
+        [
+            ("https://tenor.com/view/fav-1", "Favorites"),
+            ("cat:happy", "Categories"),
+            ("https://tenor.com/view/cat-typing-1", "Trending"),
+        ]
+    );
+    assert_eq!(world.discord.requests_to("GET", "/users/@me/settings-proto/2").len(), 1);
+
+    let added = "https://tenor.com/view/added";
+    assert_eq!(
+        world.ask(Request::Favourite {
+            account: world.account(),
+            kind: protocol::CatalogKind::Gifs,
+            id: added.into(),
+            on: true,
+        }),
+        Response::Ok
+    );
+    assert_eq!(
+        world.ask(Request::Favourite {
+            account: world.account(),
+            kind: protocol::CatalogKind::Gifs,
+            id: "https://tenor.com/view/fav-1".into(),
+            on: false,
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/users/@me/settings-proto/2");
+    assert_eq!(patches.len(), 2);
+    let decode = |seen: &Seen| base64::engine::general_purpose::STANDARD.decode(seen.body["settings"].as_str().unwrap()).unwrap();
+    let first = decode(&patches[0]);
+    let second = decode(&patches[1]);
+    for body in [&first, &second] {
+        assert!(body.windows(7).any(|window| window == b"keep-me"), "unknown field 7 survives a GIF write");
+        assert!(holds(body, &[0x10, 0x01]), "hide_tooltip survives a GIF write");
+        assert!(holds(body, &[0x98, 0x06, 0x4d]), "unknown field 99 survives a GIF write");
+    }
+    assert!(first.windows(added.len()).any(|window| window == added.as_bytes()));
+    assert!(first.windows(b"https://tenor.com/view/fav-1".len()).any(|window| window == b"https://tenor.com/view/fav-1"));
+    assert!(!second.windows(b"https://tenor.com/view/fav-1".len()).any(|window| window == b"https://tenor.com/view/fav-1"));
+    assert!(second.windows(added.len()).any(|window| window == added.as_bytes()));
+
+    // A non-numeric cursor misses chatd's page cache and is still the first page.
+    let (again, _) = gif_page(&world, "", Some("x"));
+    assert!(again.iter().any(|item| item.id == added && item.pack == "Favorites"));
+    assert!(again.iter().all(|item| item.id != "https://tenor.com/view/fav-1"));
+
+    let (found, cursor) = gif_page(&world, "wave", None);
+    assert_eq!(found[0].id, "https://tenor.com/view/wave-0");
+    assert!(found[0].pack.is_empty());
+    assert_eq!(found.last().map(|item| (item.id.as_str(), item.pack.as_str())), Some(("cat:otter", "Suggestions")));
+    assert_eq!(cursor.as_deref(), Some("50"));
+    let (next, cursor) = gif_page(&world, "wave", Some("50"));
+    assert_eq!(next.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(), ["https://tenor.com/view/wave-50"]);
+    assert!(cursor.is_none());
+    assert!(next.iter().all(|item| !item.id.starts_with("cat:")));
+    let searches = world.discord.requests_to("GET", "/gifs/search");
+    assert!(searches.iter().any(|seen| seen.path.contains("offset=0")));
+    assert!(searches.iter().any(|seen| seen.path.contains("offset=50")));
+    assert!(searches[0].path.starts_with("/gifs/search?q=wave&media_format=tinygif"));
+    assert_eq!(world.discord.requests_to("GET", "/gifs/suggest").len(), 1);
+    assert_eq!(world.discord.requests_to("GET", "/users/@me/settings-proto/2").len(), 1, "a search does not read frecency");
 }

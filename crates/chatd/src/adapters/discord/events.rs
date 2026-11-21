@@ -525,6 +525,7 @@ impl Discord {
                 state.frecency = bytes;
                 state.frecency_loaded = true;
             }
+            self.forget_gif_pages();
             return Ok(());
         }
         if update.settings.kind != 1 {

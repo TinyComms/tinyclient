@@ -1,7 +1,7 @@
 //! What is read from Discord's protobuf settings: the order of the server list, our own status,
 //! privacy, and the picker's frecency (`settings-proto/2`). Status, privacy, and favourite
-//! emoji and sticker lists are written back. Frecency scores are read and never written: a
-//! wrong score would replace the account's frecency on every device.
+//! emoji, sticker, and GIF lists are written back. Frecency scores are read and never written:
+//! a wrong score would replace the account's frecency on every device.
 //!
 //! Sessions that identify as the current web client get their settings as base64 protobuf
 //! (`user_settings_proto`) instead of JSON. The field numbers are from the community's
@@ -386,16 +386,30 @@ pub fn encode_settings(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+/// One saved GIF. The map key on the wire is [`url`](FavoriteGif::url), the page that is sent.
+/// `format` is Discord's `GIFType`: 0 none, 1 image, 2 video.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FavoriteGif {
+    pub url: String,
+    pub src: String,
+    pub format: u32,
+    pub width: u32,
+    pub height: u32,
+    pub order: u32,
+}
+
 /// Favourite lists and frecency scores from `FrecencyUserSettings` (settings-proto/2).
 /// Field numbers follow the community `discord-protos`:
+/// - 2 `favorite_gifs` (map of page URL to `FavoriteGIF`, plus `hide_tooltip`)
 /// - 3 `favorite_stickers.sticker_ids` (repeated fixed64)
 /// - 4 `sticker_frecency` (map of fixed64 to `FrecencyItem`)
 /// - 5 `favorite_emojis.emojis` (repeated string)
 /// - 6 `emoji_frecency` (map of string to `FrecencyItem`)
 /// `FrecencyItem.score` is field 4; `frecency` (field 3) is used when score is absent.
-/// Scores are only read. [`with_favorite_emojis`] and [`with_favorite_stickers`] never rewrite them.
+/// Scores are only read. Favourite writes replace only their own list.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FrecencyLists {
+    pub favorite_gifs: Vec<FavoriteGif>,
     pub favorite_emojis: Vec<String>,
     pub favorite_stickers: Vec<String>,
     /// `(key, score)`, wire order. The picker sorts.
@@ -412,6 +426,7 @@ pub fn decode_frecency(bytes: &[u8]) -> FrecencyLists {
             continue;
         };
         match number {
+            2 => lists.favorite_gifs = favorite_gif_list(inner),
             3 => ids(inner, 1, &mut lists.favorite_stickers),
             4 => lists.sticker_frecency = frecency_map(inner, true),
             5 => lists.favorite_emojis = strings(inner, 1),
@@ -433,6 +448,79 @@ pub fn with_favorite_stickers(bytes: &[u8], ids: &[String]) -> Vec<u8> {
     let mut inner = Vec::new();
     write_packed_ids(&mut inner, 1, ids);
     replace_message(bytes, 3, &inner)
+}
+
+/// Replaces favourite GIFs (field 2) and copies every other field, including frecency scores.
+/// Inside the GIF message, map entries (field 1) are replaced and the rest is kept, so
+/// `hide_tooltip` survives. An empty list is still written: clearing favourites must clear them.
+pub fn with_favorite_gifs(bytes: &[u8], gifs: &[FavoriteGif]) -> Vec<u8> {
+    let existing = bytes_of(bytes, 2).unwrap_or(&[]);
+    let mut inner = Vec::new();
+    for (number, _, raw) in fields(existing) {
+        if number != 1 {
+            inner.extend_from_slice(raw);
+        }
+    }
+    for gif in gifs {
+        let mut value = Vec::new();
+        if gif.format != 0 {
+            write_varint_field(&mut value, 1, u64::from(gif.format));
+        }
+        if !gif.src.is_empty() {
+            write(&mut value, 2, gif.src.as_bytes());
+        }
+        if gif.width != 0 {
+            write_varint_field(&mut value, 3, u64::from(gif.width));
+        }
+        if gif.height != 0 {
+            write_varint_field(&mut value, 4, u64::from(gif.height));
+        }
+        if gif.order != 0 {
+            write_varint_field(&mut value, 5, u64::from(gif.order));
+        }
+        let mut entry = Vec::new();
+        write(&mut entry, 1, gif.url.as_bytes());
+        write(&mut entry, 2, &value);
+        write(&mut inner, 1, &entry);
+    }
+    replace_message(bytes, 2, &inner)
+}
+
+/// `FavoriteGIFs.gifs`, sorted by `order`. Anything that is not a map entry is ignored.
+fn favorite_gif_list(message: &[u8]) -> Vec<FavoriteGif> {
+    let mut out = Vec::new();
+    for (number, field, _) in fields(message) {
+        let Field::Bytes(entry) = field else {
+            continue;
+        };
+        if number != 1 {
+            continue;
+        }
+        let mut gif = FavoriteGif::default();
+        for (number, field, _) in fields(entry) {
+            match (number, field) {
+                (1, Field::Bytes(bytes)) => gif.url = String::from_utf8_lossy(bytes).into_owned(),
+                (2, Field::Bytes(value)) => {
+                    for (number, field, _) in fields(value) {
+                        match (number, field) {
+                            (1, Field::Varint(format)) => gif.format = format as u32,
+                            (2, Field::Bytes(src)) => gif.src = String::from_utf8_lossy(src).into_owned(),
+                            (3, Field::Varint(width)) => gif.width = width as u32,
+                            (4, Field::Varint(height)) => gif.height = height as u32,
+                            (5, Field::Varint(order)) => gif.order = order as u32,
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !gif.url.is_empty() {
+            out.push(gif);
+        }
+    }
+    out.sort_by_key(|gif| gif.order);
+    out
 }
 
 fn replace_message(bytes: &[u8], number: u64, inner: &[u8]) -> Vec<u8> {
@@ -690,5 +778,61 @@ mod tests {
         assert_eq!(stick_lists.sticker_frecency, lists.sticker_frecency, "frecency scores are not rewritten");
         let encoded = encode_settings(&stick);
         assert_eq!(decode_frecency(&decode_settings(&encoded).unwrap()).favorite_stickers, ["222"]);
+    }
+
+    #[test]
+    fn favorite_gifs_round_trip_and_leave_tooltip_scores_and_unknown_fields() {
+        // Two GIFs out of order, hide_tooltip, an emoji favourite, and an unknown varint.
+        let gif = |url: &str, src: &str, order: u64| {
+            let mut value = Vec::new();
+            write_varint_field(&mut value, 1, 1);
+            write(&mut value, 2, src.as_bytes());
+            write_varint_field(&mut value, 3, 220);
+            write_varint_field(&mut value, 4, 120);
+            write_varint_field(&mut value, 5, order);
+            let mut entry = Vec::new();
+            write(&mut entry, 1, url.as_bytes());
+            write(&mut entry, 2, &value);
+            entry
+        };
+        let mut gifs = Vec::new();
+        write_varint_field(&mut gifs, 2, 1);
+        write(&mut gifs, 1, &gif("https://tenor.com/view/later", "https://media.tenor.com/later.gif", 2));
+        write(&mut gifs, 1, &gif("https://tenor.com/view/first", "https://media.tenor.com/first.gif", 1));
+        let mut emojis = Vec::new();
+        write(&mut emojis, 1, "😀".as_bytes());
+        let mut whole = Vec::new();
+        write(&mut whole, 2, &gifs);
+        write(&mut whole, 5, &emojis);
+        write_varint_field(&mut whole, 99, 77);
+
+        let lists = decode_frecency(&whole);
+        assert_eq!(
+            lists.favorite_gifs.iter().map(|gif| gif.url.as_str()).collect::<Vec<_>>(),
+            ["https://tenor.com/view/first", "https://tenor.com/view/later"],
+            "favourites are ordered by their order field"
+        );
+        assert_eq!(lists.favorite_gifs[0].src, "https://media.tenor.com/first.gif");
+        assert_eq!((lists.favorite_gifs[0].width, lists.favorite_gifs[0].height, lists.favorite_gifs[0].format), (220, 120, 1));
+
+        let next = with_favorite_gifs(&whole, &lists.favorite_gifs[..1]);
+        let again = decode_frecency(&next);
+        assert_eq!(again.favorite_gifs.len(), 1);
+        assert_eq!(again.favorite_emojis, ["😀"]);
+        let inner = bytes_of(&next, 2).unwrap();
+        assert!(
+            fields(inner).iter().any(|(n, field, _)| *n == 2 && matches!(field, Field::Varint(1))),
+            "hide_tooltip survives a GIF favourite write"
+        );
+        assert!(
+            fields(&next).iter().any(|(n, field, _)| *n == 99 && matches!(field, Field::Varint(77))),
+            "unknown field 99 must survive a GIF favourite write"
+        );
+        let emoji_write = with_favorite_emojis(&next, &["😀".into()]);
+        assert_eq!(decode_frecency(&emoji_write).favorite_gifs, again.favorite_gifs, "an emoji write leaves GIF favourites");
+        let cleared = with_favorite_gifs(&next, &[]);
+        assert!(decode_frecency(&cleared).favorite_gifs.is_empty(), "an empty list is written, so a clear is a clear");
+        assert!(bytes_of(&cleared, 2).is_some());
+        assert!(fields(bytes_of(&cleared, 2).unwrap()).iter().any(|(n, _, _)| *n == 2));
     }
 }

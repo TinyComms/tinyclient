@@ -1,5 +1,6 @@
 //! The picker's catalogs: the servers' own emoji and stickers, kept from READY and their update
-//! events, and Discord's GIF search, asked only when the user types (the shell debounces).
+//! events, and Discord's GIF search. An empty GIF query is favourites, trending categories, then
+//! one page of trending; a search is hits, then suggested terms. The shell debounces typing.
 
 use super::super::{CatalogPage, Refusal};
 use super::model::{self, GuildEmoji, GuildSticker};
@@ -16,6 +17,9 @@ const PAGE: usize = protocol::CATALOG_LIMIT;
 /// Section names the shell already draws. American spelling, so they merge with its labels.
 const FAVORITES: &str = "Favorites";
 const FREQUENT: &str = "Frequently used";
+const CATEGORIES: &str = "Categories";
+const SUGGESTIONS: &str = "Suggestions";
+const TRENDING: &str = "Trending";
 /// How many frecency rows lead the catalog. Scores are read, never written.
 const EMOJI_FREQUENT: usize = 36;
 const STICKER_FREQUENT: usize = 16;
@@ -27,9 +31,21 @@ const GIFS_KEPT: Duration = Duration::from_secs(600);
 /// GIF answers kept at most, across accounts; the oldest goes.
 const GIFS_HELD: usize = 64;
 
-/// GIF answers by account and query: when, and what.
-type GifAnswers = HashMap<(String, String), (Instant, CatalogPage)>;
+/// GIF answers by account, query, and page offset: when, and what.
+type GifAnswers = HashMap<(String, String, u32), (Instant, CatalogPage)>;
 static GIF_ANSWERS: Mutex<Option<GifAnswers>> = Mutex::new(None);
+
+/// Picture facts for a page URL, remembered while a page is built so a later favourite write
+/// can fill `src`, size, and format. A message star that never opened the picker has none.
+#[derive(Clone)]
+struct GifFact {
+    src: String,
+    width: u32,
+    height: u32,
+    format: u32,
+}
+type GifFacts = HashMap<String, GifFact>;
+static GIF_FACTS: Mutex<Option<GifFacts>> = Mutex::new(None);
 
 #[derive(Deserialize)]
 pub struct Pickables {
@@ -115,10 +131,11 @@ impl Discord {
     /// account's favourites and frecency (read once from `settings-proto/2`) in front. Without
     /// Nitro only the server the message is said in (none in a DM) and no animated emoji, with
     /// it every server's, plus standard sticker packs. An emoji limited to roles we lack is
-    /// never offered. GIFs are Discord's own search (trending when nothing is typed).
+    /// never offered. GIFs are Discord's search: favourites and categories when nothing is
+    /// typed, hits then suggestions when something is, and a cursor when a page is full.
     pub(super) fn catalog(&self, kind: CatalogKind, space: Option<&str>, query: &str, cursor: Option<&str>) -> Result<CatalogPage, Refusal> {
         match kind {
-            CatalogKind::Gifs => self.gifs(query),
+            CatalogKind::Gifs => self.gifs(query, cursor),
             CatalogKind::Emoji | CatalogKind::Stickers => {
                 self.ensure_frecency();
                 if kind == CatalogKind::Stickers {
@@ -132,13 +149,10 @@ impl Discord {
         }
     }
 
-    /// Adds or removes one favourite emoji or sticker. The write replaces only that list.
+    /// Adds or removes one favourite emoji, sticker, or GIF. The write replaces only that list.
     /// Frecency scores are left byte for byte: a wrong score would replace the account's
-    /// frecency on every device. GIF favourites are a different field and are not written here.
+    /// frecency on every device.
     pub(super) fn favourite(&self, kind: CatalogKind, id: &str, on: bool) -> Result<(), Refusal> {
-        if kind == CatalogKind::Gifs {
-            return Err(Refusal::Unsupported);
-        }
         self.ensure_frecency();
         let bytes = crate::hub::lock(&self.state).frecency.clone();
         let lists = super::proto::decode_frecency(&bytes);
@@ -167,7 +181,39 @@ impl Discord {
                 }
                 super::proto::with_favorite_stickers(&bytes, &stickers)
             }
-            CatalogKind::Gifs => unreachable!(),
+            CatalogKind::Gifs => {
+                let url = id.trim();
+                if url.is_empty() || url.starts_with("cat:") {
+                    return Ok(());
+                }
+                if !(url.starts_with("https://") || url.starts_with("http://")) {
+                    return Err(Refusal::Refused("A GIF favourite is its page address.".into()));
+                }
+                let url = url.to_owned();
+                let mut gifs = lists.favorite_gifs;
+                let changed = if on {
+                    if gifs.iter().any(|gif| gif.url == url) {
+                        false
+                    } else {
+                        let order = gifs.iter().map(|gif| gif.order).max().unwrap_or(0).saturating_add(1);
+                        let fact = crate::hub::lock(&GIF_FACTS).as_ref().and_then(|facts| facts.get(&url).cloned());
+                        let (src, width, height, format) = match fact {
+                            Some(fact) => (fact.src, fact.width, fact.height, fact.format),
+                            None => (url.clone(), 0, 0, 1),
+                        };
+                        gifs.push(super::proto::FavoriteGif { url, src, format, width, height, order });
+                        true
+                    }
+                } else {
+                    let before = gifs.len();
+                    gifs.retain(|gif| gif.url != url);
+                    gifs.len() != before
+                };
+                if !changed {
+                    return Ok(());
+                }
+                super::proto::with_favorite_gifs(&bytes, &gifs)
+            }
         };
         let body = json!({"settings": super::proto::encode_settings(&updated)});
         self.call("PATCH", "/users/@me/settings-proto/2", Some(body)).map_err(refusal)?;
@@ -176,7 +222,20 @@ impl Discord {
         if state.frecency == bytes {
             state.frecency = updated;
         }
+        drop(state);
+        if kind == CatalogKind::Gifs {
+            self.forget_gif_pages();
+        }
         Ok(())
+    }
+
+    /// Drops cached GIF pages for this account. A favourite write or a gateway frecency update
+    /// changed the list the next empty query should lead with.
+    pub(super) fn forget_gif_pages(&self) {
+        let account = &self.ctx.account.account;
+        if let Some(held) = crate::hub::lock(&GIF_ANSWERS).as_mut() {
+            held.retain(|(held_account, _, _), _| held_account != account);
+        }
     }
 
     /// `settings-proto/2` once per session, the first time the emoji or sticker picker opens.
@@ -438,12 +497,13 @@ impl Discord {
     /// which Discord unfurls. Each cell is the provider's `tinygif` (about 220 px), so the grid
     /// moves for a few hundred kilobytes a page. Unverified against a real account: the routes,
     /// `media_format` and the GIF object are the community's documentation.
-    fn gifs(&self, query: &str) -> Result<CatalogPage, Refusal> {
-        let asked = (self.ctx.account.account.clone(), query.trim().to_lowercase());
+    fn gifs(&self, query: &str, cursor: Option<&str>) -> Result<CatalogPage, Refusal> {
+        let offset = cursor.and_then(|cursor| cursor.parse().ok()).unwrap_or(0);
+        let asked = (self.ctx.account.account.clone(), query.trim().to_lowercase(), offset);
         if let Some((_, page)) = crate::hub::lock(&GIF_ANSWERS).get_or_insert_default().get(&asked).filter(|(at, _)| at.elapsed() < GIFS_KEPT) {
             return Ok(page.clone());
         }
-        let page = self.gifs_asked(query)?;
+        let page = self.gifs_asked(query, offset)?;
         let mut held = crate::hub::lock(&GIF_ANSWERS);
         let held = held.get_or_insert_default();
         held.retain(|_, (at, _)| at.elapsed() < GIFS_KEPT);
@@ -456,15 +516,41 @@ impl Discord {
         Ok(page)
     }
 
-    fn gifs_asked(&self, query: &str) -> Result<CatalogPage, Refusal> {
-        let path = match query.trim() {
-            "" => format!("/gifs/trending-gifs?media_format=tinygif&locale=en-US&limit={GIFS}"),
-            query => format!("/gifs/search?q={}&media_format=tinygif&locale=en-US&limit={GIFS}", escaped(query)),
+    fn gifs_asked(&self, query: &str, offset: u32) -> Result<CatalogPage, Refusal> {
+        let trimmed = query.trim();
+        let (mut items, mut files) = (Vec::new(), Vec::new());
+        let mut seen = HashSet::new();
+        // Favourites and category tiles lead the first page only. A search puts hits first so
+        // the result the shell sends is still the first GIF, and suggested terms follow it.
+        if trimmed.is_empty() && offset == 0 {
+            self.ensure_frecency();
+            let favourites = {
+                let state = crate::hub::lock(&self.state);
+                super::proto::decode_frecency(&state.frecency).favorite_gifs
+            };
+            for gif in favourites {
+                push_favourite(&mut items, &mut files, &mut seen, &gif);
+            }
+            if let Ok(body) = self.call("GET", "/gifs/trending", None) {
+                for (name, src) in categories_of(&body) {
+                    push_category(&mut items, &mut files, &mut seen, &name, &src);
+                }
+            }
+        }
+        let path = match trimmed {
+            "" if offset == 0 => format!("/gifs/trending-gifs?media_format=tinygif&locale=en-US&limit={GIFS}"),
+            "" => format!("/gifs/trending-gifs?media_format=tinygif&locale=en-US&limit={GIFS}&offset={offset}"),
+            query => format!("/gifs/search?q={}&media_format=tinygif&locale=en-US&limit={GIFS}&offset={offset}", escaped(query)),
         };
         let answer = self.call("GET", &path, None).map_err(refusal)?;
-        let gifs: Vec<Gif> = serde_json::from_str(&answer).map_err(|err| Refusal::Refused(err.to_string()))?;
-        let (mut items, mut files) = (Vec::new(), Vec::new());
+        let gifs = gif_list(&answer)?;
+        let full = gifs.len() == GIFS as usize;
+        let pack = if trimmed.is_empty() { TRENDING } else { "" };
         for gif in gifs.into_iter().filter(|gif| !gif.url.is_empty() && gif.shown().starts_with("http")) {
+            if !seen.insert(gif.url.clone()) {
+                continue;
+            }
+            remember_gif(&gif.url, &gif.src, gif.width, gif.height);
             let shown = gif.shown().to_owned();
             let file = MediaFile {
                 width: gif.width,
@@ -476,13 +562,148 @@ impl Discord {
                 id: gif.url,
                 name: gif.title,
                 file: Some(file),
-                pack: String::new(),
+                pack: pack.to_owned(),
                 animated: true,
             });
         }
+        if !trimmed.is_empty() && offset == 0 {
+            let suggest = format!("/gifs/suggest?q={}&locale=en-US", escaped(trimmed));
+            if let Ok(body) = self.call("GET", &suggest, None) {
+                for term in suggestions_of(&body) {
+                    let id = format!("cat:{term}");
+                    if !seen.insert(id.clone()) {
+                        continue;
+                    }
+                    items.push(CatalogItem { id, name: term, file: None, pack: SUGGESTIONS.to_owned(), animated: false });
+                }
+            }
+        }
         self.ctx.media(&files).map_err(|err| Refusal::Refused(err.to_string()))?;
-        Ok(CatalogPage { items, cursor: None })
+        Ok(CatalogPage { items, cursor: full.then(|| (offset + GIFS).to_string()) })
     }
+}
+
+fn remember_gif(url: &str, src: &str, width: u32, height: u32) {
+    if url.is_empty() {
+        return;
+    }
+    let mut held = crate::hub::lock(&GIF_FACTS);
+    let held = held.get_or_insert_default();
+    if held.len() >= 256 && !held.contains_key(url) {
+        if let Some(drop) = held.keys().next().cloned() {
+            held.remove(&drop);
+        }
+    }
+    held.insert(url.to_owned(), GifFact { src: src.to_owned(), width, height, format: gif_format(src) });
+}
+
+fn gif_format(src: &str) -> u32 {
+    let path = src.split('?').next().unwrap_or("");
+    if path.ends_with(".mp4") || path.ends_with(".webm") {
+        2
+    } else if src.is_empty() {
+        0
+    } else {
+        1
+    }
+}
+
+fn push_favourite(items: &mut Vec<CatalogItem>, files: &mut Vec<(MediaFile, String)>, seen: &mut HashSet<String>, gif: &super::proto::FavoriteGif) {
+    if gif.url.is_empty() || !seen.insert(gif.url.clone()) {
+        return;
+    }
+    let direct = {
+        let path = gif.src.split('?').next().unwrap_or("");
+        (gif.src.starts_with("https://") || gif.src.starts_with("http://"))
+            && (path.ends_with(".gif") || path.ends_with(".webp") || path.ends_with(".png") || path.ends_with(".jpg") || path.ends_with(".jpeg"))
+    };
+    let file = direct.then(|| {
+        let file = MediaFile {
+            width: gif.width,
+            height: gif.height,
+            ..MediaFile::new(format!("gif:{:x}", fnv(&gif.src)), MediaKind::Image)
+        };
+        (file, gif.src.clone())
+    });
+    if let Some((file, url)) = &file {
+        files.push((file.clone(), url.clone()));
+    }
+    items.push(CatalogItem {
+        id: gif.url.clone(),
+        name: "GIF".to_owned(),
+        file: file.map(|(file, _)| file),
+        pack: FAVORITES.to_owned(),
+        animated: true,
+    });
+}
+
+fn push_category(items: &mut Vec<CatalogItem>, files: &mut Vec<(MediaFile, String)>, seen: &mut HashSet<String>, name: &str, src: &str) {
+    let id = format!("cat:{name}");
+    if !seen.insert(id.clone()) {
+        return;
+    }
+    let direct = (src.starts_with("https://") || src.starts_with("http://")).then_some(src);
+    let file = direct.map(|src| {
+        let file = MediaFile::new(format!("gifcat:{:x}", fnv(src)), MediaKind::Image);
+        files.push((file.clone(), src.to_owned()));
+        file
+    });
+    items.push(CatalogItem { id, name: name.to_owned(), file, pack: CATEGORIES.to_owned(), animated: false });
+}
+
+fn gif_list(body: &str) -> Result<Vec<Gif>, Refusal> {
+    let value: serde_json::Value = serde_json::from_str(body).map_err(|err| Refusal::Refused(err.to_string()))?;
+    let list = if value.is_array() {
+        value
+    } else if let Some(gifs) = value.get("gifs").filter(|gifs| gifs.is_array()) {
+        gifs.clone()
+    } else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_value(list).map_err(|err| Refusal::Refused(err.to_string()))
+}
+
+fn categories_of(body: &str) -> Vec<(String, String)> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let Some(list) = value.get("categories").and_then(|value| value.as_array()) else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|item| {
+            let name = item.get("name").and_then(|value| value.as_str()).unwrap_or("").trim();
+            if name.is_empty() {
+                return None;
+            }
+            let src = item.get("src").and_then(|value| value.as_str()).unwrap_or("").to_owned();
+            Some((name.to_owned(), src))
+        })
+        .collect()
+}
+
+/// Suggested search terms. A GIF object (it has `url`) is not a term: those belong in the hits.
+fn suggestions_of(body: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let list = value
+        .as_array()
+        .cloned()
+        .or_else(|| value.get("suggestions").and_then(|value| value.as_array()).cloned())
+        .unwrap_or_default();
+    list.into_iter()
+        .filter_map(|item| {
+            if item.get("url").is_some() {
+                return None;
+            }
+            item.as_str()
+                .map(str::to_owned)
+                .or_else(|| item.get("term").or_else(|| item.get("text")).or_else(|| item.get("name")).and_then(|value| value.as_str()).map(str::to_owned))
+        })
+        .filter(|term| !term.is_empty() && !term.contains(['\n', '\r']))
+        .take(8)
+        .collect()
 }
 
 struct Offered {
@@ -710,5 +931,16 @@ mod tests {
         assert!(matches!(emoji_token("emoji:5101"), EmojiToken::Custom { id, animated: false, .. } if id == "5101"));
         assert!(matches!(emoji_token("a:party:5103"), EmojiToken::Custom { animated: true, id, .. } if id == "5103"));
         assert!(matches!(emoji_token("😀"), EmojiToken::Unicode(glyph) if glyph == "😀"));
+    }
+
+    #[test]
+    fn categories_and_suggestions_keep_terms_and_skip_gif_objects() {
+        let categories = categories_of(r#"{"categories":[{"name":"happy","src":"https://media.tenor.com/happy.gif"},{"name":"  ","src":"https://x"}]} "#);
+        assert_eq!(categories, vec![("happy".to_owned(), "https://media.tenor.com/happy.gif".to_owned())]);
+        assert!(categories_of("nope").is_empty());
+        assert_eq!(suggestions_of(r#"["otter", {"term":"cat typing"}, {"url":"https://tenor.com/view/x","name":"skip"}]"#), vec!["otter".to_owned(), "cat typing".to_owned()]);
+        assert!(suggestions_of("nope").is_empty());
+        assert_eq!(gif_format("https://media.tenor.com/a.mp4?w=1"), 2);
+        assert_eq!(gif_format("https://media.tenor.com/a.gif"), 1);
     }
 }

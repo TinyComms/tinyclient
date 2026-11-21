@@ -364,6 +364,8 @@ enum MenuAct {
     SaveAs,
     /// Save an animated GIF attachment to the account's saved GIFs (`Capabilities::save_gif`).
     SaveGif,
+    /// Favourite a Discord GIF by its page address.
+    FavouriteGif,
     /// This message becomes the first unread one.
     Unread,
     /// Enter multi-message selection mode with this message ticked.
@@ -510,6 +512,7 @@ fn menu_acts(
     can_open_link: bool,
     can_save: bool,
     can_save_gif: bool,
+    favourite_gif: bool,
 ) -> Vec<MenuAct> {
     if can.unsent {
         let mut acts = Vec::new();
@@ -556,6 +559,9 @@ fn menu_acts(
     }
     if can_save_gif {
         acts.push(MenuAct::SaveGif);
+    }
+    if favourite_gif {
+        acts.push(MenuAct::FavouriteGif);
     }
     if !can.unsent {
         acts.push(MenuAct::Unread);
@@ -1167,6 +1173,7 @@ impl Pane {
             has_link && self.open.as_ref().is_some_and(|open| open.key.network != Network::Tiny),
             self.saveable_file(message).is_some(),
             self.saveable_gif(message).is_some(),
+            self.favourite_gif_page(message).is_some(),
         );
         let cursor = if acts.is_empty() {
             0
@@ -1257,6 +1264,11 @@ impl Pane {
                     cx.background_executor().spawn(async move { let _ = ask(&request); }).detach();
                 }
             }
+            MenuAct::FavouriteGif => {
+                if let Some(page) = self.favourite_gif_page(&message) {
+                    self.favourite_posted_gif(&page, cx);
+                }
+            }
             MenuAct::Unread => self.mark_message_unread(&message, cx),
             MenuAct::Select => {
                 self.multi_select.enter(&message.id);
@@ -1307,6 +1319,31 @@ impl Pane {
             let path = attachment.file.path.clone().or_else(|| self.known.get(&attachment.file.id).cloned())?;
             Some((path, super::media::disk_name(attachment)))
         })
+    }
+
+    /// A Discord GIF's page address, when the message still has one.
+    fn favourite_gif_page(&self, message: &Message) -> Option<String> {
+        if !self.open.as_ref().is_some_and(|open| open.key.network == Network::Discord) {
+            return None;
+        }
+        message.attachments.iter().find_map(|attachment| {
+            let page = attachment.page.as_str();
+            (page.starts_with("https://") || page.starts_with("http://")).then(|| page.to_owned())
+        })
+    }
+
+    /// Adds a posted GIF to the account's favourites. The page address is what Discord stores.
+    pub(super) fn favourite_posted_gif(&self, page: &str, cx: &mut Context<Self>) {
+        let Some(account) = self.open.as_ref().map(|open| open.key.account()) else {
+            return;
+        };
+        let request = Request::Favourite {
+            account,
+            kind: protocol::CatalogKind::Gifs,
+            id: page.to_owned(),
+            on: true,
+        };
+        cx.background_executor().spawn(async move { let _ = ask(&request); }).detach();
     }
 
     /// A GIF attachment's network document id when the account supports saving GIFs.
@@ -1491,6 +1528,16 @@ impl Pane {
                                 let request = Request::SaveGif { account, id: gif_id.clone(), unsave: false };
                                 cx.background_executor().spawn(async move { let _ = ask(&request); }).detach();
                             }
+                        }))
+                        .into_any_element(),
+                );
+            }
+            if let Some(page) = self.favourite_gif_page(message) {
+                rows.push(
+                    row("sheet-favourite-gif", "icons/star.svg", "Favourite GIF".into(), false)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            this.favourite_posted_gif(&page, cx);
                         }))
                         .into_any_element(),
                 );
@@ -1757,6 +1804,13 @@ impl Pane {
                     menu_item("save-gif", Some("icons/star.svg"), "Save GIF", None)
                         .when(lit(MenuAct::SaveGif), |row| row.bg(theme::selected()))
                         .on_click(go(MenuAct::SaveGif)),
+                );
+            }
+            if self.favourite_gif_page(&message).is_some() {
+                items = items.child(
+                    menu_item("favourite-gif", Some("icons/star.svg"), "Favourite GIF", None)
+                        .when(lit(MenuAct::FavouriteGif), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::FavouriteGif)),
                 );
             }
             if message.state == SendState::Sent {
@@ -2877,7 +2931,7 @@ mod tests {
         let said = Message::plain("1", "Mara", "hello", 1, false);
         let on = can(&said, &discord_caps(), rights, channel, false, 10);
         assert_eq!(
-            menu_acts(on, false, 2, true, true, true, true, false, false),
+            menu_acts(on, false, 2, true, true, true, true, false, false, false),
             vec![
                 MenuAct::Quick(0),
                 MenuAct::Quick(1),
@@ -2893,7 +2947,7 @@ mod tests {
             ]
         );
         // Tiny has Copy link without Open in Tiny.
-        let tiny_acts = menu_acts(on, false, 0, true, false, true, false, false, false);
+        let tiny_acts = menu_acts(on, false, 0, true, false, true, false, false, false, false);
         assert!(tiny_acts.contains(&MenuAct::Link) && !tiny_acts.contains(&MenuAct::Open));
         let mut mine = Message::plain("2", "Robin", "on it", 2, true);
         mine.state = SendState::Failed {
@@ -2901,12 +2955,13 @@ mod tests {
         };
         let failed = can(&mine, &discord_caps(), rights, channel, false, 10);
         assert_eq!(
-            menu_acts(failed, true, 3, true, true, false, false, true, false),
+            menu_acts(failed, true, 3, true, true, false, false, true, false, false),
             vec![MenuAct::Retry, MenuAct::Copy, MenuAct::Drop]);
         assert_eq!(
-            menu_acts(on, false, 0, false, false, false, false, true, false),
+            menu_acts(on, false, 0, false, false, false, false, true, false, false),
             vec![MenuAct::Reply, MenuAct::Thread, MenuAct::Forward, MenuAct::SaveAs, MenuAct::Unread, MenuAct::Select],
         );
+        assert!(menu_acts(on, false, 0, false, false, false, false, false, false, true).contains(&MenuAct::FavouriteGif));
     }
 
     #[test]

@@ -518,6 +518,7 @@ fn attachment(rich: &mut Rich, attached: &Attached) -> Attachment {
         duration: attached.duration_secs.round() as u32,
         round: false,
         view_once: false,
+        page: String::new(),
     }
 }
 
@@ -552,6 +553,7 @@ fn sticker(rich: &mut Rich, sticker: &model::Sticker) -> Attachment {
         duration: 0,
         round: false,
         view_once: false,
+        page: String::new(),
     }
 }
 
@@ -595,6 +597,9 @@ fn moving(rich: &mut Rich, message: &str, index: usize, embed: &Embed) -> Option
     let mut attachment = Attachment::new(name, file);
     attachment.thumb = Some(thumb);
     attachment.mime = "video/mp4".to_owned();
+    if let Some(url) = embed.url.as_deref().filter(|url| url.starts_with("https://") || url.starts_with("http://")) {
+        attachment.page = url.to_owned();
+    }
     Some(attachment)
 }
 
