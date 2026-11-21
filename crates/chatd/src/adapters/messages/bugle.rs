@@ -1021,6 +1021,21 @@ pub(super) struct MediaPart<'a> {
     pub name: &'a str,
     pub mime: &'a str,
     pub size: u64,
+    /// True when this part is a recorded voice message (`Outgoing::voice`).
+    pub voice: bool,
+    /// Voice message length in seconds, when `voice` is true.
+    pub duration_secs: Option<u32>,
+}
+
+fn audio_format_of(mime: &str) -> u64 {
+    match mime {
+        "audio/aac" => 15,
+        "audio/mp4" => 16,
+        "audio/amr" => 17,
+        "audio/mpeg" => 18,
+        "audio/ogg" | "audio/opus" => 20,
+        _ => 16,
+    }
 }
 
 fn send_media_request(
@@ -1037,11 +1052,17 @@ fn send_media_request(
     payload.text(9, mine);
     for part in parts {
         let mut media = Buf::new();
+        if part.voice {
+            media.int(1, audio_format_of(part.mime));
+        }
         media.text(2, part.media_id);
         media.text(4, part.name);
         media.int(5, part.size);
         media.bytes(11, part.key);
         media.text(14, part.mime);
+        if let Some(secs) = part.duration_secs.filter(|s| *s > 0) {
+            media.int(18, u64::from(secs));
+        }
         let mut media_info = Buf::new();
         media_info.msg(3, &media.0);
         payload.msg(10, &media_info.0);
@@ -3292,6 +3313,8 @@ pub(super) fn prove_message_reply() -> Result<(), String> {
             name: "a.png",
             mime: "image/png",
             size: 4,
+            voice: false,
+            duration_secs: None,
         }],
         Some("m-orig"),
     ));
@@ -3463,6 +3486,8 @@ pub(super) fn prove_several_files() -> Result<(), String> {
             name: "one.txt",
             mime: "application/octet-stream",
             size: 3,
+            voice: false,
+            duration_secs: None,
         },
         MediaPart {
             media_id: "m2",
@@ -3470,6 +3495,8 @@ pub(super) fn prove_several_files() -> Result<(), String> {
             name: "two.txt",
             mime: "application/octet-stream",
             size: 4,
+            voice: false,
+            duration_secs: None,
         },
         MediaPart {
             media_id: "m3",
@@ -3477,6 +3504,8 @@ pub(super) fn prove_several_files() -> Result<(), String> {
             name: "three.txt",
             mime: "application/octet-stream",
             size: 5,
+            voice: false,
+            duration_secs: None,
         },
     ];
     let bytes = send_media_request("phone-grace", "picnic", "tmp", "phone-ada", &parts, None);
@@ -4038,5 +4067,27 @@ mod tests {
         bad.double(1, 95.0);
         bad.double(2, 200.0);
         assert!(decode_location(&bad.0).is_none());
+    }
+
+    #[test]
+    fn voice_media_part_encodes_audio_format_and_duration() {
+        let key = [7u8; 32];
+        let part = MediaPart {
+            media_id: "voice-1",
+            key: &key,
+            name: "voice.m4a",
+            mime: "audio/mp4",
+            size: 4096,
+            voice: true,
+            duration_secs: Some(12),
+        };
+        let bytes = send_media_request("c-rcs", "", "tmp-v", "me", &[part], None);
+        let payload = fields(&field_bytes(&fields(&bytes), 3));
+        let info = payload.iter().find(|f| f.number == 10).expect("media info");
+        let media = fields(&field_bytes(&fields(&info.bytes), 3));
+        assert_eq!(field_int(&media, 1), 16, "AUDIO_MP4 format");
+        assert_eq!(field_text(&media, 2), "voice-1");
+        assert_eq!(field_text(&media, 14), "audio/mp4");
+        assert_eq!(field_int(&media, 18), 12, "duration seconds");
     }
 }

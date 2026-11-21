@@ -673,6 +673,7 @@ fn connect(
     ctx.capabilities(Capabilities {
         max_file_bytes: bugle::FILE_CAP,
         max_files: file_limit(),
+        voice_notes: true,
         edit: true,
         edit_window: bugle::EDIT_WINDOW_SECS,
         close_direct: true,
@@ -1995,6 +1996,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             } else {
                 warn_mms(account, &conversation_id, &client_id);
                 let reply = carried_reply(account, &conversation_id, reply_to);
+                let voice = with.voice.clone();
                 let account = Arc::clone(account);
                 let conversation = conversation_id.clone();
                 let cid = client_id.clone();
@@ -2012,6 +2014,7 @@ fn serve(account: &Arc<Account>, command: Command) {
                             &cid,
                             &caption,
                             reply.as_deref(),
+                            voice.as_ref(),
                         )
                     },
                 );
@@ -2301,6 +2304,55 @@ fn send_failure(name: &str, why: String) -> String {
     }
 }
 
+/// Maximum length (seconds) and size (bytes) for a voice message sent over SMS/MMS.
+const MMS_VOICE_MAX_SECS: u32 = 60;
+const MMS_VOICE_MAX_BYTES: u64 = 300 * 1024;
+const MMS_VOICE_CAP_ERR: &str =
+    "Voice messages in SMS/MMS chats are limited to 60 seconds (300 KB) so your carrier doesn't reject them.";
+
+fn check_mms_voice_limit(carrier: u64, voice: Option<&protocol::VoiceNote>, bytes: u64) -> Result<(), String> {
+    if carrier != 1 {
+        return Ok(());
+    }
+    if let Some(note) = voice {
+        if note.duration > MMS_VOICE_MAX_SECS * 1000 || bytes > MMS_VOICE_MAX_BYTES {
+            return Err(MMS_VOICE_CAP_ERR.to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort transcode of a recorded Ogg/Opus voice note via `ffmpeg` to AAC-in-M4A (RCS)
+/// or AMR-NB (SMS/MMS) so Android Messages and MMS gateways accept and play it reliably.
+/// Returns `None` if `ffmpeg` is unavailable or fails, in which case the original file is sent.
+fn transcode_voice(src: &std::path::Path, is_sms: bool) -> Option<(std::path::PathBuf, String, &'static str)> {
+    let ext = if is_sms { "amr" } else { "m4a" };
+    let mime = if is_sms { "audio/amr" } else { "audio/mp4" };
+    let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("voice");
+    let dst = src.with_file_name(format!("{stem}-transcoded.{ext}"));
+    let mut cmd = std::process::Command::new("ffmpeg");
+    cmd.args(["-y", "-loglevel", "error", "-i"])
+        .arg(src);
+    if is_sms {
+        cmd.args(["-ar", "8000", "-ac", "1", "-c:a", "libopencore_amrnb", "-b:a", "12.2k"]);
+    } else {
+        cmd.args(["-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart"]);
+    }
+    cmd.arg(&dst);
+    protocol::launch::no_console(&mut cmd);
+    let ok = cmd
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if ok && std::fs::metadata(&dst).is_ok_and(|m| m.len() > 0) {
+        Some((dst, format!("{stem}.{ext}"), mime))
+    } else {
+        let _ = std::fs::remove_file(&dst);
+        None
+    }
+}
+
 struct Prepared {
     media_id: String,
     key: Vec<u8>,
@@ -2308,6 +2360,9 @@ struct Prepared {
     mime: &'static str,
     size: u64,
     path: std::path::PathBuf,
+    temp_path: Option<std::path::PathBuf>,
+    voice: bool,
+    duration_secs: Option<u32>,
 }
 
 /// Seals and uploads each file, then asks the phone to send them as one message.
@@ -2318,15 +2373,22 @@ fn deliver_files(
     client_id: &str,
     caption: &str,
     reply: Option<&str>,
+    voice: Option<&protocol::VoiceNote>,
 ) -> Result<Message, String> {
+    let carrier = carrier_of(account, conversation);
     let staged: Vec<(String, u64, std::path::PathBuf)> = upload
         .files()
         .iter()
         .map(|source| (source.name.clone(), source.bytes, source.path.clone()))
         .collect();
+    let voice_index = voice.and_then(|_| staged.len().checked_sub(1));
     let mut prepared = Vec::with_capacity(staged.len());
-    for (at, (name, size, path)) in staged.into_iter().enumerate() {
+    for (at, (mut name, mut size, mut path)) in staged.into_iter().enumerate() {
         upload.check()?;
+        let is_voice = voice_index == Some(at);
+        if is_voice {
+            check_mms_voice_limit(carrier, voice, size)?;
+        }
         if size > bugle::FILE_CAP {
             return Err(format!(
                 "{name} is larger than 100 MB, which tinyclient won't send through Messages."
@@ -2336,19 +2398,57 @@ fn deliver_files(
         let n = std::fs::File::open(&path)
             .and_then(|mut file| std::io::Read::read(&mut file, &mut head))
             .unwrap_or(0);
-        let mime = bugle::mime_of(&name, &head[..n]);
+        let mut mime = bugle::mime_of(&name, &head[..n]);
+        let mut temp_path = None;
+        if is_voice && (mime == "audio/ogg" || mime == "audio/opus") {
+            if let Some((dst, new_name, new_mime)) = transcode_voice(&path, carrier == 1) {
+                if let Ok(meta) = std::fs::metadata(&dst) {
+                    size = meta.len();
+                    name = new_name;
+                    mime = new_mime;
+                    path = dst.clone();
+                    temp_path = Some(dst);
+                }
+            }
+        }
+        if is_voice {
+            if let Err(err) = check_mms_voice_limit(carrier, voice, size) {
+                if let Some(tmp) = temp_path {
+                    let _ = std::fs::remove_file(tmp);
+                }
+                return Err(err);
+            }
+        }
         let mut key = [0u8; 32];
         getrandom::fill(&mut key).map_err(|_| "Messages could not make a media key.".to_owned())?;
         let mut packer = media::Packer::open(&key)?;
-        upload
-            .parts(at, media::CHUNK, 0, |part| packer.push(part.bytes))
-            .map_err(|why| send_failure(&name, why))?;
+        if temp_path.is_some() {
+            let mut file = std::fs::File::open(&path)
+                .map_err(|err| send_failure(&name, err.to_string()))?;
+            let mut buf = vec![0u8; media::CHUNK];
+            loop {
+                upload.check().map_err(|why| send_failure(&name, why))?;
+                let read = std::io::Read::read(&mut file, &mut buf)
+                    .map_err(|err| send_failure(&name, err.to_string()))?;
+                if read == 0 {
+                    break;
+                }
+                packer.push(&buf[..read]).map_err(|why| send_failure(&name, why))?;
+            }
+        } else {
+            upload
+                .parts(at, media::CHUNK, 0, |part| packer.push(part.bytes))
+                .map_err(|why| send_failure(&name, why))?;
+        }
         let packed = packer.finish().map_err(|why| send_failure(&name, why))?;
         upload.check().map_err(|why| send_failure(&name, why))?;
         let media_id = account
             .drive
             .upload_media(&packed, mime)
             .map_err(|why| send_failure(&name, why))?;
+        let duration_secs = is_voice
+            .then(|| voice.map(|v| ((v.duration + 999) / 1000).max(1)))
+            .flatten();
         prepared.push(Prepared {
             media_id,
             key: key.to_vec(),
@@ -2356,6 +2456,9 @@ fn deliver_files(
             mime,
             size,
             path,
+            temp_path,
+            voice: is_voice,
+            duration_secs,
         });
     }
     upload.check()?;
@@ -2367,6 +2470,8 @@ fn deliver_files(
             name: &part.name,
             mime: part.mime,
             size: part.size,
+            voice: part.voice,
+            duration_secs: part.duration_secs,
         })
         .collect();
     let sent = account
@@ -2375,6 +2480,11 @@ fn deliver_files(
             keep_copy(account, client_id, id);
         });
     if sent.is_err() {
+        for part in &prepared {
+            if let Some(tmp) = &part.temp_path {
+                let _ = std::fs::remove_file(tmp);
+            }
+        }
         forget(account, client_id);
     }
     let id = sent?;
@@ -2392,14 +2502,22 @@ fn deliver_files(
         if let Some(path) = land_copy(account, &file, &part.path, part.size) {
             file.path = Some(path);
         }
-        let (duration, waveform) =
-            if part.mime.starts_with("audio/") || part.mime.starts_with("video/") {
-                std::fs::read(&part.path)
-                    .map(|bytes| facts(part.mime, &bytes))
-                    .unwrap_or_default()
+        let (duration, waveform) = if part.voice {
+            if let Some(v) = voice {
+                (((v.duration + 999) / 1000).max(1), v.waveform.clone())
             } else {
-                (0, Vec::new())
-            };
+                (part.duration_secs.unwrap_or(0), Vec::new())
+            }
+        } else if part.mime.starts_with("audio/") || part.mime.starts_with("video/") {
+            std::fs::read(&part.path)
+                .map(|bytes| facts(part.mime, &bytes))
+                .unwrap_or_default()
+        } else {
+            (0, Vec::new())
+        };
+        if let Some(tmp) = &part.temp_path {
+            let _ = std::fs::remove_file(tmp);
+        }
         attachments.push(Attachment {
             name: part.name.clone(),
             file,

@@ -1075,6 +1075,14 @@ impl Drive for Fake {
                 "file {conversation} {} {} {caption}",
                 part.name, part.size
             ));
+            if part.voice {
+                record(&format!(
+                    "voice {conversation} {} {} {}",
+                    part.name,
+                    part.mime,
+                    part.duration_secs.unwrap_or(0)
+                ));
+            }
         }
         if let Some(id) = reply.filter(|id| !id.is_empty()) {
             record(&format!("reply {conversation} {id}"));

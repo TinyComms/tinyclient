@@ -2165,3 +2165,113 @@ fn shared_location_and_vcard_render_as_cards_without_leaking_coordinates() {
     assert_eq!(card.footer, "Contact card");
     assert!(!card.fields[0].1.contains("555"));
 }
+
+#[test]
+fn voice_note_uploads_with_waveform_and_enforces_mms_cap() {
+    let world = World::linked();
+    world.connected();
+
+    // 1. Account advertises voice_notes capability.
+    let status = world
+        .status()
+        .0
+        .into_iter()
+        .find(|a| a.key == account())
+        .expect("Messages account status");
+    assert!(status.can.voice_notes, "Messages must advertise voice_notes");
+
+    // 2. Recorded voice note uploads on an RCS chat and carries duration + waveform.
+    world.steer("rcs grace");
+    world.until("grace is RCS", || {
+        world
+            .conversation(GRACE)
+            .filter(|c| c.topic.contains("RCS"))
+    });
+    let outbox = world.dir.join("outbox");
+    std::fs::create_dir_all(&outbox).unwrap();
+    let voice_path = outbox.join("voice-1001.opus");
+    // Minimal OggS + OpusHead header so mime_of identifies audio/opus.
+    let mut ogg = b"OggS\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0OpusHead".to_vec();
+    ogg.extend_from_slice(&[0u8; 64]);
+    std::fs::write(&voice_path, &ogg).unwrap();
+    let res = world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "c-voice-rcs".into(),
+        text: String::new(),
+        reply_to: None,
+        with: Outgoing {
+            files: vec![OutgoingFile {
+                path: voice_path.to_string_lossy().into_owned(),
+                name: "voice-1001.opus".into(),
+                ..OutgoingFile::default()
+            }],
+            voice: Some(protocol::VoiceNote {
+                duration: 4_500,
+                waveform: vec![12, 40, 88, 30],
+            }),
+            ..Outgoing::default()
+        },
+    });
+    assert!(matches!(res, Response::Sent { .. }), "expected Sent, got {res:?}");
+    let sent = world.until("voice message settled", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "c-voice-rcs" && m.state == SendState::Sent)
+    });
+    assert_eq!(sent.attachments.len(), 1);
+    assert_eq!(sent.attachments[0].file.kind, MediaKind::Audio);
+    assert_eq!(sent.attachments[0].duration, 5);
+    assert_eq!(sent.attachments[0].waveform, vec![12, 40, 88, 30]);
+    assert!(
+        world
+            .calls()
+            .iter()
+            .any(|c| c.starts_with(&format!("voice {GRACE} ")) && c.ends_with(" 5")),
+        "expected voice call record, got {:?}",
+        world.calls()
+    );
+
+    // 3. On an SMS/MMS chat, a voice message longer than 60 seconds is refused with a clear reason.
+    world.steer("sms grace");
+    world.until("grace is SMS", || {
+        world
+            .conversation(GRACE)
+            .filter(|c| c.topic.contains("Text message"))
+    });
+    let long_voice = outbox.join("voice-1002.opus");
+    std::fs::write(&long_voice, &ogg).unwrap();
+    let _ = world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "c-voice-sms-too-long".into(),
+        text: String::new(),
+        reply_to: None,
+        with: Outgoing {
+            files: vec![OutgoingFile {
+                path: long_voice.to_string_lossy().into_owned(),
+                name: "voice-1002.opus".into(),
+                ..OutgoingFile::default()
+            }],
+            voice: Some(protocol::VoiceNote {
+                duration: 65_000,
+                waveform: vec![20, 20],
+            }),
+            ..Outgoing::default()
+        },
+    });
+    let failed = world.until("long SMS voice failed", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "c-voice-sms-too-long" && matches!(m.state, SendState::Failed { .. }))
+    });
+    match failed.state {
+        SendState::Failed { reason } => {
+            assert!(
+                reason.contains("60 seconds"),
+                "expected 60-second MMS cap reason, got {reason:?}"
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
