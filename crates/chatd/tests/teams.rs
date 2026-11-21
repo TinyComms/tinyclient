@@ -1459,7 +1459,10 @@ fn people_are_searched_watched_and_called_through_the_official_app() {
     // Title, department and email each in their place; nothing left as a bio.
     assert_eq!((profile.person.name.as_str(), profile.bio.as_str()), ("Ana Ruiz", ""));
     assert_eq!((profile.title.as_str(), profile.department.as_str()), ("Staff Engineer", "Platform"));
-    assert_eq!(profile.contacts.iter().map(|contact| contact.value.as_str()).collect::<Vec<_>>(), ["ana@contoso.com"]);
+    assert_eq!(
+        profile.contacts.iter().map(|contact| contact.value.as_str()).collect::<Vec<_>>(),
+        ["ana@contoso.com", "+351 21 555 0100", "+351 91 555 0199"]
+    );
 
     // Presence is asked for exactly who is on screen, together.
     let Response::Status { seq, .. } = world.ask(Request::Status) else {
@@ -2527,6 +2530,10 @@ fn signing_out_removes_push_registration_for_signed_out_tenant() {
     assert!(!reg_id.is_empty());
 
     // Sign out of the home tenant; only that tenant's push registration should be deleted.
+    // The answer is status, as every other network's sign-out is: the home account is gone and
+    // the guest tenant stays Expired with the refusal it already had at connect. No token is
+    // minted on the way to the registrar DELETE.
+    let minted = world.fake.calls("POST", "/oauth2/v2.0/token").len();
     let answer = world.ask(Request::SignOut {
         account: protocol::AccountKey {
             network: Network::Teams,
@@ -2534,7 +2541,15 @@ fn signing_out_removes_push_registration_for_signed_out_tenant() {
         },
         erase: false,
     });
-    assert!(matches!(answer, Response::Ok), "{answer:?}");
+    let Response::Status { accounts, .. } = answer else {
+        panic!("sign-out returns status: {answer:?}");
+    };
+    assert!(accounts.iter().all(|status| status.key.account != HOME), "home tenant is signed out: {accounts:?}");
+    assert!(
+        accounts.iter().any(|status| status.key.account == GUEST && status.link == Link::Expired),
+        "the other tenant is left as it was: {accounts:?}"
+    );
+    assert_eq!(world.fake.calls("POST", "/oauth2/v2.0/token").len(), minted, "sign-out must not refresh a token");
 
     let delete_path = format!("/registrar/prod/V2/registrations/{reg_id}");
     let deleted = world.until("registrar DELETE on sign-out", || {
@@ -3251,13 +3266,14 @@ fn inline_pasted_images_upload_to_ams_and_send_as_richtext_html() {
     let ana = key(CHAT_ANA);
     world.open(&ana, 3);
 
-    // 1. Account advertises image-only attachment capability.
+    // 1. Account advertises attachments. Documents stay on the member-scoped OneDrive path
+    // (#658), so images_only stays off; a pasted image still goes to AMS.
     let can = world.account(HOME).can;
     assert!(can.max_file_bytes > 0, "Teams should allow image attachments");
     assert!(can.max_files > 0);
-    assert!(can.images_only, "Teams should advertise images_only while OneDrive docs stay off");
+    assert!(!can.images_only, "Teams file upload is not image-only");
 
-    // 2. Stage a valid PNG screenshot (with a real IHDR header for 320x200) and a non-image file.
+    // 2. Stage a valid PNG screenshot (with a real IHDR header for 320x200).
     let staged = std::path::absolute(format!("/tmp/tinyclient-teams-ams-{}", std::process::id())).unwrap();
     std::fs::create_dir_all(&staged).unwrap();
     let img_path = staged.join("screenshot.png");
@@ -3266,30 +3282,6 @@ fn inline_pasted_images_upload_to_ams_and_send_as_richtext_html() {
     png_bytes.extend_from_slice(&200u32.to_be_bytes());
     png_bytes.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
     std::fs::write(&img_path, &png_bytes).unwrap();
-
-    let doc_path = staged.join("spec.txt");
-    std::fs::write(&doc_path, b"not an image").unwrap();
-
-    // Non-image files are still refused.
-    let doc_send = world.ask(Request::Send {
-        conversation: ana.clone(),
-        client_id: "1760000999000646".into(),
-        text: "doc".into(),
-        reply_to: None,
-        with: protocol::Outgoing {
-            files: vec![protocol::OutgoingFile {
-                path: doc_path.to_string_lossy().into_owned(),
-                name: "spec.txt".into(),
-                spoiler: false,
-                as_file: false,
-                original: false,
-                view_once: false,
-                media: None,
-            }],
-            ..Default::default()
-        },
-    });
-    assert!(!matches!(doc_send, Response::Sent { .. }), "non-image must be refused: {doc_send:?}");
 
     // 3. Send the pasted PNG screenshot with caption text.
     let client_id = "1760000999000647";

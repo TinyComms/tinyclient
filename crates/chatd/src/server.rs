@@ -1897,15 +1897,18 @@ impl Chat {
     /// One person's card: asked of the network once, kept five minutes. Opened from a Space,
     /// the adapter is asked for what is said of them there, and failing that for the card alone.
     fn profile(&self, person: Key, space: Option<Key>) -> Response {
+        // Someone not in a chat yet is still asked about: Teams learns them from the short
+        // profile while it answers, including a guest whose Graph user call is refused.
         let known = match self.hub.store().person(&person) {
-            Ok(Some(known)) => known,
-            Ok(None) => return error(ErrorCode::NotFound, "no such person"),
+            Ok(known) => known,
             Err(err) => return internal(err),
         };
         let cached = (person.clone(), space.clone());
-        if let Some(mut profile) = self.hub.profiles.get(&cached) {
-            profile.person = self.with_presence(vec![known]).remove(0);
-            return Response::Profile { profile: Box::new(profile) };
+        if let Some(known) = known.clone() {
+            if let Some(mut profile) = self.hub.profiles.get(&cached) {
+                profile.person = self.with_presence(vec![known]).remove(0);
+                return Response::Profile { profile: Box::new(profile) };
+            }
         }
         let account = person.account();
         let space_id = space.filter(|space| space.account() == account).map(|space| space.id);
@@ -1926,6 +1929,14 @@ impl Chat {
         let about = match asked {
             Ok(about) => about,
             Err(refused) => return *refused,
+        };
+        let known = match known {
+            Some(known) => known,
+            None => match self.hub.store().person(&person) {
+                Ok(Some(known)) => known,
+                Ok(None) => return error(ErrorCode::NotFound, "no such person"),
+                Err(err) => return internal(err),
+            },
         };
         let profile = typed_profile(self.with_presence(vec![known]).remove(0), about);
         self.hub.profiles.keep(cached, profile.clone());
