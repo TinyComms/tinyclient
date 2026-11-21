@@ -773,6 +773,10 @@ fn tl_privacy_key(key: protocol::PrivacyKey) -> tl::enums::InputPrivacyKey {
         protocol::PrivacyKey::PhoneCall => tl::enums::InputPrivacyKey::PhoneCall,
         protocol::PrivacyKey::PhoneP2p => tl::enums::InputPrivacyKey::PhoneP2P,
         protocol::PrivacyKey::VoiceMessages => tl::enums::InputPrivacyKey::VoiceMessages,
+        protocol::PrivacyKey::LastSeen => tl::enums::InputPrivacyKey::StatusTimestamp,
+        protocol::PrivacyKey::PhoneNumber => tl::enums::InputPrivacyKey::PhoneNumber,
+        protocol::PrivacyKey::ProfilePhoto => tl::enums::InputPrivacyKey::ProfilePhoto,
+        protocol::PrivacyKey::ChatInvite => tl::enums::InputPrivacyKey::ChatInvite,
     }
 }
 

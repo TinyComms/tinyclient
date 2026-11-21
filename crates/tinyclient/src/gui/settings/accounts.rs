@@ -196,6 +196,10 @@ impl SettingsWindow {
             protocol::PrivacyKey::PhoneCall,
             protocol::PrivacyKey::PhoneP2p,
             protocol::PrivacyKey::VoiceMessages,
+            protocol::PrivacyKey::LastSeen,
+            protocol::PrivacyKey::PhoneNumber,
+            protocol::PrivacyKey::ProfilePhoto,
+            protocol::PrivacyKey::ChatInvite,
         ];
         cx.spawn(async move |this, cx| {
             let acc = account.clone();
@@ -266,10 +270,14 @@ impl SettingsWindow {
             .stored(&scope, protocol::settings::TELEGRAM_ALWAYS_RELAY)
             == Some("on");
         let mut box_div = div().flex().flex_col();
-        let rows: [(&str, &str, protocol::PrivacyKey); 3] = [
+        let rows: [(&str, &str, protocol::PrivacyKey); 7] = [
             ("Who can call me", "Controls who can place voice or video calls to you on Telegram.", protocol::PrivacyKey::PhoneCall),
             ("Peer-to-Peer", "Controls when Telegram may share your IP address directly during a call.", protocol::PrivacyKey::PhoneP2p),
             ("Voice & video messages", "Controls who may send you voice and round video messages.", protocol::PrivacyKey::VoiceMessages),
+            ("Who can see my last seen", "Controls who can see when you were last online.", protocol::PrivacyKey::LastSeen),
+            ("Who can see my phone number", "Controls who can see the phone number on this account.", protocol::PrivacyKey::PhoneNumber),
+            ("Who can see my photo", "Controls who can see your profile photo.", protocol::PrivacyKey::ProfilePhoto),
+            ("Who can add me", "Controls who can add you to groups and channels.", protocol::PrivacyKey::ChatInvite),
         ];
         for (row_ix, (title, sub, pkey)) in rows.into_iter().enumerate() {
             let policy = self.tg_privacy.get(&(account.key.clone(), pkey)).cloned();

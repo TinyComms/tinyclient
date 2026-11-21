@@ -546,8 +546,10 @@ struct World {
     voice_forbidden: HashSet<i64>,
     /// Groups/supergroups where `send_voices` is forbidden (`CHAT_SEND_VOICES_FORBIDDEN`).
     voice_banned: HashSet<Who>,
-    /// Stored privacy rules by key name (`phone_call`, `phone_p2p`, `voice_messages`).
+    /// Stored privacy rules by key name (`phone_call`, `status_timestamp`, …).
     privacy: HashMap<&'static str, Vec<tl::enums::PrivacyRule>>,
+    /// The next `account.setPrivacy` returns `PREMIUM_ACCOUNT_REQUIRED` (`privacy-refuse`).
+    privacy_refuse: bool,
     calls: PathBuf,
     /// The test let the held pages of the chats through (`dialogs-go`, `peer-go`).
     dialogs_go: bool,
@@ -630,7 +632,12 @@ impl World {
                 ("phone_call", vec![tl::enums::PrivacyRule::PrivacyValueAllowAll]),
                 ("phone_p2p", vec![tl::enums::PrivacyRule::PrivacyValueAllowContacts]),
                 ("voice_messages", vec![tl::enums::PrivacyRule::PrivacyValueAllowAll]),
+                ("status_timestamp", vec![tl::enums::PrivacyRule::PrivacyValueAllowAll]),
+                ("phone_number", vec![tl::enums::PrivacyRule::PrivacyValueAllowContacts]),
+                ("profile_photo", vec![tl::enums::PrivacyRule::PrivacyValueAllowAll]),
+                ("chat_invite", vec![tl::enums::PrivacyRule::PrivacyValueAllowAll]),
             ]),
+            privacy_refuse: false,
             calls: protocol::support_dir().join("telegram.calls"),
             dialogs_go: false,
             peer_go: false,
@@ -881,6 +888,20 @@ fn app_config() -> tl::enums::help::AppConfig {
 
 fn rpc(code: i32, name: &str, value: Option<u32>) -> Fault {
     Fault::Rpc { code, name: name.to_owned(), value }
+}
+
+/// Wire log name for an `account.getPrivacy` / `account.setPrivacy` key.
+fn privacy_key_name(key: &tl::enums::InputPrivacyKey) -> &'static str {
+    match key {
+        tl::enums::InputPrivacyKey::PhoneCall => "phone_call",
+        tl::enums::InputPrivacyKey::PhoneP2P => "phone_p2p",
+        tl::enums::InputPrivacyKey::VoiceMessages => "voice_messages",
+        tl::enums::InputPrivacyKey::StatusTimestamp => "status_timestamp",
+        tl::enums::InputPrivacyKey::PhoneNumber => "phone_number",
+        tl::enums::InputPrivacyKey::ProfilePhoto => "profile_photo",
+        tl::enums::InputPrivacyKey::ChatInvite => "chat_invite",
+        _ => "other",
+    }
 }
 
 /// The request, if `body` is one of these.
@@ -1524,6 +1545,10 @@ impl World {
                 if let Some(trial) = words.next().and_then(|v| v.parse::<i32>().ok()) {
                     self.transcribe_trial = Some(trial);
                 }
+                Vec::new()
+            }
+            "privacy-refuse" => {
+                self.privacy_refuse = words.next().map_or(true, |v| v != "0" && v != "off");
                 Vec::new()
             }
             "transcribe-update" => {
@@ -2782,24 +2807,18 @@ impl World {
             return answer(app_config());
         }
         if let Some(request) = asked::<f::account::GetPrivacy>(body) {
-            let name = match request.key {
-                tl::enums::InputPrivacyKey::PhoneCall => "phone_call",
-                tl::enums::InputPrivacyKey::PhoneP2P => "phone_p2p",
-                tl::enums::InputPrivacyKey::VoiceMessages => "voice_messages",
-                _ => "other",
-            };
+            let name = privacy_key_name(&request.key);
             self.log(&format!("account.getPrivacy {name}"));
             let rules = self.privacy.get(name).cloned().unwrap_or_else(|| vec![tl::enums::PrivacyRule::PrivacyValueAllowAll]);
             let found = tl::types::account::PrivacyRules { rules, chats: chats(), users: users() };
             return answer(tl::enums::account::PrivacyRules::Rules(found));
         }
         if let Some(request) = asked::<f::account::SetPrivacy>(body) {
-            let name = match request.key {
-                tl::enums::InputPrivacyKey::PhoneCall => "phone_call",
-                tl::enums::InputPrivacyKey::PhoneP2P => "phone_p2p",
-                tl::enums::InputPrivacyKey::VoiceMessages => "voice_messages",
-                _ => "other",
-            };
+            let name = privacy_key_name(&request.key);
+            if self.privacy_refuse {
+                self.log(&format!("account.setPrivacy {name} refused"));
+                return Err(rpc(403, "PREMIUM_ACCOUNT_REQUIRED", None));
+            }
             let mut mapped: Vec<tl::enums::PrivacyRule> = Vec::new();
             let mut tags: Vec<String> = Vec::new();
             for rule in request.rules {

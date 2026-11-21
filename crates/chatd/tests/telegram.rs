@@ -3542,6 +3542,87 @@ fn privacy_settings_read_and_write_rules_with_user_and_chat_exceptions() {
 }
 
 #[test]
+fn privacy_last_seen_sets_contacts_with_one_exception_and_a_premium_refusal() {
+    use protocol::{ErrorCode, PrivacyAudience, PrivacyException, PrivacyKey, PrivacyPolicy};
+    let world = World::signed_in();
+    world.connected();
+
+    let Response::Privacy { policy: seen, .. } = world.ask(Request::GetPrivacy {
+        account: account(),
+        key: PrivacyKey::LastSeen,
+    }) else {
+        panic!("expected Privacy for LastSeen");
+    };
+    assert_eq!(seen.audience, PrivacyAudience::Everybody);
+    assert!(!seen.premium_only);
+
+    let Response::Privacy { policy: phone, .. } = world.ask(Request::GetPrivacy {
+        account: account(),
+        key: PrivacyKey::PhoneNumber,
+    }) else {
+        panic!("expected Privacy for PhoneNumber");
+    };
+    assert_eq!(phone.audience, PrivacyAudience::Contacts);
+
+    let Response::Privacy { policy: photo, .. } = world.ask(Request::GetPrivacy {
+        account: account(),
+        key: PrivacyKey::ProfilePhoto,
+    }) else {
+        panic!("expected Privacy for ProfilePhoto");
+    };
+    assert_eq!(photo.audience, PrivacyAudience::Everybody);
+
+    let Response::Privacy { policy: invite, .. } = world.ask(Request::GetPrivacy {
+        account: account(),
+        key: PrivacyKey::ChatInvite,
+    }) else {
+        panic!("expected Privacy for ChatInvite");
+    };
+    assert_eq!(invite.audience, PrivacyAudience::Everybody);
+
+    let updated = PrivacyPolicy {
+        audience: PrivacyAudience::Contacts,
+        always_allow: vec![PrivacyException { id: "u7002".into(), name: String::new(), chat: false }],
+        never_allow: Vec::new(),
+        premium_only: false,
+    };
+    let Response::Privacy { policy: saved, .. } = world.ask(Request::SetPrivacy {
+        account: account(),
+        key: PrivacyKey::LastSeen,
+        policy: updated,
+    }) else {
+        panic!("expected Privacy after SetPrivacy LastSeen");
+    };
+    assert_eq!(saved.audience, PrivacyAudience::Contacts);
+    assert!(saved.always_allow.iter().any(|e| e.id == "u7002" && !e.chat));
+    assert!(
+        world.calls().iter().any(|c| c.contains("account.setPrivacy status_timestamp")
+            && c.contains("allow_users:[7002]")
+            && c.contains("allow_contacts")),
+        "expected last-seen rules on the wire, got: {:#?}",
+        world.calls()
+    );
+
+    world.steer("privacy-refuse");
+    let refused = world.ask(Request::SetPrivacy {
+        account: account(),
+        key: PrivacyKey::LastSeen,
+        policy: PrivacyPolicy { audience: PrivacyAudience::Nobody, ..PrivacyPolicy::default() },
+    });
+    match refused {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("Telegram Premium"), "{detail}");
+        }
+        other => panic!("expected a premium refusal, got {other:?}"),
+    }
+    assert!(
+        world.calls().iter().any(|c| c.contains("account.setPrivacy status_timestamp refused")),
+        "expected the refused setPrivacy on the wire, got: {:#?}",
+        world.calls()
+    );
+}
+
+#[test]
 fn shared_contact_send_and_receive() {
     let world = World::signed_in();
     world.connected();

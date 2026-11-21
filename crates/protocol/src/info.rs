@@ -44,6 +44,14 @@ pub enum PrivacyKey {
     PhoneCall,
     PhoneP2p,
     VoiceMessages,
+    /// Who can see when this account was last online (`inputPrivacyKeyStatusTimestamp`).
+    LastSeen,
+    /// Who can see this account's phone number (`inputPrivacyKeyPhoneNumber`).
+    PhoneNumber,
+    /// Who can see this account's profile photo (`inputPrivacyKeyProfilePhoto`).
+    ProfilePhoto,
+    /// Who can add this account to groups and channels (`inputPrivacyKeyChatInvite`).
+    ChatInvite,
 }
 
 /// Base audience for a network privacy rule.
