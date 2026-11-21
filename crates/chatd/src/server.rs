@@ -3200,6 +3200,74 @@ impl Chat {
             }
             Request::Leave { conversation } => self.act(&conversation, |conversation_id, reply| Command::Leave { conversation_id, reply }),
             Request::LeaveSpace { space } => self.leave_space(space),
+            Request::SpaceIntegrations { space } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::SpaceIntegrations { space_id: space.id.clone(), reply }) {
+                    Ok(integrations) => Response::SpaceIntegrations { space, integrations: Box::new(integrations) },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::CreateWebhook { conversation, name } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::CreateWebhook {
+                    conversation_id: conversation.id.clone(),
+                    name,
+                    reply,
+                }) {
+                    Ok(webhook) => Response::SpaceWebhook { webhook: Box::new(webhook) },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::EditWebhook { space, webhook_id, name, channel_id } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::EditWebhook {
+                    space_id: space.id.clone(),
+                    webhook_id,
+                    name,
+                    channel_id,
+                    reply,
+                }) {
+                    Ok(webhook) => Response::SpaceWebhook { webhook: Box::new(webhook) },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::DeleteWebhook { space, webhook_id } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::DeleteWebhook {
+                    space_id: space.id.clone(),
+                    webhook_id,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::RemoveIntegration { space, integration_id } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::RemoveIntegration {
+                    space_id: space.id.clone(),
+                    integration_id,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::CloseDirect { conversation } => {
                 self.act(&conversation, |conversation_id, reply| Command::CloseDirect { conversation_id, reply })
             }

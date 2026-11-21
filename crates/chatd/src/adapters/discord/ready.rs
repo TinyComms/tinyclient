@@ -5,7 +5,8 @@ use super::super::{Command, Failure};
 use super::model::{
     self, number, seconds, Channel, Guild, GuildSettings, Kept, Member, MuteConfig, PresenceUpdate,
     ReadState, Relationship, Role, User, Versioned, VoiceState, ADMINISTRATOR, BAN_MEMBERS, CONNECT,
-    KICK_MEMBERS, MANAGE_MESSAGES, MANAGE_ROLES, PIN_MESSAGES, SEND_MESSAGES, VIEW_CHANNEL,
+    KICK_MEMBERS, MANAGE_GUILD, MANAGE_MESSAGES, MANAGE_ROLES, MANAGE_WEBHOOKS, PIN_MESSAGES,
+    SEND_MESSAGES, VIEW_CHANNEL,
 };
 use super::{proto, Discord, GuildInfo, Quiet, Resumable, RoleInfo, WARM};
 use crate::hub::now;
@@ -209,18 +210,28 @@ impl GuildInfo {
         self.timeout_until.filter(|until| *until > now)
     }
 
-    /// Discord's permission rule for a channel: the roles' own permissions, then the channel's
-    /// overwrites for everyone, for our roles, and for us.
-    pub(super) fn permissions(&self, guild: &str, me: &str, channel: &Channel) -> u64 {
+    /// Guild-level permissions for our account (owner or ADMINISTRATOR grants all bits).
+    pub(super) fn base_permissions(&self, guild: &str) -> u64 {
         if self.owner {
             return u64::MAX;
         }
         let everyone = number(guild);
         let of = |role: &u64| self.roles.get(role).map_or(0, |role| role.permissions);
-        let mut allowed = self.my_roles.iter().fold(of(&everyone), |all, role| all | of(role));
+        let allowed = self.my_roles.iter().fold(of(&everyone), |all, role| all | of(role));
         if allowed & ADMINISTRATOR != 0 {
             return u64::MAX;
         }
+        allowed
+    }
+
+    /// Discord's permission rule for a channel: the roles' own permissions, then the channel's
+    /// overwrites for everyone, for our roles, and for us.
+    pub(super) fn permissions(&self, guild: &str, me: &str, channel: &Channel) -> u64 {
+        let mut allowed = self.base_permissions(guild);
+        if allowed == u64::MAX {
+            return u64::MAX;
+        }
+        let everyone = number(guild);
         let overwrites = &channel.permission_overwrites;
         if let Some(all) = overwrites.iter().find(|over| !over.member && number(&over.id) == everyone) {
             allowed = (allowed & !all.deny) | all.allow;
@@ -597,6 +608,7 @@ impl Discord {
         };
         if moved {
             self.replant(guild)?;
+            self.spaces()?;
         }
         Ok(())
     }
@@ -623,6 +635,9 @@ impl Discord {
         if moved || timeout_changed {
             self.replant(guild)?;
         }
+        if moved {
+            self.spaces()?;
+        }
         if timeout_changed {
             self.reschedule_unmute();
         }
@@ -633,9 +648,14 @@ impl Discord {
     pub(super) fn spaces(&self) -> rusqlite::Result<()> {
         let now = now();
         let mut flags = Vec::new();
+        let mut manage = Vec::new();
         let (rows, files): (Vec<SpaceRow>, Vec<(MediaFile, String)>) = {
             let state = self.state.lock().unwrap();
-            flags.extend(state.guilds.iter().map(|(id, info)| (id.clone(), info.quiet.server_muted(now), info.quiet.hide_muted)));
+            for (id, info) in &state.guilds {
+                flags.push((id.clone(), info.quiet.server_muted(now), info.quiet.hide_muted));
+                let perms = info.base_permissions(id);
+                manage.push((id.clone(), perms & MANAGE_WEBHOOKS != 0, perms & MANAGE_GUILD != 0));
+            }
             let listed = state.guilds.iter().map(|(id, info)| {
                 let icon = info.icon.as_deref().map(|hash| model::guild_icon(id, hash));
                 let row = SpaceRow {
@@ -654,6 +674,9 @@ impl Discord {
         // A server's own mute and "hide muted channels", once its Space exists to hold them.
         for (id, muted, hide) in flags {
             self.ctx.space_flags(&id, muted, hide)?;
+        }
+        for (id, webhooks, guild) in manage {
+            self.ctx.set_space_manage(&id, webhooks, guild)?;
         }
         Ok(())
     }

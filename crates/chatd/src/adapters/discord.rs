@@ -10,6 +10,7 @@
 //! the user owns, one visible member window, the voice states of the servers. Trees, people and
 //! messages go to the store as READY and the events arrive.
 
+mod admin;
 mod content;
 mod events;
 
@@ -1862,6 +1863,19 @@ impl Discord {
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
             Command::Leave { conversation_id, reply } => answer(reply, self.leave(&conversation_id, false)),
             Command::LeaveSpace { space_id, reply } => answer(reply, self.leave_space(&space_id)),
+            Command::SpaceIntegrations { space_id, reply } => answer(reply, self.space_integrations(&space_id)),
+            Command::CreateWebhook { conversation_id, name, reply } => {
+                answer(reply, self.create_webhook(&conversation_id, &name))
+            }
+            Command::EditWebhook { space_id, webhook_id, name, channel_id, reply } => {
+                answer(reply, self.edit_webhook(&space_id, &webhook_id, name, channel_id))
+            }
+            Command::DeleteWebhook { space_id, webhook_id, reply } => {
+                answer(reply, self.delete_webhook(&space_id, &webhook_id))
+            }
+            Command::RemoveIntegration { space_id, integration_id, reply } => {
+                answer(reply, self.remove_integration(&space_id, &integration_id))
+            }
             Command::CloseDirect { conversation_id, reply } => answer(reply, self.leave(&conversation_id, true)),
             Command::AnswerMessageRequest { conversation_id, accept, reply } => {
                 answer(reply, self.answer_message_request(&conversation_id, accept))

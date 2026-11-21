@@ -636,6 +636,8 @@ fn build() -> Fixture {
         muted: false,
         hide_muted: false,
         can_create_channels: false,
+        can_manage_webhooks: false,
+        can_manage_guild: false,
     };
     let spaces = vec![
         space(&t, premier, "Premier", Some(picture("icon-premier", MediaKind::Icon, "icon-night-shift.webp", 192, 192)), 0, 0),

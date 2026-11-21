@@ -262,6 +262,12 @@ pub struct Space {
     /// The user has permission to create channels in this Space (`Request::CreateChannel`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub can_create_channels: bool,
+    /// The user has permission to manage webhooks in this Space (`MANAGE_WEBHOOKS`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_manage_webhooks: bool,
+    /// The user has permission to manage server integrations in this Space (`MANAGE_GUILD`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_manage_guild: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1732,6 +1738,34 @@ pub enum Request {
         account: AccountKey,
         code: String,
     },
+    /// Read a Space's webhooks, followed channels, and installed bots/integrations.
+    SpaceIntegrations {
+        space: Key,
+    },
+    /// Create an incoming webhook in a channel.
+    CreateWebhook {
+        conversation: Key,
+        name: String,
+    },
+    /// Rename or move an existing webhook in a Space.
+    EditWebhook {
+        space: Key,
+        webhook_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel_id: Option<String>,
+    },
+    /// Delete a webhook (or unfollow a followed announcement channel) in a Space.
+    DeleteWebhook {
+        space: Key,
+        webhook_id: String,
+    },
+    /// Remove an installed bot or integration from a Space.
+    RemoveIntegration {
+        space: Key,
+        integration_id: String,
+    },
     Watch(Watching),
 
     /// A page of one conversation, oldest first. Reading is not marking read.
@@ -3106,6 +3140,15 @@ pub enum Response {
     /// One updated/rescheduled message (`Request::RescheduleMessage`).
     ScheduledMessage {
         message: ScheduledMessage,
+    },
+    /// A Space's webhooks, followed channels, and bots/integrations (`Request::SpaceIntegrations`).
+    SpaceIntegrations {
+        space: Key,
+        integrations: Box<SpaceIntegrations>,
+    },
+    /// A created or edited webhook (`Request::CreateWebhook` / `Request::EditWebhook`).
+    SpaceWebhook {
+        webhook: Box<SpaceWebhook>,
     },
 }
 

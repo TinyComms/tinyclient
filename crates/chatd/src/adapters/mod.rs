@@ -615,6 +615,22 @@ pub enum Command {
     Leave { conversation_id: String, reply: Reply<()> },
     /// Leave a Space (e.g. Discord server `DELETE /users/@me/guilds/{id}`).
     LeaveSpace { space_id: String, reply: Reply<()> },
+    /// Read a Space's webhooks, followed channels, and installed bots/integrations.
+    SpaceIntegrations { space_id: String, reply: Reply<protocol::SpaceIntegrations> },
+    /// Create an incoming webhook in a channel.
+    CreateWebhook { conversation_id: String, name: String, reply: Reply<protocol::SpaceWebhook> },
+    /// Rename or move an existing webhook in a Space.
+    EditWebhook {
+        space_id: String,
+        webhook_id: String,
+        name: Option<String>,
+        channel_id: Option<String>,
+        reply: Reply<protocol::SpaceWebhook>,
+    },
+    /// Delete a webhook or unfollow a followed channel in a Space.
+    DeleteWebhook { space_id: String, webhook_id: String, reply: Reply<()> },
+    /// Remove an installed bot or integration from a Space.
+    RemoveIntegration { space_id: String, integration_id: String, reply: Reply<()> },
     /// Close a direct conversation as the network's own × does. Report it through
     /// [`Context::filing`] (hidden) or [`Context::conversation_gone`].
     CloseDirect { conversation_id: String, reply: Reply<()> },
@@ -844,12 +860,18 @@ impl Command {
             Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ConversationInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SpaceInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SpaceIntegrations { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateWebhook { reply, .. } | Command::EditWebhook { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetMute { reply, .. }
             | Command::SetDisappearing { reply, .. }
             | Command::Leave { reply, .. }
             | Command::LeaveSpace { reply, .. }
+            | Command::DeleteWebhook { reply, .. }
+            | Command::RemoveIntegration { reply, .. }
             | Command::CloseDirect { reply, .. }
             | Command::ClearHistory { reply, .. }
             | Command::Star { reply, .. }
@@ -1045,6 +1067,15 @@ impl Context {
     pub fn set_space_can_create_channels(&self, space_id: &str, can: bool) -> Stores {
         let space = self.key(space_id);
         if self.hub.store().set_space_can_create_channels(&space, can)? {
+            self.hub.changed(Change::Spaces { account: self.account.clone() });
+        }
+        Ok(())
+    }
+
+    /// Sets whether the user can manage webhooks or guild integrations in `space_id`.
+    pub fn set_space_manage(&self, space_id: &str, webhooks: bool, guild: bool) -> Stores {
+        let space = self.key(space_id);
+        if self.hub.store().set_space_manage(&space, webhooks, guild)? {
             self.hub.changed(Change::Spaces { account: self.account.clone() });
         }
         Ok(())

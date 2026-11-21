@@ -237,6 +237,8 @@ pub struct Shell {
     pub(super) playing_state: super::playing::State,
     /// The Tiny server on show.
     pub(super) tiny_state: super::tiny::State,
+    /// Discord server management modal (webhooks, integrations, emoji & stickers).
+    pub(super) discord_admin: super::discord_admin::State,
 
     /// chatd as the shell sees it: starting, live, reconnecting, given up; the keychain.
     pub(super) service: Service,
@@ -320,6 +322,7 @@ impl Shell {
             call_state: call::State::default(),
             playing_state: super::playing::State::default(),
             tiny_state: super::tiny::State::new(cx),
+            discord_admin: super::discord_admin::State::default(),
             service: Service::new(!cfg!(feature = "gui-shot") || std::env::args().any(|arg| arg == "--start-chatd")),
             crashed: app::crash::relaunched_after(),
             restore: Some((prefs.open.clone(), prefs.mode.clone())),
@@ -365,6 +368,16 @@ impl Shell {
             }
         })
         .detach();
+    }
+
+    /// Validates an external `http://` or `https://` URL and opens it in the system browser
+    /// (routing through the active conversation pane's link confirmation when one is open).
+    pub(in crate::gui) fn open_external_link(&mut self, url: &str, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dest) = protocol::link::Destination::parse(url) else {
+            return;
+        };
+        let choices = app::prefs::choices();
+        cx.open_url(&dest.target(choices.strip_tracking));
     }
 
     /// Runs `work` off the main thread and hands its answer back to the shell.

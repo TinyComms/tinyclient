@@ -1121,6 +1121,92 @@ impl Keychain {
     }
 }
 
+/// Kind of webhook in a Space (e.g. Discord incoming, channel follower, or application webhook).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookKind {
+    #[default]
+    Incoming,
+    ChannelFollower,
+    Application,
+}
+
+/// One webhook in a Space (incoming webhook, followed announcement channel, or app webhook).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceWebhook {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub channel_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub channel_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<MediaFile>,
+    #[serde(default)]
+    pub kind: WebhookKind,
+    /// Full webhook URL (including secret token for incoming webhooks). Never logged; only shown
+    /// or copied on explicit user action.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub creator: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_guild: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_channel: String,
+}
+
+/// One installed bot, app, or third-party integration in a Space.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceIntegration {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Integration type (e.g. `"discord"`, `"twitch"`, `"youtube"`, `"guild_subscription"`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+    #[serde(default = "is_true_val", skip_serializing_if = "is_true")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub application_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bot_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bot_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub account_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<MediaFile>,
+}
+
+fn is_true_val() -> bool {
+    true
+}
+
+/// A Space's webhooks, followed channels, and installed bots/integrations.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceIntegrations {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub webhooks: Vec<SpaceWebhook>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub followers: Vec<SpaceWebhook>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub integrations: Vec<SpaceIntegration>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_manage_webhooks: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_manage_guild: bool,
+    /// External URL to add a bot/app in Discord's App Directory.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub add_bot_url: String,
+    /// External URL to edit per-command integration permissions in Discord.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub permissions_url: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1206,5 +1292,72 @@ mod tests {
         };
         let back_opt: SendAs = serde_json::from_str(&serde_json::to_string(&opt).unwrap()).unwrap();
         assert_eq!(back_opt, opt);
+    }
+
+    #[test]
+    fn space_integrations_and_webhook_requests_round_trip() {
+        use crate::{AccountKey, Request, Response};
+        let account = AccountKey { network: Network::Discord, account: "1".into() };
+        let space = Key::new(&account, "4000");
+        let conv = Key::new(&account, "4101");
+        let reqs = [
+            Request::SpaceIntegrations { space: space.clone() },
+            Request::CreateWebhook { conversation: conv.clone(), name: "Deployments".into() },
+            Request::EditWebhook {
+                space: space.clone(),
+                webhook_id: "9001".into(),
+                name: Some("CI".into()),
+                channel_id: Some("4102".into()),
+            },
+            Request::DeleteWebhook { space: space.clone(), webhook_id: "9001".into() },
+            Request::RemoveIntegration { space: space.clone(), integration_id: "8001".into() },
+        ];
+        for req in reqs {
+            let wire = serde_json::to_string(&req).unwrap();
+            let back: Request = serde_json::from_str(&wire).unwrap();
+            assert_eq!(back, req);
+        }
+        let hook = SpaceWebhook {
+            id: "9001".into(),
+            name: "CI".into(),
+            channel_id: "4101".into(),
+            channel_name: "general".into(),
+            kind: WebhookKind::Incoming,
+            url: "https://discord.com/api/webhooks/9001/secret".into(),
+            creator: "Justin".into(),
+            ..SpaceWebhook::default()
+        };
+        let page = SpaceIntegrations {
+            webhooks: vec![hook.clone()],
+            followers: vec![SpaceWebhook {
+                id: "9002".into(),
+                name: "Rust News".into(),
+                channel_id: "4101".into(),
+                kind: WebhookKind::ChannelFollower,
+                source_guild: "Rust".into(),
+                source_channel: "announcements".into(),
+                ..SpaceWebhook::default()
+            }],
+            integrations: vec![SpaceIntegration {
+                id: "8001".into(),
+                name: "HelperBot".into(),
+                kind: "discord".into(),
+                enabled: true,
+                application_id: "7001".into(),
+                bot_id: "7002".into(),
+                bot_name: "HelperBot".into(),
+                ..SpaceIntegration::default()
+            }],
+            can_manage_webhooks: true,
+            can_manage_guild: true,
+            add_bot_url: "https://discord.com/discovery/applications".into(),
+            permissions_url: "https://discord.com/channels/4000".into(),
+        };
+        let resp = Response::SpaceIntegrations { space, integrations: Box::new(page) };
+        let back: Response = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(back, resp);
+        let hook_resp = Response::SpaceWebhook { webhook: Box::new(hook) };
+        let back_hook: Response = serde_json::from_str(&serde_json::to_string(&hook_resp).unwrap()).unwrap();
+        assert_eq!(back_hook, hook_resp);
     }
 }

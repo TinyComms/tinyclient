@@ -5045,3 +5045,152 @@ fn leave_space_sends_delete_refuses_owner_and_cleans_tree() {
         other => panic!("expected Response::Spaces, got {other:?}"),
     }
 }
+
+#[test]
+fn server_webhooks_and_integrations_list_create_edit_delete_and_remove() {
+    let ready: Value = serde_json::from_str(READY).unwrap();
+    // Guild 5000 is owned by user 1000 (full permissions), while guild 4000 has no webhook/guild manage perms.
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    // Verify Space management flags: owned guild 5000 can manage webhooks & guild; guild 4000 cannot.
+    match world.ask(Request::Spaces { network: Some(Network::Discord) }) {
+        Response::Spaces { spaces } => {
+            let g4000 = spaces.iter().find(|s| s.key.id == "4000").expect("guild 4000");
+            let g5000 = spaces.iter().find(|s| s.key.id == "5000").expect("guild 5000");
+            assert!(!g4000.can_manage_webhooks && !g4000.can_manage_guild);
+            assert!(g5000.can_manage_webhooks && g5000.can_manage_guild);
+        }
+        other => panic!("expected Response::Spaces, got {other:?}"),
+    }
+
+    // Guild 4000 is refused locally without hitting Discord.
+    match world.ask(Request::SpaceIntegrations { space: world.key("4000") }) {
+        Response::Error { detail, .. } => assert!(detail.contains("permission"), "got: {detail}"),
+        other => panic!("expected permission error, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("GET", "/guilds/4000/webhooks").is_empty());
+
+    // Script webhooks (1 incoming + 1 channel follower) and integrations for owned guild 5000.
+    world.discord.script(
+        "/guilds/5000/webhooks",
+        200,
+        json!([
+            {
+                "id": "9101",
+                "type": 1,
+                "channel_id": "5001",
+                "name": "Build Alerts",
+                "avatar": null,
+                "token": "secret_tok_123",
+                "user": {"username": "justin", "global_name": "Justin"}
+            },
+            {
+                "id": "9102",
+                "type": 2,
+                "channel_id": "5001",
+                "name": "Rust #announcements",
+                "source_guild": {"name": "Rust"},
+                "source_channel": {"name": "announcements"}
+            }
+        ]),
+    );
+    world.discord.script(
+        "/guilds/5000/integrations",
+        200,
+        json!([
+            {
+                "id": "8101",
+                "name": "DeployBot",
+                "type": "discord",
+                "enabled": true,
+                "account": {"name": "DeployBot"},
+                "application": {
+                    "id": "7101",
+                    "name": "DeployBot",
+                    "description": "Ships releases",
+                    "bot": {"id": "7102", "username": "deploybot", "global_name": "DeployBot", "avatar": null, "discriminator": "0"}
+                }
+            }
+        ]),
+    );
+
+    match world.ask(Request::SpaceIntegrations { space: world.key("5000") }) {
+        Response::SpaceIntegrations { integrations, .. } => {
+            assert!(integrations.can_manage_webhooks && integrations.can_manage_guild);
+            assert_eq!(integrations.webhooks.len(), 1);
+            assert_eq!(integrations.webhooks[0].name, "Build Alerts");
+            assert_eq!(integrations.webhooks[0].url, "https://discord.com/api/webhooks/9101/secret_tok_123");
+            assert_eq!(integrations.followers.len(), 1);
+            assert_eq!(integrations.followers[0].source_guild, "Rust");
+            assert!(integrations.followers[0].url.is_empty());
+            assert_eq!(integrations.integrations.len(), 1);
+            assert_eq!(integrations.integrations[0].bot_name, "DeployBot");
+        }
+        other => panic!("expected Response::SpaceIntegrations, got {other:?}"),
+    }
+
+    // Create webhook
+    world.discord.script(
+        "/channels/5001/webhooks",
+        200,
+        json!({
+            "id": "9103",
+            "type": 1,
+            "channel_id": "5001",
+            "name": "CI Hook",
+            "token": "new_secret_tok"
+        }),
+    );
+    match world.ask(Request::CreateWebhook { conversation: world.key("5001"), name: "CI Hook".into() }) {
+        Response::SpaceWebhook { webhook } => {
+            assert_eq!(webhook.id, "9103");
+            assert_eq!(webhook.url, "https://discord.com/api/webhooks/9103/new_secret_tok");
+        }
+        other => panic!("expected Response::SpaceWebhook, got {other:?}"),
+    }
+    let creates = world.discord.requests_to("POST", "/channels/5001/webhooks");
+    assert_eq!(creates.len(), 1);
+    assert_eq!(creates[0].body, json!({"name": "CI Hook"}));
+
+    // Edit webhook
+    world.discord.script(
+        "/webhooks/9103",
+        200,
+        json!({
+            "id": "9103",
+            "type": 1,
+            "channel_id": "5001",
+            "name": "Renamed Hook",
+            "token": "new_secret_tok"
+        }),
+    );
+    match world.ask(Request::EditWebhook {
+        space: world.key("5000"),
+        webhook_id: "9103".into(),
+        name: Some("Renamed Hook".into()),
+        channel_id: None,
+    }) {
+        Response::SpaceWebhook { webhook } => assert_eq!(webhook.name, "Renamed Hook"),
+        other => panic!("expected Response::SpaceWebhook, got {other:?}"),
+    }
+    assert_eq!(world.discord.requests_to("PATCH", "/webhooks/9103").len(), 1);
+
+    // Delete webhook
+    world.discord.script("/webhooks/9103", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::DeleteWebhook { space: world.key("5000"), webhook_id: "9103".into() }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("DELETE", "/webhooks/9103").len(), 1);
+
+    // Remove integration
+    world.discord.script("/guilds/5000/integrations/8101", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::RemoveIntegration { space: world.key("5000"), integration_id: "8101".into() }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("DELETE", "/guilds/5000/integrations/8101").len(), 1);
+}
