@@ -313,6 +313,7 @@ struct State {
     drafts: HashMap<String, DraftEntry>,
     drafts_by_id: HashMap<String, String>,
     drafts_loaded: bool,
+    draft_seq: u64,
     /// App/bot id per `(channel, ts)` for messages carrying interactive Block Kit controls.
     message_apps: HashMap<(String, String), String>,
 }
@@ -1746,10 +1747,22 @@ impl Slack {
         }
     }
 
+    fn draft_client_msg_id(&self, conversation_id: &str, now: i64) -> String {
+        let seq = {
+            let mut state = self.state();
+            state.draft_seq = state.draft_seq.wrapping_add(1);
+            state.draft_seq
+        };
+        let hash = fnv(conversation_id) % 10_000_000_000;
+        let ts = now.max(0) as u64;
+        client_msg_id(&format!("{ts:010}{hash:010}{seq:06}"))
+    }
+
     /// Syncs a locally edited draft (`Command::Draft`) to Slack (`drafts.create` / `drafts.update` / `drafts.delete`).
     fn sync_draft(&self, conversation_id: &str, text: &str) -> Result<(), Failure> {
         let trimmed = text.trim();
         let now = crate::hub::now();
+        let note_key = format!("draft_at:{conversation_id}");
         if trimmed.is_empty() {
             let existing = {
                 let mut state = self.state();
@@ -1761,6 +1774,7 @@ impl Slack {
                 }
                 removed
             };
+            self.ctx.set_note(&note_key, "");
             if let Some(entry) = existing.filter(|e| !e.id.is_empty()) {
                 let ts = format!("{}.000000", entry.updated.max(now));
                 match self.api("drafts.delete", &[("draft_id", entry.id.as_str()), ("client_last_updated_ts", ts.as_str())]) {
@@ -1784,7 +1798,7 @@ impl Slack {
         }])
         .to_string();
         let existing = self.state().drafts.get(conversation_id).cloned();
-        let response = if let Some(entry) = existing.filter(|e| !e.id.is_empty()) {
+        let (response, fallback_id) = if let Some(entry) = existing.filter(|e| !e.id.is_empty()) {
             let last_ts = format!("{}.000000", entry.updated.max(1));
             match self.api(
                 "drafts.update",
@@ -1795,45 +1809,55 @@ impl Slack {
                     ("client_last_updated_ts", last_ts.as_str()),
                 ],
             ) {
-                Ok(resp) => resp,
+                Ok(resp) => (resp, entry.id),
                 Err(Fault::Slack(err)) if err == "draft_not_found" || err == "not_found" => {
-                    let nonce = client_msg_id(&now.to_string());
-                    self.api(
-                        "drafts.create",
-                        &[
-                            ("destinations", destinations.as_str()),
-                            ("blocks", blocks.as_str()),
-                            ("client_msg_id", nonce.as_str()),
-                        ],
-                    )?
+                    let nonce = self.draft_client_msg_id(conversation_id, now);
+                    (
+                        self.api(
+                            "drafts.create",
+                            &[
+                                ("destinations", destinations.as_str()),
+                                ("blocks", blocks.as_str()),
+                                ("client_msg_id", nonce.as_str()),
+                            ],
+                        )?,
+                        String::new(),
+                    )
                 }
                 Err(fault) => return Err(fault.into()),
             }
         } else {
-            let nonce = client_msg_id(&now.to_string());
-            self.api(
-                "drafts.create",
-                &[
-                    ("destinations", destinations.as_str()),
-                    ("blocks", blocks.as_str()),
-                    ("client_msg_id", nonce.as_str()),
-                ],
-            )?
+            let nonce = self.draft_client_msg_id(conversation_id, now);
+            (
+                self.api(
+                    "drafts.create",
+                    &[
+                        ("destinations", destinations.as_str()),
+                        ("blocks", blocks.as_str()),
+                        ("client_msg_id", nonce.as_str()),
+                    ],
+                )?,
+                String::new(),
+            )
         };
         let draft_id = response["draft"]["id"]
             .as_str()
             .or_else(|| response["draft_id"].as_str())
-            .unwrap_or("")
-            .to_owned();
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .unwrap_or(fallback_id);
         let updated = draft_updated(&response["draft"]).max(now);
-        let mut state = self.state();
-        if !draft_id.is_empty() {
-            state.drafts_by_id.insert(draft_id.clone(), conversation_id.to_owned());
+        {
+            let mut state = self.state();
+            if !draft_id.is_empty() {
+                state.drafts_by_id.insert(draft_id.clone(), conversation_id.to_owned());
+            }
+            state.drafts.insert(
+                conversation_id.to_owned(),
+                DraftEntry { id: draft_id, updated, text: text.to_owned() },
+            );
         }
-        state.drafts.insert(
-            conversation_id.to_owned(),
-            DraftEntry { id: draft_id, updated, text: text.to_owned() },
-        );
+        self.ctx.set_note(&note_key, &updated.to_string());
         Ok(())
     }
 
@@ -1856,30 +1880,47 @@ impl Slack {
         let Some(conversation_id) = destination else {
             return Ok(());
         };
+        let note_key = format!("draft_at:{conversation_id}");
+        let remote_updated = draft_updated(draft);
         let cleared = cleared_event
             || draft["is_deleted"] == true
             || draft["is_sent"] == true
             || draft["deleted"] == true;
         if cleared {
-            {
+            let should_clear = {
                 let mut state = self.state();
-                if let Some(old) = state.drafts.remove(&conversation_id) {
-                    if !old.id.is_empty() {
-                        state.drafts_by_id.remove(&old.id);
+                let stale = state.drafts.get(&conversation_id).is_some_and(|local| {
+                    let id_mismatch = !id.is_empty() && !local.id.is_empty() && local.id != id;
+                    let older = remote_updated > 0 && local.updated > remote_updated;
+                    id_mismatch || older
+                });
+                if stale {
+                    if !id.is_empty() {
+                        state.drafts_by_id.remove(&id);
                     }
+                    false
+                } else {
+                    if let Some(old) = state.drafts.remove(&conversation_id) {
+                        if !old.id.is_empty() {
+                            state.drafts_by_id.remove(&old.id);
+                        }
+                    }
+                    if !id.is_empty() {
+                        state.drafts_by_id.remove(&id);
+                    }
+                    true
                 }
-                if !id.is_empty() {
-                    state.drafts_by_id.remove(&id);
-                }
+            };
+            if should_clear {
+                self.ctx.set_note(&note_key, "");
+                self.ctx.draft(&conversation_id, "")?;
             }
-            self.ctx.draft(&conversation_id, "")?;
             return Ok(());
         }
         let text = draft_text(draft);
         if text.trim().is_empty() {
             return Ok(());
         }
-        let remote_updated = draft_updated(draft);
         {
             let state = self.state();
             if let Some(local) = state.drafts.get(&conversation_id) {
@@ -1893,11 +1934,20 @@ impl Slack {
                 self.thread_known(channel, root)?;
             }
         }
-        let existing_local = self.ctx.known(&conversation_id)?.map(|c| (c.draft, c.updated));
-        if let Some((stored_draft, stored_at)) = existing_local {
+        let stored_draft = self.ctx.known(&conversation_id)?.map(|c| c.draft);
+        if let Some(stored_draft) = stored_draft {
             let tracked = self.state().drafts.contains_key(&conversation_id);
-            if !tracked && !stored_draft.trim().is_empty() && (remote_updated == 0 || remote_updated < stored_at) {
-                return Ok(());
+            if !tracked && !stored_draft.trim().is_empty() && stored_draft.trim() != text.trim() {
+                let local_at = self.ctx.note(&note_key).and_then(|v| v.parse::<i64>().ok()).filter(|&t| t > 0);
+                // If the local draft has no recorded sync timestamp (written offline) or is newer than
+                // the remote edit, preserve the local text instead of clobbering unsynced work.
+                let keep_local = match local_at {
+                    Some(ts) => remote_updated == 0 || remote_updated < ts,
+                    None => true,
+                };
+                if keep_local {
+                    return Ok(());
+                }
             }
         }
         {
@@ -1909,6 +1959,9 @@ impl Slack {
                 conversation_id.clone(),
                 DraftEntry { id, updated: remote_updated, text: text.clone() },
             );
+        }
+        if remote_updated > 0 {
+            self.ctx.set_note(&note_key, &remote_updated.to_string());
         }
         self.ctx.draft(&conversation_id, &text)?;
         Ok(())
@@ -2011,6 +2064,7 @@ impl Slack {
                     self.state().drafts_by_id.remove(&entry.id);
                 }
             }
+            self.ctx.set_note(&format!("draft_at:{conversation}"), "");
             if let Some(root) = thread {
                 self.report(self.bump(channel, root, &message));
                 if broadcast_thread {
@@ -2324,17 +2378,37 @@ impl Slack {
                 action["selected_time"] = value.into();
             }
             "checkboxes" | "multi_static_select" | "multi_external_select" => {
-                let selected: Vec<Value> = values.iter().map(|v| json!({"value": v})).collect();
+                let picked: Vec<&str> = if values.is_empty() && !value.is_empty() {
+                    vec![value]
+                } else {
+                    values.iter().map(String::as_str).collect()
+                };
+                let selected: Vec<Value> = picked.iter().map(|v| json!({"value": v})).collect();
                 action["selected_options"] = Value::Array(selected);
             }
             "multi_users_select" => {
-                action["selected_users"] = json!(values);
+                let picked: Vec<&str> = if values.is_empty() && !value.is_empty() {
+                    vec![value]
+                } else {
+                    values.iter().map(String::as_str).collect()
+                };
+                action["selected_users"] = json!(picked);
             }
             "multi_conversations_select" => {
-                action["selected_conversations"] = json!(values);
+                let picked: Vec<&str> = if values.is_empty() && !value.is_empty() {
+                    vec![value]
+                } else {
+                    values.iter().map(String::as_str).collect()
+                };
+                action["selected_conversations"] = json!(picked);
             }
             "multi_channels_select" => {
-                action["selected_channels"] = json!(values);
+                let picked: Vec<&str> = if values.is_empty() && !value.is_empty() {
+                    vec![value]
+                } else {
+                    values.iter().map(String::as_str).collect()
+                };
+                action["selected_channels"] = json!(picked);
             }
             _ => {
                 if !value.is_empty() {

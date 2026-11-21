@@ -127,6 +127,15 @@ impl Slack {
                 self.report(self.ctx.message(channel, &in_channel).map_err(Into::into));
             }
         }
+        {
+            let mut state = self.state();
+            if let Some(entry) = state.drafts.remove(conversation) {
+                if !entry.id.is_empty() {
+                    state.drafts_by_id.remove(&entry.id);
+                }
+            }
+        }
+        self.ctx.set_note(&format!("draft_at:{conversation}"), "");
         Ok(message)
     }
 

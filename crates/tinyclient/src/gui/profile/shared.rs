@@ -450,12 +450,12 @@ fn list(shared: &Shared, hub: &Hub, width: f32, cx: &mut App) -> Div {
                         .on_click(move |_, _, cx| {
                             if let Some(path) = &on_disk {
                                 cx.open_url(&format!("file://{path}"));
-                            } else if !fallback_url.is_empty() {
+                            } else if fallback_url.starts_with("https://") || fallback_url.starts_with("http://") {
                                 cx.open_url(&fallback_url);
                             }
                         }),
                 )
-            } else if !item.url.is_empty() {
+            } else if item.url.starts_with("https://") || item.url.starts_with("http://") {
                 let url = item.url.clone();
                 let title = if item.title.is_empty() { link_words(&item.url).to_owned() } else { item.title.clone() };
                 let said = [host(&item.url).to_owned(), item.sender.clone(), crate::gui::time::stamp(crate::view::now(), item.sent)];

@@ -375,10 +375,16 @@ impl Slack {
             let shares = &file["shares"];
             let shared = ["public", "private"].iter().find_map(|access| shares[*access][channel][0]["ts"].as_str());
             let ts = shared.map(str::to_owned).unwrap_or_else(|| format!("{}.000000", file["created"].as_i64().unwrap_or(0)));
-            let permalink = file["permalink"].as_str().unwrap_or("").to_owned();
+            let permalink = file["permalink"]
+                .as_str()
+                .map(str::trim)
+                .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+                .unwrap_or("")
+                .to_owned();
             if kind == SharedKind::Files && self.is_external(file) {
                 let url = file["url_private"]
                     .as_str()
+                    .map(str::trim)
                     .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
                     .unwrap_or(&permalink)
                     .to_owned();
@@ -475,10 +481,16 @@ impl Slack {
                 .filter(|u| !u.is_empty())
                 .map(|u| self.user(u).name)
                 .unwrap_or_default();
-            let permalink = file["permalink"].as_str().unwrap_or("").to_owned();
+            let permalink = file["permalink"]
+                .as_str()
+                .map(str::trim)
+                .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+                .unwrap_or("")
+                .to_owned();
             if self.is_external(file) {
                 let url = file["url_private"]
                     .as_str()
+                    .map(str::trim)
                     .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
                     .unwrap_or(&permalink)
                     .to_owned();
@@ -574,13 +586,23 @@ impl Slack {
             .map_or(&[][..], Vec::as_slice);
         let mut items = Vec::with_capacity(entries.len());
         let mut files = Vec::new();
+        let gif_url_allowed = |u: &str| {
+            self.hosted(u)
+                || super::https_host(u)
+                    .is_some_and(|host| super::within(host, "giphy.com") || super::within(host, "tenor.com"))
+        };
+        let preview_url_allowed = |u: &str| {
+            self.hosted(u)
+                || super::https_host(u)
+                    .is_some_and(|host| super::within(host, "giphy.com") || super::within(host, "media.tenor.com"))
+        };
         for entry in entries {
             let gif_url = entry["url"]
                 .as_str()
                 .or_else(|| entry["media_url"].as_str())
                 .or_else(|| entry["images"]["original"]["url"].as_str())
                 .map(str::trim)
-                .filter(|u| u.starts_with("https://") || u.starts_with("http://"));
+                .filter(|u| gif_url_allowed(u));
             let Some(gif_url) = gif_url else {
                 continue;
             };
@@ -590,8 +612,8 @@ impl Slack {
                 .or_else(|| entry["images"]["fixed_height_small"]["url"].as_str())
                 .or_else(|| entry["images"]["fixed_width_small"]["url"].as_str())
                 .map(str::trim)
-                .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
-                .unwrap_or(gif_url);
+                .filter(|u| preview_url_allowed(u))
+                .or_else(|| preview_url_allowed(gif_url).then_some(gif_url));
             let width = entry["width"]
                 .as_u64()
                 .or_else(|| entry["images"]["fixed_height_small"]["width"].as_str().and_then(|s| s.parse().ok()))
@@ -615,16 +637,19 @@ impl Slack {
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned)
                 .unwrap_or_else(|| if q.is_empty() { "Trending".to_owned() } else { String::new() });
-            let file = MediaFile {
-                width,
-                height,
-                ..MediaFile::new(format!("gif:{:x}", fnv(preview_url)), MediaKind::Image)
-            };
-            files.push((file.clone(), preview_url.to_owned()));
+            let file = preview_url.map(|url| {
+                let file = MediaFile {
+                    width,
+                    height,
+                    ..MediaFile::new(format!("gif:{:x}", fnv(url)), MediaKind::Image)
+                };
+                files.push((file.clone(), url.to_owned()));
+                file
+            });
             items.push(CatalogItem {
                 id: gif_url.to_owned(),
                 name,
-                file: Some(file),
+                file,
                 pack,
                 animated: true,
             });

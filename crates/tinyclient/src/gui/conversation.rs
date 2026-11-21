@@ -214,18 +214,21 @@ struct Earlier {
 /// A Block Kit control waiting for user confirmation before firing (`ConfirmDialog`).
 #[derive(Clone)]
 pub(super) struct PendingControlAction {
+    pub conversation: Key,
     pub message_id: String,
     pub block_id: String,
     pub action_id: String,
     pub element_type: String,
     pub value: String,
     pub values: Vec<String>,
+    pub open_url: Option<String>,
     pub confirm: protocol::ConfirmDialog,
 }
 
 /// An open popover menu for a Block Kit select/overflow/date/time control.
 #[derive(Clone)]
 pub(super) struct OpenSelect {
+    pub conversation: Key,
     pub message_id: String,
     pub block_id: String,
     pub action_id: String,
@@ -700,6 +703,9 @@ impl Pane {
         self.menu = None;
         self.picker = None;
         self.confirm = None;
+        self.action_confirm = None;
+        self.open_select = None;
+        self.pending_actions.clear();
         self.forward = None;
         self.link_ask = None;
         self.hold = None;
@@ -1609,6 +1615,7 @@ impl Pane {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn trigger_control(
         &mut self,
+        conversation: Key,
         message_id: String,
         block_id: String,
         action_id: String,
@@ -1619,26 +1626,64 @@ impl Pane {
         cx: &mut Context<Self>,
     ) {
         self.open_select = None;
+        if self.key() != Some(&conversation) {
+            return;
+        }
         if let Some(confirm) = confirm {
             self.action_confirm = Some(PendingControlAction {
+                conversation,
                 message_id,
                 block_id,
                 action_id,
                 element_type,
                 value,
                 values,
+                open_url: None,
                 confirm,
             });
             cx.notify();
             return;
         }
-        self.execute_control(message_id, block_id, action_id, element_type, value, values, cx);
+        self.execute_control(conversation, message_id, block_id, action_id, element_type, value, values, cx);
+    }
+
+    /// Triggers a Block Kit link button, showing its confirmation dialog first if required.
+    pub(super) fn trigger_link_control(
+        &mut self,
+        conversation: Key,
+        message_id: String,
+        url: String,
+        confirm: Option<protocol::ConfirmDialog>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_select = None;
+        if self.key() != Some(&conversation) {
+            return;
+        }
+        if let Some(confirm) = confirm {
+            self.action_confirm = Some(PendingControlAction {
+                conversation,
+                message_id,
+                block_id: String::new(),
+                action_id: String::new(),
+                element_type: "button".to_owned(),
+                value: String::new(),
+                values: Vec::new(),
+                open_url: Some(url),
+                confirm,
+            });
+            cx.notify();
+            return;
+        }
+        self.open_external_link(&url, window, cx);
     }
 
     /// Sends `Request::MessageAction` off-thread, tracking pending state and toasting any refusal.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn execute_control(
         &mut self,
+        conversation: Key,
         message_id: String,
         block_id: String,
         action_id: String,
@@ -1647,9 +1692,9 @@ impl Pane {
         values: Vec<String>,
         cx: &mut Context<Self>,
     ) {
-        let Some(conversation) = self.key().cloned() else {
+        if self.key() != Some(&conversation) {
             return;
-        };
+        }
         let key = (message_id.clone(), action_id.clone());
         self.pending_actions.insert(key.clone(), Instant::now());
         cx.notify();

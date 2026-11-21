@@ -676,7 +676,14 @@ impl Pane {
             return;
         }
         // A menu or the picker belongs to a message: the toolbar stays with it.
-        if self.menu.is_some() || self.picker.is_some() || self.confirm.is_some() || self.link_ask.is_some() || self.viewer.is_some() {
+        if self.menu.is_some()
+            || self.picker.is_some()
+            || self.confirm.is_some()
+            || self.action_confirm.is_some()
+            || self.open_select.is_some()
+            || self.link_ask.is_some()
+            || self.viewer.is_some()
+        {
             return;
         }
         #[cfg(feature = "gui-shot")]
@@ -718,6 +725,8 @@ impl Pane {
         self.menu.as_ref().is_some_and(|menu| menu.message.id == id)
             || self.picker.as_ref().is_some_and(|picking| picking.message == id)
             || self.confirm.as_ref().is_some_and(|message| message.id == id)
+            || self.action_confirm.as_ref().is_some_and(|pending| pending.message_id == id)
+            || self.open_select.as_ref().is_some_and(|open| open.message_id == id)
     }
 
     /// A phone's press on a message went down: the actions come up if it holds still for
@@ -766,6 +775,12 @@ impl Pane {
             self.close_viewer(cx);
         } else if self.confirm.is_some() {
             self.confirm = None;
+            cx.notify();
+        } else if self.action_confirm.is_some() {
+            self.action_confirm = None;
+            cx.notify();
+        } else if self.open_select.is_some() {
+            self.open_select = None;
             cx.notify();
         } else if self.link_ask.is_some() {
             self.close_link_ask(cx);
@@ -2171,11 +2186,13 @@ impl Pane {
         let mut list = menu().w(px(240.));
         for (ix, opt) in open.options.iter().enumerate() {
             let active = open.selected.as_deref() == Some(opt.value.as_str());
+            let conversation = open.conversation.clone();
             let msg_id = open.message_id.clone();
             let block_id = open.block_id.clone();
             let action_id = open.action_id.clone();
             let element_type = open.element_type.clone();
             let val = opt.value.clone();
+            let values = if element_type.starts_with("multi_") { vec![val.clone()] } else { Vec::new() };
             let confirm = open.confirm.clone();
             let label = if active { format!("✓ {}", opt.label) } else { opt.label.clone() };
             list = list.child(
@@ -2183,12 +2200,13 @@ impl Pane {
                     .when(active, |row| row.bg(theme::selected()))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.trigger_control(
+                            conversation.clone(),
                             msg_id.clone(),
                             block_id.clone(),
                             action_id.clone(),
                             element_type.clone(),
                             val.clone(),
-                            Vec::new(),
+                            values.clone(),
                             confirm.clone(),
                             cx,
                         );
@@ -2229,17 +2247,25 @@ impl Pane {
                         this.action_confirm = None;
                         cx.notify();
                     })))
-                    .child(button("ctrl-confirm-ok", ButtonKind::Primary, ok).on_click(cx.listener(move |this, _, _, cx| {
+                    .child(button("ctrl-confirm-ok", ButtonKind::Primary, ok).on_click(cx.listener(move |this, _, window, cx| {
                         this.action_confirm = None;
-                        this.execute_control(
-                            to_run.message_id.clone(),
-                            to_run.block_id.clone(),
-                            to_run.action_id.clone(),
-                            to_run.element_type.clone(),
-                            to_run.value.clone(),
-                            to_run.values.clone(),
-                            cx,
-                        );
+                        if let Some(url) = &to_run.open_url {
+                            if this.key() == Some(&to_run.conversation) {
+                                this.open_external_link(url, window, cx);
+                            }
+                            cx.notify();
+                        } else {
+                            this.execute_control(
+                                to_run.conversation.clone(),
+                                to_run.message_id.clone(),
+                                to_run.block_id.clone(),
+                                to_run.action_id.clone(),
+                                to_run.element_type.clone(),
+                                to_run.value.clone(),
+                                to_run.values.clone(),
+                                cx,
+                            );
+                        }
                     }))),
             )
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
