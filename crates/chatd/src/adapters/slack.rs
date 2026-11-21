@@ -498,7 +498,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
             session.user_agent = browser().to_owned();
         }
         let moved = api != session.url;
-        let agent = ureq::Agent::config_builder()
+        let agent = crate::adapters::net::apply_proxy(ureq::Agent::config_builder())
             .tls_config(crate::tls::config())
             .timeout_global(Some(Duration::from_secs(30)))
             .http_status_as_error(false)

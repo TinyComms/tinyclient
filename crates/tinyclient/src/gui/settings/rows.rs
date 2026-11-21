@@ -37,6 +37,8 @@ pub const ROWS: &[Row] = &[
     row("G2", General, "", "Keep receiving when the window is closed", &[], &["background", "quit", "close", "run", "daemon"]),
     row("G3", General, "", "Keep tinyclient in the tray when I close the window", &[], &["tray", "notification area", "systray", "system tray", "icon", "hide", "background", "close"]),
     row("G4", General, "", "Install updates automatically", &[], &["update", "upgrade", "version", "install", "automatic"]),
+    row("GN1", General, "Network", "Proxy", &["Use system proxy", "No proxy", "Custom"], &["proxy", "socks", "socks5", "http", "network", "corporate", "firewall"]),
+    row("GN2", General, "Network", "Custom proxy", &["HTTP", "SOCKS5"], &["proxy", "socks", "socks5", "host", "port", "http", "network"]),
     row("N1", Notifications, "", "Show notifications", &[], &["notify", "notification", "alert", "banner", "toast", "popup"]),
     row("N2", Notifications, "", "Notify me about", &["Direct messages and mentions", "All messages"], &["dm", "mention", "every message", "channel"]),
     row("ND", Notifications, "Notify for", "Direct messages", &[], &["dm", "private", "notify"]),
@@ -121,8 +123,6 @@ pub const ROWS: &[Row] = &[
 /// Words for what tinyclient does not have yet, or will not have, so a search for one gets an
 /// honest line rather than nothing.
 pub const NOT_YET: &[(&str, &str)] = &[
-    ("proxy", "tinyclient has no proxy setting yet."),
-    ("socks", "tinyclient has no proxy setting yet."),
     ("accent", "tinyclient keeps one accent colour."),
     ("font", "tinyclient keeps the system font. Text size is in Appearance."),
     ("language", crate::host::FOLLOWS_LANGUAGE),
@@ -239,7 +239,7 @@ pub fn kept_by_chatd(id: &str) -> bool {
     matches!(
         id,
         "N1" | "N2" | "ND" | "NG" | "NM" | "NT" | "NR" | "NF" | "NK" | "N4" | "NL" | "N5" | "N6" | "N7" | "N8" | "N9" | "N10" | "N11" | "N13" | "S2" | "S3" | "S4" | "SV" | "S13" | "S14"
-            | "G2" | "S1" | "S7" | "S8" | "S9" | "S10" | "P1" | "P2" | "P4" | "PE" | "V1" | "V2" | "V3" | "V4" | "V5" | "V6" | "V22" | "V8" | "V10" | "V11" | "V12" | "V13" | "V14" | "V15" | "V16" | "V17" | "V19" | "V20" | "V21" | "D1" | "D2" | "D3"
+            | "G2" | "GN1" | "GN2" | "S1" | "S7" | "S8" | "S9" | "S10" | "P1" | "P2" | "P4" | "PE" | "V1" | "V2" | "V3" | "V4" | "V5" | "V6" | "V22" | "V8" | "V10" | "V11" | "V12" | "V13" | "V14" | "V15" | "V16" | "V17" | "V19" | "V20" | "V21" | "D1" | "D2" | "D3"
     )
 }
 
@@ -370,8 +370,13 @@ mod tests {
 
     #[test]
     fn a_search_for_what_is_not_built_says_so() {
-        assert!(search("proxy").is_empty());
-        assert_eq!(not_yet("proxy"), Some("tinyclient has no proxy setting yet."));
+        // Proxy is built now.
+        assert!(search("proxy").iter().any(|row| row.id == "GN1"));
+        assert!(search("socks").iter().any(|row| row.id == "GN1"));
+        assert_eq!(not_yet("proxy"), None);
+        assert_eq!(not_yet("socks"), None);
+        // Accent is intentionally not customizable yet.
+        assert_eq!(not_yet("accent"), Some("tinyclient keeps one accent colour."));
         // Reactions, thread replies and keywords are built now.
         assert!(search("reactions").iter().any(|row| row.id == "NR"));
         assert!(search("threads").iter().any(|row| row.id == "NF"));

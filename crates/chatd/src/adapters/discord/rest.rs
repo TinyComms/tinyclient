@@ -32,7 +32,7 @@ fn build(user_agent: &str) -> Option<u64> {
     if faked && std::env::var_os("TINYCLIENT_DISCORD_LOGIN").is_none() {
         return None;
     }
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+    let agent: ureq::Agent = crate::adapters::net::apply_proxy(ureq::Agent::config_builder())
         .tls_config(crate::tls::config())
         .timeout_global(Some(BUILD_PATIENCE))
         .http_status_as_error(false)

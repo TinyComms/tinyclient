@@ -238,6 +238,7 @@ impl Hub {
 
     fn tap_settings(self, values: &Values) -> Self {
         apply_log_policy(values);
+        crate::adapters::net::configure_proxy(values);
         self
     }
 
@@ -256,7 +257,10 @@ impl Hub {
         let mut store = self.store();
         store.set_setting(scope, key, value.as_deref())?;
         lock(&self.settings).set(scope, key, value);
-        apply_log_policy(&self.settings());
+        let current = self.settings();
+        apply_log_policy(&current);
+        crate::adapters::net::configure_proxy(&current);
+        drop(current);
         drop(store);
         self.changed(Change::Settings);
         Ok(())
@@ -268,7 +272,10 @@ impl Hub {
         if let Ok(stored) = store.settings() {
             *lock(&self.settings) = Values::new(stored);
         }
-        apply_log_policy(&self.settings());
+        let current = self.settings();
+        apply_log_policy(&current);
+        crate::adapters::net::configure_proxy(&current);
+        drop(current);
         drop(store);
         self.changed(Change::Settings);
     }

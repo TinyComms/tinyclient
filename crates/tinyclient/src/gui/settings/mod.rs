@@ -431,6 +431,9 @@ pub struct SettingsWindow {
     pane_scroll: gpui::ScrollHandle,
     /// Comma-separated keywords for Settings › Notifications › Keywords (NK).
     pub(super) notify_keywords: Entity<TextInput>,
+    /// Custom proxy host and port for Settings › General › Network (GN2).
+    pub(super) proxy_host: Entity<TextInput>,
+    pub(super) proxy_port: Entity<TextInput>,
     /// The Linux passphrase for the screen lock. Other systems use the device prompt.
     #[cfg(target_os = "linux")]
     lock_phrase: Entity<TextInput>,
@@ -448,6 +451,28 @@ impl SettingsWindow {
             let mut input = TextInput::new("deploy, incident, your name", cx);
             if !initial_kw.is_empty() {
                 input.insert(&initial_kw, cx);
+            }
+            input
+        });
+        let initial_host = prefs::values()
+            .stored(protocol::settings::GLOBAL, protocol::settings::PROXY_HOST)
+            .unwrap_or("")
+            .to_owned();
+        let initial_port = prefs::values()
+            .stored(protocol::settings::GLOBAL, protocol::settings::PROXY_PORT)
+            .unwrap_or("")
+            .to_owned();
+        let proxy_host = cx.new(|cx| {
+            let mut input = TextInput::new("127.0.0.1", cx);
+            if !initial_host.is_empty() {
+                input.insert(&initial_host, cx);
+            }
+            input
+        });
+        let proxy_port = cx.new(|cx| {
+            let mut input = TextInput::new("1080", cx);
+            if !initial_port.is_empty() {
+                input.insert(&initial_port, cx);
             }
             input
         });
@@ -530,6 +555,8 @@ impl SettingsWindow {
             loopback: false,
             pane_scroll: gpui::ScrollHandle::new(),
             notify_keywords,
+            proxy_host,
+            proxy_port,
             #[cfg(target_os = "linux")]
             lock_phrase,
             _subscriptions: subscriptions,

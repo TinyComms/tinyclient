@@ -364,6 +364,14 @@ impl SettingsWindow {
                     groups.push(self.group(&["G3"], None, window, cx).child(caption(self.tray_caption())));
                 }
                 groups.push(self.group(&["G4"], None, window, cx).child(caption(self.updates_caption())));
+                let proxy_rows: &[&str] = if prefs::values().word(GLOBAL, keys::PROXY_MODE) == "custom" {
+                    &["GN1", "GN2"]
+                } else {
+                    &["GN1"]
+                };
+                groups.push(self.group(proxy_rows, Some("Network"), window, cx).child(caption(
+                    "Applies to network requests and gateways. Voice calls use UDP, which does not cross an HTTP proxy (Tiny falls back to ICE-TCP; Discord voice has no TCP mode). Sign-in windows follow the system proxy.",
+                )));
                 groups
             }
             Section::Notifications => self.notifications_page(window, cx),
@@ -598,6 +606,73 @@ impl SettingsWindow {
             "G4" => {
                 let on = choices.updates;
                 self.switch_row(id, on, true, None, move |this, on, cx| this.set_updates(on, cx), cx)
+            }
+            "GN1" => {
+                let current_word = values.word(GLOBAL, keys::PROXY_MODE);
+                let current = keys::PROXY_MODE_CHOICES.iter().position(|w| *w == current_word).unwrap_or(0);
+                self.segmented_row(
+                    id,
+                    &["System", "None", "Custom"],
+                    current,
+                    0,
+                    None,
+                    |this, ix, cx| {
+                        let word = keys::PROXY_MODE_CHOICES[ix];
+                        let stored = (word != "system").then(|| word.to_owned());
+                        this.set("GN1", GLOBAL.into(), keys::PROXY_MODE, stored, cx);
+                    },
+                    cx,
+                )
+            }
+            "GN2" => {
+                let scheme_word = values.word(GLOBAL, keys::PROXY_SCHEME);
+                let is_socks = scheme_word == "socks5";
+                let scheme_btn = button(
+                    "gn2-scheme",
+                    ButtonKind::Secondary,
+                    if is_socks { "SOCKS5" } else { "HTTP" },
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let next = if is_socks { None } else { Some("socks5".to_owned()) };
+                    this.set("GN2", GLOBAL.into(), keys::PROXY_SCHEME, next, cx);
+                }));
+                let host_field = div()
+                    .w(px(120.))
+                    .h(px(28.))
+                    .px(px(6.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::field())
+                    .border_1()
+                    .border_color(theme::border())
+                    .flex()
+                    .items_center()
+                    .child(self.proxy_host.clone());
+                let port_field = div()
+                    .w(px(56.))
+                    .h(px(28.))
+                    .px(px(6.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::field())
+                    .border_1()
+                    .border_color(theme::border())
+                    .flex()
+                    .items_center()
+                    .child(self.proxy_port.clone());
+                let save = button("gn2-save", ButtonKind::Secondary, "Save").on_click(cx.listener(|this, _, _, cx| {
+                    let host = this.proxy_host.read(cx).text().trim().to_owned();
+                    let port = this.proxy_port.read(cx).text().trim().to_owned();
+                    this.set("GN2", GLOBAL.into(), keys::PROXY_HOST, (!host.is_empty()).then_some(host), cx);
+                    this.set("GN2", GLOBAL.into(), keys::PROXY_PORT, (!port.is_empty()).then_some(port), cx);
+                }));
+                let control = div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(scheme_btn)
+                    .child(host_field)
+                    .child(port_field)
+                    .child(save);
+                row(label, Some("Fails closed if host or port is missing.".into()), control)
             }
             "S1" => {
                 let on = values.on(SOUNDS);

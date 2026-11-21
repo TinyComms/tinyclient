@@ -740,7 +740,7 @@ fn uploads_to(network: Network, url: &str) -> bool {
 }
 
 fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
+    crate::adapters::net::apply_proxy(ureq::Agent::config_builder())
         .tls_config(crate::tls::config())
         .timeout_connect(Some(Duration::from_secs(10)))
         // A large file on a slow line is one request, so nothing limits the body; the answer

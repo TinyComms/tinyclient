@@ -425,26 +425,21 @@ fn saved_for(session: &str, user_id: &str) -> Result<Saved, String> {
 /// connect and the TLS handshake, slow on Windows) is made once and kept for the next request.
 /// The pool is per host inside it, and an idle connection is let go after [`IDLE`].
 fn agent() -> ureq::Agent {
-    static SHARED: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
-    SHARED
-        .get_or_init(|| {
-            ureq::Agent::config_builder()
-                .tls_config(crate::tls::config())
-                .timeout_global(Some(TIMEOUT))
-                .max_idle_age(IDLE)
-                .http_status_as_error(false)
-                .max_redirects(0)
-                .max_redirects_will_error(false)
-                .user_agent("tinyclient")
-                .build()
-                .into()
-        })
-        .clone()
+    crate::adapters::net::apply_proxy(ureq::Agent::config_builder())
+        .tls_config(crate::tls::config())
+        .timeout_global(Some(TIMEOUT))
+        .max_idle_age(IDLE)
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .max_redirects_will_error(false)
+        .user_agent("tinyclient")
+        .build()
+        .into()
 }
 
 /// A bespoke agent for a request with its own long timeout (an upload). It keeps no pool.
 fn agent_with_timeout(timeout: Duration) -> ureq::Agent {
-    ureq::Agent::config_builder()
+    crate::adapters::net::apply_proxy(ureq::Agent::config_builder())
         .tls_config(crate::tls::config())
         .timeout_global(Some(timeout))
         .http_status_as_error(false)
