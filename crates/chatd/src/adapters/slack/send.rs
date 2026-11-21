@@ -51,7 +51,7 @@ impl Slack {
             None => (conversation, reply_to),
         };
         let broadcast_thread = with.broadcast && thread_of(conversation).is_some();
-        let ids = self.upload(up)?;
+        let ids = self.upload(up, with.snippet_type.as_deref())?;
         up.check()?;
 
         // The socket names the message that holds the files: it is watched for before Slack is
@@ -118,13 +118,18 @@ impl Slack {
     }
 
     /// Asks for an address per file and posts each file's bytes there from its path. Answers
-    /// the file ids, in order.
-    fn upload(&self, up: &mut Upload) -> Result<Vec<String>, String> {
+    /// the file ids, in order. When `snippet_type` is given, asks Slack to create a code/text snippet.
+    fn upload(&self, up: &mut Upload, snippet_type: Option<&str>) -> Result<Vec<String>, String> {
         let mut ids = Vec::with_capacity(up.files().len());
+        let snippet = snippet_type.map(str::trim).filter(|s| !s.is_empty());
         for at in 0..up.files().len() {
             up.check()?;
             let (name, length) = (up.files()[at].name.clone(), up.files()[at].bytes.to_string());
-            let address = self.api("files.getUploadURLExternal", &[("filename", name.as_str()), ("length", length.as_str())]);
+            let mut params = vec![("filename", name.as_str()), ("length", length.as_str())];
+            if let Some(lang) = snippet {
+                params.push(("snippet_type", lang));
+            }
+            let address = self.api("files.getUploadURLExternal", &params);
             let address = address.map_err(|fault| format!("{name} could not be sent: {}", super::reason(fault)))?;
             let (Some(url), Some(id)) = (address["upload_url"].as_str(), address["file_id"].as_str()) else {
                 return Err(format!("{name} could not be sent: Slack gave no address for it."));

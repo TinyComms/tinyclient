@@ -4,7 +4,7 @@
 //! user opened or clicked something, or (previews) because the rows are on screen, paced.
 
 use super::{emoji, fnv, seconds, thread_id, thread_of, Fault, Slack};
-use crate::adapters::{ActivityPage, CatalogPage, ConversationAbout, Failure, SharedPage};
+use crate::adapters::{AccountFilesPage, ActivityPage, CatalogPage, ConversationAbout, Failure, SharedPage};
 use crate::store::Filing;
 use protocol::{ActivityItem, ActivityItemKind, Bookmark, BookmarkKind, CatalogItem, ConversationKind, MediaFile, MediaKind, Message, Notify, SharedItem, SharedKind};
 use serde_json::{json, Value};
@@ -375,6 +375,31 @@ impl Slack {
             let shares = &file["shares"];
             let shared = ["public", "private"].iter().find_map(|access| shares[*access][channel][0]["ts"].as_str());
             let ts = shared.map(str::to_owned).unwrap_or_else(|| format!("{}.000000", file["created"].as_i64().unwrap_or(0)));
+            let permalink = file["permalink"].as_str().unwrap_or("").to_owned();
+            if kind == SharedKind::Files && self.is_external(file) {
+                let url = file["url_private"]
+                    .as_str()
+                    .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+                    .unwrap_or(&permalink)
+                    .to_owned();
+                if !url.is_empty() {
+                    let sender = file["user"].as_str().filter(|u| !u.is_empty()).map(|u| self.user(u).name).unwrap_or_default();
+                    let title = file["title"]
+                        .as_str()
+                        .or_else(|| file["name"].as_str())
+                        .unwrap_or("External file")
+                        .to_owned();
+                    items.push(SharedItem {
+                        message_id: file["id"].as_str().unwrap_or(&ts).to_owned(),
+                        sent: file["created"].as_i64().unwrap_or_else(|| seconds(&ts)),
+                        sender,
+                        attachment: None,
+                        url,
+                        title,
+                    });
+                }
+                continue;
+            }
             let event = json!({"type": "message", "ts": ts, "user": file["user"], "files": [file]});
             let Some(message) = self.message(channel, &event) else {
                 continue;
@@ -386,8 +411,8 @@ impl Slack {
                     sent: message.sent,
                     sender: message.sender.name.clone(),
                     attachment: Some(attachment.clone()),
-                    url: String::new(),
-                    title: String::new(),
+                    url: permalink.clone(),
+                    title: attachment.name.clone(),
                 });
             }
         }
@@ -396,6 +421,106 @@ impl Slack {
         // The total counts files of every kind asked for; for "all" that includes pictures.
         let total = paging["total"].as_u64().filter(|_| before.is_none() && kind == SharedKind::Media).map(|total| total as u32);
         Ok(SharedPage { items, more, total })
+    }
+
+    /// Paged workspace-wide file browser (`files.list` without a channel). Never walks the whole
+    /// workspace; returns one page plus `cursor` for the next page.
+    pub(super) fn account_files(
+        &self,
+        query: &str,
+        kind: Option<&str>,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<AccountFilesPage, Fault> {
+        let count = limit.clamp(1, FILES_PAGE).to_string();
+        let page_num: u32 = cursor.and_then(|c| c.parse().ok()).unwrap_or(1).max(1);
+        let page_str = page_num.to_string();
+        let types = match kind.map(str::trim).unwrap_or("") {
+            "" | "all" => "all",
+            "snippets" | "code" => "snippets",
+            "images" | "media" => "images",
+            "pdfs" | "pdf" => "pdfs",
+            "gdocs" | "external" => "gdocs",
+            other => other,
+        };
+        let listed = self.api(
+            "files.list",
+            &[("types", types), ("count", count.as_str()), ("page", page_str.as_str())],
+        )?;
+        let files = listed["files"].as_array().map_or(&[][..], Vec::as_slice);
+        let needle = query.trim().to_ascii_lowercase();
+        let mut items = Vec::with_capacity(files.len());
+        let mut media = Vec::new();
+        let mut variants = Vec::new();
+        for file in files {
+            let Some(id) = file["id"].as_str().filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let title = file["title"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| file["name"].as_str().filter(|s| !s.is_empty()))
+                .unwrap_or("untitled")
+                .to_owned();
+            let name = file["name"].as_str().unwrap_or(&title);
+            if !needle.is_empty()
+                && !title.to_ascii_lowercase().contains(&needle)
+                && !name.to_ascii_lowercase().contains(&needle)
+            {
+                continue;
+            }
+            let sent = file["created"].as_i64().unwrap_or(0);
+            let sender = file["user"]
+                .as_str()
+                .filter(|u| !u.is_empty())
+                .map(|u| self.user(u).name)
+                .unwrap_or_default();
+            let permalink = file["permalink"].as_str().unwrap_or("").to_owned();
+            if self.is_external(file) {
+                let url = file["url_private"]
+                    .as_str()
+                    .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+                    .unwrap_or(&permalink)
+                    .to_owned();
+                items.push(SharedItem {
+                    message_id: id.to_owned(),
+                    sent,
+                    sender,
+                    attachment: None,
+                    url,
+                    title,
+                });
+                continue;
+            }
+            let attachment = self.file(file, &mut media, &mut variants);
+            items.push(SharedItem {
+                message_id: id.to_owned(),
+                sent,
+                sender,
+                attachment,
+                url: permalink,
+                title,
+            });
+        }
+        let mut sized = variants.iter().filter(|(_, sizes)| !sizes.is_empty());
+        if let Err(err) = self.ctx.media(&media).and_then(|()| sized.try_for_each(|(id, sizes)| self.ctx.media_variants(id, sizes))) {
+            tracing::warn!("chatd: Slack: {err}");
+        }
+        let paging = &listed["paging"];
+        let page = paging["page"].as_u64().unwrap_or(u64::from(page_num)) as u32;
+        let pages = paging["pages"].as_u64().unwrap_or(1) as u32;
+        let more = page < pages;
+        let next_cursor = more.then(|| (page + 1).to_string());
+        Ok(AccountFilesPage { items, cursor: next_cursor, more })
+    }
+
+    /// Deletes a Slack file (`files.delete`, own files).
+    pub(super) fn delete_file(&self, file_id: &str) -> Result<(), Fault> {
+        if file_id.trim().is_empty() {
+            return Err(Fault::Slack("file_not_found".to_owned()));
+        }
+        self.api("files.delete", &[("file", file_id.trim())])?;
+        Ok(())
     }
 
     /// The workspace's custom emoji, from the list kept a day (`list_emoji`), a page at a time,

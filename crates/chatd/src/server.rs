@@ -3695,6 +3695,31 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::AccountFiles { account, query, kind, cursor, limit } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let limit = if limit == 0 { 25 } else { limit.min(100) };
+                match self.ask(&account, |reply| Command::AccountFiles { query, kind, cursor, limit, reply }) {
+                    Ok(mut page) => {
+                        for item in &mut page.items {
+                            clip(&mut item.title, 256);
+                            clip(&mut item.url, 2_000);
+                        }
+                        Response::AccountFiles { items: page.items, cursor: page.cursor, more: page.more }
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::DeleteFile { account, file_id } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::DeleteFile { file_id, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
                     Some(id) => self.hub.settings().custom_sound(id).is_some(),

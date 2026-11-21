@@ -162,6 +162,8 @@ fn reason(fault: Fault) -> String {
         Fault::Slack(error) => match error.as_str() {
             "cant_update_message" | "edit_window_closed" => "This message can no longer be edited.",
             "cant_delete_message" => "Slack does not let you delete this message.",
+            "cant_delete_file" => "Slack does not let you delete this file.",
+            "file_not_found" | "file_deleted" => "That file is gone.",
             "message_not_found" => "That message is gone.",
             "too_many_reactions" => "You have added as many reactions to this message as Slack allows.",
             "too_many_emoji" => "This message has as many different reactions as Slack allows.",
@@ -342,7 +344,8 @@ fn per_minute(method: &str) -> f64 {
         | "drafts.list"
         | "drafts.create"
         | "drafts.update"
-        | "drafts.delete" => 20.,
+        | "drafts.delete"
+        | "files.delete" => 20.,
         "conversations.members" | "users.info" | "users.profile.get" => 100.,
         // One message a second per channel, and the sign-in check is in a tier of its own.
         "chat.postMessage" | "auth.test" => 60.,
@@ -1517,6 +1520,12 @@ impl Slack {
             Command::Join { conversation_id, reply } => {
                 answer(reply, self.join_channel(&conversation_id))
             }
+            Command::AccountFiles { query, kind, cursor, limit, reply } => {
+                answer(reply, self.account_files(&query, kind.as_deref(), cursor.as_deref(), limit))
+            }
+            Command::DeleteFile { file_id, reply } => {
+                answer(reply, self.delete_file(&file_id))
+            }
             Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
             Command::OpenThreads(_) => self.report(self.open_threads()),
             Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
@@ -2638,6 +2647,7 @@ fn capabilities() -> protocol::Capabilities {
         groups: 8,
         save_messages: true,
         rich_status: true,
+        manage_files: true,
         ..protocol::Capabilities::default()
     }
 }

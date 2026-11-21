@@ -221,6 +221,14 @@ pub struct SharedPage {
     pub total: Option<u32>,
 }
 
+/// One page of workspace/account-wide files (`Command::AccountFiles`).
+#[derive(Debug, Clone, Default)]
+pub struct AccountFilesPage {
+    pub items: Vec<SharedItem>,
+    pub cursor: Option<String>,
+    pub more: bool,
+}
+
 /// A page of a picker's catalog, and where the next one starts.
 #[derive(Debug, Clone, Default)]
 pub struct CatalogPage {
@@ -482,6 +490,19 @@ pub enum Command {
     /// Join a public channel (`conversations.join`).
     Join {
         conversation_id: String,
+        reply: Reply<()>,
+    },
+    /// Paged workspace/account-wide file list (Slack `files.list` without a channel).
+    AccountFiles {
+        query: String,
+        kind: Option<String>,
+        cursor: Option<String>,
+        limit: u32,
+        reply: Reply<AccountFilesPage>,
+    },
+    /// Delete a file on the network (Slack `files.delete`).
+    DeleteFile {
+        file_id: String,
         reply: Reply<()>,
     },
     /// A Space's info, opened from its name.
@@ -769,7 +790,9 @@ impl Command {
             Command::BookmarkRemove { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BrowseChannels { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::PreviewChannel { reply, .. }
-            | Command::Join { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            | Command::Join { reply, .. }
+            | Command::DeleteFile { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AccountFiles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReactionRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendWith { conversation_id, client_id, .. } => {
                 let why = format!("Sending files and options is not built for {} yet.", ctx.account.network.label());

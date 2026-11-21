@@ -80,6 +80,82 @@ pub(super) fn is_list(file: &Value) -> bool {
     matches!(mime.as_str(), "application/vnd.slack-list" | "application/vnd.slack.list")
 }
 
+/// True when a Slack file entry is an inline code/text snippet (`mode == "snippet"`).
+pub(super) fn is_snippet(file: &Value) -> bool {
+    file["mode"].as_str() == Some("snippet")
+}
+
+/// True when a Slack file entry is a legacy Slack Post (`mode == "post"` or `filetype` `post`/`space`).
+pub(super) fn is_post(file: &Value) -> bool {
+    if file["mode"].as_str() == Some("post") {
+        return true;
+    }
+    let ft = file["filetype"].as_str().unwrap_or("").to_ascii_lowercase();
+    matches!(ft.as_str(), "post" | "space")
+}
+
+/// Human-readable provider name for an externally hosted file (Google Drive, Dropbox, OneDrive, Box).
+pub(super) fn external_provider(file: &Value) -> String {
+    let raw = file["external_type"].as_str().unwrap_or("").trim().to_ascii_lowercase();
+    match raw.as_str() {
+        "gdrive" | "google_drive" | "google" => return "Google Drive".to_owned(),
+        "dropbox" => return "Dropbox".to_owned(),
+        "onedrive" | "sharepoint" => return "OneDrive".to_owned(),
+        "box" => return "Box".to_owned(),
+        _ => {}
+    }
+    let url = first(&[&file["url_private"], &file["permalink"]]).unwrap_or("").to_ascii_lowercase();
+    if url.contains("docs.google.com") || url.contains("drive.google.com") {
+        "Google Drive".to_owned()
+    } else if url.contains("dropbox.com") {
+        "Dropbox".to_owned()
+    } else if url.contains("onedrive.live.com") || url.contains("sharepoint.com") {
+        "OneDrive".to_owned()
+    } else if url.contains("box.com") {
+        "Box".to_owned()
+    } else if !raw.is_empty() {
+        raw
+    } else {
+        "External file".to_owned()
+    }
+}
+
+/// Appends a Slack snippet's inline preview as a `Style::CodeBlock` span onto `rich`.
+fn append_snippet_preview(file: &Value, rich: &mut Rich) {
+    let raw = first(&[&file["preview"], &file["plain_text"], &file["preview_plain_text"]]);
+    let Some(code) = raw else {
+        return;
+    };
+    let title = first(&[&file["title"], &file["name"]]).unwrap_or("");
+    if !title.is_empty() {
+        rich.line();
+        let start = rich.text.len() as u32;
+        rich.text.push_str(title);
+        let end = rich.text.len() as u32;
+        if end > start {
+            rich.spans.push(Span { start, end, style: Style::Bold });
+        }
+    }
+    rich.line();
+    let start = rich.text.len() as u32;
+    rich.text.push_str(code);
+    let end = rich.text.len() as u32;
+    if end > start {
+        let language = file["filetype"].as_str().unwrap_or("").to_owned();
+        rich.spans.push(Span { start, end, style: Style::CodeBlock { language } });
+    }
+    let more = file["lines_more"].as_u64().unwrap_or(0);
+    if more > 0 {
+        rich.line();
+        let total = file["lines"].as_u64().unwrap_or(0);
+        if total > 0 {
+            rich.text.push_str(&format!("… {more} more lines ({total} total)"));
+        } else {
+            rich.text.push_str(&format!("… {more} more lines"));
+        }
+    }
+}
+
 /// Decodes common HTML entities and strips HTML markup into clean, readable plain text.
 pub(super) fn strip_html(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
@@ -803,12 +879,100 @@ impl Slack {
         }
     }
 
+    /// True when a Slack file is hosted outside Slack (Google Drive, Dropbox, Box, OneDrive)
+    /// and should open externally rather than attempting a Slack blob download.
+    pub(super) fn is_external(&self, file: &Value) -> bool {
+        if file["mode"].as_str() == Some("external") || file["is_external"] == true {
+            return true;
+        }
+        file["url_private"]
+            .as_str()
+            .is_some_and(|u| (u.starts_with("https://") || u.starts_with("http://")) && !self.hosted(u))
+    }
+
+    /// Maps an externally hosted file (`mode == "external"`, Google Drive, Dropbox, etc.) into a
+    /// structured card with an open link instead of attempting a broken Slack blob download.
+    fn external_file_card(&self, file: &Value, fallback_link: &str) -> Card {
+        let provider = external_provider(file);
+        let title = first(&[&file["title"], &file["name"]]).unwrap_or("External file").trim().to_owned();
+        let link = first(&[&file["url_private"], &file["permalink"]])
+            .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+            .unwrap_or(fallback_link)
+            .to_owned();
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(pretty) = first(&[&file["pretty_type"]]) {
+            parts.push(pretty.to_owned());
+        }
+        let size = file["size"].as_u64().unwrap_or(0);
+        if size > 0 {
+            let label = if size >= 1024 * 1024 {
+                format!("{:.1} MB", size as f64 / (1024. * 1024.))
+            } else if size >= 1024 {
+                format!("{} KB", size.div_ceil(1024))
+            } else {
+                format!("{size} B")
+            };
+            parts.push(label);
+        }
+        let preview = first(&[&file["preview_plain_text"], &file["preview"]])
+            .map(strip_html)
+            .unwrap_or_default();
+        let text = match (parts.is_empty(), preview.is_empty()) {
+            (false, false) => format!("{}\n{}", parts.join(" · "), preview),
+            (false, true) => parts.join(" · "),
+            (true, false) => preview,
+            (true, true) => format!("Hosted in {provider}"),
+        };
+        let footer = if provider == "External file" {
+            "Open in browser".to_owned()
+        } else {
+            format!("Open in {provider}")
+        };
+        Card {
+            author: provider,
+            title,
+            title_link: link,
+            text,
+            fields: Vec::new(),
+            footer,
+            image: None,
+            thumbnail: None,
+            color: Some(0x1d_9bd1),
+            sponsored: false,
+        }
+    }
+
+    /// Maps a legacy Slack Post (`mode == "post"`, `filetype` `post`/`space`) into a read-only card.
+    fn post_card(&self, file: &Value, fallback_link: &str) -> Card {
+        let title = first(&[&file["title"], &file["name"]]).unwrap_or("Slack Post").trim().to_owned();
+        let link = first(&[&file["permalink"], &file["url_private"]])
+            .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+            .unwrap_or(fallback_link)
+            .to_owned();
+        let text = first(&[&file["preview_plain_text"], &file["plain_text"], &file["preview"], &file["preview_highlight"]])
+            .map(|raw| if raw.contains('<') && raw.contains('>') { strip_html(raw) } else { self.words(raw) })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Shared Slack post".to_owned());
+        Card {
+            author: "Slack Post".to_owned(),
+            title,
+            title_link: link,
+            text,
+            fields: Vec::new(),
+            footer: "Open in Slack".to_owned(),
+            image: None,
+            thumbnail: None,
+            color: Some(0x4a_154b),
+            sponsored: false,
+        }
+    }
+
     /// An upload as an attachment: the file itself and the picture a row shows inline. Both
     /// addresses need the session to fetch (see `Command::Download`).
     ///
     /// The picture a row shows is registered at the size a row normally draws, and every other
     /// size Slack made of it as a variant, so a 2x screen is given one large enough.
-    fn file(&self, file: &Value, media: &mut Registered, variants: &mut Sizes) -> Option<Attachment> {
+    pub(super) fn file(&self, file: &Value, media: &mut Registered, variants: &mut Sizes) -> Option<Attachment> {
         let id = file["id"].as_str()?;
         let url = file["url_private"].as_str().filter(|url| self.hosted(url))?;
         let mime = file["mimetype"].as_str().unwrap_or("");
@@ -851,7 +1015,11 @@ impl Slack {
             MediaKind::Gif if !moving.is_empty() => moving,
             MediaKind::Image | MediaKind::Gif => THUMBS.iter().filter_map(|side| still(&format!("thumb_{side}"), *side)).collect(),
             MediaKind::Video => still("thumb_video", 0).into_iter().collect(),
-            MediaKind::File => still("thumb_pdf", 0).into_iter().collect::<Vec<_>>(),
+            MediaKind::File => still("thumb_pdf", 0)
+                .or_else(|| still("thumb_480", 480))
+                .or_else(|| still("thumb_360", 360))
+                .into_iter()
+                .collect::<Vec<_>>(),
             _ => Vec::new(),
         };
         // The picture itself, where it is small enough to stand in for a size Slack did not make.
@@ -1408,9 +1576,20 @@ impl Slack {
                 push_card(&mut framed, &mut extra_cards, self.list_card(file, &link));
                 continue;
             }
+            if is_post(file) {
+                push_card(&mut framed, &mut extra_cards, self.post_card(file, &link));
+                continue;
+            }
+            if self.is_external(file) {
+                push_card(&mut framed, &mut extra_cards, self.external_file_card(file, &link));
+                continue;
+            }
+            if is_snippet(file) {
+                append_snippet_preview(file, &mut rich);
+            }
             match self.file(file, &mut media, &mut variants) {
                 Some(attachment) => attachments.push(attachment),
-                // Kept somewhere Slack does not serve (Drive, Dropbox): a link to it.
+                // Fallback for minimal file stubs without a hosted address (e.g. pinned file stubs).
                 None => {
                     rich.line();
                     let target = first(&[&file["url_private"], &file["permalink"]]).unwrap_or(&link);

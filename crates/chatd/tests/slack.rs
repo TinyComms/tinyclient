@@ -969,6 +969,77 @@ impl Fake {
                     }
                 }))
             }
+            "files.list" if channel.is_empty() => {
+                let page = param("page").parse::<u32>().unwrap_or(1);
+                let types = param("types");
+                if page == 1 {
+                    let mut files = vec![
+                        json!({
+                            "id": "F0SNIP1",
+                            "name": "deploy.rs",
+                            "title": "Deploy helper",
+                            "mimetype": "text/plain",
+                            "filetype": "rust",
+                            "mode": "snippet",
+                            "size": 128,
+                            "created": 1760004000,
+                            "user": me(token),
+                            "url_private": format!("{}/files-pri/{}-F0SNIP1/deploy.rs", self.base, team(token)),
+                            "permalink": "https://acme.slack.com/files/U0ME/F0SNIP1/deploy.rs",
+                        }),
+                        json!({
+                            "id": "F0EXT1",
+                            "name": "Q4 Roadmap",
+                            "title": "Q4 Roadmap",
+                            "filetype": "gdoc",
+                            "pretty_type": "GSuite Document",
+                            "mode": "external",
+                            "is_external": true,
+                            "external_type": "gdrive",
+                            "created": 1760003900,
+                            "user": "U0ANA",
+                            "url_private": "https://docs.google.com/document/d/abc123/edit",
+                            "permalink": "https://acme.slack.com/files/U0ANA/F0EXT1/q4-roadmap",
+                        }),
+                    ];
+                    if types == "snippets" {
+                        files.retain(|f| f["mode"] == "snippet");
+                    }
+                    Some(json!({
+                        "ok": true,
+                        "files": files,
+                        "paging": {"count": 25, "total": 3, "page": 1, "pages": 2}
+                    }))
+                } else {
+                    Some(json!({
+                        "ok": true,
+                        "files": [{
+                            "id": "F0PAGE2",
+                            "name": "spec.pdf",
+                            "title": "Spec PDF",
+                            "mimetype": "application/pdf",
+                            "filetype": "pdf",
+                            "mode": "hosted",
+                            "size": 4096,
+                            "created": 1760003800,
+                            "user": me(token),
+                            "url_private": format!("{}/files-pri/{}-F0PAGE2/spec.pdf", self.base, team(token)),
+                            "permalink": "https://acme.slack.com/files/U0ME/F0PAGE2/spec.pdf",
+                        }],
+                        "paging": {"count": 25, "total": 3, "page": 2, "pages": 2}
+                    }))
+                }
+            }
+            "files.delete" => {
+                let fid = param("file");
+                if fid.is_empty() {
+                    return refused("file_not_found");
+                }
+                if fid == "F0OTHER" {
+                    return refused("cant_delete_file");
+                }
+                Some(json!({"ok": true}))
+            }
             method => self.fixture(token, method),
         };
         found.map_or_else(|| refused("unknown_method"), ok)
@@ -4831,4 +4902,162 @@ fn slack_drafts_sync_both_ways_with_newest_wins_and_clear_on_send() {
     let thread_call = world.fake.calls(ALPHA, "drafts.create").into_iter().last().unwrap();
     let dest_json = thread_call.params.get("destinations").cloned().unwrap_or_default();
     assert!(dest_json.contains("C0GEN") && dest_json.contains(ROOT), "thread destination missing thread_ts: {dest_json}");
+}
+
+#[test]
+fn slack_snippets_workspace_files_delete_and_external_files() {
+    let world = World::start();
+    world.ready();
+    let general = alpha("C0GEN");
+    let account = general.account();
+    assert!(world.account("T01ALPHA").can.manage_files);
+
+    // 1. Incoming Slack snippet renders inline as a `Style::CodeBlock { language: "rust" }` plus hosted file attachment.
+    let ts_snip = "1760000951.000951";
+    world.fake.push(
+        ALPHA,
+        json!({
+            "type": "message",
+            "channel": "C0GEN",
+            "user": "U0ANA",
+            "text": "",
+            "ts": ts_snip,
+            "event_ts": ts_snip,
+            "files": [{
+                "id": "F0SNIPIN",
+                "name": "main.rs",
+                "title": "Startup snippet",
+                "mimetype": "text/plain",
+                "filetype": "rust",
+                "mode": "snippet",
+                "size": 240,
+                "lines": 15,
+                "lines_more": 12,
+                "preview": "fn main() {\n    println!(\"hello\");\n}",
+                "url_private": format!("{}/files-pri/T01ALPHA-F0SNIPIN/main.rs", world.fake.base),
+                "permalink": "https://acme.slack.com/files/U0ANA/F0SNIPIN/main.rs"
+            }]
+        }),
+    );
+    let snip_msg = world.until("snippet message stored", || world.message(&general, ts_snip));
+    assert!(snip_msg.text.contains("Startup snippet"));
+    assert!(snip_msg.text.contains("fn main()"));
+    assert!(snip_msg.text.contains("12 more lines"));
+    assert!(
+        snip_msg.spans.iter().any(|s| matches!(&s.style, Style::CodeBlock { language } if language == "rust")),
+        "snippet should carry Style::CodeBlock with language=rust: {:?}",
+        snip_msg.spans
+    );
+    assert_eq!(snip_msg.attachments.len(), 1, "full snippet file stays downloadable");
+
+    // 2. Externally hosted file (`mode == "external"`, Google Drive) renders a structured Card with open link and NO blob fetch.
+    let ts_ext = "1760000952.000952";
+    world.fake.push(
+        ALPHA,
+        json!({
+            "type": "message",
+            "channel": "C0GEN",
+            "user": "U0BEN",
+            "text": "",
+            "ts": ts_ext,
+            "event_ts": ts_ext,
+            "files": [{
+                "id": "F0DRIVE1",
+                "name": "Architecture Doc",
+                "title": "Architecture Doc",
+                "filetype": "gdoc",
+                "pretty_type": "GSuite Document",
+                "mode": "external",
+                "is_external": true,
+                "external_type": "gdrive",
+                "url_private": "https://docs.google.com/document/d/xyz/edit",
+                "permalink": "https://acme.slack.com/files/U0BEN/F0DRIVE1/arch"
+            }]
+        }),
+    );
+    let ext_msg = world.until("external file message stored", || world.message(&general, ts_ext));
+    assert!(ext_msg.attachments.is_empty(), "external file must not register a Slack blob attachment");
+    let ext_card = ext_msg.card.as_deref().expect("external file card");
+    assert_eq!(ext_card.author, "Google Drive");
+    assert_eq!(ext_card.title, "Architecture Doc");
+    assert_eq!(ext_card.title_link, "https://docs.google.com/document/d/xyz/edit");
+    assert_eq!(ext_card.footer, "Open in Google Drive");
+    assert!(ext_card.text.contains("GSuite Document"));
+
+    // 3. Creating a snippet passes `snippet_type` to `files.getUploadURLExternal`.
+    let files_dir = world.dir.with_extension("files");
+    std::fs::create_dir_all(&files_dir).unwrap();
+    let tmp_snippet = files_dir.join("hello.py");
+    std::fs::write(&tmp_snippet, b"print('hi')\n").unwrap();
+    let with = protocol::Outgoing {
+        files: vec![protocol::OutgoingFile {
+            path: tmp_snippet.to_string_lossy().into_owned(),
+            name: "hello.py".into(),
+            ..Default::default()
+        }],
+        snippet_type: Some("python".into()),
+        ..Default::default()
+    };
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: general.clone(),
+            client_id: "5671".into(),
+            text: "quick script".into(),
+            reply_to: None,
+            with,
+        }),
+        Response::Sent { .. }
+    ));
+    let up_call = world.until("snippet upload requested", || {
+        world.fake.calls(ALPHA, "files.getUploadURLExternal").into_iter().last()
+    });
+    assert_eq!(up_call.params.get("snippet_type").map(String::as_str), Some("python"));
+
+    // 4. Paged workspace-wide `AccountFiles` lists hosted + external files without walking all pages at once.
+    let Response::AccountFiles { items: page1, cursor: next1, more: more1 } = world.ask(Request::AccountFiles {
+        account: account.clone(),
+        query: String::new(),
+        kind: None,
+        cursor: None,
+        limit: 25,
+    }) else {
+        panic!("expected AccountFiles page 1");
+    };
+    assert!(more1);
+    assert_eq!(next1.as_deref(), Some("2"));
+    assert_eq!(page1.len(), 2);
+    assert_eq!(page1[0].message_id, "F0SNIP1");
+    assert!(page1[0].attachment.is_some());
+    assert_eq!(page1[1].message_id, "F0EXT1");
+    assert!(page1[1].attachment.is_none());
+    assert_eq!(page1[1].url, "https://docs.google.com/document/d/abc123/edit");
+
+    let Response::AccountFiles { items: page2, cursor: next2, more: more2 } = world.ask(Request::AccountFiles {
+        account: account.clone(),
+        query: String::new(),
+        kind: None,
+        cursor: next1,
+        limit: 25,
+    }) else {
+        panic!("expected AccountFiles page 2");
+    };
+    assert!(!more2 && next2.is_none());
+    assert_eq!(page2.len(), 1);
+    assert_eq!(page2[0].message_id, "F0PAGE2");
+
+    // 5. `DeleteFile` deletes own file via `files.delete` and refuses cleanly on `cant_delete_file`.
+    assert_eq!(
+        world.ask(Request::DeleteFile { account: account.clone(), file_id: "F0SNIP1".into() }),
+        Response::Ok
+    );
+    assert_eq!(
+        world.fake.calls(ALPHA, "files.delete").last().and_then(|c| c.params.get("file")).map(String::as_str),
+        Some("F0SNIP1")
+    );
+    match world.ask(Request::DeleteFile { account, file_id: "F0OTHER".into() }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("delete this file"), "unexpected refusal: {detail}");
+        }
+        other => panic!("expected Refused for cant_delete_file, got {other:?}"),
+    }
 }

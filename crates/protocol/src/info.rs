@@ -646,6 +646,9 @@ pub struct Capabilities {
     /// This account supports setting a status with an emoji and a clear-after expiration (`SetPresence` with `status_emoji` and `clear_at`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub rich_status: bool,
+    /// This account supports workspace-wide file listing and deleting own files (`AccountFiles`, `DeleteFile`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_files: bool,
 }
 
 /// One public channel returned by [`crate::Request::BrowseChannels`].
@@ -974,6 +977,10 @@ pub struct Outgoing {
     /// dual-SIM phone). `None` keeps the conversation's default line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_as: Option<String>,
+    /// Optional Slack snippet syntax type (e.g. `"rust"`, `"python"`, `"text"`) passed to
+    /// `files.getUploadURLExternal` when uploading a code/text snippet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet_type: Option<String>,
 }
 
 impl Default for Outgoing {
@@ -993,6 +1000,7 @@ impl Default for Outgoing {
             effect: None,
             contact: None,
             send_as: None,
+            snippet_type: None,
         }
     }
 }

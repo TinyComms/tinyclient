@@ -440,18 +440,33 @@ fn list(shared: &Shared, hub: &Hub, width: f32, cx: &mut App) -> Div {
             grid
         }
         Tab::Kind(SharedKind::Files) => div().flex().flex_col().children(page.items.iter().enumerate().filter_map(|(ix, item)| {
-            let attachment = item.attachment.as_ref()?;
-            let on_disk = attachment.file.path.clone();
-            let said = [size_words(attachment.file.bytes), item.sender.clone(), crate::gui::time::stamp(crate::view::now(), item.sent)];
-            let said = said.into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" · ");
-            Some(
-                two_line(("shared-file", ix), tile_words(extension(&attachment.name)), attachment.name.clone(), said)
-                    .on_click(move |_, _, cx| {
-                        if let Some(path) = &on_disk {
-                            cx.open_url(&format!("file://{path}"));
-                        }
-                    }),
-            )
+            if let Some(attachment) = item.attachment.as_ref() {
+                let on_disk = attachment.file.path.clone();
+                let fallback_url = item.url.clone();
+                let said = [size_words(attachment.file.bytes), item.sender.clone(), crate::gui::time::stamp(crate::view::now(), item.sent)];
+                let said = said.into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" · ");
+                Some(
+                    two_line(("shared-file", ix), tile_words(extension(&attachment.name)), attachment.name.clone(), said)
+                        .on_click(move |_, _, cx| {
+                            if let Some(path) = &on_disk {
+                                cx.open_url(&format!("file://{path}"));
+                            } else if !fallback_url.is_empty() {
+                                cx.open_url(&fallback_url);
+                            }
+                        }),
+                )
+            } else if !item.url.is_empty() {
+                let url = item.url.clone();
+                let title = if item.title.is_empty() { link_words(&item.url).to_owned() } else { item.title.clone() };
+                let said = [host(&item.url).to_owned(), item.sender.clone(), crate::gui::time::stamp(crate::view::now(), item.sent)];
+                let said = said.into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join(" · ");
+                Some(
+                    two_line(("shared-file-ext", ix), tile_words("EXT".to_owned()), title, said)
+                        .on_click(move |_, _, cx| cx.open_url(&url)),
+                )
+            } else {
+                None
+            }
         })),
         Tab::Kind(SharedKind::Links) => div().flex().flex_col().children(page.items.iter().enumerate().map(|(ix, item)| {
             let url = item.url.clone();

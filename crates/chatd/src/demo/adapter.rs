@@ -1005,7 +1005,9 @@ impl Demo {
             Command::BookmarkRemove { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BrowseChannels { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::PreviewChannel { reply, .. }
-            | Command::Join { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            | Command::Join { reply, .. }
+            | Command::DeleteFile { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AccountFiles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallRing { reply, .. } | Command::CallStopRinging { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)));
             }
