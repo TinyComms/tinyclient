@@ -1,0 +1,12 @@
+{
+  "id": "wave-3-signal",
+  "title": "Wave 3E Signal enhancements",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "Desktop Wave 3E Signal enhancements verified by unit and integration test suites.",
+    "ios": "Desktop Wave 3E Signal enhancements verified by unit and integration test suites."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

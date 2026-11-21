@@ -69,6 +69,166 @@ pub struct Contact {
     pub phone: String,
 }
 
+/// Who is permitted to perform a group action in Signal Groups v2.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GroupAccess {
+    #[default]
+    Member,
+    Administrator,
+    Unsatisfiable,
+    Any,
+}
+
+/// One member, pending invitee, or join requester of a Signal group.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupMember {
+    pub id: String,
+    pub name: String,
+    pub admin: bool,
+}
+
+/// Mode for a Signal group's invite link (`https://signal.group/#...`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InviteLinkMode {
+    Off,
+    Enabled,
+    ApprovalRequired,
+    Reset,
+}
+
+/// Decoded contents of a `https://signal.group/#<base64>` link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupInviteLink {
+    pub master_key: [u8; 32],
+    pub password: Vec<u8>,
+}
+
+/// Encodes a `GroupMasterKey` (32 bytes) and `inviteLinkPassword` into a `https://signal.group/#...` URL
+/// using Signal's `GroupInviteLink` protobuf wire format (`field 1: v1Contents { 1: masterKey, 2: password }`).
+pub fn format_group_invite_link(master_key: &[u8; 32], password: &[u8]) -> String {
+    use base64::Engine as _;
+    fn push_varint(out: &mut Vec<u8>, mut val: usize) {
+        while val >= 0x80 {
+            out.push(((val & 0x7f) as u8) | 0x80);
+            val >>= 7;
+        }
+        out.push(val as u8);
+    }
+    let mut inner = Vec::with_capacity(2 + 32 + 2 + password.len());
+    inner.push((1 << 3) | 2);
+    push_varint(&mut inner, 32);
+    inner.extend_from_slice(master_key);
+    if !password.is_empty() {
+        inner.push((2 << 3) | 2);
+        push_varint(&mut inner, password.len());
+        inner.extend_from_slice(password);
+    }
+    let mut outer = Vec::with_capacity(2 + inner.len());
+    outer.push((1 << 3) | 2);
+    push_varint(&mut outer, inner.len());
+    outer.extend_from_slice(&inner);
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&outer);
+    format!("https://signal.group/#{encoded}")
+}
+
+/// Parses a `https://signal.group/#<base64>` URL into its 32-byte master key and invite link password.
+pub fn parse_group_invite_link(url: &str) -> Option<GroupInviteLink> {
+    use base64::Engine as _;
+    fn read_varint(bytes: &[u8], at: &mut usize) -> Option<usize> {
+        let mut out = 0usize;
+        let mut shift = 0u32;
+        loop {
+            let b = *bytes.get(*at)?;
+            *at += 1;
+            out |= ((b & 0x7f) as usize) << shift;
+            if b & 0x80 == 0 {
+                return Some(out);
+            }
+            shift += 7;
+            if shift > 35 {
+                return None;
+            }
+        }
+    }
+    let trimmed = url.trim();
+    let frag = trimmed
+        .strip_prefix("https://signal.group/#")
+        .or_else(|| trimmed.strip_prefix("http://signal.group/#"))?;
+    if frag.is_empty() {
+        return None;
+    }
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(frag)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(frag))
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(frag))
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(frag))
+        .ok()?;
+    let mut at = 0;
+    let mut inner: Option<&[u8]> = None;
+    while at < raw.len() {
+        let tag = read_varint(&raw, &mut at)?;
+        let field = tag >> 3;
+        let wire = tag & 7;
+        if wire != 2 {
+            return None;
+        }
+        let len = read_varint(&raw, &mut at)?;
+        let slice = raw.get(at..at + len)?;
+        at += len;
+        if field == 1 {
+            inner = Some(slice);
+        }
+    }
+    let inner = inner?;
+    let mut iat = 0;
+    let mut master_key: Option<[u8; 32]> = None;
+    let mut password: Vec<u8> = Vec::new();
+    while iat < inner.len() {
+        let tag = read_varint(inner, &mut iat)?;
+        let field = tag >> 3;
+        let wire = tag & 7;
+        if wire != 2 {
+            return None;
+        }
+        let len = read_varint(inner, &mut iat)?;
+        let slice = inner.get(iat..iat + len)?;
+        iat += len;
+        match field {
+            1 => master_key = slice.try_into().ok(),
+            2 => password = slice.to_vec(),
+            _ => {}
+        }
+    }
+    Some(GroupInviteLink { master_key: master_key?, password })
+}
+
+/// Finds the first valid `https://signal.group/#...` URL in a message's text.
+pub fn find_group_invite_link(text: &str) -> Option<(&str, GroupInviteLink)> {
+    let start = text.find("https://signal.group/#").or_else(|| text.find("http://signal.group/#"))?;
+    let rest = &text[start..];
+    let end = rest.find(|c: char| c.is_whitespace() || matches!(c, ')' | ']' | '>' | '"' | '\'')).unwrap_or(rest.len());
+    let candidate = rest[..end].trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | '!' | '?'));
+    parse_group_invite_link(candidate).map(|parsed| (candidate, parsed))
+}
+
+/// Group attribute and permission edits sent to Signal Groups v2.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupEdit {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub member_access: Option<GroupAccess>,
+    pub attributes_access: Option<GroupAccess>,
+    pub announcements_only: Option<bool>,
+}
+
+/// Full membership lists for a Signal group, read from the decrypted group state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupMembers {
+    pub members: Vec<GroupMember>,
+    pub pending: Vec<GroupMember>,
+    pub requesting: Vec<GroupMember>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GroupInfo {
     /// Public id, hex.
@@ -80,6 +240,18 @@ pub struct GroupInfo {
     pub member: bool,
     /// Account ids of the members, including us. Empty when the wire has not said who.
     pub member_ids: Vec<String>,
+    /// Account ids of the group's administrators.
+    pub admins: Vec<String>,
+    /// Who may add members to the group.
+    pub member_access: GroupAccess,
+    /// Who may edit the group's title, avatar, description, and disappearing timer.
+    pub attributes_access: GroupAccess,
+    /// Who may join from the group's invite link (`Any` = open, `Administrator` = approval required, `Unsatisfiable` = off).
+    pub invite_link_access: GroupAccess,
+    /// Only administrators may send messages (announcement group).
+    pub announcements_only: bool,
+    /// The group's `https://signal.group/#...` invite link when enabled. Empty when disabled or unknown.
+    pub invite_link: String,
     /// Disappearing-message timer in seconds. 0 means off.
     pub timer_secs: u32,
 }
@@ -89,6 +261,44 @@ pub struct GroupInfo {
 pub struct Timer {
     pub seconds: u32,
     pub version: u32,
+}
+
+/// Per-conversation sync state from Signal's storage service (contact or group record).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatState {
+    pub peer: Peer,
+    /// Milliseconds since 1970 until which the chat is muted. 0 = not muted; >= i64::MAX as u64 = forever.
+    pub muted_until: u64,
+    pub dont_notify_for_mentions_if_muted: bool,
+    pub archived: bool,
+    pub marked_unread: bool,
+    pub blocked: bool,
+    pub whitelisted: bool,
+}
+
+/// One Signal chat folder from the storage service (`ChatFolderRecord`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatFolder {
+    pub id: String,
+    pub name: String,
+    pub position: u32,
+    pub show_only_unread: bool,
+    pub show_muted: bool,
+    pub include_all_individual: bool,
+    pub include_all_groups: bool,
+    pub included: Vec<Peer>,
+    pub excluded: Vec<Peer>,
+}
+
+/// Response to a Signal message request (`SyncMessage.MessageRequestResponse.Type`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageRequestAction {
+    Accept,
+    Delete,
+    Block,
+    BlockAndDelete,
+    Spam,
+    BlockAndSpam,
 }
 
 /// The earlier message a message answers.
@@ -121,6 +331,8 @@ pub struct Text {
     pub expire_timer: u32,
     /// Timer version carried on this message. 0 when unset.
     pub expire_timer_version: u32,
+    /// Shared contact cards attached to this message.
+    pub contacts: Vec<protocol::SharedContact>,
 }
 
 /// Longest payment note shown in its label: what a sender typed joins the words after an em dash.
@@ -225,16 +437,150 @@ pub enum Event {
     /// A call we heard of is over: its hangup, or the other side telling us it was busy.
     /// `answered` says someone took it on another device; nobody did when it is false.
     CallEnded { id: u64, answered: bool },
+    /// A call synced from the user's phone (`SyncMessage.callEvent`).
+    CallEvent {
+        peer: Peer,
+        call_id: u64,
+        timestamp: u64,
+        kind: CallKind,
+        incoming: bool,
+        outcome: CallOutcome,
+    },
+    /// A call log action synced from the user's phone (`SyncMessage.callLogEvent`).
+    CallLogEvent {
+        kind: CallLogKind,
+        peer: Option<Peer>,
+        call_id: Option<u64>,
+        timestamp: u64,
+    },
+    /// A call link created or updated on another device (`SyncMessage.callLinkUpdate`).
+    CallLinkUpdated {
+        root_key: [u8; 32],
+        admin_passkey: Option<Vec<u8>>,
+    },
     /// The user's own settings, as the phone shares them.
     Settings { read_receipts: bool, typing: bool },
     /// A conversation's disappearing-messages timer changed (0 turns it off).
     TimerChanged { peer: Peer, seconds: u32, version: u32 },
+    /// Per-conversation mute, archive, pin, and mark-unread state from the phone / storage service.
+    ChatStates {
+        chats: Vec<ChatState>,
+        /// Ordered list of pinned conversations, when present in the account record.
+        pinned: Option<Vec<Peer>>,
+        /// Account setting: keep muted chats archived when new messages arrive.
+        keep_muted_archived: Option<bool>,
+    },
+    /// Chat folders synced from the phone's storage service.
+    Folders(Vec<ChatFolder>),
+    /// Block list synced from the phone (`SyncMessage.blocked`): blocked ACIs and group public ids.
+    Blocked { people: Vec<String>, groups: Vec<String> },
+    /// A message request was answered on another device (`SyncMessage.messageRequestResponse`).
+    MessageRequestResponse { peer: Peer, action: MessageRequestAction },
     /// Everything that waited while we were away has arrived.
     Caught,
     /// The connection is gone; a new wire is needed.
     Closed(String),
     /// The phone removed this device, or the account is gone. Signing in again links anew.
     Ended(String),
+}
+
+/// Kind of call in a synced `CallEvent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallKind {
+    Voice,
+    Video,
+    Group,
+    AdHoc,
+}
+
+/// Outcome of a synced `CallEvent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallOutcome {
+    Accepted,
+    NotAccepted,
+    Deleted,
+    Observed,
+}
+
+/// Action in a synced `CallLogEvent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallLogKind {
+    Clear,
+    MarkedAsRead,
+    MarkedAsReadInConversation,
+    ClearInConversation,
+}
+
+/// A Signal call link (`https://signal.link/call/#key=...`) and its settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallLink {
+    pub root_key: [u8; 32],
+    pub url: String,
+    pub name: String,
+    pub approve_all: bool,
+    pub admin_passkey: Option<Vec<u8>>,
+}
+
+/// Result of joining a Signal call link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallLinkJoin {
+    pub room_id: String,
+    pub name: String,
+    pub waiting_for_approval: bool,
+}
+
+/// Formats a 32-byte call link root key into a `https://signal.link/call/#key=...` URL.
+pub fn format_call_link(root_key: &[u8; 32]) -> String {
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(root_key);
+    format!("https://signal.link/call/#key={encoded}")
+}
+
+/// Parses a `https://signal.link/call/#key=...` URL into its 32-byte root key.
+pub fn parse_call_link(url: &str) -> Option<[u8; 32]> {
+    use base64::Engine as _;
+    let trimmed = url.trim();
+    let frag = trimmed
+        .strip_prefix("https://signal.link/call/#key=")
+        .or_else(|| trimmed.strip_prefix("http://signal.link/call/#key="))?;
+    if frag.is_empty() {
+        return None;
+    }
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(frag)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(frag))
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(frag))
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(frag))
+        .ok()?;
+    raw.try_into().ok()
+}
+
+/// Finds the first valid `https://signal.link/call/#key=...` URL in a message's text.
+pub fn find_call_link(text: &str) -> Option<(&str, [u8; 32])> {
+    let start = text.find("https://signal.link/call/#key=").or_else(|| text.find("http://signal.link/call/#key="))?;
+    let rest = &text[start..];
+    let end = rest.find(|c: char| c.is_whitespace() || matches!(c, ')' | ']' | '>' | '"' | '\'')).unwrap_or(rest.len());
+    let candidate = rest[..end].trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | '!' | '?'));
+    parse_call_link(candidate).map(|key| (candidate, key))
+}
+
+/// Derives a deterministic SFU room identifier from a call link's 32-byte root key using HKDF-SHA256.
+pub fn call_link_room_id(root_key: &[u8; 32]) -> String {
+    let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, root_key);
+    let mut okm = [0u8; 32];
+    let _ = hk.expand(b"Signal_CallLink_RoomId_v1", &mut okm);
+    okm.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// One GIF returned by Signal's Giphy proxy search/trending endpoint.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GifEntry {
+    pub id: String,
+    pub title: String,
+    pub preview_url: String,
+    pub mp4_url: String,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// One file on a message we send. The bytes are what Signal is given: a still picture has already
@@ -249,6 +595,8 @@ pub struct File {
     /// A small JPEG a conversation can show while the file arrives. Empty when there is none.
     pub thumb: Vec<u8>,
     pub blurhash: Option<String>,
+    /// True for animated GIFs (including looping MP4 GIFs from the GIF picker).
+    pub gif: bool,
 }
 
 /// What is sent.
@@ -269,6 +617,8 @@ pub enum Body {
     PollVote { author: String, target: u64, indexes: Vec<u32>, serial: u32 },
     /// End our own poll.
     PollEnd { target: u64 },
+    /// Share a contact card.
+    Contact { contact: protocol::SharedContact, timer: Timer },
 }
 
 /// Why something failed.
@@ -333,6 +683,91 @@ pub trait Wire: Send + Sync {
     /// The account id behind a username (`name.42`), or none when Signal has no such username.
     /// A phone number is not looked up here.
     fn lookup(&self, username: &str) -> Result<Option<String>, Fault>;
+    /// Sets a conversation's mute expiry in milliseconds since 1970 (0 unmutes; i64::MAX mutes forever).
+    fn set_mute(&self, to: &Peer, until_ms: u64) -> Result<(), Fault>;
+    /// Archives or unarchives a conversation.
+    fn set_archived(&self, to: &Peer, archived: bool) -> Result<(), Fault>;
+    /// Pins or unpins a conversation.
+    fn set_pinned(&self, to: &Peer, pinned: bool) -> Result<(), Fault>;
+    /// Marks a conversation as unread (or clears the manual unread flag).
+    fn set_marked_unread(&self, to: &Peer, unread: bool) -> Result<(), Fault>;
+    /// Blocks or unblocks a person or group, syncing the updated block list to other devices.
+    fn set_blocked(&self, peer: &Peer, blocked: bool) -> Result<(), Fault>;
+    /// Responds to a message request (Accept, Delete, Block, Spam, etc.) and syncs to other devices.
+    fn respond_message_request(&self, peer: &Peer, action: MessageRequestAction) -> Result<(), Fault>;
+    /// Creates a new Signal Groups v2 group with `title` and `members` (ACIs) and returns its info.
+    fn create_group(&self, title: &str, members: &[String]) -> Result<GroupInfo, Fault>;
+    /// Leaves a Signal Groups v2 group by its public hex id.
+    fn leave_group(&self, group_id: &str) -> Result<(), Fault>;
+    /// Lists a group's members (with admin flags), pending invites, and join requests.
+    fn group_members(&self, _group_id: &str) -> Result<GroupMembers, Fault> {
+        Err(Fault::Refused("Group members are not available.".to_owned()))
+    }
+    /// Adds or invites people (ACIs) to a group.
+    fn group_add_members(&self, _group_id: &str, _people: &[String]) -> Result<(), Fault> {
+        Err(Fault::Refused("Adding group members is not available.".to_owned()))
+    }
+    /// Removes a member (ACI) from a group.
+    fn group_remove_member(&self, _group_id: &str, _person: &str) -> Result<(), Fault> {
+        Err(Fault::Refused("Removing group members is not available.".to_owned()))
+    }
+    /// Promotes a member to admin or revokes their admin role.
+    fn group_set_admin(&self, _group_id: &str, _person: &str, _admin: bool) -> Result<(), Fault> {
+        Err(Fault::Refused("Changing group admin roles is not available.".to_owned()))
+    }
+    /// Updates a group's title, description, or permissions.
+    fn group_update(&self, _group_id: &str, _edit: GroupEdit) -> Result<(), Fault> {
+        Err(Fault::Refused("Editing group settings is not available.".to_owned()))
+    }
+    /// Sets (or clears when `bytes` is empty) a group's avatar.
+    fn group_set_avatar(&self, _group_id: &str, _bytes: Vec<u8>) -> Result<(), Fault> {
+        Err(Fault::Refused("Changing the group photo is not available.".to_owned()))
+    }
+    /// Sets a group's disappearing-messages timer (0 turns it off).
+    fn group_set_timer(&self, _group_id: &str, _seconds: u32) -> Result<(), Fault> {
+        Err(Fault::Refused("Changing the group timer is not available.".to_owned()))
+    }
+    /// Enables, disables, requires approval for, or resets a group's invite link.
+    /// Returns the active `https://signal.group/#...` link (or empty string when disabled).
+    fn group_invite_link(&self, _group_id: &str, _mode: InviteLinkMode) -> Result<String, Fault> {
+        Err(Fault::Refused("Group invite links are not available.".to_owned()))
+    }
+    /// Joins (or requests to join) a group from its `https://signal.group/#...` invite link.
+    fn group_join_by_link(&self, _url: &str) -> Result<GroupInfo, Fault> {
+        Err(Fault::Refused("Joining a group by link is not available.".to_owned()))
+    }
+    /// Approves or denies a member's request to join a group.
+    fn group_review_request(&self, _group_id: &str, _person: &str, _approve: bool) -> Result<(), Fault> {
+        Err(Fault::Refused("Reviewing join requests is not available.".to_owned()))
+    }
+    /// Accepts or declines a pending invite to a group for our own account.
+    fn group_pending_invite(&self, _group_id: &str, _accept: bool) -> Result<(), Fault> {
+        Err(Fault::Refused("Answering group invites is not available.".to_owned()))
+    }
+    /// Searches Giphy (or trending when `query` is empty) through Signal's content proxy.
+    fn search_gifs(&self, _query: &str, _offset: u32) -> Result<(Vec<GifEntry>, Option<u32>), Fault> {
+        Err(Fault::Refused("GIF search is not available.".to_owned()))
+    }
+    /// Downloads a GIF MP4 rendition through Signal's content proxy.
+    fn fetch_gif(&self, _url: &str) -> Result<Vec<u8>, Fault> {
+        Err(Fault::Refused("Downloading GIFs is not available.".to_owned()))
+    }
+    /// Creates a new Signal call link with an optional name and admin-approval switch.
+    fn create_call_link(&self, _name: &str, _approve_all: bool) -> Result<CallLink, Fault> {
+        Err(Fault::Refused("Call links are not available.".to_owned()))
+    }
+    /// Updates a Signal call link's name or admin-approval switch.
+    fn update_call_link(&self, _root_key: &[u8; 32], _name: Option<String>, _approve_all: Option<bool>) -> Result<CallLink, Fault> {
+        Err(Fault::Refused("Updating call links is not available.".to_owned()))
+    }
+    /// Deletes a Signal call link.
+    fn delete_call_link(&self, _root_key: &[u8; 32]) -> Result<(), Fault> {
+        Err(Fault::Refused("Deleting call links is not available.".to_owned()))
+    }
+    /// Joins a Signal call link and returns its derived SFU room id and approval state.
+    fn join_call_link(&self, _url: &str) -> Result<CallLinkJoin, Fault> {
+        Err(Fault::Refused("Joining call links is not available.".to_owned()))
+    }
     /// Ends the connection: the events end, and every later request fails.
     fn close(&self);
 }
@@ -400,5 +835,41 @@ mod tests {
         assert_eq!(view_once_label(Some("video/mp4")), "View-once video · open it on your phone");
         assert_eq!(view_once_label(Some("application/pdf")), "View-once media · open it on your phone");
         assert_eq!(view_once_label(None), "View-once media · open it on your phone");
+    }
+
+    #[test]
+    fn group_invite_link_round_trips_and_extracts_from_text() {
+        let key = [0x5au8; 32];
+        let pass = b"secret-pass-1234";
+        let url = format_group_invite_link(&key, pass);
+        assert!(url.starts_with("https://signal.group/#"));
+        let parsed = parse_group_invite_link(&url).expect("valid invite link");
+        assert_eq!(parsed.master_key, key);
+        assert_eq!(parsed.password, pass);
+
+        let msg = format!("Come join us: {url}!");
+        let (found_url, found) = find_group_invite_link(&msg).expect("found in text");
+        assert_eq!(found_url, url);
+        assert_eq!(found, parsed);
+
+        assert!(parse_group_invite_link("https://signal.group/#not-valid-base64!!!").is_none());
+        assert!(parse_group_invite_link("https://example.com/#abc").is_none());
+    }
+
+    #[test]
+    fn call_link_round_trips_derives_room_id_and_extracts_from_text() {
+        let key = [0x42u8; 32];
+        let url = format_call_link(&key);
+        assert!(url.starts_with("https://signal.link/call/#key="));
+        assert_eq!(parse_call_link(&url), Some(key));
+        let room1 = call_link_room_id(&key);
+        let room2 = call_link_room_id(&[0x43u8; 32]);
+        assert_eq!(room1.len(), 64);
+        assert_ne!(room1, room2);
+        let msg = format!("Hop on: {url}");
+        let (found_url, found_key) = find_call_link(&msg).expect("found in text");
+        assert_eq!(found_url, url);
+        assert_eq!(found_key, key);
+        assert!(parse_call_link("https://signal.link/call/#key=too-short").is_none());
     }
 }

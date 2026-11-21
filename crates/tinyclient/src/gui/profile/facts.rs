@@ -366,7 +366,14 @@ pub fn role(person: &Person, profile: &Profile, place: Option<&str>) -> Option<R
 
 /// `+44 •••• ••42`: the country code and the last two digits; every other digit a dot.
 pub fn mask(phone: &str) -> String {
-    let code = if phone.starts_with('+') { phone.split_whitespace().next().unwrap_or("").len() } else { 0 };
+    let code = if phone.starts_with('+') {
+        match phone.find(char::is_whitespace) {
+            Some(space) if space <= 5 => space,
+            _ => 0,
+        }
+    } else {
+        0
+    };
     let digits = phone.char_indices().filter(|(ix, ch)| *ix >= code && ch.is_ascii_digit()).count();
     let mut seen = 0;
     phone
@@ -571,7 +578,7 @@ pub fn offers(person: &Person) -> (bool, bool) {
 
 pub fn offers_with(person: &Person, can_block: bool) -> (bool, bool) {
     let remove = person.relation == Relation::Friend && person.key.network == Network::Discord;
-    let block = (matches!(person.key.network, Network::Discord | Network::Telegram) || can_block)
+    let block = (matches!(person.key.network, Network::Discord | Network::Telegram | Network::Signal) || can_block)
         && person.relation != Relation::Blocked
         && !person.bot;
     (remove, block)
@@ -593,8 +600,8 @@ fn tidy(mut items: Vec<Item>) -> Vec<Item> {
 /// already opens them in the network's app; a row's menu has no foot, so it says it here.
 pub fn person_menu(person: &Person, seen: &Seen, alt: bool, pane: bool) -> Vec<Item> {
     let mut items = Vec::new();
-    // Signal and Messages do not serve mute. A switch that snaps back is left out.
-    if let Some((_, muted)) = seen.direct.filter(|_| !seen.in_their_dm && !matches!(person.key.network, Network::Signal | Network::Messages)) {
+    // Messages does not serve mute. A switch that snaps back is left out.
+    if let Some((_, muted)) = seen.direct.filter(|_| !seen.in_their_dm && person.key.network != Network::Messages) {
         items.extend([Item::Mute { muted }, Item::Separator]);
     }
     if !person.handle.trim_start_matches('@').is_empty() {
@@ -628,7 +635,7 @@ pub fn person_menu(person: &Person, seen: &Seen, alt: bool, pane: bool) -> Vec<I
     if block {
         items.push(Item::Block);
     } else if person.relation == Relation::Blocked
-        && (matches!(person.key.network, Network::Discord | Network::Telegram) || seen.can_block)
+        && (matches!(person.key.network, Network::Discord | Network::Telegram | Network::Signal) || seen.can_block)
     {
         items.push(Item::Unblock);
     }
@@ -703,10 +710,10 @@ pub fn remove_member_confirm_text(person_name: &str, group_title: &str) -> Strin
     format!("Remove {person_name} from {group_title}? Others in the conversation may see this.")
 }
 
-/// A group DM, or a Telegram group or channel: the user can leave it from the pane.
+/// A group DM, Signal group, or Telegram group or channel: the user can leave it from the pane.
 pub fn can_leave(conversation: &Conversation) -> bool {
-    // A linked Signal device and paired Messages cannot leave a group. The item stays off until they can.
-    if matches!(conversation.key.network, Network::Signal | Network::Messages) {
+    // Paired Messages cannot leave a group. The item stays off until it can.
+    if conversation.key.network == Network::Messages {
         return false;
     }
     conversation.kind == ConversationKind::Group
@@ -750,9 +757,8 @@ pub fn conversation_link(conversation: &Conversation, info: Option<&Conversation
             Some(format!("https://discord.com/channels/{place}/{id}"))
         }
         Network::Slack => conversation.space.as_ref().map(|team| format!("slack://channel?team={team}&id={id}")),
-        Network::Telegram | Network::Teams => told,
-        // Signal opens a chat only by a phone number or username, which a row does not carry.
-        Network::Signal | Network::Messages | Network::Tiny => None,
+        Network::Telegram | Network::Teams | Network::Signal => told,
+        Network::Messages | Network::Tiny => None,
     }
 }
 
@@ -818,7 +824,7 @@ pub fn notify_control(conversation: &Conversation) -> NotifyControl {
         ConversationKind::Channel | ConversationKind::Announcement | ConversationKind::Voice | ConversationKind::Forum
     );
     match conversation.key.network {
-        Network::Signal => NotifyControl::Held("Set on your phone"),
+        Network::Signal => NotifyControl::Switch,
         Network::Messages => NotifyControl::Held("Stays on your phone"),
         Network::Tiny => {
             if channel {
@@ -1250,8 +1256,15 @@ mod tests {
         let mut signal = row(Network::Signal, ConversationKind::Direct);
         signal.private = true;
         assert_eq!(conversation_tag(&signal, None), None);
-        assert_eq!(notify_control(&signal), NotifyControl::Held("Set on your phone"));
-        assert!(!can_leave(&row(Network::Signal, ConversationKind::Group)));
+        assert_eq!(notify_control(&signal), NotifyControl::Switch);
+        let signal_person = person(Network::Signal, Relation::Contact);
+        let signal_seen = Seen { in_their_dm: false, direct: Some((CallSupport::None, false)), online: true, ..Seen::default() };
+        let sig_menu = person_menu(&signal_person, &signal_seen, false, false);
+        assert!(sig_menu.contains(&Item::Mute { muted: false }));
+        assert!(sig_menu.contains(&Item::Block));
+        let blocked_signal = person(Network::Signal, Relation::Blocked);
+        assert!(person_menu(&blocked_signal, &signal_seen, false, false).contains(&Item::Unblock));
+        assert!(can_leave(&row(Network::Signal, ConversationKind::Group)));
         assert!(!can_leave(&row(Network::Messages, ConversationKind::Group)));
         assert_eq!(notify_control(&row(Network::Messages, ConversationKind::Direct)), NotifyControl::Held("Stays on your phone"));
         assert_eq!(notify_control(&row(Network::Teams, ConversationKind::Channel)), NotifyControl::Segmented);
