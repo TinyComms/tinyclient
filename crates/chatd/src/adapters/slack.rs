@@ -84,15 +84,19 @@ const TREE_FRESH: Duration = Duration::from_secs(600);
 const OUTBOX: usize = 64;
 /// Errors that mean this workspace's session is over. The other workspaces are untouched.
 const ENDED: &[&str] = &["invalid_auth", "not_authed", "account_inactive", "token_revoked", "token_expired"];
-/// Errors that mean Slack wants something done in its own app before it answers again, and the
-/// words for it. Unverified: these are the documented names; what a real workspace sends when
-/// it demands a second factor or a fresh organization sign-in was not seen.
+/// Errors that mean Slack wants a fresh sign-in before it answers again, and the words for the
+/// account row. The row's button continues that sign-in here. Requests stay quiet for an hour,
+/// and nothing is asked again until the user chooses to continue. Unverified: these are the
+/// documented names; what a real workspace sends when it demands a second factor or a fresh
+/// organization sign-in was not seen.
 const DEMANDS: &[(&str, &str)] = &[
-    ("two_factor_setup_required", "Slack wants two-factor authentication set up. Finish that in the Slack app."),
-    ("org_login_required", "Your organization wants you to sign in again. Do that in the Slack app."),
-    ("team_access_not_granted", "This workspace has not let you in yet. Finish joining in the Slack app."),
-    ("password_change_required", "Slack wants your password changed. Do that in the Slack app."),
+    ("two_factor_setup_required", "Slack wants two-factor authentication set up. Continue in tinyclient for this workspace."),
+    ("org_login_required", "Your organization wants you to sign in again. Continue in tinyclient for this workspace."),
+    ("team_access_not_granted", "This workspace has not let you in yet. Continue in tinyclient to finish joining."),
+    ("password_change_required", "Slack wants your password changed. Continue in tinyclient for this workspace."),
 ];
+/// Shown on the account when the sign-in page says this browser is not allowed.
+pub const BROWSER_BLOCKED: &str = "This workspace does not allow signing in from this browser.";
 /// Addresses Slack itself serves. Nothing else in a message is ever registered for fetching.
 const HOSTS: &[&str] = &["slack.com", "slack-edge.com", "slack-imgs.com", "slack-files.com"];
 
@@ -660,6 +664,84 @@ fn retokened(stored: &str, account: &str, old: &str, fresh: &str) -> Option<Stri
     changed.then(|| parsed.to_string())
 }
 
+/// `https` on `slack.com` or a subdomain, with no user or port. What a continue may open.
+fn slack_address(url: &str) -> bool {
+    let Some(host) = https_host(url) else {
+        return false;
+    };
+    let authority = url.strip_prefix("https://").unwrap_or("").split(['/', '?', '#']).next().unwrap_or("");
+    !authority.is_empty() && !authority.contains(':') && within(host, "slack.com")
+}
+
+/// The address of one workspace or org in a stored session, when it is a Slack page.
+pub fn workspace_url(session: &str, account: &str) -> Option<String> {
+    let parsed: Value = serde_json::from_str(session).ok()?;
+    listed(&parsed).into_iter().find_map(|entry| {
+        if team_id(entry) != account {
+            return None;
+        }
+        let url = text_of(entry, &["url"]);
+        slack_address(url).then(|| url.to_owned())
+    })
+}
+
+/// The stored session with one account's token taken from a fresh sign-in. Other workspaces
+/// stay, including a newer token the fresh window also printed for them. The shared cookie is
+/// written when the fresh session has one. `None` when that account did not come back with a
+/// token. An unchanged token still returns the session, so the workspace can reconnect.
+pub fn resumed(stored: &str, fresh: &str, account: &str) -> Option<String> {
+    let fresh: Value = serde_json::from_str(fresh).ok()?;
+    let found = listed(&fresh).into_iter().find(|entry| team_id(entry) == account)?;
+    let token = text_of(found, &["token"]).to_owned();
+    if token.is_empty() {
+        return None;
+    }
+    let url = text_of(found, &["url"]).to_owned();
+    let cookie = fresh["cookie"].as_str().filter(|cookie| !cookie.is_empty()).map(str::to_owned);
+    let mut parsed: Value = serde_json::from_str(stored).ok()?;
+    let mut placed = false;
+    let apply = |entry: &mut Value| {
+        if team_id(entry) != account {
+            return false;
+        }
+        entry["token"] = token.clone().into();
+        if slack_address(&url) {
+            entry["url"] = url.clone().into();
+        }
+        true
+    };
+    if let Some(orgs) = parsed["enterprises"].as_array_mut() {
+        for org in orgs {
+            placed |= apply(org);
+        }
+    }
+    if let Some(teams) = parsed["teams"].as_array_mut() {
+        for team in teams {
+            placed |= apply(team);
+        }
+    }
+    if !placed && team_id(&parsed) == account {
+        placed = apply(&mut parsed);
+    }
+    if !placed {
+        return None;
+    }
+    if let Some(cookie) = cookie {
+        parsed["cookie"] = cookie.into();
+    }
+    Some(parsed.to_string())
+}
+
+/// Enterprises, then workspaces. A session from before workspaces were listed is itself.
+fn listed(session: &Value) -> Vec<&Value> {
+    let mut found = Vec::new();
+    if let Some(orgs) = session["enterprises"].as_array() {
+        found.extend(orgs);
+    }
+    found.extend(teams(session));
+    found
+}
+
 /// Parses the session and returns at once: everything that could be slow (finding out which
 /// Safari is installed for a session that did not record its browser, building the HTTP agent,
 /// every call to Slack) happens on the adapter's own threads.
@@ -900,8 +982,8 @@ impl Slack {
     }
 
     /// Reads Slack's `ok` envelope. A session Slack has ended is remembered, so the socket
-    /// thread reports this workspace expired whichever thread found out. A demand only Slack's
-    /// own app can meet stops every further request and is shown on the account.
+    /// thread reports this workspace expired whichever thread found out. A demand stops every
+    /// further request and is shown on the account. The hour's quiet is in `run`.
     fn checked(&self, method: &str, body: Value) -> Result<Value, Fault> {
         if body["ok"] == true {
             return Ok(body);
@@ -939,7 +1021,7 @@ impl Slack {
         }
     }
 
-    /// Refuses a call while Slack is waiting for the user to do something in its own app.
+    /// Refuses a call while Slack is waiting for the user to continue the sign-in.
     fn halted(&self, method: &str) -> Result<(), Fault> {
         match self.state().halted.clone() {
             Some(demand) if method != "auth.test" => Err(Fault::Slack(demand)),
@@ -1019,8 +1101,8 @@ impl Slack {
         let auth = match self.api("auth.test", &[]) {
             Ok(auth) => auth,
             Err(fault) => {
-                // Slack wants something done in its own app. Asking again soon is how a flag
-                // becomes a ban, so this workspace is left alone for an hour.
+                // Slack wants a fresh sign-in. Asking again soon is how a flag becomes a ban,
+                // so this workspace is left alone for an hour. The account row can continue sooner.
                 if self.state().halted.is_some() {
                     self.ctx.pause(Duration::from_secs(3600));
                 }
@@ -3347,6 +3429,70 @@ mod tests {
     }
 
     #[test]
+    fn continuing_one_workspace_replaces_only_its_token() {
+        let stored = json!({
+            "cookie": "xoxd-old", "user_agent": "Safari/1",
+            "enterprises": [{"id": "E9", "token": "xoxc-org", "url": "https://acme.enterprise.slack.com/"}],
+            "teams": [
+                {"id": "T1", "name": "Acme", "url": "https://acme.slack.com/", "token": "xoxc-1", "enterprise_id": "E9"},
+                {"id": "T3", "name": "Other", "url": "https://other.slack.com/", "token": "xoxc-3"},
+            ],
+        })
+        .to_string();
+        assert_eq!(workspace_url(&stored, "T3").as_deref(), Some("https://other.slack.com/"));
+        assert_eq!(workspace_url(&stored, "E9").as_deref(), Some("https://acme.enterprise.slack.com/"));
+        assert_eq!(workspace_url(&stored, "T9"), None);
+        assert_eq!(workspace_url(&stored.replace("https://other.slack.com/", "http://other.slack.com/"), "T3"), None);
+
+        let fresh = json!({
+            "cookie": "xoxd-new",
+            "enterprises": [{"id": "E9", "token": "xoxc-org-2", "url": "https://acme.enterprise.slack.com/"}],
+            "teams": [
+                {"id": "T1", "token": "xoxc-1-rotated", "url": "https://evil.example/"},
+                {"id": "T3", "token": "xoxc-3b", "url": "https://other.slack.com/"},
+            ],
+        })
+        .to_string();
+        let merged: Value = serde_json::from_str(&resumed(&stored, &fresh, "T3").unwrap()).unwrap();
+        assert_eq!(merged["teams"][0]["token"], "xoxc-1");
+        assert_eq!(merged["teams"][0]["url"], "https://acme.slack.com/");
+        assert_eq!(merged["teams"][1]["token"], "xoxc-3b");
+        assert_eq!(merged["enterprises"][0]["token"], "xoxc-org");
+        assert_eq!(merged["cookie"], "xoxd-new");
+        assert_eq!(merged["user_agent"], "Safari/1");
+        assert_eq!(merged["teams"].as_array().map(Vec::len), Some(2));
+
+        let org: Value = serde_json::from_str(&resumed(&stored, &fresh, "E9").unwrap()).unwrap();
+        assert_eq!(org["enterprises"][0]["token"], "xoxc-org-2");
+        assert_eq!(org["teams"][1]["token"], "xoxc-3");
+        assert_eq!(resumed(&stored, &fresh, "T9"), None);
+
+        let same = json!({"teams": [{"id": "T3", "token": "xoxc-3", "url": "https://other.slack.com/"}]}).to_string();
+        assert!(resumed(&stored, &same, "T3").is_some());
+        let kept: Value = serde_json::from_str(&resumed(&stored, &same, "T3").unwrap()).unwrap();
+        assert_eq!(kept["cookie"], "xoxd-old");
+
+        let old = r#"{"token":"xoxc-9","team_id":"T9","url":"https://glimmr.slack.com/","cookie":"xoxd-z"}"#;
+        assert_eq!(workspace_url(old, "T9").as_deref(), Some("https://glimmr.slack.com/"));
+        let again: Value = serde_json::from_str(&resumed(old, r#"{"token":"xoxc-10","team_id":"T9","url":"https://glimmr.slack.com/"}"#, "T9").unwrap()).unwrap();
+        assert_eq!((again["token"].as_str(), again["cookie"].as_str()), (Some("xoxc-10"), Some("xoxd-z")));
+    }
+
+    #[test]
+    fn the_demands_we_act_on_are_the_documented_names() {
+        let names: Vec<&str> = DEMANDS.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            names,
+            ["two_factor_setup_required", "org_login_required", "team_access_not_granted", "password_change_required"]
+        );
+        for (_, words) in DEMANDS {
+            assert!(words.contains("tinyclient"), "{words}");
+            assert!(!words.contains("from this browser"), "{words}");
+        }
+        assert!(BROWSER_BLOCKED.contains("from this browser"));
+    }
+
+    #[test]
     fn a_session_stored_before_workspaces_were_listed_still_signs_in() {
         let old = r#"{"token":"xoxc-9","team_id":"T9","team":"Glimmr","url":"https://glimmr.slack.com/","cookie":"xoxd-z"}"#;
         let found = accounts(old).unwrap();
@@ -3434,7 +3580,7 @@ mod tests {
     fn a_refused_send_is_told_in_words() {
         assert_eq!(
             reason(Fault::Slack("two_factor_setup_required".into())),
-            "Slack wants two-factor authentication set up. Finish that in the Slack app."
+            "Slack wants two-factor authentication set up. Continue in tinyclient for this workspace."
         );
         assert_eq!(reason(Fault::Slack("not_in_channel".into())), "You are not in this channel.");
         assert_eq!(

@@ -1688,6 +1688,15 @@ impl Shell {
                 Tone::Danger => banner(tone, words).child(
                     banner_action("sign-in-again", "Sign in").on_click(cx.listener(move |this, _, _, cx| this.sign_in(network, cx))),
                 ),
+                Tone::Attention if slack_can_continue(network, &words) => {
+                    let id = account.account.clone();
+                    banner(tone, words).child(
+                        banner_action("continue-slack", "Continue in tinyclient").on_click(cx.listener(move |this, _, _, cx| {
+                            this.continue_slack(id, cx);
+                        })),
+                    )
+                }
+                Tone::Attention if network == Network::Slack => banner(tone, words),
                 Tone::Attention => banner(tone, words).child(
                     banner_action("open-network", format!("Open {}", network.label())).on_click(cx.listener(move |this, _, _, cx| {
                         if network == Network::Tiny { this.tiny_reconnect(account.clone(), cx); }
@@ -2706,6 +2715,11 @@ fn urgency(tone: Tone) -> u8 {
     }
 }
 
+/// A Slack demand can be finished here. A workspace that blocks this browser is words only.
+fn slack_can_continue(network: Network, words: &str) -> bool {
+    network == Network::Slack && !words.contains("from this browser")
+}
+
 /// Where the network's own app is, for what only it can do (verify an account, solve a captcha).
 fn network_app(network: Network) -> &'static str {
     match network {
@@ -2784,6 +2798,14 @@ fn inbox_strip_fit(width: f32, phone: bool, text_scale: f32, has_unread: bool) -
 pub(crate) mod tests {
     use super::*;
     use protocol::{AccountKey, AccountStatus, Presence};
+
+    #[test]
+    fn a_slack_demand_can_continue_and_a_blocked_browser_cannot() {
+        let demand = "Slack wants two-factor authentication set up. Continue in tinyclient for this workspace.";
+        assert!(slack_can_continue(Network::Slack, demand));
+        assert!(!slack_can_continue(Network::Slack, "This workspace does not allow signing in from this browser."));
+        assert!(!slack_can_continue(Network::Discord, demand));
+    }
 
     #[cfg(feature = "gui-shot")]
     #[gpui::test]

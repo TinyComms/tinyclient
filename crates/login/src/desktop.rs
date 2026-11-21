@@ -49,7 +49,7 @@ fn platform_data_root() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-pub fn run(site: Site, at: Option<(f64, f64)>, network: &str) {
+pub fn run(site: Site, at: Option<(f64, f64)>, network: &str, start: Option<&str>) {
     // On Wayland, WebKitGTK turns on NVIDIA's explicit sync without the sync point it promises, and
     // the compositor drops the window as it opens: "Error 71 (Protocol error)", WebKit bug 280210.
     // Only NVIDIA's driver reads this.
@@ -86,7 +86,7 @@ pub fn run(site: Site, at: Option<(f64, f64)>, network: &str) {
 
     let nav_state = state.clone();
     let builder = WebViewBuilder::new_with_web_context(&mut web_context)
-        .with_url(site.start)
+        .with_url(start.unwrap_or(site.start))
         .with_user_agent(&agent)
         .with_navigation_handler({
             let nav_state = nav_state.clone();

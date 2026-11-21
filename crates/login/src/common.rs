@@ -220,6 +220,33 @@ pub fn load_failed_message(message: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+/// True when `url` is https on slack.com or a subdomain, with no user and no port.
+pub fn slack_page(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    if rest.is_empty() || rest.contains('@') {
+        return false;
+    }
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host.is_empty() || host.contains(':') || host.starts_with('.') || host.contains("..") {
+        return false;
+    }
+    host == "slack.com" || host.strip_suffix("slack.com").is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+/// `--start URL` for one Slack workspace. Absent is fine. Anything else is an error.
+pub fn parse_start(args: &[String]) -> Result<Option<String>, String> {
+    let Some(flag) = args.iter().position(|arg| arg == "--start") else {
+        return Ok(None);
+    };
+    let value = args.get(flag + 1).ok_or("--start needs a Slack address")?;
+    if !slack_page(value) {
+        return Err(format!("--start needs an https address on slack.com, not {value:?}"));
+    }
+    Ok(Some(value.to_owned()))
+}
+
 pub fn parse_at(args: &[String]) -> Result<Option<(f64, f64)>, String> {
     let Some(flag) = args.iter().position(|arg| arg == "--at") else {
         return Ok(None);
@@ -265,7 +292,8 @@ pub fn finish(session: serde_json::Value) -> ! {
 #[cfg(test)]
 mod tests {
     use super::{
-        blocked, hands_off, origin, parse_at, route, session, slack_session, web_client, Route, DISCORD,
+        blocked, hands_off, origin, parse_at, parse_start, route, session, slack_page, slack_session, web_client, Route,
+        DISCORD,
     };
 
     #[test]
@@ -296,6 +324,29 @@ mod tests {
         assert!(parse_at(&args(&["slack", "--at", "640"])).is_err());
         assert!(parse_at(&args(&["slack", "--at", "a,b"])).is_err());
         assert!(parse_at(&args(&["slack", "--at", "nan,1"])).is_err());
+    }
+
+    #[test]
+    fn start_opens_a_slack_workspace_and_refuses_anything_else() {
+        let args = |list: &[&str]| list.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        assert_eq!(parse_start(&args(&["slack"])), Ok(None));
+        assert_eq!(
+            parse_start(&args(&["slack", "--start", "https://acme.slack.com/"])).unwrap().as_deref(),
+            Some("https://acme.slack.com/")
+        );
+        assert_eq!(
+            parse_start(&args(&["slack", "--start", "https://app.slack.com/client/T1", "--at", "1,2"])).unwrap().as_deref(),
+            Some("https://app.slack.com/client/T1")
+        );
+        assert!(slack_page("https://slack.com/"));
+        assert!(!slack_page("http://acme.slack.com/"));
+        assert!(!slack_page("https://acme.slack.com:443/"));
+        assert!(!slack_page("https://user@acme.slack.com/"));
+        assert!(!slack_page("https://evil.example/"));
+        assert!(!slack_page("https://slack.com.evil.example/"));
+        assert!(!slack_page("https://notslack.com/"));
+        assert!(parse_start(&args(&["slack", "--start"])).is_err());
+        assert!(parse_start(&args(&["slack", "--start", "https://evil.example/"])).is_err());
     }
 
     #[test]

@@ -1031,6 +1031,15 @@ impl Shell {
 
     /// Opens the network's sign-in window. chatd answers when the user has finished with it.
     pub(super) fn sign_in(&mut self, network: Network, cx: &mut Context<Self>) {
+        self.begin_sign_in(network, None, cx);
+    }
+
+    /// Continues Slack SSO or two-factor for one workspace. The others stay connected.
+    pub(super) fn continue_slack(&mut self, account: String, cx: &mut Context<Self>) {
+        self.begin_sign_in(Network::Slack, Some(account), cx);
+    }
+
+    fn begin_sign_in(&mut self, network: Network, resume: Option<String>, cx: &mut Context<Self>) {
         if super::signin::open(network, cx) { return; }
         if self.signing_in.is_some() {
             return;
@@ -1038,7 +1047,7 @@ impl Shell {
         self.signing_in = Some(network);
         self.sign_in_failed = None;
         cx.notify();
-        let request = Request::SignIn { at: self.window_at.get(), network };
+        let request = Request::SignIn { at: self.window_at.get(), network, resume };
         self.off_thread(cx, move || ask(&request), move |this, answer, cx| {
             this.signing_in = None;
             this.sign_in_failed = match answer {

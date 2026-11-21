@@ -77,6 +77,7 @@ Grid org whose sign-in carries an org token is one account whose workspaces are 
 org-wide channel and a direct message are listed once. That path reads `localConfig_v2.enterprises`
 and has not been run against a live org. "Add another workspace" reopens the
 window on the same cookie. SSO is the page's own; the browser User-Agent from sign-in is stored and reused on later calls.
+When Slack asks a workspace for SSO or two-factor again, that row says so and offers Continue in tinyclient. The helper opens that workspace's address. Only that account's token is replaced, and the shared cookie is kept when the page issued a new one. The other workspaces stay connected. The error names for those demands are the documented ones; a live capture was not taken. A workspace that will not sign in from this browser says so on the row.
 
 ## First run
 
@@ -115,7 +116,7 @@ Signing out of one account removes that account's session material and its rows.
 | Network | Ends when | What I see |
 | --- | --- | --- |
 | Discord | Password change, "log out all devices", or Discord's own lock [U]. A sign-in from a new location may need an emailed approval first; the login page says so and I approve it in my mail, then press Log in again. | Story 7. |
-| Slack | Workspace session-duration policy set by its admins [U on the range], SSO re-auth, or remote sign-out. One workspace can expire while the others stay up. | Story 7, naming the workspace. Re-sign-in must replace that workspace's token only. |
+| Slack | Workspace session-duration policy set by its admins [U on the range], SSO re-auth, or remote sign-out. One workspace can expire while the others stay up. | Story 7, naming the workspace. Continue in tinyclient replaces that workspace's token only. |
 | Telegram | I terminate it from another device, or Telegram's inactivity timer (6 months by default, user-set) [U]. | Story 7. New sign-in also raises a login alert in my other Telegram apps; expected. |
 | Teams | Refresh token unused for 90 days, password change, admin revocation, or a tenant sign-in-frequency policy [U on typical values]. The skype token is short and renewed silently [U on its life]. | Story 7. If renewal fails on policy, story 14. |
 
@@ -132,6 +133,7 @@ There is no open-at-login switch (`G1`). Closing the window's effect on chatd is
 ## Uncertainties
 
 - Slack Enterprise Grid was not run against a live org. The helper reads an `enterprises` entry and its token when `teams` is empty, and a rotated `xoxc` token is saved the same way the `d` cookie is. One 2026 report describes the empty-`teams` shape [V that the report exists, U that it is general].
+- Which Slack error a live workspace sends when it wants SSO or two-factor again was not captured. The names the account row acts on are the documented ones.
 - A live Messages pair has not been run [U]. The Google-and-emoji flow and the adapter tests are in the tree.
 - `keep_connected` dropping every Slack workspace when one token dies was not re-read. The keychain item is still one per network.
 - Notarization was not checked. A second Discord or Telegram login was not found as its own keychain account.

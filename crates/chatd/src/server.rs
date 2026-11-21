@@ -439,7 +439,18 @@ impl Chat {
 
     /// Starts an adapter for every account in a network's session.
     fn connect(&self, network: Network, session: &str) -> Result<(), String> {
+        self.start_accounts(network, session, None)
+    }
+
+    /// Starts adapters from a session. `only` starts that account and leaves every other
+    /// adapter of the network running.
+    fn start_accounts(&self, network: Network, session: &str, only: Option<&str>) -> Result<(), String> {
+        let mut started = false;
         for signed in adapters::accounts(network, session)? {
+            if only.is_some_and(|id| signed.account != id) {
+                continue;
+            }
+            started = true;
             let account = AccountKey {
                 network,
                 account: signed.account,
@@ -457,6 +468,9 @@ impl Chat {
             for command in ready {
                 self.command(&account, command);
             }
+        }
+        if only.is_some() && !started {
+            return Err("that workspace is not in the session".to_owned());
         }
         Ok(())
     }
@@ -2317,7 +2331,7 @@ impl Chat {
     }
 
     /// Shows the network's sign-in and waits for the user to finish it.
-    fn sign_in(&self, network: Network, at: Option<(i32, i32)>) -> Response {
+    fn sign_in(&self, network: Network, at: Option<(i32, i32)>, resume: Option<String>) -> Response {
         if !adapters::supported(network) {
             return error(
                 ErrorCode::Unsupported,
@@ -2341,12 +2355,15 @@ impl Chat {
         if !session::enabled() && std::env::var_os("TINYCLIENT_LOGIN").is_none() && web.is_none() {
             return error(ErrorCode::SignIn, "sign-in is off while TINYCLIENT_DIR is set");
         }
+        if let Some(account) = resume {
+            return self.resume_sign_in(network, at, &account);
+        }
         let session = match web {
-            Some(web) => match login::web::sign_in(&*web, &network.label().to_lowercase()) {
+            Some(web) => match login::web::sign_in(&*web, &network.label().to_lowercase(), None) {
                 Ok(session) => session,
                 Err(code) => return sign_in_ended(network, Some(code)),
             },
-            None => match self.sign_in_helper(network, at) {
+            None => match self.sign_in_helper(network, at, None) {
                 Ok(session) => session,
                 Err(answer) => return *answer,
             },
@@ -2363,12 +2380,73 @@ impl Chat {
         }
     }
 
+    /// Continues Slack SSO or two-factor for one workspace. The helper opens that workspace's
+    /// address. Only that account's token is saved, and only that adapter is restarted.
+    fn resume_sign_in(&self, network: Network, at: Option<(i32, i32)>, account: &str) -> Response {
+        if network != Network::Slack {
+            return error(ErrorCode::Unsupported, "Only a Slack workspace can be continued this way.");
+        }
+        let stored = match session::read(Network::Slack) {
+            session::Stored::Found(session) => session,
+            session::Stored::Absent => return error(ErrorCode::SignIn, "That workspace is not signed in."),
+            session::Stored::Unreadable(why) => {
+                return error(ErrorCode::Internal, format!("The session could not be read from {}: {why}", session::STORE));
+            }
+        };
+        match adapters::slack::accounts(&stored) {
+            Ok(found) if found.iter().any(|signed| signed.account == account) => {}
+            Ok(_) => return error(ErrorCode::SignIn, "That workspace is not signed in."),
+            Err(why) => return error(ErrorCode::SignIn, why),
+        }
+        let Some(url) = adapters::slack::workspace_url(&stored, account) else {
+            return error(ErrorCode::SignIn, "That workspace has no address to continue at.");
+        };
+        let fresh = match protocol::web_sign_in::provider() {
+            Some(web) => match login::web::sign_in(&*web, "slack", Some(&url)) {
+                Ok(session) => session,
+                Err(code) => return self.resume_ended(account, sign_in_ended(network, Some(code))),
+            },
+            None => match self.sign_in_helper(network, at, Some(&url)) {
+                Ok(session) => session,
+                Err(answer) => return self.resume_ended(account, *answer),
+            },
+        };
+        let Some(merged) = adapters::slack::resumed(&stored, &fresh, account) else {
+            return error(ErrorCode::SignIn, "That workspace did not come back signed in.");
+        };
+        let key = AccountKey { network: Network::Slack, account: account.to_owned() };
+        let started = session::save(Network::Slack, &merged).and_then(|()| {
+            lock(&self.adapters).remove(&key);
+            self.hub.set_required(&key, "");
+            self.start_accounts(Network::Slack, &merged, Some(account))
+        });
+        match started {
+            Ok(()) => self.status(),
+            Err(why) => error(ErrorCode::SignIn, why),
+        }
+    }
+
+    /// A continue that the page refused because this browser is not allowed is said on the
+    /// account row. Closing the window leaves the demand where it was.
+    fn resume_ended(&self, account: &str, ended: Response) -> Response {
+        if matches!(ended, Response::Error { code: ErrorCode::SignInBlocked, .. }) {
+            let key = AccountKey { network: Network::Slack, account: account.to_owned() };
+            self.hub.set_required(&key, adapters::slack::BROWSER_BLOCKED);
+            return self.status();
+        }
+        ended
+    }
+
     /// The desktop's sign-in: the helper window (`tinyclient-login`), and the session it prints.
-    fn sign_in_helper(&self, network: Network, at: Option<(i32, i32)>) -> Result<String, Refused> {
+    /// `start` opens that Slack address instead of the usual sign-in page.
+    fn sign_in_helper(&self, network: Network, at: Option<(i32, i32)>, start: Option<&str>) -> Result<String, Refused> {
         let helper = login_path().and_then(|path| {
             let mut helper = std::process::Command::new(path);
             protocol::log_policy::share_session(&mut helper);
             protocol::launch::no_console(&mut helper).arg(network.label().to_lowercase());
+            if let Some(start) = start {
+                helper.args(["--start", start]);
+            }
             if let Some((x, y)) = at {
                 helper.args(["--at", &format!("{x},{y}")]);
             }
@@ -3397,7 +3475,7 @@ impl Chat {
                 }
             }
 
-            Request::SignIn { network, at } => self.sign_in(network, at),
+            Request::SignIn { network, at, resume } => self.sign_in(network, at, resume),
             Request::SignInBegin { network } => self.sign_in_step(network, None),
             Request::SignInAnswer { network, input } => self.sign_in_step(network, Some(input)),
             Request::SignInCancel { network } => {

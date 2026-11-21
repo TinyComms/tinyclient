@@ -116,7 +116,7 @@ impl WebDelegate {
     }
 }
 
-pub fn run(site: Site, at: Option<(f64, f64)>) {
+pub fn run(site: Site, at: Option<(f64, f64)>, start: Option<&str>) {
     let mtm = MainThreadMarker::new().expect("main thread");
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
@@ -175,7 +175,7 @@ pub fn run(site: Site, at: Option<(f64, f64)>) {
         let url = NSURL::URLWithString(&NSString::from_str(url)).expect("a valid url");
         web.loadRequest(&NSURLRequest::requestWithURL(&url));
     };
-    load(&web, site.start);
+    load(&web, start.unwrap_or(site.start));
     window.setContentView(Some(&web));
     window.makeKeyAndOrderFront(None);
     #[allow(deprecated)]

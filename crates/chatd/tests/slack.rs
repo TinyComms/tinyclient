@@ -2825,12 +2825,12 @@ fn a_reissued_cookie_is_used_and_saved_and_a_demand_only_slacks_app_can_meet_sto
     assert_eq!((saved["user_agent"].as_str(), saved["teams"].as_array().map(Vec::len)), (Some(agent()), Some(2)));
     assert_eq!((saved["teams"][0]["token"].as_str(), saved["teams"][1]["token"].as_str()), (Some(ALPHA), Some(BETA)));
 
-    // Slack wants a second factor set up: only its own app can do that. The account says so,
-    // and nothing more is asked of Slack for this workspace.
+    // Slack wants a second factor set up. The account says so, and nothing more is asked of
+    // Slack for this workspace until the user continues that sign-in.
     world.fake.refusing.lock().unwrap().insert("conversations.replies".to_owned(), "two_factor_setup_required".to_owned());
     world.messages(&alpha("C0GEN:1760000200.000200"));
     let required = world.until("the account to say what Slack wants", || Some(world.account("T01ALPHA").required).filter(|required| !required.is_empty()));
-    assert_eq!(required, "Slack wants two-factor authentication set up. Finish that in the Slack app.");
+    assert_eq!(required, "Slack wants two-factor authentication set up. Continue in tinyclient for this workspace.");
     world.fake.refusing.lock().unwrap().clear();
     let asked = world.fake.calls.lock().unwrap().iter().filter(|call| call.token == ALPHA).count();
     let members = world.ask(Request::Members { conversation: general.clone(), offset: 0, limit: 10 });
