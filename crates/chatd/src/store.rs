@@ -3832,12 +3832,17 @@ impl Store {
                 }
                 SharedKind::Music => {
                     let wanted = message.attachments.iter().filter(|attachment| {
-                        !attachment.sticker && attachment.file.kind == protocol::MediaKind::Audio && !attachment.voice
+                        !attachment.sticker
+                            && attachment.file.kind == protocol::MediaKind::Audio
+                            && attachment.waveform.is_empty()
+                            && !attachment.round
                     });
                     items.extend(wanted.map(|attachment| item(Some(attachment.clone()), "", "")));
                 }
                 SharedKind::Voice => {
-                    let wanted = message.attachments.iter().filter(|attachment| attachment.voice);
+                    let wanted = message.attachments.iter().filter(|attachment| {
+                        attachment.round || !attachment.waveform.is_empty()
+                    });
                     items.extend(wanted.map(|attachment| item(Some(attachment.clone()), "", "")));
                 }
                 SharedKind::Gifs => {

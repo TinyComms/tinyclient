@@ -1113,7 +1113,8 @@ fn check_schedule_target(account: &Account, who: Who, opts: Options) -> Result<(
     if opts.schedule == Some(protocol::SCHEDULE_WHEN_ONLINE as i32) {
         match who {
             Who::User(uid) if uid != account.me => {
-                let known = account.dir().get(who);
+                let dir = account.dir();
+                let known = dir.get(who);
                 if known.as_ref().is_some_and(|known| known.bot || !known.seen.is_empty()) {
                     return Err(Fault::Rpc { code: 400, name: "SCHEDULE_STATUS_PRIVATE".to_owned(), value: None });
                 }

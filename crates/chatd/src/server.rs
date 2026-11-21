@@ -2785,7 +2785,7 @@ impl Chat {
                     Ok(topic_id) => {
                         let key = Key::new(&forum.account(), topic_id);
                         match self.hub.store().conversation(&key) {
-                            Ok(Some(row)) => Response::Conversation { conversation: Box::new(self.row(row)) },
+                            Ok(Some(row)) => Response::Conversation { conversation: self.row(row) },
                             Ok(None) => error(ErrorCode::NotFound, "topic not found after creation"),
                             Err(err) => internal(err),
                         }
@@ -2965,7 +2965,7 @@ impl Chat {
                     Ok(message_id) => Response::Resolved {
                         conversation: Some(conversation),
                         message_id,
-                        error: String::new(),
+                        title: String::new(),
                     },
                     Err(refused) => *refused,
                 }
@@ -3582,13 +3582,13 @@ impl Chat {
             Request::Delete { conversation, message_id, scope } => self.rewrite(conversation, message_id, None, Vec::new(), scope),
             Request::DeleteMany { conversation, message_ids, scope } => {
                 if message_ids.is_empty() {
-                    return error(ErrorCode::Invalid, "choose at least one message to delete");
+                    return error(ErrorCode::Refused, "choose at least one message to delete");
                 }
                 if message_ids.iter().collect::<HashSet<_>>().len() != message_ids.len() {
-                    return error(ErrorCode::Invalid, "the same message was listed more than once");
+                    return error(ErrorCode::Refused, "the same message was listed more than once");
                 }
                 if message_ids.len() > 1_000 {
-                    return error(ErrorCode::Invalid, "at most 1,000 messages may be deleted in one batch");
+                    return error(ErrorCode::Refused, "at most 1,000 messages may be deleted in one batch");
                 }
                 let account = conversation.account();
                 if let Err(refused) = self.online(&account) {
@@ -3615,7 +3615,7 @@ impl Chat {
             }
             Request::DeleteParticipantHistory { conversation, person } => {
                 if person.account() != conversation.account() {
-                    return error(ErrorCode::Invalid, "person and conversation must belong to the same account");
+                    return error(ErrorCode::Refused, "person and conversation must belong to the same account");
                 }
                 self.act(&conversation, |conversation_id, reply| Command::DeleteParticipantHistory {
                     conversation_id,
@@ -3625,10 +3625,10 @@ impl Chat {
             }
             Request::ReportSpamMessages { conversation, person, message_ids } => {
                 if person.account() != conversation.account() {
-                    return error(ErrorCode::Invalid, "person and conversation must belong to the same account");
+                    return error(ErrorCode::Refused, "person and conversation must belong to the same account");
                 }
                 if message_ids.len() > 1_000 {
-                    return error(ErrorCode::Invalid, "at most 1,000 messages may be reported in one batch");
+                    return error(ErrorCode::Refused, "at most 1,000 messages may be reported in one batch");
                 }
                 self.act(&conversation, |conversation_id, reply| Command::ReportSpamMessages {
                     conversation_id,

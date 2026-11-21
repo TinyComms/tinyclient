@@ -4303,10 +4303,10 @@ fn chat_search_filters_paging_hashtags_jump_to_date_calendar_and_shared_tabs() {
     // Jump to date resolves the message closest to a target timestamp.
     let target_date = base_t0 - 50 * 86_400;
     match world.ask(Request::JumpToDate { conversation: key("g8001"), date: target_date }) {
-        Response::Resolved { conversation, message_id, error } => {
+        Response::Resolved { conversation, message_id, title } => {
             assert_eq!(conversation, Some(key("g8001")));
             assert!(message_id.is_some(), "expected a resolved message id");
-            assert!(error.is_empty());
+            assert!(title.is_empty());
         }
         other => panic!("expected Resolved, got {other:?}"),
     }

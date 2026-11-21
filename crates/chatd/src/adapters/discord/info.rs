@@ -86,8 +86,12 @@ pub(super) fn shared_items(message: &Message, kind: SharedKind) -> Vec<SharedIte
                 !attachment.sticker && match kind {
                     SharedKind::Media => pictured(attachment.file.kind),
                     SharedKind::Gifs => attachment.file.kind == MediaKind::Gif,
-                    SharedKind::Voice => attachment.voice,
-                    SharedKind::Music => attachment.file.kind == MediaKind::Audio && !attachment.voice,
+                    SharedKind::Voice => attachment.round || !attachment.waveform.is_empty(),
+                    SharedKind::Music => {
+                        attachment.file.kind == MediaKind::Audio
+                            && attachment.waveform.is_empty()
+                            && !attachment.round
+                    }
                     _ => !pictured(attachment.file.kind),
                 }
             });
