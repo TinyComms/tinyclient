@@ -64,11 +64,12 @@ impl Shell {
         };
         // Keys only: the read runs off this thread.
         let drill = self.sidebar_state.drill.as_ref().map(|drill| match drill {
-            Drill::Threads(space) => (Shelf::Main, Some(space.clone()), None, false),
-            Drill::Archive => (Shelf::Archive, None, None, false),
-            Drill::Calls => (Shelf::Main, None, None, true),
-            Drill::Requests => (Shelf::Requests, None, None, false),
-            Drill::Topics(forum) => (Shelf::Main, None, Some(forum.key.clone()), false),
+            Drill::Threads(space) => (Shelf::Main, Some(space.clone()), None, false, false),
+            Drill::Drafts(_) => (Shelf::Main, None, None, false, true),
+            Drill::Archive => (Shelf::Archive, None, None, false, false),
+            Drill::Calls => (Shelf::Main, None, None, true, false),
+            Drill::Requests => (Shelf::Requests, None, None, false, false),
+            Drill::Topics(forum) => (Shelf::Main, None, Some(forum.key.clone()), false, false),
         });
         let tg_account = self
             .snapshot
@@ -82,7 +83,8 @@ impl Shell {
         let read = move || -> std::io::Result<Read> {
             let mut read = Read::default();
             match drill {
-                Some((_, _, _, true)) => {
+                Some((_, _, _, false, true)) => {}
+                Some((_, _, _, true, _)) => {
                     if let Some(account) = tg_account {
                         if let Response::CallHistory { entries, next, more } =
                             ask(&Request::CallHistory { account, missed: calls_missed, before: None, limit: 30 })?
@@ -93,9 +95,9 @@ impl Shell {
                         }
                     }
                 }
-                Some((_, Some(space), _, false)) => read.drilled = conversations(&Request::Threads { space, offset: 0, limit: PAGE_LIMIT })?.0,
-                Some((_, _, Some(forum), false)) => read.drilled = conversations(&Request::Topics { forum, offset: 0, limit: PAGE_LIMIT, landing: false })?.0,
-                Some((shelf, None, None, false)) => read.drilled = whole(network, None, shelf)?.0,
+                Some((_, Some(space), _, false, false)) => read.drilled = conversations(&Request::Threads { space, offset: 0, limit: PAGE_LIMIT })?.0,
+                Some((_, _, Some(forum), false, false)) => read.drilled = conversations(&Request::Topics { forum, offset: 0, limit: PAGE_LIMIT, landing: false })?.0,
+                Some((shelf, None, None, false, false)) => read.drilled = whole(network, None, shelf)?.0,
                 None => {}
             }
             match network {
@@ -181,10 +183,50 @@ impl Shell {
         Some(super::tree::Row::Threads { space: space.clone(), count: news.len() as u32, mention: news.iter().any(|c| c.mentions > 0) })
     }
 
+    /// The Slack workspace's Drafts & sent row: unsent drafts across the workspace.
+    pub(super) fn drafts_row(&self, space: &Key) -> Option<super::tree::Row> {
+        let tree = self.trees.get(space)?;
+        let count = tree
+            .conversations
+            .iter()
+            .filter(|c| !self.draft_of(c).trim().is_empty())
+            .count() as u32;
+        Some(super::tree::Row::Drafts { space: space.clone(), count })
+    }
+
     /// The home's items again, from what is held.
     pub(super) fn rebuild_home(&mut self, cx: &mut Context<Self>) {
         let state = &self.sidebar_state;
         let items: Vec<Item> = match (&state.mode, &state.drill) {
+            (Mode::Network(_), Some(Drill::Drafts(space))) => {
+                let mut out = Vec::new();
+                if let Some(tree) = self.trees.get(space) {
+                    let mut drafts: Vec<Rc<Conversation>> = tree
+                        .conversations
+                        .iter()
+                        .filter(|c| !self.draft_of(c).trim().is_empty())
+                        .cloned()
+                        .collect();
+                    drafts.sort_by_key(|c| std::cmp::Reverse(c.updated));
+                    if !drafts.is_empty() {
+                        out.push(Item::Header { label: "Drafts", first: true });
+                        out.extend(drafts.into_iter().map(Item::Chat));
+                    }
+                    let mut sent: Vec<Rc<Conversation>> = tree
+                        .conversations
+                        .iter()
+                        .filter(|c| c.preview_mine && !c.preview.trim().is_empty())
+                        .cloned()
+                        .collect();
+                    sent.sort_by_key(|c| std::cmp::Reverse(c.updated));
+                    sent.truncate(25);
+                    if !sent.is_empty() {
+                        out.push(Item::Header { label: "Sent", first: out.is_empty() });
+                        out.extend(sent.into_iter().map(Item::Chat));
+                    }
+                }
+                out
+            }
             (Mode::Network(_), Some(Drill::Requests)) => {
                 let mut out: Vec<Item> = state.home.drilled.iter().filter(|c| !c.spam).cloned().map(Item::Chat).collect();
                 let spam: Vec<Item> = state.home.drilled.iter().filter(|c| c.spam).cloned().map(Item::Chat).collect();
@@ -752,6 +794,7 @@ impl Shell {
         let state = &self.sidebar_state;
         let (icon, title, detail): (&'static str, String, String) = match (&state.home.network, &state.drill) {
             (_, Some(Drill::Threads(_))) => ("icons/messages-square.svg", "No new replies".into(), "Threads you follow show here when someone replies.".into()),
+            (_, Some(Drill::Drafts(_))) => ("icons/square-pen.svg", "No drafts or sent messages".into(), "Drafts you write and messages you send appear here.".into()),
             (_, Some(Drill::Archive)) => ("icons/inbox.svg", "Nothing archived".into(), "Chats you archive in Telegram show up here.".into()),
             (_, Some(Drill::Calls)) => ("icons/phone.svg", "No recent calls".into(), "Your Telegram calls show up here.".into()),
             (_, Some(Drill::Requests)) => ("icons/mail.svg", "No message requests".into(), "Messages from people you don't know wait here.".into()),

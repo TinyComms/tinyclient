@@ -130,6 +130,8 @@ struct Fake {
     dnd_info: Mutex<Option<Value>>,
     /// Channel bookmarks keyed by channel_id.
     bookmarks: Mutex<HashMap<String, Vec<Value>>>,
+    /// Active Slack drafts for `drafts.list` / `drafts.create` / `drafts.update` / `drafts.delete`.
+    drafts: Mutex<Vec<Value>>,
 }
 
 fn unescape(text: &str) -> String {
@@ -181,6 +183,7 @@ impl Fake {
                     json!({"id": "Bk2", "channel_id": "C0GEN", "title": "Team Canvas", "link": "https://alpha.slack.com/docs/T01ALPHA/F0CANVAS", "emoji": "", "type": "canvas"}),
                 ],
             )])),
+            drafts: Mutex::default(),
         });
         let socket_url = format!("ws://{}/", socket.local_addr().unwrap());
         for (listener, serve) in [(http, Fake::http as fn(Arc<Fake>, TcpStream)), (socket, Fake::socket)] {
@@ -718,6 +721,50 @@ impl Fake {
                 let cid = param("channel_id");
                 let list = self.bookmarks.lock().unwrap().get(cid).cloned().unwrap_or_default();
                 Some(json!({"ok": true, "bookmarks": list}))
+            }
+            "drafts.list" => {
+                let list = self.drafts.lock().unwrap().clone();
+                Some(json!({"ok": true, "drafts": list}))
+            }
+            "drafts.create" => {
+                let dests: Value = serde_json::from_str(param("destinations")).unwrap_or_else(|_| json!([]));
+                let blocks: Value = serde_json::from_str(param("blocks")).unwrap_or_else(|_| json!([]));
+                let n = self.posted.fetch_add(1, Ordering::Relaxed) + 1;
+                let id = format!("Dr{n:04}");
+                let draft = json!({
+                    "id": id,
+                    "destinations": dests,
+                    "blocks": blocks,
+                    "date_last_updated": 1760005000 + i64::from(n),
+                    "is_deleted": false,
+                    "is_sent": false,
+                });
+                self.drafts.lock().unwrap().push(draft.clone());
+                Some(json!({"ok": true, "draft": draft}))
+            }
+            "drafts.update" => {
+                let id = param("draft_id");
+                let dests: Value = serde_json::from_str(param("destinations")).unwrap_or_else(|_| json!([]));
+                let blocks: Value = serde_json::from_str(param("blocks")).unwrap_or_else(|_| json!([]));
+                let n = self.posted.fetch_add(1, Ordering::Relaxed) + 1;
+                let mut drafts = self.drafts.lock().unwrap();
+                let Some(existing) = drafts.iter_mut().find(|d| d["id"] == id) else {
+                    return refused("draft_not_found");
+                };
+                existing["destinations"] = dests;
+                existing["blocks"] = blocks;
+                existing["date_last_updated"] = (1760005000 + i64::from(n)).into();
+                Some(json!({"ok": true, "draft": existing.clone()}))
+            }
+            "drafts.delete" => {
+                let id = param("draft_id");
+                let mut drafts = self.drafts.lock().unwrap();
+                let before = drafts.len();
+                drafts.retain(|d| d["id"] != id);
+                if drafts.len() == before {
+                    return refused("draft_not_found");
+                }
+                Some(json!({"ok": true}))
             }
             "bookmarks.add" => {
                 let cid = param("channel_id").to_owned();
@@ -4659,4 +4706,129 @@ fn slack_create_channel_and_start_group_dm() {
         !updated_spaces.iter().find(|s| s.key == space).unwrap().can_create_channels,
         "restricted_action should clear can_create_channels on the Space"
     );
+}
+
+#[test]
+fn slack_drafts_sync_both_ways_with_newest_wins_and_clear_on_send() {
+    let world = World::start();
+    world.ready();
+    let gen = alpha("C0GEN");
+    let rnd = alpha("C0RND");
+
+    // 1. Typing a draft locally creates a Slack draft (`drafts.create`).
+    assert!(matches!(
+        world.ask(Request::SetDraft { conversation: gen.clone(), text: "wip deploy note".into() }),
+        Response::Ok
+    ));
+    world.until("drafts.create called", || (!world.fake.calls(ALPHA, "drafts.create").is_empty()).then_some(()));
+    let created = world.fake.calls(ALPHA, "drafts.create");
+    assert_eq!(created.len(), 1);
+    assert!(
+        created[0].params.get("destinations").is_some_and(|d| d.contains("C0GEN")),
+        "destinations should target C0GEN: {:?}",
+        created[0].params
+    );
+    assert!(
+        created[0].params.get("blocks").is_some_and(|b| b.contains("wip deploy note")),
+        "blocks should carry draft text: {:?}",
+        created[0].params
+    );
+
+    // 2. Updating the local draft calls `drafts.update` with the same draft_id.
+    assert!(matches!(
+        world.ask(Request::SetDraft { conversation: gen.clone(), text: "wip deploy note v2".into() }),
+        Response::Ok
+    ));
+    world.until("drafts.update called", || (!world.fake.calls(ALPHA, "drafts.update").is_empty()).then_some(()));
+    let updated = world.fake.calls(ALPHA, "drafts.update");
+    assert_eq!(updated.len(), 1);
+    let draft_id = updated[0].params.get("draft_id").cloned().unwrap();
+    assert!(draft_id.starts_with("Dr"), "unexpected draft_id: {draft_id}");
+
+    // 3. An older remote `draft_update` MUST NOT overwrite our newer non-empty local draft.
+    world.fake.push(
+        ALPHA,
+        json!({
+            "type": "draft_update",
+            "draft": {
+                "id": draft_id,
+                "destinations": [{"channel_id": "C0GEN"}],
+                "date_last_updated": 1000,
+                "blocks": [{
+                    "type": "rich_text",
+                    "elements": [{"type": "rich_text_section", "elements": [{"type": "text", "text": "stale older draft"}]}]
+                }]
+            }
+        }),
+    );
+    sleep(Duration::from_millis(250));
+    let Response::Conversation { conversation: gen_row } = world.ask(Request::Conversation { conversation: gen.clone() }) else {
+        panic!("expected Conversation");
+    };
+    assert_eq!(gen_row.draft, "wip deploy note v2", "older remote draft must not clobber newer local draft");
+
+    // 4. Clearing the local draft calls `drafts.delete`.
+    assert!(matches!(
+        world.ask(Request::SetDraft { conversation: gen.clone(), text: String::new() }),
+        Response::Ok
+    ));
+    world.until("drafts.delete called", || (!world.fake.calls(ALPHA, "drafts.delete").is_empty()).then_some(()));
+    assert_eq!(
+        world.fake.calls(ALPHA, "drafts.delete")[0].params.get("draft_id").map(String::as_str),
+        Some(draft_id.as_str())
+    );
+
+    // 5. A remote draft created on another device populates `conversation.draft`, and `draft_sent` clears it.
+    world.fake.push(
+        ALPHA,
+        json!({
+            "type": "draft_create",
+            "draft": {
+                "id": "DrREMOTE1",
+                "destinations": [{"channel_id": "C0RND"}],
+                "date_last_updated": 1800000000,
+                "blocks": [{
+                    "type": "rich_text",
+                    "elements": [{"type": "rich_text_section", "elements": [{"type": "text", "text": "typed on phone"}]}]
+                }]
+            }
+        }),
+    );
+    world.until("remote draft stored", || {
+        matches!(
+            world.ask(Request::Conversation { conversation: rnd.clone() }),
+            Response::Conversation { conversation } if conversation.draft == "typed on phone"
+        )
+        .then_some(())
+    });
+
+    world.fake.push(
+        ALPHA,
+        json!({
+            "type": "draft_sent",
+            "draft_id": "DrREMOTE1"
+        }),
+    );
+    world.until("draft_sent clears local draft", || {
+        matches!(
+            world.ask(Request::Conversation { conversation: rnd.clone() }),
+            Response::Conversation { conversation } if conversation.draft.is_empty()
+        )
+        .then_some(())
+    });
+
+    // 6. A thread draft includes `thread_ts` in `destinations`.
+    let thread = alpha(&format!("C0GEN:{ROOT}"));
+    world.general();
+    world.until("thread conversation known", || {
+        matches!(world.ask(Request::Conversation { conversation: thread.clone() }), Response::Conversation { .. }).then_some(())
+    });
+    assert!(matches!(
+        world.ask(Request::SetDraft { conversation: thread, text: "thread reply draft".into() }),
+        Response::Ok
+    ));
+    world.until("thread drafts.create called", || (world.fake.calls(ALPHA, "drafts.create").len() >= 2).then_some(()));
+    let thread_call = world.fake.calls(ALPHA, "drafts.create").into_iter().last().unwrap();
+    let dest_json = thread_call.params.get("destinations").cloned().unwrap_or_default();
+    assert!(dest_json.contains("C0GEN") && dest_json.contains(ROOT), "thread destination missing thread_ts: {dest_json}");
 }
