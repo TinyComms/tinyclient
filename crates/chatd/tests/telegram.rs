@@ -4092,7 +4092,7 @@ fn forum_topics_crud_search_icons_and_paging_past_fifty() {
         icon_color: Some(0x6FB9F0),
         icon_emoji_id: Some("e6501".into()),
     }) {
-        Response::Conversation { conversation } => *conversation,
+        Response::Conversation { conversation } => conversation,
         other => panic!("expected created topic Conversation, got {other:?}"),
     };
     assert_eq!(created.title, "Sharpening");
