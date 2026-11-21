@@ -126,6 +126,8 @@ struct Fake {
     reissue: Mutex<Option<String>>,
     /// "limit once" has been limited.
     limited: AtomicBool,
+    /// Optional override for `dnd.info` response.
+    dnd_info: Mutex<Option<Value>>,
 }
 
 fn unescape(text: &str) -> String {
@@ -169,6 +171,7 @@ impl Fake {
             refusing: Mutex::default(),
             reissue: Mutex::default(),
             limited: AtomicBool::new(false),
+            dnd_info: Mutex::default(),
         });
         let socket_url = format!("ws://{}/", socket.local_addr().unwrap());
         for (listener, serve) in [(http, Fake::http as fn(Arc<Fake>, TcpStream)), (socket, Fake::socket)] {
@@ -430,6 +433,29 @@ impl Fake {
                 "channel": {"id": "D0NEW", "created": 1760000000, "is_im": true, "is_org_shared": false,
                             "user": param("users"), "is_open": true, "priority": 0},
             })),
+            "conversations.close" => {
+                if channel.is_empty() {
+                    return refused("invalid_arguments");
+                }
+                Some(json!({"ok": true}))
+            }
+            "usergroups.list" => Some(json!({
+                "ok": true,
+                "usergroups": [
+                    {"id": "S0MINE", "handle": "oncall", "name": "On Call", "date_delete": 0, "users": [me(token), "U0ANA"]},
+                    {"id": "S0OTHER", "handle": "design", "name": "Design", "date_delete": 0, "users": ["U0ANA", "U0BEN"]},
+                    {"id": "S0OFF", "handle": "legacy", "name": "Legacy", "date_delete": 1700000000, "users": [me(token)]},
+                ],
+            })),
+            "dnd.info" => self.dnd_info.lock().unwrap().clone().or_else(|| Some(json!({
+                "ok": true,
+                "dnd_enabled": false,
+                "next_dnd_start_ts": 0,
+                "next_dnd_end_ts": 0,
+                "snooze_enabled": false,
+                "snooze_endtime": 0,
+            }))),
+            "dnd.teamInfo" => Some(json!({"ok": true, "users": {}})),
             // A conversation star is the channel alone. A timestamp would star a message.
             "stars.add" | "stars.remove" => {
                 if channel.is_empty() || !param("timestamp").is_empty() {
@@ -1995,12 +2021,17 @@ fn connecting_asks_little_spaces_what_it_warms_and_a_reconnect_asks_less() {
             ("auth.test", connections),
             ("client.counts", connections),
             ("conversations.history", history),
+            ("dnd.info", connections),
             ("edge:users/info", 1),
             ("team.info", 1),
+            ("usergroups.list", connections),
             ("users.channelSections.list", sidebars),
             ("users.conversations", sidebars),
             ("users.prefs.get", connections),
         ];
+        if connections > 1 {
+            expected.push(("dnd.teamInfo", connections - 1));
+        }
         expected.sort();
         expected.into_iter().map(|(method, count)| (method.to_owned(), count)).collect()
     };
@@ -2620,4 +2651,127 @@ fn a_call_block_is_a_meeting_card_with_a_join_link_and_an_old_call_names_itself(
         "room": { "date_start": started, "date_end": started + 25 * 60, "has_ended": true, "call_family": "huddle" },
     }));
     assert_eq!(huddle.text, "A huddle happened · 25 min");
+}
+
+#[test]
+fn closing_a_direct_or_leaving_a_group_dm_calls_conversations_close_and_drops_the_row() {
+    let world = World::start();
+    world.ready();
+    let dm = alpha("D0ANA");
+    let group = alpha("G0GRP");
+    assert!(world.conversation(&dm).is_some(), "DM starts in the tree");
+    assert!(world.conversation(&group).is_some(), "group DM starts in the tree");
+
+    let closed = world.ask(Request::CloseDirect { conversation: dm.clone() });
+    assert!(matches!(closed, Response::Ok), "CloseDirect should succeed, got {closed:?}");
+    let left = world.ask(Request::Leave { conversation: group.clone() });
+    assert!(matches!(left, Response::Ok), "Leave on group DM should succeed, got {left:?}");
+
+    let calls = world.fake.calls(ALPHA, "conversations.close");
+    let closed_ids: Vec<&str> = calls.iter().filter_map(|call| call.params.get("channel").map(String::as_str)).collect();
+    assert_eq!(closed_ids, ["D0ANA", "G0GRP"]);
+    world.until("closed DM to leave the tree", || world.conversation(&dm).is_none().then_some(()));
+    world.until("left group DM to leave the tree", || world.conversation(&group).is_none().then_some(()));
+}
+
+#[test]
+fn usergroup_mention_counts_as_mention_only_for_my_active_groups_and_follows_subteam_events() {
+    let world = World::start();
+    world.ready();
+    let general = alpha("C0GEN");
+    let push = |ts: &str, text: &str| {
+        world.fake.push(ALPHA, json!({
+            "type": "message", "channel": "C0GEN", "user": "U0ANA", "text": text, "ts": ts,
+        }));
+        world.until("the usergroup message", || world.message(&general, ts))
+    };
+
+    let mine = push("1760000700.000100", "<!subteam^S0MINE> check");
+    assert!(mine.mentions_me, "a mention of a user group I belong to must set mentions_me");
+    assert_eq!(mine.text, "@oncall check");
+
+    let other = push("1760000700.000200", "<!subteam^S0OTHER> check");
+    assert!(!other.mentions_me, "a group I do not belong to must not set mentions_me");
+
+    let disabled = push("1760000700.000300", "<!subteam^S0OFF> check");
+    assert!(!disabled.mentions_me, "a disabled user group must be ignored");
+
+    // Joining S0OTHER via socket makes it count as a mention.
+    world.fake.push(ALPHA, json!({"type": "subteam_self_added", "subteam_id": "S0OTHER"}));
+    sleep(Duration::from_millis(200));
+    let now_mine = push("1760000700.000400", "<!subteam^S0OTHER> now mine");
+    assert!(now_mine.mentions_me, "subteam_self_added should add the group to my groups");
+
+    // Leaving S0MINE via socket stops it counting as a mention.
+    world.fake.push(ALPHA, json!({"type": "subteam_self_removed", "subteam_id": "S0MINE"}));
+    sleep(Duration::from_millis(200));
+    let no_longer = push("1760000700.000500", "<!subteam^S0MINE> no longer mine");
+    assert!(!no_longer.mentions_me, "subteam_self_removed should remove the group from my groups");
+}
+
+#[test]
+fn slack_dnd_snooze_sets_presence_dnd_and_dnd_updated_clears_it() {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    let world = World::start_with(|fake| {
+        *fake.dnd_info.lock().unwrap() = Some(json!({
+            "ok": true,
+            "dnd_enabled": true,
+            "next_dnd_start_ts": 0,
+            "next_dnd_end_ts": 0,
+            "snooze_enabled": true,
+            "snooze_endtime": now + 3600,
+        }));
+    });
+    world.ready();
+
+    // Connecting reads dnd.info and reports our own presence as Dnd while snoozed.
+    world.until("own presence to become Dnd from dnd.info", || {
+        (world.account("T01ALPHA").presence == Presence::Dnd).then_some(())
+    });
+    assert_eq!(world.fake.calls(ALPHA, "dnd.info").len(), 1);
+
+    // A mention while DND is active still raises the badge count on the conversation.
+    let general = alpha("C0GEN");
+    let before = world.conversation(&general).unwrap().mentions;
+    world.fake.push(ALPHA, json!({
+        "type": "message", "channel": "C0GEN", "user": "U0ANA", "text": "<@U0ME> ping", "ts": "1760000800.000100",
+    }));
+    world.until("mention badge to rise under DND", || {
+        world.conversation(&general).filter(|row| row.mentions > before).map(|_| ())
+    });
+
+    // Another user's DND via dnd_updated_user shows as Presence::Dnd.
+    world.fake.push(ALPHA, json!({
+        "type": "dnd_updated_user",
+        "user": "U0ANA",
+        "dnd_status": {
+            "dnd_enabled": true,
+            "next_dnd_start_ts": now - 60,
+            "next_dnd_end_ts": now + 3600,
+        },
+    }));
+    world.until("Ana to show as Dnd", || {
+        let Response::People { people, .. } = world.ask(Request::People {
+            network: Some(Network::Slack), relation: None, query: Some("Ana".into()), offset: 0, limit: 10,
+        }) else {
+            return None;
+        };
+        people.into_iter().find(|p| p.key == alpha("U0ANA") && p.presence == Presence::Dnd).map(|_| ())
+    });
+
+    // Ending our snooze via dnd_updated clears Dnd back to Online.
+    world.fake.push(ALPHA, json!({
+        "type": "dnd_updated",
+        "user": "U0ME",
+        "dnd_status": {
+            "dnd_enabled": false,
+            "next_dnd_start_ts": 0,
+            "next_dnd_end_ts": 0,
+            "snooze_enabled": false,
+            "snooze_endtime": 0,
+        },
+    }));
+    world.until("own presence to clear Dnd after dnd_updated", || {
+        (world.account("T01ALPHA").presence == Presence::Online).then_some(())
+    });
 }

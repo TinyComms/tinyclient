@@ -598,7 +598,7 @@ pub fn person_menu(person: &Person, seen: &Seen, alt: bool, pane: bool) -> Vec<I
     if !pane && !person.link.is_empty() {
         items.push(Item::OpenIn);
     }
-    if seen.in_their_dm && seen.direct.is_some() {
+    if seen.in_their_dm && seen.direct.is_some() && can_close_direct(person.key.network) {
         items.push(Item::CloseDirect);
     }
     let (remove, block) = offers(person);
@@ -610,6 +610,11 @@ pub fn person_menu(person: &Person, seen: &Seen, alt: bool, pane: bool) -> Vec<I
         items.push(Item::Block);
     }
     tidy(items)
+}
+
+/// Whether this network's adapter serves `Request::CloseDirect`.
+pub fn can_close_direct(network: Network) -> bool {
+    matches!(network, Network::Discord | Network::Messages | Network::Slack)
 }
 
 /// A group DM, or a Telegram group or channel: the user can leave it from the pane.
@@ -1060,6 +1065,14 @@ mod tests {
         assert!(!can_leave(&row(Network::Discord, ConversationKind::Channel)));
         assert!(can_leave(&row(Network::Teams, ConversationKind::Group)));
         assert!(!can_leave(&row(Network::Teams, ConversationKind::Channel)));
+        // Slack serves CloseDirect on DMs and Leave (via conversations.close) on group DMs;
+        // networks that do not serve CloseDirect omit it from the person menu.
+        assert!(person_menu(&tess, &DM, false, true).contains(&Item::CloseDirect));
+        assert!(conversation_menu(&row(Network::Slack, ConversationKind::Group), Some("l"), false).contains(&Item::Leave));
+        for unsupported in [Network::Signal, Network::Telegram, Network::Teams, Network::Tiny] {
+            let other = person(unsupported, Relation::Contact);
+            assert!(!person_menu(&other, &DM, false, true).contains(&Item::CloseDirect), "{unsupported:?} should not offer CloseDirect");
+        }
     }
 
     #[test]

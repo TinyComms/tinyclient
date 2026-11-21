@@ -1060,8 +1060,17 @@ impl Shell {
             ));
             items.push(act("row-open-in", "icons/external-link.svg", format!("Open in {}", network.label()).into(), Box::new(move |_, cx| cx.open_url(&link))));
         }
-        // CONTRACT: closing a DM has a request on Discord only; leaving, where `can_leave` says.
-        let close = row.kind == protocol::ConversationKind::Direct && network == Network::Discord;
+        if row.call == protocol::CallSupport::Handoff && network == Network::Slack {
+            let handoff_key = key.clone();
+            items.push(act(
+                "row-huddle",
+                "icons/headphones.svg",
+                "Huddle in Slack".into(),
+                Box::new(move |this, cx| this.call_handoff(handoff_key.clone(), cx)),
+            ));
+        }
+        // Closing a DM is offered only on networks whose adapter serves `CloseDirect`; leaving, where `can_leave` says.
+        let close = row.kind == protocol::ConversationKind::Direct && matches!(network, Network::Discord | Network::Messages | Network::Slack);
         if close || leave {
             items.push(menu_separator().into_any_element());
         }

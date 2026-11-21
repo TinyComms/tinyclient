@@ -29,6 +29,58 @@ const ROSTER: usize = 1_000;
 /// none for someone Slack does serve one for.
 const NOTE: u8 = 4;
 
+/// One person's Do Not Disturb state as Slack reports it (`dnd.info`, `dnd.teamInfo`,
+/// `dnd_updated`, `dnd_updated_user`). Both an active snooze and scheduled quiet hours
+/// count as Do Not Disturb.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct DndState {
+    pub dnd_enabled: bool,
+    pub next_dnd_start_ts: i64,
+    pub next_dnd_end_ts: i64,
+    pub snooze_enabled: bool,
+    pub snooze_endtime: i64,
+}
+
+impl DndState {
+    pub(super) fn from_value(value: &Value) -> DndState {
+        DndState {
+            dnd_enabled: value["dnd_enabled"] == true,
+            next_dnd_start_ts: value["next_dnd_start_ts"].as_i64().unwrap_or(0),
+            next_dnd_end_ts: value["next_dnd_end_ts"].as_i64().unwrap_or(0),
+            snooze_enabled: value["snooze_enabled"] == true,
+            snooze_endtime: value["snooze_endtime"].as_i64().unwrap_or(0),
+        }
+    }
+
+    /// True while snooze or scheduled quiet hours are active at `now`.
+    pub(super) fn active(&self, now: i64) -> bool {
+        let snoozed = self.snooze_enabled && self.snooze_endtime > now;
+        let scheduled = self.dnd_enabled
+            && self.next_dnd_start_ts > 0
+            && self.next_dnd_start_ts <= now
+            && now < self.next_dnd_end_ts;
+        snoozed || scheduled
+    }
+
+    /// The earliest Unix timestamp strictly after `now` when `active` may flip.
+    pub(super) fn next_change(&self, now: i64) -> Option<i64> {
+        let mut soonest: Option<i64> = None;
+        let mut consider = |ts: i64| {
+            if ts > now {
+                soonest = Some(soonest.map_or(ts, |best| best.min(ts)));
+            }
+        };
+        if self.snooze_enabled {
+            consider(self.snooze_endtime);
+        }
+        if self.dnd_enabled {
+            consider(self.next_dnd_start_ts);
+            consider(self.next_dnd_end_ts);
+        }
+        soonest
+    }
+}
+
 /// What tinyclient keeps of a person in memory.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(super) struct User {
@@ -590,6 +642,19 @@ impl Slack {
         self.ctx.relation(person, Relation::Contact)
     }
 
+    /// Drops a closed direct conversation's partner so presence is no longer watched for them.
+    pub(super) fn forget_partner(&self, channel: &str) {
+        let removed = {
+            let mut state = self.state();
+            let before = state.partners.len();
+            state.partners.retain(|_, id| id != channel);
+            state.partners.len() != before
+        };
+        if removed {
+            self.keep_partners();
+        }
+    }
+
     /// The row of a direct conversation. The partner is looked up first, which registers
     /// their picture and records them before the row that names both.
     pub(super) fn direct_row(&self, channel: &str, person: &str) -> ConversationRow {
@@ -649,6 +714,7 @@ impl Slack {
 
     /// `presence_change`, for one person or a batch. Away is all Slack says of someone not
     /// active, so it is drawn as offline; ours is Away, the state the user can set.
+    /// An active Do Not Disturb window (snooze or quiet hours) overrides the shown presence.
     pub(super) fn presence_changed(&self, event: &Value) {
         let away = match event["presence"].as_str() {
             Some("active") => false,
@@ -656,17 +722,108 @@ impl Slack {
             _ => return,
         };
         let me = self.me.get();
+        let now = crate::hub::now();
         let one = event["user"].as_str().into_iter();
         let many = event["users"].as_array().into_iter().flatten().filter_map(Value::as_str);
         for id in one.chain(many) {
-            let presence = match (away, me.is_some_and(|me| me == id)) {
+            let raw = match (away, me.is_some_and(|me| me == id)) {
                 (false, _) => Presence::Online,
                 (true, true) => Presence::Idle,
                 (true, false) => Presence::Offline,
             };
+            let dnd_active = {
+                let mut state = self.state();
+                state.raw_presence.insert(id.to_owned(), raw);
+                state.dnd.get(id).is_some_and(|dnd| dnd.active(now))
+            };
+            let presence = if dnd_active { Presence::Dnd } else { raw };
             let status = self.cached(id).map(|user| user.status).unwrap_or_default();
             self.ctx.presence(id, presence, &status, self.owned(id));
         }
+    }
+
+    /// Reads our own DND state (`dnd.info`) and visible DM partners' DND (`dnd.teamInfo`)
+    /// once after connecting.
+    pub(super) fn load_dnd(&self) {
+        let now = crate::hub::now();
+        if let Some(me) = self.me.get().cloned() {
+            if let Ok(info) = self.api("dnd.info", &[]) {
+                self.apply_dnd(&me, DndState::from_value(&info), now);
+            }
+        }
+        let partners: Vec<String> = self.state().partners.keys().cloned().collect();
+        if partners.is_empty() {
+            return;
+        }
+        let users = partners.join(",");
+        if let Ok(team) = self.api("dnd.teamInfo", &[("users", &users)]) {
+            if let Some(map) = team["users"].as_object() {
+                for (id, entry) in map {
+                    let dnd = DndState::from_value(entry);
+                    if dnd.active(now) || dnd.next_change(now).is_some() {
+                        self.apply_dnd(id, dnd, now);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `dnd_updated` (ours) or `dnd_updated_user` (another user).
+    pub(super) fn dnd_updated(&self, event: &Value) {
+        let id = event["user"].as_str().or_else(|| self.me.get().map(String::as_str));
+        let Some(id) = id.filter(|id| !id.is_empty()) else {
+            return;
+        };
+        let dnd = DndState::from_value(&event["dnd_status"]);
+        self.apply_dnd(id, dnd, crate::hub::now());
+    }
+
+    /// Called on each socket tick: flips presence when a tracked snooze or quiet-hours
+    /// boundary passes, without polling Slack.
+    pub(super) fn tick_dnd(&self) {
+        let now = crate::hub::now();
+        let due = {
+            let mut state = self.state();
+            if !state.dnd_next.is_some_and(|at| now >= at) {
+                return;
+            }
+            state.dnd_next = state.dnd.values().filter_map(|d| d.next_change(now)).min();
+            state.dnd.keys().cloned().collect::<Vec<_>>()
+        };
+        for id in due {
+            self.report_effective_presence(&id, now);
+        }
+    }
+
+    fn apply_dnd(&self, id: &str, dnd: DndState, now: i64) {
+        let active = dnd.active(now);
+        let was_active = {
+            let mut state = self.state();
+            let prev = state.dnd.insert(id.to_owned(), dnd);
+            state.dnd_next = state.dnd.values().filter_map(|d| d.next_change(now)).min();
+            prev.is_some_and(|prev| prev.active(now))
+        };
+        if active || was_active {
+            self.report_effective_presence(id, now);
+        }
+    }
+
+    fn report_effective_presence(&self, id: &str, now: i64) {
+        let is_me = self.me.get().is_some_and(|me| me == id);
+        let presence = {
+            let state = self.state();
+            if state.dnd.get(id).is_some_and(|dnd| dnd.active(now)) {
+                Presence::Dnd
+            } else if let Some(&raw) = state.raw_presence.get(id) {
+                raw
+            } else if is_me {
+                Presence::Online
+            } else {
+                Presence::Unknown
+            }
+        };
+        let status = self.cached(id).map(|user| user.status).unwrap_or_default();
+        self.ctx.presence(id, presence, &status, self.owned(id));
     }
 
     /// `manual_presence_change`: the user set themselves away or back, here or elsewhere.
@@ -727,5 +884,29 @@ mod tests {
         };
         let read: Kept = serde_json::from_str(&serde_json::to_string(&kept).unwrap()).unwrap();
         assert_eq!((read.form, read.user.name.as_str(), read.picture.as_str(), read.portrait.as_str()), (NOTE, "Ana", kept.picture.as_str(), kept.portrait.as_str()));
+    }
+
+    #[test]
+    fn dnd_state_tracks_snooze_and_scheduled_quiet_hours_and_next_boundary() {
+        let now = 1_800_000_000_i64;
+        let snooze = DndState::from_value(&json!({
+            "dnd_enabled": false, "next_dnd_start_ts": 0, "next_dnd_end_ts": 0,
+            "snooze_enabled": true, "snooze_endtime": now + 3600,
+        }));
+        assert!(snooze.active(now));
+        assert!(!snooze.active(now + 3600));
+        assert_eq!(snooze.next_change(now), Some(now + 3600));
+        assert_eq!(snooze.next_change(now + 3600), None);
+
+        let quiet = DndState::from_value(&json!({
+            "dnd_enabled": true, "next_dnd_start_ts": now + 600, "next_dnd_end_ts": now + 3600,
+            "snooze_enabled": false, "snooze_endtime": 0,
+        }));
+        assert!(!quiet.active(now));
+        assert_eq!(quiet.next_change(now), Some(now + 600));
+        assert!(quiet.active(now + 600));
+        assert_eq!(quiet.next_change(now + 600), Some(now + 3600));
+        assert!(!quiet.active(now + 3600));
+        assert_eq!(quiet.next_change(now + 3600), None);
     }
 }
