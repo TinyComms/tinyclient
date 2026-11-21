@@ -707,6 +707,13 @@ pub struct ActionResult {
     /// True when the answer should open a modal dialog rather than a brief toast or immediate open.
     #[serde(default, skip_serializing_if = "is_false")]
     pub alert: bool,
+    /// When set, the modal's primary button sends this action in the same conversation.
+    /// Empty means the button opens `url`, or the modal only closes.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub follow_action: String,
+    /// The value sent with [`ActionResult::follow_action`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub follow_value: String,
 }
 
 fn is_http_url(url: &str) -> bool {
@@ -730,6 +737,14 @@ impl ActionResult {
         for (label, value) in &mut self.fields {
             clip(label, 256);
             clip(value, 1_000);
+        }
+        clip(&mut self.follow_action, 64);
+        clip(&mut self.follow_value, 64);
+        let follow_ok = !self.follow_action.is_empty()
+            && self.follow_action.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-'));
+        if !follow_ok {
+            self.follow_action.clear();
+            self.follow_value.clear();
         }
     }
 }

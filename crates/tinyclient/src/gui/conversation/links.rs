@@ -90,6 +90,30 @@ pub(super) fn is_mailto(url: &str) -> bool {
         && !url.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"')
 }
 
+/// A Telegram mini app handed to Telegram's own app: `tg://resolve?domain=<bot>&appname=<app>`.
+/// Anything else, including a login token, is not one.
+pub(super) fn telegram_app_link(url: &str) -> bool {
+    let Some(query) = url.strip_prefix("tg://resolve?") else {
+        return false;
+    };
+    let mut domain = "";
+    let mut app = "";
+    for pair in query.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            return false;
+        };
+        if value.is_empty() || value.len() > 128 || !value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+            return false;
+        }
+        match key {
+            "domain" if domain.is_empty() => domain = value,
+            "appname" if app.is_empty() => app = value,
+            _ => return false,
+        }
+    }
+    !domain.is_empty() && !app.is_empty()
+}
+
 /// Whether a link to `dest` opens without a question, given what the person chose.
 pub(super) fn opens_at_once(dest: &Destination, confirm: bool, trusted: bool) -> bool {
     // A lookalike or a "user@" address is always asked about: that is what the question is for.
@@ -360,6 +384,22 @@ mod tests {
         ] {
             assert!(!is_mailto(bad), "{bad:?}");
             assert!(Destination::parse(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_mini_app_link_is_handed_to_telegram_and_a_token_is_not() {
+        assert!(telegram_app_link("tg://resolve?domain=trail_bot&appname=ridge"));
+        assert!(Destination::parse("tg://resolve?domain=trail_bot&appname=ridge").is_none());
+        for bad in [
+            "tg://resolve?domain=trail_bot",
+            "tg://resolve?domain=trail_bot&appname=ridge&hash=secret-token-9",
+            "tg://login?token=secret-token-9",
+            "tg://resolve?appname=ridge&domain=trail_bot",
+            "https://t.me/trail_bot/ridge",
+            "tg://resolve?domain=trail_bot&appname=../ridge",
+        ] {
+            assert!(!telegram_app_link(bad), "{bad}");
         }
     }
 

@@ -676,6 +676,15 @@ fn main() -> io::Result<()> {
         eprintln!("prove-telegram-games:0");
         return Ok(());
     }
+    // The lab's telegram-webapps driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-webapps") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_webapps() {
+            eprintln!("telegram-webapps: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-webapps:0");
+        return Ok(());
+    }
     // The lab's telegram-round-video driver. A build without this stays up and the driver fails.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-round-video") {
         if let Err(err) = chatd::adapters::telegram::prove_telegram_round() {

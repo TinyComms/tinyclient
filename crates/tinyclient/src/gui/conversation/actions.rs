@@ -2380,7 +2380,11 @@ impl Pane {
                         this.action_confirm = None;
                         if let Some(url) = &to_run.open_url {
                             if this.key() == Some(&to_run.conversation) {
-                                this.open_external_link(url, window, cx);
+                                if super::links::telegram_app_link(url) {
+                                    cx.open_url(url);
+                                } else {
+                                    this.open_external_link(url, window, cx);
+                                }
                             }
                             cx.notify();
                         } else {
@@ -2427,6 +2431,8 @@ impl Pane {
         let fields = result.fields.clone();
         let url = result.url.clone();
         let url_label = if result.url_label.is_empty() { "Open".to_owned() } else { result.url_label.clone() };
+        let follow = (!result.follow_action.is_empty()).then(|| (result.follow_action.clone(), result.follow_value.clone()));
+        let origin = self.action_origin.clone();
         let room = f32::from(window.viewport_size().width) - 32.;
         let field_rows = (!fields.is_empty()).then(|| {
             div().mt(px(8.)).flex().flex_col().gap(px(4.)).children(fields.into_iter().map(|(label, value)| {
@@ -2446,13 +2452,40 @@ impl Pane {
                 modal_buttons()
                     .child(button("action-result-close", ButtonKind::Secondary, "Close").on_click(cx.listener(|this, _, _, cx| {
                         this.action_result = None;
+                        this.action_origin = None;
                         cx.notify();
                     })))
-                    .when(open.is_some(), |row| {
+                    .when(follow.is_some() && origin.is_some(), |row| {
+                        let Some((action_id, value)) = follow.clone() else {
+                            return row;
+                        };
+                        let Some((conversation, message_id)) = origin.clone() else {
+                            return row;
+                        };
+                        row.child(button("action-result-allow", ButtonKind::Primary, "Allow").on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.action_result = None;
+                                this.action_origin = None;
+                                this.execute_control(
+                                    conversation.clone(),
+                                    message_id.clone(),
+                                    String::new(),
+                                    action_id.clone(),
+                                    "telegram_login".to_owned(),
+                                    value.clone(),
+                                    Vec::new(),
+                                    window,
+                                    cx,
+                                );
+                            },
+                        )))
+                    })
+                    .when(open.is_some() && follow.is_none(), |row| {
                         let target = open.clone().unwrap_or_default();
                         row.child(button("action-result-open", ButtonKind::Primary, url_label.clone()).on_click(
                             cx.listener(move |this, _, window, cx| {
                                 this.action_result = None;
+                                this.action_origin = None;
                                 this.open_external_link(&target, window, cx);
                             }),
                         ))
@@ -2473,6 +2506,7 @@ impl Pane {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     this.action_result = None;
+                    this.action_origin = None;
                     cx.notify();
                 }),
             )

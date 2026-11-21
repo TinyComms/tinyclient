@@ -878,8 +878,9 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::Catalog { kind, space_id, query, cursor, reply } => {
             let _ = reply.send(catalog::catalog(account, kind, space_id.as_deref(), &query, cursor.as_deref()).map_err(refused));
         }
-        Command::MessageAction { conversation_id, message_id, action_id, value, reply, .. } => {
-            let answer = match action_id.as_str() {
+        Command::MessageAction { conversation_id, message_id, block_id, action_id, value, reply, .. } => {
+            let action = action_id.as_str();
+            let answer = match action {
                 "tg:giveaway_info" => {
                     let target_id = value.parse::<i32>().ok().or_else(|| message_id.parse::<i32>().ok()).unwrap_or(0);
                     info::giveaway_info(account, &conversation_id, target_id).map(Some).map_err(refused)
@@ -891,6 +892,19 @@ fn serve(account: &Arc<Account>, command: Command) {
                 "tg:game_scores" => {
                     let target_id = value.parse::<i32>().ok().or_else(|| message_id.parse::<i32>().ok()).unwrap_or(0);
                     info::game_scores(account, &conversation_id, target_id).map(Some).map_err(refused)
+                }
+                "tg:webapp"
+                | "tg:webapp_simple"
+                | "tg:webapp_main"
+                | "tg:webapp_app"
+                | "tg:webapp_prolong"
+                | "tg:webapp_data"
+                | "tg:webapp_result"
+                | "tg:attach_menu"
+                | "tg:url_auth"
+                | "tg:url_auth_accept" => {
+                    let target_id = message_id.parse::<i32>().unwrap_or(0);
+                    info::webapp_action(account, &conversation_id, target_id, action, &block_id, &value).map(Some).map_err(refused)
                 }
                 _ => Err(Refusal::Unsupported),
             };
@@ -1539,6 +1553,11 @@ pub fn prove_telegram_giveaways() -> Result<(), String> {
 /// The lab's telegram-games driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_games() -> Result<(), String> {
     content::prove_games()
+}
+
+/// The lab's telegram-webapps driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_webapps() -> Result<(), String> {
+    content::prove_webapps()
 }
 
 pub fn prove_telegram_round() -> Result<(), String> {

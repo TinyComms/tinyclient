@@ -393,6 +393,8 @@ pub struct Pane {
     action_confirm: Option<PendingControlAction>,
     /// Details modal returned by an interactive control (giveaway status, game high scores, alerts).
     action_result: Option<protocol::ActionResult>,
+    /// Conversation and message that modal came from, so its Allow button can send a follow-up.
+    action_origin: Option<(Key, String)>,
     /// Currently open select/overflow/date/time picker popover for a Block Kit control.
     open_select: Option<OpenSelect>,
     /// On-demand reactors fetched for messages in the open conversation, keyed by `(message_id, emoji)`.
@@ -515,6 +517,7 @@ impl Pane {
             pending_actions: HashMap::new(),
             action_confirm: None,
             action_result: None,
+            action_origin: None,
             open_select: None,
             fetched_reactors: HashMap::new(),
             reactors_loading: None,
@@ -736,6 +739,7 @@ impl Pane {
         self.confirm = None;
         self.action_confirm = None;
         self.action_result = None;
+        self.action_origin = None;
         self.open_select = None;
         self.pending_actions.clear();
         self.forward = None;
@@ -1739,6 +1743,12 @@ impl Pane {
             cx.notify();
             return;
         }
+        // A mini app is handed to Telegram's own app. Every other tg:// link stays closed:
+        // a login token must not be opened from a message.
+        if links::telegram_app_link(&url) {
+            cx.open_url(&url);
+            return;
+        }
         self.open_external_link(&url, window, cx);
     }
 
@@ -1762,6 +1772,7 @@ impl Pane {
         let key = (message_id.clone(), action_id.clone());
         self.pending_actions.insert(key.clone(), Instant::now());
         cx.notify();
+        let origin = (conversation.clone(), message_id.clone());
         let request = Request::MessageAction {
             conversation,
             message_id,
@@ -1778,13 +1789,14 @@ impl Pane {
                 match answer {
                     Ok(Response::Ok) => {}
                     Ok(Response::ActionResult { result }) => {
-                        if !result.alert && result.title.is_empty() && result.fields.is_empty() {
+                        if !result.alert && result.title.is_empty() && result.fields.is_empty() && result.follow_action.is_empty() {
                             if let Some(url) = &result.url {
                                 this.open_external_link(url, window, cx);
                             } else if !result.text.is_empty() {
                                 this.say(result.text, cx);
                             }
                         } else {
+                            this.action_origin = Some(origin);
                             this.action_result = Some(result);
                         }
                     }
