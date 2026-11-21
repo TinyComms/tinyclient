@@ -643,6 +643,12 @@ pub enum Command {
         nickname: Option<String>,
         reply: Reply<()>,
     },
+    /// Set (or clear, when `None` or empty) a private nickname for a friend.
+    SetFriendNickname {
+        person_id: String,
+        nickname: Option<String>,
+        reply: Reply<()>,
+    },
     /// A registered file is wanted: answer with where and how to fetch it now.
     Download { id: String, url: String, reply: Reply<Download> },
     /// The pane's search asked the network itself: a Space's own search, or one conversation's.
@@ -747,6 +753,7 @@ impl Command {
             | Command::SetProfile { reply, .. }
             | Command::SetAvatar { reply, .. }
             | Command::SetNickname { reply, .. }
+            | Command::SetFriendNickname { reply, .. }
             | Command::AnswerMessageRequest { reply, .. }
             | Command::OpenForum { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Source { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

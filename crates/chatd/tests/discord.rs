@@ -4457,3 +4457,71 @@ fn add_friend_by_username_sends_request_and_translates_refusals() {
         }
     }
 }
+
+#[test]
+fn set_and_clear_friend_nickname_updates_relationship_and_refuses_non_friends() {
+    let world = World::start();
+
+    // 1. Non-friend (2006 is not a friend in READY) is refused locally before hitting Discord.
+    match world.ask(Request::SetFriendNickname {
+        person: world.key("2006"),
+        nickname: Some("Pal".into()),
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("Only friends"), "got: {detail}"),
+        other => panic!("expected refusal for non-friend, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("PATCH", "/users/@me/relationships/2006").is_empty());
+
+    // 2. Setting a friend nickname on friend 2001 sends PATCH /users/@me/relationships/2001 with {"nickname": "M"}
+    world.discord.script("/users/@me/relationships/2001", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::SetFriendNickname {
+            person: world.key("2001"),
+            nickname: Some("  Bestie  ".into()),
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/users/@me/relationships/2001");
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0].body, json!({"nickname": "Bestie"}));
+
+    // Gateway RELATIONSHIP_UPDATE updates local person display name live
+    world.discord.push(
+        "RELATIONSHIP_UPDATE",
+        json!({
+            "id": "2001",
+            "type": 1,
+            "nickname": "Bestie",
+            "user": {"id": "2001", "username": "mara", "global_name": "Mara", "discriminator": "0", "avatar": null}
+        }),
+    );
+    wait("friend nickname to update to Bestie", || {
+        world.people(Some(Relation::Friend), None).into_iter().find(|p| p.key.id == "2001" && p.name == "Bestie")
+    });
+
+    // 3. Clearing the nickname (empty or None) sends {"nickname": null} and RELATIONSHIP_UPDATE restores real name
+    world.discord.script("/users/@me/relationships/2001", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::SetFriendNickname {
+            person: world.key("2001"),
+            nickname: Some("   ".into()),
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/users/@me/relationships/2001");
+    assert_eq!(patches.len(), 2);
+    assert_eq!(patches[1].body, json!({"nickname": null}));
+
+    world.discord.push(
+        "RELATIONSHIP_UPDATE",
+        json!({
+            "id": "2001",
+            "type": 1,
+            "nickname": null,
+            "user": {"id": "2001", "username": "mara", "global_name": "Mara", "discriminator": "0", "avatar": null}
+        }),
+    );
+    wait("friend nickname to clear back to Mara", || {
+        world.people(Some(Relation::Friend), None).into_iter().find(|p| p.key.id == "2001" && p.name == "Mara")
+    });
+}

@@ -465,6 +465,7 @@ impl InfoPane {
             online: self.online(person.key.network),
             close_direct: super::scene_can_close_direct(&self.scene, &person.key),
             can_block: self.scene.blocks_accounts.contains(&person.key.account()),
+            can_friend_nickname: self.scene.accounts.iter().any(|own| own.key == person.key.account() && own.can.friend_nickname),
         }
     }
 

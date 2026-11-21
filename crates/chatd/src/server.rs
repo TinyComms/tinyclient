@@ -1659,6 +1659,22 @@ impl Chat {
         }
     }
 
+    fn set_friend_nickname(&self, person: Key, nickname: Option<String>) -> Response {
+        let account = person.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let nickname = nickname.map(|n| n.trim().to_owned()).filter(|n| !n.is_empty());
+        match self.ask(&account, |reply| Command::SetFriendNickname {
+            person_id: person.id,
+            nickname,
+            reply,
+        }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
     fn report(
         &self,
         target: protocol::ReportTarget,
@@ -3068,6 +3084,7 @@ impl Chat {
             }
             Request::SetAvatar { account, path } => self.set_avatar(account, path),
             Request::SetNickname { space, nickname } => self.set_nickname(space, nickname),
+            Request::SetFriendNickname { person, nickname } => self.set_friend_nickname(person, nickname),
             Request::Watch(watching) => self.watch(watching),
 
             Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),

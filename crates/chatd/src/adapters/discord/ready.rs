@@ -833,6 +833,7 @@ impl Discord {
             burst_reactions: false,
             blocks: true,
             add_friend_by_username: true,
+            friend_nickname: true,
             ..Default::default()
         });
         self.state.lock().unwrap().premium = premium;

@@ -1273,6 +1273,35 @@ impl Discord {
             .map_err(add_friend_refusal)
     }
 
+    /// Sets or clears a private nickname for a friend (`PATCH /users/@me/relationships/{id}`).
+    /// Only allowed when the person is currently a friend.
+    fn set_friend_nickname(&self, person: &str, nickname: Option<String>) -> Result<(), Refusal> {
+        let is_friend = crate::hub::lock(&self.state).relations.get(person) == Some(&Relation::Friend);
+        if !is_friend {
+            return Err(Refusal::Refused("Only friends can be given a nickname.".to_owned()));
+        }
+        let nick = nickname.map(|n| n.trim().to_owned()).filter(|n| !n.is_empty());
+        if nick.as_deref().is_some_and(|n| n.chars().count() > 32) {
+            return Err(Refusal::Refused("Friend nickname must be 32 characters or fewer.".to_owned()));
+        }
+        let body = json!({ "nickname": nick });
+        self.call("PATCH", &format!("/users/@me/relationships/{person}"), Some(body)).map_err(refusal)?;
+        if let Some(nick) = nick {
+            let updated = {
+                let mut state = crate::hub::lock(&self.state);
+                state.users.insert(person.to_owned(), nick.clone());
+                state.rows.get_mut(person).map(|row| {
+                    row.name = nick;
+                    row.clone()
+                })
+            };
+            if let Some(row) = updated {
+                let _ = self.ctx.people(&[row]);
+            }
+        }
+        Ok(())
+    }
+
     /// Our own presence, and the status line unless it is `None`. Both are settings: the web
     /// client saves them (protobuf, `settings-proto/1`) and tells the gateway (op 3), and so
     /// does this.
@@ -1748,6 +1777,9 @@ impl Discord {
             }
             Command::Relate { person_id, action, reply } => answer(reply, self.relate(&person_id, action)),
             Command::AddFriend { username, reply } => answer(reply, self.add_friend(&username)),
+            Command::SetFriendNickname { person_id, nickname, reply } => {
+                answer(reply, self.set_friend_nickname(&person_id, nickname))
+            }
             Command::SetPresence { presence, status, clear_at: _, reply } => answer(reply, self.set_presence(presence, status)),
             Command::Profile { person_id, reply } => answer(reply, self.profile(&person_id, None)),
             Command::ProfileIn { person_id, space_id, reply } => answer(reply, self.profile(&person_id, Some(&space_id))),

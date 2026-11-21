@@ -592,6 +592,9 @@ pub struct Capabilities {
     /// This account supports sending a friend request by typing a username (`Request::AddFriend`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub add_friend_by_username: bool,
+    /// This account supports setting a private nickname on a friend (`Request::SetFriendNickname`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub friend_nickname: bool,
     /// This account serves an activity feed (`Request::ActivityFeed`: mentions, thread replies, reactions).
     #[serde(default, skip_serializing_if = "is_false")]
     pub activity_feed: bool,
