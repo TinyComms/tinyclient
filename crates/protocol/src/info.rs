@@ -773,6 +773,9 @@ pub struct BrowsedChannel {
     pub archived: bool,
 }
 
+/// Telegram sentinel `schedule_date` value meaning "send when the recipient comes online".
+pub const SCHEDULE_WHEN_ONLINE: i64 = 0x7FFF_FFFE;
+
 /// One pending scheduled message returned by [`crate::Request::ScheduledMessages`] or
 /// [`crate::Request::RescheduleMessage`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

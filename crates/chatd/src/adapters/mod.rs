@@ -653,8 +653,14 @@ pub enum Command {
         conversation_id: String,
         reply: Reply<Vec<protocol::ScheduledMessage>>,
     },
-    /// Cancels a pending scheduled message (Slack `chat.deleteScheduledMessage`).
+    /// Cancels a pending scheduled message (Slack `chat.deleteScheduledMessage` / Telegram `messages.deleteScheduledMessages`).
     CancelScheduled {
+        conversation_id: String,
+        scheduled_id: String,
+        reply: Reply<()>,
+    },
+    /// Sends a pending scheduled message immediately (Telegram `messages.sendScheduledMessages`).
+    SendScheduledNow {
         conversation_id: String,
         scheduled_id: String,
         reply: Reply<()>,
@@ -926,6 +932,7 @@ impl Command {
             | Command::StarMessage { reply, .. }
             | Command::Remind { reply, .. }
             | Command::CancelScheduled { reply, .. }
+            | Command::SendScheduledNow { reply, .. }
             | Command::FollowThread { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }

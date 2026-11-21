@@ -723,6 +723,9 @@ fn offline(ctx: &Context, command: Command) {
         Command::TopicCreate { reply, .. } => drop(reply.send(Err(down()))),
         Command::TopicUpdate { reply, .. } | Command::TopicDelete { reply, .. } => drop(reply.send(Err(down()))),
         Command::TopicIcons { reply } => drop(reply.send(Err(down()))),
+        Command::ScheduledList { reply, .. } => drop(reply.send(Err(down()))),
+        Command::CancelScheduled { reply, .. } | Command::SendScheduledNow { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Reschedule { reply, .. } => drop(reply.send(Err(down()))),
         Command::Pinned { reply, .. } => drop(reply.send(Err(down()))),
         Command::Pin { reply, .. } => drop(reply.send(Err(down()))),
         Command::Forward { reply, .. } => drop(reply.send(Err(down()))),
@@ -784,6 +787,20 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::TopicIcons { reply } => {
             let _ = reply.send(catalog::topic_icons(account).map_err(refused));
+        }
+        Command::ScheduledList { conversation_id, reply } => {
+            let _ = reply.send(info::scheduled_list(account, &conversation_id).map_err(refused));
+        }
+        Command::CancelScheduled { conversation_id, scheduled_id, reply } => {
+            let _ = reply.send(info::cancel_scheduled(account, &conversation_id, &scheduled_id).map_err(refused));
+        }
+        Command::SendScheduledNow { conversation_id, scheduled_id, reply } => {
+            let _ = reply.send(info::send_scheduled_now(account, &conversation_id, &scheduled_id).map_err(refused));
+        }
+        Command::Reschedule { conversation_id, scheduled_id, text, post_at, reply } => {
+            let _ = reply.send(
+                info::reschedule(account, &conversation_id, &scheduled_id, text.as_deref(), post_at).map_err(refused),
+            );
         }
         Command::Wanted(ids) => drop(account.files.asked(&ids)),
         Command::Previews(ids) => sync::previews(account, &ids),
@@ -1066,9 +1083,27 @@ fn remember_random(account: &Account, random: i64, client_id: &str) {
     live.random.push_back((random, client_id.to_owned()));
 }
 
+fn check_schedule_target(account: &Account, who: Who, opts: Options) -> Result<(), Fault> {
+    if opts.schedule == Some(protocol::SCHEDULE_WHEN_ONLINE as i32) {
+        match who {
+            Who::User(uid) if uid != account.me => {
+                let hidden = account.dir().get(who).is_some_and(|known| !known.seen.is_empty());
+                if hidden {
+                    return Err(Fault::Rpc { code: 400, name: "SCHEDULE_STATUS_PRIVATE".to_owned(), value: None });
+                }
+            }
+            _ => {
+                return Err(Fault::Rpc { code: 400, name: "SCHEDULE_STATUS_PRIVATE".to_owned(), value: None });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn send_text(account: &Account, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, opts: Options, spans: &[protocol::Span]) -> Result<protocol::Message, Fault> {
     let invalid = || Fault::Rpc { code: 400, name: "PEER_ID_INVALID".to_owned(), value: None };
     let (who, topic) = Who::parse(conversation).ok_or_else(invalid)?;
+    check_schedule_target(account, who, opts)?;
     // The comments of a channel post are held in the discussion group behind it: the send
     // names that, under the echo of the post itself, where Telegram's own apps write them.
     let (who, topic) = sync::comment_target(account, conversation)?.map(|(group, echo)| (group, Some(echo))).unwrap_or((who, topic));

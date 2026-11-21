@@ -4122,3 +4122,119 @@ fn forum_topics_crud_search_icons_and_paging_past_fifty() {
     assert_eq!(world.ask(Request::TopicDelete { topic: created.key.clone() }), Response::Ok);
     world.until("deleted topic gone", || world.conversation(&created.key.id).is_none().then_some(()));
 }
+
+#[test]
+fn scheduled_messages_list_reschedule_send_now_cancel_and_when_online() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.schedule, "Telegram must advertise schedule capability");
+
+    let future = 1_900_000_000i64;
+    // Schedule a timed message to Odalys.
+    assert_eq!(
+        world.ask(Request::Send {
+            conversation: key("u7002"),
+            client_id: "sched-1".into(),
+            text: "Morning check-in".into(),
+            reply_to: None,
+            with: protocol::Outgoing { schedule: Some(future), ..protocol::Outgoing::default() },
+        }),
+        Response::Ok
+    );
+    world.until("first scheduled placeholder", || {
+        world.messages("u7002").into_iter().find(|m| m.text == "Morning check-in")
+    });
+
+    // Schedule a "when online" message to Odalys (last seen visible).
+    assert_eq!(
+        world.ask(Request::Send {
+            conversation: key("u7002"),
+            client_id: "sched-2".into(),
+            text: "Ping when you are online".into(),
+            reply_to: None,
+            with: protocol::Outgoing {
+                schedule: Some(protocol::SCHEDULE_WHEN_ONLINE),
+                ..protocol::Outgoing::default()
+            },
+        }),
+        Response::Ok
+    );
+    world.until("second scheduled placeholder", || {
+        world.messages("u7002").into_iter().find(|m| m.text == "Ping when you are online")
+    });
+
+    // "Send when online" to Tobin (hidden last seen) fails with a clear message.
+    assert_eq!(
+        world.ask(Request::Send {
+            conversation: key("u7003"),
+            client_id: "sched-bad".into(),
+            text: "Hidden last seen".into(),
+            reply_to: None,
+            with: protocol::Outgoing {
+                schedule: Some(protocol::SCHEDULE_WHEN_ONLINE),
+                ..protocol::Outgoing::default()
+            },
+        }),
+        Response::Ok
+    );
+    let failed = world.until("when-online refused for hidden last seen", || {
+        world
+            .messages("u7003")
+            .into_iter()
+            .find(|m| m.text == "Hidden last seen" && matches!(m.state, SendState::Failed { .. }))
+    });
+    match failed.state {
+        SendState::Failed { reason } => assert!(reason.contains("last seen"), "{reason}"),
+        other => panic!("expected Failed, got {other:?}"),
+    }
+
+    // List scheduled messages for Odalys: both pending messages appear.
+    let listed = match world.ask(Request::ScheduledMessages { conversation: key("u7002") }) {
+        Response::ScheduledMessages { messages } => messages,
+        other => panic!("expected ScheduledMessages, got {other:?}"),
+    };
+    assert_eq!(listed.len(), 2, "{listed:?}");
+    let timed = listed.iter().find(|m| m.text == "Morning check-in").expect("timed message");
+    let online = listed.iter().find(|m| m.text == "Ping when you are online").expect("when-online message");
+    assert_eq!(online.post_at, protocol::SCHEDULE_WHEN_ONLINE);
+
+    // Reschedule & edit the timed message.
+    let new_time = future + 3_600;
+    match world.ask(Request::RescheduleMessage {
+        conversation: key("u7002"),
+        scheduled_id: timed.id.clone(),
+        text: Some("Updated check-in".into()),
+        post_at: new_time,
+    }) {
+        Response::ScheduledMessage { message } => {
+            assert_eq!(message.text, "Updated check-in");
+            assert_eq!(message.post_at, new_time);
+        }
+        other => panic!("expected ScheduledMessage, got {other:?}"),
+    }
+
+    // Send the rescheduled message immediately: it moves to real history and leaves scheduled queue.
+    assert_eq!(
+        world.ask(Request::SendScheduledNow { conversation: key("u7002"), scheduled_id: timed.id.clone() }),
+        Response::Ok
+    );
+    world.until("sent scheduled message in history", || {
+        world
+            .messages("u7002")
+            .into_iter()
+            .find(|m| m.id == timed.id && m.text == "Updated check-in")
+    });
+    assert!(world.calls().iter().any(|c| c.starts_with("SendScheduledMessages u7002")));
+
+    // Cancel the remaining scheduled message.
+    assert_eq!(
+        world.ask(Request::CancelScheduled { conversation: key("u7002"), scheduled_id: online.id.clone() }),
+        Response::Ok
+    );
+    assert!(world.calls().iter().any(|c| c.starts_with("DeleteScheduledMessages u7002")));
+    match world.ask(Request::ScheduledMessages { conversation: key("u7002") }) {
+        Response::ScheduledMessages { messages } => assert!(messages.is_empty(), "{messages:?}"),
+        other => panic!("expected empty ScheduledMessages, got {other:?}"),
+    }
+}

@@ -1326,8 +1326,13 @@ pub enum Request {
     ScheduledMessages {
         conversation: Key,
     },
-    /// Cancels a pending scheduled message (Slack `chat.deleteScheduledMessage`).
+    /// Cancels a pending scheduled message (Slack `chat.deleteScheduledMessage` / Telegram `messages.deleteScheduledMessages`).
     CancelScheduled {
+        conversation: Key,
+        scheduled_id: String,
+    },
+    /// Sends a pending scheduled message immediately (Telegram `messages.sendScheduledMessages`).
+    SendScheduledNow {
         conversation: Key,
         scheduled_id: String,
     },
@@ -3737,6 +3742,7 @@ mod sock_path_tests {
         let reqs = [
             Request::ScheduledMessages { conversation: conv.clone() },
             Request::CancelScheduled { conversation: conv.clone(), scheduled_id: "Q1".into() },
+            Request::SendScheduledNow { conversation: conv.clone(), scheduled_id: "Q1".into() },
             Request::RescheduleMessage {
                 conversation: conv.clone(),
                 scheduled_id: "Q1".into(),

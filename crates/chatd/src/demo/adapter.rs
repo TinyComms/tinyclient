@@ -1045,6 +1045,7 @@ impl Demo {
             Command::TopicIcons { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CancelScheduled { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SendScheduledNow { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::FollowThread { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Backfill(_)

@@ -585,6 +585,8 @@ struct World {
     custom_folders: Option<Vec<tl::enums::DialogFilter>>,
     /// Mutable forum topics per forum channel (initialized on demand for `WORKSHOP`).
     forum_topics: HashMap<Who, Vec<FakeTopic>>,
+    /// Pending scheduled messages by conversation key (`messages.getScheduledHistory`).
+    scheduled: BTreeMap<String, BTreeMap<i32, tl::enums::Message>>,
 }
 
 fn key(peer: Who, topic: Option<i32>) -> String {
@@ -658,6 +660,7 @@ impl World {
             default_ttl: 0,
             custom_folders: None,
             forum_topics: HashMap::new(),
+            scheduled: BTreeMap::new(),
         };
         let odalys = Who::User(ODALYS);
         world.store(None, message(odalys, 10, ODALYS, t0() - 300, "Are you coming to the ridge on Saturday?"));
@@ -771,6 +774,13 @@ impl World {
                 sent = in_topic(sent, topic);
             }
             if schedule.is_some() {
+                if schedule == Some(protocol::SCHEDULE_WHEN_ONLINE as i32) && peer == Who::User(TOBIN) {
+                    return Err(rpc(400, "SCHEDULE_STATUS_PRIVATE", None));
+                }
+                self.scheduled
+                    .entry(key(peer, topic))
+                    .or_default()
+                    .insert(id, sent.clone().into());
                 all.push(tl::types::UpdateMessageId { id, random_id }.into());
                 all.push(tl::types::UpdateNewScheduledMessage { message: sent.into() }.into());
                 continue;
@@ -2786,6 +2796,25 @@ impl World {
             let peer = input_who(&request.peer);
             let noted = super::content::entity_note(request.entities.as_deref().unwrap_or(&[]));
             self.log(&format!("EditMessage {} {}{noted}", peer.text(), request.id));
+            if let Some(tl::enums::Message::Message(mut sched)) = self
+                .scheduled
+                .get(&peer.text())
+                .and_then(|held| held.get(&request.id))
+                .cloned()
+            {
+                if let Some(ref text) = request.message {
+                    sched.message = text.clone();
+                }
+                if let Some(date) = request.schedule_date {
+                    sched.date = date;
+                }
+                sched.entities = request.entities.clone();
+                self.scheduled
+                    .entry(peer.text())
+                    .or_default()
+                    .insert(request.id, sched.clone().into());
+                return answer(updates(vec![tl::types::UpdateNewScheduledMessage { message: sched.into() }.into()]));
+            }
             let Some(tl::enums::Message::Message(mut edited)) = self.messages.get(&peer.text()).and_then(|held| held.get(&request.id)).cloned() else {
                 return Err(rpc(400, "MESSAGE_ID_INVALID", None));
             };
@@ -2797,6 +2826,79 @@ impl World {
             edited.edit_date = Some(crate::hub::now() as i32);
             self.store(None, edited.clone());
             return answer(updates(vec![tl::types::UpdateEditMessage { message: edited.into(), pts: 0, pts_count: 0 }.into()]));
+        }
+        if let Some(request) = asked::<f::messages::GetScheduledHistory>(body) {
+            let peer = input_who(&request.peer);
+            self.log(&format!("GetScheduledHistory {}", peer.text()));
+            let prefix = format!("{}_", peer.text());
+            let messages: Vec<tl::enums::Message> = self
+                .scheduled
+                .iter()
+                .filter(|(k, _)| k.as_str() == peer.text() || k.starts_with(&prefix))
+                .flat_map(|(_, held)| held.values().cloned())
+                .collect();
+            return answer(tl::enums::messages::Messages::Messages(tl::types::messages::Messages {
+                messages,
+                topics: Vec::new(),
+                chats: chats(),
+                users: users(),
+            }));
+        }
+        if let Some(request) = asked::<f::messages::SendScheduledMessages>(body) {
+            let peer = input_who(&request.peer);
+            self.log(&format!("SendScheduledMessages {} {:?}", peer.text(), request.id));
+            let mut upds: Vec<tl::enums::Update> = Vec::new();
+            let mut sent_ids: Vec<i32> = Vec::new();
+            let prefix = format!("{}_", peer.text());
+            for (k, held) in self.scheduled.iter_mut() {
+                if k.as_str() != peer.text() && !k.starts_with(&prefix) {
+                    continue;
+                }
+                for &id in &request.id {
+                    if let Some(tl::enums::Message::Message(mut msg)) = held.remove(&id) {
+                        msg.from_scheduled = true;
+                        msg.date = crate::hub::now() as i32;
+                        let topic = msg.reply_to.as_ref().and_then(|r| match r {
+                            tl::enums::MessageReplyHeader::Header(h) if h.forum_topic => h.reply_to_top_id.or(h.reply_to_msg_id),
+                            _ => None,
+                        });
+                        self.messages.entry(key(peer, topic)).or_default().insert(msg.id, msg.clone().into());
+                        sent_ids.push(id);
+                        let new: tl::enums::Update = match peer {
+                            Who::Channel(_) => tl::types::UpdateNewChannelMessage { message: msg.into(), pts: 0, pts_count: 0 }.into(),
+                            _ => tl::types::UpdateNewMessage { message: msg.into(), pts: 0, pts_count: 0 }.into(),
+                        };
+                        let _ = events.send(update(new.clone()));
+                        upds.push(new);
+                    }
+                }
+            }
+            if !sent_ids.is_empty() {
+                upds.push(tl::types::UpdateDeleteScheduledMessages {
+                    peer: peer.peer(),
+                    messages: sent_ids,
+                    sent_messages: None,
+                }.into());
+            }
+            return answer(updates(upds));
+        }
+        if let Some(request) = asked::<f::messages::DeleteScheduledMessages>(body) {
+            let peer = input_who(&request.peer);
+            self.log(&format!("DeleteScheduledMessages {} {:?}", peer.text(), request.id));
+            let prefix = format!("{}_", peer.text());
+            for (k, held) in self.scheduled.iter_mut() {
+                if k.as_str() != peer.text() && !k.starts_with(&prefix) {
+                    continue;
+                }
+                for &id in &request.id {
+                    held.remove(&id);
+                }
+            }
+            return answer(updates(vec![tl::types::UpdateDeleteScheduledMessages {
+                peer: peer.peer(),
+                messages: request.id,
+                sent_messages: None,
+            }.into()]));
         }
         if let Some(request) = asked::<f::messages::DeleteMessages>(body) {
             self.log(&format!("DeleteMessages {:?} revoke {}", request.id, request.revoke));

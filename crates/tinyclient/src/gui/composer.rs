@@ -3536,6 +3536,21 @@ impl Composer {
                 if self.target.as_ref().is_some_and(|t| t.key.network == Network::Messages) {
                     items = items.child(menu_label("Sends while this computer is on and your phone is reachable."));
                 }
+                let can_when_online = self.target.as_ref().is_some_and(|t| {
+                    schedule::when_online_for(
+                        t.key.network,
+                        t.kind,
+                        t.special == protocol::Special::Saved,
+                        false,
+                    )
+                });
+                if can_when_online {
+                    items = items.child(
+                        menu_item("schedule-when-online", Some("icons/clock.svg"), "Send when online", None).on_click(
+                            cx.listener(|this, _, _, cx| this.choose_schedule(protocol::SCHEDULE_WHEN_ONLINE, cx)),
+                        ),
+                    );
+                }
                 for (index, moment) in presets.into_iter().enumerate() {
                     let at = moment.at;
                     items = items.child(menu_item(schedule::preset_id(index), Some("icons/calendar.svg"), moment.label, None).on_click(

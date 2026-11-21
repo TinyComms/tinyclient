@@ -281,6 +281,119 @@ pub(super) fn set_default_disappearing(account: &Account, seconds: u32) -> Resul
     Ok(())
 }
 
+fn parse_scheduled_id(raw: &str) -> Result<i32, Fault> {
+    raw.strip_prefix('s')
+        .unwrap_or(raw)
+        .parse::<i32>()
+        .map_err(|_| invalid("MESSAGE_ID_INVALID"))
+}
+
+/// Lists pending scheduled messages in one conversation (`messages.getScheduledHistory`).
+pub(super) fn scheduled_list(account: &Account, conversation: &str) -> Result<Vec<protocol::ScheduledMessage>, Fault> {
+    let (who, topic) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    let peer = account.input(who)?;
+    let answer = account.ask(&tl::functions::messages::GetScheduledHistory { peer, hash: 0 })?;
+    let messages = match answer {
+        tl::enums::messages::Messages::Messages(all) => all.messages,
+        tl::enums::messages::Messages::Slice(all) => all.messages,
+        tl::enums::messages::Messages::ChannelMessages(all) => all.messages,
+        tl::enums::messages::Messages::NotModified(_) => Vec::new(),
+    };
+    let conv_key = protocol::Key::new(&account.ctx.account, conversation);
+    let mut out: Vec<protocol::ScheduledMessage> = messages
+        .into_iter()
+        .filter_map(|raw| {
+            let tl::enums::Message::Message(msg) = raw else {
+                return None;
+            };
+            if let Some(wanted_topic) = topic {
+                let msg_topic = msg.reply_to.as_ref().and_then(|r| match r {
+                    tl::enums::MessageReplyHeader::Header(h) if h.forum_topic => h.reply_to_top_id.or(h.reply_to_msg_id),
+                    _ => None,
+                });
+                if msg_topic != Some(wanted_topic) {
+                    return None;
+                }
+            }
+            Some(protocol::ScheduledMessage {
+                id: msg.id.to_string(),
+                conversation: conv_key.clone(),
+                text: msg.message,
+                post_at: i64::from(msg.date),
+                created: 0,
+            })
+        })
+        .collect();
+    out.sort_by_key(|m| m.post_at);
+    Ok(out)
+}
+
+/// Sends a pending scheduled message immediately (`messages.sendScheduledMessages`).
+pub(super) fn send_scheduled_now(account: &Account, conversation: &str, scheduled_id: &str) -> Result<(), Fault> {
+    let (who, _) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    let id = parse_scheduled_id(scheduled_id)?;
+    let peer = account.input(who)?;
+    let answer = account.ask(&tl::functions::messages::SendScheduledMessages { peer, id: vec![id] })?;
+    let _ = account.ctx.deleted(conversation, &format!("s{id}"));
+    super::live::answered(account, &answer);
+    Ok(())
+}
+
+/// Cancels a pending scheduled message (`messages.deleteScheduledMessages`).
+pub(super) fn cancel_scheduled(account: &Account, conversation: &str, scheduled_id: &str) -> Result<(), Fault> {
+    let (who, _) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    let id = parse_scheduled_id(scheduled_id)?;
+    let peer = account.input(who)?;
+    let answer = account.ask(&tl::functions::messages::DeleteScheduledMessages { peer, id: vec![id] })?;
+    let _ = account.ctx.deleted(conversation, &format!("s{id}"));
+    super::live::answered(account, &answer);
+    Ok(())
+}
+
+/// Edits and/or reschedules a pending scheduled message (`messages.editMessage` with `schedule_date`).
+pub(super) fn reschedule(
+    account: &Account,
+    conversation: &str,
+    scheduled_id: &str,
+    text: Option<&str>,
+    post_at: i64,
+) -> Result<protocol::ScheduledMessage, Fault> {
+    let (who, _) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    let id = parse_scheduled_id(scheduled_id)?;
+    let peer = account.input(who)?;
+    let schedule_date = i32::try_from(post_at).map_err(|_| invalid("SCHEDULE_DATE_INVALID"))?;
+    let (plain, entities) = match text {
+        Some(t) => {
+            let (p, e) = super::prepared(account, conversation, t);
+            (Some(p), e)
+        }
+        None => (None, None),
+    };
+    let answer = account.ask(&tl::functions::messages::EditMessage {
+        no_webpage: false,
+        invert_media: false,
+        peer,
+        id,
+        message: plain.clone(),
+        media: None,
+        reply_markup: None,
+        entities,
+        schedule_date: Some(schedule_date),
+        schedule_repeat_period: None,
+        quick_reply_shortcut_id: None,
+        rich_message: None,
+    })?;
+    super::live::answered(account, &answer);
+    let final_text = plain.unwrap_or_default();
+    Ok(protocol::ScheduledMessage {
+        id: id.to_string(),
+        conversation: protocol::Key::new(&account.ctx.account, conversation),
+        text: final_text,
+        post_at,
+        created: 0,
+    })
+}
+
 /// The network's own mute. Telegram has no "mentions only" for a chat: a muted chat still
 /// counts its mentions, so that is what `Mentions` sets (unverified that every app notifies them).
 /// `until` is when that mute ends, as Unix seconds. Absent is muted until it is turned off.

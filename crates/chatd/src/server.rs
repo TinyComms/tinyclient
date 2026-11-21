@@ -3107,6 +3107,19 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::SendScheduledNow { conversation, scheduled_id } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                match self.ask(&conversation.account(), |reply| Command::SendScheduledNow {
+                    conversation_id: conversation.id.clone(),
+                    scheduled_id,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::RescheduleMessage { conversation, scheduled_id, text, post_at } => {
                 if !self.shows(&conversation.account()) {
                     return error(ErrorCode::NotFound, "signed out");
