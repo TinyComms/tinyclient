@@ -109,6 +109,8 @@ const TABLES: &str = "
         kind      TEXT NOT NULL DEFAULT 'section',
         muted     INTEGER NOT NULL DEFAULT 0,
         unread_only INTEGER NOT NULL DEFAULT 0,
+        emoji     TEXT NOT NULL DEFAULT '',
+        sort      TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (network, account, space, id)
     ) WITHOUT ROWID;
     CREATE TABLE conversation (
@@ -1150,6 +1152,12 @@ impl Store {
         if !column(&store.db, "space", "can_create_channels")? {
             store.db.execute_batch("ALTER TABLE space ADD COLUMN can_create_channels INTEGER NOT NULL DEFAULT 0")?;
         }
+        if !column(&store.db, "section", "emoji")? {
+            store.db.execute_batch("ALTER TABLE section ADD COLUMN emoji TEXT NOT NULL DEFAULT ''")?;
+        }
+        if !column(&store.db, "section", "sort")? {
+            store.db.execute_batch("ALTER TABLE section ADD COLUMN sort TEXT NOT NULL DEFAULT ''")?;
+        }
         Ok(store)
     }
 
@@ -1428,8 +1436,8 @@ impl Store {
         for group in groups {
             tx.execute(
                 "INSERT OR REPLACE INTO section
-                     (network, account, space, id, name, position, collapsed, kind, muted, unread_only)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     (network, account, space, id, name, position, collapsed, kind, muted, unread_only, emoji, sort)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     word(&space.network),
                     space.account,
@@ -1441,6 +1449,8 @@ impl Store {
                     word(&group.kind),
                     group.muted,
                     group.unread_only,
+                    group.emoji,
+                    group.sort,
                 ],
             )?;
         }
@@ -1451,11 +1461,12 @@ impl Store {
     /// collapsed it is kept.
     pub fn upsert_group(&mut self, space: &Key, group: &Group) -> rusqlite::Result<()> {
         self.db.execute(
-            "INSERT INTO section (network, account, space, id, name, position, kind, muted, unread_only)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO section (network, account, space, id, name, position, kind, muted, unread_only, emoji, sort)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT (network, account, space, id) DO UPDATE SET
                  name = excluded.name, position = excluded.position, kind = excluded.kind,
-                 muted = excluded.muted, unread_only = excluded.unread_only",
+                 muted = excluded.muted, unread_only = excluded.unread_only,
+                 emoji = excluded.emoji, sort = excluded.sort",
             params![
                 word(&space.network),
                 space.account,
@@ -1465,10 +1476,35 @@ impl Store {
                 group.position,
                 word(&group.kind),
                 group.muted,
-                group.unread_only
+                group.unread_only,
+                group.emoji,
+                group.sort,
             ],
         )?;
         Ok(())
+    }
+
+    /// Moves one conversation into `group` (a section id in its Space).
+    pub fn set_conversation_group(&mut self, key: &Key, group: &str) -> rusqlite::Result<bool> {
+        let changed = self.db.execute(
+            "UPDATE conversation SET section = ?4
+              WHERE network = ?1 AND account = ?2 AND id = ?3",
+            params![word(&key.network), key.account, key.id, group],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Updates the positions of sections in `space` to match `section_ids` order.
+    pub fn reorder_groups(&mut self, space: &Key, section_ids: &[String]) -> rusqlite::Result<()> {
+        let tx = self.db.transaction()?;
+        for (pos, id) in section_ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE section SET position = ?5
+                  WHERE network = ?1 AND account = ?2 AND space = ?3 AND id = ?4",
+                params![word(&space.network), space.account, space.id, id, pos as i32],
+            )?;
+        }
+        tx.commit()
     }
 
     /// True if it was there. Its conversations stay, under no group.
@@ -1512,7 +1548,7 @@ impl Store {
                         (SELECT COUNT(*) FROM conversation c
                           WHERE c.network = g.network AND c.account = g.account
                             AND c.space = g.space AND c.section = g.id),
-                        g.muted, g.unread_only
+                        g.muted, g.unread_only, g.emoji, g.sort
                    FROM section g
                   WHERE g.network = ?1 AND g.account = ?2 AND g.space = ?3 ORDER BY g.position, g.id",
             )?
@@ -1526,6 +1562,8 @@ impl Store {
                     count: row.get(5)?,
                     muted: row.get(6)?,
                     unread_only: row.get(7)?,
+                    emoji: row.get(8)?,
+                    sort: row.get(9)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;

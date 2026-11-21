@@ -1019,6 +1019,11 @@ impl Demo {
             | Command::UserGroupUpdate { reply, .. }
             | Command::UserGroupMembers { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::AppView { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SectionCreate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SectionRename { reply, .. }
+            | Command::SectionDelete { reply, .. }
+            | Command::SectionReorder { reply, .. }
+            | Command::SectionMoveChannel { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::AccountFiles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallRing { reply, .. } | Command::CallStopRinging { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)));

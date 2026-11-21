@@ -303,6 +303,12 @@ pub struct Group {
     /// drawn, except the open one and starred ones.
     #[serde(default, skip_serializing_if = "is_false")]
     pub unread_only: bool,
+    /// Optional section icon / emoji (e.g. Slack custom sidebar section emoji).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub emoji: String,
+    /// Optional per-section sort order (e.g. `"alphabetical"`, `"recent"`, `"priority"`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sort: String,
 }
 
 impl Group {
@@ -316,6 +322,8 @@ impl Group {
             count: 0,
             muted: false,
             unread_only: false,
+            emoji: String::new(),
+            sort: String::new(),
         }
     }
 }
@@ -2661,6 +2669,40 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor: Option<String>,
     },
+    /// Create a custom sidebar section in a Space (Slack `users.channelSections.create`).
+    /// Answers `Response::Section`.
+    SectionCreate {
+        space: Key,
+        name: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        emoji: String,
+    },
+    /// Rename or update a custom sidebar section (Slack `users.channelSections.update`).
+    SectionRename {
+        space: Key,
+        section_id: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emoji: Option<String>,
+    },
+    /// Delete a custom sidebar section (Slack `users.channelSections.delete`).
+    SectionDelete {
+        space: Key,
+        section_id: String,
+    },
+    /// Reorder sidebar sections (Slack `users.channelSections.order`).
+    SectionReorder {
+        space: Key,
+        section_ids: Vec<String>,
+    },
+    /// Move a conversation between sidebar sections (Slack `users.channelSections.channels.bulkUpdate`).
+    SectionMoveChannel {
+        space: Key,
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_section: Option<String>,
+        to_section: String,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -3185,6 +3227,10 @@ pub enum Response {
     /// A Slack app's About profile and optional Home tab (`Request::AppView`).
     AppView {
         view: Box<AppView>,
+    },
+    /// A newly created custom sidebar section (`Request::SectionCreate`).
+    Section {
+        group: Group,
     },
 }
 

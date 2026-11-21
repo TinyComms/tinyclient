@@ -876,6 +876,41 @@ pub enum Command {
         include_home: bool,
         reply: Reply<protocol::AppView>,
     },
+    /// Create a custom sidebar section (`users.channelSections.create`).
+    SectionCreate {
+        space_id: String,
+        name: String,
+        emoji: String,
+        reply: Reply<Group>,
+    },
+    /// Rename or update a custom sidebar section (`users.channelSections.update`).
+    SectionRename {
+        space_id: String,
+        section_id: String,
+        name: String,
+        emoji: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Delete a custom sidebar section (`users.channelSections.delete`).
+    SectionDelete {
+        space_id: String,
+        section_id: String,
+        reply: Reply<()>,
+    },
+    /// Reorder sidebar sections (`users.channelSections.order`).
+    SectionReorder {
+        space_id: String,
+        section_ids: Vec<String>,
+        reply: Reply<()>,
+    },
+    /// Move a conversation between sidebar sections (`users.channelSections.channels.bulkUpdate`).
+    SectionMoveChannel {
+        space_id: String,
+        conversation_id: String,
+        from_section: Option<String>,
+        to_section: String,
+        reply: Reply<()>,
+    },
     /// The adapter is being dropped. `serve_commands` returns on it; an adapter never sees it.
     Stop,
 }
@@ -976,6 +1011,11 @@ impl Command {
             | Command::UserGroupUpdate { reply, .. }
             | Command::UserGroupMembers { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::AppView { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SectionCreate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SectionRename { reply, .. }
+            | Command::SectionDelete { reply, .. }
+            | Command::SectionReorder { reply, .. }
+            | Command::SectionMoveChannel { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Download { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Search { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchFiles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1142,6 +1182,25 @@ impl Context {
         if self.hub.store().remove_group(&space, group_id)? {
             self.hub.changed(Change::Tree { space });
         }
+        Ok(())
+    }
+
+    /// Moves a conversation into `group_id` within `space_id` and announces the tree change.
+    pub fn move_conversation_group(&self, space_id: &str, conversation_id: &str, group_id: &str) -> Stores {
+        let key = self.key(conversation_id);
+        let space = self.key(space_id);
+        if self.hub.store().set_conversation_group(&key, group_id)? {
+            self.hub.changed(Change::Tree { space });
+            self.hub.changed(Change::Conversation { conversation: key });
+        }
+        Ok(())
+    }
+
+    /// Updates section ordering within `space_id` and announces the tree change.
+    pub fn reorder_groups(&self, space_id: &str, section_ids: &[String]) -> Stores {
+        let space = self.key(space_id);
+        self.hub.store().reorder_groups(&space, section_ids)?;
+        self.hub.changed(Change::Tree { space });
         Ok(())
     }
 

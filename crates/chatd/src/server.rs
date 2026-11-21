@@ -4014,6 +4014,68 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::SectionCreate { space, name, emoji } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id;
+                match self.ask(&account, |reply| Command::SectionCreate { space_id, name, emoji, reply }) {
+                    Ok(group) => Response::Section { group },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SectionRename { space, section_id, name, emoji } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id;
+                match self.ask(&account, |reply| Command::SectionRename { space_id, section_id, name, emoji, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SectionDelete { space, section_id } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id;
+                match self.ask(&account, |reply| Command::SectionDelete { space_id, section_id, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SectionReorder { space, section_ids } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id;
+                match self.ask(&account, |reply| Command::SectionReorder { space_id, section_ids, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SectionMoveChannel { space, conversation, from_section, to_section } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id;
+                let conversation_id = conversation.id;
+                match self.ask(&account, |reply| Command::SectionMoveChannel {
+                    space_id,
+                    conversation_id,
+                    from_section,
+                    to_section,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
                     Some(id) => self.hub.settings().custom_sound(id).is_some(),

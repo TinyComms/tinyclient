@@ -2039,6 +2039,32 @@ impl Shell {
         was
     }
 
+    /// Moves a Slack conversation into another sidebar section (`Request::SectionMoveChannel`).
+    pub(in crate::gui) fn move_to_section(
+        &mut self,
+        space: Key,
+        conversation: Key,
+        from_section: Option<String>,
+        to_section: String,
+        cx: &mut Context<Self>,
+    ) {
+        let request = Request::SectionMoveChannel {
+            space,
+            conversation,
+            from_section,
+            to_section,
+        };
+        self.off_thread(
+            cx,
+            move || crate::client::ask(&request),
+            |this, answer, cx| {
+                if let Some(why) = refused(&answer) {
+                    this.toast(None, why, cx);
+                }
+            },
+        );
+    }
+
     /// The Slack header's menu on a phone: the same rows as a bottom sheet over the screen.
     pub(in crate::gui) fn phone_slack_sheet(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
         let body = self.slack_menu(cx)?;

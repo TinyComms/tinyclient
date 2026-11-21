@@ -769,6 +769,10 @@ pub struct Capabilities {
     /// This account supports following and unfollowing threads (`Request::FollowThread`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub follow_threads: bool,
+    /// This account supports creating, renaming, deleting, reordering, and moving channels
+    /// between custom sidebar sections (Slack paid plans).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sidebar_sections: bool,
 }
 
 /// Preview of a Space invite (`Request::InvitePreview`).

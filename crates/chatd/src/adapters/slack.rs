@@ -362,6 +362,12 @@ fn per_minute(method: &str) -> f64 {
         | "apps.home.get"
         | "search.files"
         | "search.modules"
+        | "users.channelSections.create"
+        | "users.channelSections.update"
+        | "users.channelSections.delete"
+        | "users.channelSections.order"
+        | "users.channelSections.channels.list"
+        | "users.channelSections.channels.bulkUpdate"
         | "dnd.setSnooze"
         | "dnd.endSnooze"
         | "stars.add"
@@ -1147,6 +1153,10 @@ impl Slack {
             }
             "draft_saved" => self.draft_saved(event),
             "draft_deleted" | "draft_sent" => self.draft_deleted(event),
+            "channel_sections_upserted" => self.sections_upserted(event),
+            "channel_sections_removed" | "channel_sections_deleted" => self.sections_removed(event),
+            "channel_sections_channels_upserted" => self.sections_channels_changed(event, true),
+            "channel_sections_channels_removed" => self.sections_channels_changed(event, false),
             "goodbye" => Err(Failure::Dropped("Slack asked for a new connection".to_owned())),
             "error" => {
                 let error = &event["error"];
@@ -1651,6 +1661,21 @@ impl Slack {
             }
             Command::AppView { conversation_id, include_home, reply } => {
                 answer(reply, self.app_view(&conversation_id, include_home))
+            }
+            Command::SectionCreate { name, emoji, reply, .. } => {
+                answer(reply, self.section_create(&name, &emoji))
+            }
+            Command::SectionRename { section_id, name, emoji, reply, .. } => {
+                answer(reply, self.section_rename(&section_id, &name, emoji.as_deref()))
+            }
+            Command::SectionDelete { section_id, reply, .. } => {
+                answer(reply, self.section_delete(&section_id))
+            }
+            Command::SectionReorder { section_ids, reply, .. } => {
+                answer(reply, self.section_reorder(&section_ids))
+            }
+            Command::SectionMoveChannel { conversation_id, from_section, to_section, reply, .. } => {
+                answer(reply, self.section_move_channel(&conversation_id, from_section.as_deref(), &to_section))
             }
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
             Command::Star { conversation_id, starred, reply } => answer(reply, self.star(&conversation_id, starred)),
@@ -3104,6 +3129,7 @@ fn capabilities() -> protocol::Capabilities {
         manage_files: true,
         dnd_snooze: true,
         follow_threads: true,
+        sidebar_sections: true,
         ..protocol::Capabilities::default()
     }
 }

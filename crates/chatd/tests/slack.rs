@@ -753,6 +753,37 @@ impl Fake {
                     self.fixture(token, "users.channelSections.list")
                 }
             }
+            "users.channelSections.channels.list" => {
+                if param("channel_section_id") == "S0BIG" && param("cursor") == "sec_p2" {
+                    Some(json!({
+                        "ok": true,
+                        "channel_ids": ["C0SIDE"],
+                        "response_metadata": {"next_cursor": ""}
+                    }))
+                } else {
+                    Some(json!({"ok": true, "channel_ids": [], "response_metadata": {"next_cursor": ""}}))
+                }
+            }
+            "users.channelSections.create" => {
+                let name = param("name");
+                if name.is_empty() {
+                    return refused("invalid_name_required");
+                }
+                Some(json!({
+                    "ok": true,
+                    "channel_section_id": "S0CUSTOM1",
+                    "channel_section": {"channel_section_id": "S0CUSTOM1", "name": name, "emoji": param("emoji")}
+                }))
+            }
+            "users.channelSections.update" | "users.channelSections.delete" | "users.channelSections.order" => {
+                Some(json!({"ok": true}))
+            }
+            "users.channelSections.channels.bulkUpdate" => {
+                if param("insert").is_empty() && param("remove").is_empty() {
+                    return refused("invalid_arguments");
+                }
+                Some(json!({"ok": true}))
+            }
             "apps.profile.get" => {
                 let app = param("app");
                 if app == "A0DEP" || param("bot") == "B0DEP" {
@@ -6442,4 +6473,159 @@ fn slack_search_falls_back_to_search_modules_when_search_messages_is_refused() {
     assert_eq!(hits.len(), 1);
     assert!(hits[0].snippet.contains("search.modules"));
     assert_eq!(world.fake.calls(ALPHA, "search.modules").len(), 1);
+}
+
+#[test]
+fn slack_sidebar_sections_mixed_types_paging_crud_live_events_and_paid_gating() {
+    let world = World::start_with(|fake| {
+        // Custom section S0BIG holds a channel (page 1), a DM (D0ANA), an app (D0BOT),
+        // an emoji, recent sort, AND pages to page 2 (`sec_p2` -> C0SIDE).
+        *fake.sections_override.lock().unwrap() = Some(json!({
+            "ok": true,
+            "channel_sections": [
+                {
+                    "channel_section_id": "S0BIG",
+                    "name": "Projects",
+                    "type": "standard",
+                    "emoji": "rocket",
+                    "sort": "recent",
+                    "next_channel_section_id": "S0CHAN",
+                    "channel_ids_page": {
+                        "channel_ids": ["C0DEP", "D0ANA", "D0BOT"],
+                        "next_cursor": "sec_p2"
+                    }
+                },
+                {
+                    "channel_section_id": "S0CHAN",
+                    "name": "Channels",
+                    "type": "channels",
+                    "channel_ids_page": {
+                        "channel_ids": ["C0GEN", "C0RND"]
+                    }
+                }
+            ]
+        }));
+    });
+    world.ready();
+
+    // 1. Custom section paged past first page, kept DM & app inside it, and preserved emoji + sort.
+    assert_eq!(world.fake.calls(ALPHA, "users.channelSections.channels.list").len(), 1);
+    let (groups, rows) = world.tree(&alpha("T01ALPHA")).unwrap();
+    let projects = groups.iter().find(|g| g.id == "S0BIG").expect("Projects section");
+    assert_eq!(projects.name, "Projects");
+    assert_eq!(projects.emoji, "🚀");
+    assert_eq!(projects.sort, "recent");
+    for id in ["C0DEP", "D0ANA", "D0BOT", "C0SIDE"] {
+        let row = rows.iter().find(|r| r.key.id == id).expect(id);
+        assert_eq!(row.group.as_deref(), Some("S0BIG"), "{id} should stay inside custom section S0BIG");
+    }
+
+    // 2. Create, rename, reorder, move channel, and delete custom section.
+    let space = alpha("T01ALPHA");
+    let Response::Section { group: created } = world.ask(Request::SectionCreate {
+        space: space.clone(),
+        name: "Urgent".into(),
+        emoji: "fire".into(),
+    }) else {
+        panic!("expected Response::Section");
+    };
+    assert_eq!((created.id.as_str(), created.name.as_str(), created.emoji.as_str()), ("S0CUSTOM1", "Urgent", "🔥"));
+
+    assert_eq!(
+        world.ask(Request::SectionRename {
+            space: space.clone(),
+            section_id: "S0CUSTOM1".into(),
+            name: "Priority".into(),
+            emoji: Some("star".into()),
+        }),
+        Response::Ok
+    );
+    let (groups, _) = world.tree(&space).unwrap();
+    let renamed = groups.iter().find(|g| g.id == "S0CUSTOM1").expect("renamed section");
+    assert_eq!((renamed.name.as_str(), renamed.emoji.as_str()), ("Priority", "⭐"));
+
+    assert_eq!(
+        world.ask(Request::SectionMoveChannel {
+            space: space.clone(),
+            conversation: alpha("C0GEN"),
+            from_section: Some("S0CHAN".into()),
+            to_section: "S0CUSTOM1".into(),
+        }),
+        Response::Ok
+    );
+    let (_, rows) = world.tree(&space).unwrap();
+    assert_eq!(rows.iter().find(|r| r.key.id == "C0GEN").unwrap().group.as_deref(), Some("S0CUSTOM1"));
+    let bulk = world.fake.calls(ALPHA, "users.channelSections.channels.bulkUpdate").pop().unwrap();
+    assert!(bulk.params["insert"].contains("S0CUSTOM1") && bulk.params["insert"].contains("C0GEN"));
+    assert!(bulk.params["remove"].contains("S0CHAN"));
+
+    assert_eq!(
+        world.ask(Request::SectionReorder {
+            space: space.clone(),
+            section_ids: vec!["S0CUSTOM1".into(), "S0BIG".into(), "S0CHAN".into()],
+        }),
+        Response::Ok
+    );
+    let (groups, _) = world.tree(&space).unwrap();
+    let positions: Vec<(&str, i32)> = groups
+        .iter()
+        .filter(|g| matches!(g.id.as_str(), "S0CUSTOM1" | "S0BIG" | "S0CHAN"))
+        .map(|g| (g.id.as_str(), g.position))
+        .collect();
+    assert_eq!(positions, [("S0CUSTOM1", 0), ("S0BIG", 1), ("S0CHAN", 2)]);
+
+    assert_eq!(
+        world.ask(Request::SectionDelete {
+            space: space.clone(),
+            section_id: "S0CUSTOM1".into(),
+        }),
+        Response::Ok
+    );
+    let (groups, _) = world.tree(&space).unwrap();
+    assert!(groups.iter().all(|g| g.id != "S0CUSTOM1"));
+
+    // 3. Live socket events update sections and channel memberships without reload.
+    world.fake.push(ALPHA, json!({
+        "type": "channel_sections_upserted",
+        "channel_sections": [{
+            "channel_section_id": "S0LIVE",
+            "name": "Live Ops",
+            "type": "standard",
+            "emoji": "zap"
+        }]
+    }));
+    world.until("live section upserted", || {
+        let (groups, _) = world.tree(&space)?;
+        groups.into_iter().find(|g| g.id == "S0LIVE" && g.name == "Live Ops" && g.emoji == "⚡")
+    });
+    world.fake.push(ALPHA, json!({
+        "type": "channel_sections_channels_upserted",
+        "channel_section_id": "S0LIVE",
+        "channel_ids": ["C0RND"]
+    }));
+    world.until("live channel moved into S0LIVE", || {
+        let (_, rows) = world.tree(&space)?;
+        rows.into_iter().find(|r| r.key.id == "C0RND" && r.group.as_deref() == Some("S0LIVE"))
+    });
+    world.fake.push(ALPHA, json!({
+        "type": "channel_sections_removed",
+        "channel_section_ids": ["S0LIVE"]
+    }));
+    world.until("live section removed", || {
+        let (groups, _) = world.tree(&space)?;
+        groups.iter().all(|g| g.id != "S0LIVE").then_some(())
+    });
+
+    // 4. Paid-plan refusal turns off sidebar_sections capability so the shell hides controls.
+    assert!(world.account("T01ALPHA").can.sidebar_sections);
+    world.fake.refusing.lock().unwrap().insert("users.channelSections.create".into(), "paid_only".into());
+    let refused = world.ask(Request::SectionCreate {
+        space,
+        name: "Free Workspace".into(),
+        emoji: String::new(),
+    });
+    assert!(matches!(refused, Response::Error { code: ErrorCode::Refused, .. }), "{refused:?}");
+    world.until("sidebar_sections capability disabled after paid_only", || {
+        (!world.account("T01ALPHA").can.sidebar_sections).then_some(())
+    });
 }
