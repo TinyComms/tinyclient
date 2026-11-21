@@ -284,6 +284,11 @@ pub struct CallSecurity {
     /// the call, new whenever someone joins or leaves. Empty until the group has keys.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub code: String,
+    /// Explicit verification emoji for a 1:1 end-to-end encrypted call (Telegram's 4 emoji from
+    /// `SHA-256(key || g_a)` over the 333-emoji table). Empty before `phone.confirmCall` succeeds
+    /// and the fingerprint matches, and empty for group video chats.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emojis: Vec<String>,
     /// The group's epoch. It moves on every join and leave.
     #[serde(default)]
     pub epoch: u64,
@@ -302,6 +307,25 @@ pub struct CallSecurity {
     /// then offers no way on but leaving.
     #[serde(default, skip_serializing_if = "crate::is_false")]
     pub required: bool,
+}
+
+impl CallSecurity {
+    /// Builds [`CallSecurity`] for a confirmed Telegram 1:1 call whose key fingerprint matched.
+    /// Returns `None` before `phone.confirmCall` succeeds or when the fingerprint did not match.
+    pub fn telegram_verified(key: &[u8], g_a: &[u8], confirmed: bool, fingerprint_matched: bool) -> Option<Self> {
+        if !confirmed || !fingerprint_matched {
+            return None;
+        }
+        let emojis = crate::telegram_call_emojis(key, g_a)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        Some(CallSecurity {
+            mode: SecurityMode::EndToEnd,
+            emojis,
+            ..CallSecurity::default()
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -126,6 +126,28 @@ pub(super) fn call_emojis(code: &str) -> Vec<&'static str> {
     protocol::safety_emojis(code)
 }
 
+/// Verification emojis to show in the security panel: explicit emojis (Telegram's 333-emoji
+/// table) when present, otherwise Tiny's digit-derived safety emojis.
+pub(super) fn security_emojis(security: &CallSecurity) -> Vec<String> {
+    if !security.emojis.is_empty() {
+        return security.emojis.clone();
+    }
+    call_emojis(&security.code).into_iter().map(str::to_owned).collect()
+}
+
+/// Four verification emoji shown inline in the call header for a confirmed Telegram 1:1 E2EE call.
+/// Returns `None` for non-Telegram calls, unconfirmed/non-E2EE calls, or group video chats.
+pub(super) fn telegram_header_emojis(call: &Call) -> Option<String> {
+    if call.conversation.network != protocol::Network::Telegram {
+        return None;
+    }
+    let security = call.security.as_ref()?;
+    if security.mode != SecurityMode::EndToEnd || security.emojis.len() != 4 {
+        return None;
+    }
+    Some(security.emojis.join(" "))
+}
+
 /// A member's name as the call's roster has it. Someone the server does not list in the call
 /// is said to be exactly that.
 pub(super) fn member_name(call: &Call, user_id: &str) -> String {
@@ -252,29 +274,56 @@ impl Shell {
         let shown = badge(security, call.participants.is_empty());
         let (icon, color) = badge_look(shown);
         let open = self.call_security_open(place);
-        let mut indicator = div()
-            .id(("call-security", place as usize))
-            .flex_none()
-            .size(px(24.))
-            .rounded(px(theme::R_CONTROL))
-            .flex()
-            .items_center()
-            .justify_center()
-            .cursor_pointer()
-            .tab_index(0)
-            .when(open, |el| el.bg(theme::selected()))
-            .hover(|style| style.bg(theme::hover()))
-            .focus_visible(|style| style.shadow(theme::focus_ring()))
-            .child(glyph(icon, 14., color))
-            .tooltip(tip(badge_words(shown), None))
-            // Stop the dock title's click (open conversation) on press, not only on click: a
-            // parent that sees mouse_down first steals the gesture and the lock looks dead.
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                this.call_state.security_at = place;
-                this.call_menu_toggle(Menu::Security, cx);
-            }));
+        let tg_emojis = telegram_header_emojis(call);
+        let mut indicator = if let Some(emojis) = tg_emojis {
+            div()
+                .id(("call-security", place as usize))
+                .flex_none()
+                .h(px(24.))
+                .px(px(6.))
+                .rounded(px(theme::R_CONTROL))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .tab_index(0)
+                .when(open, |el| el.bg(theme::selected()))
+                .hover(|style| style.bg(theme::hover()))
+                .focus_visible(|style| style.shadow(theme::focus_ring()))
+                .text_size(px(13.))
+                .child(emojis)
+                .tooltip(tip("End-to-end encrypted · compare these four emoji", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_state.security_at = place;
+                    this.call_menu_toggle(Menu::Security, cx);
+                }))
+        } else {
+            div()
+                .id(("call-security", place as usize))
+                .flex_none()
+                .size(px(24.))
+                .rounded(px(theme::R_CONTROL))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .tab_index(0)
+                .when(open, |el| el.bg(theme::selected()))
+                .hover(|style| style.bg(theme::hover()))
+                .focus_visible(|style| style.shadow(theme::focus_ring()))
+                .child(glyph(icon, 14., color))
+                .tooltip(tip(badge_words(shown), None))
+                // Stop the dock title's click (open conversation) on press, not only on click: a
+                // parent that sees mouse_down first steals the gesture and the lock looks dead.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_state.security_at = place;
+                    this.call_menu_toggle(Menu::Security, cx);
+                }))
+        };
         // The dock's card places its own popovers; the other two hang the panel off the
         // indicator, over the content beside the column: up from the compact bar at the bottom
         // of the column, down from the top bar.
@@ -382,8 +431,14 @@ impl Shell {
         if security.mode != SecurityMode::EndToEnd {
             return panel;
         }
-        let emojis = call_emojis(&security.code);
+        let is_telegram = call.conversation.network == protocol::Network::Telegram && !security.emojis.is_empty();
+        let emojis = security_emojis(&security);
         if !emojis.is_empty() {
+            let note = if is_telegram {
+                "If these four emoji match on the other person's screen, this call is end-to-end encrypted and nobody sits between you."
+            } else {
+                "Same four on everyone's screen? You're in one encrypted call."
+            };
             panel = panel
                 .child(
                     div()
@@ -408,10 +463,10 @@ impl Shell {
                                 .child(glyph)
                         })),
                 )
-                .child(words(
-                    "Same four on everyone's screen? You're in one encrypted call.".to_owned(),
-                    theme::text_faint(),
-                ));
+                .child(words(note.to_owned(), theme::text_faint()));
+        }
+        if is_telegram {
+            return panel;
         }
         let in_it = in_call(call);
         if !security.members.is_empty() {
@@ -714,5 +769,29 @@ mod tests {
         assert!(why_transport(&call_, &pending).is_empty());
         // A blocked call claims no keys: the panel shows none of an encrypted call's detail.
         assert!(!alarming(&CallSecurity { members: vec![member("", Trust::Changed)], ..blocked }));
+    }
+
+    #[test]
+    fn telegram_call_verification_emojis_render_only_when_confirmed_e2ee() {
+        let key = [0x01u8; 32];
+        let g_a = [0x02u8; 32];
+        let sec = CallSecurity::telegram_verified(&key, &g_a, true, true).unwrap();
+        let mut tg_call = call(sec.clone());
+        tg_call.conversation.network = protocol::Network::Telegram;
+        let shown = telegram_header_emojis(&tg_call).expect("telegram confirmed e2ee shows 4 emoji");
+        assert_eq!(shown.split(' ').count(), 4);
+        assert_eq!(security_emojis(&sec), sec.emojis);
+
+        // Non-Telegram call uses Tiny lock, not inline Telegram emoji.
+        let tiny_call = call(sec.clone());
+        assert!(telegram_header_emojis(&tiny_call).is_none());
+
+        // Group video chat (security: None) or pending call shows no emoji.
+        let mut group_call = tg_call.clone();
+        group_call.security = None;
+        assert!(telegram_header_emojis(&group_call).is_none());
+        let mut pending = tg_call;
+        pending.security = Some(CallSecurity { mode: SecurityMode::Pending, ..sec });
+        assert!(telegram_header_emojis(&pending).is_none());
     }
 }

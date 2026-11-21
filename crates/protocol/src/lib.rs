@@ -33,6 +33,7 @@ pub mod quarantine;
 mod react;
 pub mod settings;
 mod signin;
+pub mod telegram_call_emoji;
 mod tiny;
 pub mod web_sign_in;
 
@@ -46,6 +47,7 @@ pub use play::*;
 pub use react::*;
 pub use record::*;
 pub use signin::*;
+pub use telegram_call_emoji::*;
 pub use tiny::*;
 
 pub const CHAT_SOCK_NAME: &str = "chat.sock";
