@@ -495,6 +495,16 @@ pub enum Command {
     },
     /// A Space's info, opened from its name.
     SpaceInfo { space_id: String, reply: Reply<SpaceAbout> },
+    /// Preview a Space invite link or code.
+    InvitePreview {
+        code: String,
+        reply: Reply<protocol::InvitePreview>,
+    },
+    /// Join a Space from an invite link or code; returns `(space_id, channel_id)`.
+    InviteJoin {
+        code: String,
+        reply: Reply<(Option<String>, Option<String>)>,
+    },
     /// Set the network's notification setting. `until` is when a mute ends, as Unix seconds.
     /// Absent means muted until it is turned off, or not muted. An adapter with no timed mute
     /// ignores it. Report the new mute through [`Context::muted`] before answering.
@@ -713,6 +723,8 @@ impl Command {
             Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ConversationInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SpaceInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetMute { reply, .. }
             | Command::SetDisappearing { reply, .. }
             | Command::Leave { reply, .. }

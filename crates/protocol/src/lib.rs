@@ -1647,6 +1647,16 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         nickname: Option<String>,
     },
+    /// Preview a Space invite link or code before joining (e.g. Discord `GET /invites/{code}`).
+    InvitePreview {
+        account: AccountKey,
+        code: String,
+    },
+    /// Join a Space from an invite link or code (e.g. Discord `POST /invites/{code}`).
+    InviteJoin {
+        account: AccountKey,
+        code: String,
+    },
     Watch(Watching),
 
     /// A page of one conversation, oldest first. Reading is not marking read.
@@ -2765,6 +2775,17 @@ pub enum Response {
     },
     SpaceInfo {
         info: Box<SpaceInfo>,
+    },
+    /// Answers `InvitePreview`: metadata and member counts for an invite code.
+    InvitePreview {
+        preview: InvitePreview,
+    },
+    /// Answers `InviteJoin`: the joined Space and landing conversation, when reported.
+    InviteJoined {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<Key>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation: Option<Key>,
     },
     Pinned {
         conversation: Key,

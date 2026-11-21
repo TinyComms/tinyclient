@@ -1675,6 +1675,37 @@ impl Chat {
         }
     }
 
+    fn invite_preview(&self, account: AccountKey, code: String) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let code = code.trim().to_owned();
+        if code.is_empty() {
+            return error(ErrorCode::Refused, "Enter an invite link or code.");
+        }
+        match self.ask(&account, |reply| Command::InvitePreview { code, reply }) {
+            Ok(preview) => Response::InvitePreview { preview },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn invite_join(&self, account: AccountKey, code: String) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let code = code.trim().to_owned();
+        if code.is_empty() {
+            return error(ErrorCode::Refused, "Enter an invite link or code.");
+        }
+        match self.ask(&account, |reply| Command::InviteJoin { code, reply }) {
+            Ok((space_id, channel_id)) => Response::InviteJoined {
+                space: space_id.map(|id| Key::new(&account, id)),
+                conversation: channel_id.map(|id| Key::new(&account, id)),
+            },
+            Err(refused) => *refused,
+        }
+    }
+
     fn report(
         &self,
         target: protocol::ReportTarget,
@@ -3085,6 +3116,8 @@ impl Chat {
             Request::SetAvatar { account, path } => self.set_avatar(account, path),
             Request::SetNickname { space, nickname } => self.set_nickname(space, nickname),
             Request::SetFriendNickname { person, nickname } => self.set_friend_nickname(person, nickname),
+            Request::InvitePreview { account, code } => self.invite_preview(account, code),
+            Request::InviteJoin { account, code } => self.invite_join(account, code),
             Request::Watch(watching) => self.watch(watching),
 
             Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),

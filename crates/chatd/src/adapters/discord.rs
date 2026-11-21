@@ -1302,6 +1302,78 @@ impl Discord {
         Ok(())
     }
 
+    /// Previews a Discord server invite (`GET /invites/{code}?with_counts=true&with_expiration=true`).
+    fn invite_preview(&self, raw: &str) -> Result<protocol::InvitePreview, Refusal> {
+        let code = parse_discord_invite_code(raw).map_err(Refusal::Refused)?;
+        let path = format!("/invites/{}?with_counts=true&with_expiration=true", escaped(&code));
+        let body = self.call("GET", &path, None).map_err(invite_refusal)?;
+        let parsed: Value = serde_json::from_str(&body)
+            .map_err(|err| Refusal::Refused(format!("Discord's answer was unreadable: {err}")))?;
+        let guild = parsed.get("guild").filter(|v| v.is_object());
+        let space_id = guild
+            .and_then(|g| g.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let name = guild
+            .and_then(|g| g.get("name"))
+            .and_then(Value::as_str)
+            .or_else(|| parsed.get("channel").and_then(|c| c.get("name")).and_then(Value::as_str))
+            .unwrap_or(&code)
+            .to_owned();
+        let description = guild
+            .and_then(|g| g.get("description"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let icon = space_id
+            .as_deref()
+            .zip(guild.and_then(|g| g.get("icon")).and_then(Value::as_str))
+            .map(|(gid, hash)| {
+                let (file, url) = model::guild_icon(gid, hash);
+                let _ = self.ctx.media(&[(file.clone(), url)]);
+                file
+            });
+        let channel_id = parsed
+            .get("channel")
+            .and_then(|c| c.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        Ok(protocol::InvitePreview {
+            code: parsed.get("code").and_then(Value::as_str).unwrap_or(&code).to_owned(),
+            name,
+            description,
+            icon,
+            members: parsed.get("approximate_member_count").and_then(Value::as_u64).map(|n| n as u32),
+            online: parsed.get("approximate_presence_count").and_then(Value::as_u64).map(|n| n as u32),
+            space_id,
+            channel_id,
+        })
+    }
+
+    /// Joins a Discord server from an invite code (`POST /invites/{code}`). Never retries on
+    /// captcha or refusal; `GUILD_CREATE` on the gateway plants the server tree.
+    fn invite_join(&self, raw: &str) -> Result<(Option<String>, Option<String>), Refusal> {
+        let code = parse_discord_invite_code(raw).map_err(Refusal::Refused)?;
+        let context = base64::engine::general_purpose::STANDARD.encode(json!({"location": "Join Guild"}).to_string());
+        let path = format!("/invites/{}", escaped(&code));
+        let body = self
+            .rest
+            .call_with("POST", &path, Some(json!({})), &[("X-Context-Properties", &context)])
+            .map_err(invite_refusal)?;
+        let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        let space_id = parsed
+            .get("guild")
+            .and_then(|g| g.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let channel_id = parsed
+            .get("channel")
+            .and_then(|c| c.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        Ok((space_id, channel_id))
+    }
+
     /// Our own presence, and the status line unless it is `None`. Both are settings: the web
     /// client saves them (protobuf, `settings-proto/1`) and tells the gateway (op 3), and so
     /// does this.
@@ -1785,6 +1857,8 @@ impl Discord {
             Command::ProfileIn { person_id, space_id, reply } => answer(reply, self.profile(&person_id, Some(&space_id))),
             Command::ConversationInfo { conversation_id, reply } => answer(reply, self.conversation_info(&conversation_id)),
             Command::SpaceInfo { space_id, reply } => answer(reply, self.space_info(&space_id)),
+            Command::InvitePreview { code, reply } => answer(reply, self.invite_preview(&code)),
+            Command::InviteJoin { code, reply } => answer(reply, self.invite_join(&code)),
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
             Command::Leave { conversation_id, reply } => answer(reply, self.leave(&conversation_id, false)),
             Command::CloseDirect { conversation_id, reply } => answer(reply, self.leave(&conversation_id, true)),
@@ -1915,6 +1989,71 @@ fn add_friend_refusal(err: Refused) -> Refusal {
     }
 }
 
+/// Extracts a Discord invite code from `discord.gg/<code>`, `discord.com/invite/<code>`,
+/// `discordapp.com/invite/<code>`, or a bare invite code.
+fn parse_discord_invite_code(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim().trim_matches(|c| matches!(c, '<' | '>' | '"' | '\''));
+    if trimmed.is_empty() {
+        return Err("Enter a valid Discord invite link or code.".to_owned());
+    }
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    let without_www = without_scheme.strip_prefix("www.").unwrap_or(without_scheme);
+    let candidate = if let Some(rest) = without_www.strip_prefix("discord.gg/") {
+        rest
+    } else if let Some(rest) = without_www.strip_prefix("discord.com/invite/") {
+        rest
+    } else if let Some(rest) = without_www.strip_prefix("discordapp.com/invite/") {
+        rest
+    } else if without_www.contains('/') || without_www.contains('.') {
+        return Err("Enter a valid Discord invite link or code.".to_owned());
+    } else {
+        without_www
+    };
+    let code = candidate
+        .split(['?', '#', '/'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    if code.len() < 2
+        || code.len() > 64
+        || !code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("Enter a valid Discord invite link or code.".to_owned());
+    }
+    Ok(code.to_owned())
+}
+
+/// Translates Discord's refusal codes on `/invites/{code}` into clear words.
+fn invite_refusal(err: Refused) -> Refusal {
+    match err {
+        Refused::Challenge => Refusal::Refused(
+            "Discord asked for a captcha check tinyclient cannot complete. Join this server in Discord.".to_owned(),
+        ),
+        Refused::Limited(_) | Refused::Paused(_) | Refused::Status { status: 429, .. } => {
+            Refusal::Refused("Too many invite requests. Wait a moment and try again.".to_owned())
+        }
+        Refused::Status { code: 10006, .. } | Refused::Status { status: 404, .. } => {
+            Refusal::Refused("This invite is invalid or has expired.".to_owned())
+        }
+        Refused::Status { code: 40007, .. } => Refusal::Refused("You are banned from this server.".to_owned()),
+        Refused::Status { code: 30001, .. } => {
+            Refusal::Refused("You have reached Discord's server limit (100 servers, or 200 with Nitro).".to_owned())
+        }
+        Refused::Status { code: 50013 | 50001, .. } => {
+            Refusal::Refused("You do not have permission to join this server.".to_owned())
+        }
+        Refused::Status { status: 400, ref message, .. } if message.to_ascii_lowercase().contains("captcha") => {
+            Refusal::Refused(
+                "Discord asked for a captcha check tinyclient cannot complete. Join this server in Discord.".to_owned(),
+            )
+        }
+        other => refusal(other),
+    }
+}
+
 /// Sends the answer to a command the shell is waiting on.
 fn answer<T>(reply: Reply<T>, outcome: Result<T, Refusal>) {
     let _ = reply.send(outcome);
@@ -1956,5 +2095,29 @@ mod tests {
         assert!(msg(Refused::Status { status: 400, code: 80008, message: String::new(), retry_after: None }).contains("does not accept friend requests"));
         assert!(msg(Refused::Challenge).contains("captcha"));
         assert!(msg(Refused::Limited(10.0)).contains("Too many friend requests"));
+    }
+
+    #[test]
+    fn parse_discord_invite_code_extracts_urls_and_bare_codes() {
+        assert_eq!(parse_discord_invite_code("rustlang").unwrap(), "rustlang");
+        assert_eq!(parse_discord_invite_code("https://discord.gg/AbC-123_x?event=1").unwrap(), "AbC-123_x");
+        assert_eq!(parse_discord_invite_code("discord.gg/rust").unwrap(), "rust");
+        assert_eq!(parse_discord_invite_code("https://discord.com/invite/rustlang").unwrap(), "rustlang");
+        assert_eq!(parse_discord_invite_code("http://www.discordapp.com/invite/rustlang/").unwrap(), "rustlang");
+        assert!(parse_discord_invite_code("").is_err());
+        assert!(parse_discord_invite_code("https://example.com/invite/abc").is_err());
+        assert!(parse_discord_invite_code("https://discord.gg/").is_err());
+    }
+
+    #[test]
+    fn invite_refusal_translates_discord_codes() {
+        let msg = |r: Refused| match invite_refusal(r) {
+            Refusal::Refused(m) => m,
+            Refusal::Unsupported => panic!("unexpected unsupported"),
+        };
+        assert!(msg(Refused::Status { status: 404, code: 10006, message: String::new(), retry_after: None }).contains("invalid or has expired"));
+        assert!(msg(Refused::Status { status: 403, code: 40007, message: String::new(), retry_after: None }).contains("banned"));
+        assert!(msg(Refused::Status { status: 400, code: 30001, message: String::new(), retry_after: None }).contains("server limit"));
+        assert!(msg(Refused::Challenge).contains("captcha"));
     }
 }

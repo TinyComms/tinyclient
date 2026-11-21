@@ -164,6 +164,15 @@ pub struct State {
     pub spaces_pending: bool,
     pub switcher: Option<switcher::Switcher>,
     pub create_channel: Option<CreateChannelModal>,
+    pub join_server: Option<JoinServerModal>,
+}
+
+pub struct JoinServerModal {
+    pub account: AccountKey,
+    pub input: Entity<crate::gui::input::TextInput>,
+    pub preview: Option<protocol::InvitePreview>,
+    pub error: Option<String>,
+    pub busy: bool,
 }
 
 fn list_state() -> ListState {
@@ -286,6 +295,7 @@ impl State {
             spaces_pending: false,
             switcher: None,
             create_channel: None,
+            join_server: None,
         }
     }
 
@@ -2062,6 +2072,217 @@ impl Shell {
     }
 
     /// Open the "Create channel…" modal for a Space (optionally inside a section/group).
+    pub(super) fn open_join_server(&mut self, account: AccountKey, cx: &mut Context<Self>) {
+        let input = cx.new(|cx| crate::gui::input::TextInput::new("discord.gg/… or invite code", cx));
+        self.sidebar_state.join_server = Some(JoinServerModal {
+            account,
+            input,
+            preview: None,
+            error: None,
+            busy: false,
+        });
+        cx.notify();
+    }
+
+    fn preview_join_server(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.sidebar_state.join_server.as_mut() else {
+            return;
+        };
+        if modal.busy {
+            return;
+        }
+        let code = modal.input.read(cx).text().trim().to_owned();
+        if code.is_empty() {
+            modal.error = Some("Enter an invite link or code.".to_owned());
+            cx.notify();
+            return;
+        }
+        modal.busy = true;
+        modal.error = None;
+        let account = modal.account.clone();
+        cx.notify();
+        let req = Request::InvitePreview { account, code };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                if let Some(modal) = this.sidebar_state.join_server.as_mut() {
+                    modal.busy = false;
+                    match answer {
+                        Ok(Response::InvitePreview { preview }) => {
+                            modal.preview = Some(preview);
+                            modal.error = None;
+                        }
+                        Ok(Response::Error { detail, .. }) => {
+                            modal.preview = None;
+                            modal.error = Some(detail);
+                        }
+                        Ok(_) => modal.error = Some("Could not load invite preview.".to_owned()),
+                        Err(err) => modal.error = Some(err.to_string()),
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn submit_join_server(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.sidebar_state.join_server.as_mut() else {
+            return;
+        };
+        if modal.busy {
+            return;
+        }
+        let code = modal
+            .preview
+            .as_ref()
+            .map(|p| p.code.clone())
+            .unwrap_or_else(|| modal.input.read(cx).text().trim().to_owned());
+        if code.is_empty() {
+            modal.error = Some("Enter an invite link or code.".to_owned());
+            cx.notify();
+            return;
+        }
+        modal.busy = true;
+        modal.error = None;
+        let account = modal.account.clone();
+        cx.notify();
+        let req = Request::InviteJoin { account, code };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| match answer {
+                Ok(Response::InviteJoined { space, .. }) => {
+                    this.sidebar_state.join_server = None;
+                    if let Some(space) = space {
+                        this.open_space(space, cx);
+                    }
+                    this.toast(Some(("icons/check.svg", theme::text_soft())), "Joined server", cx);
+                    cx.notify();
+                }
+                Ok(Response::Error { detail, .. }) => {
+                    if let Some(modal) = this.sidebar_state.join_server.as_mut() {
+                        modal.busy = false;
+                        modal.error = Some(detail);
+                    }
+                    cx.notify();
+                }
+                Ok(_) => {
+                    if let Some(modal) = this.sidebar_state.join_server.as_mut() {
+                        modal.busy = false;
+                        modal.error = Some("Could not join server.".to_owned());
+                    }
+                    cx.notify();
+                }
+                Err(err) => {
+                    if let Some(modal) = this.sidebar_state.join_server.as_mut() {
+                        modal.busy = false;
+                        modal.error = Some(err.to_string());
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(in crate::gui) fn join_server_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let modal = self.sidebar_state.join_server.as_ref()?;
+        let ready = !modal.input.read(cx).text().trim().is_empty() && !modal.busy;
+        let preview_box = modal.preview.as_ref().map(|p| {
+            let mut meta = Vec::new();
+            if let Some(online) = p.online {
+                meta.push(format!("{online} online"));
+            }
+            if let Some(members) = p.members {
+                meta.push(format!("{members} members"));
+            }
+            div()
+                .p(px(10.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(theme::canvas())
+                .border_1()
+                .border_color(theme::border())
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(p.name.clone()))
+                .when(!p.description.is_empty(), |box_el| {
+                    box_el.child(div().type_small().text_color(theme::text_soft()).child(p.description.clone()))
+                })
+                .when(!meta.is_empty(), |box_el| {
+                    box_el.child(div().type_small().text_color(theme::text_soft()).child(meta.join(" · ")))
+                })
+        });
+        let card = div()
+            .id("join-server-card")
+            .w(px(380.))
+            .max_w_full()
+            .p(px(16.))
+            .rounded(px(theme::R_FLOAT))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().type_title().text_color(theme::text()).child("Join a server"))
+            .child(
+                div()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::canvas())
+                    .border_1()
+                    .border_color(theme::border())
+                    .type_ui()
+                    .child(modal.input.clone()),
+            )
+            .children(preview_box)
+            .children(modal.error.as_ref().map(|err| div().type_small().text_color(theme::danger()).child(err.clone())))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(button("join-server-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_state.join_server = None;
+                        cx.notify();
+                    })))
+                    .child(
+                        button("join-server-preview", ButtonKind::Secondary, "Preview").when(ready, |b| {
+                            b.on_click(cx.listener(|this, _, _, cx| this.preview_join_server(cx)))
+                        }),
+                    )
+                    .child(
+                        button(
+                            "join-server-submit",
+                            ButtonKind::Primary,
+                            if modal.busy { "Joining…" } else { "Join" },
+                        )
+                        .when(ready, |b| {
+                            b.on_click(cx.listener(|this, _, _, cx| this.submit_join_server(cx)))
+                        }),
+                    ),
+            );
+        Some(
+            div()
+                .id("join-server-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(gpui::rgba(0x0000_0066))
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.sidebar_state.join_server = None;
+                    cx.notify();
+                }))
+                .child(card),
+        )
+    }
+
     pub(super) fn open_create_channel(&mut self, space: Key, group: Option<String>, cx: &mut Context<Self>) {
         let name = cx.new(|cx| crate::gui::input::TextInput::new("channel-name", cx));
         self.sidebar_state.create_channel = Some(CreateChannelModal {

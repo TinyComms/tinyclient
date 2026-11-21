@@ -4525,3 +4525,79 @@ fn set_and_clear_friend_nickname_updates_relationship_and_refuses_non_friends() 
         world.people(Some(Relation::Friend), None).into_iter().find(|p| p.key.id == "2001" && p.name == "Mara")
     });
 }
+
+#[test]
+fn invite_preview_join_and_error_translation() {
+    let world = World::start();
+    let account = AccountKey { network: Network::Discord, account: "1000".into() };
+
+    // 1. Preview from full URL https://discord.gg/rustlang?foo=1
+    world.discord.script(
+        "/invites/rustlang",
+        200,
+        json!({
+            "code": "rustlang",
+            "guild": {"id": "9900", "name": "Rust Community", "description": "All things Rust", "icon": null},
+            "channel": {"id": "9901", "name": "welcome"},
+            "approximate_member_count": 4200,
+            "approximate_presence_count": 350
+        }),
+    );
+    match world.ask(Request::InvitePreview {
+        account: account.clone(),
+        code: "https://discord.gg/rustlang?foo=1".into(),
+    }) {
+        Response::InvitePreview { preview } => {
+            assert_eq!(preview.code, "rustlang");
+            assert_eq!(preview.name, "Rust Community");
+            assert_eq!(preview.description, "All things Rust");
+            assert_eq!(preview.members, Some(4200));
+            assert_eq!(preview.online, Some(350));
+            assert_eq!(preview.space_id.as_deref(), Some("9900"));
+            assert_eq!(preview.channel_id.as_deref(), Some("9901"));
+        }
+        other => panic!("expected Response::InvitePreview, got {other:?}"),
+    }
+    let preview_reqs = world.discord.requests_to("GET", "/invites/rustlang");
+    assert_eq!(preview_reqs.len(), 1);
+    assert!(preview_reqs[0].path.contains("with_counts=true"));
+
+    // 2. Join from discord.com/invite/rustlang
+    world.discord.script(
+        "/invites/rustlang",
+        200,
+        json!({
+            "code": "rustlang",
+            "guild": {"id": "9900", "name": "Rust Community"},
+            "channel": {"id": "9901"}
+        }),
+    );
+    match world.ask(Request::InviteJoin {
+        account: account.clone(),
+        code: "https://discord.com/invite/rustlang".into(),
+    }) {
+        Response::InviteJoined { space, conversation } => {
+            assert_eq!(space.map(|k| k.id), Some("9900".into()));
+            assert_eq!(conversation.map(|k| k.id), Some("9901".into()));
+        }
+        other => panic!("expected Response::InviteJoined, got {other:?}"),
+    }
+    let join_reqs = world.discord.requests_to("POST", "/invites/rustlang");
+    assert_eq!(join_reqs.len(), 1);
+    assert!(join_reqs[0].headers.contains_key("x-context-properties"));
+
+    // 3. Error translations: expired/invalid (10006), banned (40007), server limit (30001)
+    for (status, code, expected) in [
+        (404, 10006, "invalid or has expired"),
+        (403, 40007, "banned"),
+        (400, 30001, "server limit"),
+    ] {
+        world.discord.script("/invites/badcode", status, json!({"code": code, "message": "err"}));
+        match world.ask(Request::InviteJoin { account: account.clone(), code: "badcode".into() }) {
+            Response::Error { detail, .. } => {
+                assert!(detail.contains(expected), "code {code} expected '{expected}', got '{detail}'");
+            }
+            other => panic!("expected error for code {code}, got {other:?}"),
+        }
+    }
+}

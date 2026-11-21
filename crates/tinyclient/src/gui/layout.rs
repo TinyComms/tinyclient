@@ -808,6 +808,21 @@ impl Shell {
                             }))
                             .into_any_element(),
                     );
+                } else if let Some(account) = snapshot
+                    .accounts
+                    .iter()
+                    .find(|a| a.key.network == network && a.link == Link::Connected && a.capabilities.join_space_by_invite)
+                    .map(|a| a.key.clone())
+                {
+                    items.push(menu_separator().into_any_element());
+                    items.push(
+                        menu_item("join-server-invite", Some("icons/log-in.svg"), "Join a server…", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.open_join_server(account.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    );
                 }
             }
             // CONTRACT: of the Space menu in `02-layout-navigation.md` pinning and mark-as-read
@@ -1560,6 +1575,7 @@ impl Render for Shell {
             })
             .children(self.switcher(window, cx))
             .children(self.create_channel_modal(cx))
+            .children(self.join_server_modal(cx))
             .children(self.tiny_layer(window, cx))
             .children(self.menu_layer(snapshot, plan.sidebar.unwrap_or(state.sidebar_width), overview, window, cx))
             .children(self.toast_layer(width, cx))
