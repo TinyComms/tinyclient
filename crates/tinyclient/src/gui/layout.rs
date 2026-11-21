@@ -126,6 +126,8 @@ pub enum Menu {
     Own,
     Network(Network),
     Space(Key),
+    /// A server folder's context menu, where the pointer was.
+    Folder(Key, Point<Pixels>),
     /// A conversation row's context menu, where the pointer was.
     Row(Rc<Conversation>, Point<Pixels>),
 }
@@ -746,6 +748,10 @@ impl Shell {
                 let items = menu().w(px(200.)).children(self.menu_items(open, snapshot, cx));
                 placed("menu-space-at", Place::Below(menu_anchor), Layer::Menu, window, fade_in("menu-space", 120, items))
             }
+            Menu::Folder(_, position) => {
+                let items = menu().w(px(200.)).children(self.menu_items(open, snapshot, cx));
+                placed("menu-folder-at", Place::Pointer(*position), Layer::Menu, window, fade_in("menu-folder", 120, items))
+            }
             Menu::Row(_, position) => {
                 let items = menu().w(px(220.)).children(self.menu_items(open, snapshot, cx));
                 placed("menu-row-at", Place::Pointer(*position), Layer::Menu, window, fade_in("menu-row", 120, items))
@@ -846,11 +852,25 @@ impl Shell {
                         }))
                         .into_any_element(),
                 );
+                let has_badge = self.spaces.iter().any(|s| &s.key == space && (s.unread || s.attention > 0));
+                if has_badge {
+                    items.push(
+                        menu_item("space-read", Some("icons/check.svg"), "Mark as read", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.mark_space_read(read.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
+            }
+            Menu::Folder(folder, _) => {
+                let read = folder.clone();
                 items.push(
-                    menu_item("space-read", Some("icons/check.svg"), "Mark as read", None)
+                    menu_item("folder-read", Some("icons/check.svg"), "Mark as read", None)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.close_menu(cx);
-                            this.mark_space_read(read.clone(), cx);
+                            this.mark_folder_read(read.clone(), cx);
                         }))
                         .into_any_element(),
                 );
@@ -1055,6 +1075,18 @@ impl Shell {
                     .h(px(52.))
                     .child(super::components::Avatar::new(space, &name, 28.).shape(super::components::Shape::Place).image_at(icon).build())
                     .child(div().min_w_0().truncate().phone_title().child(name));
+                column().child(head).children(self.menu_items(open, snapshot, cx)).into_any_element()
+            }
+            Menu::Folder(folder, _) => {
+                let name = self
+                    .sidebar_state
+                    .home
+                    .folders
+                    .iter()
+                    .find(|f| &f.key == folder)
+                    .map(|f| if f.name.is_empty() { "Folder".to_owned() } else { f.name.clone() })
+                    .unwrap_or_else(|| "Folder".to_owned());
+                let head = div().flex().items_center().gap(px(10.)).px(px(8.)).h(px(44.)).child(glyph("icons/folder.svg", 20., theme::text_soft())).child(div().min_w_0().truncate().phone_title().child(name));
                 column().child(head).children(self.menu_items(open, snapshot, cx)).into_any_element()
             }
             Menu::Row(conversation, _) => {

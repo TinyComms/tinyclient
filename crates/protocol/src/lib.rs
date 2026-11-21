@@ -1728,8 +1728,8 @@ pub enum Request {
         message_id: String,
     },
     /// Every conversation with a badge is read, here and on the network. `network` limits it to
-    /// one; `space` to one Space's conversations; both `None` is the whole Inbox. Message
-    /// requests are read here only.
+    /// one; `space` to one Space's conversations; `folder` to one folder's conversations/Spaces;
+    /// all `None` is the whole Inbox. Message requests are read here only.
     MarkAllRead {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         network: Option<Network>,
@@ -1737,6 +1737,9 @@ pub enum Request {
         /// peer that does not know the field ignores it and hears the wider request.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         space: Option<Key>,
+        /// The folder to read out (e.g. a Discord server folder or Telegram chat folder).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder: Option<Key>,
     },
     /// Drops this conversation's cached messages and its badge. A direct or group conversation
     /// leaves the Inbox until a newer message arrives. The network is not asked to delete

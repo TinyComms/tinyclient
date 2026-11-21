@@ -1741,7 +1741,7 @@ fn marking_a_message_unread_moves_the_marker_back_and_a_manual_ack_does_too() {
 fn marking_everything_read_tells_discord_in_one_bulk_ack() {
     let world = World::start();
     assert!(world.conversation("3001").unread > 0);
-    assert_eq!(world.ask(Request::MarkAllRead { network: None, space: None }), Response::Ok);
+    assert_eq!(world.ask(Request::MarkAllRead { network: None, space: None, folder: None }), Response::Ok);
     assert_eq!(world.conversation("3001").unread, 0);
     let bulk = wait("the bulk ack", || {
         let found = world.discord.requests_to("POST", "/read-states/ack-bulk");
@@ -1763,7 +1763,7 @@ fn marking_one_space_read_leaves_the_other_spaces_badges_alone() {
         (four > 0 && five > 0 && dm > 0).then_some(())
     });
     assert_eq!(
-        world.ask(Request::MarkAllRead { network: Some(Network::Discord), space: Some(world.key("4000")) }),
+        world.ask(Request::MarkAllRead { network: Some(Network::Discord), space: Some(world.key("4000")), folder: None }),
         Response::Ok
     );
     assert_eq!(world.conversation("4101").unread, 0, "the space's channels are read");

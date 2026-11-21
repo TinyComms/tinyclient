@@ -1132,8 +1132,8 @@ impl Chat {
     /// Every badge goes. Discord hears one bulk ack per account; the other networks hear the
     /// read they already know. A message request is read here and not announced. `network`
     /// limits it to one network; `space` to one Space's conversations.
-    fn mark_all_read(&self, network: Option<Network>, space: Option<Key>) -> Response {
-        let marks = match self.hub.store().unread_marks(network, space.as_ref()) {
+    fn mark_all_read(&self, network: Option<Network>, space: Option<Key>, folder: Option<Key>) -> Response {
+        let marks = match self.hub.store().unread_marks(network, space.as_ref(), folder.as_ref()) {
             Ok(marks) => marks,
             Err(err) => return internal(err),
         };
@@ -3126,7 +3126,7 @@ impl Chat {
             Request::Resolve { url } => self.resolve_link(&url),
             Request::MarkRead { conversation, message_id } => self.mark_read(conversation, message_id),
             Request::MarkUnread { conversation, message_id } => self.mark_unread(conversation, message_id),
-            Request::MarkAllRead { network, space } => self.mark_all_read(network, space),
+            Request::MarkAllRead { network, space, folder } => self.mark_all_read(network, space, folder),
             Request::Forget { conversation } => self.forget_conversation(conversation),
             Request::Send { conversation, client_id, text, reply_to, with } => {
                 let began = std::time::Instant::now();
@@ -4310,7 +4310,7 @@ pub fn prove_offline_queue() -> Result<(), String> {
 /// reads the whole Inbox.
 pub fn prove_space_mark_all_read() -> Result<(), String> {
     match serde_json::from_value::<Request>(serde_json::json!({"op": "mark_all_read"})) {
-        Ok(Request::MarkAllRead { network: None, space: None }) => {}
+        Ok(Request::MarkAllRead { network: None, space: None, folder: None }) => {}
         _ => return Err("an older frame without a Space did not read".into()),
     }
     let mut store = Store::open(std::path::Path::new(":memory:")).map_err(|err| err.to_string())?;
@@ -4326,7 +4326,7 @@ pub fn prove_space_mark_all_read() -> Result<(), String> {
     store.ingest(&general, &Message::plain("8", "mara", "for this space", 10, false), true).map_err(|err| err.to_string())?;
     store.ingest(&elsewhere, &Message::plain("9", "mara", "for another", 20, false), true).map_err(|err| err.to_string())?;
     let chat = Arc::new(Chat::new(store));
-    let read = chat.handle(Request::MarkAllRead { network: Some(Network::Discord), space: Some(Key::new(&account, "4000")) });
+    let read = chat.handle(Request::MarkAllRead { network: Some(Network::Discord), space: Some(Key::new(&account, "4000")), folder: None });
     if !matches!(read, Response::Ok) {
         return Err(format!("the space-scoped read was refused: {read:?}"));
     }

@@ -1360,16 +1360,8 @@ impl Discord {
 
     /// Discord's "mark inbox read": one request, up to 50 channels. `reads` is `(channel, message)`.
     fn ack_bulk(&self, reads: &[(String, String)]) -> Result<(), Refused> {
-        for chunk in reads.chunks(50) {
-            let states: Vec<Value> = chunk
-                .iter()
-                .filter(|(_, message)| !message.is_empty())
-                .map(|(channel, message)| json!({"channel_id": channel, "message_id": message, "read_state_type": 0}))
-                .collect();
-            if states.is_empty() {
-                continue;
-            }
-            self.call("POST", "/read-states/ack-bulk", Some(json!({"read_states": states})))?;
+        for body in ack_bulk_payloads(reads) {
+            self.call("POST", "/read-states/ack-bulk", Some(body))?;
         }
         Ok(())
     }
@@ -1843,6 +1835,25 @@ fn answer<T>(reply: Reply<T>, outcome: Result<T, Refusal>) {
     let _ = reply.send(outcome);
 }
 
+/// Builds `POST /read-states/ack-bulk` request bodies in chunks of 50, skipping empty message ids.
+pub(super) fn ack_bulk_payloads(reads: &[(String, String)]) -> Vec<Value> {
+    let valid: Vec<(&str, &str)> = reads
+        .iter()
+        .filter(|(_, message)| !message.is_empty())
+        .map(|(channel, message)| (channel.as_str(), message.as_str()))
+        .collect();
+    valid
+        .chunks(50)
+        .map(|chunk| {
+            let states: Vec<Value> = chunk
+                .iter()
+                .map(|(channel, message)| json!({"channel_id": channel, "message_id": message, "read_state_type": 0}))
+                .collect();
+            json!({"read_states": states})
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1854,5 +1865,20 @@ mod tests {
         assert_eq!(found[0].account, "1000");
         // A token that does not start with an id still signs in.
         assert_eq!(accounts(r#"{"token":"opaque"}"#).unwrap()[0].account, "main");
+    }
+
+    #[test]
+    fn ack_bulk_payloads_chunk_at_50_and_skip_empty_message_ids() {
+        let mut reads: Vec<(String, String)> = (1..=55)
+            .map(|i| (format!("chan{i}"), format!("msg{i}")))
+            .collect();
+        reads.push(("empty_chan".into(), String::new()));
+        let payloads = ack_bulk_payloads(&reads);
+        assert_eq!(payloads.len(), 2, "55 valid reads split into chunks of 50 and 5");
+        assert_eq!(payloads[0]["read_states"].as_array().unwrap().len(), 50);
+        assert_eq!(payloads[1]["read_states"].as_array().unwrap().len(), 5);
+        assert_eq!(payloads[0]["read_states"][0]["channel_id"], "chan1");
+        assert_eq!(payloads[0]["read_states"][0]["message_id"], "msg1");
+        assert_eq!(payloads[0]["read_states"][0]["read_state_type"], 0);
     }
 }
