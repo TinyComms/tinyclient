@@ -270,6 +270,13 @@ fn giphy_gif(gif: &html::Image, media: &mut Vec<(MediaFile, String)>) -> Attachm
     }
 }
 
+/// Metadata remembered for our own messages so editing them preserves subject and inline images.
+#[derive(Debug, Clone, Default)]
+pub(super) struct OwnMeta {
+    pub subject: Option<String>,
+    pub images_html: String,
+}
+
 /// What one of Teams' message objects turned out to be.
 enum Read {
     Message(Box<Message>),
@@ -442,6 +449,17 @@ impl Teams {
         };
         // A channel post's headline is part of what it says.
         let subject = [&props["subject"], &props["title"]].into_iter().filter_map(Value::as_str).find(|subject| !subject.trim().is_empty());
+        if message.outgoing {
+            let subject_owned = subject.map(|s| s.trim().to_owned());
+            let images_html = html::inline_images_html(content, |url| self.pictures(url));
+            if subject_owned.is_some() || !images_html.is_empty() {
+                let mut state = self.state();
+                if state.own_meta.len() >= super::REMEMBERED {
+                    state.own_meta.clear();
+                }
+                state.own_meta.insert((conversation.to_owned(), id.clone()), OwnMeta { subject: subject_owned, images_html });
+            }
+        }
         if let Some(subject) = subject.map(str::trim) {
             let shift = (subject.len() + usize::from(!parsed.text.is_empty())) as u32;
             for span in &mut parsed.spans {
@@ -985,15 +1003,55 @@ impl Teams {
 
     pub(super) fn edit(&self, conversation: &str, id: &str, text: &str) -> Result<(), Fault> {
         let stored = self.ctx.stored_message(conversation, id)?;
-        let mut content = html::compose(text);
+        let meta = self.state().own_meta.get(&(conversation.to_owned(), id.to_owned())).cloned();
+        let (kept_subject, body_text) = match meta.as_ref().and_then(|meta| meta.subject.as_deref()) {
+            Some(subject) => {
+                let bold_line = format!("**{subject}**\n");
+                let plain_line = format!("{subject}\n");
+                let bold_only = format!("**{subject}**");
+                if let Some(rest) = text.strip_prefix(&bold_line) {
+                    (Some(subject.to_owned()), rest)
+                } else if let Some(rest) = text.strip_prefix(&plain_line) {
+                    (Some(subject.to_owned()), rest)
+                } else if text == bold_only || text == subject {
+                    (Some(subject.to_owned()), "")
+                } else {
+                    (Some(subject.to_owned()), text)
+                }
+            }
+            None => (None, text),
+        };
+        let (mut content, mentions) = html::compose_rich(body_text);
+        if let Some(images_html) = meta.as_ref().map(|meta| meta.images_html.as_str()).filter(|html| !html.is_empty()) {
+            content.push_str(images_html);
+        }
         // The quote above a reply is part of the body, so it is written again.
         if let Some(quote) = stored.as_ref().and_then(|stored| stored.reply_to.as_ref()).filter(|_| chain_of(conversation).is_none()) {
             content = format!("{}{content}", quote_markup(quote));
         }
-        let body = self.body(&now_ms().to_string(), &content);
+        let mut body = self.body(&now_ms().to_string(), &content);
+        if !mentions.is_empty() || kept_subject.is_some() {
+            let mut props = serde_json::Map::new();
+            if !mentions.is_empty() {
+                props.insert("mentions".to_owned(), Value::String(html::mentions_property(&mentions)));
+            }
+            if let Some(subject) = &kept_subject {
+                props.insert("subject".to_owned(), Value::String(subject.clone()));
+            }
+            body["properties"] = Value::Object(props);
+        }
         self.chat("PUT", &self.message_path(conversation, id), Body::Json(&body), false)?;
         if let Some(mut edited) = stored {
-            let (shown, spans) = html::styled(text);
+            let (mut shown, mut spans) = html::styled(body_text);
+            if let Some(subject) = &kept_subject {
+                let shift = (subject.len() + usize::from(!shown.is_empty())) as u32;
+                for span in &mut spans {
+                    span.start += shift;
+                    span.end += shift;
+                }
+                shown = if shown.is_empty() { subject.clone() } else { format!("{subject}\n{shown}") };
+                spans.insert(0, Span { start: 0, end: subject.len() as u32, style: Style::Bold });
+            }
             edited.text = shown;
             edited.spans = spans;
             edited.edited = true;

@@ -538,6 +538,30 @@ impl Builder<'_> {
     }
 }
 
+/// Extracts raw hosted `<img ...>` tags from a message's original HTML so editing the message
+/// does not drop inline pictures.
+pub(super) fn inline_images_html(html: &str, hosted: impl Fn(&str) -> bool) -> String {
+    let mut out = String::new();
+    let mut rest = html;
+    while let Some((token, after)) = next(rest) {
+        let consumed = rest.len() - after.len();
+        let slice = &rest[..consumed];
+        rest = after;
+        if let Token::Open { name, attrs, .. } = token {
+            if name == "img" {
+                let kind = attr(&attrs, "itemtype");
+                let src = attr(&attrs, "src");
+                if kind != EMOJI && kind != CUSTOM_EMOJI && kind != GIPHY && hosted(src) {
+                    out.push_str("<p>");
+                    out.push_str(slice);
+                    out.push_str("</p>");
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Reads a message body. `me` is our own id, to know a mention of us.
 pub(super) fn parse(html: &str, lookup: &dyn Lookup, me: &str) -> Parsed {
     let mut builder = Builder {
@@ -1126,6 +1150,7 @@ pub(super) fn compose_rich(text: &str) -> (String, Vec<OutMention>) {
 /// The text the user typed, as HTML Teams will show. Bold, italic, strike, code, quotes,
 /// lists and links become tags. Underline, headings, colour and tables have no markdown, so
 /// they stay as typed. Only http, https and mailto become links; everything else is escaped.
+#[cfg(test)]
 pub(super) fn compose(text: &str) -> String {
     compose_rich(text).0
 }

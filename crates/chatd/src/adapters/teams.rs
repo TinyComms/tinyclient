@@ -321,6 +321,8 @@ struct State {
     resync: bool,
     /// Out-of-office notes from presence, and until when: what a card says under "away".
     away: HashMap<String, (String, Option<i64>)>,
+    /// Subject and inline image HTML remembered for our own messages so edits keep them.
+    own_meta: HashMap<(String, String), message::OwnMeta>,
 }
 
 /// What a call presents.

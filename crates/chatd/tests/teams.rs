@@ -1584,3 +1584,59 @@ fn sending_a_mention_writes_the_span_and_properties_mentions() {
     assert!(found.contains(&("@Ana Ruiz", &Style::Mention { kind: MentionKind::User, id: ANA.into() })));
     assert!(found.contains(&("@General", &Style::Mention { kind: MentionKind::Everyone, id: GENERAL.into() })));
 }
+
+#[test]
+fn editing_a_message_preserves_formatting_mentions_images_and_subject() {
+    let world = World::start();
+    world.ready();
+    let general = key(GENERAL);
+    world.open(&general, 6);
+
+    let img_url = format!("{}/ams/v1/objects/0-weu-d1-editimg/views/imgo", world.fake.base);
+    let post_id = 1_760_000_800_800u64;
+    let mut post = message(
+        GENERAL,
+        Some(&post_id.to_string()),
+        post_id,
+        ME,
+        "Me Myself",
+        &format!(
+            "<p>Ship <b>today</b> with <span itemscope=\"\" itemtype=\"http://schema.skype.com/Mention\" itemid=\"0\">Ana Ruiz</span></p>\
+             <p><img src=\"{img_url}\" alt=\"chart\" itemtype=\"http://schema.skype.com/AMSImage\" width=\"400\" height=\"300\"></p>"
+        ),
+    );
+    post["properties"] = json!({
+        "subject": "Release plan",
+        "mentions": json!([{"@type": "http://schema.skype.com/Mention", "itemid": 0, "mri": ANA, "mentionType": "person", "displayName": "Ana Ruiz"}]).to_string(),
+    });
+    world.fake.push("NewMessage", post, false);
+    let stored = world.until("the outgoing post to arrive", || world.message(&general, &post_id.to_string()));
+    assert_eq!(stored.attachments.len(), 1);
+
+    let edit = Request::Edit {
+        conversation: general.clone(),
+        message_id: post_id.to_string(),
+        text: format!("**Release plan**\nShip **tomorrow** with <@{ANA}|Ana Ruiz>"),
+        spans: Vec::new(),
+    };
+    assert_eq!(world.ask(edit), Response::Ok);
+    let put = world.fake.calls("PUT", &format!("/chat/v1/users/ME/conversations/{GENERAL}/messages/{post_id}")).pop().expect("edit PUT");
+    let body = put.json();
+    let html = body["content"].as_str().unwrap_or("");
+    assert!(html.contains("<strong>tomorrow</strong>"), "bold stripped: {html}");
+    assert!(html.contains("itemtype=\"http://schema.skype.com/Mention\""), "mention markup stripped: {html}");
+    assert!(html.contains("0-weu-d1-editimg/views/imgo"), "inline image stripped: {html}");
+    assert!(!html.contains("Release plan"), "subject doubled in body: {html}");
+    assert_eq!(body["properties"]["subject"].as_str(), Some("Release plan"));
+    let mentions: Vec<Value> = serde_json::from_str(body["properties"]["mentions"].as_str().expect("properties.mentions")).unwrap();
+    assert_eq!(mentions.len(), 1);
+    assert_eq!((mentions[0]["mri"].as_str(), mentions[0]["displayName"].as_str()), (Some(ANA), Some("Ana Ruiz")));
+
+    let updated = world.message(&general, &post_id.to_string()).unwrap();
+    assert_eq!(updated.text, "Release plan\nShip tomorrow with @Ana Ruiz");
+    let found = ranges(&updated);
+    assert!(found.contains(&("Release plan", &Style::Bold)));
+    assert!(found.contains(&("tomorrow", &Style::Bold)));
+    assert!(found.contains(&("@Ana Ruiz", &Style::Mention { kind: MentionKind::User, id: ANA.into() })));
+    assert_eq!(updated.attachments.len(), 1);
+}
