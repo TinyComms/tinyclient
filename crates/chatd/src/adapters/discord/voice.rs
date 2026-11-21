@@ -175,6 +175,9 @@ pub struct Heard {
     name: String,
     muted: bool,
     deafened: bool,
+    server_muted: bool,
+    server_deafened: bool,
+    suppressed: bool,
     camera: bool,
     sharing: bool,
     /// On a stage's platform (`suppress` false there): who the channel hears. A voice
@@ -330,6 +333,9 @@ impl Discord {
                     speaking: false,
                     muted: heard.muted,
                     deafened: heard.deafened,
+                    server_muted: heard.server_muted,
+                    server_deafened: heard.server_deafened,
+                    suppressed: heard.suppressed,
                     camera: heard.camera,
                     sharing: heard.sharing,
                     ..Participant::default()
@@ -386,6 +392,9 @@ impl Discord {
                     name: heard.name.clone(),
                     muted: heard.muted,
                     deafened: heard.deafened,
+                    server_muted: heard.server_muted,
+                    server_deafened: heard.server_deafened,
+                    suppressed: heard.suppressed,
                     streaming: heard.sharing,
                     camera: heard.camera,
                     speaking: heard.live,
@@ -470,15 +479,19 @@ impl Discord {
                 let named = voice.member.as_ref().map(|member| member.name().to_owned()).filter(|name| !name.is_empty());
                 let named = named.or_else(|| state.users.get(&voice.user_id).cloned());
                 let me = (voice.user_id == state.me).then_some("You".to_owned());
+                let is_stage = stages.contains(channel.as_str());
                 let heard = Heard {
                     guild: voice.guild_id.clone().or_else(|| guild.map(str::to_owned)),
                     channel: channel.clone(),
                     name: named.or(before.map(|before| before.name)).or(me).unwrap_or_default(),
-                    muted: voice.self_mute || voice.mute,
-                    deafened: voice.self_deaf || voice.deaf,
+                    muted: voice.self_mute,
+                    deafened: voice.self_deaf,
+                    server_muted: voice.mute,
+                    server_deafened: voice.deaf,
+                    suppressed: !is_stage && voice.suppress,
                     camera: voice.self_video,
                     sharing: voice.self_stream,
-                    live: stages.contains(channel.as_str()) && !voice.suppress,
+                    live: is_stage && !voice.suppress,
                 };
                 changed.insert(channel.clone());
                 state.voice.states.insert(voice.user_id.clone(), heard);
@@ -574,6 +587,7 @@ impl Discord {
         enum Ours {
             Left(String),
             Moved { from: String, to: String },
+            Here(String),
             Same,
         }
         let ours = {
@@ -589,7 +603,7 @@ impl Discord {
                         call.session = voice.session_id.clone();
                         call.reported = false;
                     }
-                    Ours::Same
+                    Ours::Here(call.conversation.clone())
                 }
                 Follow::Moved(to) => {
                     let from = std::mem::replace(&mut call.conversation, to.clone());
@@ -615,8 +629,13 @@ impl Discord {
             Ours::Left(conversation) => self.ctx.call_failed(&conversation, CallFailure::Refused, REMOVED),
             Ours::Moved { from, to } => {
                 self.ctx.tiny_moved(&from, &to);
+                self.ctx.self_moderation(&to, voice.mute, voice.deaf, voice.suppress);
                 self.roster();
                 self.occupancy(BTreeSet::from([from, to]));
+                self.report();
+            }
+            Ours::Here(conversation) => {
+                self.ctx.self_moderation(&conversation, voice.mute, voice.deaf, voice.suppress);
                 self.report();
             }
             Ours::Same => self.report(),
@@ -1366,6 +1385,9 @@ mod tests {
             name: "Ada".into(),
             muted: false,
             deafened: false,
+            server_muted: false,
+            server_deafened: false,
+            suppressed: false,
             camera: true,
             sharing: false,
             live: false,

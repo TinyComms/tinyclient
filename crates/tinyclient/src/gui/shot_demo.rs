@@ -489,7 +489,7 @@ fn build() -> Fixture {
     campfire.occupants = Some(Occupants {
         people: ["yusuf", "ines"]
             .into_iter()
-            .map(|id| Occupant { person: Key::new(&d, id), name: who(id).map_or(id, |w| w.name).into(), muted: id == "ines", deafened: false, streaming: false, camera: false, speaking: id == "yusuf" })
+            .map(|id| Occupant { person: Key::new(&d, id), name: who(id).map_or(id, |w| w.name).into(), muted: id == "ines", deafened: false, server_muted: false, server_deafened: false, suppressed: false, streaming: false, camera: false, speaking: id == "yusuf" })
             .collect(),
         total: 2,
     });
@@ -953,6 +953,9 @@ fn demo_call(conversation: &protocol::Key) -> protocol::Call {
         participants: vec![protocol::Participant { id: LOOPBACK_ID.into(), name: "Camera loopback".into(), ..Default::default() }],
         muted: false,
         deafened: false,
+        server_muted: false,
+        server_deafened: false,
+        suppressed: false,
         joined: now(),
         input: String::new(),
         output: String::new(),

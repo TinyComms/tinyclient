@@ -1498,6 +1498,11 @@ impl Context {
         self.hub.calls.set_participants(&self.hub, &self.key(conversation_id), participants);
     }
 
+    /// Server-side moderation on our own voice state (server mute, server deafen, suppressed).
+    pub fn self_moderation(&self, conversation_id: &str, server_muted: bool, server_deafened: bool, suppressed: bool) {
+        self.hub.calls.set_self_moderation(&self.hub, &self.key(conversation_id), server_muted, server_deafened, suppressed);
+    }
+
     /// A Tiny server call: mediad's offer for this room, with mediad started for it first. A
     /// rejoin of the room the call is in keeps the call.
     pub fn tiny_offer(&self, conversation_id: &str, offer: protocol::TinyOffer) -> Result<String, String> {

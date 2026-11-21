@@ -4316,3 +4316,86 @@ fn source_fetches_raw_markdown_for_editing() {
         asked.iter().map(|r| &r.path).collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn server_mute_deafen_and_suppress_are_kept_apart_from_self_flags() {
+    let world = World::start();
+    let call = || match world.ask(Request::Status) {
+        Response::Status { call, .. } => call,
+        other => panic!("{other:?}"),
+    };
+    world.ask(Request::CallStart { conversation: world.key("4201") });
+    wait("the join", || world.discord.frames_of(4).pop());
+
+    // Someone else: server-muted (not self-muted), suppressed; another: self-muted only.
+    world.discord.push(
+        "VOICE_STATE_UPDATE",
+        json!({
+            "guild_id": "4000", "channel_id": "4201", "user_id": "2002", "session_id": "voice-dev",
+            "self_mute": false, "self_deaf": false, "mute": true, "deaf": true, "suppress": true,
+            "self_stream": false, "self_video": false
+        }),
+    );
+    world.discord.push(
+        "VOICE_STATE_UPDATE",
+        json!({
+            "guild_id": "4000", "channel_id": "4201", "user_id": "2006", "session_id": "voice-sam",
+            "self_mute": true, "self_deaf": false, "mute": false, "deaf": false, "suppress": false,
+            "self_stream": false, "self_video": false,
+            "member": {"user": {"id": "2006", "username": "sam", "global_name": "Sam Whitlock"}, "nick": null, "roles": []}
+        }),
+    );
+    // Us: server-muted by a moderator (not self-muted) and suppressed.
+    world.discord.push(
+        "VOICE_STATE_UPDATE",
+        json!({
+            "guild_id": "4000", "channel_id": "4201", "user_id": "1000", "session_id": "voice-me",
+            "self_mute": false, "self_deaf": false, "mute": true, "deaf": false, "suppress": true,
+            "self_stream": false, "self_video": false
+        }),
+    );
+
+    let active = wait("server mute flags on call and participants", || {
+        call().filter(|call| {
+            let dev = call.participants.iter().find(|p| p.id == "2002");
+            let sam = call.participants.iter().find(|p| p.id == "2006");
+            call.server_muted
+                && call.suppressed
+                && !call.server_deafened
+                && dev.is_some_and(|p| p.server_muted && p.server_deafened && p.suppressed && !p.muted && !p.deafened)
+                && sam.is_some_and(|p| p.muted && !p.server_muted && !p.server_deafened && !p.suppressed)
+        })
+    });
+    assert!(!active.muted, "self mute stays false when only server-muted");
+    assert!(active.server_muted && active.suppressed && !active.server_deafened);
+
+    // Occupants on the tree row also carry the split.
+    let (dev_occ, sam_occ) = wait("occupants carry server mute split", || {
+        match world.ask(Request::Tree { space: world.key("4000"), offset: 0, limit: 500, peek: true }) {
+            Response::Tree { conversations, .. } => {
+                let row = conversations.iter().find(|r| r.key.id == "4201")?;
+                let occ = row.occupants.as_ref()?;
+                let dev = occ.people.iter().find(|p| p.person.id == "2002")?;
+                let sam = occ.people.iter().find(|p| p.person.id == "2006")?;
+                (dev.server_muted && dev.server_deafened && dev.suppressed && !dev.muted && sam.muted && !sam.server_muted)
+                    .then(|| (dev.clone(), sam.clone()))
+            }
+            other => panic!("{other:?}"),
+        }
+    });
+    assert!(dev_occ.server_muted && dev_occ.server_deafened && dev_occ.suppressed && !dev_occ.muted);
+    assert!(sam_occ.muted && !sam_occ.server_muted && !sam_occ.suppressed);
+
+    // Moderator lifts the server mute and suppress on us.
+    world.discord.push(
+        "VOICE_STATE_UPDATE",
+        json!({
+            "guild_id": "4000", "channel_id": "4201", "user_id": "1000", "session_id": "voice-me",
+            "self_mute": false, "self_deaf": false, "mute": false, "deaf": false, "suppress": false,
+            "self_stream": false, "self_video": false
+        }),
+    );
+    wait("server mute cleared on call", || {
+        call().filter(|call| !call.server_muted && !call.suppressed && !call.server_deafened)
+    });
+}

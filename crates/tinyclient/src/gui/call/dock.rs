@@ -949,7 +949,18 @@ impl Shell {
         // Reconnecting keeps the joined controls, dead; only Leave is live.
         let enabled = call.state != CallState::Reconnecting;
         let menu = self.call_menu().filter(|_| enabled);
-        let off = call.muted || call.deafened;
+        let forced_mute = call.server_muted || call.suppressed;
+        let off = call.muted || call.deafened || forced_mute;
+        let mute_enabled = enabled && !forced_mute;
+        let mute_tip = if call.server_muted {
+            "Server muted"
+        } else if call.suppressed {
+            "Can't speak in this channel"
+        } else if off {
+            "Unmute"
+        } else {
+            "Mute"
+        };
 
         let mute = control(
             "call-mute",
@@ -959,14 +970,14 @@ impl Shell {
                 "icons/mic.svg"
             },
             if off { Look::Off } else { Look::Rest },
-            enabled,
+            mute_enabled,
         )
-        .when(enabled, |mute| {
-            mute.tooltip(tip(if off { "Unmute" } else { "Mute" }, Some("⌘⇧M")))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.call_mute(cx);
-                }))
+        .tooltip(tip(mute_tip, mute_enabled.then_some("⌘⇧M")))
+        .when(mute_enabled, |mute| {
+            mute.on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.call_mute(cx);
+            }))
         })
         // While I am heard: a 2 px ring inside the button, the same green as a speaker's.
         .when(call.speaking && !off && joined, |mute| {
@@ -981,26 +992,31 @@ impl Shell {
                     .border_color(theme::positive()),
             )
         });
+        let deafen_off = call.deafened || call.server_deafened;
+        let deafen_enabled = enabled && !call.server_deafened;
+        let deafen_tip = if call.server_deafened {
+            "Server deafened"
+        } else if call.deafened {
+            "Undeafen"
+        } else {
+            "Deafen"
+        };
         let deafen = control(
             "call-deafen",
-            if call.deafened {
+            if deafen_off {
                 "icons/headphone-off.svg"
             } else {
                 "icons/headphones.svg"
             },
-            if call.deafened { Look::Off } else { Look::Rest },
-            enabled,
+            if deafen_off { Look::Off } else { Look::Rest },
+            deafen_enabled,
         )
-        .when(enabled, |deafen| {
-            deafen
-                .tooltip(tip(
-                    if call.deafened { "Undeafen" } else { "Deafen" },
-                    Some("⌘⇧D"),
-                ))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.call_deafen(cx);
-                }))
+        .tooltip(tip(deafen_tip, deafen_enabled.then_some("⌘⇧D")))
+        .when(deafen_enabled, |deafen| {
+            deafen.on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.call_deafen(cx);
+            }))
         });
         let pictures = self.call_pictures(call);
         let share_on = encoding(call, Content::Share);
@@ -1314,6 +1330,9 @@ mod tests {
             participants: Vec::new(),
             muted: false,
             deafened: false,
+            server_muted: false,
+            server_deafened: false,
+            suppressed: false,
             joined,
             input: String::new(),
             output: String::new(),

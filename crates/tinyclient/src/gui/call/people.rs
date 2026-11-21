@@ -90,8 +90,17 @@ pub(super) fn stack(call: &Call) -> Div {
         })
 }
 
-/// The 13 px glyphs at the right of a person's row.
-fn status(muted: bool, deafened: bool, camera: bool, sharing: bool) -> Div {
+/// The 13 px glyphs at the right of a person's row: server-imposed moderation in `danger`
+/// (or `warning` for suppressed), distinct from self mute/deafen in `text_faint`.
+fn status(
+    muted: bool,
+    deafened: bool,
+    server_muted: bool,
+    server_deafened: bool,
+    suppressed: bool,
+    camera: bool,
+    sharing: bool,
+) -> Div {
     div()
         .flex_none()
         .flex()
@@ -99,8 +108,15 @@ fn status(muted: bool, deafened: bool, camera: bool, sharing: bool) -> Div {
         .gap(px(5.))
         .when(sharing, |status| status.child(glyph("icons/monitor-up.svg", 13., theme::text_soft())))
         .when(camera, |status| status.child(glyph("icons/video.svg", 13., theme::text_soft())))
-        .when(muted, |status| status.child(glyph("icons/mic-off.svg", 13., theme::text_faint())))
-        .when(deafened, |status| {
+        .when(server_muted, |status| status.child(glyph("icons/mic-off.svg", 13., theme::danger())))
+        .when(!server_muted && suppressed, |status| status.child(glyph("icons/mic-off.svg", 13., theme::warning())))
+        .when(!server_muted && !suppressed && muted && !deafened && !server_deafened, |status| {
+            status.child(glyph("icons/mic-off.svg", 13., theme::text_faint()))
+        })
+        .when(server_deafened, |status| {
+            status.child(glyph("icons/headphone-off.svg", 13., theme::danger()))
+        })
+        .when(!server_deafened && deafened, |status| {
             status.child(glyph("icons/headphone-off.svg", 13., theme::text_faint()))
         })
 }
@@ -153,15 +169,38 @@ fn row(sizes: &Sizes, avatar: Div, name: &str, you: bool, speaking: bool, glyphs
 fn rows(call: &Call, me: Option<&str>, sizes: &Sizes) -> Vec<Div> {
     let mine = me.filter(|name| !name.is_empty()).unwrap_or("You");
     let own = Avatar::named(mine, sizes.avatar).build();
-    let heard = call.speaking && !call.muted && !call.deafened;
+    let heard = call.speaking && !call.muted && !call.deafened && !call.server_muted && !call.suppressed;
     let my_camera = call.self_view.is_some()
         || call.video.iter().any(|v| v.direction == Direction::Encode && v.content == Content::Camera);
     let my_sharing = call.share_view.is_some()
         || call.video.iter().any(|v| v.direction == Direction::Encode && v.content == Content::Share);
-    let first = row(sizes, own, mine, true, heard, status(call.muted || call.deafened, call.deafened, my_camera, my_sharing));
+    let first = row(
+        sizes,
+        own,
+        mine,
+        true,
+        heard,
+        status(
+            call.muted || call.deafened,
+            call.deafened,
+            call.server_muted,
+            call.server_deafened,
+            call.suppressed,
+            my_camera,
+            my_sharing,
+        ),
+    );
     let others = roster(call).into_iter().map(|who| {
         let avatar = person(call, who, sizes.avatar);
-        row(sizes, avatar, &who.name, false, who.speaking, status(who.muted, who.deafened, who.camera, who.sharing))
+        let speaking = who.speaking && !who.server_muted && !who.suppressed;
+        row(
+            sizes,
+            avatar,
+            &who.name,
+            false,
+            speaking,
+            status(who.muted, who.deafened, who.server_muted, who.server_deafened, who.suppressed, who.camera, who.sharing),
+        )
     });
     std::iter::once(first).chain(others).collect()
 }

@@ -347,6 +347,14 @@ pub struct Occupant {
     pub muted: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub deafened: bool,
+    /// A moderator muted or deafened them on the server.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub server_muted: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub server_deafened: bool,
+    /// They may not speak in this voice channel.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub suppressed: bool,
     /// Sharing a screen.
     #[serde(default, skip_serializing_if = "is_false")]
     pub streaming: bool,

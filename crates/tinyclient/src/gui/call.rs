@@ -462,6 +462,9 @@ fn bare_call(conversation: Key, state: CallState, muted: bool, deafened: bool) -
         participants: Vec::new(),
         muted,
         deafened,
+        server_muted: false,
+        server_deafened: false,
+        suppressed: false,
         joined: 0,
         input: String::new(),
         output: String::new(),
@@ -1611,6 +1614,9 @@ impl Shell {
         if !matches!(call.state, CallState::RingingOut | CallState::Connecting | CallState::Joined) {
             return;
         }
+        if call.server_muted || call.suppressed {
+            return;
+        }
         let (muted, deafened) = (call.muted, call.deafened);
         if deafened {
             self.call_state.mute_before_deafen = None;
@@ -1625,7 +1631,7 @@ impl Shell {
         let Some(call) = self.call_now() else {
             return;
         };
-        if call.state != CallState::Joined {
+        if call.state != CallState::Joined || call.server_deafened {
             return;
         }
         let (muted, deafened) = (call.muted, call.deafened);
@@ -2108,6 +2114,9 @@ mod tests {
             name: (*name).to_owned(),
             muted: false,
             deafened: false,
+            server_muted: false,
+            server_deafened: false,
+            suppressed: false,
             streaming: false,
             camera: false,
             speaking: false,

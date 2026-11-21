@@ -37,20 +37,27 @@ impl Shell {
         let up = in_call(call);
         // Reconnecting keeps the controls, dead; only the way out works.
         let live = call.state != CallState::Reconnecting;
-        let off = call.muted || call.deafened;
+        let forced_mute = call.server_muted || call.suppressed;
+        let off = call.muted || call.deafened || forced_mute;
         let push = crate::gui::app::prefs::values().on(PUSH_TO_TALK);
-        let mute = if push && up && live {
+        let mute = if push && up && live && !forced_mute {
             round("call-phone-talk", "icons/hand.svg", "Hold to talk", if call.speaking { Look::On } else { Look::Rest }, SIZE)
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.call_ask(Request::CallTalk { held: true, priority: false }, cx)))
                 .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.call_ask(Request::CallTalk { held: false, priority: false }, cx)))
         } else {
-            let (look, word) = match (live, off) {
-                (false, _) => (Look::Unavailable, "Mute"),
-                (true, true) => (Look::Off, "Unmute"),
-                (true, false) => (Look::Rest, "Mute"),
+            let (look, word) = if call.server_muted {
+                (Look::Off, "Server muted")
+            } else if call.suppressed {
+                (Look::Off, "Can't speak")
+            } else {
+                match (live, off) {
+                    (false, _) => (Look::Unavailable, "Mute"),
+                    (true, true) => (Look::Off, "Unmute"),
+                    (true, false) => (Look::Rest, "Mute"),
+                }
             };
             round("call-phone-mute", if off { "icons/mic-off.svg" } else { "icons/mic.svg" }, word, look, SIZE)
-                .when(live, |mute| mute.on_click(cx.listener(|this, _, _, cx| this.call_mute(cx))))
+                .when(live && !forced_mute, |mute| mute.on_click(cx.listener(|this, _, _, cx| this.call_mute(cx))))
         };
         let route = self.call_phone_route(call);
         let routes = hooks::routes();
@@ -81,18 +88,29 @@ impl Shell {
             _ => "Leave",
         };
         let end = round("call-phone-end", "icons/phone-off.svg", end_word, Look::End, SIZE).on_click(cx.listener(|this, _, _, cx| this.call_leave(cx)));
+        let deafen_off = call.deafened || call.server_deafened;
         let deafen = round(
             "call-phone-deafen",
-            if call.deafened { "icons/headphone-off.svg" } else { "icons/headphones.svg" },
-            if call.deafened { "Undeafen" } else { "Deafen" },
-            match (live, call.deafened) {
-                (false, _) => Look::Unavailable,
-                (true, true) => Look::Off,
-                (true, false) => Look::Rest,
+            if deafen_off { "icons/headphone-off.svg" } else { "icons/headphones.svg" },
+            if call.server_deafened {
+                "Server deafened"
+            } else if call.deafened {
+                "Undeafen"
+            } else {
+                "Deafen"
+            },
+            if call.server_deafened {
+                Look::Off
+            } else {
+                match (live, call.deafened) {
+                    (false, _) => Look::Unavailable,
+                    (true, true) => Look::Off,
+                    (true, false) => Look::Rest,
+                }
             },
             SIZE,
         )
-        .when(live, |button| button.on_click(cx.listener(|this, _, _, cx| this.call_deafen(cx))));
+        .when(live && !call.server_deafened, |button| button.on_click(cx.listener(|this, _, _, cx| this.call_deafen(cx))));
         let more = round("call-phone-more", "icons/ellipsis.svg", "More", if live { Look::Rest } else { Look::Unavailable }, SIZE)
             .when(live, |button| button.on_click(cx.listener(|this, _, _, cx| this.call_phone_open_sheet(Sheet::More, cx))));
 
