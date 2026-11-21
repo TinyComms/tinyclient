@@ -3331,6 +3331,9 @@ impl Composer {
                 if controls.silent && !presets.is_empty() {
                     items = items.child(menu_separator());
                 }
+                if self.target.as_ref().is_some_and(|t| t.key.network == Network::Messages) {
+                    items = items.child(menu_label("Sends while this computer is on and your phone is reachable."));
+                }
                 for (index, moment) in presets.into_iter().enumerate() {
                     let at = moment.at;
                     items = items.child(menu_item(schedule::preset_id(index), Some("icons/calendar.svg"), moment.label, None).on_click(

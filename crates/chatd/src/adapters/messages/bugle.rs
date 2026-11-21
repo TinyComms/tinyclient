@@ -1151,9 +1151,9 @@ fn decode_thumbnails(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
 
 /// Unix seconds from a Bugle timestamp, which arrives in microseconds.
 fn unix_seconds(raw: i64) -> i64 {
-    if raw > 10_000_000_000_000_000 {
+    if raw > 1_000_000_000_000_000 {
         raw / 1_000_000
-    } else if raw > 10_000_000_000_000 {
+    } else if raw > 1_000_000_000_000 {
         raw / 1_000
     } else {
         raw
@@ -1336,6 +1336,8 @@ pub struct Note {
     pub edited_at: Option<i64>,
     /// `Message.isStarred`, field 24.
     pub starred: bool,
+    /// True when the phone reports this message as scheduled (`status == 16`).
+    pub scheduled: bool,
 }
 
 /// What the other side did with one of my messages, as far as the phone knows.
@@ -3094,7 +3096,11 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
             continue;
         }
         let wire = field_int(&msg, 11);
-        let sent = unix_seconds(field_int(&msg, 5) as i64);
+        let mut sent = unix_seconds(field_int(&msg, 5) as i64);
+        let scheduled = status == 16;
+        if scheduled && sent == 0 {
+            sent = unix_seconds(field_int(&msg, 26) as i64);
+        }
         let mut author = field_text(&msg, 9);
         let mut name = String::new();
         let mut outgoing = false;
@@ -3192,6 +3198,7 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
             edited,
             edited_at,
             starred,
+            scheduled,
         });
     }
     notes
@@ -4146,5 +4153,28 @@ mod tests {
         );
         assert_eq!(notes[0].reactions[1].emoji, "🖼️");
         assert!(notes[0].reactions[1].media.is_none());
+    }
+
+    #[test]
+    fn phone_scheduled_message_decodes_as_scheduled_pending() {
+        let mut status = Buf::new();
+        status.int(2, 16); // OUTGOING_SCHEDULED
+        let mut words = Buf::new();
+        words.text(1, "Happy birthday!");
+        let mut info = Buf::new();
+        info.msg(2, &words.0);
+        let mut msg = Buf::new();
+        msg.text(1, "m-sched-phone");
+        msg.text(7, "c1");
+        msg.msg(4, &status.0);
+        msg.msg(10, &info.0);
+        msg.int(26, 1_800_000_000_000_000);
+        let mut wrap = Buf::new();
+        wrap.msg(1, &msg.0);
+        let notes = decode_messages(&wrap.0);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].scheduled);
+        assert_eq!(notes[0].sent, 1_800_000_000);
+        assert_eq!(progress(notes[0].status), Progress::Pending);
     }
 }

@@ -2343,3 +2343,144 @@ fn gif_file_capability_mms_gif_warning_and_photomoji_custom_reactions() {
             .find(|m| m.kind == MessageKind::System && m.text.contains("Large GIFs"))
     });
 }
+
+#[test]
+fn scheduled_send_waits_until_clock_reaches_time_supports_cancel_and_reports_missed() {
+    let world = World::linked();
+    world.connected();
+
+    // 1. Account advertises schedule capability.
+    let status = world
+        .status()
+        .0
+        .into_iter()
+        .find(|a| a.key == account())
+        .expect("Messages account status");
+    assert!(status.can.schedule, "Messages must advertise schedule");
+
+    // 2. Set controlled clock to T0 = 1_800_000_000 (09:00 UTC on a fixed day -> 2027-01-15 08:00:00 UTC).
+    //    Use 1_800_003_600 = exact 09:00 UTC so HH:MM is 09:00.
+    let t0: i64 = 1_800_000_000;
+    let t_due: i64 = t0 + 300;
+    let t_cancel: i64 = t0 + 600;
+    let t_missed: i64 = 1_800_003_600; // 09:00 UTC
+    world.steer(&format!("clock {t0}"));
+    world.heard(&format!("clock {t0}"));
+
+    // 3. Schedule a text for t_due: shown as pending/waiting before t_due and NOT sent yet.
+    let _ = world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "c-sched-1".into(),
+        text: "Good morning!".into(),
+        reply_to: None,
+        with: Outgoing {
+            schedule: Some(t_due),
+            ..Outgoing::default()
+        },
+    });
+    let pending = world.until("scheduled message pending", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "c-sched-1" && m.state == SendState::Pending && m.waiting)
+    });
+    assert_eq!(pending.sent, t_due);
+    assert!(
+        !world.calls().iter().any(|c| c.contains("Good morning!")),
+        "scheduled message must not be sent before T"
+    );
+
+    // 4. Schedule a second message and cancel it before its time.
+    let _ = world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "c-sched-cancel".into(),
+        text: "Never mind".into(),
+        reply_to: None,
+        with: Outgoing {
+            schedule: Some(t_cancel),
+            ..Outgoing::default()
+        },
+    });
+    world.until("cancel target pending", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "c-sched-cancel" && m.state == SendState::Pending)
+    });
+    assert_eq!(
+        world.ask(Request::CancelSend {
+            conversation: key(GRACE),
+            client_id: "c-sched-cancel".into(),
+        }),
+        Response::Ok
+    );
+    world.until("cancelled schedule failed", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "c-sched-cancel" && matches!(m.state, SendState::Failed { .. }))
+    });
+
+    // 5. Schedule a third message for 09:00 UTC (t_missed) to verify missed-while-off reporting.
+    let _ = world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "c-sched-missed".into(),
+        text: "Missed reminder".into(),
+        reply_to: None,
+        with: Outgoing {
+            schedule: Some(t_missed),
+            ..Outgoing::default()
+        },
+    });
+    world.until("missed target pending", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "c-sched-missed" && m.state == SendState::Pending)
+    });
+
+    // 6. Advance clock to t_due: first message sends!
+    world.steer(&format!("clock {t_due}"));
+    world.heard(&format!("send {GRACE} Good morning!"));
+    world.until("scheduled message sent", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "c-sched-1" && m.state == SendState::Sent)
+    });
+
+    // 7. Jump clock far past t_missed (simulating computer sleep): must NOT send, must report off at 09:00.
+    let t_late = t_missed + 600;
+    world.steer(&format!("clock {t_late}"));
+    let missed = world.until("missed schedule failed", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "c-sched-missed" && matches!(m.state, SendState::Failed { .. }))
+    });
+    match missed.state {
+        SendState::Failed { reason } => {
+            assert_eq!(reason, "Not sent: this computer was off at 09:00");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert!(
+        !world.calls().iter().any(|c| c.contains("Missed reminder")),
+        "missed scheduled message must not be silently sent late"
+    );
+    assert!(
+        !world.calls().iter().any(|c| c.contains("Never mind")),
+        "cancelled scheduled message must never be sent"
+    );
+
+    // 8. Phone-created scheduled message (status 16) shows as pending/waiting in the conversation.
+    world.steer(&format!("phone-scheduled grace {} From phone", t_late + 3600));
+    let from_phone = world.until("phone scheduled shown", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == "m-phone-sched")
+    });
+    assert_eq!(from_phone.state, SendState::Pending);
+    assert!(from_phone.waiting);
+}

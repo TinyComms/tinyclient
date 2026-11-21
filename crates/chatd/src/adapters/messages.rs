@@ -508,6 +508,34 @@ struct Held {
     name: String,
 }
 
+/// A locally scheduled text held by chatd until `at` (unix seconds).
+struct ScheduledSend {
+    conversation: String,
+    client_id: String,
+    text: String,
+    reply: Option<String>,
+    at: i64,
+}
+
+/// Grace window past a scheduled time before assuming the computer was asleep / off.
+const SCHEDULE_MISSED_GRACE: i64 = 120;
+
+fn clock_now() -> i64 {
+    if scripted() {
+        if let Some(t) = fake::clock() {
+            return t;
+        }
+    }
+    crate::hub::now()
+}
+
+fn format_hhmm(unix_secs: i64) -> String {
+    let secs_in_day = unix_secs.rem_euclid(86_400);
+    let hour = secs_in_day / 3_600;
+    let minute = (secs_in_day % 3_600) / 60;
+    format!("{hour:02}:{minute:02}")
+}
+
 /// A text this computer has not asked the phone to send yet. Kept only for this connection.
 struct WaitingSend {
     conversation: String,
@@ -581,6 +609,8 @@ struct Account {
     /// Phone contacts cached for this session.
     contacts: Mutex<Vec<bugle::ContactEntry>>,
     contacts_loaded: std::sync::atomic::AtomicBool,
+    /// Locally scheduled texts waiting for their send time while chatd runs.
+    scheduled: Mutex<Vec<ScheduledSend>>,
 }
 
 pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<(), String> {
@@ -669,11 +699,13 @@ fn connect(
         newest: Mutex::default(),
         contacts: Mutex::default(),
         contacts_loaded: std::sync::atomic::AtomicBool::new(false),
+        scheduled: Mutex::default(),
     });
     ctx.capabilities(Capabilities {
         max_file_bytes: bugle::FILE_CAP,
         max_files: file_limit(),
         gif_file: true,
+        schedule: true,
         voice_notes: true,
         edit: true,
         edit_window: bugle::EDIT_WINDOW_SECS,
@@ -698,6 +730,29 @@ fn connect(
         return Failure::Dropped("stopped".to_owned());
     }
     ctx.link(protocol::Link::Connected);
+    let sched_account = Arc::downgrade(&account);
+    let _ = std::thread::Builder::new()
+        .name("messages-schedule".into())
+        .spawn(move || {
+            while let Some(acc) = sched_account.upgrade() {
+                if acc.ctx.stopped() {
+                    break;
+                }
+                let due = {
+                    let now = clock_now();
+                    acc.scheduled
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .iter()
+                        .any(|item| now >= item.at)
+                };
+                if due {
+                    let _ = acc.ctx.commands.send(Command::OpenHome);
+                }
+                drop(acc);
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        });
     let ended = loop {
         match events.recv() {
             Ok(Event::Ready) => {
@@ -1139,6 +1194,9 @@ fn show(account: &Account, note: &bugle::Note, page: &[bugle::Note]) {
     let mut shown = message(account, note, page);
     if note.outgoing || note.author == account.me {
         shown.state = state_of(note);
+        if note.scheduled {
+            shown.waiting = true;
+        }
         if let Some(client_id) = claim(account, note) {
             if shown.attachments.is_empty() || shown.text.is_empty() || shown.reply_to.is_none() {
                 if let Ok(Some(had)) = account.ctx.stored_message(&note.conversation, &client_id) {
@@ -2010,7 +2068,11 @@ fn serve(account: &Arc<Account>, command: Command) {
             client_id,
             text,
             reply_to,
-        } => post_text(account, &conversation_id, &client_id, text, reply_to),
+        } => {
+            // If this client_id was scheduled locally, treat a direct Send as "send now".
+            let _ = take_scheduled(account, &conversation_id, &client_id);
+            post_text(account, &conversation_id, &client_id, text, reply_to);
+        }
         Command::SendWith {
             conversation_id,
             client_id,
@@ -2018,7 +2080,17 @@ fn serve(account: &Arc<Account>, command: Command) {
             reply_to,
             with,
         } => {
-            if with.files.is_empty() {
+            if let Some(at) = with.schedule {
+                if !with.files.is_empty() {
+                    ctx.sent(
+                        &conversation_id,
+                        &client_id,
+                        Err("Messages schedules text only, not files.".into()),
+                    );
+                } else {
+                    schedule_text(account, &conversation_id, &client_id, text, reply_to, at);
+                }
+            } else if with.files.is_empty() {
                 post_text(account, &conversation_id, &client_id, text, reply_to);
             } else {
                 warn_mms(account, &conversation_id, &client_id, &with.files);
@@ -2053,7 +2125,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             client_id,
         } => {
             upload::cancel(&ctx.account, &client_id);
-            let mut queued = false;
+            let mut queued = take_scheduled(account, &conversation_id, &client_id).is_some();
             phone(account).queue.retain(|held| {
                 let drop = held.conversation == conversation_id && held.client_id == client_id;
                 queued |= drop;
@@ -2124,6 +2196,11 @@ fn serve(account: &Arc<Account>, command: Command) {
             scope,
             reply,
         } => {
+            if take_scheduled(account, &conversation_id, &message_id).is_some() {
+                let _ = ctx.deleted(&conversation_id, &message_id);
+                let _ = reply.send(Ok(()));
+                return;
+            }
             let answer = if scope == protocol::DeleteScope::Everyone {
                 Err(Refusal::Refused("Google Messages can only delete messages for you.".to_owned()))
             } else {
@@ -3165,7 +3242,99 @@ fn retry_due(account: &Account, due: Due) -> bool {
     phone(account).down
 }
 
+fn schedule_text(
+    account: &Account,
+    conversation: &str,
+    client_id: &str,
+    text: String,
+    reply: Option<String>,
+    at: i64,
+) {
+    let now = clock_now();
+    if at <= now {
+        account
+            .ctx
+            .sent(conversation, client_id, Err("That time has passed.".into()));
+        return;
+    }
+    let reply = carried_reply(account, conversation, reply);
+    let mut pending = outgoing(account, client_id.to_owned(), text.clone());
+    pending.sent = at;
+    pending.state = SendState::Pending;
+    pending.waiting = true;
+    pending.client_id = Some(client_id.to_owned());
+    if let Some(id) = reply.as_deref() {
+        pending.reply_to = Some(quoted(account, conversation, id, &[]));
+    }
+    let _ = account.ctx.message(conversation, &pending);
+    let mut sched = account
+        .scheduled
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    sched.retain(|item| item.conversation != conversation || item.client_id != client_id);
+    sched.push(ScheduledSend {
+        conversation: conversation.to_owned(),
+        client_id: client_id.to_owned(),
+        text,
+        reply,
+        at,
+    });
+}
+
+fn take_scheduled(account: &Account, conversation: &str, client_id: &str) -> Option<ScheduledSend> {
+    let mut sched = account
+        .scheduled
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let pos = sched
+        .iter()
+        .position(|item| item.conversation == conversation && item.client_id == client_id)?;
+    Some(sched.remove(pos))
+}
+
+fn drain_scheduled(account: &Account) {
+    let now = clock_now();
+    let due: Vec<ScheduledSend> = {
+        let mut sched = account
+            .scheduled
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut ready = Vec::new();
+        let mut i = 0;
+        while i < sched.len() {
+            if now >= sched[i].at {
+                ready.push(sched.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        ready
+    };
+    for item in due {
+        if now - item.at > SCHEDULE_MISSED_GRACE {
+            let hhmm = format_hhmm(item.at);
+            account.ctx.sent(
+                &item.conversation,
+                &item.client_id,
+                Err(format!("Not sent: this computer was off at {hhmm}")),
+            );
+            continue;
+        }
+        post(
+            account,
+            WaitingSend {
+                conversation: item.conversation,
+                client_id: item.client_id,
+                text: item.text,
+                since: now,
+                reply: item.reply,
+            },
+        );
+    }
+}
+
 fn catch_up(account: &Arc<Account>) {
+    drain_scheduled(account);
     loop {
         let next = {
             let mut phone = phone(account);

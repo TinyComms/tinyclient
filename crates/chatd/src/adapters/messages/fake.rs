@@ -40,6 +40,13 @@ struct SentCopy {
     phone_id: String,
 }
 
+static FAKE_CLOCK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+pub(super) fn clock() -> Option<i64> {
+    let t = FAKE_CLOCK.load(Ordering::Acquire);
+    (t > 0).then_some(t)
+}
+
 pub(super) fn record(line: &str) {
     let path = protocol::support_dir().join("messages.calls");
     if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -231,6 +238,14 @@ impl Fake {
                         }
                         return true;
                     }
+        if let Some(secs) = line.strip_prefix("clock ") {
+                        if let Ok(t) = secs.trim().parse::<i64>() {
+                            FAKE_CLOCK.store(t, Ordering::Release);
+                            record(&format!("clock {t}"));
+                            let _ = events.send(Event::PhoneBack);
+                        }
+                        return true;
+                    }
                     if line == "hold" {
                         hold.store(true, Ordering::Release);
                         record("hold");
@@ -344,6 +359,7 @@ fn note(
         edited: false,
         edited_at: None,
         starred: false,
+        scheduled: false,
     }
 }
 
@@ -630,6 +646,19 @@ fn steer(line: &str) -> Vec<Event> {
             updated.edited = true;
             updated.edited_at = Some(crate::hub::now());
             vec![Event::Message(updated)]
+        }
+        "phone-scheduled" => {
+            let Some((author, _)) = who(words.next().unwrap_or("")) else {
+                return Vec::new();
+            };
+            let at: i64 = words.next().and_then(|s| s.parse().ok()).unwrap_or(1_800_000_000);
+            let text = rest(3);
+            let mut msg = note(ME, "Ada Quill", author, "m-phone-sched", &text, false, Vec::new(), Vec::new());
+            msg.outgoing = true;
+            msg.status = 16;
+            msg.sent = at;
+            msg.scheduled = true;
+            vec![Event::Message(msg)]
         }
         "starred" => {
             let Some((author, name)) = who(words.next().unwrap_or("")) else {
