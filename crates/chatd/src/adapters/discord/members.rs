@@ -60,7 +60,7 @@ struct Subscription {
     people: Vec<String>,
 }
 
-enum Entry {
+pub(super) enum Entry {
     /// A section header; it takes a row of Discord's list.
     Header,
     Member(Box<Person>),
@@ -68,11 +68,11 @@ enum Entry {
 
 /// The visible part of the open channel's member list, kept current by Discord's own updates
 /// and dropped when the channel closes.
-struct Roster {
-    channel: String,
+pub(super) struct Roster {
+    pub(super) channel: String,
     /// Sections in order: role id (or `online` / `offline`) and how many people it holds.
     groups: Vec<(String, u32)>,
-    rows: BTreeMap<u32, Entry>,
+    pub(super) rows: BTreeMap<u32, Entry>,
 }
 
 #[derive(Default)]
@@ -84,7 +84,7 @@ pub struct Watched {
     ranges: Vec<(u32, u32)>,
     people: Vec<String>,
     sent: Option<Subscription>,
-    roster: Option<Roster>,
+    pub(super) roster: Option<Roster>,
     /// The shell's screen as last acted on, so a heartbeat that finds it unchanged does nothing.
     seen: Arc<Watching>,
     /// When the shell last asked for the Space's tree.
@@ -482,11 +482,16 @@ impl Discord {
     pub(super) fn member_list(&self, update: ListUpdate) {
         let mut files = Vec::new();
         let mut seen = Vec::new();
+        let mut member_roles: Vec<(String, Vec<u64>)> = Vec::new();
         let shown;
         let changed;
-        let mut entry = |item: &ListItem| match item.member.as_ref().and_then(|member| self.person(member, &mut files)) {
-            Some((person, presence, status)) => {
+        let mut entry = |item: &ListItem| match item.member.as_ref().and_then(|member| {
+            let roles: Vec<u64> = member.roles.iter().map(|r| super::model::number(r)).collect();
+            self.person(member, &mut files).map(|res| (res, roles))
+        }) {
+            Some(((person, presence, status), roles)) => {
                 seen.push((person.key.id.clone(), presence, status));
+                member_roles.push((person.key.id.clone(), roles));
                 Entry::Member(Box::new(person))
             }
             None => Entry::Header,
@@ -553,9 +558,26 @@ impl Discord {
                 let ranges = &watched.ranges;
                 roster.rows.retain(|row, _| ranges.iter().any(|(from, to)| row >= from && row <= to));
             }
+            if let Some(info) = state.guilds.get_mut(&update.guild_id) {
+                for (uid, roles) in member_roles {
+                    info.set_member_roles(&uid, roles);
+                }
+            }
+            let guild_info = state.guilds.get(&update.guild_id);
             for entry in roster.rows.values_mut() {
                 if let Entry::Member(person) = entry {
                     person.relation = state.relations.get(&person.key.id).copied().unwrap_or_default();
+                    if let Some(info) = guild_info {
+                        let (color, icon, emoji) = info.member_role_style(&person.key.id);
+                        person.role_color = color;
+                        person.role_emoji = emoji;
+                        if let Some((file, url)) = icon {
+                            person.role_icon = Some(file.clone());
+                            files.push((file, url));
+                        } else {
+                            person.role_icon = None;
+                        }
+                    }
                 }
             }
         }

@@ -638,8 +638,9 @@ impl Discord {
     fn tick(&self) -> bool {
         let voice = self.voice_tick();
         let search = self.search_tick();
+        let collapse = self.collapse_tick();
         self.unmute_tick();
-        voice || search
+        voice || search || collapse
     }
 }
 

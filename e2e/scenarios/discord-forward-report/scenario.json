@@ -1,0 +1,8 @@
+{
+  "id": "discord-forward-report",
+  "title": "A Discord forward keeps every snapshot, and a message report uses one menu path",
+  "platforms": ["windows", "macos", "linux", "android", "ios"],
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
