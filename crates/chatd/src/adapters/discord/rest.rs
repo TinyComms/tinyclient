@@ -398,6 +398,91 @@ impl Rest {
         self.call_inner(method, path, body, extra, false, false)
     }
 
+    /// One-shot `POST` with a `multipart/form-data` body (e.g. guild sticker uploads).
+    /// Never retries on HTTP 429 so rate-limit wait times surface directly to the user.
+    pub fn call_multipart_once(&self, path: &str, boundary: &str, body: &[u8]) -> Result<String, Refused> {
+        if self.challenged.load(Ordering::Relaxed) {
+            return Err(Refused::Challenge);
+        }
+        if self.expired.load(Ordering::Relaxed) {
+            return Err(Refused::Expired);
+        }
+        if let Some(left) = self.paused() {
+            return Err(Refused::Paused(left));
+        }
+        let url = format!("{}{path}", address("TINYCLIENT_DISCORD_API", API));
+        let route = route("POST", path);
+        self.pace(&route)?;
+        let identity = self.identity();
+        let agent = self.agent.get_or_init(agent);
+        let mut request = agent
+            .post(&url)
+            .header("Authorization", &self.token)
+            .header("User-Agent", &identity.user_agent)
+            .header("X-Super-Properties", &identity.super_properties)
+            .header("X-Discord-Locale", "en-US")
+            .header("Accept", "*/*")
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Origin", "https://discord.com")
+            .header("Referer", "https://discord.com/channels/@me")
+            .header("Content-Type", &format!("multipart/form-data; boundary={boundary}"));
+        if let Some(zone) = &identity.timezone {
+            request = request.header("X-Discord-Timezone", zone);
+        }
+        let mut response = request.send(body).map_err(|err| Refused::Network(err.to_string()))?;
+        let headers = response.headers().clone();
+        let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok()).map(str::to_owned);
+        let remaining = header("x-ratelimit-remaining").and_then(|value| value.parse::<u32>().ok());
+        let reset = header("x-ratelimit-reset-after").as_deref().and_then(seconds_of);
+        if let (Some(remaining), Some(reset)) = (remaining, reset) {
+            let window = Window {
+                remaining,
+                resets: Instant::now() + Duration::from_secs_f64(reset.clamp(0., 3600.)),
+            };
+            crate::hub::lock(&self.windows).insert(route.clone(), window);
+        }
+        let status = response.status().as_u16();
+        let text = response.body_mut().read_to_string().unwrap_or_default();
+        if (200..300).contains(&status) {
+            return Ok(text);
+        }
+        let problem: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        let code = problem["code"].as_u64().unwrap_or(0);
+        let retry_after = problem["retry_after"].as_f64();
+        if problem.get("captcha_key").is_some() || problem.get("captcha_sitekey").is_some() {
+            return Err(Refused::Challenge);
+        }
+        match status {
+            401 => {
+                self.expired.store(true, Ordering::Relaxed);
+                Err(Refused::Expired)
+            }
+            429 if code != 20016 => {
+                let limit = limit(&problem, header);
+                if !limit.shared {
+                    self.refused();
+                }
+                let until = Instant::now() + Duration::from_secs_f64(limit.wait.min(3600.));
+                if limit.global {
+                    *crate::hub::lock(&self.everything_waits) = Some(until);
+                }
+                crate::hub::lock(&self.windows).insert(route, Window { remaining: 0, resets: until });
+                Err(Refused::Limited(limit.wait))
+            }
+            _ => {
+                if status == 403 {
+                    self.refused();
+                }
+                Err(Refused::Status {
+                    status,
+                    code,
+                    message: problem["message"].as_str().unwrap_or("").to_owned(),
+                    retry_after,
+                })
+            }
+        }
+    }
+
     fn call_inner(
         &self,
         method: &str,

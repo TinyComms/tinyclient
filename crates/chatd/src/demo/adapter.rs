@@ -1039,6 +1039,16 @@ impl Demo {
             Command::DeleteWebhook { reply, .. } | Command::RemoveIntegration { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
+            Command::SpaceExpressions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateEmoji { reply, .. } | Command::EditEmoji { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::CreateSticker { reply, .. } | Command::EditSticker { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::DeleteEmoji { reply, .. } | Command::DeleteSticker { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CancelScheduled { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

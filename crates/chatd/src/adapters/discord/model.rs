@@ -54,6 +54,8 @@ pub const MOVE_MEMBERS: u64 = 1 << 24;
 pub const USE_VAD: u64 = 1 << 25;
 pub const MANAGE_ROLES: u64 = 1 << 28;
 pub const MANAGE_WEBHOOKS: u64 = 1 << 29;
+pub const MANAGE_GUILD_EXPRESSIONS: u64 = 1 << 30;
+pub const CREATE_GUILD_EXPRESSIONS: u64 = 1 << 43;
 pub const PIN_MESSAGES: u64 = 1 << 51;
 
 /// Validates a Discord snowflake id before interpolating it into an API path.

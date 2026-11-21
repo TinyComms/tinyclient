@@ -3268,6 +3268,104 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::SpaceExpressions { space } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::SpaceExpressions { space_id: space.id.clone(), reply }) {
+                    Ok(expressions) => Response::SpaceExpressions { space, expressions: Box::new(expressions) },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::CreateEmoji { space, name, path } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::CreateEmoji { space_id: space.id.clone(), name, path, reply }) {
+                    Ok(emoji) => Response::SpaceEmoji { emoji: Box::new(emoji) },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::EditEmoji { space, emoji_id, name, roles } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::EditEmoji {
+                    space_id: space.id.clone(),
+                    emoji_id,
+                    name,
+                    roles,
+                    reply,
+                }) {
+                    Ok(emoji) => Response::SpaceEmoji { emoji: Box::new(emoji) },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::DeleteEmoji { space, emoji_id } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::DeleteEmoji {
+                    space_id: space.id.clone(),
+                    emoji_id,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::CreateSticker { space, name, tags, description, path } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::CreateSticker {
+                    space_id: space.id.clone(),
+                    name,
+                    tags,
+                    description,
+                    path,
+                    reply,
+                }) {
+                    Ok(sticker) => Response::SpaceSticker { sticker: Box::new(sticker) },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::EditSticker { space, sticker_id, name, tags, description } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::EditSticker {
+                    space_id: space.id.clone(),
+                    sticker_id,
+                    name,
+                    tags,
+                    description,
+                    reply,
+                }) {
+                    Ok(sticker) => Response::SpaceSticker { sticker: Box::new(sticker) },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::DeleteSticker { space, sticker_id } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::DeleteSticker {
+                    space_id: space.id.clone(),
+                    sticker_id,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::CloseDirect { conversation } => {
                 self.act(&conversation, |conversation_id, reply| Command::CloseDirect { conversation_id, reply })
             }

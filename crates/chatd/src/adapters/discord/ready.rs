@@ -5,8 +5,8 @@ use super::super::{Command, Failure};
 use super::model::{
     self, number, seconds, Channel, Guild, GuildSettings, Kept, Member, MuteConfig, PresenceUpdate,
     ReadState, Relationship, Role, User, Versioned, VoiceState, ADMINISTRATOR, BAN_MEMBERS, CONNECT,
-    KICK_MEMBERS, MANAGE_GUILD, MANAGE_MESSAGES, MANAGE_ROLES, MANAGE_WEBHOOKS, PIN_MESSAGES,
-    SEND_MESSAGES, VIEW_CHANNEL,
+    CREATE_GUILD_EXPRESSIONS, KICK_MEMBERS, MANAGE_GUILD, MANAGE_GUILD_EXPRESSIONS, MANAGE_MESSAGES,
+    MANAGE_ROLES, MANAGE_WEBHOOKS, PIN_MESSAGES, SEND_MESSAGES, VIEW_CHANNEL,
 };
 use super::{proto, Discord, GuildInfo, Quiet, Resumable, RoleInfo, WARM};
 use crate::hub::now;
@@ -654,7 +654,12 @@ impl Discord {
             for (id, info) in &state.guilds {
                 flags.push((id.clone(), info.quiet.server_muted(now), info.quiet.hide_muted));
                 let perms = info.base_permissions(id);
-                manage.push((id.clone(), perms & MANAGE_WEBHOOKS != 0, perms & MANAGE_GUILD != 0));
+                manage.push((
+                    id.clone(),
+                    perms & MANAGE_WEBHOOKS != 0,
+                    perms & MANAGE_GUILD != 0,
+                    perms & (MANAGE_GUILD_EXPRESSIONS | CREATE_GUILD_EXPRESSIONS) != 0,
+                ));
             }
             let listed = state.guilds.iter().map(|(id, info)| {
                 let icon = info.icon.as_deref().map(|hash| model::guild_icon(id, hash));
@@ -675,8 +680,8 @@ impl Discord {
         for (id, muted, hide) in flags {
             self.ctx.space_flags(&id, muted, hide)?;
         }
-        for (id, webhooks, guild) in manage {
-            self.ctx.set_space_manage(&id, webhooks, guild)?;
+        for (id, webhooks, guild, expressions) in manage {
+            self.ctx.set_space_manage(&id, webhooks, guild, expressions)?;
         }
         Ok(())
     }

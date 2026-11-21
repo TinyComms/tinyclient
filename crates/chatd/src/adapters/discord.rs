@@ -13,6 +13,7 @@
 mod admin;
 mod content;
 mod events;
+mod expressions;
 
 pub(super) fn prove_code_colors() -> Result<(), String> {
     protocol::highlight::prove_code_colors()
@@ -1875,6 +1876,25 @@ impl Discord {
             }
             Command::RemoveIntegration { space_id, integration_id, reply } => {
                 answer(reply, self.remove_integration(&space_id, &integration_id))
+            }
+            Command::SpaceExpressions { space_id, reply } => answer(reply, self.space_expressions(&space_id)),
+            Command::CreateEmoji { space_id, name, path, reply } => {
+                answer(reply, self.create_emoji(&space_id, &name, &path))
+            }
+            Command::EditEmoji { space_id, emoji_id, name, roles, reply } => {
+                answer(reply, self.edit_emoji(&space_id, &emoji_id, name, roles))
+            }
+            Command::DeleteEmoji { space_id, emoji_id, reply } => {
+                answer(reply, self.delete_emoji(&space_id, &emoji_id))
+            }
+            Command::CreateSticker { space_id, name, tags, description, path, reply } => {
+                answer(reply, self.create_sticker(&space_id, &name, &tags, &description, &path))
+            }
+            Command::EditSticker { space_id, sticker_id, name, tags, description, reply } => {
+                answer(reply, self.edit_sticker(&space_id, &sticker_id, name, tags, description))
+            }
+            Command::DeleteSticker { space_id, sticker_id, reply } => {
+                answer(reply, self.delete_sticker(&space_id, &sticker_id))
             }
             Command::CloseDirect { conversation_id, reply } => answer(reply, self.leave(&conversation_id, true)),
             Command::AnswerMessageRequest { conversation_id, accept, reply } => {

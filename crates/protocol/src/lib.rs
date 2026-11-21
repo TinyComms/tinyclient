@@ -268,6 +268,9 @@ pub struct Space {
     /// The user has permission to manage server integrations in this Space (`MANAGE_GUILD`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub can_manage_guild: bool,
+    /// The user has permission to manage or create emoji/stickers in this Space (`MANAGE_GUILD_EXPRESSIONS` / `CREATE_GUILD_EXPRESSIONS`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_manage_expressions: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1766,6 +1769,55 @@ pub enum Request {
         space: Key,
         integration_id: String,
     },
+    /// Read a Space's custom emoji, stickers, slot counts, and available roles.
+    SpaceExpressions {
+        space: Key,
+    },
+    /// Upload a new custom emoji to a Space from a local image file.
+    CreateEmoji {
+        space: Key,
+        name: String,
+        path: String,
+    },
+    /// Rename or change role restrictions on an existing custom emoji in a Space.
+    EditEmoji {
+        space: Key,
+        emoji_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        roles: Option<Vec<String>>,
+    },
+    /// Delete a custom emoji from a Space.
+    DeleteEmoji {
+        space: Key,
+        emoji_id: String,
+    },
+    /// Upload a new custom sticker (PNG, APNG, or Lottie JSON) to a Space.
+    CreateSticker {
+        space: Key,
+        name: String,
+        tags: String,
+        #[serde(default)]
+        description: String,
+        path: String,
+    },
+    /// Rename or edit tags/description on an existing custom sticker in a Space.
+    EditSticker {
+        space: Key,
+        sticker_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tags: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+    },
+    /// Delete a custom sticker from a Space.
+    DeleteSticker {
+        space: Key,
+        sticker_id: String,
+    },
     Watch(Watching),
 
     /// A page of one conversation, oldest first. Reading is not marking read.
@@ -3149,6 +3201,19 @@ pub enum Response {
     /// A created or edited webhook (`Request::CreateWebhook` / `Request::EditWebhook`).
     SpaceWebhook {
         webhook: Box<SpaceWebhook>,
+    },
+    /// A Space's custom emoji, stickers, and slot limits (`Request::SpaceExpressions`).
+    SpaceExpressions {
+        space: Key,
+        expressions: Box<SpaceExpressions>,
+    },
+    /// A created or edited custom emoji (`Request::CreateEmoji` / `Request::EditEmoji`).
+    SpaceEmoji {
+        emoji: Box<SpaceEmoji>,
+    },
+    /// A created or edited custom sticker (`Request::CreateSticker` / `Request::EditSticker`).
+    SpaceSticker {
+        sticker: Box<SpaceSticker>,
     },
 }
 

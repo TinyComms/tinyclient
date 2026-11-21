@@ -631,6 +631,40 @@ pub enum Command {
     DeleteWebhook { space_id: String, webhook_id: String, reply: Reply<()> },
     /// Remove an installed bot or integration from a Space.
     RemoveIntegration { space_id: String, integration_id: String, reply: Reply<()> },
+    /// Read a Space's custom emoji, stickers, slot limits, and roles.
+    SpaceExpressions { space_id: String, reply: Reply<protocol::SpaceExpressions> },
+    /// Upload a new custom emoji to a Space.
+    CreateEmoji { space_id: String, name: String, path: String, reply: Reply<protocol::SpaceEmoji> },
+    /// Rename or edit role restrictions on an existing custom emoji.
+    EditEmoji {
+        space_id: String,
+        emoji_id: String,
+        name: Option<String>,
+        roles: Option<Vec<String>>,
+        reply: Reply<protocol::SpaceEmoji>,
+    },
+    /// Delete a custom emoji from a Space.
+    DeleteEmoji { space_id: String, emoji_id: String, reply: Reply<()> },
+    /// Upload a new custom sticker to a Space.
+    CreateSticker {
+        space_id: String,
+        name: String,
+        tags: String,
+        description: String,
+        path: String,
+        reply: Reply<protocol::SpaceSticker>,
+    },
+    /// Rename or edit tags/description on an existing custom sticker.
+    EditSticker {
+        space_id: String,
+        sticker_id: String,
+        name: Option<String>,
+        tags: Option<String>,
+        description: Option<String>,
+        reply: Reply<protocol::SpaceSticker>,
+    },
+    /// Delete a custom sticker from a Space.
+    DeleteSticker { space_id: String, sticker_id: String, reply: Reply<()> },
     /// Close a direct conversation as the network's own × does. Report it through
     /// [`Context::filing`] (hidden) or [`Context::conversation_gone`].
     CloseDirect { conversation_id: String, reply: Reply<()> },
@@ -864,6 +898,13 @@ impl Command {
             Command::CreateWebhook { reply, .. } | Command::EditWebhook { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
+            Command::SpaceExpressions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateEmoji { reply, .. } | Command::EditEmoji { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::CreateSticker { reply, .. } | Command::EditSticker { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetMute { reply, .. }
@@ -872,6 +913,8 @@ impl Command {
             | Command::LeaveSpace { reply, .. }
             | Command::DeleteWebhook { reply, .. }
             | Command::RemoveIntegration { reply, .. }
+            | Command::DeleteEmoji { reply, .. }
+            | Command::DeleteSticker { reply, .. }
             | Command::CloseDirect { reply, .. }
             | Command::ClearHistory { reply, .. }
             | Command::Star { reply, .. }
@@ -1072,10 +1115,10 @@ impl Context {
         Ok(())
     }
 
-    /// Sets whether the user can manage webhooks or guild integrations in `space_id`.
-    pub fn set_space_manage(&self, space_id: &str, webhooks: bool, guild: bool) -> Stores {
+    /// Sets whether the user can manage webhooks, guild integrations, or expressions in `space_id`.
+    pub fn set_space_manage(&self, space_id: &str, webhooks: bool, guild: bool, expressions: bool) -> Stores {
         let space = self.key(space_id);
-        if self.hub.store().set_space_manage(&space, webhooks, guild)? {
+        if self.hub.store().set_space_manage(&space, webhooks, guild, expressions)? {
             self.hub.changed(Change::Spaces { account: self.account.clone() });
         }
         Ok(())

@@ -1207,6 +1207,77 @@ pub struct SpaceIntegrations {
     pub permissions_url: String,
 }
 
+/// One custom emoji in a Space (e.g. Discord guild emoji).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceEmoji {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub animated: bool,
+    #[serde(default = "is_true_val", skip_serializing_if = "is_true")]
+    pub available: bool,
+    /// Role IDs allowed to use this emoji; empty means everyone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<MediaFile>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub creator: String,
+}
+
+/// One custom sticker in a Space (e.g. Discord guild sticker).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceSticker {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Related Unicode emoji or autocomplete tag.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tags: String,
+    /// Discord sticker format: 1 PNG, 2 APNG, 3 Lottie, 4 GIF.
+    #[serde(default)]
+    pub format: u8,
+    #[serde(default = "is_true_val", skip_serializing_if = "is_true")]
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<MediaFile>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub creator: String,
+}
+
+/// A role that can be selected when restricting custom emoji access.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceRoleChoice {
+    pub id: String,
+    pub name: String,
+}
+
+/// A Space's custom emoji, stickers, slot limits (from boost tier), and available roles.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceExpressions {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emojis: Vec<SpaceEmoji>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stickers: Vec<SpaceSticker>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<SpaceRoleChoice>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub static_emoji_limit: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub animated_emoji_limit: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub sticker_limit: u32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_manage: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_create: bool,
+    #[serde(default)]
+    pub premium_tier: u8,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1359,5 +1430,73 @@ mod tests {
         let hook_resp = Response::SpaceWebhook { webhook: Box::new(hook) };
         let back_hook: Response = serde_json::from_str(&serde_json::to_string(&hook_resp).unwrap()).unwrap();
         assert_eq!(back_hook, hook_resp);
+    }
+
+    #[test]
+    fn space_expressions_requests_and_responses_round_trip() {
+        use crate::{AccountKey, Request, Response};
+        let account = AccountKey { network: Network::Discord, account: "1".into() };
+        let space = Key::new(&account, "4000");
+        let reqs = [
+            Request::SpaceExpressions { space: space.clone() },
+            Request::CreateEmoji { space: space.clone(), name: "ferris".into(), path: "/tmp/ferris.png".into() },
+            Request::EditEmoji {
+                space: space.clone(),
+                emoji_id: "7001".into(),
+                name: Some("ferris_happy".into()),
+                roles: Some(vec!["4010".into()]),
+            },
+            Request::DeleteEmoji { space: space.clone(), emoji_id: "7001".into() },
+            Request::CreateSticker {
+                space: space.clone(),
+                name: "Wave".into(),
+                tags: "wave".into(),
+                description: "Waving mascot".into(),
+                path: "/tmp/wave.png".into(),
+            },
+            Request::EditSticker {
+                space: space.clone(),
+                sticker_id: "8001".into(),
+                name: Some("Big Wave".into()),
+                tags: Some("hand".into()),
+                description: Some("Updated".into()),
+            },
+            Request::DeleteSticker { space: space.clone(), sticker_id: "8001".into() },
+        ];
+        for req in reqs {
+            let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+            assert_eq!(back, req);
+        }
+        let emoji = SpaceEmoji {
+            id: "7001".into(),
+            name: "ferris".into(),
+            roles: vec!["4010".into()],
+            ..SpaceEmoji::default()
+        };
+        let sticker = SpaceSticker {
+            id: "8001".into(),
+            name: "Wave".into(),
+            tags: "wave".into(),
+            format: 1,
+            ..SpaceSticker::default()
+        };
+        let expr = SpaceExpressions {
+            emojis: vec![emoji.clone()],
+            stickers: vec![sticker.clone()],
+            roles: vec![SpaceRoleChoice { id: "4010".into(), name: "mods".into() }],
+            static_emoji_limit: 50,
+            animated_emoji_limit: 50,
+            sticker_limit: 5,
+            can_manage: true,
+            can_create: true,
+            premium_tier: 0,
+        };
+        let resp = Response::SpaceExpressions { space, expressions: Box::new(expr) };
+        let back: Response = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(back, resp);
+        let e_resp = Response::SpaceEmoji { emoji: Box::new(emoji) };
+        assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&e_resp).unwrap()).unwrap(), e_resp);
+        let s_resp = Response::SpaceSticker { sticker: Box::new(sticker) };
+        assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&s_resp).unwrap()).unwrap(), s_resp);
     }
 }

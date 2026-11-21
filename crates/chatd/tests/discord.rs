@@ -5194,3 +5194,212 @@ fn server_webhooks_and_integrations_list_create_edit_delete_and_remove() {
     );
     assert_eq!(world.discord.requests_to("DELETE", "/guilds/5000/integrations/8101").len(), 1);
 }
+
+/// A 1×1 PNG. Small enough to pass the emoji size check and fail the sticker's 320×320 rule.
+const TINY_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01,
+    0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41,
+    0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+    0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+];
+
+#[test]
+fn server_emoji_and_stickers_list_upload_edit_roles_and_delete() {
+    let ready: Value = serde_json::from_str(READY).unwrap();
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    match world.ask(Request::Spaces { network: Some(Network::Discord) }) {
+        Response::Spaces { spaces } => {
+            let g4000 = spaces.iter().find(|s| s.key.id == "4000").expect("guild 4000");
+            let g5000 = spaces.iter().find(|s| s.key.id == "5000").expect("guild 5000");
+            assert!(!g4000.can_manage_expressions);
+            assert!(g5000.can_manage_expressions);
+        }
+        other => panic!("expected Response::Spaces, got {other:?}"),
+    }
+
+    match world.ask(Request::SpaceExpressions { space: world.key("4000") }) {
+        Response::Error { detail, .. } => assert!(detail.contains("permission"), "got: {detail}"),
+        other => panic!("expected permission error, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("GET", "/guilds/4000/emojis").is_empty());
+
+    match world.ask(Request::CreateEmoji {
+        space: world.key("4000"),
+        name: "nope".into(),
+        path: "not-a-file".into(),
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("permission"), "got: {detail}"),
+        other => panic!("expected permission error, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("POST", "/guilds/4000/emojis").is_empty());
+
+    world.discord.script(
+        "/guilds/5000/emojis",
+        200,
+        json!([{
+            "id": "7201",
+            "name": "ferris",
+            "animated": false,
+            "available": true,
+            "roles": ["4010"],
+            "user": {"username": "justin", "global_name": "Justin"}
+        }]),
+    );
+    world.discord.script(
+        "/guilds/5000/stickers",
+        200,
+        json!([{
+            "id": "8201",
+            "name": "Wave",
+            "description": "Waving",
+            "tags": "wave",
+            "format_type": 1,
+            "available": true,
+            "user": {"username": "justin", "global_name": "Justin"}
+        }]),
+    );
+    match world.ask(Request::SpaceExpressions { space: world.key("5000") }) {
+        Response::SpaceExpressions { expressions, .. } => {
+            assert!(expressions.can_manage && expressions.can_create);
+            assert_eq!(expressions.premium_tier, 0);
+            assert_eq!((expressions.static_emoji_limit, expressions.animated_emoji_limit, expressions.sticker_limit), (50, 50, 5));
+            assert_eq!(expressions.emojis.len(), 1);
+            assert_eq!(expressions.emojis[0].name, "ferris");
+            assert_eq!(expressions.emojis[0].roles, ["4010"]);
+            assert_eq!(expressions.emojis[0].creator, "Justin");
+            assert_eq!(expressions.stickers.len(), 1);
+            assert_eq!(expressions.stickers[0].name, "Wave");
+            assert_eq!(expressions.stickers[0].format, 1);
+            assert!(expressions.roles.is_empty(), "@everyone is not a restrictable role");
+        }
+        other => panic!("expected Response::SpaceExpressions, got {other:?}"),
+    }
+
+    match world.ask(Request::CreateEmoji {
+        space: world.key("5000"),
+        name: "bad-name".into(),
+        path: "not-a-file".into(),
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("2 to 32"), "got: {detail}"),
+        other => panic!("expected name refusal, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("POST", "/guilds/5000/emojis").is_empty());
+
+    let png_path = std::env::temp_dir().join(format!("tinyclient-emoji-{}.png", std::process::id()));
+    std::fs::write(&png_path, TINY_PNG).unwrap();
+    let png = png_path.to_string_lossy().into_owned();
+    world.discord.script(
+        "/guilds/5000/emojis",
+        200,
+        json!({
+            "id": "7202",
+            "name": "ferris",
+            "animated": false,
+            "available": true,
+            "roles": [],
+            "user": {"username": "justin", "global_name": "Justin"}
+        }),
+    );
+    match world.ask(Request::CreateEmoji { space: world.key("5000"), name: "ferris".into(), path: png.clone() }) {
+        Response::SpaceEmoji { emoji } => {
+            assert_eq!(emoji.id, "7202");
+            assert_eq!(emoji.name, "ferris");
+        }
+        other => panic!("expected Response::SpaceEmoji, got {other:?}"),
+    }
+    let creates = world.discord.requests_to("POST", "/guilds/5000/emojis");
+    assert_eq!(creates.len(), 1);
+    assert_eq!(creates[0].body["name"], "ferris");
+    assert_eq!(creates[0].body["roles"], json!([]));
+    let image = creates[0].body["image"].as_str().unwrap_or("");
+    assert!(image.starts_with("data:image/png;base64,"), "got: {image}");
+
+    world.discord.script(
+        "/guilds/5000/emojis/7202",
+        200,
+        json!({
+            "id": "7202",
+            "name": "ferris_happy",
+            "animated": false,
+            "available": true,
+            "roles": ["4010"]
+        }),
+    );
+    match world.ask(Request::EditEmoji {
+        space: world.key("5000"),
+        emoji_id: "7202".into(),
+        name: Some("ferris_happy".into()),
+        roles: Some(vec!["4010".into()]),
+    }) {
+        Response::SpaceEmoji { emoji } => {
+            assert_eq!(emoji.name, "ferris_happy");
+            assert_eq!(emoji.roles, ["4010"]);
+        }
+        other => panic!("expected Response::SpaceEmoji, got {other:?}"),
+    }
+    let edits = world.discord.requests_to("PATCH", "/guilds/5000/emojis/7202");
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].body["name"], "ferris_happy");
+    assert_eq!(edits[0].body["roles"], json!(["4010"]));
+
+    world.discord.script("/guilds/5000/emojis/7202", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::DeleteEmoji { space: world.key("5000"), emoji_id: "7202".into() }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("DELETE", "/guilds/5000/emojis/7202").len(), 1);
+
+    match world.ask(Request::CreateSticker {
+        space: world.key("5000"),
+        name: "Wave".into(),
+        tags: "wave".into(),
+        description: "Hi".into(),
+        path: png,
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("320x320"), "got: {detail}"),
+        other => panic!("expected dimension refusal, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("POST", "/guilds/5000/stickers").is_empty());
+    let _ = std::fs::remove_file(&png_path);
+
+    world.discord.script(
+        "/guilds/5000/stickers/8201",
+        200,
+        json!({
+            "id": "8201",
+            "name": "Big Wave",
+            "description": "Updated",
+            "tags": "ocean",
+            "format_type": 1,
+            "available": true
+        }),
+    );
+    match world.ask(Request::EditSticker {
+        space: world.key("5000"),
+        sticker_id: "8201".into(),
+        name: Some("Big Wave".into()),
+        tags: Some("ocean".into()),
+        description: Some("Updated".into()),
+    }) {
+        Response::SpaceSticker { sticker } => {
+            assert_eq!(sticker.name, "Big Wave");
+            assert_eq!(sticker.tags, "ocean");
+        }
+        other => panic!("expected Response::SpaceSticker, got {other:?}"),
+    }
+    let sticker_edits = world.discord.requests_to("PATCH", "/guilds/5000/stickers/8201");
+    assert_eq!(sticker_edits.len(), 1);
+    assert_eq!(sticker_edits[0].body["name"], "Big Wave");
+    assert_eq!(sticker_edits[0].body["tags"], "ocean");
+
+    world.discord.script("/guilds/5000/stickers/8201", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::DeleteSticker { space: world.key("5000"), sticker_id: "8201".into() }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("DELETE", "/guilds/5000/stickers/8201").len(), 1);
+}
