@@ -1023,11 +1023,11 @@ fn people_are_answered_looked_up_and_searched_for_only_when_the_typing_pauses() 
         (ours.presence, ours.status, ours.avatar.is_some())
     };
     assert_eq!(own(&chatd), (Presence::Online, String::new(), true));
-    let set = Request::SetPresence { account: account.clone(), presence: Presence::Dnd, status: Some("heads down".into()) };
+    let set = Request::SetPresence { account: account.clone(), presence: Presence::Dnd, status: Some("heads down".into()), clear_at: None };
     assert_eq!(chatd.ask(set), Response::Ok);
     assert_eq!(own(&chatd), (Presence::Dnd, "heads down".to_owned(), true));
     // No text given leaves the text as it is.
-    assert_eq!(chatd.ask(Request::SetPresence { account: account.clone(), presence: Presence::Idle, status: None }), Response::Ok);
+    assert_eq!(chatd.ask(Request::SetPresence { account: account.clone(), presence: Presence::Idle, status: None, clear_at: None }), Response::Ok);
     assert_eq!(own(&chatd), (Presence::Idle, "heads down".to_owned(), true));
 
     let ines = demo("220000000000000001");

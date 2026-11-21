@@ -371,6 +371,8 @@ pub fn incognito_host(host: &str) -> bool {
 pub const TINY_FEATURE_UPLOAD_LIMITS: &str = "upload_limits";
 /// Uploads are scanned, and archives stay off until an owner allows them.
 pub const TINY_FEATURE_FILE_SCAN: &str = "file_scan";
+/// Custom presence states (`online`, `idle`, `dnd`, `invisible`) and status text on the live socket.
+pub const TINY_FEATURE_PRESENCE_STATUS: &str = "presence_status";
 /// Images and GIFs, until an admin changes it.
 pub const TINY_IMAGE_MAX_DEFAULT: i64 = 8 * 1024 * 1024;
 /// Video and every other file, until an admin changes it.

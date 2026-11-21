@@ -1543,12 +1543,15 @@ pub enum Request {
         target: ReportTarget,
     },
     /// Our own presence on one account, and the status text beside it: `None` leaves the text
-    /// as it is, empty clears it.
+    /// as it is, empty clears it. `clear_at`, when given, is a Unix timestamp (seconds) when
+    /// the status text expires.
     SetPresence {
         account: AccountKey,
         presence: Presence,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clear_at: Option<i64>,
     },
     /// Our own profile on one account. `None` leaves that part. An empty about or emoji clears
     /// it. A username, or `photo`, is refused: those are still changed on the phone. Signal is

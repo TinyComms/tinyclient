@@ -443,6 +443,19 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
                 live.ask(Ask::Type { conversation_id });
             }
         }
+        Command::SetPresence { presence, status, clear_at, reply } => {
+            let known = super::manage::known(saved);
+            let supported = if known.checked {
+                known.capabilities.has(protocol::TINY_FEATURE_PRESENCE_STATUS)
+            } else {
+                super::manage::capabilities_of(saved).has(protocol::TINY_FEATURE_PRESENCE_STATUS)
+            };
+            if !supported {
+                let _ = reply.send(Err(Refusal::Unsupported));
+            } else {
+                live.ask(Ask::SetPresence { presence, status, clear_at, reply });
+            }
+        }
         Command::StartDirect { person_id, reply } => start_direct(ctx, saved, &person_id, reply),
         Command::StartDirectCall { person_id, reply } => start_direct_intent(ctx, saved, &person_id, true, reply),
         Command::MembersRemove { person, reply, .. } => {
@@ -2170,7 +2183,9 @@ struct UploadLimits {
 /// What this account may send. `file_scan` is absent on an older server, which keeps today's upload.
 fn account_caps(saved: &Saved) -> Capabilities {
     let limits = upload_limits(saved);
-    let scans = super::manage::capabilities_of(saved).has(protocol::TINY_FEATURE_FILE_SCAN);
+    let server_caps = super::manage::capabilities_of(saved);
+    let scans = server_caps.has(protocol::TINY_FEATURE_FILE_SCAN);
+    let presence_status = server_caps.has(protocol::TINY_FEATURE_PRESENCE_STATUS);
     Capabilities {
         max_file_bytes: limits.image.max(limits.file),
         max_files: protocol::ATTACHMENTS_LIMIT as u32,
@@ -2183,6 +2198,7 @@ fn account_caps(saved: &Saved) -> Capabilities {
         pins: false,
         reactions: true,
         gif_file: true,
+        presence_status,
         profile_avatar: true,
         ..Capabilities::default()
     }

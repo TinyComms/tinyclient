@@ -1629,7 +1629,7 @@ impl Chat {
     }
 
     /// Our own presence, shown at once and put back if the network refuses it.
-    fn set_presence(&self, account: AccountKey, presence: Presence, status: Option<String>) -> Response {
+    fn set_presence(&self, account: AccountKey, presence: Presence, status: Option<String>, clear_at: Option<i64>) -> Response {
         if let Err(refused) = self.online(&account) {
             return *refused;
         }
@@ -1645,7 +1645,7 @@ impl Chat {
             self.hub.set_presence(me.clone(), presence, status.as_deref().unwrap_or(old), true);
             self.hub.changed(Change::Status);
         }
-        match self.ask(&account, |reply| Command::SetPresence { presence, status, reply }) {
+        match self.ask(&account, |reply| Command::SetPresence { presence, status, clear_at, reply }) {
             Ok(()) => Response::Ok,
             Err(refused) => {
                 if let (Some(me), Some((presence, status))) = (me, before) {
@@ -1680,7 +1680,7 @@ impl Chat {
                 return *refused;
             }
             let status = adapters::signal::profile_status(name.as_deref(), about.as_deref(), emoji.as_deref());
-            return match self.ask(&account, |reply| Command::SetPresence { presence: Presence::Online, status: Some(status), reply }) {
+            return match self.ask(&account, |reply| Command::SetPresence { presence: Presence::Online, status: Some(status), clear_at: None, reply }) {
                 Ok(()) => {
                     self.forget_own_profile(&account, None);
                     Response::Ok
@@ -2925,7 +2925,7 @@ impl Chat {
             Request::Relate { person, action } => self.relate(person, action),
             Request::Report { target, reason, note, block } => self.report(target, reason, note, block),
             Request::ReportReasons { target } => self.report_reasons(target),
-            Request::SetPresence { account, presence, status } => self.set_presence(account, presence, status),
+            Request::SetPresence { account, presence, status, clear_at } => self.set_presence(account, presence, status, clear_at),
             Request::SetProfile { account, name, about, pronouns, emoji, username, photo } => {
                 self.set_profile(account, name, about, pronouns, emoji, username, photo)
             }

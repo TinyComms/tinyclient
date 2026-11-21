@@ -195,6 +195,13 @@ pub enum Ask {
     Resume,
     /// Media is flowing again. The resume clock starts over once the link has held.
     Settled,
+    /// Update this user's presence state and optional status text on the live socket.
+    SetPresence {
+        presence: Presence,
+        status: Option<String>,
+        clear_at: Option<i64>,
+        reply: Reply<()>,
+    },
 }
 
 impl Ask {
@@ -206,7 +213,8 @@ impl Ask {
             | Ask::Leave { reply }
             | Ask::Kick { reply, .. }
             | Ask::Moderate { reply, .. }
-            | Ask::Move { reply, .. } => Some(reply),
+            | Ask::Move { reply, .. }
+            | Ask::SetPresence { reply, .. } => Some(reply),
             Ask::Look
             | Ask::Hangup { .. }
             | Ask::State { .. }
@@ -1051,6 +1059,19 @@ fn serve(
                     Ask::Type { conversation_id } => wire.send(
                         json!({"type": "typing", "conversation_id": conversation_id}).to_string(),
                     ),
+                    Ask::SetPresence { presence, status, clear_at, reply } => {
+                        let frame = presence_set_frame(presence, status.as_deref(), clear_at);
+                        match wire.send(frame.to_string()) {
+                            Ok(()) => {
+                                let _ = reply.send(Ok(()));
+                                Ok(())
+                            }
+                            Err(err) => {
+                                let _ = reply.send(Err(Refusal::Refused(LOST.to_owned())));
+                                Err(err)
+                            }
+                        }
+                    }
                 };
                 if let Err(err) = sent {
                     return End::Dropped(err.to_string());
@@ -1453,12 +1474,74 @@ fn seated_in(seat: &Seat, room: &str) -> bool {
 }
 
 #[derive(Deserialize)]
+struct PresenceEntry {
+    user_id: String,
+    #[serde(default, deserialize_with = "protocol::text_or_null")]
+    state: String,
+    #[serde(default, deserialize_with = "protocol::text_or_null")]
+    text: String,
+}
+
+fn presence_from_str(state: &str) -> Presence {
+    match state {
+        "online" => Presence::Online,
+        "idle" => Presence::Idle,
+        "dnd" | "busy" => Presence::Dnd,
+        "offline" | "invisible" => Presence::Offline,
+        _ => Presence::Online,
+    }
+}
+
+fn presence_to_str(presence: Presence) -> &'static str {
+    match presence {
+        Presence::Online | Presence::Unknown => "online",
+        Presence::Idle => "idle",
+        Presence::Dnd | Presence::Busy => "dnd",
+        Presence::Offline => "invisible",
+    }
+}
+
+/// Build the `presence.set` live frame. `status: None` omits `"text"` so the server leaves it
+/// untouched; `Some("")` sends `"text": ""` to clear it.
+pub(crate) fn presence_set_frame(presence: Presence, status: Option<&str>, clear_at: Option<i64>) -> Value {
+    let mut map = serde_json::Map::new();
+    map.insert("type".to_owned(), Value::String("presence.set".to_owned()));
+    map.insert("state".to_owned(), Value::String(presence_to_str(presence).to_owned()));
+    if let Some(text) = status {
+        map.insert("text".to_owned(), Value::String(text.to_owned()));
+    }
+    if let Some(ts) = clear_at {
+        map.insert("clear_at".to_owned(), json!(ts));
+    }
+    Value::Object(map)
+}
+
+/// Parse a `presence` live frame, supporting both `state` + `text` (newer servers) and
+/// `online: bool` (older servers).
+pub(crate) fn parse_presence_frame(frame: &Value) -> Option<(&str, Presence, &str)> {
+    let user = text(frame, "user_id")?;
+    let state = text(frame, "state");
+    let online = frame.get("online").and_then(Value::as_bool);
+    let presence = match (state, online) {
+        (Some(s), _) if !s.is_empty() => presence_from_str(s),
+        (_, Some(true)) => Presence::Online,
+        (_, Some(false)) => Presence::Offline,
+        _ => return None,
+    };
+    let status = text(frame, "text").unwrap_or("");
+    Some((user, presence, status))
+}
+
+#[derive(Deserialize)]
 struct ReadyFrame {
     seq: i64,
     #[serde(default)]
     me: MeFrame,
     #[serde(default, deserialize_with = "protocol::or_default")]
     online: Vec<String>,
+    /// Rich presence entries (`user_id`, `state`, `text`) from servers with `presence_status`.
+    #[serde(default, deserialize_with = "protocol::or_default")]
+    presence: Vec<PresenceEntry>,
     /// Read row by row (`calls_of`): one call this client cannot read leaves the others.
     #[serde(default)]
     calls: Value,
@@ -1558,20 +1641,8 @@ fn heard_frame(
         "resync" => return Some(End::Resync),
         "pong" => {}
         "presence" => {
-            if let (Some(user), Some(online)) = (
-                text(frame, "user_id"),
-                frame.get("online").and_then(Value::as_bool),
-            ) {
-                ctx.presence(
-                    user,
-                    if online {
-                        Presence::Online
-                    } else {
-                        Presence::Offline
-                    },
-                    "",
-                    true,
-                );
+            if let Some((user, presence, status)) = parse_presence_frame(frame) {
+                ctx.presence(user, presence, status, true);
             }
         }
         "call.joined" => {
@@ -1758,8 +1829,19 @@ fn ready_heard(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, heard
     for user in heard.online.iter().take(NAMES) {
         ctx.presence(user, Presence::Online, "", true);
     }
+    let mut me_listed = false;
+    for entry in heard.presence.iter().take(NAMES) {
+        if entry.user_id.is_empty() {
+            continue;
+        }
+        if entry.user_id == seat.me {
+            me_listed = true;
+        }
+        let state = if entry.state.is_empty() { Presence::Online } else { presence_from_str(&entry.state) };
+        ctx.presence(&entry.user_id, state, &entry.text, true);
+    }
     // The server counts us online while this socket is up, but may not list us to ourselves.
-    if !seat.me.is_empty() {
+    if !seat.me.is_empty() && !me_listed {
         ctx.presence(&seat.me, Presence::Online, "", true);
     }
     // Before `calls` is taken off the frame. A ring here does not start mediad.
@@ -3302,6 +3384,43 @@ mod join_order {
         let join = steps.iter().position(|step| *step == AfterOffer::Join).expect("a join step");
         let room = steps.iter().position(|step| *step == AfterOffer::Room).expect("a room step");
         assert!(join < room, "room settings ran before call.join");
+    }
+}
+
+#[cfg(test)]
+mod presence_tests {
+    use super::{parse_presence_frame, presence_set_frame};
+    use protocol::Presence;
+    use serde_json::json;
+
+    #[test]
+    fn presence_set_frame_omits_text_when_none_and_sends_empty_to_clear() {
+        let state_only = presence_set_frame(Presence::Dnd, None, None);
+        assert_eq!(state_only, json!({"type": "presence.set", "state": "dnd"}));
+
+        let with_text = presence_set_frame(Presence::Idle, Some("grabbing coffee"), Some(1_700_000_000));
+        assert_eq!(
+            with_text,
+            json!({"type": "presence.set", "state": "idle", "text": "grabbing coffee", "clear_at": 1_700_000_000})
+        );
+
+        let cleared = presence_set_frame(Presence::Offline, Some(""), None);
+        assert_eq!(cleared, json!({"type": "presence.set", "state": "invisible", "text": ""}));
+    }
+
+    #[test]
+    fn parse_presence_frame_handles_new_and_legacy_shapes() {
+        let rich = json!({"type": "presence", "user_id": "u1", "state": "dnd", "text": "in a meeting"});
+        assert_eq!(parse_presence_frame(&rich), Some(("u1", Presence::Dnd, "in a meeting")));
+
+        let legacy_on = json!({"type": "presence", "user_id": "u2", "online": true});
+        assert_eq!(parse_presence_frame(&legacy_on), Some(("u2", Presence::Online, "")));
+
+        let legacy_off = json!({"type": "presence", "user_id": "u2", "online": false});
+        assert_eq!(parse_presence_frame(&legacy_off), Some(("u2", Presence::Offline, "")));
+
+        let invisible = json!({"type": "presence", "user_id": "u3", "state": "invisible"});
+        assert_eq!(parse_presence_frame(&invisible), Some(("u3", Presence::Offline, "")));
     }
 }
 
