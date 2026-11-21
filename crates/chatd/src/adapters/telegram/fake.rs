@@ -695,9 +695,23 @@ impl World {
 
     /// A manual unread mark rides the dialog the next time it is read.
     fn flag_unread(&self, dialog: &mut tl::enums::Dialog) {
+        self.stamp_jump_counts(dialog);
         let tl::enums::Dialog::Dialog(row) = dialog else { return };
         let Some(on) = self.unread_marks.get(&Who::of(&row.peer)) else { return };
         row.unread_mark = *on;
+    }
+
+    /// Unread mention and reaction totals, from the lists `getUnreadMentions` and
+    /// `getUnreadReactions` answer. A chat with no list keeps the count the dialog already had.
+    fn stamp_jump_counts(&self, dialog: &mut tl::enums::Dialog) {
+        let tl::enums::Dialog::Dialog(row) = dialog else { return };
+        let place = Who::of(&row.peer).text();
+        if let Some(ids) = self.unread_mentions.get(&place) {
+            row.unread_mentions_count = ids.len() as i32;
+        }
+        if let Some(ids) = self.unread_reactions.get(&place) {
+            row.unread_reactions_count = ids.len() as i32;
+        }
     }
 
     fn folder(&self, id: i32) -> tl::enums::DialogFilter {
@@ -848,13 +862,24 @@ impl World {
 
     /// One page of a conversation, as `getHistory` and `getReplies` count it: newest first,
     /// from `offset_id` back, shifted by `add_offset`.
+    ///
+    /// A mention or reaction still on the unread list stays out of the page. The next jump
+    /// has to land on it; once it is read it comes back with the rest of the chat.
     fn page(&self, place: &str, offset_id: i32, add_offset: i32, limit: i32) -> tl::enums::messages::Messages {
-        let all: Vec<&tl::enums::Message> = self.messages.get(place).map(|held| held.values().rev().collect()).unwrap_or_default();
         let id = |message: &tl::enums::Message| match message {
             tl::enums::Message::Message(message) => message.id,
             tl::enums::Message::Service(message) => message.id,
             tl::enums::Message::Empty(message) => message.id,
         };
+        let still_unread = |message_id: i32| {
+            self.unread_mentions.get(place).is_some_and(|ids| ids.contains(&message_id))
+                || self.unread_reactions.get(place).is_some_and(|ids| ids.contains(&message_id))
+        };
+        let all: Vec<&tl::enums::Message> = self
+            .messages
+            .get(place)
+            .map(|held| held.values().rev().filter(|message| !still_unread(id(message))).collect())
+            .unwrap_or_default();
         let start = match offset_id {
             0 => 0,
             offset => all.iter().position(|message| id(message) < offset).unwrap_or(all.len()) as i32,
@@ -888,6 +913,12 @@ fn app_config() -> tl::enums::help::AppConfig {
 
 fn rpc(code: i32, name: &str, value: Option<u32>) -> Fault {
     Fault::Rpc { code, name: name.to_owned(), value }
+}
+
+/// The first `limit` ids, or none when Telegram asked for nothing.
+fn limited(ids: &[i32], limit: i32) -> Vec<i32> {
+    let n = usize::try_from(limit).unwrap_or(0);
+    ids.iter().copied().take(n).collect()
 }
 
 /// The request, if `body` is one of these.
@@ -1910,21 +1941,41 @@ impl World {
                 self.store(None, msg.clone());
                 vec![new(msg)]
             }
-            // Seed 2 unread mentions and 2 unread reactions in Trail crew (g8001).
+            // Three unread mentions and two unread reactions in Trail crew, one mention in the
+            // Tools topic, and the channel post that already names the user. The messages stay
+            // on the wire until a jump asks for them. The dialog mark is what puts the counts
+            // on the row.
             "unread-jumps" => {
                 let crew = Who::Group(CREW);
                 let mut m21 = message(crew, 21, TOBIN, t0() + 10, "@mira_k bring the stove!");
                 m21.mentioned = true;
                 let mut m22 = message(crew, 22, ODALYS, t0() + 20, "@mira_k check the map!");
                 m22.mentioned = true;
-                let m23 = message(crew, 23, ME, t0() + 30, "Stove packed.");
-                let m24 = message(crew, 24, ME, t0() + 40, "Map packed.");
-                for m in [&m21, &m22, &m23, &m24] {
+                let mut m23 = message(crew, 23, TOBIN, t0() + 30, "@mira_k the gate code!");
+                m23.mentioned = true;
+                let m24 = message(crew, 24, ME, t0() + 40, "Stove packed.");
+                let m25 = message(crew, 25, ME, t0() + 50, "Map packed.");
+                for m in [&m21, &m22, &m23, &m24, &m25] {
                     self.store(None, m.clone());
                 }
-                self.unread_mentions.insert(crew.text(), vec![21, 22]);
-                self.unread_reactions.insert(crew.text(), vec![23, 24]);
-                vec![new(m21), new(m22), new(m23), new(m24)]
+                self.unread_mentions.insert(crew.text(), vec![21, 22, 23]);
+                self.unread_reactions.insert(crew.text(), vec![24, 25]);
+                let mut topic = in_topic(
+                    message(Who::Channel(WORKSHOP), 42, TOBIN, t0() + 60, "@mira_k the wrench is back."),
+                    TOOLS,
+                );
+                topic.mentioned = true;
+                self.store(Some(TOOLS), topic);
+                self.unread_mentions.insert(key(Who::Channel(WORKSHOP), Some(TOOLS)), vec![42]);
+                self.unread_mentions.insert(Who::Channel(NOTES).text(), vec![5]);
+                vec![update(
+                    tl::types::UpdateDialogUnreadMark {
+                        unread: false,
+                        peer: tl::types::DialogPeer { peer: crew.peer() }.into(),
+                        saved_peer_id: None,
+                    }
+                    .into(),
+                )]
             }
             // The channel's post gains a section of comments: the post says its count and the
             // linked group it is answered in, and two comments stand in the thread. A number
@@ -2280,7 +2331,7 @@ impl World {
             let who = input_who(&request.peer);
             let k = key(who, request.top_msg_id);
             self.log(&format!("GetUnreadMentions {k}"));
-            let ids = self.unread_mentions.get(&k).cloned().unwrap_or_default();
+            let ids = limited(self.unread_mentions.get(&k).map(Vec::as_slice).unwrap_or(&[]), request.limit);
             let msgs: Vec<tl::enums::Message> = ids
                 .into_iter()
                 .filter_map(|id| self.messages.get(&k).and_then(|m| m.get(&id)).cloned())
@@ -2304,7 +2355,7 @@ impl World {
         }
         if let Some(request) = asked::<f::channels::ReadMessageContents>(body) {
             let joined = request.id.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
-            self.log(&format!("ReadMessageContents {joined}"));
+            self.log(&format!("channels.ReadMessageContents {joined}"));
             for list in self.unread_mentions.values_mut() {
                 list.retain(|id| !request.id.contains(id));
             }
@@ -2323,7 +2374,7 @@ impl World {
             let who = input_who(&request.peer);
             let k = key(who, request.top_msg_id);
             self.log(&format!("GetUnreadReactions {k}"));
-            let ids = self.unread_reactions.get(&k).cloned().unwrap_or_default();
+            let ids = limited(self.unread_reactions.get(&k).map(Vec::as_slice).unwrap_or(&[]), request.limit);
             let msgs: Vec<tl::enums::Message> = ids
                 .into_iter()
                 .filter_map(|id| self.messages.get(&k).and_then(|m| m.get(&id)).cloned())

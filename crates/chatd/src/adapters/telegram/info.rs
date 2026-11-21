@@ -1365,6 +1365,7 @@ pub(super) fn mark_unread_items_read(
         protocol::UnreadItemKind::Mentions => {
             let parsed_ids: Vec<i32> = message_ids.iter().filter_map(|id| id.parse::<i32>().ok()).collect();
             if !parsed_ids.is_empty() {
+                let seen = parsed_ids.len() as u32;
                 match who {
                     Who::Channel(_) => {
                         let channel = account.input_channel(who)?;
@@ -1373,6 +1374,11 @@ pub(super) fn mark_unread_items_read(
                     _ => {
                         account.ask(&tl::functions::messages::ReadMessageContents { id: parsed_ids })?;
                     }
+                }
+                // Seeing one mention tells Telegram about that message. The badge drops by
+                // what was just read; an empty list is the separate "mark all" below.
+                if let Ok(Some(row)) = account.ctx.known(conversation_id) {
+                    let _ = account.ctx.mentions_count(conversation_id, row.mentions.saturating_sub(seen));
                 }
             } else {
                 let peer = account.input(who)?;
@@ -1391,6 +1397,9 @@ pub(super) fn mark_unread_items_read(
                     saved_peer_id: None,
                 })?;
                 let _ = account.ctx.unread_reactions(conversation_id, 0);
+            } else if let Ok(Some(row)) = account.ctx.known(conversation_id) {
+                let seen = message_ids.len() as u32;
+                let _ = account.ctx.unread_reactions(conversation_id, row.unread_reactions.saturating_sub(seen));
             }
         }
     }

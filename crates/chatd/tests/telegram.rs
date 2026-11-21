@@ -4048,55 +4048,72 @@ fn active_sessions_list_and_end_non_current() {
 }
 
 #[test]
-fn unread_mentions_and_reactions_jump_and_clear() {
+fn unread_mentions_jump_three_times_and_the_count_reaches_zero() {
     let world = World::signed_in();
     world.connected();
     let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
     assert!(can.unread_jumps, "Telegram must advertise unread_jumps capability");
 
     let crew = key("g8001");
-    // Seed 2 unread mentions and 2 unread reactions on Trail crew.
+    // Three unread mentions (21, 22, 23) and two unread reactions (24, 25) on Trail crew.
+    // A topic mention and a channel mention ride the same tell, for top_msg_id and channels.readMessageContents.
     world.steer("unread-jumps");
-
-    // Fetch unread mentions (`messages.getUnreadMentions`).
-    let mention_ids = match world.ask(Request::UnreadItems {
-        conversation: crew.clone(),
-        kind: protocol::UnreadItemKind::Mentions,
-        limit: 20,
-    }) {
-        Response::UnreadItems { message_ids } => message_ids,
-        other => panic!("expected UnreadItems, got {other:?}"),
-    };
-    assert_eq!(mention_ids, vec!["21".to_owned(), "22".to_owned()]);
-    assert!(
-        world.calls().iter().any(|c| c == "GetUnreadMentions g8001"),
-        "expected GetUnreadMentions g8001 on wire, got: {:#?}",
-        world.calls()
-    );
-
-    // Visiting a mention marks its content read (`messages.readMessageContents`).
-    let ok = world.ask(Request::MarkUnreadItemsRead {
-        conversation: crew.clone(),
-        kind: protocol::UnreadItemKind::Mentions,
-        message_ids: vec!["21".into()],
+    let row = world.until("the mention and reaction counts on the row", || {
+        let conversation = world.conversation("g8001")?;
+        (conversation.mentions == 3 && conversation.unread_reactions == 2).then_some(conversation)
     });
-    assert!(matches!(ok, Response::Ok), "expected Ok marking mention content read, got {ok:?}");
-    assert!(
-        world.calls().iter().any(|c| c == "ReadMessageContents 21"),
-        "expected ReadMessageContents 21 on wire, got: {:#?}",
-        world.calls()
-    );
-    let left = match world.ask(Request::UnreadItems {
-        conversation: crew.clone(),
-        kind: protocol::UnreadItemKind::Mentions,
-        limit: 20,
-    }) {
-        Response::UnreadItems { message_ids } => message_ids,
-        other => panic!("expected UnreadItems, got {other:?}"),
-    };
-    assert_eq!(left, vec!["22".to_owned()], "visiting one mention leaves the other");
+    assert_eq!(row.mentions, 3);
+    assert_eq!(row.unread_reactions, 2);
 
-    // Mark all mentions read (`messages.readMentions`).
+    // Each press: the next unread mention, a HistoryAround landing, then that mention's contents read.
+    for (step, id) in ["21", "22", "23"].into_iter().enumerate() {
+        let left = 3 - step as u32;
+        let mention_ids = match world.ask(Request::UnreadItems {
+            conversation: crew.clone(),
+            kind: protocol::UnreadItemKind::Mentions,
+            limit: 1,
+        }) {
+            Response::UnreadItems { message_ids } => message_ids,
+            other => panic!("expected UnreadItems, got {other:?}"),
+        };
+        assert_eq!(mention_ids, vec![id.to_owned()], "press {} should land on the next mention", step + 1);
+        assert!(
+            world.calls().iter().any(|call| call == "GetUnreadMentions g8001"),
+            "expected GetUnreadMentions g8001 on wire, got: {:#?}",
+            world.calls()
+        );
+
+        let _ = world.ask(Request::Messages {
+            conversation: crew.clone(),
+            page: Page::Around { id: id.to_owned() },
+            limit: 50,
+        });
+        let landing = format!("GetHistory g8001 {id} -25");
+        world.until(&format!("the landing on {id}"), || {
+            world.calls().iter().any(|call| call == &landing).then_some(())
+        });
+        world.until(&format!("message {id} in the landing"), || world.message("g8001", id));
+
+        let ok = world.ask(Request::MarkUnreadItemsRead {
+            conversation: crew.clone(),
+            kind: protocol::UnreadItemKind::Mentions,
+            message_ids: vec![id.into()],
+        });
+        assert!(matches!(ok, Response::Ok), "expected Ok marking mention {id} read, got {ok:?}");
+        let contents = format!("ReadMessageContents {id}");
+        assert!(
+            world.calls().iter().any(|call| call == &contents),
+            "expected {contents} on wire, got: {:#?}",
+            world.calls()
+        );
+        let now = world.until(&format!("the mention count to fall to {}", left - 1), || {
+            world.conversation("g8001").filter(|conversation| conversation.mentions == left - 1)
+        });
+        assert_eq!(now.mentions, left - 1);
+    }
+    assert_eq!(world.conversation("g8001").unwrap().mentions, 0);
+
+    // Mark all is a separate call from seeing one mention.
     let ok = world.ask(Request::MarkUnreadItemsRead {
         conversation: crew.clone(),
         kind: protocol::UnreadItemKind::Mentions,
@@ -4104,21 +4121,41 @@ fn unread_mentions_and_reactions_jump_and_clear() {
     });
     assert!(matches!(ok, Response::Ok), "expected Ok marking all mentions read, got {ok:?}");
     assert!(
-        world.calls().iter().any(|c| c == "ReadMentions g8001"),
+        world.calls().iter().any(|call| call == "ReadMentions g8001"),
         "expected ReadMentions g8001 on wire, got: {:#?}",
         world.calls()
     );
-    let cleared = match world.ask(Request::UnreadItems {
-        conversation: crew.clone(),
+
+    // A forum topic sends top_msg_id (the conversation key carries it on the wire log).
+    let topic_ids = match world.ask(Request::UnreadItems {
+        conversation: key("c9002_31"),
         kind: protocol::UnreadItemKind::Mentions,
-        limit: 20,
+        limit: 1,
     }) {
         Response::UnreadItems { message_ids } => message_ids,
         other => panic!("expected UnreadItems, got {other:?}"),
     };
-    assert!(cleared.is_empty(), "marking every mention clears the list, got {cleared:?}");
+    assert_eq!(topic_ids, vec!["42".to_owned()]);
+    assert!(
+        world.calls().iter().any(|call| call == "GetUnreadMentions c9002_31"),
+        "expected GetUnreadMentions c9002_31 (top_msg_id) on wire, got: {:#?}",
+        world.calls()
+    );
 
-    // Fetch unread reactions (`messages.getUnreadReactions`).
+    // A channel mention on screen uses channels.readMessageContents.
+    let ok = world.ask(Request::MarkUnreadItemsRead {
+        conversation: key("c9001"),
+        kind: protocol::UnreadItemKind::Mentions,
+        message_ids: vec!["5".into()],
+    });
+    assert!(matches!(ok, Response::Ok), "expected Ok marking the channel mention read, got {ok:?}");
+    assert!(
+        world.calls().iter().any(|call| call == "channels.ReadMessageContents 5"),
+        "expected channels.ReadMessageContents 5 on wire, got: {:#?}",
+        world.calls()
+    );
+
+    // Reactions: the row's count, then mark-all (`messages.readReactions`) clears it.
     let reaction_ids = match world.ask(Request::UnreadItems {
         conversation: crew.clone(),
         kind: protocol::UnreadItemKind::Reactions,
@@ -4127,14 +4164,12 @@ fn unread_mentions_and_reactions_jump_and_clear() {
         Response::UnreadItems { message_ids } => message_ids,
         other => panic!("expected UnreadItems, got {other:?}"),
     };
-    assert_eq!(reaction_ids, vec!["23".to_owned(), "24".to_owned()]);
+    assert_eq!(reaction_ids, vec!["24".to_owned(), "25".to_owned()]);
     assert!(
-        world.calls().iter().any(|c| c == "GetUnreadReactions g8001"),
+        world.calls().iter().any(|call| call == "GetUnreadReactions g8001"),
         "expected GetUnreadReactions g8001 on wire, got: {:#?}",
         world.calls()
     );
-
-    // Mark reactions read (`messages.readReactions`).
     let ok = world.ask(Request::MarkUnreadItemsRead {
         conversation: crew.clone(),
         kind: protocol::UnreadItemKind::Reactions,
@@ -4142,25 +4177,13 @@ fn unread_mentions_and_reactions_jump_and_clear() {
     });
     assert!(matches!(ok, Response::Ok), "expected Ok marking reactions read, got {ok:?}");
     assert!(
-        world.calls().iter().any(|c| c == "ReadReactions g8001"),
+        world.calls().iter().any(|call| call == "ReadReactions g8001"),
         "expected ReadReactions g8001 on wire, got: {:#?}",
         world.calls()
     );
-    let cleared = match world.ask(Request::UnreadItems {
-        conversation: crew.clone(),
-        kind: protocol::UnreadItemKind::Reactions,
-        limit: 20,
-    }) {
-        Response::UnreadItems { message_ids } => message_ids,
-        other => panic!("expected UnreadItems, got {other:?}"),
-    };
-    assert!(cleared.is_empty(), "marking reactions read clears the list, got {cleared:?}");
-
-    // Conversation unread_reactions count must now be 0.
-    let conv = match world.ask(Request::Conversation { conversation: crew }) {
-        Response::Conversation { conversation } => conversation,
-        other => panic!("expected Conversation, got {other:?}"),
-    };
-    assert_eq!(conv.mentions, 0);
-    assert_eq!(conv.unread_reactions, 0);
+    let cleared = world.until("the reaction count to reach zero", || {
+        world.conversation("g8001").filter(|conversation| conversation.unread_reactions == 0 && conversation.mentions == 0)
+    });
+    assert_eq!(cleared.unread_reactions, 0);
+    assert_eq!(cleared.mentions, 0);
 }

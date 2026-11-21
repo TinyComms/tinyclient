@@ -1803,7 +1803,13 @@ impl Pane {
             let done = queue.is_empty();
             self.jump_to(&id, cx);
             let conv = conversation.clone();
-            let message_ids = if done { Vec::new() } else { vec![id] };
+            // A mention is this message (`readMessageContents`). A reaction names the one
+            // just opened until the last, which is the clear (`readReactions` takes no ids).
+            let message_ids = match kind {
+                protocol::UnreadItemKind::Mentions => vec![id],
+                protocol::UnreadItemKind::Reactions if done => Vec::new(),
+                protocol::UnreadItemKind::Reactions => vec![id],
+            };
             cx.spawn(async move |_, cx| {
                 let _ = cx
                     .background_executor()
@@ -1846,7 +1852,11 @@ impl Pane {
                         }
                         this.jump_to(&first, cx);
                         let conv_mark = conversation.clone();
-                        let mark_ids = if done { Vec::new() } else { vec![first] };
+                        let mark_ids = match kind {
+                            protocol::UnreadItemKind::Mentions => vec![first.clone()],
+                            protocol::UnreadItemKind::Reactions if done => Vec::new(),
+                            protocol::UnreadItemKind::Reactions => vec![first],
+                        };
                         cx.spawn(async move |_, cx| {
                             let _ = cx
                                 .background_executor()
