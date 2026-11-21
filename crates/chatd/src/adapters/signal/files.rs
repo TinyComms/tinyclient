@@ -38,8 +38,10 @@ pub fn refused(with: &Outgoing) -> Option<String> {
     if with.voice.is_some() {
         return Some("A voice note can't be sent to Signal from here.".into());
     }
-    if with.pick.is_some() {
-        return Some("Signal can't send a chosen sticker or GIF from here.".into());
+    if let Some(pick) = &with.pick {
+        if pick.kind != protocol::CatalogKind::Gifs {
+            return Some("Signal can't send a chosen sticker from here.".into());
+        }
     }
     if with.files.iter().any(|file| file.spoiler) {
         return Some("Signal can't hide a file behind a spoiler.".into());
@@ -120,6 +122,7 @@ pub fn prepare(name: &str, mime: &str, bytes: Vec<u8>, keep: bool) -> File {
         }
         _ => (0, 0, Vec::new(), None),
     };
+    let gif = sent_mime == "image/gif";
     File {
         name: shown,
         mime: sent_mime,
@@ -128,6 +131,7 @@ pub fn prepare(name: &str, mime: &str, bytes: Vec<u8>, keep: bool) -> File {
         height,
         thumb,
         blurhash,
+        gif,
     }
 }
 

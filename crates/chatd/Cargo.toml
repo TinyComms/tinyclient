@@ -77,6 +77,8 @@ aes-gcm = "0.10"
 async-trait = { version = "0.1", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
 rand = { version = "0.9", optional = true }
+prost = { version = "0.14", optional = true }
+reqwest = { version = "0.12", default-features = false, optional = true }
 
 # End-to-end encrypted text and attachments on a Tiny server (`adapters/tiny/e2ee.rs`): MLS
 # groups, sealed attachments, the device identity. All the cryptography is that crate's.
@@ -96,7 +98,7 @@ openmls_rust_crypto = "0.5.1"
 
 [features]
 default = ["signal"]
-signal = ["dep:presage", "dep:aes-gcm-siv", "dep:futures", "dep:async-trait", "dep:chrono", "dep:rand", "tokio/rt"]
+signal = ["dep:presage", "dep:aes-gcm-siv", "dep:futures", "dep:async-trait", "dep:chrono", "dep:rand", "dep:prost", "dep:reqwest", "tokio/rt"]
 
 [dev-dependencies]
 # Real MLS receive regressions construct the service's ordinary signed proposals/Welcomes.

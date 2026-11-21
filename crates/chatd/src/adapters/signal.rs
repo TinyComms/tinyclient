@@ -41,11 +41,15 @@ pub mod signin;
 mod vault;
 mod wire;
 
-use super::{keep_connected, serve_commands, About, Command, Context, Failure, Refusal, Signed};
+use super::{keep_connected, serve_commands, About, CatalogPage, Command, Context, ConversationAbout, Failure, Members, Refusal, Signed};
 use crate::blobs::upload::{self, Upload};
 use crate::session;
 use crate::store::{ConversationRow, Filing, FolderRow, PersonRow};
-use protocol::{Attachment, Contact, ContactKind, ConversationKind, Delivery, Link, MediaFile, MediaKind, Message, MessageKind, Outgoing, Poll, PollBallot, PollDraft, Reaction, RelateAction, Relation, ReplyTo, ReportReason, ReportTarget, Span, Special};
+use protocol::{
+    Attachment, CatalogItem, CatalogKind, Contact, ContactKind, ConversationKind, ConversationRights, Delivery, Link,
+    MediaFile, MediaKind, MemberSection, Message, MessageKind, Outgoing, Person, Poll, PollBallot, PollDraft,
+    Reaction, RelateAction, Relation, ReplyTo, ReportReason, ReportTarget, Span, Special,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -87,6 +91,121 @@ const POLL_MOST: usize = 10;
 /// never starts with this mark.
 const POLL_VOTE: &str = "\u{1}signal-poll-vote\u{1}";
 const POLL_END: &str = "\u{1}signal-poll-end\u{1}";
+/// Promote or revoke a group admin, packed into a `MembersRemove` person string (`\u{1}admin\u{1}<aci>`
+/// or `\u{1}member\u{1}<aci>`). An ACI never starts with `\u{1}`.
+const GROUP_ADMIN_PROMOTE: &str = "\u{1}signal-admin-promote\u{1}";
+const GROUP_ADMIN_REVOKE: &str = "\u{1}signal-admin-revoke\u{1}";
+/// Group permissions edit packed into `ConversationUpdate.description`:
+/// `\u{1}signal-group-perms\u{1}members=admin|member;attributes=admin|member;announcements=on|off`.
+const GROUP_PERMS_PREFIX: &str = "\u{1}signal-group-perms\u{1}";
+/// Group invite link control packed into `ConversationUpdate.description`:
+/// `\u{1}signal-group-link\u{1}off|on|approval|reset`.
+const GROUP_LINK_PREFIX: &str = "\u{1}signal-group-link\u{1}";
+/// Join request approval/denial packed into `MembersRemove.person`:
+/// `\u{1}signal-join-approve\u{1}<aci>` or `\u{1}signal-join-deny\u{1}<aci>`.
+const GROUP_JOIN_APPROVE: &str = "\u{1}signal-join-approve\u{1}";
+const GROUP_JOIN_DENY: &str = "\u{1}signal-join-deny\u{1}";
+/// Join a group from its `https://signal.group/#...` link packed into `StartDirect.person_id`.
+const GROUP_JOIN_LINK: &str = "\u{1}signal-join-link\u{1}";
+/// Signal call link commands packed into `Handoff.conversation_id`:
+/// - `\u{1}signal-call-link-create\u{1}<approve:0|1>|<name>` -> returns `https://signal.link/call/#key=...`
+/// - `\u{1}signal-call-link-update\u{1}<approve:0|1>|<url>|<name>` -> returns updated `https://signal.link/call/#key=...`
+/// - `\u{1}signal-call-link-join\u{1}<url>` -> returns `room:<hex>` or `waiting:<hex>`
+/// - `\u{1}signal-call-link-delete\u{1}<url>` -> returns `"deleted"`
+const CALL_LINK_CREATE: &str = "\u{1}signal-call-link-create\u{1}";
+const CALL_LINK_UPDATE: &str = "\u{1}signal-call-link-update\u{1}";
+const CALL_LINK_JOIN: &str = "\u{1}signal-call-link-join\u{1}";
+const CALL_LINK_DELETE: &str = "\u{1}signal-call-link-delete\u{1}";
+
+/// Packs a Signal call link creation request for `Request::Handoff`.
+pub fn call_link_create_command(name: &str, approve_all: bool) -> String {
+    format!("{CALL_LINK_CREATE}{}|{name}", u8::from(approve_all))
+}
+
+/// Packs a Signal call link join request for `Request::Handoff`.
+pub fn call_link_join_command(url: &str) -> String {
+    format!("{CALL_LINK_JOIN}{url}")
+}
+
+/// Packs a Signal call link delete request for `Request::Handoff`.
+pub fn call_link_delete_command(url: &str) -> String {
+    format!("{CALL_LINK_DELETE}{url}")
+}
+
+/// Packs a Signal group invite link mode change (`off`, `on`, `approval`, `reset`).
+pub fn group_link_command(mode: &str) -> String {
+    format!("{GROUP_LINK_PREFIX}{mode}")
+}
+
+/// Packs a join-request approval or denial for `MembersRemove`.
+pub fn group_join_request_command(person: &str, approve: bool) -> String {
+    if approve {
+        format!("{GROUP_JOIN_APPROVE}{person}")
+    } else {
+        format!("{GROUP_JOIN_DENY}{person}")
+    }
+}
+
+/// Packs a `https://signal.group/#...` join request for `StartDirect`.
+pub fn group_join_link_command(url: &str) -> String {
+    format!("{GROUP_JOIN_LINK}{url}")
+}
+
+/// Packs a Signal group permissions edit so `Request::ConversationUpdate` carries it.
+pub fn group_permissions_command(
+    member_access: Option<bool>,
+    attributes_access: Option<bool>,
+    announcements_only: Option<bool>,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(admins_only) = member_access {
+        parts.push(format!("members={}", if admins_only { "admin" } else { "member" }));
+    }
+    if let Some(admins_only) = attributes_access {
+        parts.push(format!("attributes={}", if admins_only { "admin" } else { "member" }));
+    }
+    if let Some(on) = announcements_only {
+        parts.push(format!("announcements={}", if on { "on" } else { "off" }));
+    }
+    format!("{GROUP_PERMS_PREFIX}{}", parts.join(";"))
+}
+
+fn parse_group_permissions(text: &str) -> Option<wire::GroupEdit> {
+    let rest = text.strip_prefix(GROUP_PERMS_PREFIX)?;
+    let mut edit = wire::GroupEdit::default();
+    for pair in rest.split(';').filter(|s| !s.is_empty()) {
+        let (k, v) = pair.split_once('=')?;
+        match (k, v) {
+            ("members", "admin") => edit.member_access = Some(wire::GroupAccess::Administrator),
+            ("members", "member") => edit.member_access = Some(wire::GroupAccess::Member),
+            ("attributes", "admin") => edit.attributes_access = Some(wire::GroupAccess::Administrator),
+            ("attributes", "member") => edit.attributes_access = Some(wire::GroupAccess::Member),
+            ("announcements", "on") => edit.announcements_only = Some(true),
+            ("announcements", "off") => edit.announcements_only = Some(false),
+            _ => return None,
+        }
+    }
+    Some(edit)
+}
+
+/// Packs a Signal group admin role change so the existing member-management channel carries it.
+pub fn group_admin_command(person: &str, admin: bool) -> String {
+    if admin {
+        format!("{GROUP_ADMIN_PROMOTE}{person}")
+    } else {
+        format!("{GROUP_ADMIN_REVOKE}{person}")
+    }
+}
+
+fn group_admin_action(person: &str) -> Option<(&str, bool)> {
+    if let Some(aci) = person.strip_prefix(GROUP_ADMIN_PROMOTE) {
+        Some((aci, true))
+    } else if let Some(aci) = person.strip_prefix(GROUP_ADMIN_REVOKE) {
+        Some((aci, false))
+    } else {
+        None
+    }
+}
 /// What a person with no name we know is called.
 const NO_NAME: &str = "Signal user";
 
@@ -523,6 +642,8 @@ struct Live {
     groups: HashMap<String, Vec<String>>,
     /// A group's administrator ACIs, keyed by the conversation id.
     group_admins: HashMap<String, Vec<String>>,
+    /// Full group metadata, keyed by conversation id (`g.<hex>`), for info panes and access checks.
+    group_info: HashMap<String, wire::GroupInfo>,
     /// Each person's reaction on a message: (message id, person) → emoji.
     /// Bounded to `REACTIONS_KEPT` in memory and on disk at `reactions_path`.
     reactions: HashMap<(String, String), String>,
@@ -566,6 +687,12 @@ struct Live {
     accepted: HashSet<String>,
     /// Direct conversations currently waiting as unaccepted message requests.
     requests: HashSet<String>,
+    /// Recently searched GIF entries keyed by catalog item id, bounded to 256 entries.
+    gifs: HashMap<String, wire::GifEntry>,
+    /// Synced call history rows (`(conversation_id, call_id)`), bounded to 500 entries.
+    call_history: VecDeque<(String, u64)>,
+    /// Created or synced call links keyed by their 32-byte root key.
+    call_links: HashMap<[u8; 32], wire::CallLink>,
 }
 
 /// What [`Event::Call`] told of, for [`Event::CallEnded`] to end it.
@@ -1045,6 +1172,32 @@ fn message(account: &Account, text: &Text, outgoing: bool) -> Message {
         message.kind = MessageKind::Unsupported { link: String::new() };
     }
     message.contacts = text.contacts.clone();
+    if wire::find_group_invite_link(&message.text).is_some() {
+        message.card = Some(Box::new(protocol::Card {
+            title: "Signal group invite".to_owned(),
+            text: "Joining by link shares your profile key with the group.".to_owned(),
+            footer: "Join group".to_owned(),
+            ..protocol::Card::default()
+        }));
+    } else if let Some((_, root_key)) = wire::find_call_link(&message.text) {
+        let known = account.live().call_links.get(&root_key).cloned();
+        let title = known
+            .as_ref()
+            .filter(|l| !l.name.is_empty())
+            .map(|l| l.name.clone())
+            .unwrap_or_else(|| "Signal call link".to_owned());
+        let text = if known.as_ref().is_some_and(|l| l.approve_all) {
+            "Admin approval required to join.".to_owned()
+        } else {
+            "Anyone with this link can join the call.".to_owned()
+        };
+        message.card = Some(Box::new(protocol::Card {
+            title,
+            text,
+            footer: "Join call".to_owned(),
+            ..protocol::Card::default()
+        }));
+    }
     message.reply_to = text.quote.as_ref().map(|quote| reply_to(account, quote));
     message
 }
@@ -1111,10 +1264,13 @@ fn apply(account: &Account, event: Event) {
             for group in groups {
                 let peer = Peer::Group(group.id.clone());
                 let conv = peer.conversation();
+                let rights = group_rights(&group, &account.me);
+                let is_admin = group.admins.iter().any(|id| id == &account.me);
                 {
                     let mut live = account.live();
                     live.groups.insert(conv.clone(), group.member_ids.clone());
                     live.group_admins.insert(conv.clone(), group.admins.clone());
+                    live.group_info.insert(conv.clone(), group.clone());
                     live.known_conversations.insert(conv.clone());
                     live.accepted.insert(conv.clone());
                     if group.timer_secs > 0 {
@@ -1123,7 +1279,11 @@ fn apply(account: &Account, event: Event) {
                 }
                 let mut row = row(&peer, &group.title);
                 row.topic = group.description.chars().take(300).collect();
-                row.read_only = !group.member;
+                row.read_only = !group.member || (group.announcements_only && !is_admin);
+                if group.member && group.announcements_only && !is_admin {
+                    row.read_only_reason = "Only admins can send messages".to_owned();
+                }
+                row.rights = rights;
                 row.avatar = ctx.avatar_of(&row.id);
                 let _ = ctx.conversation(&row);
                 if !account.live().folders.is_empty() {
@@ -1353,6 +1513,25 @@ fn apply(account: &Account, event: Event) {
         }
         Event::Call { peer, by, name, video, id, sent } => incoming_call(account, &peer, &by, &name, video, id, sent),
         Event::CallEnded { id, answered } => ended_call(account, id, answered),
+        Event::CallEvent { peer, call_id, timestamp, kind, incoming, outcome } => {
+            apply_call_event(account, &peer, call_id, timestamp, kind, incoming, outcome);
+        }
+        Event::CallLogEvent { kind, peer, call_id, timestamp } => {
+            apply_call_log_event(account, kind, peer.as_ref(), call_id, timestamp);
+        }
+        Event::CallLinkUpdated { root_key, admin_passkey } => {
+            let mut live = account.live();
+            let entry = live.call_links.entry(root_key).or_insert_with(|| wire::CallLink {
+                root_key,
+                url: wire::format_call_link(&root_key),
+                name: String::new(),
+                approve_all: false,
+                admin_passkey: None,
+            });
+            if admin_passkey.is_some() {
+                entry.admin_passkey = admin_passkey;
+            }
+        }
         Event::Settings { read_receipts, typing } => {
             let mut live = account.live();
             live.read_receipts = read_receipts;
@@ -1633,6 +1812,149 @@ fn ended_call(account: &Account, id: u64, answered: bool) {
     let _ = account.ctx.quiet_line(&ring.conversation, &line, true);
 }
 
+fn call_event_label(kind: wire::CallKind, incoming: bool, outcome: wire::CallOutcome) -> &'static str {
+    match (outcome, kind, incoming) {
+        (wire::CallOutcome::Observed, _, _) => "Answered on another device",
+        (wire::CallOutcome::Accepted, wire::CallKind::Voice, true) => "Incoming voice call",
+        (wire::CallOutcome::Accepted, wire::CallKind::Video, true) => "Incoming video call",
+        (wire::CallOutcome::Accepted, wire::CallKind::Voice, false) => "Outgoing voice call",
+        (wire::CallOutcome::Accepted, wire::CallKind::Video, false) => "Outgoing video call",
+        (wire::CallOutcome::Accepted, wire::CallKind::Group, _) => "Group call",
+        (wire::CallOutcome::Accepted, wire::CallKind::AdHoc, _) => "Call link",
+        (wire::CallOutcome::NotAccepted, wire::CallKind::Voice, true) => "Missed voice call",
+        (wire::CallOutcome::NotAccepted, wire::CallKind::Video, true) => "Missed video call",
+        (wire::CallOutcome::NotAccepted, wire::CallKind::Voice, false) => "Cancelled voice call",
+        (wire::CallOutcome::NotAccepted, wire::CallKind::Video, false) => "Cancelled video call",
+        (wire::CallOutcome::NotAccepted, wire::CallKind::Group, _) => "Missed group call",
+        (wire::CallOutcome::NotAccepted, wire::CallKind::AdHoc, _) => "Missed call",
+        (wire::CallOutcome::Deleted, _, _) => "",
+    }
+}
+
+fn apply_call_event(
+    account: &Account,
+    peer: &Peer,
+    call_id: u64,
+    timestamp: u64,
+    kind: wire::CallKind,
+    incoming: bool,
+    outcome: wire::CallOutcome,
+) {
+    let conversation = peer.conversation();
+    let msg_id = format!("signal-call-{call_id}");
+    if outcome == wire::CallOutcome::Deleted {
+        account.live().call_history.retain(|(c, id)| !(c == &conversation && *id == call_id));
+        let _ = account.ctx.deleted(&conversation, &msg_id);
+        return;
+    }
+    // If an incoming ring is active for this call/peer and it was accepted/observed elsewhere, stop ringing.
+    if matches!(outcome, wire::CallOutcome::Accepted | wire::CallOutcome::Observed) {
+        let stop = {
+            let mut live = account.live();
+            if live.ring.as_ref().is_some_and(|r| r.id == call_id || r.conversation == conversation) {
+                live.ring.take()
+            } else {
+                None
+            }
+        };
+        if let Some(ring) = stop {
+            account.ctx.phone_ring_stopped(&ring.conversation);
+        }
+    }
+    match peer {
+        Peer::Direct(aci) => {
+            let title = account.live().names.get(aci).cloned().unwrap_or_default();
+            ensure_row(account, peer, &title);
+        }
+        Peer::Group(_) => {
+            if let Ok(None) = account.ctx.known(&conversation) {
+                let _ = account.ctx.conversation(&row(peer, ""));
+            }
+        }
+    }
+    let label = call_event_label(kind, incoming, outcome);
+    let author_id = if incoming {
+        match peer {
+            Peer::Direct(aci) => aci.clone(),
+            Peer::Group(_) => String::new(),
+        }
+    } else {
+        account.me.clone()
+    };
+    let author_name = if author_id == account.me {
+        account.name.clone()
+    } else if author_id.is_empty() {
+        String::new()
+    } else {
+        account.live().name(&author_id)
+    };
+    let mut line = Message::plain(msg_id, author_name, label, i64::try_from(timestamp / 1_000).unwrap_or(0), !incoming);
+    line.kind = MessageKind::System;
+    line.sender.id = author_id;
+    {
+        let mut live = account.live();
+        if !live.call_history.iter().any(|(c, id)| c == &conversation && *id == call_id) {
+            if live.call_history.len() >= 500 {
+                live.call_history.pop_front();
+            }
+            live.call_history.push_back((conversation.clone(), call_id));
+        }
+    }
+    let unread = incoming && outcome == wire::CallOutcome::NotAccepted;
+    let _ = account.ctx.quiet_line(&conversation, &line, unread);
+}
+
+fn apply_call_log_event(account: &Account, kind: wire::CallLogKind, peer: Option<&Peer>, _call_id: Option<u64>, _timestamp: u64) {
+    match kind {
+        wire::CallLogKind::Clear => {
+            let entries: Vec<(String, u64)> = account.live().call_history.drain(..).collect();
+            for (conv, cid) in entries {
+                let _ = account.ctx.deleted(&conv, &format!("signal-call-{cid}"));
+            }
+        }
+        wire::CallLogKind::ClearInConversation => {
+            let Some(conv) = peer.map(Peer::conversation) else {
+                return;
+            };
+            let mut removed = Vec::new();
+            account.live().call_history.retain(|(c, cid)| {
+                if c == &conv {
+                    removed.push(*cid);
+                    false
+                } else {
+                    true
+                }
+            });
+            for cid in removed {
+                let _ = account.ctx.deleted(&conv, &format!("signal-call-{cid}"));
+            }
+        }
+        wire::CallLogKind::MarkedAsRead => {
+            let mut latest: HashMap<String, u64> = HashMap::new();
+            for (conv, cid) in account.live().call_history.iter() {
+                latest.insert(conv.clone(), *cid);
+            }
+            for (conv, cid) in latest {
+                let updated = account.ctx.known(&conv).ok().flatten().map_or(0, |row| row.updated);
+                let _ = account.ctx.counts(&conv, 0, 0, Some(&format!("signal-call-{cid}")), updated);
+            }
+        }
+        wire::CallLogKind::MarkedAsReadInConversation => {
+            if let Some(conv) = peer.map(Peer::conversation) {
+                let last_cid = account
+                    .live()
+                    .call_history
+                    .iter()
+                    .rev()
+                    .find(|(c, _)| c == &conv)
+                    .map(|(_, cid)| format!("signal-call-{cid}"));
+                let updated = account.ctx.known(&conv).ok().flatten().map_or(0, |row| row.updated);
+                let _ = account.ctx.counts(&conv, 0, 0, last_cid.as_deref(), updated);
+            }
+        }
+    }
+}
+
 /// A Signal username as libsignal's `Username::new` accepts one: `nickname.42`, optionally with
 /// one leading `@`. A plain name, a phone number, and a `signal.me` link are not usernames, so
 /// they are not sent to Signal.
@@ -1736,7 +2058,14 @@ fn offline(ctx: &Context, command: Command) {
         | Command::Relate { reply, .. }
         | Command::AnswerMessageRequest { reply, .. }
         | Command::Report { reply, .. }
-        | Command::Leave { reply, .. } => drop(reply.send(Err(down()))),
+        | Command::Leave { reply, .. }
+        | Command::MembersAdd { reply, .. }
+        | Command::MembersRemove { reply, .. }
+        | Command::ConversationUpdate { reply, .. }
+        | Command::ConversationPicture { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Members { reply, .. } => drop(reply.send(Err(down()))),
+        Command::ConversationInfo { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
         Command::StartDirect { reply, .. } | Command::StartGroup { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchPeople(query) => ctx.searched(&query),
         Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
@@ -1761,6 +2090,7 @@ fn capabilities() -> protocol::Capabilities {
         edit_window: (SEND_WINDOW_MS / 1_000) as u32,
         max_file_bytes: files.max_file_bytes,
         max_files: files.max_files,
+        gifs: true,
         reply: true,
         edit: true,
         delete: true,
@@ -1781,6 +2111,7 @@ fn capabilities() -> protocol::Capabilities {
         pin_chats: 4,
         archive: true,
         groups: 1_000,
+        blocks: true,
         ..protocol::Capabilities::default()
     }
 }
@@ -1921,6 +2252,15 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::Typing { conversation_id, activity: _ } => typing(account, &conversation_id),
         Command::StartDirect { person_id, reply } => {
+            if let Some(url) = person_id.strip_prefix(GROUP_JOIN_LINK) {
+                let res = account
+                    .wire
+                    .group_join_by_link(url.trim())
+                    .map(|g| Peer::Group(g.id).conversation())
+                    .map_err(refused);
+                let _ = reply.send(res);
+                return;
+            }
             // Nothing reaches the other person: the chat exists on Signal once a message does.
             let started = wire::is_aci(&person_id).then(|| {
                 let name = account.live().names.get(&person_id).cloned().unwrap_or_default();
@@ -1957,16 +2297,19 @@ fn serve(account: &Arc<Account>, command: Command) {
                 let created = account.wire.create_group(&title, &members).map_err(refused)?;
                 let peer = Peer::Group(created.id.clone());
                 let conv = peer.conversation();
+                let rights = group_rights(&created, &account.me);
                 {
                     let mut live = account.live();
                     live.groups.insert(conv.clone(), created.member_ids.clone());
                     live.group_admins.insert(conv.clone(), created.admins.clone());
+                    live.group_info.insert(conv.clone(), created.clone());
                     live.known_conversations.insert(conv.clone());
                     live.accepted.insert(conv.clone());
                 }
                 let mut group_row = row(&peer, &created.title);
                 group_row.topic = created.description.chars().take(300).collect();
                 group_row.read_only = !created.member;
+                group_row.rights = rights;
                 group_row.avatar = ctx.avatar_of(&group_row.id);
                 let _ = ctx.conversation(&group_row);
                 if !account.live().folders.is_empty() {
@@ -1977,6 +2320,30 @@ fn serve(account: &Arc<Account>, command: Command) {
             let _ = reply.send(outcome);
         }
         Command::SearchPeople(query) => search_people(account, &query),
+        Command::Members { conversation_id, offset, limit, reply } => {
+            let _ = reply.send(group_members(account, &conversation_id, offset, limit));
+        }
+        Command::ConversationInfo { conversation_id, reply } => {
+            let _ = reply.send(conversation_info(account, &conversation_id));
+        }
+        Command::MembersAdd { conversation_id, people, reply } => {
+            let _ = reply.send(members_add(account, &conversation_id, &people));
+        }
+        Command::MembersRemove { conversation_id, person, reply } => {
+            let _ = reply.send(members_remove(account, &conversation_id, &person));
+        }
+        Command::ConversationUpdate { conversation_id, title, topic, description, reply } => {
+            let _ = reply.send(group_update(account, &conversation_id, title, topic.or(description)));
+        }
+        Command::ConversationPicture { conversation_id, path, reply } => {
+            let _ = reply.send(group_picture(account, &conversation_id, &path));
+        }
+        Command::Catalog { kind, query, cursor, reply, .. } => {
+            let _ = reply.send(catalog(account, kind, &query, cursor.as_deref()));
+        }
+        Command::Handoff { conversation_id, reply } => {
+            let _ = reply.send(call_link_handoff(account, &conversation_id));
+        }
         Command::Watch(watching) => pictures(account, &watching),
         Command::SignOut(reply) => {
             if let Err(fault) = account.wire.unlink() {
@@ -2023,19 +2390,26 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::AnswerMessageRequest { conversation_id, accept, reply } => {
             let outcome = (|| -> Result<(), Refusal> {
                 let to = peer(&conversation_id).map_err(refused)?;
-                let action = if accept { wire::MessageRequestAction::Accept } else { wire::MessageRequestAction::Delete };
-                account.wire.respond_message_request(&to, action).map_err(refused)?;
-                if accept {
-                    let title = {
-                        let mut live = account.live();
-                        live.requests.remove(&conversation_id);
-                        live.accepted.insert(conversation_id.clone());
-                        live.names.get(&conversation_id).cloned().unwrap_or_default()
-                    };
-                    ensure_row(account, &to, &title);
-                } else {
-                    account.live().requests.remove(&conversation_id);
-                    let _ = ctx.forget_conversation(&conversation_id);
+                match &to {
+                    Peer::Group(group_id) => {
+                        account.wire.group_pending_invite(group_id, accept).map_err(refused)?;
+                    }
+                    Peer::Direct(_) => {
+                        let action = if accept { wire::MessageRequestAction::Accept } else { wire::MessageRequestAction::Delete };
+                        account.wire.respond_message_request(&to, action).map_err(refused)?;
+                        if accept {
+                            let title = {
+                                let mut live = account.live();
+                                live.requests.remove(&conversation_id);
+                                live.accepted.insert(conversation_id.clone());
+                                live.names.get(&conversation_id).cloned().unwrap_or_default()
+                            };
+                            ensure_row(account, &to, &title);
+                        } else {
+                            account.live().requests.remove(&conversation_id);
+                            let _ = ctx.forget_conversation(&conversation_id);
+                        }
+                    }
                 }
                 Ok(())
             })();
@@ -2097,6 +2471,7 @@ fn serve(account: &Arc<Account>, command: Command) {
                     let mut live = account.live();
                     live.groups.remove(&conversation_id);
                     live.group_admins.remove(&conversation_id);
+                    live.group_info.remove(&conversation_id);
                     live.known_conversations.remove(&conversation_id);
                     live.archived.remove(&conversation_id);
                     live.pinned.retain(|id| id != &conversation_id);
@@ -2107,6 +2482,21 @@ fn serve(account: &Arc<Account>, command: Command) {
             let _ = reply.send(outcome);
         }
         Command::SetDisappearing { conversation_id, seconds, reply } => {
+            if let Some(Peer::Group(group_id)) = Peer::parse(&conversation_id) {
+                let allowed = account
+                    .live()
+                    .group_info
+                    .get(&conversation_id)
+                    .is_some_and(|g| group_rights(g, &account.me).edit_topic);
+                if !allowed {
+                    let _ = reply.send(Err(Refusal::Refused("Only group admins can change the disappearing messages timer.".into())));
+                    return;
+                }
+                if let Err(fault) = account.wire.group_set_timer(&group_id, seconds) {
+                    let _ = reply.send(Err(refused(fault)));
+                    return;
+                }
+            }
             let next_version = {
                 let mut live = account.live();
                 let current = live.timer_of(&conversation_id);
@@ -2171,6 +2561,410 @@ fn set_own(account: &Account, name: Option<String>, about: Option<String>, emoji
     account.wire.set_card(name, about, emoji).map_err(refused)?;
     show_self(account);
     Ok(())
+}
+
+/// Computes `ConversationRights` for a Signal group from its access control and our role.
+fn group_rights(group: &wire::GroupInfo, me: &str) -> ConversationRights {
+    if !group.member {
+        return ConversationRights::default();
+    }
+    let is_admin = group.admins.iter().any(|id| id == me);
+    let can_add = is_admin || matches!(group.member_access, wire::GroupAccess::Member | wire::GroupAccess::Any);
+    let can_edit = is_admin || matches!(group.attributes_access, wire::GroupAccess::Member | wire::GroupAccess::Any);
+    ConversationRights {
+        pin: false,
+        delete_others: is_admin,
+        manage_members: is_admin,
+        add_members: can_add,
+        remove_members: is_admin,
+        rename: can_edit,
+        edit_topic: can_edit,
+        edit_picture: can_edit,
+    }
+}
+
+fn group_members(account: &Account, conversation_id: &str, offset: u32, limit: u32) -> Result<Members, Refusal> {
+    let Some(Peer::Group(group_id)) = Peer::parse(conversation_id) else {
+        return Err(Refusal::Unsupported);
+    };
+    let listed = account.wire.group_members(&group_id).map_err(refused)?;
+    let live = account.live();
+    let resolve_name = |m: &wire::GroupMember| -> String {
+        if m.id == account.me {
+            if !account.name.is_empty() {
+                return account.name.clone();
+            }
+        }
+        if !m.name.is_empty() {
+            return m.name.clone();
+        }
+        live.name(&m.id)
+    };
+    let make_person = |m: &wire::GroupMember, status: &str| -> Person {
+        let mut person = Person::new(account.ctx.key(&m.id), resolve_name(m));
+        person.status = status.to_owned();
+        person
+    };
+
+    let mut admins: Vec<Person> = listed
+        .members
+        .iter()
+        .filter(|m| m.admin)
+        .map(|m| make_person(m, "Admin"))
+        .collect();
+    let mut regular: Vec<Person> = listed
+        .members
+        .iter()
+        .filter(|m| !m.admin)
+        .map(|m| make_person(m, ""))
+        .collect();
+    let mut pending: Vec<Person> = listed
+        .pending
+        .iter()
+        .map(|m| make_person(m, "Invited"))
+        .collect();
+    let mut requesting: Vec<Person> = listed
+        .requesting
+        .iter()
+        .map(|m| make_person(m, "Requested to join"))
+        .collect();
+    drop(live);
+
+    let mut sections = Vec::new();
+    if !admins.is_empty() {
+        sections.push(MemberSection { name: "Admins".into(), count: admins.len() as u32 });
+    }
+    if !regular.is_empty() {
+        sections.push(MemberSection { name: "Members".into(), count: regular.len() as u32 });
+    }
+    if !pending.is_empty() {
+        sections.push(MemberSection { name: "Pending invites".into(), count: pending.len() as u32 });
+    }
+    if !requesting.is_empty() {
+        sections.push(MemberSection { name: "Join requests".into(), count: requesting.len() as u32 });
+    }
+
+    let mut all = Vec::with_capacity(admins.len() + regular.len() + pending.len() + requesting.len());
+    all.append(&mut admins);
+    all.append(&mut regular);
+    all.append(&mut pending);
+    all.append(&mut requesting);
+
+    let start = (offset as usize).min(all.len());
+    let take = if limit == 0 { all.len() } else { limit as usize };
+    let members = all.into_iter().skip(start).take(take).collect();
+    Ok(Members { pending: false, sections, members })
+}
+
+fn conversation_info(account: &Account, conversation_id: &str) -> Result<ConversationAbout, Refusal> {
+    let Some(peer) = Peer::parse(conversation_id) else {
+        return Err(Refusal::Unsupported);
+    };
+    let live = account.live();
+    match peer {
+        Peer::Group(_) => {
+            let Some(group) = live.group_info.get(conversation_id) else {
+                return Err(Refusal::Refused("This group isn't one Signal still knows for you.".into()));
+            };
+            let timer = live.timer_of(conversation_id).seconds;
+            let disappearing = if timer > 0 { Some(timer) } else if group.timer_secs > 0 { Some(group.timer_secs) } else { None };
+            Ok(ConversationAbout {
+                description: group.description.clone(),
+                members: Some(group.members),
+                link: group.invite_link.clone(),
+                disappearing,
+                ..ConversationAbout::default()
+            })
+        }
+        Peer::Direct(_) => {
+            let timer = live.timer_of(conversation_id).seconds;
+            Ok(ConversationAbout {
+                disappearing: (timer > 0).then_some(timer),
+                ..ConversationAbout::default()
+            })
+        }
+    }
+}
+
+fn members_add(account: &Account, conversation_id: &str, people: &[String]) -> Result<(), Refusal> {
+    let Some(Peer::Group(group_id)) = Peer::parse(conversation_id) else {
+        return Err(Refusal::Unsupported);
+    };
+    if people.is_empty() {
+        return Err(Refusal::Refused("Choose at least one person to add.".into()));
+    }
+    let allowed = account
+        .live()
+        .group_info
+        .get(conversation_id)
+        .is_some_and(|g| group_rights(g, &account.me).add_members);
+    if !allowed {
+        return Err(Refusal::Refused("Only group admins can add members.".into()));
+    }
+    let mut acis = Vec::with_capacity(people.len());
+    for raw in people {
+        let trimmed = raw.trim();
+        if wire::is_aci(trimmed) {
+            acis.push(trimmed.to_owned());
+        } else if let Some(username) = username_of(trimmed) {
+            match account.wire.lookup(username).map_err(refused)? {
+                Some(aci) if wire::is_aci(&aci) => acis.push(aci),
+                _ => return Err(Refusal::Refused(format!("No Signal account found for {trimmed}."))),
+            }
+        } else {
+            return Err(Refusal::Refused(format!("{trimmed} is not a Signal account id or username.")));
+        }
+    }
+    account.wire.group_add_members(&group_id, &acis).map_err(refused)
+}
+
+fn members_remove(account: &Account, conversation_id: &str, person: &str) -> Result<(), Refusal> {
+    let Some(Peer::Group(group_id)) = Peer::parse(conversation_id) else {
+        return Err(Refusal::Unsupported);
+    };
+    if let Some((target_aci, admin)) = group_admin_action(person) {
+        let target_aci = target_aci.trim();
+        if !wire::is_aci(target_aci) {
+            return Err(Refusal::Refused("That person's role can't be changed here.".into()));
+        }
+        let allowed = account
+            .live()
+            .group_info
+            .get(conversation_id)
+            .is_some_and(|g| group_rights(g, &account.me).manage_members);
+        if !allowed {
+            return Err(Refusal::Refused("Only group admins can change admin roles.".into()));
+        }
+        return account.wire.group_set_admin(&group_id, target_aci, admin).map_err(refused);
+    }
+    if let Some(target_aci) = person.strip_prefix(GROUP_JOIN_APPROVE).or_else(|| person.strip_prefix(GROUP_JOIN_DENY)) {
+        let approve = person.starts_with(GROUP_JOIN_APPROVE);
+        let target_aci = target_aci.trim();
+        if !wire::is_aci(target_aci) {
+            return Err(Refusal::Refused("That join request can't be reviewed here.".into()));
+        }
+        let allowed = account
+            .live()
+            .group_info
+            .get(conversation_id)
+            .is_some_and(|g| group_rights(g, &account.me).manage_members);
+        if !allowed {
+            return Err(Refusal::Refused("Only group admins can approve or deny join requests.".into()));
+        }
+        return account.wire.group_review_request(&group_id, target_aci, approve).map_err(refused);
+    }
+    let person = person.trim();
+    if !wire::is_aci(person) {
+        return Err(Refusal::Refused("That person can't be removed from here.".into()));
+    }
+    if person == account.me {
+        return Err(Refusal::Refused("You can't remove yourself from the group here.".into()));
+    }
+    let allowed = account
+        .live()
+        .group_info
+        .get(conversation_id)
+        .is_some_and(|g| group_rights(g, &account.me).remove_members);
+    if !allowed {
+        return Err(Refusal::Refused("Only group admins can remove members.".into()));
+    }
+    account.wire.group_remove_member(&group_id, person).map_err(refused)
+}
+
+fn group_update(account: &Account, conversation_id: &str, title: Option<String>, description: Option<String>) -> Result<(), Refusal> {
+    let Some(Peer::Group(group_id)) = Peer::parse(conversation_id) else {
+        return Err(Refusal::Unsupported);
+    };
+    if let Some(desc) = description.as_deref() {
+        if let Some(mode_str) = desc.strip_prefix(GROUP_LINK_PREFIX) {
+            let is_admin = account
+                .live()
+                .group_info
+                .get(conversation_id)
+                .is_some_and(|g| group_rights(g, &account.me).manage_members);
+            if !is_admin {
+                return Err(Refusal::Refused("Only group admins can change the group invite link.".into()));
+            }
+            let mode = match mode_str.trim() {
+                "off" => wire::InviteLinkMode::Off,
+                "on" => wire::InviteLinkMode::Enabled,
+                "approval" => wire::InviteLinkMode::ApprovalRequired,
+                "reset" => wire::InviteLinkMode::Reset,
+                _ => return Err(Refusal::Refused("Unknown invite link setting.".into())),
+            };
+            account.wire.group_invite_link(&group_id, mode).map_err(refused)?;
+            return Ok(());
+        }
+        if let Some(edit) = parse_group_permissions(desc) {
+            let is_admin = account
+                .live()
+                .group_info
+                .get(conversation_id)
+                .is_some_and(|g| group_rights(g, &account.me).manage_members);
+            if !is_admin {
+                return Err(Refusal::Refused("Only group admins can change group permissions.".into()));
+            }
+            return account.wire.group_update(&group_id, edit).map_err(refused);
+        }
+    }
+    let allowed = account
+        .live()
+        .group_info
+        .get(conversation_id)
+        .is_some_and(|g| {
+            let r = group_rights(g, &account.me);
+            (title.is_none() || r.rename) && (description.is_none() || r.edit_topic)
+        });
+    if !allowed {
+        return Err(Refusal::Refused("Only group admins can edit group details.".into()));
+    }
+    if title.as_ref().is_some_and(|t| t.trim().is_empty()) {
+        return Err(Refusal::Refused("A group name can't be empty.".into()));
+    }
+    let edit = wire::GroupEdit { title, description, ..wire::GroupEdit::default() };
+    account.wire.group_update(&group_id, edit).map_err(refused)
+}
+
+fn group_picture(account: &Account, conversation_id: &str, path: &str) -> Result<(), Refusal> {
+    let Some(Peer::Group(group_id)) = Peer::parse(conversation_id) else {
+        return Err(Refusal::Unsupported);
+    };
+    let allowed = account
+        .live()
+        .group_info
+        .get(conversation_id)
+        .is_some_and(|g| group_rights(g, &account.me).edit_picture);
+    if !allowed {
+        return Err(Refusal::Refused("Only group admins can change the group photo.".into()));
+    }
+    let bytes = if path.trim().is_empty() {
+        Vec::new()
+    } else {
+        std::fs::read(path).map_err(|_| Refusal::Refused("The photo file could not be read.".into()))?
+    };
+    account.wire.group_set_avatar(&group_id, bytes).map_err(refused)
+}
+
+fn catalog(account: &Account, kind: CatalogKind, query: &str, cursor: Option<&str>) -> Result<CatalogPage, Refusal> {
+    if kind != CatalogKind::Gifs {
+        return Err(Refusal::Unsupported);
+    }
+    let offset = cursor.and_then(|c| c.parse::<u32>().ok()).unwrap_or(0);
+    let (entries, next_offset) = account.wire.search_gifs(query, offset).map_err(refused)?;
+    let mut items = Vec::with_capacity(entries.len());
+    let mut media = Vec::with_capacity(entries.len());
+    {
+        let mut live = account.live();
+        if live.gifs.len() > 256 {
+            live.gifs.clear();
+        }
+        for entry in entries {
+            let mut file = MediaFile::new(format!("signal:gif:{}", entry.id), MediaKind::Gif);
+            file.width = entry.width;
+            file.height = entry.height;
+            if !entry.preview_url.is_empty() {
+                media.push((file.clone(), entry.preview_url.clone()));
+            }
+            items.push(CatalogItem {
+                id: entry.id.clone(),
+                name: entry.title.clone(),
+                file: Some(file),
+                pack: String::new(),
+                animated: true,
+            });
+            live.gifs.insert(entry.id.clone(), entry);
+        }
+    }
+    if !media.is_empty() {
+        let _ = account.ctx.media(&media);
+    }
+    Ok(CatalogPage { items, cursor: next_offset.map(|n| n.to_string()) })
+}
+
+fn call_link_handoff(account: &Account, raw: &str) -> Result<String, Refusal> {
+    if let Some(rest) = raw.strip_prefix(CALL_LINK_CREATE) {
+        let (approve_str, name) = rest.split_once('|').unwrap_or(("0", rest));
+        let approve_all = approve_str == "1" || approve_str.eq_ignore_ascii_case("true");
+        let link = account.wire.create_call_link(name.trim(), approve_all).map_err(refused)?;
+        let url = link.url.clone();
+        account.live().call_links.insert(link.root_key, link);
+        return Ok(url);
+    }
+    if let Some(rest) = raw.strip_prefix(CALL_LINK_UPDATE) {
+        let mut parts = rest.splitn(3, '|');
+        let approve_str = parts.next().unwrap_or("");
+        let url = parts.next().unwrap_or("").trim();
+        let name = parts.next().map(|s| s.trim().to_owned());
+        let Some(root_key) = wire::parse_call_link(url) else {
+            return Err(Refusal::Refused("That is not a valid Signal call link.".into()));
+        };
+        let approve = match approve_str {
+            "1" | "true" => Some(true),
+            "0" | "false" => Some(false),
+            _ => None,
+        };
+        let updated = account.wire.update_call_link(&root_key, name, approve).map_err(refused)?;
+        let url = updated.url.clone();
+        account.live().call_links.insert(updated.root_key, updated);
+        return Ok(url);
+    }
+    if let Some(url) = raw.strip_prefix(CALL_LINK_JOIN) {
+        let joined = account.wire.join_call_link(url.trim()).map_err(refused)?;
+        let prefix = if joined.waiting_for_approval { "waiting" } else { "room" };
+        return Ok(format!("{prefix}:{}", joined.room_id));
+    }
+    if let Some(url) = raw.strip_prefix(CALL_LINK_DELETE) {
+        let Some(root_key) = wire::parse_call_link(url.trim()) else {
+            return Err(Refusal::Refused("That is not a valid Signal call link.".into()));
+        };
+        account.wire.delete_call_link(&root_key).map_err(refused)?;
+        account.live().call_links.remove(&root_key);
+        return Ok("deleted".to_owned());
+    }
+    Err(Refusal::Unsupported)
+}
+
+fn send_gif(account: &Account, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, pick_id: &str) -> Result<Message, Fault> {
+    let to = peer(conversation)?;
+    let entry = account.live().gifs.get(pick_id).cloned();
+    let (mp4_url, width, height) = match entry {
+        Some(entry) => (entry.mp4_url, entry.width, entry.height),
+        None if pick_id.starts_with("https://") => (pick_id.to_owned(), 0, 0),
+        None => return Err(Fault::Refused("That GIF is no longer in the picker. Search again.".into())),
+    };
+    let bytes = account.wire.fetch_gif(&mp4_url)?;
+    if let Some(why) = files::too_big("giphy.mp4", bytes.len() as u64) {
+        return Err(Fault::Refused(why));
+    }
+    let gif_file = wire::File {
+        name: "giphy.mp4".to_owned(),
+        mime: "video/mp4".to_owned(),
+        bytes,
+        width,
+        height,
+        thumb: Vec::new(),
+        blurhash: None,
+        gif: true,
+    };
+    let quote = quote_of(account, conversation, reply_to)?;
+    let attachment = show_file(account, client_id, 0, &gif_file);
+    let timer = account.live().timer_of(conversation);
+    let sent = match account.wire.send(&to, Body::Files { text: text.to_owned(), quote: quote.clone(), files: vec![gif_file], timer }) {
+        Ok(sent) => sent,
+        Err(fault) => {
+            forget_landed(&[attachment]);
+            return Err(fault);
+        }
+    };
+    account.live().echoed(sent);
+    account.live().sent(sent, conversation);
+    let words = Text { author: account.me.clone(), name: account.name.clone(), sent, text: text.to_owned(), quote, ..Text::default() };
+    let mut message = message(account, &words, true);
+    if timer.seconds > 0 {
+        message.expires_at = Some(crate::hub::now() + i64::from(timer.seconds));
+    }
+    message.attachments = vec![attachment];
+    Ok(message)
 }
 
 /// The pictures of the people and groups on screen (rows, people, the open conversation): each
@@ -2287,6 +3081,11 @@ fn send_with(account: &Arc<Account>, conversation: &str, client_id: &str, text: 
         return;
     }
     if with.files.is_empty() {
+        if let Some(pick) = with.pick.filter(|p| p.kind == CatalogKind::Gifs) {
+            let outcome = send_gif(account, conversation, client_id, text, reply_to, &pick.id).map_err(|fault| fault.words());
+            account.ctx.sent(conversation, client_id, outcome);
+            return;
+        }
         let outcome = send_text(account, conversation, text, reply_to, &with.spans).map_err(|fault| fault.words());
         account.ctx.sent(conversation, client_id, outcome);
         return;
@@ -2353,7 +3152,8 @@ fn send_files(account: &Account, conversation: &str, client_id: &str, text: &str
 /// The id is the shell's client id, known before Signal names the message, so the bytes can
 /// be written once and then moved to the wire.
 fn show_file(account: &Account, client_id: &str, index: usize, file: &wire::File) -> Attachment {
-    let mut media = MediaFile::new(format!("signal:{client_id}:{index}"), files::kind(&file.mime));
+    let media_kind = if file.gif { MediaKind::Gif } else { files::kind(&file.mime) };
+    let mut media = MediaFile::new(format!("signal:{client_id}:{index}"), media_kind);
     media.width = file.width;
     media.height = file.height;
     media.bytes = file.bytes.len() as u64;

@@ -1726,3 +1726,461 @@ fn leaving_a_signal_group_checks_sole_admin_and_removes_the_row() {
     world.heard(&format!("leave-group {hex_id}"));
     world.until("Club row removed", || world.conversation(CLUB).is_none().then_some(()));
 }
+
+#[test]
+fn a_group_lists_its_members_and_admins_and_serves_conversation_info() {
+    let world = World::linked();
+    world.connected();
+
+    let Response::ConversationInfo { info } = world.ask(Request::ConversationInfo { conversation: key(CLUB) }) else {
+        panic!("expected ConversationInfo");
+    };
+    assert_eq!(info.description, "Tuesdays, 7 pm");
+    assert_eq!(info.members, Some(3));
+
+    let Response::Members { sections, members, .. } = world.ask(Request::Members { conversation: key(CLUB), offset: 0, limit: 50 }) else {
+        panic!("expected Members");
+    };
+    assert_eq!(sections.len(), 2);
+    assert_eq!((sections[0].name.as_str(), sections[0].count), ("Admins", 1));
+    assert_eq!((sections[1].name.as_str(), sections[1].count), ("Members", 2));
+    assert_eq!(members.len(), 3);
+    assert_eq!(members[0].key.id, ME);
+    assert_eq!(members[0].name, "Ada Quill");
+    assert_eq!(members[0].status, "Admin");
+    let non_admins: Vec<&str> = members[1..].iter().map(|p| p.key.id.as_str()).collect();
+    assert!(non_admins.contains(&GRACE) && non_admins.contains(&ALAN));
+
+    // Pending invites and join requests appear in their own sections.
+    let dave = "d4d4d4d4-0000-4000-8000-000000000004";
+    let eve = "e5e5e5e5-0000-4000-8000-000000000005";
+    world.steer(&format!("group-pending {dave} Dave"));
+    world.steer(&format!("group-requesting {eve} Eve"));
+    let (sections, members) = world.until("pending and requesting members", || {
+        match world.ask(Request::Members { conversation: key(CLUB), offset: 0, limit: 50 }) {
+            Response::Members { sections, members, .. } if sections.len() == 4 => Some((sections, members)),
+            _ => None,
+        }
+    });
+    assert_eq!((sections[2].name.as_str(), sections[2].count), ("Pending invites", 1));
+    assert_eq!((sections[3].name.as_str(), sections[3].count), ("Join requests", 1));
+    assert!(members.iter().any(|p| p.key.id == dave && p.status == "Invited"));
+    assert!(members.iter().any(|p| p.key.id == eve && p.status == "Requested to join"));
+}
+
+#[test]
+fn adding_and_removing_group_members_respects_permissions() {
+    let world = World::linked();
+    world.connected();
+
+    let club = world.conversation(CLUB).unwrap();
+    assert!(club.rights.add_members, "admin can add members");
+    assert!(club.rights.remove_members, "admin can remove members");
+    assert!(club.rights.manage_members, "admin can manage members");
+
+    let dave = "d4d4d4d4-0000-4000-8000-000000000004";
+    assert_eq!(
+        world.ask(Request::MembersAdd { conversation: key(CLUB), people: vec![dave.into()] }),
+        Response::Ok
+    );
+    world.heard(&format!("group-add {CLUB} {dave}"));
+    world.until("Dave in member list", || {
+        match world.ask(Request::Members { conversation: key(CLUB), offset: 0, limit: 50 }) {
+            Response::Members { members, .. } if members.iter().any(|m| m.key.id == dave) => Some(()),
+            _ => None,
+        }
+    });
+
+    assert_eq!(
+        world.ask(Request::MembersRemove { conversation: key(CLUB), person: ALAN.into() }),
+        Response::Ok
+    );
+    world.heard(&format!("group-remove {CLUB} {ALAN}"));
+    world.until("Alan removed from member list", || {
+        match world.ask(Request::Members { conversation: key(CLUB), offset: 0, limit: 50 }) {
+            Response::Members { members, .. } if !members.iter().any(|m| m.key.id == ALAN) => Some(()),
+            _ => None,
+        }
+    });
+
+    // Promote Grace to admin, then revoke.
+    assert_eq!(
+        world.ask(Request::MembersRemove { conversation: key(CLUB), person: format!("\u{1}signal-admin-promote\u{1}{GRACE}") }),
+        Response::Ok
+    );
+    world.heard(&format!("group-role {CLUB} {GRACE} admin"));
+    world.until("Grace promoted to admin", || {
+        match world.ask(Request::Members { conversation: key(CLUB), offset: 0, limit: 50 }) {
+            Response::Members { members, .. } if members.iter().any(|m| m.key.id == GRACE && m.status == "Admin") => Some(()),
+            _ => None,
+        }
+    });
+    assert_eq!(
+        world.ask(Request::MembersRemove { conversation: key(CLUB), person: format!("\u{1}signal-admin-revoke\u{1}{GRACE}") }),
+        Response::Ok
+    );
+    world.heard(&format!("group-role {CLUB} {GRACE} member"));
+    world.until("Grace demoted to member", || {
+        match world.ask(Request::Members { conversation: key(CLUB), offset: 0, limit: 50 }) {
+            Response::Members { members, .. } if members.iter().any(|m| m.key.id == GRACE && m.status.is_empty()) => Some(()),
+            _ => None,
+        }
+    });
+
+    // Demote Ada and restrict member additions to admins only: both rights turn off and requests are refused.
+    world.steer("group-role me member");
+    world.steer("group-access members=admin");
+    world.until("rights revoked for non-admin", || {
+        let row = world.conversation(CLUB)?;
+        (!row.rights.add_members && !row.rights.remove_members).then_some(())
+    });
+    let add_err = world.ask(Request::MembersAdd { conversation: key(CLUB), people: vec![ALAN.into()] });
+    assert!(matches!(add_err, Response::Error { code: ErrorCode::Refused, .. }), "expected Refused, got {add_err:?}");
+    let rem_err = world.ask(Request::MembersRemove { conversation: key(CLUB), person: GRACE.into() });
+    assert!(matches!(rem_err, Response::Error { code: ErrorCode::Refused, .. }), "expected Refused, got {rem_err:?}");
+}
+
+#[test]
+fn an_announcement_only_group_is_read_only_for_non_admins() {
+    let world = World::linked();
+    world.connected();
+
+    world.steer("group-role me member");
+    world.steer("group-access announcements=on");
+    let row = world.until("announcement-only read_only row", || {
+        let row = world.conversation(CLUB)?;
+        row.read_only.then_some(row)
+    });
+    assert_eq!(row.read_only_reason, "Only admins can send messages");
+
+    // Sending is refused while read-only.
+    let err = world.ask(Request::Send {
+        conversation: key(CLUB),
+        client_id: "ann-1".into(),
+        text: "Hello?".into(),
+        reply_to: None,
+        with: Default::default(),
+    });
+    assert!(matches!(err, Response::Error { code: ErrorCode::Refused, .. }), "expected Refused, got {err:?}");
+
+    // Promoting back to admin re-enables posting.
+    world.steer("group-role me admin");
+    world.until("admin can post again", || {
+        let row = world.conversation(CLUB)?;
+        (!row.read_only).then_some(())
+    });
+    let sent = world.send(CLUB, "ann-2", "Admin announcement", None);
+    assert_eq!(sent.text, "Admin announcement");
+}
+
+#[test]
+fn editing_group_name_description_avatar_and_permissions() {
+    let world = World::linked();
+    world.connected();
+
+    let long_desc = "Bridge night details: ".to_owned() + &"a".repeat(350);
+    assert_eq!(
+        world.ask(Request::ConversationUpdate {
+            conversation: key(CLUB),
+            title: Some("Wednesday Bridge".into()),
+            topic: None,
+            description: Some(long_desc.clone()),
+        }),
+        Response::Ok
+    );
+    let updated = world.until("updated group title", || {
+        let row = world.conversation(CLUB)?;
+        (row.title == "Wednesday Bridge").then_some(row)
+    });
+    assert_eq!(updated.topic.chars().count(), 300, "row topic is capped at 300 chars");
+    let Response::ConversationInfo { info } = world.ask(Request::ConversationInfo { conversation: key(CLUB) }) else {
+        panic!("expected ConversationInfo");
+    };
+    assert_eq!(info.description, long_desc, "ConversationInfo carries the full description");
+
+    // Change group photo.
+    let img = world.dir.join("group.png");
+    std::fs::write(&img, b"\x89PNG\r\n\x1a\nfake").unwrap();
+    assert_eq!(
+        world.ask(Request::ConversationPicture { conversation: key(CLUB), path: img.to_string_lossy().into_owned() }),
+        Response::Ok
+    );
+    world.heard(&format!("group-avatar {CLUB} 12bytes"));
+
+    // Change permissions (attributes=admin, announcements=on).
+    assert_eq!(
+        world.ask(Request::ConversationUpdate {
+            conversation: key(CLUB),
+            title: None,
+            topic: None,
+            description: Some("\u{1}signal-group-perms\u{1}attributes=admin;announcements=on".into()),
+        }),
+        Response::Ok
+    );
+    world.heard(&format!("group-update {CLUB} attributes=Administrator announcements=true"));
+
+    // Demote Ada: editing title/description/photo/permissions is now refused.
+    world.steer("group-role me member");
+    world.until("edit rights revoked for non-admin", || {
+        let row = world.conversation(CLUB)?;
+        (!row.rights.rename && !row.rights.edit_topic && !row.rights.edit_picture).then_some(())
+    });
+    let edit_err = world.ask(Request::ConversationUpdate {
+        conversation: key(CLUB),
+        title: Some("Blocked rename".into()),
+        topic: None,
+        description: None,
+    });
+    assert!(matches!(edit_err, Response::Error { code: ErrorCode::Refused, .. }));
+    let pic_err = world.ask(Request::ConversationPicture { conversation: key(CLUB), path: String::new() });
+    assert!(matches!(pic_err, Response::Error { code: ErrorCode::Refused, .. }));
+}
+
+#[test]
+fn a_group_invite_link_renders_a_join_card_and_can_be_managed_and_joined() {
+    let world = World::linked();
+    world.connected();
+
+    // Enable the group invite link as admin and verify ConversationInfo.link exposes it.
+    assert_eq!(
+        world.ask(Request::ConversationUpdate {
+            conversation: key(CLUB),
+            title: None,
+            topic: None,
+            description: Some("\u{1}signal-group-link\u{1}on".into()),
+        }),
+        Response::Ok
+    );
+    world.heard(&format!("group-link {CLUB} Enabled"));
+    let link = world.until("invite link populated", || {
+        match world.ask(Request::ConversationInfo { conversation: key(CLUB) }) {
+            Response::ConversationInfo { info } if info.link.starts_with("https://signal.group/#") => Some(info.link),
+            _ => None,
+        }
+    });
+    assert_eq!(protocol::redact(&link), "https://signal.group/#[redacted]");
+
+    // An incoming message containing the invite link gets a join card with profile-key notice.
+    world.steer(&format!("incoming grace {} Join here {link}", T0 + 25_000));
+    let msg = world.arrived(GRACE, &id(T0 + 25_000, GRACE));
+    let card = msg.card.expect("group invite link must render a card");
+    assert_eq!(card.title, "Signal group invite");
+    assert!(card.text.contains("profile key"));
+    assert_eq!(card.footer, "Join group");
+
+    // Join a group from its link.
+    let Response::Conversation { conversation: joined } = world.ask(Request::StartDirect {
+        person: key(&format!("\u{1}signal-join-link\u{1}{link}")),
+    }) else {
+        panic!("expected joined group conversation");
+    };
+    assert!(joined.key.id.starts_with("g."));
+    world.heard("group-join-link");
+
+    // Reset and turn off the invite link.
+    assert_eq!(
+        world.ask(Request::ConversationUpdate {
+            conversation: key(CLUB),
+            title: None,
+            topic: None,
+            description: Some("\u{1}signal-group-link\u{1}reset".into()),
+        }),
+        Response::Ok
+    );
+    world.heard(&format!("group-link {CLUB} Reset"));
+    let reset_link = world.until("reset link differs", || {
+        match world.ask(Request::ConversationInfo { conversation: key(CLUB) }) {
+            Response::ConversationInfo { info } if !info.link.is_empty() && info.link != link => Some(info.link),
+            _ => None,
+        }
+    });
+    assert!(reset_link.starts_with("https://signal.group/#"));
+}
+
+#[test]
+fn group_join_requests_and_pending_invites_can_be_approved_or_declined() {
+    let world = World::linked();
+    world.connected();
+
+    let eve = "e5e5e5e5-0000-4000-8000-000000000005";
+    let frank = "f6f6f6f6-0000-4000-8000-000000000006";
+    world.steer(&format!("group-requesting {eve} Eve"));
+    world.steer(&format!("group-requesting {frank} Frank"));
+    world.until("two join requests listed", || {
+        match world.ask(Request::Members { conversation: key(CLUB), offset: 0, limit: 50 }) {
+            Response::Members { members, .. } if members.iter().filter(|m| m.status == "Requested to join").count() == 2 => Some(()),
+            _ => None,
+        }
+    });
+
+    // Approve Eve -> becomes a full member; deny Frank -> removed from requests.
+    assert_eq!(
+        world.ask(Request::MembersRemove { conversation: key(CLUB), person: format!("\u{1}signal-join-approve\u{1}{eve}") }),
+        Response::Ok
+    );
+    world.heard(&format!("group-request {CLUB} {eve} approve"));
+    assert_eq!(
+        world.ask(Request::MembersRemove { conversation: key(CLUB), person: format!("\u{1}signal-join-deny\u{1}{frank}") }),
+        Response::Ok
+    );
+    world.heard(&format!("group-request {CLUB} {frank} deny"));
+    world.until("Eve approved and Frank denied", || {
+        match world.ask(Request::Members { conversation: key(CLUB), offset: 0, limit: 50 }) {
+            Response::Members { members, .. }
+                if members.iter().any(|m| m.key.id == eve && m.status.is_empty())
+                    && !members.iter().any(|m| m.key.id == frank) =>
+            {
+                Some(())
+            }
+            _ => None,
+        }
+    });
+
+    // Accept / decline a pending group invite to me.
+    assert_eq!(
+        world.ask(Request::AnswerMessageRequest { conversation: key(CLUB), accept: true }),
+        Response::Ok
+    );
+    world.heard(&format!("group-invite {CLUB} accept"));
+    assert_eq!(
+        world.ask(Request::AnswerMessageRequest { conversation: key(CLUB), accept: false }),
+        Response::Ok
+    );
+    world.heard(&format!("group-invite {CLUB} decline"));
+}
+
+#[test]
+fn searching_and_sending_gifs_from_the_composer() {
+    let world = World::linked();
+    world.connected();
+
+    let (accounts, _) = world.status();
+    let signal = accounts.iter().find(|a| a.key == account()).unwrap();
+    assert!(signal.can.gifs, "Signal advertises GIF picker capability");
+
+    // Search GIFs via Catalog.
+    let Response::Catalog { items, .. } = world.ask(Request::Catalog {
+        account: account(),
+        kind: protocol::CatalogKind::Gifs,
+        space: None,
+        query: "cat".into(),
+        cursor: None,
+    }) else {
+        panic!("expected Catalog response");
+    };
+    world.heard("gif-search offset=0 query=cat");
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, "gif-cat");
+    assert!(items[0].animated);
+    assert_eq!(items[0].file.as_ref().map(|f| f.kind), Some(protocol::MediaKind::Gif));
+
+    // Send the picked GIF: fetches MP4 and sends as looping GIF attachment.
+    let Response::Sent { .. } = world.ask(Request::Send {
+        conversation: key(CLUB),
+        client_id: "gif-1".into(),
+        text: String::new(),
+        reply_to: None,
+        with: Outgoing {
+            pick: Some(protocol::Pick { kind: protocol::CatalogKind::Gifs, id: "gif-cat".into() }),
+            ..Outgoing::default()
+        },
+    }) else {
+        panic!("expected Sent");
+    };
+    world.heard("gif-fetch https://media.giphy.com/media/cat/200w.mp4");
+    world.heard(&format!("send {CLUB} files giphy.mp4"));
+    let sent = world.until("sent GIF message", || {
+        world
+            .messages(CLUB)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("gif-1") && m.id != "gif-1")
+    });
+    assert_eq!(sent.attachments.len(), 1);
+    assert_eq!(sent.attachments[0].file.kind, protocol::MediaKind::Gif);
+    assert_eq!(sent.attachments[0].mime, "video/mp4");
+}
+
+#[test]
+fn synced_call_events_and_call_log_events_record_and_clear_call_history() {
+    let world = World::linked();
+    world.connected();
+
+    // Accepted incoming video call -> "Incoming video call", not missed (0 unread).
+    world.steer(&format!("call-event grace 9001 video incoming accepted {}", T0 + 10_000));
+    let call_msg = world.arrived(GRACE, "signal-call-9001");
+    assert_eq!((&call_msg.kind, call_msg.text.as_str(), call_msg.outgoing), (&MessageKind::System, "Incoming video call", false));
+    assert_eq!(world.conversation(GRACE).unwrap().unread, 0);
+
+    // Outgoing accepted voice call -> "Outgoing voice call".
+    world.steer(&format!("call-event grace 9002 audio outgoing accepted {}", T0 + 20_000));
+    let out_msg = world.arrived(GRACE, "signal-call-9002");
+    assert_eq!((&out_msg.kind, out_msg.text.as_str(), out_msg.outgoing), (&MessageKind::System, "Outgoing voice call", true));
+
+    // Missed incoming voice call -> unread increments; then call-log read-chat clears unread.
+    world.steer(&format!("call-event grace 9003 audio incoming missed {}", T0 + 30_000));
+    let missed = world.arrived(GRACE, "signal-call-9003");
+    assert_eq!(missed.text, "Missed voice call");
+    world.until("missed call unread", || (world.conversation(GRACE)?.unread >= 1).then_some(()));
+    world.steer("call-log read-chat grace");
+    world.until("call-log read clears unread", || (world.conversation(GRACE)?.unread == 0).then_some(()));
+
+    // Group call event in CLUB.
+    world.steer(&format!("call-event club 9004 group incoming accepted {}", T0 + 40_000));
+    let group_call = world.arrived(CLUB, "signal-call-9004");
+    assert_eq!(group_call.text, "Group call");
+
+    // Deleting a single call event removes it.
+    world.steer(&format!("call-event grace 9002 audio outgoing deleted {}", T0 + 45_000));
+    world.until("call 9002 deleted", || {
+        (!world.messages(GRACE).iter().any(|m| m.id == "signal-call-9002")).then_some(())
+    });
+
+    // Clearing call history in Grace's conversation removes remaining call rows there, leaving CLUB untouched.
+    world.steer("call-log clear-chat grace");
+    world.until("grace call history cleared", || {
+        (!world.messages(GRACE).iter().any(|m| m.id.starts_with("signal-call-"))).then_some(())
+    });
+    assert!(world.messages(CLUB).iter().any(|m| m.id == "signal-call-9004"));
+}
+
+#[test]
+fn call_links_are_redacted_render_join_cards_and_can_be_created_synced_joined_and_deleted() {
+    let world = World::linked();
+    world.connected();
+
+    // Create a call link with approval required.
+    let Response::Link { url } = world.ask(Request::Handoff {
+        conversation: key("\u{1}signal-call-link-create\u{1}1|Weekly standup"),
+    }) else {
+        panic!("expected Link with call link URL");
+    };
+    assert!(url.starts_with("https://signal.link/call/#key="));
+    assert_eq!(protocol::redact(&url), "https://signal.link/call/#key=[redacted]");
+    world.heard("call-link-create name=Weekly standup approve=true");
+
+    // A message containing the call link renders a "Join call" card with its name and approval notice.
+    world.steer(&format!("incoming grace {} Join the call {url}", T0 + 60_000));
+    let msg = world.arrived(GRACE, &id(T0 + 60_000, GRACE));
+    let card = msg.card.expect("call link message must render a Join call card");
+    assert_eq!(card.title, "Weekly standup");
+    assert_eq!(card.text, "Admin approval required to join.");
+    assert_eq!(card.footer, "Join call");
+
+    // Joining the approval-required call link reports waiting:<room_id>.
+    let Response::Link { url: joined } = world.ask(Request::Handoff {
+        conversation: key(&format!("\u{1}signal-call-link-join\u{1}{url}")),
+    }) else {
+        panic!("expected Link join response");
+    };
+    assert!(joined.starts_with("waiting:"), "expected waiting room state, got {joined}");
+
+    // Synced call link from another device is accepted, and deleting our link removes it.
+    world.steer("call-link-sync 99");
+    let Response::Link { url: del } = world.ask(Request::Handoff {
+        conversation: key(&format!("\u{1}signal-call-link-delete\u{1}{url}")),
+    }) else {
+        panic!("expected delete response");
+    };
+    assert_eq!(del, "deleted");
+    world.heard("call-link-delete");
+}
