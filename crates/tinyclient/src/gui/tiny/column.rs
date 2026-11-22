@@ -11,7 +11,10 @@ use crate::gui::sidebar::Mode;
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use gpui::{div, prelude::*, px, AnyElement, Context, Div, MouseButton, MouseDownEvent, Render, SharedString, Stateful, Window};
-use protocol::{Conversation, ConversationKind, Key, Network, TinyChannel, TinyLayoutItem, TinyLayoutItemKind, TinyRoom, TinySeat, TINY_FEATURE_CHANNEL_LAYOUT};
+use protocol::{
+    Call, CallState, CallSupport, Conversation, ConversationKind, Key, Network, TinyChannel, TinyLayoutItem, TinyLayoutItemKind, TinyRoom, TinySeat,
+    TINY_FEATURE_CHANNEL_LAYOUT, TINY_FEATURE_DIRECT_CALLS,
+};
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -30,6 +33,72 @@ fn in_the_server(chats: &[Rc<Conversation>]) -> Vec<Rc<Conversation>> {
 /// Text channels only, in the tree's order.
 fn channels_in_server(chats: &[Rc<Conversation>]) -> Vec<Rc<Conversation>> {
     chats.iter().filter(|chat| chat.kind == ConversationKind::Channel).cloned().collect()
+}
+
+/// Quick call action shown on hover for a direct or group row in the Tiny server column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectCallAction {
+    Call,
+    Join,
+}
+
+/// Live-call metadata derived for a Tiny direct or group conversation row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DirectRowCall {
+    live: bool,
+    mine: bool,
+    pill_label: Option<String>,
+    quick_action: Option<DirectCallAction>,
+}
+
+fn is_group_direct(chat: &Conversation) -> bool {
+    chat.kind == ConversationKind::Group
+}
+
+fn direct_row_call(chat: &Conversation, active_call: Option<&Call>, direct_calls_supported: bool) -> DirectRowCall {
+    let mine = active_call.is_some_and(|call| call.conversation == chat.key && !matches!(call.state, CallState::Failed { .. }));
+    let occupants = chat.occupants.as_ref().map_or(0, |occupants| occupants.total);
+    let live = mine || occupants > 0;
+    let pill_label = if live {
+        let count = occupants.max(if mine {
+            active_call.map_or(0, |call| call.participants.len() as u32)
+        } else {
+            0
+        });
+        Some(if count > 0 { count.to_string() } else { "Live".to_owned() })
+    } else {
+        None
+    };
+    let can_call = match chat.call {
+        CallSupport::Native | CallSupport::Handoff => true,
+        CallSupport::Restricted => false,
+        CallSupport::None => direct_calls_supported,
+    };
+    let quick_action = if mine || chat.call == CallSupport::Restricted {
+        None
+    } else if live {
+        Some(DirectCallAction::Join)
+    } else if can_call {
+        Some(DirectCallAction::Call)
+    } else {
+        None
+    };
+    DirectRowCall { live, mine, pill_label, quick_action }
+}
+
+fn direct_live_tooltip(chat: &Conversation, mine: bool) -> String {
+    let count = chat.occupants.as_ref().map_or(0, |occupants| occupants.total);
+    if mine {
+        if count > 1 {
+            format!("You're in this call · {count} in call")
+        } else {
+            "You're in this call".to_owned()
+        }
+    } else if count > 0 {
+        format!("{count} in call · Click to open")
+    } else {
+        "Active call".to_owned()
+    }
 }
 
 /// Direct and group conversations on this server, ordered newest-first by last activity and
@@ -357,39 +426,134 @@ impl Shell {
         list
     }
 
-    /// A direct conversation row in the server column: picture, presence dot, name, unread badge.
-    fn direct_row(&self, page: &Page, chat: &Conversation, open: Option<&Key>, cx: &mut Context<Self>) -> Stateful<Div> {
+    /// A direct or group conversation row in the server column: picture (or group badge), presence
+    /// dot, live-call pill, hover quick Call/Join button, unread badge, and context menu.
+    fn direct_row(&self, page: &Page, chat: &Rc<Conversation>, open: Option<&Key>, cx: &mut Context<Self>) -> Stateful<Div> {
         let selected = open.is_some_and(|open| open == &chat.key);
         let badge = row_badge(chat);
         let unread = badge.is_some();
-        let tone = if selected || unread { theme::text() } else { theme::text_soft() };
+        let active_call = self.snapshot.as_ref().and_then(|snapshot| snapshot.call.as_ref());
+        let call_info = direct_row_call(chat, active_call, page.community.has(TINY_FEATURE_DIRECT_CALLS));
+        let group_chat = is_group_direct(chat);
+        let tone = if selected || unread || call_info.live { theme::text() } else { theme::text_soft() };
         let peer_id = chat.peer.as_deref();
         let avatar_key = peer_id.map(|id| page.key(id)).unwrap_or_else(|| chat.key.clone());
         let picture = peer_id
             .and_then(|id| page.picture(id))
             .or_else(|| chat.avatar.as_ref().and_then(|file| file.path.as_deref()).map(std::path::PathBuf::from));
-        let mut avatar = Avatar::new(&avatar_key, &chat.title, 20.).image_at(picture);
-        if let Some(presence) = peer_id.and_then(|id| page.online(id)) {
-            avatar = avatar.presence(presence, theme::sidebar());
-        }
+        let has_picture = picture.is_some();
+        let avatar_el: AnyElement = if group_chat && !has_picture {
+            div()
+                .size(px(20.))
+                .flex_none()
+                .rounded_full()
+                .bg(theme::hover())
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(glyph("icons/users.svg", 12., theme::text_soft()))
+                .into_any_element()
+        } else {
+            let mut avatar = Avatar::new(&avatar_key, &chat.title, 20.).image_at(picture);
+            if let Some(presence) = peer_id.and_then(|id| page.online(id)) {
+                avatar = avatar.presence(presence, theme::sidebar());
+            }
+            avatar.build().into_any_element()
+        };
+        let row_group: SharedString = format!("tiny-direct-row-{}", chat.key.id).into();
+        let live_pill = call_info.pill_label.map(|label| {
+            div()
+                .id(SharedString::from(format!("tiny-direct-live-{}", chat.key.id)))
+                .flex_none()
+                .px(px(5.))
+                .h(px(16.))
+                .rounded(px(theme::R_CHIP))
+                .bg(theme::positive_soft())
+                .flex()
+                .items_center()
+                .gap(px(3.))
+                .tooltip(tip(direct_live_tooltip(chat, call_info.mine), None))
+                .child(glyph("icons/volume-2.svg", 11., theme::positive()))
+                .child(div().type_micro().font_weight(theme::SEMIBOLD).text_color(theme::positive()).child(label))
+        });
+        let quick_button = call_info.quick_action.map(|action| {
+            let call_key = chat.key.clone();
+            let join = action == DirectCallAction::Join;
+            let tip_words = if join {
+                format!("Join call in {}", chat.title)
+            } else {
+                format!("Call {}", chat.title)
+            };
+            div()
+                .id(SharedString::from(format!("tiny-direct-call-{}", chat.key.id)))
+                .flex_none()
+                .size(px(22.))
+                .rounded(px(theme::R_CHIP))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .invisible()
+                .group_hover(row_group.clone(), |style| style.visible())
+                .when(join, |btn| btn.bg(theme::positive_soft()).hover(|style| style.bg(theme::positive_soft())))
+                .when(!join, |btn| btn.hover(|style| style.bg(theme::hover())))
+                .tooltip(tip(tip_words, None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_start(call_key.clone(), cx);
+                }))
+                .child(glyph("icons/phone.svg", 13., if join { theme::positive() } else { theme::text_soft() }))
+        });
         let content = div()
             .gap(px(8.))
-            .child(avatar.build())
+            .child(avatar_el)
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .truncate()
-                    .type_ui()
-                    .when(unread, |name| name.font_weight(theme::MEDIUM))
-                    .text_color(tone)
-                    .child(chat.title.clone()),
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .type_ui()
+                            .when(unread || call_info.live, |name| name.font_weight(theme::MEDIUM))
+                            .text_color(tone)
+                            .child(chat.title.clone()),
+                    )
+                    .when(group_chat && has_picture, |title| {
+                        title.child(
+                            div()
+                                .id(SharedString::from(format!("tiny-direct-group-{}", chat.key.id)))
+                                .flex_none()
+                                .tooltip(tip("Group chat", None))
+                                .child(glyph("icons/users.svg", 12., theme::text_faint())),
+                        )
+                    }),
             )
+            .children(live_pill)
+            .children(quick_button)
             .children(badge);
         let key = chat.key.clone();
         let title = chat.title.clone();
+        let menu_member = peer_id.filter(|id| page.community.member(id).is_some()).map(str::to_owned);
+        let menu_chat = Rc::clone(chat);
         list_row(SharedString::from(format!("tiny-direct-{}", key.id)), theme::row_height(theme::ROW_ONE), selected, false, content)
+            .group(row_group)
             .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| this.select(key.clone(), &title, cx)))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    if let Some(user_id) = menu_member.clone() {
+                        this.tiny_open_float(Float::Person { user_id, at: event.position }, cx);
+                    } else {
+                        this.open_menu(crate::gui::layout::Menu::Row(Rc::clone(&menu_chat), event.position), cx);
+                    }
+                }),
+            )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -703,5 +867,30 @@ mod tests {
         assert_eq!(directs.len(), DIRECT_CAP);
         assert_eq!(directs[0].title, "User 24");
         assert_eq!(directs[DIRECT_CAP - 1].title, "User 05");
+    }
+
+    #[test]
+    fn direct_row_call_reports_live_occupants_and_quick_actions() {
+        let account = AccountKey { network: Network::Tiny, account: "host".into() };
+        let mut dm = Conversation::new(Key::new(&account, "dm-1"), ConversationKind::Direct, "Ada");
+        dm.call = CallSupport::Native;
+        assert!(!is_group_direct(&dm));
+        let idle = direct_row_call(&dm, None, true);
+        assert!(!idle.live);
+        assert_eq!(idle.pill_label, None);
+        assert_eq!(idle.quick_action, Some(DirectCallAction::Call));
+
+        let mut group = Conversation::new(Key::new(&account, "grp-1"), ConversationKind::Group, "Crew");
+        group.occupants = Some(protocol::Occupants { people: Vec::new(), total: 3 });
+        assert!(is_group_direct(&group));
+        let live = direct_row_call(&group, None, true);
+        assert!(live.live);
+        assert!(!live.mine);
+        assert_eq!(live.pill_label.as_deref(), Some("3"));
+        assert_eq!(live.quick_action, Some(DirectCallAction::Join));
+
+        dm.call = CallSupport::Restricted;
+        let restricted = direct_row_call(&dm, None, true);
+        assert_eq!(restricted.quick_action, None);
     }
 }

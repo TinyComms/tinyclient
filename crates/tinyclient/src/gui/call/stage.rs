@@ -12,7 +12,7 @@ use protocol::{
     Call, CallState, Content, ConversationKind, Direction, Key, Network, Participant, PictureKind, TinyRoom,
     TinySeat,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -22,6 +22,7 @@ pub(in crate::gui) struct Seat {
     pub id: String,
     pub name: String,
     pub me: bool,
+    pub ringing: bool,
     pub speaking: bool,
     pub muted: bool,
     pub deafened: bool,
@@ -147,25 +148,30 @@ pub(in crate::gui) fn with_me(room: &TinyRoom, me: &str) -> Option<TinyRoom> {
 
 impl Stage {
     /// Builds a stage from any live, ringing, connecting, or failed `Call`: everyone else first,
-    /// then me last (matching `call_phone_tiles`). While ringing out with no joined peers, only
-    /// my seat is present.
+    /// then me last (matching `call_phone_tiles`). The direct peer can be shown before the
+    /// network publishes participants.
     pub(in crate::gui) fn of_call(
         call: &Call,
         subject: &Subject,
         me_id: &str,
         me_name: &str,
+        direct_peer: Option<&str>,
     ) -> Stage {
         let my_id = if me_id.is_empty() { "me" } else { me_id };
         let my_name = if me_name.is_empty() { "You" } else { me_name };
-        let live = matches!(call.state, CallState::Joined | CallState::Reconnecting);
-        let mut seats: Vec<Seat> = if live {
-            call.participants
-                .iter()
-                .filter(|who| !who.ringing && who.id != my_id)
-                .map(|who| Seat {
+        let starting = matches!(call.state, CallState::RingingOut | CallState::Connecting);
+        let mut seats = Vec::new();
+        if starting || matches!(call.state, CallState::Joined | CallState::Reconnecting) {
+            let mut seen = HashSet::from([my_id]);
+            for who in call.participants.iter().filter(|who| !who.ringing) {
+                if !seen.insert(who.id.as_str()) {
+                    continue;
+                }
+                seats.push(Seat {
                     id: who.id.clone(),
                     name: who.name.clone(),
                     me: false,
+                    ringing: false,
                     speaking: who.speaking,
                     muted: who.muted,
                     deafened: who.deafened,
@@ -177,17 +183,48 @@ impl Stage {
                     sharing: who.sharing,
                     hand_raised: who.hand_raised,
                     reaction: who.reaction.clone(),
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+                });
+            }
+            for who in call.participants.iter().filter(|who| who.ringing) {
+                if seen.insert(who.id.as_str()) {
+                    seats.push(Seat {
+                        id: who.id.clone(),
+                        name: who.name.clone(),
+                        ringing: true,
+                        ..Seat::default()
+                    });
+                }
+            }
+            for ring in call.ringing.iter().filter(|ring| ring.state == "ringing") {
+                if seen.insert(ring.id.as_str()) {
+                    seats.push(Seat {
+                        id: ring.id.clone(),
+                        name: ring.name.clone(),
+                        ringing: true,
+                        ..Seat::default()
+                    });
+                }
+            }
+            if starting && subject.kind == ConversationKind::Direct && seats.is_empty() {
+                let id = direct_peer
+                    .filter(|id| !id.is_empty() && *id != my_id)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("ringing:{}", call.conversation.id));
+                seats.push(Seat {
+                    id,
+                    name: subject.title.clone(),
+                    ringing: true,
+                    ..Seat::default()
+                });
+            }
+        }
         let my_camera = sending(call, Content::Camera);
         let my_sharing = sending(call, Content::Share);
         seats.push(Seat {
             id: my_id.to_owned(),
             name: my_name.to_owned(),
             me: true,
+            ringing: false,
             speaking: call.state == CallState::Joined && call.speaking,
             muted: call.muted || call.deafened,
             deafened: call.deafened,
@@ -228,6 +265,7 @@ impl Stage {
                     id: heard.user_id.clone(),
                     name: model::name_by_id(page.community, &heard.user_id),
                     me,
+                    ringing: false,
                     speaking: heard.speaking,
                     muted: heard.muted,
                     deafened: heard.deafened,
@@ -465,8 +503,8 @@ pub(in crate::gui) const STAGE_GRID_CAP: usize = 12;
 
 /// Partition `seats` into `(grid, roster)` for a call of any size.
 /// Small calls (`<= cap`) place everyone in `grid` with an empty `roster`.
-/// Large calls place speaking seats, anyone with an active stream, and `me` in `grid` (filling
-/// remaining slots up to `cap`), and place the remaining silent participants in `roster`.
+/// Large calls place speaking seats, ringing invitees, anyone with an active stream, and `me`
+/// in `grid` (filling remaining slots up to `cap`), and place silent listeners in `roster`.
 pub(in crate::gui) fn partition_stage<'a>(
     seats: &'a [Seat],
     streams: &[Stream],
@@ -481,6 +519,7 @@ pub(in crate::gui) fn partition_stage<'a>(
     let mut rest = Vec::new();
     for seat in seats {
         if seat.speaking
+            || seat.ringing
             || seat.sharing
             || seat.camera
             || seat.me
@@ -706,7 +745,7 @@ mod tests {
     }
 
     #[test]
-    fn stage_of_call_direct_has_two_seats_with_me_last_and_ringing_has_one() {
+    fn joined_direct_call_keeps_both_seats_with_me_last() {
         let subject = Subject {
             title: "Mara Okafor".into(),
             kind: ConversationKind::Direct,
@@ -724,16 +763,51 @@ mod tests {
                 ..Participant::default()
             }],
         );
-        let stage = Stage::of_call(&joined, &subject, "robin", "Robin");
+        let stage = Stage::of_call(&joined, &subject, "robin", "Robin", Some("mara"));
         assert_eq!(stage.seats.len(), 2);
         assert_eq!(stage.seats[0].id, "mara");
         assert!(!stage.seats[0].me);
+        assert!(!stage.seats[0].ringing);
         assert!(stage.seats[0].speaking && stage.seats[0].camera);
         assert_eq!(stage.seats[1].id, "robin");
         assert!(stage.seats[1].me);
         assert!(stage.video);
 
-        let ringing = sample_call(
+        let alone = sample_call(CallState::Joined, Vec::new());
+        let stage = Stage::of_call(&alone, &subject, "robin", "Robin", Some("mara"));
+        assert_eq!(stage.seats.len(), 1);
+        assert!(stage.seats[0].me);
+    }
+
+    #[test]
+    fn outgoing_direct_call_seats_the_callee_before_participants_arrive() {
+        let subject = Subject {
+            title: "Mara Okafor".into(),
+            kind: ConversationKind::Direct,
+            avatar: None,
+            space: None,
+        };
+        for state in [CallState::RingingOut, CallState::Connecting] {
+            let call = sample_call(state, Vec::new());
+            let stage = Stage::of_call(&call, &subject, "robin", "Robin", Some("mara"));
+            assert_eq!(stage.seats.len(), 2);
+            assert_eq!(stage.seats[0].id, "mara");
+            assert_eq!(stage.seats[0].name, "Mara Okafor");
+            assert!(stage.seats[0].ringing);
+            assert!(stage.seats[1].me);
+            assert!(!stage.seats[1].ringing);
+        }
+    }
+
+    #[test]
+    fn direct_call_prefers_the_ringing_participant_when_reported() {
+        let subject = Subject {
+            title: "Mara".into(),
+            kind: ConversationKind::Direct,
+            avatar: None,
+            space: None,
+        };
+        let call = sample_call(
             CallState::RingingOut,
             vec![Participant {
                 id: "mara".into(),
@@ -742,9 +816,40 @@ mod tests {
                 ..Participant::default()
             }],
         );
-        let ringing_stage = Stage::of_call(&ringing, &subject, "robin", "Robin");
-        assert_eq!(ringing_stage.seats.len(), 1);
-        assert!(ringing_stage.seats[0].me);
+        let stage = Stage::of_call(&call, &subject, "robin", "Robin", Some("mara"));
+        assert_eq!(stage.seats.len(), 2);
+        assert_eq!(stage.seats[0].name, "Mara Okafor");
+        assert!(stage.seats[0].ringing);
+    }
+
+    #[test]
+    fn group_call_shows_ringing_invitees_once_and_prefers_joined_seats() {
+        let subject = Subject {
+            title: "Friends".into(),
+            kind: ConversationKind::Group,
+            avatar: None,
+            space: None,
+        };
+        let ringing = |id: &str| Participant {
+            id: id.into(),
+            name: id.into(),
+            ringing: true,
+            ..Participant::default()
+        };
+        let call = sample_call(
+            CallState::Joined,
+            vec![
+                ringing("mara"),
+                Participant { id: "mara".into(), speaking: true, ..Participant::default() },
+                ringing("dev"),
+                ringing("dev"),
+                ringing("robin"),
+            ],
+        );
+        let stage = Stage::of_call(&call, &subject, "robin", "Robin", None);
+        let seats: Vec<_> = stage.seats.iter().map(|seat| (seat.id.as_str(), seat.ringing)).collect();
+        assert_eq!(seats, [("mara", false), ("dev", true), ("robin", false)]);
+        assert!(stage.seats[0].speaking);
     }
 
     #[test]

@@ -286,7 +286,11 @@ impl Render for CallPopout {
                         .rounded_full()
                         .border_2()
                         .border_color(ring)
-                        .child(Avatar::named(&data.speaker_name, 52.).build()),
+                        .child(
+                            Avatar::named(&data.speaker_name, 52.)
+                                .image_at(data.speaker_avatar.clone())
+                                .build(),
+                        ),
                 )
                 .child(
                     div()

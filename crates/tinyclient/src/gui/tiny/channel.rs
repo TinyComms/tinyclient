@@ -5,7 +5,7 @@
 use super::{join_blocked, model, Page};
 use crate::gui::call::stage::{Stage, self};
 use crate::gui::call::view::ViewBar;
-use crate::gui::components::{button, button_disabled, button_with_icon, glyph, ButtonKind};
+use crate::gui::components::{button, button_disabled, button_with_icon, glyph, tip, ButtonKind};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use gpui::{div, prelude::*, px, AnyElement, Context, Div};
@@ -14,12 +14,25 @@ use protocol::{Call, CallState, TinyRoom};
 pub(in crate::gui) use crate::gui::call::stage::{as_heard, with_me};
 pub(in crate::gui) use crate::gui::call::view::chip;
 
+/// The occupancy pill's tooltip: who is in, then the room's bitrate and whether it needs end-to-end encryption.
+fn occupancy_tip(room: &TinyRoom) -> String {
+    let mut parts = vec![model::channel_occupancy(room)];
+    if room.bitrate_kbps > 0 {
+        parts.push(format!("{} kb/s Opus", room.bitrate()));
+    }
+    if room.e2ee_required {
+        parts.push("End-to-end encrypted".to_owned());
+    }
+    parts.join(" · ")
+}
+
 impl Shell {
-    /// What the top bar says of a channel after its name.
-    pub(super) fn tiny_channel_facts(&self, page: &Page, room: &TinyRoom) -> Div {
-        let seated_here = self
-            .tiny_call_here(room)
-            .is_some_and(|call| matches!(call.state, CallState::Joined | CallState::Reconnecting));
+    /// What the top bar says of a channel after its name: the topic, one occupancy pill (green
+    /// with the call's clock beside it while I am in the room; bitrate and encryption are its
+    /// tooltip), and Push to talk where the room insists on it.
+    pub(super) fn tiny_channel_facts(&self, page: &Page, room: &TinyRoom, cx: &mut Context<Self>) -> Div {
+        let call = self.tiny_call_here(room);
+        let seated_here = call.as_ref().is_some_and(|call| matches!(call.state, CallState::Joined | CallState::Reconnecting));
         let seated = seated_here.then(|| with_me(room, page.me)).flatten();
         let shown = seated.as_ref().unwrap_or(room);
         let mut facts = div().flex().items_center().gap(px(6.)).min_w_0();
@@ -28,16 +41,20 @@ impl Shell {
                 .child(div().flex_none().w(px(1.)).h(px(16.)).bg(theme::hairline()))
                 .child(div().min_w_0().truncate().type_ui().text_color(theme::text_soft()).child(shown.topic.clone()));
         }
-        facts = facts.child(chip(
-            model::channel_occupancy(shown),
-            if model::full(shown) { theme::warning() } else { theme::text_soft() },
-            if model::full(shown) { theme::warning_soft() } else { theme::hover() },
-        ));
+        let (tone, fill) = if model::full(shown) {
+            (theme::warning(), theme::warning_soft())
+        } else if seated_here {
+            (theme::positive(), theme::positive_soft())
+        } else {
+            (theme::text_soft(), theme::hover())
+        };
+        facts = facts.child(chip(model::channel_occupancy(shown), tone, fill).id("tiny-room-occupancy").tooltip(tip(occupancy_tip(shown), None)));
+        // The banner draws this clock while connecting or reconnecting; one place at a time.
+        if let Some(clock) = call.as_ref().filter(|call| call.state == CallState::Joined).and_then(|call| self.call_stage_clock(call, cx)) {
+            facts = facts.child(div().flex_none().type_small().text_color(theme::text_soft()).child(clock));
+        }
         if shown.ptt_only {
             facts = facts.child(chip("Push to talk", theme::accent_text(), theme::accent_soft()));
-        }
-        if shown.bitrate_kbps > 0 {
-            facts = facts.child(chip(format!("{} kb/s", shown.bitrate()), theme::text_soft(), theme::hover()));
         }
         facts
     }
@@ -293,6 +310,19 @@ mod tests {
 
     fn seat(user_id: &str) -> TinySeat {
         TinySeat { user_id: user_id.into(), ..TinySeat::default() }
+    }
+
+    #[test]
+    fn the_occupancy_tooltip_carries_the_bitrate_and_encryption_the_bar_no_longer_shows() {
+        let mut room = TinyRoom::new("general", "General");
+        assert_eq!(occupancy_tip(&room), "Empty", "an older server says no bitrate, so none is claimed");
+        room.participants = vec![seat("bea"), seat("me")];
+        room.bitrate_kbps = 64;
+        assert_eq!(occupancy_tip(&room), "2 in call · 64 kb/s Opus");
+        room.user_limit = 10;
+        room.bitrate_kbps = 500;
+        room.e2ee_required = true;
+        assert_eq!(occupancy_tip(&room), "2 of 10 · 128 kb/s Opus · End-to-end encrypted", "the bitrate is held to what the server allows");
     }
 
     #[test]

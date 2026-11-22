@@ -12,7 +12,7 @@ use crate::gui::call::Subject;
 use crate::gui::components::{glyph, tint_of, Avatar};
 use crate::gui::phone::tokens::{self, PhoneType};
 use crate::gui::theme;
-use gpui::{div, img, prelude::*, px, AnyElement, Context, Div, MouseButton, ObjectFit, SharedString};
+use gpui::{div, img, prelude::*, px, AnyElement, Context, Div, MouseButton, ObjectFit, SharedString, Stateful};
 use protocol::{Call, CallState, Content, ConversationKind, Key, PictureKind};
 use std::path::PathBuf;
 
@@ -90,6 +90,14 @@ fn chip() -> Div {
         .flex()
         .items_center()
         .gap(px(5.))
+}
+
+fn centered_stage() -> Div {
+    div().min_h_full().w_full().flex().flex_col().justify_center().items_center()
+}
+
+fn stage_scroll(id: &'static str, body: Div) -> Stateful<Div> {
+    div().id(id).flex_1().size_full().min_h_0().overflow_y_scroll().child(body)
 }
 
 /// The person's color, faint, as a tile's ground: each tile reads as its person.
@@ -239,7 +247,7 @@ impl Shell {
     }
 
     /// One face large in the middle: who is rung, who it is with, a voice channel's plate.
-    fn call_phone_hero(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Div {
+    fn call_phone_hero(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Stateful<Div> {
         let peer = call.participants.first().filter(|_| subject.kind == ConversationKind::Direct);
         let live = in_call(call);
         let speaking = live && peer.is_some_and(|peer| peer.speaking);
@@ -281,14 +289,9 @@ impl Shell {
             )),
             _ => None,
         };
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
+        let body = centered_stage()
             .gap(px(20.))
-            .pb(px(24.))
+            .py(px(12.))
             .child(lead)
             .child(
                 div()
@@ -314,7 +317,8 @@ impl Shell {
                         let clock = counting.then(|| self.call_phone_clock(call, cx)).flatten();
                         div().flex().gap(px(8.)).phone_row().text_color(color).child(words).children(clock)
                     })),
-            )
+            );
+        stage_scroll("call-phone-hero-scroll", body)
     }
 
     /// Everyone as tiles, in as many columns and rows as their number asks for. Past eight the
@@ -326,7 +330,7 @@ impl Shell {
         let tile_w = (wide - (cols as f32 - 1.) * GAP) / cols as f32;
         let fit = (tall - (rows as f32 - 1.) * GAP) / rows as f32;
         let tile_h = if fit < 100. { (tile_w * 1.1).round() } else { fit };
-        let mut column = div().id("call-phone-grid").size_full().overflow_y_scroll().flex().flex_col().gap(px(GAP));
+        let mut column = centered_stage().gap(px(GAP));
         for row in tiles.chunks(cols) {
             column = column.child(
                 div()
@@ -338,7 +342,7 @@ impl Shell {
                     .children(row.iter().map(|tile| self.call_phone_tile(tile, tile_w, tile_h, cx))),
             );
         }
-        column.into_any_element()
+        stage_scroll("call-phone-grid", column).into_any_element()
     }
 
     /// A person's tile: their picture, or their face on their color; their name and their mic

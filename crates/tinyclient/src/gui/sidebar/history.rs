@@ -39,6 +39,11 @@ impl<T: PartialEq> History<T> {
         !(if back { &self.back } else { &self.forward }).is_empty()
     }
 
+    /// Where `travel(back, ..)` would go, without going.
+    pub(crate) fn peek(&self, back: bool) -> Option<&T> {
+        (if back { &self.back } else { &self.forward }).last()
+    }
+
     /// The places behind, newest first.
     pub fn behind(&self) -> impl Iterator<Item = &T> {
         self.back.iter().rev()
@@ -68,6 +73,20 @@ mod tests {
         history.leave("b");
         assert!(!history.can(false));
         assert_eq!(history.behind().copied().collect::<Vec<_>>(), ["b", "a"]);
+    }
+
+    #[test]
+    fn peek_names_the_next_stop_and_moves_nothing() {
+        let mut history = History::default();
+        assert_eq!((history.peek(true), history.peek(false)), (None, None));
+        history.leave("a");
+        history.leave("b");
+        assert_eq!((history.peek(true), history.peek(false)), (Some(&"b"), None));
+        assert_eq!(history.peek(true), Some(&"b"), "peeking twice changes nothing");
+        assert_eq!(history.travel(true, "c"), Some("b"));
+        assert_eq!((history.peek(true), history.peek(false)), (Some(&"a"), Some(&"c")));
+        assert_eq!(history.travel(false, "b"), Some("c"));
+        assert_eq!((history.peek(true), history.peek(false)), (Some(&"b"), None));
     }
 
     #[test]

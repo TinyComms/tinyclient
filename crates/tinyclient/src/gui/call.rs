@@ -441,6 +441,9 @@ pub struct State {
     watch_timer: Option<Task<()>>,
     /// The call whose full call view has the main pane (`gui/call/view.rs`).
     pub(in crate::gui) view: Option<Key>,
+    /// The call whose stage the user closed. It stays closed until a new call starts or they
+    /// choose Show call, and goes when the call ends or moves to another conversation.
+    pub(super) stage_dismissed_for: Option<Key>,
     /// The person drawn large, or the stream filling the stage, pinned by a click on its tile.
     pub(in crate::gui) focus: Option<stage::Focus>,
     /// Where the people go while a stream fills the stage.
@@ -488,6 +491,7 @@ pub(super) struct PopoutSnapshot {
     pub pip_frame: Option<std::sync::Arc<gpui::RenderImage>>,
     pub speaker_name: String,
     pub speaker_speaking: bool,
+    pub speaker_avatar: Option<std::path::PathBuf>,
     pub live_badge: bool,
 }
 
@@ -1135,6 +1139,31 @@ fn call_go_target(key: &Key, is_tiny_room: bool) -> CallGoTarget {
     }
 }
 
+/// Opening `opening` keeps the call stage when it was already up on that live call and the
+/// user has not dismissed it. A different conversation drops the stage.
+pub(super) fn stage_follows(view_open: bool, dismissed: Option<&Key>, active: Option<&Key>, opening: &Key) -> bool {
+    view_open && dismissed != Some(opening) && active == Some(opening)
+}
+
+/// A dismiss sticks only while that same call is still up. A new conversation, or no call, clears it.
+pub(super) fn stage_dismiss_holds(dismissed: Option<&Key>, active: Option<&Key>) -> bool {
+    matches!((dismissed, active), (Some(dismissed), Some(active)) if dismissed == active)
+}
+
+/// Direct and group calls take the main-pane stage. A Tiny voice room is the server's own page.
+pub(super) fn opens_call_stage(is_tiny_room: bool) -> bool {
+    !is_tiny_room
+}
+
+fn call_has_video(call: &Call) -> bool {
+    call.self_view.is_some()
+        || call.share_view.is_some()
+        || call.participants.iter().any(|person| person.camera || person.sharing)
+        || call.video.iter().any(|stream| {
+            matches!(stream.content, protocol::Content::Camera | protocol::Content::Share)
+        })
+}
+
 /// Keyboard action on a participant row in the call card's participant list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowKeyAction {
@@ -1180,6 +1209,9 @@ impl Shell {
         let Change::Call { call, .. } = change else {
             return;
         };
+        if !stage_dismiss_holds(self.call_state.stage_dismissed_for.as_ref(), call.as_ref().map(|call| &call.conversation)) {
+            self.call_state.stage_dismissed_for = None;
+        }
         let last = call.as_ref().map(|call| (call.conversation.clone(), discriminant(&call.state)));
         if self.call_state.last != last {
             self.call_state.phone.state_changed(call.as_ref(), self.call_state.last.as_ref().map(|(key, _)| key));
@@ -1950,6 +1982,33 @@ impl Shell {
         }
         let key = Key::new(account, &who.id);
         self.person_picture(&key, cx)
+    }
+
+    /// The active speaker's picture: a Tiny member's file when the call is on a Tiny server,
+    /// otherwise that person's avatar, then the conversation's.
+    fn call_speaker_avatar(
+        &self,
+        call: &Call,
+        speaker: Option<&protocol::Participant>,
+        contact: Option<&MediaFile>,
+    ) -> Option<std::path::PathBuf> {
+        let account = call.conversation.account();
+        if call.conversation.network == Network::Tiny {
+            if let Some(who) = speaker {
+                if let Some(path) = self.tiny_member_picture(&account, &who.id) {
+                    return Some(path);
+                }
+            }
+        }
+        if let Some(who) = speaker {
+            if let Some(file) = who.avatar.as_ref() {
+                let key = Key::new(&account, &who.id);
+                if let Some(path) = self.media_path(&key, Some(file)) {
+                    return Some(path);
+                }
+            }
+        }
+        self.media_path(&call.conversation, contact)
     }
 
     pub(super) fn call_people_list(&self, call: &Call, subject: &Subject, cx: &mut Context<Self>) -> Div {
@@ -3077,6 +3136,7 @@ impl Shell {
             .map(|p| p.name.clone())
             .unwrap_or_else(|| subject.title.clone());
         let speaker_speaking = speaker.is_some_and(|p| p.speaking);
+        let speaker_avatar = self.call_speaker_avatar(&call, speaker, subject.avatar.as_ref());
         let camera_on = call.self_view.is_some()
             || call.video.iter().any(|v| v.direction == protocol::Direction::Encode && v.content == protocol::Content::Camera);
         let share_on = call.share_view.is_some()
@@ -3093,6 +3153,7 @@ impl Shell {
             pip_frame,
             speaker_name,
             speaker_speaking,
+            speaker_avatar,
             live_badge,
         })
     }
@@ -3429,6 +3490,7 @@ impl Shell {
         if let Some(call) = self.call_now() {
             if call.conversation == conversation && !matches!(call.state, CallState::Failed { .. })
             {
+                self.call_show_stage(&conversation, cx);
                 return;
             }
         }
@@ -3480,6 +3542,7 @@ impl Shell {
     /// it off the main thread: the system's prompt can stay up as long as the user likes.
     fn call_begin(&mut self, requests: Vec<Request>, conversation: Key, cx: &mut Context<Self>) {
         self.call_asked();
+        self.call_show_stage(&conversation, cx);
         // Answering a ring starts mediad, which takes a moment: say so now, not when it is up.
         if requests.iter().any(|request| matches!(request, Request::CallAccept)) {
             self.call_state.connecting = Some(bare_call(conversation.clone(), CallState::Connecting, false, false));
@@ -3617,6 +3680,74 @@ impl Shell {
         values.set(GLOBAL, SOUNDBOARD_FAVORITES, value.clone());
         crate::gui::app::prefs::set_values(values);
         self.call_ask(Request::Set { scope: GLOBAL.to_owned(), key: SOUNDBOARD_FAVORITES.to_owned(), value }, cx);
+    }
+
+    /// Closes the call stage and remembers which call, so Show chat stays in the conversation
+    /// until a new call starts or the user chooses Show call.
+    pub(in crate::gui) fn call_dismiss_view(&mut self, cx: &mut Context<Self>) {
+        let active = self.snapshot.as_ref().and_then(|snapshot| {
+            self.call_shown(snapshot)
+                .filter(|call| !matches!(call.state, CallState::Failed { .. }))
+                .map(|call| call.conversation)
+        });
+        if let Some(key) = active {
+            self.call_state.stage_dismissed_for = Some(key);
+        }
+        self.call_state.view = None;
+        self.call_state.focus = None;
+        cx.notify();
+    }
+
+    /// Opens the main-pane stage for a direct or group call. A Tiny voice room stays on its page.
+    fn call_show_stage(&mut self, conversation: &Key, cx: &mut Context<Self>) {
+        self.call_state.stage_dismissed_for = None;
+        if opens_call_stage(self.tiny_room(conversation).is_some()) {
+            self.call_open_view(conversation.clone(), cx);
+        }
+    }
+
+    /// Header pill back to the stage of the open conversation's live call, once that stage is closed.
+    pub(in crate::gui) fn call_return_stage_pill(&self, snapshot: &Snapshot, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let call = self.call_shown(snapshot).filter(|call| !matches!(call.state, CallState::Failed { .. }))?;
+        if snapshot.open.as_ref().map(|open| &open.key) != Some(&call.conversation) {
+            return None;
+        }
+        if self.call_state.view.as_ref() == Some(&call.conversation) {
+            return None;
+        }
+        let icon_name = if call_has_video(&call) { "icons/video.svg" } else { "icons/phone.svg" };
+        let key = call.conversation.clone();
+        let clock = self.call_stage_clock(&call, cx);
+        let show_count = clock.is_none();
+        let count = call_people_count(&call);
+        Some(
+            div()
+                .id("call-return-stage")
+                .flex_none()
+                .h(px(28.))
+                .px(px(10.))
+                .rounded(px(14.))
+                .bg(theme::positive())
+                .text_color(theme::on_accent())
+                .hover(|style| style.opacity(0.88))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .text_size(px(12.))
+                .font_weight(FontWeight::MEDIUM)
+                .cursor_pointer()
+                .tooltip(tip("Show call", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.call_state.stage_dismissed_for = None;
+                    this.call_open_view(key.clone(), cx);
+                }))
+                .child(glyph(icon_name, 13., theme::on_accent()))
+                .child("Show call")
+                .children(clock)
+                .when(show_count, |pill| pill.child(count.to_string()))
+                .into_any_element(),
+        )
     }
 
     /// A small header pill while a call is live elsewhere, taking you back to it in one click.
@@ -3979,6 +4110,22 @@ mod tests {
         assert_eq!(target(&snapshot), Some(("peer".to_owned(), false)));
         snapshot.call = Some(call("peer", CallState::RingingOut));
         assert_eq!(target(&snapshot), None);
+    }
+
+    #[test]
+    fn a_dismissed_stage_stays_down_until_the_call_changes() {
+        let lounge = key("lounge");
+        let den = key("den");
+        assert!(stage_follows(true, None, Some(&lounge), &lounge), "an open stage follows its own conversation");
+        assert!(!stage_follows(true, Some(&lounge), Some(&lounge), &lounge), "Show chat keeps the stage closed");
+        assert!(!stage_follows(false, None, Some(&lounge), &lounge), "a closed stage is not invented by opening the chat");
+        assert!(!stage_follows(true, None, Some(&lounge), &den), "another conversation drops the stage");
+        assert!(stage_follows(true, Some(&den), Some(&lounge), &lounge), "a dismiss for a different call does not hide this one");
+        assert!(stage_dismiss_holds(Some(&lounge), Some(&lounge)));
+        assert!(!stage_dismiss_holds(Some(&lounge), Some(&den)), "a moved call forgets the dismiss");
+        assert!(!stage_dismiss_holds(Some(&lounge), None), "a call that ended forgets the dismiss");
+        assert!(opens_call_stage(false), "a direct or group call opens the stage");
+        assert!(!opens_call_stage(true), "a Tiny voice room stays on the server page");
     }
 
     #[test]

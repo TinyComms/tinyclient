@@ -4,11 +4,11 @@
 //! right-clicking opens the person menu. I am marked "You".
 
 use super::{model, Float, Page};
-use crate::gui::components::{field, glyph, Avatar};
+use crate::gui::components::{field, glyph, tip, Avatar};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use gpui::{div, prelude::*, px, AnyElement, Context, Div, Focusable, MouseButton, MouseDownEvent, SharedString, Window};
-use protocol::TinyMember;
+use protocol::{CallState, Content, TinyMember, TinyRoom, TinySeat};
 
 pub(super) const MEMBERS_WIDTH: f32 = 248.;
 
@@ -64,6 +64,20 @@ impl Shell {
             .into_any_element()
     }
 
+    fn member_seat<'a>(&self, page: &'a Page<'a>, member: &TinyMember) -> Option<(&'a TinyRoom, TinySeat)> {
+        let (room, raw) = model::seat_of(page.community, &member.user_id)?;
+        let me = member.user_id == page.me;
+        let call = self.tiny_call().filter(|call| call.conversation.id == room.id);
+        let mut seat = super::channel::as_heard(raw, me, call.as_ref());
+        if me {
+            if let Some(call) = call.as_ref().filter(|call| call.state == CallState::Joined) {
+                seat.sharing |= crate::gui::call::stage::sending(call, Content::Share);
+                seat.camera |= crate::gui::call::stage::sending(call, Content::Camera);
+            }
+        }
+        Some((room, seat))
+    }
+
     fn tiny_member_row(&self, page: &Page, member: &TinyMember, offline: bool, cx: &mut Context<Self>) -> AnyElement {
         let name = model::name_of(member);
         let me = member.user_id == page.me;
@@ -72,12 +86,32 @@ impl Shell {
             avatar = avatar.presence(presence, theme::sidebar());
         }
         let color = model::color_of(page.community, member).map(gpui::rgb).unwrap_or(theme::text());
-        let seat = model::seat_of(page.community, &member.user_id);
-        let second = match (&seat, &member.timeout_until) {
-            (_, Some(_)) => Some(("Timed out".to_owned(), theme::warning())),
-            (Some((room, _)), None) => Some((format!("In {}", room.name), theme::text_soft())),
-            (None, None) if model::is_owner(member) && page.community.roles.is_empty() => None,
-            _ => None,
+        let seat = self.member_seat(page, member);
+        let second: Option<AnyElement> = if member.timeout_until.is_some() {
+            Some(div().min_w_0().truncate().type_small().text_color(theme::warning()).child("Timed out").into_any_element())
+        } else if let Some((room, heard)) = seat {
+            let glyphs = super::column::seat_glyphs(&heard);
+            let speaking = heard.speaking && !heard.server_muted;
+            Some(
+                div()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .child(glyph("icons/volume-2.svg", 11., if speaking { theme::positive() } else { theme::text_faint() }))
+                    .child(div().min_w_0().truncate().type_small().text_color(theme::text_soft()).child(format!("In {}", room.name)))
+                    .when(!glyphs.is_empty(), |row| {
+                        row.child(div().flex_none().flex().items_center().gap(px(3.)).children(glyphs.into_iter().map(|(icon, tone, words)| {
+                            div()
+                                .id(SharedString::from(format!("tiny-member-glyph-{}-{icon}", member.user_id)))
+                                .tooltip(tip(words, None))
+                                .child(glyph(icon, 12., tone))
+                        })))
+                    })
+                    .into_any_element(),
+            )
+        } else {
+            None
         };
         let hovered = self.tiny_state.card.as_ref().is_some_and(|(id, _)| *id == member.user_id);
         let (hover_id, menu_id, open_id) = (member.user_id.clone(), member.user_id.clone(), member.user_id.clone());
@@ -114,7 +148,7 @@ impl Shell {
                                     .when(model::is_owner(member), |row| row.child(glyph("icons/crown.svg", 12., theme::warning())))
                                     .when(me, |row| row.child(super::channel::chip("You", theme::text_soft(), theme::hover()))),
                             )
-                            .children(second.map(|(words, tone)| div().min_w_0().truncate().type_small().text_color(tone).child(words))),
+                            .children(second),
                     ),
             )
             .on_hover(cx.listener(move |this, over: &bool, window, cx| {
@@ -215,9 +249,23 @@ impl Shell {
             facts = facts.child(fact("Seen", seen));
         }
         card = card.child(facts);
-        if let Some((room, _)) = model::seat_of(page.community, &member.user_id) {
+        if let Some((room, heard)) = self.member_seat(page, member) {
+            let glyphs = super::column::seat_glyphs(&heard);
             card = card.child(
-                div().flex().items_center().gap(px(6.)).child(glyph("icons/volume-2.svg", 14., theme::positive())).child(div().type_small().text_color(theme::text_soft()).child(format!("In {}", room.name))),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(glyph("icons/volume-2.svg", 14., theme::positive()))
+                    .child(div().flex_1().min_w_0().truncate().type_small().text_color(theme::text_soft()).child(format!("In {}", room.name)))
+                    .when(!glyphs.is_empty(), |row| {
+                        row.child(div().flex_none().flex().items_center().gap(px(4.)).children(glyphs.into_iter().map(|(icon, tone, words)| {
+                            div()
+                                .id(SharedString::from(format!("tiny-card-glyph-{}-{icon}", member.user_id)))
+                                .tooltip(tip(words, None))
+                                .child(glyph(icon, 13., tone))
+                        })))
+                    }),
             );
         }
         if let Some(timeout) = timeout {

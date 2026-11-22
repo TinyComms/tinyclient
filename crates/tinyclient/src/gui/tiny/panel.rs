@@ -53,17 +53,40 @@ pub(super) fn quality(health: &Health) -> Rgba {
 
 /// The panel's second line while this server has a call, and whether a click on it opens
 /// Call health. `None` when the call is not one to speak of (failed: the dock says so).
+/// The dock above already prints "Voice connected", so the joined line stays compact and
+/// never truncates the latency reading.
 fn call_line(state: &CallState, health: Option<&Health>, securing: bool) -> Option<(String, Rgba)> {
     Some(match state {
         CallState::Joined if securing => ("Securing…".to_owned(), theme::warning()),
         CallState::Connecting | CallState::RingingOut => ("Connecting…".to_owned(), theme::warning()),
         CallState::Reconnecting => ("Reconnecting…".to_owned(), theme::warning()),
         CallState::Joined => match health.and_then(|health| Some((health, health.rtt_ms?))) {
-            Some((health, ms)) => (format!("Voice connected · {ms} ms"), quality(health)),
-            None => ("Voice connected".to_owned(), theme::positive()),
+            Some((health, ms)) => (format!("{ms} ms"), quality(health)),
+            None => ("Connected".to_owned(), theme::positive()),
         },
         CallState::Failed { .. } | CallState::RingingIn { .. } => return None,
     })
+}
+
+/// Full voice connection status shown on hover over the compact status line.
+fn call_tooltip(state: &CallState, room: Option<&str>, health: Option<&Health>, securing: bool) -> String {
+    let mut parts = Vec::new();
+    match state {
+        CallState::Joined if securing => parts.push("Securing voice connection".to_owned()),
+        CallState::Connecting | CallState::RingingOut => parts.push("Connecting to voice".to_owned()),
+        CallState::Reconnecting => parts.push("Reconnecting to voice".to_owned()),
+        CallState::Joined => parts.push("Voice connected".to_owned()),
+        CallState::Failed { .. } | CallState::RingingIn { .. } => return "Call health".to_owned(),
+    }
+    if let Some(room) = room.filter(|room| !room.is_empty()) {
+        parts.push(room.to_owned());
+    }
+    if matches!(state, CallState::Joined) && !securing {
+        if let Some(ms) = health.and_then(|health| health.rtt_ms) {
+            parts.push(format!("{ms} ms"));
+        }
+    }
+    parts.join(" · ")
 }
 
 pub(super) fn path_words(path: CallPath) -> &'static str {
@@ -287,10 +310,19 @@ impl Shell {
         let (muted, deafened) = self.tiny_quiet();
         let call = self.tiny_call();
         let room = page.mine.and_then(|id| page.community.rooms.iter().find(|room| room.id == id));
+        let call_room = call
+            .as_ref()
+            .and_then(|call| page.community.rooms.iter().find(|room| room.id == call.conversation.id))
+            .or(room);
         let health = self.tiny_health();
-        let in_call = call.as_ref().and_then(|call| call_line(&call.state, health.as_ref(), crate::gui::call::securing(call)));
-        let grade = health.map_or(Grade::Unknown, |health| health.grade());
-        let joined = call.as_ref().is_some_and(|call| call.state == CallState::Joined);
+        let securing = call.as_ref().is_some_and(crate::gui::call::securing);
+        let in_call = call.as_ref().and_then(|call| call_line(&call.state, health.as_ref(), securing));
+        let grade = health.as_ref().map_or(Grade::Unknown, |health| health.grade());
+        let joined = call.as_ref().is_some_and(|call| call.state == CallState::Joined && !securing);
+        let status_tip = call
+            .as_ref()
+            .map(|call| call_tooltip(&call.state, call_room.map(|room| room.name.as_str()), health.as_ref(), securing))
+            .unwrap_or_else(|| "Call health".to_owned());
         let (line, color, clickable): (String, Rgba, bool) = match (in_call, room) {
             (Some((line, color)), _) => (line, color, true),
             (None, Some(room)) => (format!("Seated in {}", room.name), theme::text_soft(), false),
@@ -313,7 +345,7 @@ impl Shell {
                     .tab_index(0)
                     .hover(|style| style.underline())
                     .focus_visible(|style| style.underline())
-                    .tooltip(tip("Call health", None))
+                    .tooltip(tip(status_tip, None))
                     .on_click(cx.listener(|this, _, _, cx| this.tiny_toggle_health(cx)))
             });
         let mic = panel_button("tiny-panel-mic", if muted { "icons/mic-off.svg" } else { "icons/mic.svg" }, muted)
@@ -357,6 +389,7 @@ impl Shell {
                     div()
                         .flex_1()
                         .min_w_0()
+                        .overflow_hidden()
                         .flex()
                         .flex_col()
                         .child(div().min_w_0().truncate().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(name))
@@ -500,13 +533,22 @@ mod tests {
     #[test]
     fn the_panel_says_what_the_call_is_doing_not_just_that_there_is_one() {
         let good = Health::from_stats(&CallStats { rtt_ms: 38, jitter_ms: 3, ..CallStats::default() });
-        assert_eq!(call_line(&CallState::Joined, Some(&good), false).map(|line| line.0), Some("Voice connected · 38 ms".to_owned()));
-        assert_eq!(call_line(&CallState::Joined, None, false).map(|line| line.0), Some("Voice connected".to_owned()));
+        assert_eq!(call_line(&CallState::Joined, Some(&good), false).map(|line| line.0), Some("38 ms".to_owned()));
+        assert_eq!(call_line(&CallState::Joined, None, false).map(|line| line.0), Some("Connected".to_owned()));
         assert_eq!(call_line(&CallState::Joined, Some(&good), true).map(|line| line.0), Some("Securing…".to_owned()), "keys not ready: nothing is heard yet");
         assert_eq!(call_line(&CallState::Connecting, Some(&good), false), Some(("Connecting…".to_owned(), theme::warning())));
         assert_eq!(call_line(&CallState::Reconnecting, Some(&good), false), Some(("Reconnecting…".to_owned(), theme::warning())));
         let failed = CallState::Failed { reason: protocol::CallFailure::Lost, detail: String::new() };
-        assert_eq!(call_line(&failed, Some(&good), false), None, "a failed call is the dock's to tell, not 'Voice connected'");
+        assert_eq!(call_line(&failed, Some(&good), false), None, "a failed call is the dock's to tell, not 'Connected'");
+    }
+
+    #[test]
+    fn call_tooltip_carries_full_voice_status_with_room_and_latency() {
+        let good = Health::from_stats(&CallStats { rtt_ms: 52, jitter_ms: 3, ..CallStats::default() });
+        assert_eq!(call_tooltip(&CallState::Joined, Some("General"), Some(&good), false), "Voice connected · General · 52 ms");
+        assert_eq!(call_tooltip(&CallState::Joined, Some("General"), None, false), "Voice connected · General");
+        assert_eq!(call_tooltip(&CallState::Joined, Some("General"), Some(&good), true), "Securing voice connection · General");
+        assert_eq!(call_tooltip(&CallState::Connecting, Some("General"), Some(&good), false), "Connecting to voice · General");
     }
 
     #[test]

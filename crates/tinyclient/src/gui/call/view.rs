@@ -18,14 +18,14 @@ use gpui::{
     deferred, div, img, prelude::*, px, relative, AnyElement, Context, Div, MouseButton,
     MouseDownEvent, ObjectFit, SharedString, Stateful, Window,
 };
-use protocol::{Call, CallState, Content, ConversationKind, Key, MediaRequest, Network, PictureKind, Request};
+use protocol::{
+    Call, CallState, Content, Conversation, ConversationKind, Key, MediaRequest, Network,
+    PictureKind, Request,
+};
 use std::collections::HashMap;
 
-const TILE_W: f32 = 196.;
-const TILE_H: f32 = 148.;
-/// Two-person direct call: one large tile each.
-const DUO_W: f32 = 280.;
-const DUO_H: f32 = 210.;
+const STAGE_PAD: f32 = 24.;
+const TILE_GAP: f32 = 12.;
 /// A focused tile: the one person drawn large.
 const FOCUS_W: f32 = 420.;
 const FOCUS_H: f32 = 300.;
@@ -33,16 +33,49 @@ const FOCUS_H: f32 = 300.;
 const STRIP_W: f32 = 150.;
 const STRIP_H: f32 = 96.;
 
+/// Size a person tile for the available stage width, including its outer padding.
+pub(crate) fn stage_tile_size(avail_w: f32, seat_count: usize, has_streams: bool) -> (f32, f32) {
+    if has_streams {
+        return (STRIP_W, STRIP_H);
+    }
+    let inner = avail_w - 2. * STAGE_PAD;
+    let two = ((inner - TILE_GAP) / 2.).floor();
+    let (w, min_h, max_h) = match seat_count {
+        0 | 1 => (inner.floor().clamp(180., 320.), 140., 240.),
+        2 if avail_w >= 396. => (two.clamp(168., 280.), 132., 210.),
+        2 => (inner.floor().clamp(160., 260.), 124., 196.),
+        3 | 4 => (two.clamp(164., 248.), 126., 186.),
+        _ => {
+            let cols = if avail_w >= 640. { 3. } else { 2. };
+            let w = ((inner - TILE_GAP * (cols - 1.)) / cols).floor();
+            (w.clamp(148., 210.), 114., 158.)
+        }
+    };
+    (w, (w * 0.75).round().clamp(min_h, max_h))
+}
+
+/// Center a stage that fits and let a taller stage grow from the scroll viewport's top.
+fn centered_stage() -> Div {
+    div()
+        .min_h_full()
+        .w_full()
+        .flex()
+        .flex_col()
+        .justify_center()
+        .items_center()
+        .p(px(STAGE_PAD))
+        .gap(px(20.))
+}
+
 /// Said under the call while echo cancellation is switched off in Settings → Voice.
 pub(in crate::gui) const HEADPHONES: &str =
     "Echo cancellation is off: wear headphones, or others hear themselves.";
 
 /// How large a tile is drawn.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq)]
 pub(in crate::gui) enum Size {
-    Grid,
-    Duo,
-    Big,
+    Grid(f32, f32),
+    Big(f32),
     Strip,
 }
 
@@ -50,9 +83,11 @@ impl Size {
     /// A person's tile: width, height and avatar.
     pub(in crate::gui) fn person(self) -> (f32, f32, f32) {
         match self {
-            Size::Grid => (TILE_W, TILE_H, 64.),
-            Size::Duo => (DUO_W, DUO_H, 84.),
-            Size::Big => (FOCUS_W, FOCUS_H, 112.),
+            Size::Grid(w, h) => (w, h, (h * 0.40).round()),
+            Size::Big(w) => {
+                let h = (w * FOCUS_H / FOCUS_W).round();
+                (w, h, (h * 0.37).round())
+            }
             Size::Strip => (STRIP_W, STRIP_H, 36.),
         }
     }
@@ -61,6 +96,11 @@ impl Size {
     pub(in crate::gui) fn stream(self) -> (f32, f32) {
         let (_, h, _) = self.person();
         (h * 16. / 9., h)
+    }
+
+    fn grid(avail_w: f32, seat_count: usize, has_streams: bool) -> Self {
+        let (w, h) = stage_tile_size(avail_w, seat_count, has_streams);
+        if has_streams { Self::Strip } else { Self::Grid(w, h) }
     }
 }
 
@@ -321,25 +361,37 @@ impl Shell {
         cx.notify();
     }
 
-    /// Leaves the main-pane call view back to the conversation underneath.
-    pub(in crate::gui) fn call_close_view(&mut self, cx: &mut Context<Self>) {
-        if self.call_state.view.take().is_some() {
-            self.call_state.focus = None;
-            cx.notify();
-        }
+    fn call_conversation_row(&self, snapshot: &Snapshot, call: &Call) -> Option<Conversation> {
+        snapshot.open.as_ref().filter(|row| row.key == call.conversation).cloned()
+            .or_else(|| self.sidebar_state.find(&self.trees, &call.conversation))
     }
 
-    /// Builds a `CallPeople` lookup for a non-room call.
-    fn call_people_for(&self, call: &Call, me_id: &str, me_name: &str, cx: &mut Context<Self>) -> CallPeople {
+    /// Builds a `CallPeople` lookup for a non-room call, including its local and ringing seats.
+    fn call_people_for(&self, call: &Call, stage: &Stage, subject: &Subject, cx: &mut Context<Self>) -> CallPeople {
         let account = call.conversation.account();
         let mut names = HashMap::new();
         let mut pictures = HashMap::new();
-        let my_id = if me_id.is_empty() { "me" } else { me_id };
-        names.insert(my_id.to_owned(), if me_name.is_empty() { "You".to_owned() } else { me_name.to_owned() });
-        for who in &call.participants {
-            names.insert(who.id.clone(), who.name.clone());
-            if let Some(path) = self.call_participant_picture(&account, who, cx) {
-                pictures.insert(who.id.clone(), path);
+        for seat in &stage.seats {
+            names.insert(seat.id.clone(), seat.name.clone());
+            let who = call.participants.iter().find(|who| who.id == seat.id && who.ringing == seat.ringing);
+            let picture = self.tiny_member_picture(&account, &seat.id)
+                .or_else(|| who.and_then(|who| self.call_participant_picture(&account, who, cx)))
+                .or_else(|| {
+                    if seat.me {
+                        self.person_picture(&Key::new(&account, &seat.id), cx).or_else(|| {
+                            (account.network == Network::Tiny)
+                                .then(|| crate::gui::app::prefs::me().picture_path())
+                                .flatten()
+                        })
+                    } else if subject.kind == ConversationKind::Direct {
+                        let file = subject.avatar.as_ref()?;
+                        self.people_state.hub().file(&account, file, cx).path.map(Into::into)
+                    } else {
+                        None
+                    }
+                });
+            if let Some(path) = picture {
+                pictures.insert(seat.id.clone(), path);
             }
         }
         CallPeople { conversation: call.conversation.clone(), names, pictures }
@@ -349,8 +401,26 @@ impl Shell {
     fn call_me(&self, snapshot: &Snapshot, call: &Call) -> (String, String) {
         let account = call.conversation.account();
         let found = snapshot.accounts.iter().find(|a| a.key == account);
-        let id = found.map(|a| a.me.clone()).filter(|s| !s.is_empty()).unwrap_or_else(|| "me".to_owned());
-        let name = found.map(|a| a.name.clone()).filter(|s| !s.is_empty()).unwrap_or_else(|| "You".to_owned());
+        let page = self.tiny_page_facts().filter(|page| page.account == &account);
+        let id = page.as_ref().map(|page| page.community.me.as_str()).filter(|id| !id.is_empty())
+            .or_else(|| found.map(|a| a.me.as_str()).filter(|id| !id.is_empty()))
+            .unwrap_or("me")
+            .to_owned();
+        let name = if account.network == Network::Tiny {
+            page.and_then(|page| page.community.member(&id))
+                .map(crate::gui::tiny::model::name_of)
+                .or_else(|| {
+                    self.people_state.hub().person(&Key::new(&account, &id))
+                        .map(|person| person.name)
+                        .filter(|name| !name.trim().is_empty())
+                })
+                .unwrap_or_else(|| {
+                    let me = crate::gui::app::prefs::me();
+                    if me.name.trim().is_empty() { "You".to_owned() } else { me.name }
+                })
+        } else {
+            found.map(|a| a.name.clone()).filter(|name| !name.is_empty()).unwrap_or_else(|| "You".to_owned())
+        };
         (id, name)
     }
 
@@ -366,15 +436,19 @@ impl Shell {
             return div().size_full();
         };
         let subject = Subject::of(self, snapshot, &call);
+        let row = self.call_conversation_row(snapshot, &call);
+        let peer = row.as_ref().and_then(|row| row.peer.as_deref());
         let (me_id, me_name) = self.call_me(snapshot, &call);
-        let mut stage = Stage::of_call(&call, &subject, &me_id, &me_name);
+        let mut stage = Stage::of_call(&call, &subject, &me_id, &me_name, peer);
         if call.stage {
             super::discord_ux::order_seats(&mut stage.seats, &call.raised, call.request_to_speak);
         }
-        let people = self.call_people_for(&call, &me_id, &me_name, cx);
+        let people = self.call_people_for(&call, &stage, &subject, cx);
 
         let phone = crate::gui::phone::active();
-        let count = stage.seats.len();
+        let end_pad = chrome::end_pad(End::Conversation, 12.);
+        let roomy = self.conversation_room() - end_pad >= 540.;
+        let count = stage.seats.iter().filter(|seat| !seat.ringing).count();
         let count_label = if count == 1 { "1 person".to_owned() } else { format!("{count} people") };
         let place_chip = subject.space.as_ref().map(|space| {
             chip(space.clone(), theme::text_soft(), theme::hover())
@@ -386,18 +460,27 @@ impl Shell {
                 && call.state == CallState::Joined
                 && (call.participants.len() + 1) < 10);
 
-        let back = icon_button("call-view-back", "icons/arrow-left.svg", false)
-            .tooltip(tip("Back to conversation (Esc)", None))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(|this, _, _, cx| this.call_close_view(cx)));
+        let unread = row.as_ref().map_or(0, |row| row.unread);
+        let show_chat = button_with_icon(
+            "call-view-show-chat",
+            ButtonKind::Secondary,
+            "icons/message-square.svg",
+            "Show chat",
+        )
+        .flex_none()
+        .h(px(28.))
+        .when(unread > 0, |button| {
+            let count = if unread > 99 { "99+".to_owned() } else { unread.to_string() };
+            button.child(chip(count, theme::accent_text(), theme::accent_soft()).rounded_full())
+        })
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(cx.listener(|this, _, _, cx| this.call_dismiss_view(cx)));
         let title_icon = if subject.kind == ConversationKind::Voice {
             "icons/volume-2.svg"
         } else {
             "icons/phone.svg"
         };
-        let voice_row = snapshot.open.as_ref().filter(|row| row.key == call.conversation).cloned()
-            .or_else(|| self.sidebar_state.find(&self.trees, &call.conversation));
-        let voice_status = voice_row.as_ref().and_then(crate::gui::sidebar::discord_voice_status);
+        let voice_status = row.as_ref().and_then(crate::gui::sidebar::discord_voice_status);
         let voice_details = call.conversation.network == Network::Discord && call.state == CallState::Joined
             && subject.kind == ConversationKind::Voice;
         let details_key = call.conversation.clone();
@@ -407,7 +490,6 @@ impl Shell {
             .flex()
             .items_center()
             .gap(px(8.))
-            .child(back)
             .child(glyph(
                 title_icon,
                 16.,
@@ -415,7 +497,7 @@ impl Shell {
             ))
             .child(
                 div()
-                    .flex_none()
+                    .min_w_0()
                     .max_w(px(260.))
                     .min_w_0()
                     .flex()
@@ -434,9 +516,9 @@ impl Shell {
                         div().truncate().type_micro().text_color(theme::text_soft()).child(super::discord_ux::activity_line(&activity.name))
                     })),
             )
-            .children(place_chip)
+            .children(place_chip.filter(|_| roomy))
             .children(voice_status.map(|status| self.voice_status_line(&call.conversation, &status, cx)))
-            .child(chip(count_label, theme::text_soft(), theme::hover()))
+            .when(roomy, |row| row.child(chip(count_label, theme::text_soft(), theme::hover())))
             .children(
                 call.record_start_date
                     .map(|since| super::telegram::recording_badge("call-header-rec", since, call.record_video_active)),
@@ -445,6 +527,9 @@ impl Shell {
                 call.rtmp_stream
                     .then(|| chip("Live stream", theme::accent_text(), theme::accent_soft())),
             )
+            .children(self.call_stage_clock(&call, cx).map(|clock| {
+                div().flex_none().type_small().text_color(theme::text_soft()).child(clock)
+            }))
             .children(self.call_security(&call, Place::TopBar, cx));
         let add_people = can_add_people.then(|| {
             button_with_icon(
@@ -466,22 +551,78 @@ impl Shell {
                 }
             }))
         });
+        let streams = stage::streams(&stage, &me_id, sending_now(Some(&call)));
+        // Remember an explicit grid choice on this call so an incoming video frame doesn't
+        // immediately restore the automatic direct-call picture-in-picture layout.
+        let grid_choice = window.use_keyed_state(
+            SharedString::from(format!("call-view-grid-choice:{:?}", call.conversation)),
+            cx,
+            |_, _| false,
+        );
+        let auto_peer_video = !*grid_choice.read(cx);
+        let focused = stage::still(self.call_state.focus.as_ref(), &stage, &streams).is_some()
+            || (auto_peer_video && self.call_peer_video(&stage, &streams, Some(&call)).is_some());
+        let layout_toggle = (focused || stage.seats.len() > 1).then(|| {
+            let target = streams.iter().find(|stream| !stream.mine && stream.watchable)
+                .or_else(|| streams.iter().find(|stream| stream.mine))
+                .cloned();
+            let person = stage.seats.iter().find(|seat| !seat.me && !seat.ringing)
+                .or_else(|| stage.seats.iter().find(|seat| !seat.me))
+                .map(|seat| seat.id.clone());
+            let (icon, label) = if focused { ("icons/users.svg", "Grid") } else { ("icons/maximize.svg", "Focus") };
+            let button = if roomy {
+                button_with_icon("call-view-layout", ButtonKind::Ghost, icon, label).h(px(28.))
+            } else {
+                icon_button("call-view-layout", icon, false)
+            };
+            button
+                .flex_none()
+                .tooltip(tip(label, None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if focused {
+                        grid_choice.update(cx, |choice, _| *choice = true);
+                        this.call_keep_keys(window, cx);
+                        this.call_state.focus = None;
+                        this.call_sync_watch_now(cx);
+                        cx.notify();
+                    } else if let Some(stream) = &target {
+                        this.call_open_stream(&stream.user_id, stream.mine, window, cx);
+                    } else if let Some(id) = &person {
+                        this.call_toggle_focus(id, window, cx);
+                    }
+                }))
+        });
+        let popout = (!phone && super::in_call(&call)).then(|| {
+            let open = self.call_popout_open();
+            icon_button("call-view-popout", "icons/picture-in-picture-2.svg", open)
+                .tooltip(tip(if open { "Bring back to window" } else { "Pop out" }, Some("⇧⌘O")))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(|this, _, _, cx| this.call_toggle_popout(cx)))
+        });
         let bar = drags_window(div())
             .h(px(TOP_BAR))
             .flex_none()
             .pl(px(theme::PANE_PAD))
-            .pr(px(chrome::end_pad(End::Conversation, 12.)))
+            .pr(px(end_pad))
             .border_b_1()
             .border_color(theme::hairline())
             .flex()
             .items_center()
             .gap(px(8.))
             .when(!phone, |bar| bar.child(self.strip_controls(window, cx)))
+            .child(show_chat)
             .child(title_row)
             .children(voice_details.then(|| icon_button("call-voice-region", "icons/info.svg", false)
                 .tooltip(tip("Connection details", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |this, _, _, cx| this.open_discord_voice_settings(details_key.clone(), false, cx)))))
-            .children(add_people);
+            .children(add_people)
+            .children(layout_toggle)
+            .children(popout)
+            .when(!cfg!(target_os = "macos") && end_pad > 12., |bar| {
+                bar.child(div().flex_none().w(px(1.)).h(px(20.)).bg(theme::hairline()))
+            });
 
         let held = if call.server_muted {
             Some("A moderator muted you here")
@@ -490,8 +631,8 @@ impl Shell {
         } else {
             None
         };
-        let banner = self.call_view_banner(&subject.title, &call, cx);
-        let stage_el = self.call_stage(&stage, &people, Some(&call), false, cx);
+        let banner = self.call_view_banner_inner(&subject.title, &call, false, cx);
+        let stage_el = self.call_stage_inner(&stage, &people, Some(&call), false, auto_peer_video, cx);
         let controls = self.call_view_bar(
             Some(&call),
             &ViewBar {
@@ -525,6 +666,16 @@ impl Shell {
         &self,
         title_place: &str,
         call: &Call,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        self.call_view_banner_inner(title_place, call, true, cx)
+    }
+
+    fn call_view_banner_inner(
+        &self,
+        title_place: &str,
+        call: &Call,
+        show_clock: bool,
         cx: &mut Context<Self>,
     ) -> Option<Div> {
         let (icon, color, fill, title, line): (
@@ -608,7 +759,7 @@ impl Shell {
                 .on_click(cx.listener(|this, _, _, cx| this.call_leave(cx)))
                 .child(glyph("icons/x.svg", 14., theme::text_soft()))
         });
-        let clock = self.call_stage_clock(call, cx);
+        let clock = show_clock.then(|| self.call_stage_clock(call, cx)).flatten();
         Some(
             div().flex_none().px(px(24.)).pt(px(16.)).flex().justify_center().child(
                 div()
@@ -689,6 +840,28 @@ impl Shell {
         room_context: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.call_stage_inner(stage, people, call, room_context, true, cx)
+    }
+
+    fn call_peer_video<'a>(&self, stage: &Stage, streams: &'a [Stream], call: Option<&Call>) -> Option<&'a Stream> {
+        if stage.kind != ConversationKind::Direct || stage.seats.len() > 2 {
+            return None;
+        }
+        streams.iter().find(|stream| {
+            let kind = if stream.share { PictureKind::Share } else { PictureKind::Camera };
+            !stream.mine && self.call_frame(call, &stream.user_id, kind).is_some()
+        })
+    }
+
+    fn call_stage_inner(
+        &self,
+        stage: &Stage,
+        people: &dyn People,
+        call: Option<&Call>,
+        room_context: bool,
+        auto_peer_video: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let me = stage.me_id().unwrap_or("");
         let streams = stage::streams(stage, me, sending_now(call));
         #[cfg(feature = "gui-shot")]
@@ -697,49 +870,51 @@ impl Shell {
         let shot_focus: Option<Focus> = None;
         let active_focus = shot_focus.as_ref().or(self.call_state.focus.as_ref());
         let focus = stage::still(active_focus, stage, &streams);
-        let base = div().id("tiny-stage").flex_1().min_h_0();
+        let mut avail_w = self.conversation_room();
+        if room_context {
+            // Match the Tiny pane's drawer threshold. The width in `conversation_room` already
+            // accounts for the rail and the sidebar when it has its own column.
+            if self.layout_state.sidebar_hidden && !self.layout_state.floating && !crate::gui::phone::active() {
+                avail_w -= 260.;
+            }
+            if self.tiny_state.members_open() && avail_w - 248. >= 440. {
+                avail_w -= 248.;
+            }
+        }
+        let base = div().id("tiny-stage").flex_1().w_full().min_h_0();
         match focus {
             None => {
                 // Direct 1:1 video call: if the peer has a live frame on screen, draw it large
                 // with my own camera/tile in the corner.
-                if stage.kind == ConversationKind::Direct && stage.seats.len() <= 2 {
-                    if let Some(peer_stream) = streams.iter().find(|s| {
-                        let kind = if s.share { PictureKind::Share } else { PictureKind::Camera };
-                        !s.mine && self.call_frame(call, &s.user_id, kind).is_some()
-                    }) {
-                        let main = self.call_stream_view(stage, people, peer_stream, call, false, cx);
-                        let self_frame = self
-                            .call_self_frame(call, false)
-                            .or_else(|| self.call_self_frame(call, true));
-                        let pip = self_frame.map(|frame| {
-                            div()
-                                .absolute()
-                                .bottom(px(16.))
-                                .right(px(16.))
-                                .w(px(184.))
-                                .h(px(108.))
-                                .rounded(px(10.))
-                                .overflow_hidden()
-                                .border_1()
-                                .border_color(theme::border())
-                                .bg(gpui::rgb(0x0b0b0d))
-                                .shadow(theme::shadow_popover())
-                                .child(img(frame).size_full().object_fit(ObjectFit::Contain))
-                        });
-                        return base
-                            .p(px(16.))
-                            .flex()
-                            .child(div().relative().flex_1().min_h_0().flex().child(main).children(pip))
-                            .into_any_element();
-                    }
+                if let Some(peer_stream) = auto_peer_video.then(|| self.call_peer_video(stage, &streams, call)).flatten() {
+                    let main = self.call_stream_view(stage, people, peer_stream, call, false, cx);
+                    let self_frame = self
+                        .call_self_frame(call, false)
+                        .or_else(|| self.call_self_frame(call, true));
+                    let pip = self_frame.map(|frame| {
+                        div()
+                            .absolute()
+                            .bottom(px(16.))
+                            .right(px(16.))
+                            .w(px(184.))
+                            .h(px(108.))
+                            .rounded(px(10.))
+                            .overflow_hidden()
+                            .border_1()
+                            .border_color(theme::border())
+                            .bg(gpui::rgb(0x0b0b0d))
+                            .shadow(theme::shadow_popover())
+                            .child(img(frame).size_full().object_fit(ObjectFit::Contain))
+                    });
+                    return base
+                        .p(px(16.))
+                        .flex()
+                        .child(div().relative().flex_1().min_h_0().flex().child(main).children(pip))
+                        .into_any_element();
                 }
-                let size = if stage.seats.len() <= 2 && streams.is_empty() {
-                    Size::Duo
-                } else {
-                    Size::Grid
-                };
                 let (grid_seats, roster_seats) =
                     stage::partition_stage(&stage.seats, &streams, me, stage::STAGE_GRID_CAP);
+                let size = Size::grid(avail_w, grid_seats.len(), !streams.is_empty());
                 let grid_tiles = self.call_tiles_for(
                     stage,
                     people,
@@ -751,26 +926,22 @@ impl Shell {
                     room_context,
                     cx,
                 );
-                let mut content = base
-                    .overflow_y_scroll()
-                    .p(px(24.))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(20.))
+                let mut content = centered_stage()
                     .child(
                         div()
+                            .flex_none()
                             .w_full()
                             .flex()
                             .flex_wrap()
                             .content_center()
                             .items_center()
                             .justify_center()
-                            .gap(px(12.))
+                            .gap(px(TILE_GAP))
                             .children(grid_tiles),
                     );
                 if !roster_seats.is_empty() {
                     let mut roster = div()
+                        .flex_none()
                         .w_full()
                         .max_w(px(680.))
                         .p(px(12.))
@@ -861,36 +1032,42 @@ impl Shell {
                     }
                     content = content.child(roster);
                 }
-                crate::gui::components::scroll::scroll_page("tiny-stage-grid-scroll-frame", content)
-                    .into_any_element()
+                crate::gui::components::scroll::scroll_page(
+                    "tiny-stage-grid-scroll-frame",
+                    base.overflow_y_scroll().child(content),
+                )
+                .into_any_element()
             }
             Some(Focus::Person(focus)) => {
+                let big_size = Size::Big((avail_w - 2. * STAGE_PAD).clamp(160., FOCUS_W));
                 let big = stage
                     .seats
                     .iter()
                     .find(|seat| seat.id == *focus)
-                    .map(|seat| self.call_tile(stage, people, seat, call, Size::Big, room_context, cx));
+                    .map(|seat| self.call_tile(stage, people, seat, call, big_size, room_context, cx));
                 let rest = self.call_tiles(
                     stage,
                     people,
                     &streams,
                     call,
                     Some(&Focus::Person(focus.clone())),
-                    Size::Grid,
+                    Size::grid(avail_w, stage.seats.len().saturating_sub(1), !streams.is_empty()),
                     room_context,
                     cx,
                 );
                 crate::gui::components::scroll::scroll_page(
                     "tiny-stage-person-scroll-frame",
-                    base.overflow_y_scroll()
-                        .p(px(24.))
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .gap(px(16.))
-                        .children(big)
-                        .child(div().flex().flex_wrap().justify_center().gap(px(12.)).children(rest)),
+                    base.overflow_y_scroll().child(
+                        centered_stage()
+                            .gap(px(16.))
+                            .children(big)
+                            .when(!rest.is_empty(), |content| {
+                                content.child(
+                                    div().flex_none().w_full().flex().flex_wrap()
+                                        .justify_center().gap(px(TILE_GAP)).children(rest),
+                                )
+                            }),
+                    ),
                 )
                 .into_any_element()
             }
@@ -1044,7 +1221,7 @@ impl Shell {
             return img(frame).size_full().object_fit(ObjectFit::Contain).into_any_element();
         }
         let small = size == Size::Strip;
-        let large = size == Size::Big;
+        let large = matches!(size, Size::Big(_));
         let body = div()
             .size_full()
             .relative()
@@ -1075,7 +1252,7 @@ impl Shell {
                     .child(img(frame).size_full().object_fit(ObjectFit::Contain))
                     .when(!small, |tile| {
                         let row = div().absolute().left_0().right_0().flex().justify_center();
-                        let row = if matches!(size, Size::Grid | Size::Duo) {
+                        let row = if matches!(size, Size::Grid(..)) {
                             row.top(px(8.))
                         } else {
                             row.bottom(px(10.))
@@ -1455,7 +1632,7 @@ impl Shell {
                 )
                 .into_any_element()
         } else {
-            self.call_stream_body(people, stream, call, Size::Big, cx).into_any_element()
+            self.call_stream_body(people, stream, call, Size::Big(FOCUS_W), cx).into_any_element()
         };
         let volume = call
             .filter(|_| stream.share && !mine)
@@ -1508,9 +1685,11 @@ impl Shell {
         }
         let call = self.call_shown(snapshot)?;
         let subject = Subject::of(self, snapshot, &call);
+        let row = self.call_conversation_row(snapshot, &call);
+        let peer = row.as_ref().and_then(|row| row.peer.as_deref());
         let (me_id, me_name) = self.call_me(snapshot, &call);
-        let stage = Stage::of_call(&call, &subject, &me_id, &me_name);
-        let people = self.call_people_for(&call, &me_id, &me_name, cx);
+        let stage = Stage::of_call(&call, &subject, &me_id, &me_name, peer);
+        let people = self.call_people_for(&call, &stage, &subject, cx);
         Some(self.call_full_stage_inner(&stage, &people, Some(&call), cx))
     }
 
@@ -1530,24 +1709,28 @@ impl Shell {
         let inside: AnyElement = match stream {
             Some(stream) => self.call_stream_view(stage, people, stream, call, true, cx).into_any_element(),
             None => div()
-                .size_full()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap(px(12.))
-                .child(div().type_title().text_color(theme::text()).child("The stream ended"))
+                .id("call-full-ended-scroll")
+                .flex_1()
+                .w_full()
+                .h_full()
+                .min_h_0()
+                .overflow_y_scroll()
                 .child(
-                    button_with_icon(
-                        "tiny-stream-ended",
-                        ButtonKind::Secondary,
-                        "icons/minimize.svg",
-                        "Exit full screen",
-                    )
-                    .h(px(32.))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.call_unfull(window, cx);
-                    })),
+                    centered_stage()
+                        .gap(px(12.))
+                        .child(div().type_title().text_color(theme::text()).child("The stream ended"))
+                        .child(
+                            button_with_icon(
+                                "tiny-stream-ended",
+                                ButtonKind::Secondary,
+                                "icons/minimize.svg",
+                                "Exit full screen",
+                            )
+                            .h(px(32.))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.call_unfull(window, cx);
+                            })),
+                        ),
                 )
                 .into_any_element(),
         };
@@ -1575,9 +1758,10 @@ impl Shell {
         room_context: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let big = size == Size::Big;
+        let big = matches!(size, Size::Big(_));
         let small = size == Size::Strip;
         let me = seat.me;
+        let ringing = seat.ringing;
         let name = if seat.name.is_empty() { people.name(&seat.id) } else { seat.name.clone() };
         let speaking = seat.speaking && !seat.server_muted && !seat.suppressed;
         let color = people.color(&seat.id).map(gpui::rgb).unwrap_or(theme::text());
@@ -1710,7 +1894,24 @@ impl Shell {
             .when(percent != 100 && !local_mute && !me, |row| {
                 row.child(chip(format!("{percent} %"), theme::text_soft(), theme::hover()))
             });
-        let ring = if speaking && seat.priority {
+        let stop_ring = (ringing && stage.key.network == Network::Discord && call.is_some_and(|call| {
+            call.participants.iter().any(|who| who.id == seat.id && who.ringing)
+        })).then(|| {
+            let id = seat.id.clone();
+            button(format!("call-stage-stop-ringing-{id}"), ButtonKind::Ghost, "Stop")
+                .h(px(22.))
+                .px(px(6.))
+                .type_micro()
+                .tooltip(tip("Stop ringing", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_ask(Request::CallStopRinging { people: Some(vec![id.clone()]) }, cx);
+                }))
+        });
+        let ring = if ringing {
+            gpui::Rgba { alpha: 0.45, ..theme::accent() }
+        } else if speaking && seat.priority {
             theme::accent_text()
         } else if speaking {
             theme::positive()
@@ -1746,6 +1947,7 @@ impl Shell {
             .overflow_hidden()
             .border_2()
             .border_color(ring)
+            .when(ringing, |tile| tile.border_dashed())
             .when(speaking, |tile| {
                 tile.shadow(vec![gpui::BoxShadow {
                     color: gpui::Rgba {
@@ -1795,7 +1997,12 @@ impl Shell {
                 .child(caption(if me { format!("{name} (You)") } else { name }, small))
         } else {
             base_tile
-                .child(Avatar::new(&people.key(&seat.id), &name, avatar).image_at(people.picture(&seat.id)).build())
+                .child(
+                    Avatar::new(&people.key(&seat.id), &name, avatar)
+                        .image_at(people.picture(&seat.id))
+                        .build()
+                        .when(ringing, |avatar| avatar.opacity(0.72)),
+                )
                 .child(
                     div()
                         .max_w(px(w - 24.))
@@ -1824,7 +2031,17 @@ impl Shell {
                 .when(camera_refused, |tile| {
                     tile.child(chip("Too many videos", theme::text_soft(), theme::hover()))
                 })
-                .when(!small, |tile| tile.child(state_row))
+                .when(ringing, |tile| {
+                    tile.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .child(chip("Ringing…", theme::accent_text(), theme::accent_soft()).rounded_full())
+                            .children(stop_ring),
+                    )
+                })
+                .when(!small && !ringing, |tile| tile.child(state_row))
         };
         tile.children(link)
             .children(seat.reaction.as_ref().filter(|r| !r.is_empty()).map(|emoji| {
@@ -1850,7 +2067,7 @@ impl Shell {
                     .gap(px(4.))
                     .children(glyphs.into_iter().map(|(icon, color, _)| glyph(icon, 14., color))),
             )
-            .when(!small, |tile| tile.child(actions))
+            .when(!small && !ringing, |tile| tile.child(actions))
             .into_any_element()
     }
 
@@ -2757,5 +2974,47 @@ impl Shell {
     /// Keep keyboard focus on the window root so Escape still reaches `close_top`.
     pub(in crate::gui) fn call_keep_keys(&self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus, cx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stage_tile_size;
+
+    #[test]
+    fn stage_tiles_scale_with_width_and_seat_count() {
+        for (width, count, expected) in [
+            (360., 1, (312., 234.)),
+            (360., 2, (260., 195.)),
+            (360., 3, (164., 126.)),
+            (464., 1, (320., 240.)),
+            (464., 2, (202., 152.)),
+            (464., 3, (202., 152.)),
+            (464., 4, (202., 152.)),
+            (464., 6, (202., 152.)),
+            (900., 1, (320., 240.)),
+            (900., 2, (280., 210.)),
+            (900., 4, (248., 186.)),
+            (900., 6, (210., 158.)),
+        ] {
+            assert_eq!(stage_tile_size(width, count, false), expected, "{width}px, {count} seats");
+        }
+    }
+
+    #[test]
+    fn a_pair_fits_on_one_row_with_padding_at_and_above_the_duo_threshold() {
+        for width in [396., 464., 900.] {
+            let (tile, _) = stage_tile_size(width, 2, false);
+            assert!(2. * tile + 12. + 48. <= width);
+        }
+        let (tile, _) = stage_tile_size(395., 2, false);
+        assert!(2. * tile + 12. + 48. > 395.);
+    }
+
+    #[test]
+    fn stage_tiles_stay_compact_when_streams_are_visible() {
+        for (width, count) in [(360., 1), (464., 4), (900., 6)] {
+            assert_eq!(stage_tile_size(width, count, true), (150., 96.));
+        }
     }
 }

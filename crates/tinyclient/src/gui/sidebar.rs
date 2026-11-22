@@ -87,6 +87,8 @@ pub struct Location {
     mode: Mode,
     open: Option<(Key, String)>,
     tiny_channel: Option<String>,
+    /// The main-pane call view that was over `open`, if any.
+    call_view: Option<Key>,
 }
 
 pub struct FolderEdit {
@@ -785,7 +787,28 @@ impl Shell {
             mode: self.sidebar_state.mode.clone(),
             open: open.map(|open| (open.key.clone(), open.title.clone())),
             tiny_channel: self.tiny_state.channel(),
+            call_view: self.call_state.view.clone(),
         }
+    }
+
+    /// Words for the place back (or forward) leads to, for the strip's tooltips.
+    pub(in crate::gui) fn peek_travel_label(&self, back: bool) -> Option<String> {
+        let there = self.sidebar_state.history.peek(back)?;
+        let named = |title: &str| Some(title.trim().to_owned()).filter(|title| !title.is_empty());
+        let room = there.tiny_channel.as_ref().and_then(|id| {
+            let community = self.tiny_state.community.as_ref()?;
+            community.rooms.iter().find(|room| room.id == *id).map(|room| room.name.clone())
+        });
+        let label = match (&there.mode, &there.open) {
+            (_, Some((_, title))) if there.call_view.is_some() => named(title).map_or("Call".to_owned(), |title| format!("{title} call")),
+            (_, Some((_, title))) => named(title).unwrap_or_else(|| "Conversation".to_owned()),
+            (Mode::Network(Network::Tiny), None) => room.unwrap_or_else(|| "Server home".to_owned()),
+            (Mode::Inbox, None) => "Inbox".to_owned(),
+            (Mode::People, None) => "People".to_owned(),
+            (Mode::Network(network), None) => network.label().to_owned(),
+            (Mode::Space(space), None) => self.spaces.iter().find(|candidate| candidate.key == *space).and_then(|space| named(&space.name)).unwrap_or_else(|| space.network.label().to_owned()),
+        };
+        Some(label)
     }
 
     /// Notes where the user is, before they go somewhere else.
@@ -817,6 +840,11 @@ impl Shell {
         match there.open {
             Some((key, title)) if self.open.as_ref() != Some(&key) => self.open_now(key, &title, cx),
             _ => cx.notify(),
+        }
+        // Opening a conversation closes the call view over it; put it back only for a call still up.
+        let live = there.call_view.filter(|key| self.snapshot.as_ref().and_then(|snapshot| self.call_shown(snapshot)).is_some_and(|call| call.conversation == *key));
+        if live.is_some() {
+            self.call_state.view = live;
         }
     }
 
@@ -7274,8 +7302,8 @@ pub(crate) mod tests {
     #[test]
     fn location_round_trips_tiny_channel_in_history() {
         let mut history = history::History::default();
-        let inbox = Location { mode: Mode::Inbox, open: Some((Key { network: Network::Tiny, account: "a".into(), id: "dm-1".into() }, "Bea".into())), tiny_channel: None };
-        let room = Location { mode: Mode::Network(Network::Tiny), open: None, tiny_channel: Some("lounge".into()) };
+        let inbox = Location { mode: Mode::Inbox, open: Some((Key { network: Network::Tiny, account: "a".into(), id: "dm-1".into() }, "Bea".into())), tiny_channel: None, call_view: None };
+        let room = Location { mode: Mode::Network(Network::Tiny), open: None, tiny_channel: Some("lounge".into()), call_view: None };
         history.leave(inbox.clone());
         assert_eq!(history.travel(true, room.clone()), Some(inbox.clone()));
         assert_eq!(history.travel(false, inbox), Some(room));
