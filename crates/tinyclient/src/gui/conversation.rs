@@ -1043,6 +1043,7 @@ impl Pane {
             None,
             conversation.age_restricted,
             gated,
+            conversation.unread,
             cx,
         );
         self.wants_focus = !typing;
@@ -1074,7 +1075,7 @@ impl Pane {
         cx: &mut Context<Self>,
     ) {
         let replies = root.thread.as_ref().map_or(0, |thread| thread.replies);
-        self.start(key, title, ConversationKind::Thread, me, can, rights, Some((root, replies)), age_restricted, gated, cx);
+        self.start(key, title, ConversationKind::Thread, me, can, rights, Some((root, replies)), age_restricted, gated, 0, cx);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1089,6 +1090,7 @@ impl Pane {
         root: Option<(Rc<Message>, u32)>,
         age_restricted: bool,
         gated: bool,
+        unread: u32,
         cx: &mut Context<Self>,
     ) {
         let landing = self.landing.take();
@@ -1104,11 +1106,22 @@ impl Pane {
         self.poll_voters_task = None;
         self.translations.clear();
         self.translating.clear();
+        // Flush any throttled read mark before leaving, so returning to this conversation does
+        // not re-open on a stale "New" divider for messages the user already saw.
+        if !self.read.suppress && may_mark_read(SCREENSHOTS, self.active, self.open.is_some(), true) {
+            if let Some(next) = self.read.next.take().and_then(|id| self.find(&id)) {
+                self.mark_read(next.rank(), cx);
+            }
+        }
         // Where the one being left was, for coming back to it.
         if let Some((left, place)) = self.key().cloned().zip(self.place()) {
             self.places.put(left, place);
         }
-        let back = self.places.get(&key).filter(|place| !place.bottom).cloned();
+        let newest_pref = super::app::prefs::choices().newest;
+        let back = restore_place(self.places.get(&key), unread, newest_pref);
+        if back.is_none() && (unread > 0 || newest_pref) {
+            self.places.forget(&key);
+        }
         self.open = Some(Open {
             key,
             title: title.to_owned(),
@@ -1333,16 +1346,10 @@ impl Pane {
     /// Where the user is in this conversation now: the first message on screen and how far
     /// into it, as a place that stays true however the rows above it are measured later.
     fn place(&self) -> Option<Place> {
-        if self.is_thread() || self.items.is_empty() {
+        if self.is_thread() || self.window.messages.is_empty() {
             return None;
         }
-        let bottom = !self.away;
-        let top = self.list.logical_scroll_top();
-        let (id, offset) = match self.items.get(top.item_ix).and_then(Item::message) {
-            Some(message) => (message.id.clone(), f32::from(top.offset_in_item)),
-            None => (self.items.get(top.item_ix..)?.iter().find_map(Item::message)?.id.clone(), 0.),
-        };
-        Some(Place { id, offset, bottom })
+        record_place(&self.items, self.list.logical_scroll_top(), self.away, self.pinned(), self.window.newer)
     }
 
     fn key(&self) -> Option<&Key> {
@@ -1501,17 +1508,26 @@ impl Pane {
         if !pinned && !mine {
             self.unseen += arrived.map_or(0, |new| new.iter().filter(|message| !message.outgoing).count());
         }
-        self.relay(pinned || mine, top);
+        let pin_on_load = pinned || mine || (purpose == Purpose::Open && !self.is_thread());
+        self.relay(pin_on_load, top);
         match &purpose {
             Purpose::Jump(id) => self.reveal(id, cx),
             Purpose::Bottom => self.snap_to_end(),
-            Purpose::Restore(id, offset) => self.restore(id, *offset),
+            Purpose::Restore(id, offset) => {
+                if !self.restore(id, *offset) {
+                    self.load(Page::Newest, Purpose::Open, cx);
+                    return;
+                }
+            }
             // Unread that may not fit: placed once the rows can be measured.
             Purpose::Open => {
                 self.land = !super::app::prefs::choices().newest && self.items.iter().any(|item| matches!(item, Item::New));
                 // A phone decides where the open lands once the rows are measured; placing
                 // unread wins over both.
                 self.opening = self.metrics == Metrics::PHONE && !self.thread && !self.land;
+                if !self.is_thread() && !self.land && !self.opening {
+                    self.snap_to_end();
+                }
             }
             _ if mine => self.snap_to_end(),
             _ => {}
@@ -1575,9 +1591,7 @@ impl Pane {
         if let Some((range, count)) = rows::changed(&self.items, &new) {
             self.list.splice(range, count);
             if pinned {
-                if self.is_thread() {
-                    self.list.scroll_to_end();
-                }
+                self.list.scroll_to_end();
             } else if let Some((item_ix, offset)) = rows::anchor(&self.items, &new, top.item_ix, top.offset_in_item.into()) {
                 self.list.scroll_to(ListOffset { item_ix, offset_in_item: px(offset) });
             }
@@ -1599,12 +1613,13 @@ impl Pane {
     }
 
     /// Back where the user left it: the same message at the same depth.
-    fn restore(&mut self, id: &str, offset: f32) {
+    fn restore(&mut self, id: &str, offset: f32) -> bool {
         let Some(at) = self.items.iter().position(|item| item.message().is_some_and(|message| message.id == id)) else {
-            return;
+            return false;
         };
         self.list.scroll_to(ListOffset { item_ix: at, offset_in_item: px(offset) });
         self.away = true;
+        true
     }
 
     /// Lands on the first unread (07 R3): when what is unread does not fit, the "New" line sits
@@ -1646,7 +1661,9 @@ impl Pane {
     }
 
     fn snap_to_end(&mut self) {
-        self.list.scroll_to(ListOffset { item_ix: self.items.len(), offset_in_item: px(0.) });
+        self.list.scroll_to_end();
+        self.land = false;
+        self.opening = false;
         self.unseen = 0;
         self.away = false;
     }
@@ -2119,14 +2136,22 @@ impl Pane {
             }
         }
 
-        let end = seen.iter().find(|(ix, _)| *ix == last).map(|(_, bounds)| bounds.bottom());
-        let away = !self.items.is_empty() && end.is_none_or(|end| end - viewport.bottom() > px(AWAY));
-        if away != self.away {
-            self.away = away;
-            if !away {
-                self.unseen = 0;
+        let end = seen.iter().rfind(|(ix, _)| *ix == last).map(|(_, bounds)| f32::from(bounds.bottom()));
+        if let Some(away) = is_away(
+            !self.window.messages.is_empty(),
+            self.pinned(),
+            self.window.newer,
+            f32::from(viewport.size.height),
+            f32::from(viewport.bottom()),
+            end,
+        ) {
+            if away != self.away {
+                self.away = away;
+                if !away {
+                    self.unseen = 0;
+                }
+                cx.notify();
             }
-            cx.notify();
         }
 
         #[cfg(feature = "gui-shot")]
@@ -4191,6 +4216,62 @@ pub(crate) fn prove_selection_clamp() -> Result<(), &'static str> {
     text::prove_selection_clamp()
 }
 
+/// Where a conversation was left, for coming back to it in this session.
+///
+/// A bottom-aligned list pinned to the newest message reports `logical_scroll_top().item_ix == items.len()`,
+/// so looking up a message at `top.item_ix` would return `None` and leave an earlier scrolled-up
+/// `Place` stale in `places`. Recording `Place { bottom: true }` whenever the view is at or near
+/// the bottom ensures leaving from the bottom always replaces any earlier scrolled-up anchor.
+fn record_place(items: &[Item], top: ListOffset, away: bool, pinned: bool, newer: bool) -> Option<Place> {
+    if items.is_empty() {
+        return None;
+    }
+    if !away || (pinned && !newer) {
+        return Some(Place { id: String::new(), offset: 0., bottom: true });
+    }
+    let (id, offset) = match items.get(top.item_ix).and_then(Item::message) {
+        Some(message) => (message.id.clone(), f32::from(top.offset_in_item)),
+        None => (items.get(top.item_ix..)?.iter().find_map(Item::message)?.id.clone(), 0.),
+    };
+    Some(Place { id, offset, bottom: false })
+}
+
+/// Whether returning to a conversation should restore a previously saved scrolled-up place.
+/// Restores only when the user left it scrolled up with nothing new since (07 R3), and when the
+/// "Open conversations at newest" preference is off.
+fn restore_place(saved: Option<&Place>, unread: u32, newest_pref: bool) -> Option<Place> {
+    if unread > 0 || newest_pref {
+        return None;
+    }
+    saved.filter(|place| !place.bottom).cloned()
+}
+
+/// Whether the viewport is scrolled away from the newest message.
+/// Returns `None` when the viewport has not been laid out yet (`viewport_height <= 0`), so a
+/// zero-height frame never flips `away` to `true` and poisons `place()` on leave.
+fn is_away(
+    has_messages: bool,
+    pinned: bool,
+    newer: bool,
+    viewport_height: f32,
+    viewport_bottom: f32,
+    last_bottom: Option<f32>,
+) -> Option<bool> {
+    if !has_messages {
+        return Some(false);
+    }
+    if newer {
+        return Some(true);
+    }
+    if pinned {
+        return Some(false);
+    }
+    if viewport_height <= 0. {
+        return None;
+    }
+    Some(last_bottom.is_none_or(|end| end - viewport_bottom > AWAY))
+}
+
 pub(crate) fn prove_stale_page() -> Result<(), &'static str> {
     if stale_page(&Purpose::Newest, 1, 2)
         && stale_page(&Purpose::Open, 1, 2)
@@ -4201,6 +4282,62 @@ pub(crate) fn prove_stale_page() -> Result<(), &'static str> {
     } else {
         Err("a late newest page would replace a newer read")
     }
+}
+
+/// The lab's return-to-bottom driver. Leaving a conversation from the bottom overwrites any
+/// earlier scrolled-up anchor (even when GPUI's bottom-aligned `ListState` reports
+/// `item_ix == items.len()`), and returning opens at the bottom.
+pub(crate) fn prove_return_to_bottom() -> Result<(), &'static str> {
+    let key = Key { network: Network::Discord, account: "1".into(), id: "c1".into() };
+    let items = vec![
+        Item::Start,
+        Item::Message { message: Rc::new(Message::plain("m1", "Mara", "one", 10, false)), head: true },
+        Item::Message { message: Rc::new(Message::plain("m2", "Mara", "two", 20, false)), head: false },
+        Item::Message { message: Rc::new(Message::plain("m3", "Mara", "three", 30, false)), head: false },
+    ];
+    let mut places: crate::gui::pane::Memory<Place> = crate::gui::pane::Memory::default();
+
+    // 1. Leave while scrolled up: saves the scrolled-up anchor.
+    let scrolled_up = record_place(&items, ListOffset { item_ix: 1, offset_in_item: px(12.) }, true, false, false)
+        .ok_or("leaving while scrolled up did not record a place")?;
+    if scrolled_up.bottom || scrolled_up.id != "m1" {
+        return Err("leaving while scrolled up recorded the wrong anchor");
+    }
+    places.put(key.clone(), scrolled_up);
+    if restore_place(places.get(&key), 0, false).is_none() {
+        return Err("returning with nothing new should restore a scrolled-up anchor");
+    }
+
+    // 2. Scroll to the bottom on a bottom-aligned ListState (`logical_scroll_top().item_ix == items.len()`),
+    // then leave: must overwrite the stale scrolled-up anchor with `bottom: true`.
+    let list = ListState::new(items.len(), ListAlignment::Bottom, px(AHEAD));
+    let at_bottom = record_place(&items, list.logical_scroll_top(), false, true, false)
+        .ok_or("leaving from the bottom returned None and left the stale scrolled-up anchor behind")?;
+    if !at_bottom.bottom {
+        return Err("leaving from the bottom was not marked as bottom");
+    }
+    places.put(key.clone(), at_bottom);
+    if restore_place(places.get(&key), 0, false).is_some() {
+        return Err("returning after leaving at the bottom still restored an old scrolled-up position");
+    }
+
+    // 3. New unread messages or the newest-message preference must not restore an old scrolled-up place.
+    let stale = Place { id: "m1".into(), offset: 0., bottom: false };
+    if restore_place(Some(&stale), 3, false).is_some() {
+        return Err("returning with unread messages restored an old scrolled-up place");
+    }
+    if restore_place(Some(&stale), 0, true).is_some() {
+        return Err("returning with the newest-message preference restored an old scrolled-up place");
+    }
+
+    // 4. Zero-height frames and bottom-pinned views never falsely flip `away` to true.
+    if is_away(true, true, false, 700., 700., None) != Some(false) {
+        return Err("a pinned list without newer history was marked away");
+    }
+    if is_away(true, false, false, 0., 0., None).is_some() {
+        return Err("a zero-height viewport frame flipped away");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4355,5 +4492,34 @@ mod tests {
         assert!(!is_gated(&Conversation::new(normal, ConversationKind::Channel, "general"), &passed));
         passed.insert(nsfw);
         assert!(!is_gated(&row, &passed));
+    }
+
+    #[test]
+    fn leaving_from_the_bottom_clears_a_stale_scrolled_up_place_across_networks() {
+        assert_eq!(prove_return_to_bottom(), Ok(()));
+
+        // Verify across every chat network and verify `is_away` transitions.
+        let items = vec![
+            Item::Start,
+            Item::Message { message: Rc::new(Message::plain("m1", "Ada", "first", 10, false)), head: true },
+            Item::Message { message: Rc::new(Message::plain("m2", "Ada", "last", 20, false)), head: false },
+        ];
+        for network in Network::ALL {
+            let key = Key { network, account: "acct".into(), id: "chat".into() };
+            let mut places: crate::gui::pane::Memory<Place> = crate::gui::pane::Memory::default();
+            places.put(key.clone(), record_place(&items, ListOffset { item_ix: 1, offset_in_item: px(4.) }, true, false, false).unwrap());
+            assert!(restore_place(places.get(&key), 0, false).is_some());
+            let list = ListState::new(items.len(), ListAlignment::Bottom, px(AHEAD));
+            assert_eq!(list.logical_scroll_top().item_ix, items.len());
+            let bottom = record_place(&items, list.logical_scroll_top(), false, true, false).unwrap();
+            assert!(bottom.bottom);
+            places.put(key.clone(), bottom);
+            assert_eq!(restore_place(places.get(&key), 0, false), None);
+        }
+        // Newer pages beyond the window are always away; within AWAY of bottom is not away.
+        assert_eq!(is_away(true, true, true, 600., 600., Some(600.)), Some(true));
+        assert_eq!(is_away(true, false, false, 600., 600., Some(750.)), Some(false));
+        assert_eq!(is_away(true, false, false, 600., 600., Some(850.)), Some(true));
+        assert_eq!(is_away(false, false, false, 600., 600., None), Some(false));
     }
 }
