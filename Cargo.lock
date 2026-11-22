@@ -5882,19 +5882,26 @@ version = "0.2.86"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
+ "block2 0.6.2",
  "bzip2-rs",
  "chacha20poly1305",
  "core-graphics 0.24.0",
  "cpal",
  "davey",
+ "dispatch2",
  "hush-vani",
  "image",
  "libc",
  "libloading",
+ "memmap2",
  "mio",
  "native-tls",
  "nokhwa",
  "objc2 0.6.5",
+ "objc2-core-media",
+ "objc2-core-video",
+ "objc2-foundation 0.3.2",
+ "objc2-screen-capture-kit",
  "openh264",
  "openh264-sys2",
  "openmls",
@@ -6980,6 +6987,22 @@ dependencies = [
  "objc2 0.6.5",
  "objc2-app-kit 0.3.2",
  "objc2-core-foundation",
+ "objc2-core-media",
+ "objc2-foundation 0.3.2",
+]
+
+[[package]]
+name = "objc2-screen-capture-kit"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74b7c5390f477482f001bc354d6571a70db7e4f8d5288e860c45521fbce11394"
+dependencies = [
+ "block2 0.6.2",
+ "dispatch2",
+ "libc",
+ "objc2 0.6.5",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
  "objc2-core-media",
  "objc2-foundation 0.3.2",
 ]
@@ -10651,6 +10674,7 @@ name = "tinyclient"
 version = "0.2.86"
 dependencies = [
  "android-activity",
+ "async-io",
  "block2 0.6.2",
  "chatd",
  "dispatch2",
@@ -10681,6 +10705,7 @@ dependencies = [
  "objc2-video-toolbox",
  "palette",
  "protocol",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "smallvec",
@@ -10690,6 +10715,7 @@ dependencies = [
  "ureq 3.4.2",
  "url",
  "windows-sys 0.61.2",
+ "zbus",
 ]
 
 [[package]]
