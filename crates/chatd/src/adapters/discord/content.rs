@@ -134,9 +134,49 @@ fn timestamp(unix: i64, style: &str) -> String {
     }
 }
 
-/// One `<...>` token: a mention, a custom emoji, a time, a link without a preview. Returns how
-/// many bytes of `text` it took.
-fn angle(rich: &mut Rich, text: &str, names: &dyn Names) -> Option<usize> {
+/// Formats a Discord channel or message link (`discord.com/channels/{guild|@me}/{channel}[/{msg}]`,
+/// including `ptb.`, `canary.`, and `discordapp.com`) as a channel/message chip carrying both
+/// `Style::Mention { kind: MentionKind::Channel }` and `Style::Link { url }` so clicking resolves
+/// in-app and falls back to the browser if the server/channel is unknown.
+fn discord_channel_link(
+    rich: &mut Rich,
+    url: &str,
+    masked_label: Option<&str>,
+    names: &dyn Names,
+    guild: Option<&str>,
+) -> bool {
+    if !protocol::link::is_web(url) {
+        return false;
+    }
+    let Some(parsed) = protocol::link::parse_network_link(url) else {
+        return false;
+    };
+    if parsed.network != protocol::Network::Discord {
+        return false;
+    }
+    let start = rich.text.len();
+    match masked_label {
+        Some(label) => inline(rich, label, names, guild),
+        None => {
+            let channel_shown = match names.channel(&parsed.channel) {
+                Some(name) => format!("#{name}"),
+                None => "# No Access".to_owned(),
+            };
+            if parsed.message_id.is_some() {
+                rich.text.push_str(&format!("{channel_shown} › message"));
+            } else {
+                rich.text.push_str(&channel_shown);
+            }
+        }
+    }
+    rich.span(start, Style::Mention { kind: MentionKind::Channel, id: parsed.channel });
+    rich.span(start, Style::Link { url: url.to_owned() });
+    true
+}
+
+/// One `<...>` token: a mention, a custom emoji, a time, a server navigation token, or a link
+/// without a preview. Returns how many bytes of `text` it took.
+fn angle(rich: &mut Rich, text: &str, names: &dyn Names, guild: Option<&str>) -> Option<usize> {
     let end = text.find('>')?;
     let inner = &text[1..end];
     let start = rich.text.len();
@@ -151,8 +191,22 @@ fn angle(rich: &mut Rich, text: &str, names: &dyn Names) -> Option<usize> {
         let name = names.user(id).unwrap_or_else(|| "someone".to_owned());
         mention(rich, format!("@{name}"), MentionKind::User, id);
     } else if let Some(id) = inner.strip_prefix('#').filter(|id| digits(id)) {
-        let name = names.channel(id).unwrap_or_else(|| "channel".to_owned());
-        mention(rich, format!("#{name}"), MentionKind::Channel, id);
+        let shown = match names.channel(id) {
+            Some(name) => format!("#{name}"),
+            None => "# No Access".to_owned(),
+        };
+        mention(rich, shown, MentionKind::Channel, id);
+    } else if let Some(special) = inner.strip_prefix("id:") {
+        let (label, suffix) = match special {
+            "browse" => ("Browse Channels", "channel-browser"),
+            "customize" => ("Channels & Roles", "customize-community"),
+            "guide" | "home" => ("Server Guide", "home"),
+            _ => return None,
+        };
+        rich.text.push_str(label);
+        if let Some(guild) = guild.filter(|g| digits(g)) {
+            rich.span(start, Style::Link { url: format!("https://discord.com/channels/{guild}/{suffix}") });
+        }
     } else if let Some(emoji) = inner.strip_prefix("a:").or_else(|| inner.strip_prefix(':')) {
         let (name, id) = emoji.split_once(':')?;
         if !digits(id) || name.is_empty() {
@@ -172,8 +226,10 @@ fn angle(rich: &mut Rich, text: &str, names: &dyn Names) -> Option<usize> {
         }
         rich.text.push_str(&format!("/{name}"));
     } else if inner.starts_with("https://") || inner.starts_with("http://") {
-        rich.text.push_str(inner);
-        rich.span(start, Style::Link { url: inner.to_owned() });
+        if !discord_channel_link(rich, inner, None, names, guild) {
+            rich.text.push_str(inner);
+            rich.span(start, Style::Link { url: inner.to_owned() });
+        }
     } else {
         return None;
     }
@@ -196,7 +252,7 @@ fn bare_link(text: &str) -> usize {
 }
 
 /// Inline markdown of one line.
-fn inline(rich: &mut Rich, text: &str, names: &dyn Names) {
+fn inline(rich: &mut Rich, text: &str, names: &dyn Names, guild: Option<&str>) {
     const PAIRS: [(&str, Option<Style>); 5] = [
         ("**", Some(Style::Bold)),
         ("__", Some(Style::Underline)),
@@ -227,7 +283,7 @@ fn inline(rich: &mut Rich, text: &str, names: &dyn Names) {
                 let inner = &rest[delimiter.len()..close];
                 match style {
                     Some(style) => {
-                        inline(rich, inner, names);
+                        inline(rich, inner, names, guild);
                         rich.span(start, style.clone());
                     }
                     None => {
@@ -258,7 +314,7 @@ fn inline(rich: &mut Rich, text: &str, names: &dyn Names) {
                         && !(first == '_' && word_follows)
                 });
                 if let Some(close) = close {
-                    inline(rich, &rest[1..close], names);
+                    inline(rich, &rest[1..close], names, guild);
                     rich.span(start, Style::Italic);
                     at += close + 1;
                     continue;
@@ -275,14 +331,16 @@ fn inline(rich: &mut Rich, text: &str, names: &dyn Names) {
                         .then(|| (label_end, url.to_owned(), label_end + 2 + target_end + 1))
                 });
                 if let Some((label_end, url, taken)) = masked {
-                    inline(rich, &rest[1..label_end], names);
-                    rich.span(start, Style::Link { url });
+                    if !discord_channel_link(rich, &url, Some(&rest[1..label_end]), names, guild) {
+                        inline(rich, &rest[1..label_end], names, guild);
+                        rich.span(start, Style::Link { url });
+                    }
                     at += taken;
                     continue;
                 }
             }
             '<' => {
-                if let Some(taken) = angle(rich, rest, names) {
+                if let Some(taken) = angle(rich, rest, names, guild) {
                     at += taken;
                     continue;
                 }
@@ -300,8 +358,11 @@ fn inline(rich: &mut Rich, text: &str, names: &dyn Names) {
             'h' if !after_word && (rest.starts_with("https://") || rest.starts_with("http://")) => {
                 let end = bare_link(rest);
                 if end > "https://".len() {
-                    rich.text.push_str(&rest[..end]);
-                    rich.span(start, Style::Link { url: rest[..end].to_owned() });
+                    let url = &rest[..end];
+                    if !discord_channel_link(rich, url, None, names, guild) {
+                        rich.text.push_str(url);
+                        rich.span(start, Style::Link { url: url.to_owned() });
+                    }
                     at += end;
                     continue;
                 }
@@ -326,7 +387,7 @@ fn list_item(line: &str) -> Option<(u8, bool, usize)> {
 }
 
 /// The lines outside code blocks: quotes, headings, lists, then inline markdown.
-fn lines(rich: &mut Rich, text: &str, names: &dyn Names) {
+fn lines(rich: &mut Rich, text: &str, names: &dyn Names, guild: Option<&str>) {
     let mut quoting = false;
     for (index, line) in text.split('\n').enumerate() {
         if index > 0 {
@@ -343,22 +404,24 @@ fn lines(rich: &mut Rich, text: &str, names: &dyn Names) {
                 (quoted, line) = (true, rest);
             }
         }
-        let heading = ["### ", "## ", "# "].into_iter().find_map(|mark| line.strip_prefix(mark));
-        if let Some(heading) = heading {
-            // The model has no heading; bold is the nearest.
-            inline(rich, heading, names);
-            rich.span(start, Style::Bold);
+        let heading = [("### ", 3u8), ("## ", 2), ("# ", 1)]
+            .into_iter()
+            .find_map(|(mark, level)| line.strip_prefix(mark).map(|body| (body, level)));
+        if let Some((heading, level)) = heading {
+            inline(rich, heading, names, guild);
+            rich.span(start, Style::Heading { level });
         } else if let Some(small) = line.strip_prefix("-# ") {
-            inline(rich, small, names);
+            inline(rich, small, names, guild);
+            rich.span(start, Style::Small);
         } else if let Some((depth, ordered, begins)) = list_item(line) {
             // The marker stays in the text for numbered items, so the numbers are not lost.
             if ordered {
                 rich.text.push_str(line[..begins].trim_start());
             }
-            inline(rich, &line[begins..], names);
+            inline(rich, &line[begins..], names, guild);
             rich.span(start, Style::ListItem { ordered, depth });
         } else {
-            inline(rich, line, names);
+            inline(rich, line, names, guild);
         }
         if quoted {
             rich.span(start, Style::Quote);
@@ -368,6 +431,12 @@ fn lines(rich: &mut Rich, text: &str, names: &dyn Names) {
 
 /// Discord markdown into plain text and styled ranges.
 pub fn markdown(rich: &mut Rich, text: &str, names: &dyn Names) {
+    markdown_in(rich, text, names, None);
+}
+
+/// Discord markdown into plain text and styled ranges, with optional guild context for
+/// server navigation tokens (`<id:browse>`, `<id:customize>`, `<id:guide>`).
+pub fn markdown_in(rich: &mut Rich, text: &str, names: &dyn Names, guild: Option<&str>) {
     let mut rest = text;
     while let Some(open) = rest.find("```") {
         let Some(close) = closing(rest, open + 3, "```") else {
@@ -375,7 +444,7 @@ pub fn markdown(rich: &mut Rich, text: &str, names: &dyn Names) {
         };
         let before = rest[..open].strip_suffix('\n').unwrap_or(&rest[..open]);
         if !before.is_empty() {
-            lines(rich, before, names);
+            lines(rich, before, names, guild);
         }
         if !rich.text.is_empty() {
             rich.text.push('\n');
@@ -402,7 +471,7 @@ pub fn markdown(rich: &mut Rich, text: &str, names: &dyn Names) {
         }
     }
     if !rest.is_empty() {
-        lines(rich, rest, names);
+        lines(rich, rest, names, guild);
     }
 }
 
@@ -479,7 +548,7 @@ fn waveform(encoded: Option<&str>) -> Vec<u8> {
     bars
 }
 
-fn attachment(rich: &mut Rich, attached: &Attached) -> Attachment {
+fn attachment(rich: &mut Rich, attached: &Attached, blur_explicit: bool) -> Attachment {
     let mime = attached.content_type.as_deref().unwrap_or("");
     let mime = mime.split(';').next().unwrap_or("").trim();
     let kind = media_kind(mime, &attached.filename);
@@ -507,7 +576,7 @@ fn attachment(rich: &mut Rich, attached: &Attached) -> Attachment {
         thumb
     });
     Attachment {
-        spoiler: attached.spoiler(),
+        spoiler: attached.spoiler() || (blur_explicit && attached.is_explicit()),
         sticker: false,
         waveform: waveform(attached.waveform.as_deref()),
         name: attached.filename.clone(),
@@ -574,7 +643,7 @@ fn embed_still(rich: &mut Rich, id: String, picture: &EmbedImage) -> Option<Medi
 /// A GIF from Tenor or Giphy (`gifv`, an MP4) or a video Discord's proxy serves, as an
 /// attachment: its still in the row, the moving picture fetched only when it is played. A
 /// video only its site can play (YouTube) has no proxy address and stays a link card.
-fn moving(rich: &mut Rich, message: &str, index: usize, embed: &Embed) -> Option<Attachment> {
+fn moving(rich: &mut Rich, message: &str, index: usize, embed: &Embed, blur_explicit: bool) -> Option<Attachment> {
     let kind = match embed.kind.as_deref() {
         Some("gifv") => MediaKind::Gif,
         Some("video") => MediaKind::Video,
@@ -597,11 +666,12 @@ fn moving(rich: &mut Rich, message: &str, index: usize, embed: &Embed) -> Option
     let mut attachment = Attachment::new(name, file);
     attachment.thumb = Some(thumb);
     attachment.mime = "video/mp4".to_owned();
+    attachment.spoiler = blur_explicit && embed.is_explicit();
     Some(attachment)
 }
 
 /// A card, with a picture only when Discord's own proxy serves it.
-fn preview(rich: &mut Rich, message: &str, index: usize, embed: &Embed) -> Preview {
+fn preview(rich: &mut Rich, message: &str, index: usize, embed: &Embed, blur_explicit: bool) -> Preview {
     let mut description = embed.description.clone().unwrap_or_default();
     for field in &embed.fields {
         if !description.is_empty() {
@@ -609,7 +679,9 @@ fn preview(rich: &mut Rich, message: &str, index: usize, embed: &Embed) -> Previ
         }
         description.push_str(&format!("{}: {}", field.name, field.value));
     }
-    let picture = embed.image.as_ref().or(embed.thumbnail.as_ref());
+    let picture = (!blur_explicit || !embed.is_explicit())
+        .then(|| embed.image.as_ref().or(embed.thumbnail.as_ref()))
+        .flatten();
     let image = picture.and_then(|picture| embed_still(rich, format!("embed:{message}:{index}"), picture));
     let site = embed.provider.as_ref().or(embed.author.as_ref());
     Preview {
@@ -793,6 +865,8 @@ pub struct Place<'a> {
     pub names: &'a dyn Names,
     /// What the author goes by here when it is not what the message says: a friend's nickname.
     pub author: Option<String>,
+    /// Whether explicitly flagged media (`CONTAINS_EXPLICIT_MEDIA`) should be blurred behind a spoiler cover.
+    pub blur_explicit: bool,
 }
 
 fn build_call_note(
@@ -867,7 +941,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         .unwrap_or_else(|| "This server".to_owned());
     match system_line(posted, kind, &who, content, mentioned, &server) {
         None => {
-            markdown(&mut rich, content, place.names);
+            markdown_in(&mut rich, content, place.names, place.guild);
             // What was forwarded is the message's own text; a forward has none of its own.
             for snapshot in &posted.message_snapshots {
                 let snap_text = snapshot.message.content.as_deref().unwrap_or("");
@@ -875,7 +949,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
                     if !rich.text.is_empty() {
                         rich.text.push('\n');
                     }
-                    markdown(&mut rich, snap_text, place.names);
+                    markdown_in(&mut rich, snap_text, place.names, place.guild);
                 }
             }
         }
@@ -899,13 +973,13 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
     let mut composed = false;
     for part in &carried {
         for attached in part.attachments.as_deref().unwrap_or(&[]) {
-            attachments.push(attachment(&mut rich, attached));
+            attachments.push(attachment(&mut rich, attached, place.blur_explicit));
         }
         attachments.extend(part.sticker_items.iter().map(|item| sticker(&mut rich, item)));
         embeds.extend(part.embeds.as_deref().unwrap_or(&[]).iter().cloned());
         composed |= part.author.as_ref().is_some_and(|author| author.bot) || part.webhook_id.is_some();
     }
-    let (card, previews, moving_pictures) = cards(&mut rich, &posted.id, &embeds, place.names, composed);
+    let (card, previews, moving_pictures) = cards(&mut rich, &posted.id, &embeds, place.names, composed, place.blur_explicit);
     attachments.extend(moving_pictures);
     let reactions = reactions(&mut rich, posted.reactions.as_deref().unwrap_or(&[]));
     let origin = posted.message_reference.as_ref().filter(|reference| reference.kind == 1 && has_snapshots);
@@ -999,6 +1073,22 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
     } else {
         None
     };
+    let flags = posted.flags.unwrap_or(0);
+    let published = flags & model::CROSSPOSTED != 0;
+    let crosspost_source = if flags & model::IS_CROSSPOST != 0 {
+        posted.message_reference.as_ref().map_or_else(String::new, |origin| {
+            let space = origin.guild_id.as_deref().and_then(|g| place.names.space(g));
+            let channel = origin.channel_id.as_deref().and_then(|c| place.names.channel(c)).map(|name| format!("#{name}"));
+            match (space, channel) {
+                (Some(s), Some(c)) => format!("{s} › {c}"),
+                (Some(s), None) => s,
+                (None, Some(c)) => c,
+                (None, None) => "Announcement".to_owned(),
+            }
+        })
+    } else {
+        String::new()
+    };
     // Our own client's nonce is the shell's client id: digits, at most 25.
     let client_id = posted.nonce.clone().filter(|nonce| outgoing && digits(nonce) && nonce.len() <= 25);
     let message = Message {
@@ -1051,6 +1141,8 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         can_delete: None,
         importance: protocol::Importance::Normal,
         announcement: false,
+        published,
+        crosspost_source,
         effect: None,
         contacts: Vec::new(),
         sent_via: None,
@@ -1086,17 +1178,18 @@ fn cards(
     embeds: &[Embed],
     names: &dyn Names,
     by_bot: bool,
+    blur_explicit: bool,
 ) -> (Option<Box<Card>>, Vec<Preview>, Vec<Attachment>) {
     let mut composed = None;
     let mut previews = Vec::new();
     let mut moving_pictures = Vec::new();
     for (index, embed) in embeds.iter().enumerate() {
-        if let Some(attachment) = moving(rich, message, index, embed) {
+        if let Some(attachment) = moving(rich, message, index, embed, blur_explicit) {
             moving_pictures.push(attachment);
             continue;
         }
         if !by_bot || composed.is_some() || embed.kind.as_deref() != Some("rich") {
-            previews.push(preview(rich, message, index, embed));
+            previews.push(preview(rich, message, index, embed, blur_explicit));
             continue;
         }
         composed = Some(Box::new(card(embed, names)));
@@ -1111,7 +1204,7 @@ fn cards(
                 ..embed.clone()
             };
             // Only when Discord's own proxy serves it: a picture elsewhere is never fetched.
-            let picture = preview(rich, message, index, &picture);
+            let picture = preview(rich, message, index, &picture, blur_explicit);
             if picture.image.is_some() {
                 previews.push(picture);
             }
@@ -1125,7 +1218,7 @@ pub fn patch(stored: &mut Message, update: &Posted, place: &Place) -> Files {
     let mut rich = Rich::default();
     if let Some(content) = &update.content {
         if stored.kind == MessageKind::Normal {
-            markdown(&mut rich, content, place.names);
+            markdown_in(&mut rich, content, place.names, place.guild);
             stored.text = std::mem::take(&mut rich.text);
             stored.spans = std::mem::take(&mut rich.spans);
         }
@@ -1138,11 +1231,11 @@ pub fn patch(stored: &mut Message, update: &Posted, place: &Place) -> Files {
             .filter(|kept| kept.file.id.starts_with("sticker:") || kept.file.id.starts_with("embed:"))
             .cloned()
             .collect();
-        stored.attachments = attached.iter().map(|attached| attachment(&mut rich, attached)).collect();
+        stored.attachments = attached.iter().map(|attached| attachment(&mut rich, attached, place.blur_explicit)).collect();
         stored.attachments.extend(stickers);
     }
     if let Some(embeds) = &update.embeds {
-        let (card, previews, moving_pictures) = cards(&mut rich, &stored.id, embeds, place.names, stored.sender.bot);
+        let (card, previews, moving_pictures) = cards(&mut rich, &stored.id, embeds, place.names, stored.sender.bot, place.blur_explicit);
         stored.card = card;
         stored.previews = previews;
         stored.attachments.retain(|kept| !kept.file.id.starts_with("embed:"));
@@ -1153,6 +1246,9 @@ pub fn patch(stored: &mut Message, update: &Posted, place: &Place) -> Files {
     }
     if let Some(pinned) = update.pinned {
         stored.pinned = pinned;
+    }
+    if let Some(flags) = update.flags {
+        stored.published = flags & model::CROSSPOSTED != 0;
     }
     if update.edited_timestamp.is_some() {
         stored.edited = true;
@@ -1214,7 +1310,7 @@ mod tests {
             "id": "100", "channel_id": "200", "type": 67, "content": "",
             "author": {"id": "300", "username": "casimir", "global_name": "Casimir Thorne"}
         })).unwrap();
-        let mut place = Place { account: &account, me: "400", guild: None, names: &Nobody, author: None };
+        let mut place = Place { account: &account, me: "400", guild: None, names: &Nobody, author: None, blur_explicit: true };
         let (decoded, _) = message(&posted, &place);
         assert_eq!(decoded.kind, MessageKind::System);
         assert_eq!(decoded.text, "Casimir Thorne accepted your friend request.");
@@ -1263,8 +1359,14 @@ mod tests {
 
     #[test]
     fn blocks_code_quotes_and_lists() {
-        let rich = parsed("before\n```rust\nlet a = *b;\n```\n> quoted **line**\n- one\n1. two\nénd");
-        assert_eq!(rich.text, "before\nlet a = *b;\nquoted line\none\n1. two\nénd");
+        let rich = parsed("# Big\n## Mid *em*\n### Small\n-# footnote **note**\nbefore\n```rust\nlet a = *b;\n```\n> quoted **line**\n- one\n1. two\nénd");
+        assert_eq!(rich.text, "Big\nMid em\nSmall\nfootnote note\nbefore\nlet a = *b;\nquoted line\none\n1. two\nénd");
+        assert_eq!(styled(&rich, &Style::Heading { level: 1 }), ["Big"]);
+        assert_eq!(styled(&rich, &Style::Heading { level: 2 }), ["Mid em"]);
+        assert_eq!(styled(&rich, &Style::Italic), ["em"]);
+        assert_eq!(styled(&rich, &Style::Heading { level: 3 }), ["Small"]);
+        assert_eq!(styled(&rich, &Style::Small), ["footnote note"]);
+        assert_eq!(styled(&rich, &Style::Bold), ["note", "line"]);
         assert_eq!(styled(&rich, &Style::CodeBlock { language: "rust".into() }), ["let a = *b;"]);
         assert_eq!(styled(&rich, &Style::Quote), ["quoted line"]);
         assert_eq!(styled(&rich, &Style::ListItem { ordered: false, depth: 0 }), ["one"]);
@@ -1311,7 +1413,7 @@ mod tests {
             fn space(&self, _: &str) -> Option<String> { None }
         }
         let account = AccountKey { network: protocol::Network::Discord, account: "acct".into() };
-        let place = Place { account: &account, me: "me", guild: None, names: &Empty, author: None };
+        let place = Place { account: &account, me: "me", guild: None, names: &Empty, author: None, blur_explicit: true };
         // Snowflake 1000000000000000000 -> (1000000000000000000 >> 22) + 1420070400000 = 1658489056s (2022-07-22T11:24:16Z)
         let base = Posted {
             id: "1000000000000000000".into(),
@@ -1377,7 +1479,7 @@ mod tests {
             fn space(&self, id: &str) -> Option<String> { (id == "4000").then(|| "Rustaceans".into()) }
         }
         let account = AccountKey { network: protocol::Network::Discord, account: "acct".into() };
-        let place = Place { account: &account, me: "me", guild: None, names: &Known, author: None };
+        let place = Place { account: &account, me: "me", guild: None, names: &Known, author: None, blur_explicit: false };
         let snap1 = Posted {
             content: Some("First snapshot".into()),
             attachments: Some(vec![Attached {
@@ -1429,7 +1531,7 @@ mod tests {
     #[test]
     fn every_system_message_type_has_wording_boost_tiers_and_jump_targets() {
         let account = AccountKey { network: protocol::Network::Discord, account: "test".into() };
-        let place = Place { account: &account, me: "400", guild: Some("4000"), names: &Nobody, author: None };
+        let place = Place { account: &account, me: "400", guild: Some("4000"), names: &Nobody, author: None, blur_explicit: false };
         let make = |kind: u8, content: &str| -> Posted {
             serde_json::from_value(serde_json::json!({
                 "id": "100", "channel_id": "200", "type": kind, "content": content,
@@ -1541,5 +1643,83 @@ mod tests {
         let unknown = make(250, "");
         let (unsupported, _) = message(&unknown, &place);
         assert!(matches!(unsupported.kind, MessageKind::Unsupported { .. }));
+    }
+
+    #[test]
+    fn explicit_media_is_blurred_when_filter_is_on_and_shown_when_off() {
+        let account = AccountKey { network: protocol::Network::Discord, account: "acct".into() };
+        let posted = Posted {
+            id: "1000000000000000001".into(),
+            channel_id: "c1".into(),
+            author: Some(model::User { id: "2001".into(), username: "bea".into(), ..Default::default() }),
+            attachments: Some(vec![Attached {
+                id: "9001".into(),
+                filename: "pic.png".into(),
+                size: 1024,
+                url: "https://cdn.discordapp.com/attachments/1/9001/pic.png".into(),
+                proxy_url: Some("https://media.discordapp.net/attachments/1/9001/pic.png".into()),
+                width: 400,
+                height: 300,
+                content_type: Some("image/png".into()),
+                duration_secs: 0.0,
+                waveform: None,
+                flags: 1 << 4,
+            }]),
+            ..Default::default()
+        };
+        let blur = Place { account: &account, me: "me", guild: None, names: &Nobody, author: None, blur_explicit: true };
+        let (blurred, _) = message(&posted, &blur);
+        assert!(blurred.attachments[0].spoiler, "explicit attachment blurs when filter is active");
+
+        let show = Place { blur_explicit: false, ..blur };
+        let (shown, _) = message(&posted, &show);
+        assert!(!shown.attachments[0].spoiler, "explicit attachment unblurred when filter is set to show");
+    }
+
+    #[test]
+    fn discord_channel_and_message_links_and_special_tokens_parse() {
+        struct Partial;
+        impl Names for Partial {
+            fn user(&self, _: &str) -> Option<String> { None }
+            fn role(&self, _: &str) -> Option<String> { None }
+            fn channel(&self, id: &str) -> Option<String> {
+                (id == "4102").then(|| "announcements".to_owned())
+            }
+            fn space(&self, _: &str) -> Option<String> { None }
+        }
+        let mut rich = Rich::default();
+        markdown_in(
+            &mut rich,
+            "see <#4102> <#9999> https://discord.com/channels/4000/4102/1300001 <https://ptb.discord.com/channels/4000/4102> https://canary.discordapp.com/channels/@me/9999/1300002 [jump](https://discord.com/channels/4000/4102/1300003) <id:browse> <id:customize> <id:guide>",
+            &Partial,
+            Some("4000"),
+        );
+        assert_eq!(
+            rich.text,
+            "see #announcements # No Access #announcements › message #announcements # No Access › message jump Browse Channels Channels & Roles Server Guide"
+        );
+        let ch_mention = Style::Mention { kind: MentionKind::Channel, id: "4102".into() };
+        assert_eq!(
+            styled(&rich, &ch_mention),
+            ["#announcements", "#announcements › message", "#announcements", "jump"]
+        );
+        let no_access = Style::Mention { kind: MentionKind::Channel, id: "9999".into() };
+        assert_eq!(styled(&rich, &no_access), ["# No Access", "# No Access › message"]);
+        assert_eq!(
+            styled(&rich, &Style::Link { url: "https://discord.com/channels/4000/4102/1300001".into() }),
+            ["#announcements › message"]
+        );
+        assert_eq!(
+            styled(&rich, &Style::Link { url: "https://discord.com/channels/4000/channel-browser".into() }),
+            ["Browse Channels"]
+        );
+        assert_eq!(
+            styled(&rich, &Style::Link { url: "https://discord.com/channels/4000/customize-community".into() }),
+            ["Channels & Roles"]
+        );
+        assert_eq!(
+            styled(&rich, &Style::Link { url: "https://discord.com/channels/4000/home".into() }),
+            ["Server Guide"]
+        );
     }
 }

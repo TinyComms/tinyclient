@@ -1636,7 +1636,7 @@ impl Slack {
             Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
                 answer(reply, self.react(&conversation_id, &message_id, &emoji, on));
             }
-            Command::Edit { conversation_id, message_id, text, spans, reply } => {
+            Command::Edit { conversation_id, message_id, text, spans, suppress_embeds: _, keep_attachments: _, reply } => {
                 answer(reply, self.edit(&conversation_id, &message_id, &text, &spans));
             }
             Command::Delete { conversation_id, message_id, scope, reply } => {

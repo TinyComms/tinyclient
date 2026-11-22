@@ -1014,7 +1014,7 @@ impl Teams {
                 let _ = reply.send(self.invoke_card_action(&conversation_id, &message_id, &block_id, &action_id, &value).map_err(refuse));
             }
             Command::ReactionRules { reply, .. } => drop(reply.send(Ok(message::reaction_rules()))),
-            Command::Edit { conversation_id, message_id, text, spans, reply } => {
+            Command::Edit { conversation_id, message_id, text, spans, suppress_embeds: _, keep_attachments: _, reply } => {
                 let _ = reply.send(self.edit(&conversation_id, &message_id, &text, &spans).map_err(refuse));
             }
             Command::Delete { conversation_id, message_id, scope, reply } => {

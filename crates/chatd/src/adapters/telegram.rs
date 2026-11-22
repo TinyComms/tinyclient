@@ -800,7 +800,7 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::SetDefaultReaction { emoji, reply } => {
             let _ = reply.send(react::set_default(account, &emoji).map_err(refused));
         }
-        Command::Edit { conversation_id, message_id, text, spans, reply } => {
+        Command::Edit { conversation_id, message_id, text, spans, suppress_embeds: _, keep_attachments: _, reply } => {
             let _ = reply.send(edit(account, &conversation_id, &message_id, &text, &spans).map_err(refused));
         }
         Command::Delete { conversation_id, message_id, scope, reply } => {

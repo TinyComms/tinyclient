@@ -836,6 +836,7 @@ impl Discord {
                 continue;
             }
             let known = self.ctx.known(&posted.channel_id).ok().flatten();
+            let age_restricted = known.as_ref().is_some_and(|row| row.age_restricted);
             let kind = known.as_ref().map_or(ConversationKind::Channel, |row| row.kind);
             let title = known.as_ref().map_or_else(String::new, |row| row.title.clone());
             let space_title = known.as_ref().map_or_else(String::new, |row| row.space_title.clone());
@@ -856,6 +857,7 @@ impl Discord {
                 title,
                 space_title,
                 outgoing: message.outgoing,
+                age_restricted,
             });
         }
         Ok(found_hits)

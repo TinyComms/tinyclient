@@ -386,14 +386,17 @@ pub enum Command {
         user_id: Option<String>,
         reply: Reply<()>,
     },
-    /// Replace the text of one of our messages. Report the edited message through
-    /// [`Context::message`] before answering: nothing was changed locally. `spans` are the
-    /// styled ranges of `text`; an adapter that cannot send them leaves them unused.
+    /// Replace the text of one of our messages, suppress embeds, or keep a subset of attachments.
+    /// Report the edited message through [`Context::message`] before answering: nothing was
+    /// changed locally. `spans` are the styled ranges of `text`; an adapter that cannot send them
+    /// leaves them unused.
     Edit {
         conversation_id: String,
         message_id: String,
         text: String,
         spans: Vec<protocol::Span>,
+        suppress_embeds: bool,
+        keep_attachments: Option<Vec<String>>,
         reply: Reply<()>,
     },
     /// Fetch the raw source text of a message for lossless editing.
@@ -907,6 +910,18 @@ pub enum Command {
         action: RelateAction,
         reply: Reply<()>,
     },
+    /// Publish (crosspost) a message in an announcement channel (Discord).
+    Publish {
+        conversation_id: String,
+        message_id: String,
+        reply: Reply<()>,
+    },
+    /// Follow an announcement channel into `into_channel_id` (Discord).
+    Follow {
+        conversation_id: String,
+        into_channel_id: String,
+        reply: Reply<()>,
+    },
     /// Send a friend request by username (e.g. Discord `POST /users/@me/relationships`).
     AddFriend {
         username: String,
@@ -1065,7 +1080,9 @@ impl Command {
             | Command::CancelScheduled { reply, .. }
             | Command::FollowThread { reply, .. }
             | Command::ThreadUpdate { reply, .. }
-            | Command::DeleteThread { reply, .. } => {
+            | Command::DeleteThread { reply, .. }
+            | Command::Publish { reply, .. }
+            | Command::Follow { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::ChannelThreads { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

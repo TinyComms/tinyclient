@@ -1762,6 +1762,8 @@ fn rcs_messages_can_be_edited_inside_window_and_incoming_edits_are_marked() {
         message_id: sent.id.clone(),
         text: "Edited text".into(),
         spans: Vec::new(),
+        suppress_embeds: false,
+        keep_attachments: None,
     }) {
         Response::Ok => {}
         other => panic!("expected Edit Ok, got {other:?}"),
@@ -1783,6 +1785,8 @@ fn rcs_messages_can_be_edited_inside_window_and_incoming_edits_are_marked() {
         message_id: old.id.clone(),
         text: "Cannot edit".into(),
         spans: Vec::new(),
+        suppress_embeds: false,
+        keep_attachments: None,
     }) {
         Response::Error { detail, .. } => assert!(detail.contains("no longer be edited"), "{detail}"),
         other => panic!("expected stale edit refusal, got {other:?}"),
@@ -1800,6 +1804,8 @@ fn rcs_messages_can_be_edited_inside_window_and_incoming_edits_are_marked() {
         message_id: sent.id.clone(),
         text: "SMS edit".into(),
         spans: Vec::new(),
+        suppress_embeds: false,
+        keep_attachments: None,
     }) {
         Response::Error { detail, .. } => assert!(detail.contains("RCS"), "{detail}"),
         other => panic!("expected SMS edit refusal, got {other:?}"),

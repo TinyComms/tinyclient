@@ -1329,7 +1329,7 @@ fn sending_editing_reacting_deleting_and_reading_go_to_teams() {
     assert_eq!(failed.state, SendState::Failed { reason: "Teams is rate limiting you. Try again in 7 s.".to_owned() });
 
     // Edit: Teams is asked first, and the message changes once it agreed.
-    let edit = Request::Edit { conversation: ana.clone(), message_id: sent.id.clone(), text: "hello Ana".to_owned(), spans: Vec::new() };
+    let edit = Request::Edit { conversation: ana.clone(), message_id: sent.id.clone(), text: "hello Ana".to_owned(), spans: Vec::new(), suppress_embeds: false, keep_attachments: None };
     assert_eq!(world.ask(edit), Response::Ok);
     let put = world.fake.calls("PUT", &path("/messages/1760001000000")).pop().expect("the edit reached Teams");
     assert_eq!((put.json()["content"].as_str(), put.json()["messagetype"].as_str()), (Some("<p>hello Ana</p>"), Some("RichText/Html")));
@@ -1823,6 +1823,8 @@ fn editing_a_message_preserves_formatting_mentions_images_and_subject() {
         message_id: post_id.to_string(),
         text: format!("**Release plan**\nShip **tomorrow** with <@{ANA}|Ana Ruiz>"),
         spans: Vec::new(),
+        suppress_embeds: false,
+        keep_attachments: None,
     };
     assert_eq!(world.ask(edit), Response::Ok);
     let put = world.fake.calls("PUT", &format!("/chat/v1/users/ME/conversations/{GENERAL}/messages/{post_id}")).pop().expect("edit PUT");
@@ -2127,6 +2129,8 @@ fn scheduled_chat_message_send_edit_cancel_and_channel_refusal() {
             message_id: scheduled.id.clone(),
             text: "Updated reminder".to_owned(),
             spans: Vec::new(),
+            suppress_embeds: false,
+            keep_attachments: None,
         }),
         Response::Ok
     );

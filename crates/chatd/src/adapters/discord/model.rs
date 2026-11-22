@@ -60,6 +60,7 @@ pub const MANAGE_THREADS: u64 = 1 << 34;
 pub const CREATE_PUBLIC_THREADS: u64 = 1 << 35;
 pub const CREATE_PRIVATE_THREADS: u64 = 1 << 36;
 pub const SEND_MESSAGES_IN_THREADS: u64 = 1 << 38;
+pub const MANAGE_WEBHOOKS: u64 = 1 << 29;
 pub const PIN_MESSAGES: u64 = 1 << 51;
 
 /// Formats Unix seconds as UTC ISO 8601 (`YYYY-MM-DDTHH:MM:SSZ`) for Discord REST bodies.
@@ -82,6 +83,10 @@ pub fn iso_timestamp(unix_secs: i64) -> String {
     let year = y + i64::from(month <= 2);
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
+/// Discord message flags.
+pub const CROSSPOSTED: u64 = 1 << 0;
+pub const IS_CROSSPOST: u64 = 1 << 1;
+pub const SUPPRESS_EMBEDS: u64 = 1 << 2;
 
 /// Where Discord's own app, or its site when the app is not installed, shows a person.
 pub fn user_link(id: &str) -> String {
@@ -165,6 +170,9 @@ pub struct User {
     /// Our own plan, on READY's user: 0 none, 1 Nitro Classic, 2 Nitro, 3 Nitro Basic.
     #[serde(default, deserialize_with = "nullable")]
     pub premium_type: u8,
+    /// On READY's user: `Some(false)` when the account is underage / not permitted in age-restricted channels.
+    #[serde(default)]
+    pub nsfw_allowed: Option<bool>,
     /// Present on the users of a message's `mentions`.
     #[serde(default)]
     pub member: Option<Box<Member>>,
@@ -569,6 +577,13 @@ pub struct Channel {
     /// Default slowmode interval for newly created threads under this channel.
     #[serde(default, deserialize_with = "nullable")]
     pub default_thread_rate_limit_per_user: u32,
+    /// Marked age-restricted (`nsfw`) by the server.
+    #[serde(default, deserialize_with = "nullable")]
+    pub nsfw: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// What is kept of a server's channel between connects, in a note: enough to work out again
@@ -599,6 +614,8 @@ pub struct Kept {
     /// Slowmode interval in seconds, 0 when off.
     #[serde(rename = "s", default, skip_serializing_if = "no_limit")]
     pub slowmode: u32,
+    #[serde(rename = "x", default, skip_serializing_if = "is_false")]
+    pub nsfw: bool,
 }
 
 /// A count that means "none" stays off a note.
@@ -620,6 +637,7 @@ impl Kept {
             topic: channel.topic.clone().filter(|topic| !topic.is_empty()),
             overwrites: overwrites.map(|over| (over.id.clone(), over.member, over.allow, over.deny)).collect(),
             slowmode: channel.rate_limit_per_user,
+            nsfw: channel.nsfw,
         }
     }
 
@@ -636,6 +654,7 @@ impl Kept {
             topic: self.topic,
             permission_overwrites: overwrites.collect(),
             rate_limit_per_user: self.slowmode,
+            nsfw: self.nsfw,
             ..Channel::default()
         }
     }
@@ -1093,6 +1112,11 @@ impl Attachment {
     pub fn spoiler(&self) -> bool {
         self.flags & (1 << 3) != 0 || self.filename.starts_with("SPOILER_")
     }
+
+    /// Flagged as explicit/sensitive media by Discord's scanner (`CONTAINS_EXPLICIT_MEDIA`, bit 4).
+    pub fn is_explicit(&self) -> bool {
+        self.flags & (1 << 4) != 0
+    }
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -1154,6 +1178,15 @@ pub struct Embed {
     pub video: Option<EmbedImage>,
     #[serde(default, deserialize_with = "nullable")]
     pub fields: Vec<EmbedField>,
+    /// Bit 4 marks explicit media (`CONTAINS_EXPLICIT_MEDIA`).
+    #[serde(default, deserialize_with = "nullable")]
+    pub flags: u32,
+}
+
+impl Embed {
+    pub fn is_explicit(&self) -> bool {
+        self.flags & (1 << 4) != 0
+    }
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -1259,6 +1292,9 @@ pub struct Posted {
     pub nonce: Option<String>,
     #[serde(default)]
     pub call: Option<CallPayload>,
+    /// Discord message flags bitmask (`CROSSPOSTED`, `IS_CROSSPOST`, `SUPPRESS_EMBEDS`, etc.).
+    #[serde(default)]
+    pub flags: Option<u64>,
     #[serde(default)]
     pub role_subscription_data: Option<RoleSubscriptionData>,
     #[serde(default)]

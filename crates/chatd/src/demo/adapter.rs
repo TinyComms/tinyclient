@@ -660,7 +660,7 @@ impl Demo {
                 let reacted = demo.ctx.reacted(&conversation_id, &message_id, &demo.reaction(&emoji), on);
                 let _ = reply.send(reacted.map_err(|err| Refusal::Refused(err.to_string())));
             }
-            Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
+            Command::Edit { conversation_id, message_id, text, spans: _, suppress_embeds: _, keep_attachments: _, reply } => {
                 let _ = reply.send(demo.edit(&conversation_id, &message_id, text));
             }
             Command::Delete { conversation_id, message_id, scope: _, reply } => {
@@ -1068,6 +1068,7 @@ impl Demo {
             Command::ChannelThreads { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ThreadUpdate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::DeleteThread { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Publish { reply, .. } | Command::Follow { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Backfill(_)
             | Command::Warm(_)
             | Command::History { .. }

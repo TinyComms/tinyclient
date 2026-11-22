@@ -836,6 +836,7 @@ fn hits(query: &str, only: Option<&Key>) -> Vec<MessageHit> {
                 title: row.map(|r| r.title.clone()).unwrap_or_default(),
                 space_title: row.map(|r| r.space_title.clone()).unwrap_or_default(),
                 outgoing: m.outgoing,
+                age_restricted: row.is_some_and(|r| r.age_restricted),
             })
         })
         .collect();
@@ -1218,7 +1219,7 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
             },
             None => Response::Error { code: protocol::ErrorCode::NotFound, detail: "Not in the demo.".into() },
         },
-        Request::Fetch { .. } => Response::Media { files: Vec::new() },
+        Request::Fetch { .. } | Request::FetchPreview { .. } => Response::Media { files: Vec::new() },
         Request::Settings => Response::Settings { values: Vec::new() },
         Request::Storage => Response::Storage { messages: 48_213, files: 734_003_200 },
         Request::Prunable { .. } => Response::Prunable { messages: 0, bytes: 0 },

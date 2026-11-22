@@ -615,7 +615,8 @@ pub fn parse_network_link(raw: &str) -> Option<NetworkLink> {
         let guild = iter.next()?;
         let channel = iter.next()?;
         let message_id = iter.next().map(str::to_owned);
-        if channel.is_empty() || !channel.bytes().all(|b| b.is_ascii_digit()) {
+        let guild_ok = guild == "@me" || (!guild.is_empty() && guild.bytes().all(|b| b.is_ascii_digit()));
+        if !guild_ok || channel.is_empty() || !channel.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
         if let Some(ref mid) = message_id {
@@ -1053,12 +1054,13 @@ mod tests {
     fn network_links_parse_and_reject_invites() {
         use crate::Network;
 
-        // Discord guild & DM message links
+        // Discord guild & DM message links. A guild is @me or a snowflake; G7 is not a match.
+        assert_eq!(parse_network_link("https://discord.com/channels/G7/12345/67890"), None);
         assert_eq!(
-            parse_network_link("https://discord.com/channels/G7/12345/67890"),
+            parse_network_link("https://discord.com/channels/4000/12345/67890"),
             Some(NetworkLink {
                 network: Network::Discord,
-                space: Some("G7".into()),
+                space: Some("4000".into()),
                 channel: "12345".into(),
                 message_id: Some("67890".into()),
                 thread_id: None,

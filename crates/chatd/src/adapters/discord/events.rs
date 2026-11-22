@@ -237,6 +237,9 @@ impl Discord {
                 // Ours: a new name or picture.
                 if user.id == self.me() {
                     self.myself(&user)?;
+                    if user.nsfw_allowed.is_some() {
+                        self.capabilities(user.premium_type, user.nsfw_allowed == Some(false));
+                    }
                 }
             }
             "USER_SETTINGS_PROTO_UPDATE" => self.settings_proto(from_str(data)?)?,
@@ -413,12 +416,14 @@ impl Discord {
                 guild: guild.as_deref(),
                 mentions: &posted.mentions,
             };
+            let blur_explicit = !crate::hub::lock(&self.state).show_explicit_media;
             let place = Place {
                 account: &self.ctx.account,
                 me: &me,
                 guild: guild.as_deref(),
                 names: &lookup,
                 author: None,
+                blur_explicit,
             };
             content::patch(&mut stored, &posted, &place)
         };
@@ -566,6 +571,7 @@ impl Discord {
         if update.partial {
             return Ok(());
         }
+        self.state.lock().unwrap().show_explicit_media = !proto::blur_explicit_media(&update.settings.proto);
         if let Some(folders) = proto::guild_folders(&update.settings.proto) {
             self.record_folders(&folders)?;
         }

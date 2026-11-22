@@ -107,7 +107,7 @@ fn print_search(query: &str) -> io::Result<()> {
             hit.conversation.network.label(),
             hit.title,
             view::age(now, hit.sent),
-            hit.snippet
+            if hit.age_restricted { "Age-restricted channel" } else { hit.snippet.as_str() }
         );
     }
     Ok(())

@@ -475,6 +475,7 @@ pub(super) fn renamed(known: &protocol::Conversation, title: &str) -> crate::sto
     row.rights = known.rights;
     row.slowmode_seconds = known.slowmode_seconds;
     row.locked = known.locked;
+    row.age_restricted = known.age_restricted;
     row
 }
 
@@ -535,6 +536,8 @@ struct State {
     renewed: HashMap<String, String>,
     /// Our plan (`premium_type`), which says what may be sent.
     premium: u8,
+    /// `true` only when Discord's sensitive-media filter is set to Show (`0`); otherwise flagged media is blurred.
+    show_explicit_media: bool,
     /// Friends' status emoji and what they are doing, as their presence last said, so a voice
     /// state can be told beside it.
     doing: HashMap<String, (String, Option<protocol::Activity>)>,
@@ -852,12 +855,14 @@ impl Discord {
         // Outside a server a friend goes by the nickname the user gave them.
         let author = posted.author.as_ref().filter(|_| guild.is_none() && posted.webhook_id.is_none());
         let author = author.and_then(|author| crate::hub::lock(&self.state).users.get(&author.id).cloned());
+        let blur_explicit = !crate::hub::lock(&self.state).show_explicit_media;
         let place = Place {
             account: &self.ctx.account,
             me: &me,
             guild,
             names: &lookup,
             author,
+            blur_explicit,
         };
         let (mut message, mut files) = content::message(posted, &place);
         if let (Some(guild_id), None) = (guild, posted.webhook_id.as_ref()) {
@@ -1094,6 +1099,7 @@ impl Discord {
                     // A thread started from a message has that message's id on Discord. The
                     // note from `remember_starter` is what the chip follows when it differs.
                     root: Some(thread.id.clone()),
+                    age_restricted: thread.nsfw || conversation.age_restricted,
                     ..ConversationRow::new(&thread.id, ConversationKind::Thread, title)
                 })?;
             }
@@ -1374,14 +1380,42 @@ impl Discord {
         Ok(super::ReactorsPage { reactors, more })
     }
 
-    /// Replaces the text of one of our messages. The store changes with Discord's answer.
-    fn edit(&self, channel: &str, message: &str, text: &str) -> Result<(), Refusal> {
-        let premium = self.state.lock().unwrap().premium;
-        if let Some(why) = too_long(premium, text) {
-            return Err(Refusal::Refused(why));
+    /// Edits one of our messages, suppresses its embeds (preserving existing flag bits), or
+    /// removes attachments by listing the kept attachment ids. The store changes with Discord's
+    /// answer.
+    fn edit(
+        &self,
+        channel: &str,
+        message: &str,
+        text: &str,
+        suppress_embeds: bool,
+        keep_attachments: Option<&[String]>,
+    ) -> Result<(), Refusal> {
+        let suppress_only = suppress_embeds && text.is_empty() && keep_attachments.is_none();
+        let mut body = serde_json::Map::new();
+        if !suppress_only {
+            let premium = self.state.lock().unwrap().premium;
+            if let Some(why) = too_long(premium, text) {
+                return Err(Refusal::Refused(why));
+            }
+            body.insert("content".to_owned(), json!(text));
+        }
+        if suppress_embeds {
+            // Read current flags before patching so existing bits (e.g. IS_VOICE_MESSAGE,
+            // CROSSPOSTED, SUPPRESS_NOTIFICATIONS) are preserved rather than cleared.
+            // A miss refuses: inventing 0 and sending SUPPRESS_EMBEDS alone would clear them.
+            let existing = self.message_flags(channel, message)?;
+            body.insert("flags".to_owned(), json!(existing | model::SUPPRESS_EMBEDS));
+        }
+        if let Some(keep) = keep_attachments {
+            let kept: Vec<Value> = keep
+                .iter()
+                .map(|id| json!({"id": id.strip_prefix("att:").unwrap_or(id)}))
+                .collect();
+            body.insert("attachments".to_owned(), Value::Array(kept));
         }
         let path = format!("/channels/{channel}/messages/{message}");
-        let edited = self.call("PATCH", &path, Some(json!({"content": text}))).map_err(refusal)?;
+        let edited = self.call("PATCH", &path, Some(Value::Object(body))).map_err(refusal)?;
         let unreadable = |err: String| Refusal::Refused(format!("Discord's answer was unreadable: {err}"));
         let mut posted: Posted = serde_json::from_str(&edited).map_err(|err| unreadable(err.to_string()))?;
         if posted.channel_id.is_empty() {
@@ -1390,6 +1424,22 @@ impl Discord {
         self.updated(posted).map_err(|failed| match failed {
             Failure::SignedOut(why) | Failure::Dropped(why) => unreadable(why),
         })
+    }
+
+    /// Reads the current `flags` bitmask of one message so PATCH merges rather than overwrites it.
+    /// The single-message route is required: a list that does not contain the id is a miss, and
+    /// a miss must not be treated as flags 0.
+    fn message_flags(&self, channel: &str, message: &str) -> Result<u64, Refusal> {
+        let path = format!("/channels/{channel}/messages/{message}");
+        let body = self.call("GET", &path, None).map_err(refusal)?;
+        let posted: Posted = serde_json::from_str(&body)
+            .map_err(|err| Refusal::Refused(format!("Discord's answer was unreadable: {err}")))?;
+        if posted.id != message {
+            return Err(Refusal::Refused("That message is gone.".to_owned()));
+        }
+        posted
+            .flags
+            .ok_or_else(|| Refusal::Refused("Discord's answer was unreadable: missing flags".to_owned()))
     }
 
     /// Fetches the raw markdown source of a single message for lossless editing.
@@ -1475,6 +1525,38 @@ impl Discord {
             "name": "message",
         });
         self.rest.call_once_with("POST", "/reporting/message", Some(body), &[]).map(drop).map_err(refusal)
+    }
+    /// Publishes (crossposts) a message in an announcement channel (`POST /channels/{id}/messages/{msg}/crosspost`).
+    /// A message the store already has as published is left alone. A body that is not a message
+    /// is the same unreadable fault as any other Discord answer we cannot apply.
+    fn publish(&self, channel: &str, message: &str) -> Result<(), Refusal> {
+        if self.ctx.stored_message(channel, message).ok().flatten().is_some_and(|stored| stored.published) {
+            return Ok(());
+        }
+        let raw = self
+            .call("POST", &format!("/channels/{channel}/messages/{message}/crosspost"), None)
+            .map_err(refusal)?;
+        let posted: Posted = serde_json::from_str(&raw)
+            .map_err(|err| Refusal::Refused(format!("Discord's answer was unreadable: {err}")))?;
+        if posted.id != message || posted.channel_id != channel {
+            return Err(Refusal::Refused("Discord's answer was unreadable: not a message".to_owned()));
+        }
+        self.updated(posted).map_err(|failed| match failed {
+            Failure::SignedOut(why) | Failure::Dropped(why) => {
+                Refusal::Refused(format!("Discord's answer was unreadable: {why}"))
+            }
+        })
+    }
+
+    /// Follows an announcement channel into `into_channel_id` (`POST /channels/{id}/followers`).
+    fn follow_announcement(&self, channel: &str, into_channel_id: &str) -> Result<(), Refusal> {
+        self.call(
+            "POST",
+            &format!("/channels/{channel}/followers"),
+            Some(json!({ "webhook_channel_id": into_channel_id })),
+        )
+        .map(drop)
+        .map_err(refusal)
     }
 
     /// Sends or answers a friend request, withdraws or ends a friendship, or blocks. One request:
@@ -2736,6 +2818,7 @@ impl Discord {
         row.private = thread.kind == model::PRIVATE_THREAD;
         row.read_only = read_only;
         row.read_only_reason = read_only_reason;
+        row.age_restricted = parent.age_restricted;
         row.rights = rights;
         row.slowmode_seconds = thread.rate_limit_per_user;
         row.locked = locked;
@@ -2963,9 +3046,18 @@ impl Discord {
             Command::ClearReactions { conversation_id, message_id, emoji, user_id, reply } => {
                 answer(reply, self.clear_reactions(&conversation_id, &message_id, emoji.as_deref(), user_id.as_deref()))
             }
-            Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
-                answer(reply, self.edit(&conversation_id, &message_id, &text))
-            }
+            Command::Edit {
+                conversation_id,
+                message_id,
+                text,
+                spans: _,
+                suppress_embeds,
+                keep_attachments,
+                reply,
+            } => answer(
+                reply,
+                self.edit(&conversation_id, &message_id, &text, suppress_embeds, keep_attachments.as_deref()),
+            ),
             Command::Source { conversation_id, message_id, reply } => {
                 answer(reply, self.source(&conversation_id, &message_id))
             }
@@ -3019,6 +3111,12 @@ impl Discord {
             }
             Command::Report { target, reason, note: _, block: _, reply } => answer(reply, self.file_report(&target, reason)),
             Command::ReportReasons { target, reply } => answer(reply, report_reasons(&target)),
+            Command::Publish { conversation_id, message_id, reply } => {
+                answer(reply, self.publish(&conversation_id, &message_id))
+            }
+            Command::Follow { conversation_id, into_channel_id, reply } => {
+                answer(reply, self.follow_announcement(&conversation_id, &into_channel_id))
+            }
             Command::SearchShared { conversation_id, kind, before, limit, reply } => {
                 answer(reply, self.search_shared(&conversation_id, kind, before.as_deref(), limit))
             }
@@ -3183,7 +3281,7 @@ pub(super) fn prove_forward_report() -> Result<(), String> {
         fn space(&self, id: &str) -> Option<String> { (id == "4000").then(|| "Rustaceans".to_owned()) }
     }
     let account = protocol::AccountKey { network: protocol::Network::Discord, account: "acct".into() };
-    let place = Place { account: &account, me: "me", guild: None, names: &Known, author: None };
+    let place = Place { account: &account, me: "me", guild: None, names: &Known, author: None, blur_explicit: false };
     let snap = |text: &str, id: &str| Posted {
         content: Some(text.to_owned()),
         attachments: Some(vec![model::Attachment { id: id.into(), filename: format!("{id}.txt"), size: 12, url: format!("https://cdn.discordapp.com/attachments/4101/{id}/{id}.txt"), ..Default::default() }]),

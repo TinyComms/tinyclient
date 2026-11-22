@@ -14,6 +14,8 @@ const PAD: &str = "\u{2005}";
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
     Text(Inline),
+    Heading { level: u8, text: Inline },
+    Small(Inline),
     Quote(Inline),
     Item { ordered: bool, depth: u8, number: u32, text: Inline },
     Code { language: String, text: String },
@@ -87,7 +89,21 @@ fn floor(text: &str, at: u32) -> usize {
 }
 
 fn is_block(style: &Style) -> bool {
-    matches!(style, Style::CodeBlock { .. } | Style::Quote | Style::ListItem { .. })
+    matches!(
+        style,
+        Style::CodeBlock { .. } | Style::Quote | Style::ListItem { .. } | Style::Heading { .. } | Style::Small
+    )
+}
+
+fn block_rank(style: &Style) -> u8 {
+    match style {
+        Style::CodeBlock { .. } => 0,
+        Style::Quote => 1,
+        Style::ListItem { .. } => 2,
+        Style::Heading { .. } => 3,
+        Style::Small => 4,
+        _ => 5,
+    }
 }
 
 /// The styled runs of `text[range]`.
@@ -126,7 +142,7 @@ fn inline(text: &str, spans: &[Span], range: Range<usize>) -> Inline {
                     }
                     run.emoji = Some(file.clone());
                 }
-                Style::CodeBlock { .. } | Style::Quote | Style::ListItem { .. } => {}
+                Style::CodeBlock { .. } | Style::Quote | Style::ListItem { .. } | Style::Heading { .. } | Style::Small => {}
             }
         }
         match pieces.last_mut() {
@@ -163,7 +179,7 @@ fn trimmed(text: &str, range: Range<usize>) -> Range<usize> {
 
 pub fn blocks(text: &str, spans: &[Span]) -> Vec<Block> {
     let mut whole: Vec<&Span> = spans.iter().filter(|span| is_block(&span.style)).collect();
-    whole.sort_by_key(|span| span.start);
+    whole.sort_by_key(|span| (span.start, block_rank(&span.style)));
 
     let mut out = Vec::new();
     let mut at = 0;
@@ -219,6 +235,17 @@ pub fn blocks(text: &str, spans: &[Span]) -> Vec<Block> {
                     number: numbers[depth as usize],
                     text: inline(text, spans, body),
                 });
+            }
+            Style::Heading { level } => {
+                numbers = [0; 3];
+                out.push(Block::Heading {
+                    level: (*level).clamp(1, 3),
+                    text: inline(text, spans, body),
+                });
+            }
+            Style::Small => {
+                numbers = [0; 3];
+                out.push(Block::Small(inline(text, spans, body)));
             }
             _ => {}
         }
@@ -295,7 +322,8 @@ pub fn plain(blocks: &[Block], a: Place, b: Place) -> String {
             (start == 0, inline.plain(start..end.max(start)))
         };
         lines.push(match block {
-            Block::Text(inline) => part(inline).1,
+            Block::Text(inline) | Block::Small(inline) => part(inline).1,
+            Block::Heading { text, .. } => part(text).1,
             Block::Quote(inline) => match part(inline) {
                 (true, text) => text.lines().map(|line| format!("> {line}")).collect::<Vec<_>>().join("\n"),
                 (false, text) => text,
@@ -492,7 +520,11 @@ mod tests {
             last.mark_edited();
         }
         let end = |block: usize| match &found[block] {
-            Block::Text(inline) | Block::Quote(inline) | Block::Item { text: inline, .. } => inline.text.len(),
+            Block::Text(inline)
+            | Block::Heading { text: inline, .. }
+            | Block::Small(inline)
+            | Block::Quote(inline)
+            | Block::Item { text: inline, .. } => inline.text.len(),
             Block::Code { text, .. } => text.len(),
         };
         // Everything: mention by name, the emoji by its name, the link by its address, the code
@@ -534,6 +566,8 @@ mod tests {
             .iter()
             .map(|block| match block {
                 Block::Text(inline) => format!("text {:?}", inline.text),
+                Block::Heading { level, text } => format!("h{level} {:?}", text.text),
+                Block::Small(inline) => format!("small {:?}", inline.text),
                 Block::Quote(inline) => format!("quote {:?}", inline.text),
                 Block::Item { depth, number, text, .. } => format!("item {depth}.{number} {:?}", text.text),
                 Block::Code { language, text } => format!("code {language} {text:?}"),
@@ -580,23 +614,30 @@ mod tests {
             for _ in 0..400 {
                 let spans: Vec<Span> = (0..next(6))
                     .map(|_| {
-                        let style = match next(9) {
-                            0 => Style::Bold,
-                            1 => Style::Code,
-                            2 => Style::Spoiler,
-                            3 => Style::Link { url: "https://example.org".into() },
-                            4 => Style::Mention { kind: MentionKind::User, id: "U1".into() },
-                            5 => Style::Emoji { file: file.clone() },
-                            6 => Style::Quote,
-                            7 => Style::ListItem { ordered: next(2) == 0, depth: next(5) as u8 },
-                            _ => Style::CodeBlock { language: String::new() },
-                        };
-                        Span { start: next(limit), end: next(limit), style }
-                    })
-                    .collect();
+                    let style = match next(11) {
+                        0 => Style::Bold,
+                        1 => Style::Code,
+                        2 => Style::Spoiler,
+                        3 => Style::Link { url: "https://example.org".into() },
+                        4 => Style::Mention { kind: MentionKind::User, id: "U1".into() },
+                        5 => Style::Emoji { file: file.clone() },
+                        6 => Style::Quote,
+                        7 => Style::ListItem { ordered: next(2) == 0, depth: next(5) as u8 },
+                        8 => Style::Heading { level: (next(3) as u8) + 1 },
+                        9 => Style::Small,
+                        _ => Style::CodeBlock { language: String::new() },
+                    };
+                    Span { start: next(limit), end: next(limit), style }
+                })
+                .collect();
                 let found = blocks(&text, &spans);
                 for block in &found {
-                    if let Block::Text(inline) | Block::Quote(inline) | Block::Item { text: inline, .. } = block {
+                    if let Block::Text(inline)
+                    | Block::Heading { text: inline, .. }
+                    | Block::Small(inline)
+                    | Block::Quote(inline)
+                    | Block::Item { text: inline, .. } = block
+                    {
                         assert_eq!(inline.runs.iter().map(|run| run.len).sum::<usize>(), inline.text.len());
                         for _ in 0..4 {
                             let (a, b) = (next(inline.text.len() as u32 + 3) as usize, next(inline.text.len() as u32 + 3) as usize);
@@ -638,5 +679,43 @@ mod tests {
             Some(vec![Jumbo::Custom { file, name: ":parrot:".into() }, Jumbo::Unicode("🎉".into())])
         );
         assert_eq!(jumbo("🎉", &[span("🎉", "🎉", Style::Bold)]), None);
+        assert_eq!(jumbo("🎉", &[span("🎉", "🎉", Style::Heading { level: 1 })]), None);
+        assert_eq!(jumbo("🎉", &[span("🎉", "🎉", Style::Small)]), None);
+    }
+
+    #[test]
+    fn headings_and_subtext_keep_inline_styles_and_copy_cleanly() {
+        let text = "Title ok\nSub note\nFootnote link";
+        let spans = [
+            span(text, "Title ok", Style::Heading { level: 1 }),
+            span(text, "ok", Style::Italic),
+            span(text, "Sub note", Style::Heading { level: 3 }),
+            span(text, "Footnote link", Style::Small),
+            span(text, "link", Style::Link { url: "https://example.org".into() }),
+        ];
+        let found = blocks(text, &spans);
+        assert_eq!(found.len(), 3);
+        match &found[0] {
+            Block::Heading { level, text } => {
+                assert_eq!(*level, 1);
+                assert_eq!(runs(text), [("Title ", String::new()), ("ok", "i".into())]);
+            }
+            other => panic!("expected heading 1, got {other:?}"),
+        }
+        match &found[1] {
+            Block::Heading { level, text } => {
+                assert_eq!(*level, 3);
+                assert_eq!(text.text, "Sub note");
+            }
+            other => panic!("expected heading 3, got {other:?}"),
+        }
+        match &found[2] {
+            Block::Small(inline) => {
+                assert_eq!(inline.text, "Footnote link");
+                assert_eq!(inline.runs.last().and_then(|r| r.link.as_deref()), Some("https://example.org"));
+            }
+            other => panic!("expected small block, got {other:?}"),
+        }
+        assert_eq!(plain(&found, (0, 0), (2, usize::MAX)), "Title ok\nSub note\nFootnote https://example.org");
     }
 }

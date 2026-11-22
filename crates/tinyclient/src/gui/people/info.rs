@@ -97,6 +97,8 @@ pub struct InfoPane {
     note_saving: bool,
     note_saved: bool,
     note_error: Option<String>,
+    /// True when the current conversation's age gate was already passed this session.
+    age_gate_passed: bool,
 }
 
 /// The Space a person is seen from, when the open conversation is in one: what the network
@@ -152,6 +154,7 @@ impl InfoPane {
             note_saving: false,
             note_saved: false,
             note_error: None,
+            age_gate_passed: false,
         }
     }
 
@@ -427,8 +430,9 @@ impl InfoPane {
         let same = self.subject.as_ref() == Some(&Subject::Conversation(key.clone()));
         self.subject = Some(Subject::Conversation(key.clone()));
         self.row = row.or_else(|| self.row.clone().filter(|_| same));
+        let gated = self.row.as_ref().is_some_and(|r| r.age_restricted) && !self.age_gate_passed;
         let entity = cx.entity();
-        self.shared.show(Some(key.clone()), &entity, cx, |pane: &mut InfoPane| &mut pane.shared);
+        self.shared.show((!gated).then(|| key.clone()), &entity, cx, |pane: &mut InfoPane| &mut pane.shared);
         if same && matches!(self.info, Answer::Got(_)) {
             cx.notify();
             return;
@@ -445,6 +449,10 @@ impl InfoPane {
                 this.info = match answer {
                     Ok(Response::ConversationInfo { info }) => {
                         this.row = Some(info.conversation.clone());
+                        if info.conversation.age_restricted && !this.age_gate_passed {
+                            let entity = cx.entity();
+                            this.shared.show(None, &entity, cx, |pane: &mut InfoPane| &mut pane.shared);
+                        }
                         let small = matches!(facts::members_shown(&info.conversation, Some(&info)), facts::MembersShown::Inline);
                         if small {
                             this.ask_members(key.clone(), asked, cx);
@@ -456,6 +464,15 @@ impl InfoPane {
                 cx.notify();
             });
         });
+    }
+
+    pub(in crate::gui) fn unlock_age_gate(&mut self, key: &Key, cx: &mut Context<Self>) {
+        if self.subject.as_ref() == Some(&Subject::Conversation(key.clone())) {
+            self.age_gate_passed = true;
+            let entity = cx.entity();
+            self.shared.show(Some(key.clone()), &entity, cx, |pane: &mut InfoPane| &mut pane.shared);
+            cx.notify();
+        }
     }
 
     fn ask_members(&mut self, conversation: Key, asked: u64, cx: &mut Context<Self>) {
@@ -1313,6 +1330,14 @@ impl InfoPane {
     }
 
     fn shared_part(&self, network: Network, _: &Window, cx: &mut Context<Self>) -> Div {
+        if self.row.as_ref().is_some_and(|row| row.age_restricted) && !self.age_gate_passed {
+            return div()
+                .px(px(theme::PANE_PAD))
+                .py(px(12.))
+                .type_small()
+                .text_color(theme::text_faint())
+                .child("Confirm the age warning to view shared media.");
+        }
         let entity = cx.entity();
         let (pick_to, search_to) = (entity.clone(), entity.clone());
         let link = self.row.as_ref().and_then(|row| facts::conversation_link(row, self.info.got()));
@@ -1656,9 +1681,18 @@ impl Shell {
         if let Some(peer) = row.as_ref().filter(|row| row.kind == protocol::ConversationKind::Direct).and_then(super::peer_of) {
             return self.details_person(peer, None, cx);
         }
+        let passed = self.age_gate_passed(&conversation);
         let info = self.info_entity(cx);
-        info.update(cx, |info, cx| info.show_conversation(conversation, row, cx));
+        info.update(cx, |info, cx| {
+            info.age_gate_passed = passed;
+            info.show_conversation(conversation, row, cx);
+        });
         self.open_details("Details", cx);
+    }
+
+    pub(in crate::gui) fn info_age_gate_passed(&mut self, key: &Key, cx: &mut Context<Self>) {
+        let info = self.info_entity(cx);
+        info.update(cx, |info, cx| info.unlock_age_gate(key, cx));
     }
 
     /// A Space's own details, opened from its name above its tree.

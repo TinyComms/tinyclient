@@ -123,6 +123,20 @@ pub(in crate::gui) fn open_external_link(url: &str, cx: &mut App) {
     };
     cx.open_url(&dest.target(prefs::choices().strip_tracking));
 }
+/// Web URL fallback when a `#channel` mention is clicked but chatd has no row for it.
+pub(super) fn channel_mention_fallback_url(
+    network: protocol::Network,
+    space: Option<&str>,
+    channel_id: &str,
+) -> Option<String> {
+    if network != protocol::Network::Discord || channel_id.is_empty() || !channel_id.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let place = space
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or("@me");
+    Some(format!("https://discord.com/channels/{place}/{channel_id}"))
+}
 
 impl Pane {
     /// Opens a link externally (in the system browser), asking for confirmation per preferences.
@@ -179,6 +193,51 @@ impl Pane {
             return;
         }
         self.open_external_link(url, window, cx);
+    }
+
+    /// A click on a `#channel` mention: resolves the channel via `Request::Conversation` and opens
+    /// it in-app. If chatd does not know the row (or Alt is held), falls back to the web link.
+    pub(super) fn open_channel_mention(
+        &mut self,
+        channel_id: &str,
+        external: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(open) = self.open.as_ref() else {
+            return;
+        };
+        let key = protocol::Key::new(&open.key.account(), channel_id);
+        let space = self
+            .shell
+            .upgrade()
+            .and_then(|shell| shell.read(cx).snapshot.as_ref()?.open.as_ref()?.space.clone());
+        let fallback = channel_mention_fallback_url(open.key.network, space.as_deref(), channel_id);
+        if external {
+            if let Some(url) = fallback {
+                self.open_external_link(&url, window, cx);
+            }
+            return;
+        }
+        let request = protocol::Request::Conversation { conversation: key };
+        let window_handle = window.window_handle();
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { crate::client::ask(&request) }).await;
+            if let Ok(protocol::Response::Conversation { conversation }) = answer {
+                let _ = this.update(cx, |this, cx| {
+                    let _ = this.shell.update(cx, |shell, cx| {
+                        shell.open_resolved_link(conversation.key, None, &conversation.title, cx);
+                    });
+                });
+                return;
+            }
+            if let Some(url) = fallback {
+                let _ = cx.update_window(window_handle, |_, window, cx| {
+                    let _ = this.update(cx, |this, cx| this.open_external_link(&url, window, cx));
+                });
+            }
+        })
+        .detach();
     }
 
     /// Opens what is asked about, and remembers its domain if that was ticked.
@@ -390,11 +449,11 @@ mod tests {
     fn message_link_round_trips_through_parse_network_link() {
         let mut key = protocol::Key { network: protocol::Network::Discord, account: "1".into(), id: "12345".into() };
         let said = protocol::Message::plain("67890", "Mara", "hello", 1, false);
-        let url = message_link(&key, Some("G7"), &said).unwrap();
-        assert_eq!(url, "https://discord.com/channels/G7/12345/67890");
+        let url = message_link(&key, Some("4000"), &said).unwrap();
+        assert_eq!(url, "https://discord.com/channels/4000/12345/67890");
         let parsed = protocol::link::parse_network_link(&url).unwrap();
         assert_eq!(parsed.network, protocol::Network::Discord);
-        assert_eq!(parsed.space.as_deref(), Some("G7"));
+        assert_eq!(parsed.space.as_deref(), Some("4000"));
         assert_eq!(parsed.channel, "12345");
         assert_eq!(parsed.message_id.as_deref(), Some("67890"));
 
@@ -422,11 +481,31 @@ mod tests {
             "engineering",
         );
         assert_eq!(
-            network_link_chip("https://discord.com/channels/G7/12345/67890", &[conv.clone()]).as_deref(),
+            network_link_chip("https://discord.com/channels/4000/12345/67890", &[conv.clone()]).as_deref(),
             Some("#engineering ↗")
         );
         assert_eq!(
-            network_link_chip("https://discord.com/channels/G7/99999/67890", &[conv]),
+            network_link_chip("https://discord.com/channels/4000/99999/67890", &[conv]),
+            None
+        );
+    }
+
+    #[test]
+    fn channel_mention_fallback_url_validates_discord_snowflakes() {
+        assert_eq!(
+            channel_mention_fallback_url(protocol::Network::Discord, Some("4000"), "4102").as_deref(),
+            Some("https://discord.com/channels/4000/4102")
+        );
+        assert_eq!(
+            channel_mention_fallback_url(protocol::Network::Discord, None, "4102").as_deref(),
+            Some("https://discord.com/channels/@me/4102")
+        );
+        assert_eq!(
+            channel_mention_fallback_url(protocol::Network::Discord, Some("4000"), "bad/id"),
+            None
+        );
+        assert_eq!(
+            channel_mention_fallback_url(protocol::Network::Slack, Some("T1"), "C1"),
             None
         );
     }

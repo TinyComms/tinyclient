@@ -527,6 +527,8 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
             message_id,
             text,
             spans,
+            suppress_embeds: _,
+            keep_attachments: _,
             reply,
         } => edit(ctx, saved, &conversation_id, &message_id, &text, &spans, reply),
         Command::Delete {
@@ -2751,6 +2753,7 @@ fn search(
                     snippet,
                     title,
                     space_title: space_title.clone(),
+                    age_restricted: false,
                 });
             }
             // If the server skipped encrypted conversations in a space-wide search, merge cached hits

@@ -498,6 +498,9 @@ pub struct ConversationRights {
     /// May create an invite link for this conversation (`Request::CreateInvite`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub create_invite: bool,
+    /// May manage webhooks in this channel (Discord `MANAGE_WEBHOOKS`, required to follow an announcement channel here).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_webhooks: bool,
 }
 
 impl ConversationRights {
@@ -517,6 +520,8 @@ impl ConversationRights {
     // Bits 8..=11 are thread rights and bit 12 is slowmode exemption on the Discord
     // thread lane, so an invite right cannot share them. The review asked for bit 12.
     const CREATE_INVITE: i64 = 1 << 13;
+    /// Bit 14. Bits 8–12 are already conversation rights on other Discord branches.
+    const MANAGE_WEBHOOKS: i64 = 1 << 14;
 
     pub fn is_none(&self) -> bool {
         *self == ConversationRights::default()
@@ -570,6 +575,9 @@ impl ConversationRights {
         if self.create_invite {
             bits |= Self::CREATE_INVITE;
         }
+        if self.manage_webhooks {
+            bits |= Self::MANAGE_WEBHOOKS;
+        }
         bits
     }
 
@@ -589,6 +597,7 @@ impl ConversationRights {
             manage_threads: (bits & Self::MANAGE_THREADS) != 0,
             slowmode_exempt: (bits & Self::SLOWMODE_EXEMPT) != 0,
             create_invite: (bits & Self::CREATE_INVITE) != 0,
+            manage_webhooks: (bits & Self::MANAGE_WEBHOOKS) != 0,
         }
     }
 }
@@ -810,6 +819,12 @@ pub struct Capabilities {
     /// This account supports following and unfollowing threads (`Request::FollowThread`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub follow_threads: bool,
+    /// The network marks this account as not permitted to enter age-restricted channels (`nsfw_allowed == false` on Discord).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub age_restricted_blocked: bool,
+    /// This account supports following announcement channels (`Request::Follow`) and publishing messages in them (`Request::Publish`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub announcement_follow: bool,
     /// This account supports creating a friend-invite link (`Request::CreateInvite` with `account` only).
     #[serde(default, skip_serializing_if = "is_false")]
     pub create_friend_invite: bool,

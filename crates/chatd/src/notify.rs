@@ -185,7 +185,11 @@ pub fn decide(values: &Values, conversation: &Conversation, message: &Message, m
         || moment.sounded_here
         || moment.sounded_any;
     let sound = Some(sound_word(values, key, mention || urgent || keyword_hit)).filter(|word| !silent && word != "none");
-    Some(Verdict { banner: true, sound, preview: preview(values, moment.locked), mention: mention || urgent || keyword_hit })
+    let mut show = preview(values, moment.locked);
+    if conversation.age_restricted && show == Preview::Full {
+        show = Preview::Sender;
+    }
+    Some(Verdict { banner: true, sound, preview: show, mention: mention || urgent || keyword_hit })
 }
 
 /// Whether a reaction to one of my messages notifies. Respects mutes, focus, quiet hours,
@@ -234,7 +238,11 @@ pub fn decide_reaction(
         || moment.sounded_here
         || moment.sounded_any;
     let sound = Some(sound_word(values, key, false)).filter(|word| !silent && word != "none");
-    Some(Verdict { banner: true, sound, preview: preview(values, moment.locked), mention: false })
+    let mut show = preview(values, moment.locked);
+    if conversation.age_restricted && show == Preview::Full {
+        show = Preview::Sender;
+    }
+    Some(Verdict { banner: true, sound, preview: show, mention: false })
 }
 
 /// Whether a ring posts (N5, N9, N3) and whether it is heard. `None`: nothing at all.

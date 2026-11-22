@@ -6,7 +6,7 @@ use super::model::{
     self, number, seconds, Channel, Guild, GuildSettings, Kept, Member, MuteConfig, PresenceUpdate,
     ReadState, Relationship, Role, User, Versioned, VoiceState, ADMINISTRATOR, BAN_MEMBERS, CONNECT,
     CREATE_INSTANT_INVITE, CREATE_PRIVATE_THREADS, CREATE_PUBLIC_THREADS, KICK_MEMBERS, MANAGE_CHANNELS, MANAGE_MESSAGES,
-    MANAGE_ROLES, MANAGE_THREADS, PIN_MESSAGES, SEND_MESSAGES, SEND_MESSAGES_IN_THREADS, VIEW_CHANNEL,
+    MANAGE_ROLES, MANAGE_THREADS, MANAGE_WEBHOOKS, PIN_MESSAGES, SEND_MESSAGES, SEND_MESSAGES_IN_THREADS, VIEW_CHANNEL,
 };
 use super::{proto, Discord, GuildInfo, Quiet, Resumable, RoleInfo, WARM};
 use crate::hub::now;
@@ -34,6 +34,8 @@ struct LegacySettings {
     guild_folders: Vec<Folder>,
     #[serde(default)]
     guild_positions: Vec<String>,
+    #[serde(default)]
+    explicit_content_filter: Option<u8>,
 }
 
 /// The parts of READY that are used. Everything else in it is skipped while parsing.
@@ -301,6 +303,7 @@ impl GuildInfo {
             manage_threads: timed_out.is_none() && (perms & MANAGE_THREADS != 0),
             slowmode_exempt: slowmode_exempt(perms, false),
             create_invite: timed_out.is_none() && (perms & CREATE_INSTANT_INVITE != 0),
+            manage_webhooks: timed_out.is_none() && (perms & MANAGE_WEBHOOKS != 0),
             ..protocol::ConversationRights::default()
         };
         let call = if timed_out.is_some() || (channel.kind == model::VOICE && !can_connect) {
@@ -322,6 +325,7 @@ impl GuildInfo {
             opted_out: self.quiet.opted_out(&channel.id, parent),
             max_file_bytes: super::send::tier_upload_limit(self.premium_tier),
             slowmode_seconds: channel.rate_limit_per_user,
+            age_restricted: channel.nsfw,
             ..ConversationRow::new(&channel.id, kind, name)
         })
     }
@@ -408,7 +412,7 @@ impl Discord {
     fn tree(&self, guild: &Guild, info: &mut GuildInfo, me: &str, read: &HashMap<String, ReadState>) -> Tree {
         let mut rows = Vec::new();
         let mut counts = Vec::new();
-        let mut placed: HashMap<&str, (Option<String>, i32, protocol::ConversationRights, u64)> = HashMap::new();
+        let mut placed: HashMap<&str, (Option<String>, i32, protocol::ConversationRights, u64, bool)> = HashMap::new();
         info.channels.clear();
         let standing = |channel: &Channel, joined: Option<i64>| {
             let state = read.get(&channel.id);
@@ -439,7 +443,7 @@ impl Discord {
                 continue;
             };
             let perms = info.permissions(&guild.id, me, channel);
-            placed.insert(&channel.id, (row.group.clone(), row.position, row.rights, perms));
+            placed.insert(&channel.id, (row.group.clone(), row.position, row.rights, perms, row.age_restricted));
             info.remember(&channel.id, channel.parent_id.as_deref());
             // A voice channel's chat is not "unread" in the tree. A forum's own marker is:
             // its posts hold no row to carry a badge, so the forum itself counts them, and a
@@ -461,7 +465,7 @@ impl Discord {
         let mut under: HashMap<&str, i32> = HashMap::new();
         for thread in &guild.threads {
             let archived = thread.thread_metadata.as_ref().is_some_and(|metadata| metadata.archived);
-            let Some((group, position, parent_rights, parent_perms)) = thread.parent_id.as_deref().and_then(|parent| placed.get(parent)) else {
+            let Some((group, position, parent_rights, parent_perms, parent_nsfw)) = thread.parent_id.as_deref().and_then(|parent| placed.get(parent)) else {
                 continue;
             };
             if archived || !thread.is_thread() {
@@ -487,6 +491,7 @@ impl Discord {
                 rights: thread_rights,
                 slowmode_seconds: thread.rate_limit_per_user,
                 locked,
+                age_restricted: thread.nsfw || *parent_nsfw,
                 // A server's threads in READY are the ones we were added to.
                 filing: Some(Filing {
                     followed: true,
@@ -951,7 +956,7 @@ impl Discord {
     /// file limit is the documented 10 MiB (a press report says 20 MB since August 2026; the
     /// smaller one is used until a real session says otherwise), and a server's boosts, which
     /// raise it there, are not counted.
-    pub(super) fn capabilities(&self, premium: u8) {
+    pub(super) fn capabilities(&self, premium: u8, age_restricted_blocked: bool) {
         let (max_file_bytes, emoji) = match premium {
             2 => (500 << 20, protocol::EmojiScope::All),
             1 | 3 => (50 << 20, protocol::EmojiScope::All),
@@ -1006,6 +1011,8 @@ impl Discord {
             create_friend_invite: true,
             rich_status: true,
             person_notes: true,
+            age_restricted_blocked,
+            announcement_follow: true,
             ..Default::default()
         });
         self.state.lock().unwrap().premium = premium;
@@ -1030,7 +1037,13 @@ impl Discord {
     pub(super) fn ready(&self, ready: Ready) -> Result<(), Failure> {
         let me = ready.user.id.clone();
         self.myself(&ready.user)?;
-        self.capabilities(ready.user.premium_type);
+        self.capabilities(ready.user.premium_type, ready.user.nsfw_allowed == Some(false));
+        let blur_explicit = ready
+            .user_settings_proto
+            .as_deref()
+            .map(proto::blur_explicit_media)
+            .unwrap_or_else(|| ready.user_settings.as_ref().and_then(|s| s.explicit_content_filter).is_none_or(|v| v != 0));
+        self.state.lock().unwrap().show_explicit_media = !blur_explicit;
         let order = Self::order(&ready);
         let folders = Self::folders(&ready);
         let known: HashMap<String, User> = ready.users.into_iter().map(|user| (user.id.clone(), user)).collect();
@@ -1538,6 +1551,7 @@ impl Discord {
             rights: thread_rights,
             slowmode_seconds: thread.rate_limit_per_user,
             locked,
+            age_restricted: thread.nsfw || parent.age_restricted,
             filing: Some(super::kept_filing(known.as_ref(), archived, followed)),
             ..ConversationRow::new(&thread.id, ConversationKind::Thread, name)
         };

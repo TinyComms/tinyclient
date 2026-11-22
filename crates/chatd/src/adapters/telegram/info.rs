@@ -413,6 +413,7 @@ pub(super) fn search_messages(account: &Account, conversation: &str, query: &str
         title: known.as_ref().map(|row| row.title.clone()).unwrap_or_default(),
         space_title: known.as_ref().map(|row| row.space_title.clone()).unwrap_or_default(),
         outgoing: message.outgoing,
+        age_restricted: known.as_ref().is_some_and(|row| row.age_restricted),
     }).collect())
 }
 
@@ -504,6 +505,7 @@ pub(super) fn search_global(account: &Account, query: &str, cursor: Option<&str>
                 title,
                 space_title,
                 outgoing: mapped.message.outgoing,
+                age_restricted: known_row.as_ref().is_some_and(|row| row.age_restricted),
             });
             if hits.len() >= LIMIT {
                 break;

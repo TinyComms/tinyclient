@@ -1022,6 +1022,7 @@ mod tests {
             slowmode_seconds: 0,
             slowmode_until: None,
             locked: false,
+            age_restricted: false,
         }
     }
 

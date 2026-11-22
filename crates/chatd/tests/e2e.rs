@@ -955,7 +955,7 @@ fn what_the_user_does_to_a_message_is_shown_and_settled_by_the_network() {
     let mine = find("Same spot as this one");
     assert!(mine.outgoing && !mine.edited);
     let edit = |message: &Message, text: &str| {
-        chatd.ask(Request::Edit { conversation: room.clone(), message_id: message.id.clone(), text: text.into(), spans: Vec::new() })
+        chatd.ask(Request::Edit { conversation: room.clone(), message_id: message.id.clone(), text: text.into(), spans: Vec::new(), suppress_embeds: false, keep_attachments: None })
     };
     assert_eq!(edit(&mine, "Same spot, and the camera was level."), Response::Ok);
     let edited = find("Same spot, and the camera was level.");

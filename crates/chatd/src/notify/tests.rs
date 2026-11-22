@@ -61,6 +61,17 @@ fn by_default_direct_messages_and_mentions_notify_with_pebble_and_channel_chatte
     assert!(posts(&values, &channel(), &mention("Tom", "@me look"), &now));
     let group = row(Network::Slack, "G1", ConversationKind::Group, "Lisbon trip");
     assert!(posts(&values, &group, &message("Odile", "tickets"), &now));
+
+    // Age-restricted channels never show message text in notification previews (#351).
+    let nsfw = Conversation { age_restricted: true, ..channel() };
+    let mut full = Values::default();
+    set(&mut full, settings::GLOBAL, settings::PREVIEW, "full");
+    let verdict = decide(&full, &nsfw, &mention("Tom", "@me secret"), &now).expect("still notifies");
+    assert_eq!(verdict.preview, Preview::Sender);
+    let mut none = Values::default();
+    set(&mut none, settings::GLOBAL, settings::PREVIEW, "nothing");
+    let verdict_none = decide(&none, &nsfw, &mention("Tom", "@me secret"), &now).expect("still notifies");
+    assert_eq!(verdict_none.preview, Preview::Nothing);
 }
 
 #[test]
@@ -663,6 +674,11 @@ fn reactions_to_my_messages_notify_according_to_scope_and_withdraw_when_read() {
     set(&mut values, GLOBAL, settings::NOTIFY_REACTIONS, "everywhere");
     assert!(decide_reaction(&values, &channel(), true, &now).is_some());
     assert!(decide_reaction(&values, &Conversation { muted: true, ..channel() }, true, &now).is_none());
+    // An age-restricted channel downgrades a full preview to the sender, as a message does.
+    set(&mut values, GLOBAL, settings::PREVIEW, "full");
+    let nsfw = Conversation { age_restricted: true, ..channel() };
+    let gated = decide_reaction(&values, &nsfw, true, &now).expect("still notifies");
+    assert_eq!(gated.preview, Preview::Sender);
 
     // Posting formats "Ines reacted 👍 to: <snippet>" and reading withdraws it.
     set(&mut values, GLOBAL, settings::PREVIEW, "full");

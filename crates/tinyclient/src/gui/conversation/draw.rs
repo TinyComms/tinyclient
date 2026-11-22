@@ -1002,7 +1002,7 @@ impl Pane {
                         .child(div().type_body().text_color(theme::text()).child(from.text.clone()))
                         .children(attached);
                     sent.children(said)
-                        .child(div().mt(px(4.)).child(forwarded_line(from)))
+                        .child(div().mt(px(4.)).child(self.forwarded_line(&message.id, from, cx)))
                         .child(
                             div()
                                 .flex()
@@ -1011,7 +1011,7 @@ impl Pane {
                         )
                 }
                 // What was forwarded is the message itself, set behind a bar under where it came from.
-                Some(from) => sent.child(forwarded_line(from)).child(
+                Some(from) => sent.child(self.forwarded_line(&message.id, from, cx)).child(
                     div()
                         .flex()
                         .child(div().w(px(2.)).flex_none().rounded(px(1.)).bg(tokens::border_strong()))
@@ -1114,6 +1114,7 @@ impl Pane {
             .children(head.then(|| self.header(message, in_header, cx)))
             .child(sent)
             .children(self.otp_chip(message, cx))
+            .children(self.publish_chip(message, cx))
             .children(self.views_line(message))
             .children(self.reactions(message, window, cx))
             .children(self.thread_line(message, window, cx))
@@ -1374,6 +1375,14 @@ impl Pane {
             )
             .children(message.sender.bot.then(|| tag("APP")))
             .children(message.saved_history.then(|| tag("SAVED")))
+            .children(message.published.then(|| tag("PUBLISHED")))
+            .children((!message.crosspost_source.is_empty()).then(|| {
+                div()
+                    .flex_none()
+                    .type_micro()
+                    .text_color(theme::text_faint())
+                    .child(format!("from {}", message.crosspost_source))
+            }))
             .children(message.pinned.then(|| {
                 div()
                     .flex_none()
@@ -1449,6 +1458,38 @@ impl Pane {
                         block.into_any_element()
                     }
                 }
+                Block::Heading { level, text } => {
+                    let (size, line, top, bottom) = match *level {
+                        1 => (20., 26., 6., 2.),
+                        2 => (18., 24., 4., 1.),
+                        _ => (16., 22., 2., 0.),
+                    };
+                    div()
+                        .max_w(px(MEASURE))
+                        .mt(px(top))
+                        .mb(px(bottom))
+                        .flex()
+                        .flex_col()
+                        .text_size(theme::sized(size))
+                        .line_height(theme::sized(line))
+                        .font_weight(theme::SEMIBOLD)
+                        .when(phone, |div| {
+                            div.text_size(px(tokens_phone::scaled(size + 2.)))
+                                .line_height(px(tokens_phone::scaled(line + 2.)))
+                        })
+                        .child(self.rich(message, ix, text, theme::text().into_color(), window, cx))
+                        .into_any_element()
+                }
+                Block::Small(inline) => div()
+                    .max_w(px(MEASURE))
+                    .mt(px(1.))
+                    .flex()
+                    .flex_col()
+                    .type_small()
+                    .when(phone, |div| div.text_size(px(tokens_phone::scaled(13.))).line_height(px(tokens_phone::scaled(18.))))
+                    .text_color(theme::text_faint())
+                    .child(self.rich(message, ix, inline, theme::text_faint().into_color(), window, cx))
+                    .into_any_element(),
                 Block::Quote(inline) => div()
                     .max_w(px(MEASURE))
                     .mt(px(3.))
@@ -1557,6 +1598,75 @@ impl Pane {
                 .detach();
             }));
         Some(div().flex().child(chip).into_any_element())
+    }
+
+    /// One-click "Publish" chip under my own unpublished messages in an announcement channel.
+    fn publish_chip(&mut self, message: &Rc<Message>, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !message.outgoing || !self.can(message).publish {
+            return None;
+        }
+        let msg = message.clone();
+        let chip = div()
+            .id(name_id("publish", &message.id))
+            .mt(px(4.))
+            .h(px(26.))
+            .px(px(10.))
+            .rounded(px(theme::R_CONTROL))
+            .bg(theme::field())
+            .border_1()
+            .border_color(theme::border())
+            .hover(|style| style.bg(theme::selected()).border_color(theme::border_strong()))
+            .active(|style| style.bg(theme::pressed()))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .type_small()
+            .text_color(theme::text())
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(crate::gui::components::glyph("icons/megaphone.svg", 12., theme::text_soft()))
+            .child("Publish")
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.publish_message(&msg, cx);
+            }));
+        Some(div().flex().child(chip).into_any_element())
+    }
+
+    /// Where a forwarded message was first said, with an in-app "→ origin" link when present.
+    fn forwarded_line(&self, message_id: &str, from: &Forwarded, cx: &mut Context<Self>) -> Div {
+        let place = match (from.from_title.is_empty(), from.from_space.is_empty()) {
+            (true, true) => "Forwarded".to_owned(),
+            (false, true) => format!("Forwarded from {}", from.from_title),
+            (true, false) => format!("Forwarded from {}", from.from_space),
+            (false, false) => format!("Forwarded from {} in {}", from.from_title, from.from_space),
+        };
+        let origin = (!from.link.is_empty()).then(|| {
+            let url = from.link.clone();
+            div()
+                .id(name_id("fwd-origin", message_id))
+                .flex_none()
+                .cursor_pointer()
+                .text_color(tokens::link())
+                .hover(|s| s.underline())
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_link(&url, event.modifiers().alt, window, cx);
+                }))
+                .child("→ origin")
+        });
+        div()
+            .h(px(18.))
+            .mb(px(2.))
+            .flex()
+            .items_center()
+            .gap(px(5.))
+            .type_small()
+            .text_color(theme::text_faint())
+            .child(icon(Icon::Forward, 13., theme::text_faint()))
+            .child(div().min_w_0().truncate().child(place))
+            .children(origin)
     }
 
     /// "(edited)", with the time it was edited. A network that keeps earlier wordings opens them on a click.
@@ -1865,7 +1975,13 @@ impl Pane {
                     last.mark_edited();
                 }
                 let inline = match blocks.get(block) {
-                    Some(Block::Text(inline) | Block::Quote(inline) | Block::Item { text: inline, .. }) => inline,
+                    Some(
+                        Block::Text(inline)
+                        | Block::Heading { text: inline, .. }
+                        | Block::Small(inline)
+                        | Block::Quote(inline)
+                        | Block::Item { text: inline, .. },
+                    ) => inline,
                     _ => return,
                 };
                 let Some(run) = inline.runs.get(run) else {
@@ -1908,9 +2024,10 @@ impl Pane {
                             }
                         }
                     }
+                } else if let Some((MentionKind::Channel, channel_id)) = &run.mention {
+                    let channel_id = channel_id.clone();
+                    self.open_channel_mention(&channel_id, alt, window, cx);
                 }
-                // LATER: a click on a channel mention opens the channel; it needs the channel's
-                // row, which the sidebar holds.
             }
         }
     }
@@ -2365,6 +2482,13 @@ impl Pane {
 
     fn file_row(&mut self, message: &Rc<Message>, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let attachment = &message.attachments[index];
+        if crate::gui::app::prefs::choices().text_previews && !attachment.spoiler && !self.is_gated() {
+            if let Some(lang) = super::text_preview::preview_language(attachment) {
+                if let Some(card) = self.text_preview_card(message, index, lang, cx) {
+                    return card;
+                }
+            }
+        }
         let file = attachment.file.clone();
         let on_disk = file.path.clone();
         let fetching = self.then.contains_key(&file.id);
@@ -2469,6 +2593,237 @@ impl Pane {
             None => row.child(tool("download", Icon::Download, 28.).tooltip(tip("Download", None))),
         };
         row.into_any_element()
+    }
+
+    /// Inline preview card for a text or code file attachment (#385). Fetches up to 100 KB via a
+    /// ranged request only when this row is drawn on screen, decodes UTF-8 lossily off the UI
+    /// thread, rejects binary-looking bytes, and renders with the same syntax-coloured code frame.
+    fn text_preview_card(
+        &mut self,
+        message: &Rc<Message>,
+        index: usize,
+        language: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let attachment = message.attachments[index].clone();
+        let file_id = attachment.file.id.clone();
+        let preview = match self.text_previews.get(&file_id) {
+            Some(Some(preview)) => Rc::clone(preview),
+            Some(None) => return None,
+            None => {
+                let head_key = super::text_preview::head_id(&file_id);
+                let disk_path = attachment
+                    .file
+                    .path
+                    .clone()
+                    .or_else(|| self.known.get(&file_id).cloned())
+                    .or_else(|| self.known.get(&head_key).cloned());
+                if let Some(path) = disk_path {
+                    if self.text_preview_loading.insert(file_id.clone()) {
+                        let declared = attachment.file.bytes;
+                        let id_for_task = file_id.clone();
+                        let path_buf = std::path::PathBuf::from(path);
+                        cx.spawn(async move |this, cx| {
+                            let decoded = cx
+                                .background_executor()
+                                .spawn(async move {
+                                    super::text_preview::read_file_preview(&path_buf, declared, language)
+                                })
+                                .await;
+                            let _ = this.update(cx, |this, cx| {
+                                this.text_preview_loading.remove(&id_for_task);
+                                this.text_previews.insert(id_for_task, decoded.map(Rc::new));
+                                cx.notify();
+                            });
+                        })
+                        .detach();
+                    }
+                } else if attachment.file.failed.is_none() && !self.asked_text_previews.contains(&file_id) {
+                    self.want_text_previews.push(file_id);
+                }
+                return None;
+            }
+        };
+
+        let block_id = 10_000usize.saturating_add(index);
+        let key = (message.id.clone(), block_id);
+        let lines = preview.inline_lines;
+        let folded = lines > CODE_LINES && !self.expanded.contains(&key);
+        let lit = if lines > super::highlight::PLAIN_LINES {
+            None
+        } else {
+            self.code_colors(message, block_id, preview.language, &preview.inline_text, cx)
+        };
+        let shown = match &lit {
+            Some(lit) if folded => first_lines(&lit.text, CODE_LINES).to_owned(),
+            Some(lit) => lit.text.clone(),
+            None if folded => preview.inline_text.lines().take(CODE_LINES).collect::<Vec<_>>().join("\n"),
+            None => preview.inline_text.clone(),
+        };
+        let highlights = code_highlights(&shown, lit.as_ref().map(|lit| lit.runs.as_slice()).unwrap_or(&[]));
+        let copied = self.copied.as_ref() == Some(&key);
+        let phone = self.metrics == Metrics::PHONE;
+        let btn_size = if phone { 36. } else { 24. };
+        let copy_text = preview.head_text.clone();
+        let copy_key = key.clone();
+        let expand_att = attachment.clone();
+        let expand_text = preview.head_text.clone();
+        let expand_truncated = preview.truncated;
+        let expand_lang = preview.language;
+        let download_att = attachment.clone();
+        let mut meta = media::type_label(&attachment);
+        if attachment.file.bytes > 0 {
+            meta = format!("{meta} · {}", media::size_label(attachment.file.bytes));
+        }
+        let mut body = div().id(("text-preview-body", block_id)).overflow_x_scroll().px(px(12.)).pt(px(2.)).pb(px(9.));
+        body.style().restrict_scroll_to_axis = Some(true);
+
+        let footer = if folded {
+            let expand_key = key.clone();
+            Some(
+                div()
+                    .id(("text-preview-more", block_id))
+                    .h(px(28.))
+                    .px(px(12.))
+                    .flex()
+                    .items_center()
+                    .border_t_1()
+                    .border_color(theme::hairline())
+                    .type_small()
+                    .text_color(theme::accent_text())
+                    .cursor_pointer()
+                    .child(format!("Show {} more lines", lines - CODE_LINES))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.expanded.insert(expand_key.clone());
+                        cx.notify();
+                    })),
+            )
+        } else if preview.truncated {
+            let open_att = attachment.clone();
+            let open_text = preview.head_text.clone();
+            let open_lang = preview.language;
+            Some(
+                div()
+                    .id(("text-preview-full", block_id))
+                    .h(px(28.))
+                    .px(px(12.))
+                    .flex()
+                    .items_center()
+                    .border_t_1()
+                    .border_color(theme::hairline())
+                    .type_small()
+                    .text_color(theme::accent_text())
+                    .cursor_pointer()
+                    .child("Expand full file")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_text_viewer(open_att.clone(), open_lang, open_text.clone(), true, window, cx);
+                    })),
+            )
+        } else {
+            None
+        };
+
+        Some(
+            div()
+                .mt(px(5.))
+                .mb(px(3.))
+                .max_w(px(MEASURE))
+                .rounded(px(theme::R_CARD))
+                .bg(tokens::code_bg())
+                .border_1()
+                .border_color(theme::hairline())
+                .overflow_hidden()
+                .child(
+                    div()
+                        .h(px(if phone { 38. } else { 32. }))
+                        .pl(px(10.))
+                        .pr(px(4.))
+                        .border_b_1()
+                        .border_color(theme::hairline())
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(icon(media::file_icon(&attachment), 14., theme::text_soft()))
+                                .child(div().min_w_0().truncate().type_small().font_weight(theme::MEDIUM).text_color(theme::text()).child(attachment.name.clone()))
+                                .child(div().flex_none().type_micro().text_color(theme::text_faint()).child(meta)),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap(px(2.))
+                                .child(
+                                    tool(("tp-copy", block_id), if copied { Icon::Check } else { Icon::Copy }, btn_size)
+                                        .when(!phone, |b| b.tooltip(tip("Copy text", None)))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                                            this.copied = Some(copy_key.clone());
+                                            cx.notify();
+                                            let copy_key = copy_key.clone();
+                                            cx.spawn(async move |this, cx| {
+                                                cx.background_executor().timer(Duration::from_millis(1500)).await;
+                                                let _ = this.update(cx, |this, cx| {
+                                                    if this.copied.as_ref() == Some(&copy_key) {
+                                                        this.copied = None;
+                                                        cx.notify();
+                                                    }
+                                                });
+                                            })
+                                            .detach();
+                                        })),
+                                )
+                                .child(
+                                    tool(("tp-expand", block_id), Icon::Fit, btn_size)
+                                        .when(!phone, |b| b.tooltip(tip("Expand", None)))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.open_text_viewer(
+                                                expand_att.clone(),
+                                                expand_lang,
+                                                expand_text.clone(),
+                                                expand_truncated,
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                                .child(
+                                    tool(("tp-download", block_id), Icon::Download, btn_size)
+                                        .when(!phone, |b| b.tooltip(tip("Download", None)))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.fetch_then(&download_att, Then::Open, cx);
+                                        })),
+                                ),
+                        ),
+                )
+                .child(crate::gui::components::scroll::scroll_content(
+                    ("tp-scroll-frame", block_id),
+                    body.pb(px(14.)).child(
+                        div()
+                            .type_code()
+                            .when(phone, |code| code.text_size(px(tokens_phone::scaled(14.))).line_height(px(tokens_phone::scaled(20.))))
+                            .whitespace_nowrap()
+                            .child(if highlights.is_empty() {
+                                shown.into_any_element()
+                            } else {
+                                StyledText::new(SharedString::from(shown)).with_highlights(highlights).into_any_element()
+                            }),
+                    ),
+                ))
+                .children(footer)
+                .into_any_element(),
+        )
     }
 
     /// What a bot or app posts instead of text: one framed card, its bar in one of our colors.
@@ -3382,17 +3737,26 @@ impl Pane {
 
     fn cards(&mut self, message: &Rc<Message>, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let previews: Vec<Preview> = message.previews.iter().take(CARDS).cloned().collect();
+        let can_suppress = self.can(message).suppress_embeds;
         previews
             .iter()
             .enumerate()
             .map(|(ix, preview)| {
-                let card = self.card(ix, preview, window, cx);
+                let card = self.card(&message.id, ix, preview, can_suppress, window, cx);
                 div().pt(px(if ix == 0 { 5. } else { 4. })).flex().child(card).into_any_element()
             })
             .collect()
     }
 
-    fn card(&mut self, index: usize, preview: &Preview, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn card(
+        &mut self,
+        message_id: &str,
+        index: usize,
+        preview: &Preview,
+        can_suppress: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let preview = self.wikipedia_preview(preview, cx);
         let scale = window.scale_factor();
         let image = preview.image.as_ref();
@@ -3427,20 +3791,46 @@ impl Pane {
                 clamp(sized(div().type_ui(), 14., 20.), 20.).text_color(theme::text_soft()).child(preview.description.clone())
             }));
         let url = preview.url.clone();
+        let dismiss = can_suppress.then(|| {
+            let msg_id = message_id.to_owned();
+            div()
+                .id(SharedString::from(format!("suppress-preview-{message_id}-{index}")))
+                .absolute()
+                .top(px(6.))
+                .right(px(6.))
+                .size(px(20.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(tokens::card())
+                .hover(|s| s.bg(theme::selected()))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .tooltip(tip("Remove link preview", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.suppress_message_embeds(&msg_id, cx);
+                }))
+                .child(glyph("icons/x.svg", 12., theme::text_soft()))
+        });
         // A phone's card is exactly the column's width: wrapped words then measure against it,
         // not against the desktop's 440, and never run past its edge.
         let card = div()
             .id(("card", index))
+            .relative()
             .w(px(if phone { self.media_width() } else { 440. }))
             .max_w_full()
             .px(px(12.))
+            .when(can_suppress, |c| c.pr(px(30.)))
             .py(px(10.))
             .rounded(px(theme::R_FLOAT))
             .bg(tokens::card())
             .border_1()
             .border_color(theme::hairline())
             .cursor_pointer()
-            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| this.open_link(&url, event.modifiers().alt, window, cx)));
+            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| this.open_link(&url, event.modifiers().alt, window, cx)))
+            .children(dismiss);
         let Some(image) = image.cloned() else {
             return card.child(words).into_any_element();
         };
@@ -3985,26 +4375,6 @@ fn megabytes(bytes: u64) -> String {
         0..1_000_000 => format!("{} KB", bytes.div_ceil(1000)),
         _ => format!("{:.1} MB", bytes as f64 / 1_000_000.),
     }
-}
-
-/// Where a forwarded message was first said.
-fn forwarded_line(from: &Forwarded) -> Div {
-    let place = match (from.from_title.is_empty(), from.from_space.is_empty()) {
-        (true, true) => "Forwarded".to_owned(),
-        (false, true) => format!("Forwarded from {}", from.from_title),
-        (true, false) => format!("Forwarded from {}", from.from_space),
-        (false, false) => format!("Forwarded from {} in {}", from.from_title, from.from_space),
-    };
-    div()
-        .h(px(18.))
-        .mb(px(2.))
-        .flex()
-        .items_center()
-        .gap(px(5.))
-        .type_small()
-        .text_color(theme::text_faint())
-        .child(icon(Icon::Forward, 13., theme::text_faint()))
-        .child(div().min_w_0().truncate().child(place))
 }
 
 /// The size the network gave for an attachment's picture: the file's, or its still's.

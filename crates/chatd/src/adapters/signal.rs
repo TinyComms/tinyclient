@@ -3401,7 +3401,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             let _ = reply.send(react(account, &conversation_id, &message_id, &emoji, on).map_err(refused));
         }
         Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
-        Command::Edit { conversation_id, message_id, text, spans, reply } => {
+        Command::Edit { conversation_id, message_id, text, spans, suppress_embeds: _, keep_attachments: _, reply } => {
             let answered = match poll_action(&text) {
                 Some(act) => poll_act(account, &conversation_id, &message_id, act),
                 None => edit(account, &conversation_id, &message_id, &text, &spans),
@@ -3868,6 +3868,7 @@ fn group_rights(group: &wire::GroupInfo, me: &str) -> ConversationRights {
         rename: can_edit,
         edit_topic: can_edit,
         edit_picture: can_edit,
+        manage_webhooks: false,
         create_invite: false,
         ..ConversationRights::default()
     }

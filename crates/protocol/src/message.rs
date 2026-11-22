@@ -102,8 +102,8 @@ pub enum MentionKind {
     Everyone,
 }
 
-/// How a range of a message's text is drawn. Block styles (`CodeBlock`, `Quote`, `ListItem`)
-/// cover whole lines.
+/// How a range of a message's text is drawn. Block styles (`CodeBlock`, `Quote`, `ListItem`,
+/// `Heading`, `Small`) cover whole lines.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "style", rename_all = "snake_case")]
 pub enum Style {
@@ -121,6 +121,12 @@ pub enum Style {
         ordered: bool,
         depth: u8,
     },
+    /// A section heading: level 1, 2, or 3 (`#`, `##`, `###`).
+    Heading {
+        level: u8,
+    },
+    /// Smaller, muted subtext (`-# ` in Discord).
+    Small,
     Spoiler,
     Link {
         url: String,
@@ -905,6 +911,12 @@ pub struct Message {
     /// Target message id for a system line (pins, thread starter, poll result), so clicking opens it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jump: Option<String>,
+    /// Published (crossposted) from an announcement channel to following channels (Discord `CROSSPOSTED`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub published: bool,
+    /// Source server/channel label for a crossposted announcement message (Discord `IS_CROSSPOST`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub crosspost_source: String,
 }
 
 /// How a direct or group call ended, or that it is live.
@@ -1016,6 +1028,8 @@ impl Message {
             controls: Vec::new(),
             buttons: Vec::new(),
             jump: None,
+            published: false,
+            crosspost_source: String::new(),
         }
     }
 
@@ -1095,6 +1109,7 @@ impl Message {
         if let Some(jump) = &mut self.jump {
             clip(jump, 128);
         }
+        clip(&mut self.crosspost_source, 200);
         self.controls.truncate(MESSAGE_CONTROLS_LIMIT);
         for control in &mut self.controls {
             clip(&mut control.block_id, 255);
@@ -1189,6 +1204,8 @@ impl Message {
         self.deliveries.clear();
         self.receipt_note.clear();
         self.pinned = false;
+        self.published = false;
+        self.crosspost_source.clear();
         self.mentions_me = false;
         self.deleted = true;
     }
@@ -1467,5 +1484,14 @@ mod tests {
         assert_eq!(back.jump, msg.jump);
         msg.tombstone();
         assert_eq!(msg.jump, None);
+    }
+
+    #[test]
+    fn heading_and_small_styles_round_trip() {
+        for style in [Style::Heading { level: 1 }, Style::Heading { level: 2 }, Style::Heading { level: 3 }, Style::Small] {
+            let span = Span { start: 0, end: 4, style };
+            let wire = serde_json::to_string(&span).unwrap();
+            assert_eq!(serde_json::from_str::<Span>(&wire).unwrap(), span);
+        }
     }
 }

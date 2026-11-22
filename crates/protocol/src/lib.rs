@@ -43,6 +43,9 @@ pub use e2ee::*;
 pub use info::*;
 pub use ipc::{ChatListener, ChatStream};
 pub use message::*;
+
+/// Maximum bytes fetched automatically for an inline text/code attachment preview (100 KB).
+pub const TEXT_PREVIEW_MAX_BYTES: u32 = 100 * 1024;
 pub use play::*;
 pub use react::*;
 pub use record::*;
@@ -598,6 +601,9 @@ pub struct Conversation {
     /// Thread is locked by a moderator (Discord `thread_metadata.locked`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub locked: bool,
+    /// Marked age-restricted / NSFW by the network (Discord `channel.nsfw`, inherited by threads).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub age_restricted: bool,
 }
 
 /// What became of my newest message, as its mark says it (`design/06-live-signals.md` §4).
@@ -672,6 +678,7 @@ impl Conversation {
             slowmode_seconds: 0,
             slowmode_until: None,
             locked: false,
+            age_restricted: false,
         }
     }
 
@@ -1260,6 +1267,9 @@ pub struct MessageHit {
     /// Mine, so the row can say "You".
     #[serde(default, skip_serializing_if = "is_false")]
     pub outgoing: bool,
+    /// The conversation is age-restricted. A search hit keeps this even when the row is not on screen.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub age_restricted: bool,
 }
 
 /// A reminder the user set on one message ("Remind me…"). Local to this device: no network
@@ -2099,15 +2109,22 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         user_id: Option<String>,
     },
-    /// Replaces the text of one of our own messages. Nothing changes on screen until the
-    /// network accepts it; a refusal is the answer. `spans` are the styled ranges of `text`;
-    /// empty keeps the edit as plain text. An older client omits them.
+    /// Replaces the text of one of our own messages, suppresses its link previews, or removes
+    /// attachments. Nothing changes on screen until the network accepts it; a refusal is the
+    /// answer. `spans` are the styled ranges of `text`; empty keeps the edit as plain text.
     Edit {
         conversation: Key,
         message_id: String,
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         spans: Vec<Span>,
+        /// Suppress embeds / link previews on the message (Discord `SUPPRESS_EMBEDS` flag bit 2).
+        #[serde(default, skip_serializing_if = "is_false")]
+        suppress_embeds: bool,
+        /// Attachment ids to keep on the message (`None` leaves attachments untouched; `Some(ids)`
+        /// keeps only those attachments and drops the rest).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keep_attachments: Option<Vec<String>>,
     },
     /// Deletes a message. `scope` defaults to `Everyone` (so older shells keep working);
     /// `Me` removes it on this user's side only (Telegram, Signal, Google Messages).
@@ -2196,6 +2213,17 @@ pub enum Request {
         /// with its `failed` reason and nothing is fetched.
         #[serde(default, skip_serializing_if = "is_false")]
         retry: bool,
+    },
+
+    /// Fetches at most `max_bytes` (clamped to [`TEXT_PREVIEW_MAX_BYTES`]) from the head of
+    /// registered file attachments via a ranged HTTP request through chatd's media cache, for
+    /// inline text/code previews. Returned [`MediaFile`] ids carry a `"head:"` prefix so full
+    /// downloads stay separate; counts against the cache budget.
+    FetchPreview {
+        account: AccountKey,
+        ids: Vec<String>,
+        #[serde(default)]
+        max_bytes: u32,
     },
 
     /// Opens the network's sign-in and keeps the session. Answers when the user is done.
@@ -2724,6 +2752,19 @@ pub enum Request {
         account: AccountKey,
         user_id: String,
         room_id: String,
+    },
+
+    /// Publish (crosspost) a message in an announcement channel to following channels (Discord).
+    /// Answers `Ok`.
+    Publish {
+        conversation: Key,
+        message_id: String,
+    },
+    /// Follow an announcement channel into `into` (a channel where the account holds
+    /// `ConversationRights::manage_webhooks`). Answers `Ok`.
+    Follow {
+        conversation: Key,
+        into: Key,
     },
 
     /// The push-to-talk key went down or up, from the shell's global hotkey. `priority` is the
@@ -3728,9 +3769,20 @@ mod tests {
             r#"{"op":"edit","conversation":{"network":"slack","account":"T1","id":"C1"},"message_id":"1","text":"hi"}"#,
         )
         .unwrap();
-        let Request::Edit { spans, text, .. } = &old else { panic!("not an edit") };
-        assert!(spans.is_empty() && text == "hi");
-        assert!(!serde_json::to_string(&old).unwrap().contains("spans"));
+        let Request::Edit { spans, text, suppress_embeds, keep_attachments, .. } = &old else { panic!("not an edit") };
+        assert!(spans.is_empty() && text == "hi" && !suppress_embeds && keep_attachments.is_none());
+        let serialized = serde_json::to_string(&old).unwrap();
+        assert!(!serialized.contains("spans") && !serialized.contains("suppress_embeds") && !serialized.contains("keep_attachments"));
+        let edit_flags = Request::Edit {
+            conversation: Key { network: Network::Discord, account: "1".into(), id: "4101".into() },
+            message_id: "99".into(),
+            text: String::new(),
+            spans: Vec::new(),
+            suppress_embeds: true,
+            keep_attachments: Some(vec!["att:1".into()]),
+        };
+        let encoded = serde_json::to_string(&edit_flags).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&encoded).unwrap(), edit_flags);
         let styled = Outgoing { spans: vec![Span { start: 0, end: 2, style: Style::Bold }], ..Outgoing::default() };
         assert!(!styled.is_plain());
         assert!(serde_json::to_string(&styled).unwrap().contains("bold"));
@@ -3763,6 +3815,7 @@ mod tests {
             title: String::new(),
             space_title: String::new(),
             outgoing: false,
+            age_restricted: false,
         };
         assert_eq!(
             serde_json::to_string(&Response::MessageHits { hits: vec![hit], cursor: None, not_searched: Vec::new() }).unwrap(),
@@ -3823,6 +3876,13 @@ mod tests {
     fn frames_written_before_these_fields_existed_still_read() {
         let request: Request = serde_json::from_str(r#"{"op":"fetch","account":{"network":"slack","account":"T1"},"ids":["a"]}"#).unwrap();
         assert!(matches!(request, Request::Fetch { size: None, retry: false, .. }));
+        let preview = Request::FetchPreview {
+            account: AccountKey { network: Network::Discord, account: "1".into() },
+            ids: vec!["att:42".into()],
+            max_bytes: TEXT_PREVIEW_MAX_BYTES,
+        };
+        let encoded = serde_json::to_string(&preview).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&encoded).unwrap(), preview);
         let request: Request = serde_json::from_str(r#"{"op":"sign_in","network":"slack"}"#).unwrap();
         assert!(matches!(request, Request::SignIn { at: None, .. }));
         let thread: ThreadSummary = serde_json::from_str(r#"{"id":"t","replies":2,"last":5}"#).unwrap();
@@ -3986,8 +4046,24 @@ mod tests {
             manage_threads: true,
             slowmode_exempt: true,
             create_invite: true,
+            manage_webhooks: true,
         };
         assert_eq!(ConversationRights::from_bits(all.to_bits()), all);
+        let webhooks = ConversationRights { manage_webhooks: true, ..ConversationRights::default() };
+        assert_eq!(webhooks.to_bits(), 1 << 14);
+        assert_eq!(ConversationRights::from_bits(1 << 14), webhooks);
+        assert!(!ConversationRights::from_bits(1 << 8).manage_webhooks);
+
+        let pub_req = Request::Publish {
+            conversation: Key { network: Network::Discord, account: "1".into(), id: "4101".into() },
+            message_id: "99".into(),
+        };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&pub_req).unwrap()).unwrap(), pub_req);
+        let follow_req = Request::Follow {
+            conversation: Key { network: Network::Discord, account: "1".into(), id: "4101".into() },
+            into: Key { network: Network::Discord, account: "1".into(), id: "5101".into() },
+        };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&follow_req).unwrap()).unwrap(), follow_req);
     }
 }
 

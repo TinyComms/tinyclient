@@ -1677,7 +1677,17 @@ impl Chat {
 
     /// Edit and delete change nothing here: the answer is the network's, and the message
     /// changes when the adapter reports it.
-    fn rewrite(&self, conversation: Key, message_id: String, text: Option<String>, spans: Vec<protocol::Span>, scope: protocol::DeleteScope) -> Response {
+    #[allow(clippy::too_many_arguments)]
+    fn rewrite(
+        &self,
+        conversation: Key,
+        message_id: String,
+        text: Option<String>,
+        spans: Vec<protocol::Span>,
+        suppress_embeds: bool,
+        keep_attachments: Option<Vec<String>>,
+        scope: protocol::DeleteScope,
+    ) -> Response {
         let account = conversation.account();
         if let Err(refused) = self.online(&account) {
             return *refused;
@@ -1690,17 +1700,48 @@ impl Chat {
         if message.state != SendState::Sent {
             return error(ErrorCode::Refused, "This message was never sent. Discard it instead.");
         }
+        let can_moderate = self
+            .hub
+            .store()
+            .conversation(&conversation)
+            .ok()
+            .flatten()
+            .is_some_and(|row| row.moderate || row.rights.delete_others);
         let conversation_id = conversation.id;
         let asked = match text {
-            Some(_) if !message.outgoing => return error(ErrorCode::Refused, "Only your own messages can be edited."),
-            Some(text) if text.trim().is_empty() => return error(ErrorCode::Refused, "A message cannot be edited to nothing. Delete it instead."),
-            Some(text) => self.ask(&account, |reply| Command::Edit {
-                conversation_id,
-                message_id,
-                text,
-                spans,
-                reply,
-            }),
+            Some(text) => {
+                let suppress_only = suppress_embeds && text.is_empty() && keep_attachments.is_none();
+                if suppress_only {
+                    if !message.outgoing && !can_moderate {
+                        return error(
+                            ErrorCode::Refused,
+                            "Only your own messages or a moderator can suppress link previews.",
+                        );
+                    }
+                } else {
+                    if !message.outgoing {
+                        return error(ErrorCode::Refused, "Only your own messages can be edited.");
+                    }
+                    if text.trim().is_empty() {
+                        let has_attachments = match &keep_attachments {
+                            Some(kept) => !kept.is_empty(),
+                            None => message.attachments.iter().any(|a| !a.sticker),
+                        };
+                        if !has_attachments {
+                            return error(ErrorCode::Refused, "A message cannot be edited to nothing. Delete it instead.");
+                        }
+                    }
+                }
+                self.ask(&account, |reply| Command::Edit {
+                    conversation_id,
+                    message_id,
+                    text,
+                    spans,
+                    suppress_embeds,
+                    keep_attachments,
+                    reply,
+                })
+            }
             None => self.ask(&account, |reply| Command::Delete {
                 conversation_id,
                 message_id,
@@ -1844,6 +1885,60 @@ impl Chat {
             return *refused;
         }
         match self.ask(&account, |reply| Command::LeaveSpace { space_id: space.id.clone(), reply }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
+    fn publish(&self, conversation: Key, message_id: String) -> Response {
+        let account = conversation.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.hub.store().message(&conversation, &message_id) {
+            Ok(Some(message)) if message.published => return Response::Ok,
+            Ok(_) => {}
+            Err(err) => return internal(err),
+        }
+        match self.ask(&account, |reply| Command::Publish {
+            conversation_id: conversation.id,
+            message_id,
+            reply,
+        }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
+    fn follow_announcement(&self, conversation: Key, into: Key) -> Response {
+        let account = conversation.account();
+        if into.account() != account {
+            return error(ErrorCode::Refused, "Choose a channel on the same account.");
+        }
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let allowed = {
+            let store = self.hub.store();
+            match (store.conversation(&conversation), store.conversation(&into)) {
+                (Ok(source), Ok(target)) => {
+                    source.is_some_and(|row| row.kind == ConversationKind::Announcement)
+                        && target.is_some_and(|row| row.rights.manage_webhooks)
+                }
+                (Err(err), _) | (_, Err(err)) => return internal(err),
+            }
+        };
+        if !allowed {
+            return error(
+                ErrorCode::Refused,
+                "Follow an announcement channel into a channel where you can manage webhooks.",
+            );
+        }
+        match self.ask(&account, |reply| Command::Follow {
+            conversation_id: conversation.id,
+            into_channel_id: into.id,
+            reply,
+        }) {
             Ok(()) => Response::Ok,
             Err(refused) => *refused,
         }
@@ -3788,9 +3883,28 @@ impl Chat {
             Request::ClearReactions { conversation, message_id, emoji, user_id } => {
                 self.clear_reactions(conversation, message_id, emoji, user_id)
             }
-            Request::Edit { conversation, message_id, text, spans } => self.rewrite(conversation, message_id, Some(text), spans, protocol::DeleteScope::Everyone),
-            Request::Delete { conversation, message_id, scope } => self.rewrite(conversation, message_id, None, Vec::new(), scope),
+            Request::Edit {
+                conversation,
+                message_id,
+                text,
+                spans,
+                suppress_embeds,
+                keep_attachments,
+            } => self.rewrite(
+                conversation,
+                message_id,
+                Some(text),
+                spans,
+                suppress_embeds,
+                keep_attachments,
+                protocol::DeleteScope::Everyone,
+            ),
+            Request::Delete { conversation, message_id, scope } => {
+                self.rewrite(conversation, message_id, None, Vec::new(), false, None, scope)
+            }
             Request::Forward { from, message_ids, to, note } => self.forward(from, message_ids, to, note),
+            Request::Publish { conversation, message_id } => self.publish(conversation, message_id),
+            Request::Follow { conversation, into } => self.follow_announcement(conversation, into),
 
             Request::Poll { conversation, message_id, votes } => self.poll(conversation, message_id, votes),
 
@@ -3823,6 +3937,14 @@ impl Chat {
                         }
                         Response::Media { files }
                     }
+                    Err(err) => internal(err),
+                }
+            }
+            Request::FetchPreview { account, ids, max_bytes } => {
+                let adapter = lock(&self.adapters).get(&account).map(Adapter::sender);
+                let ids = &ids[..ids.len().min(PAGE_LIMIT as usize)];
+                match self.blobs.request_preview(&account, ids, max_bytes, adapter) {
+                    Ok(files) => Response::Media { files },
                     Err(err) => internal(err),
                 }
             }
@@ -4969,7 +5091,14 @@ pub fn prove_offline_queue() -> Result<(), String> {
     if !matches!(scheduled, Response::Error { code: ErrorCode::Offline, .. }) {
         return Err("a scheduled send while offline was stored".into());
     }
-    let edit = chat.handle(Request::Edit { conversation: conversation.clone(), message_id: "1".into(), text: "no".into(), spans: Vec::new() });
+    let edit = chat.handle(Request::Edit {
+        conversation: conversation.clone(),
+        message_id: "1".into(),
+        text: "no".into(),
+        spans: Vec::new(),
+        suppress_embeds: false,
+        keep_attachments: None,
+    });
     let react = chat.handle(Request::React {
         conversation: conversation.clone(),
         message_id: "1".into(),

@@ -2254,6 +2254,8 @@ fn serve(account: &Arc<Account>, command: Command) {
             message_id,
             text,
             spans: _,
+            suppress_embeds: _,
+            keep_attachments: _,
             reply,
         } => {
             let answer = edit_message(account, &conversation_id, &message_id, text);

@@ -38,6 +38,9 @@ pub fn row_time(now: i64, at: i64) -> String {
     time::stamp(now, at)
 }
 
+/// Shown instead of a message preview until this session passes the age gate.
+pub(in crate::gui) const AGE_GATE_LINE: &str = "Age-restricted channel";
+
 /// Sidebar text occupies one visual line, even when a message or draft has paragraphs.
 pub(super) fn one_line(text: &str) -> std::borrow::Cow<'_, str> {
     if text.chars().any(|c| c.is_whitespace() && c != ' ') {
@@ -268,10 +271,11 @@ impl Shell {
         // A4 off: no words of any message, for screen sharing. Typing and Not sent still say so.
         let previews = crate::gui::app::prefs::choices().previews;
         if self.send_failed_in(&c.key) {
+            let hidden = self.age_gated(c);
             return line
                 .child(glyph("icons/circle-alert.svg", 12., theme::danger()))
                 .child(div().flex_none().text_color(theme::danger()).child("Not sent"))
-                .when(previews, |line| line.child(div().min_w_0().truncate().text_color(theme::text_faint()).child(format!("· {}", one_line(&c.preview)))));
+                .when(previews && !hidden, |line| line.child(div().min_w_0().truncate().text_color(theme::text_faint()).child(format!("· {}", one_line(&c.preview)))));
         }
         let typing = self.slots.typing.and_then(|typing| typing(self, &c.key));
         if let Some(words) = typing {
@@ -291,6 +295,9 @@ impl Shell {
                 .child(glyph("icons/pencil.svg", 12., quiet(theme::text_faint())))
                 .child(div().flex_none().text_color(quiet(theme::text())).font_weight(if c.muted { theme::REGULAR } else { theme::MEDIUM }).child("Draft:"))
                 .child(div().min_w_0().truncate().text_color(quiet(theme::text_soft())).child(one_line(draft).into_owned()));
+        }
+        if self.age_gated(c) {
+            return line.text_color(color).child(AGE_GATE_LINE);
         }
         let names = self.my_names(c);
         let preview = names.iter().map(|me| strip_me(&c.preview, me)).find(|stripped| stripped.len() != c.preview.len()).unwrap_or(&c.preview);

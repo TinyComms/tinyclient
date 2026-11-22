@@ -189,6 +189,7 @@ const TABLES: &str = "
         unread_reactions INTEGER NOT NULL DEFAULT 0,
         slowmode_seconds INTEGER NOT NULL DEFAULT 0,
         locked INTEGER NOT NULL DEFAULT 0,
+        age_restricted INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (network, account, id)
     ) WITHOUT ROWID;
     CREATE INDEX conversation_threads ON conversation (network, account, parent) WHERE parent != '';
@@ -308,7 +309,7 @@ const CONVERSATION: &str = "
            (c.preview_mine AND c.delivered_to != '' AND (length(c.delivered_to), c.delivered_to) >= (length(c.preview_id), c.preview_id)),
            (c.preview_mine AND EXISTS (SELECT 1 FROM message f WHERE f.network = c.network AND f.account = c.account
                                          AND f.conversation = c.id AND f.id = c.preview_id AND f.pending = 1)),
-           c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason, c.spam, c.rights, c.disappearing, c.moderate, c.can_pin, c.joined, c.call_video, c.shared, c.unread_reactions, c.slowmode_seconds, c.locked
+           c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason, c.spam, c.rights, c.disappearing, c.moderate, c.can_pin, c.joined, c.call_video, c.shared, c.unread_reactions, c.slowmode_seconds, c.locked, c.age_restricted
     FROM conversation c
     LEFT JOIN media m ON m.network = c.network AND m.account = c.account AND m.id = c.avatar
     LEFT JOIN space s ON s.network = c.network AND s.account = c.account AND s.id = c.space
@@ -372,6 +373,8 @@ pub struct ConversationRow {
     pub call: CallSupport,
     /// The other side supports video calls (Telegram's `video_calls_available`).
     pub call_video: bool,
+    /// Marked age-restricted / NSFW by the network (Discord `nsfw`, inherited by threads).
+    pub age_restricted: bool,
     /// The most who may be in a voice channel at once, 0 when it has none.
     pub limit: u32,
     /// Show it in the Inbox even though it is a channel nobody mentioned me in.
@@ -500,6 +503,7 @@ impl ConversationRow {
             peer: None,
             call: CallSupport::None,
             call_video: false,
+            age_restricted: false,
             limit: 0,
             listed: false,
             topic: String::new(),
@@ -773,6 +777,7 @@ fn conversation_from(row: &Row) -> rusqlite::Result<Conversation> {
         slowmode_seconds: row.get(62)?,
         slowmode_until: None,
         locked: row.get(63)?,
+        age_restricted: row.get(64)?,
     })
 }
 
@@ -940,9 +945,9 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
         "INSERT INTO conversation
              (network, account, id, kind, title, space, section, position, avatar, peer, call, listed,
               topic, parent, root, read_only, private, bot, meeting, special, mark, opted_out,
-              folders, archived, pin, hidden, followed, voice_limit, encryption, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin, joined, call_video, shared, slowmode_seconds, locked)
+              folders, archived, pin, hidden, followed, voice_limit, encryption, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin, joined, call_video, shared, slowmode_seconds, locked, age_restricted)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43)
+                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44)
          ON CONFLICT (network, account, id) DO UPDATE SET
              kind = excluded.kind, title = excluded.title, space = excluded.space,
              section = excluded.section, position = excluded.position, avatar = excluded.avatar,
@@ -965,6 +970,7 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
              shared = excluded.shared,
              slowmode_seconds = excluded.slowmode_seconds,
              locked = excluded.locked,
+             age_restricted = excluded.age_restricted,
              folders = CASE WHEN ?23 THEN excluded.folders ELSE folders END,
              archived = CASE WHEN ?23 THEN excluded.archived ELSE archived END,
              pin = CASE WHEN ?23 THEN excluded.pin ELSE pin END,
@@ -1014,6 +1020,7 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
             row.shared,
             row.slowmode_seconds,
             row.locked,
+            row.age_restricted,
         ],
     )?;
     Ok(())
@@ -1113,6 +1120,9 @@ fn keep_added_columns(db: &Connection, version: i32) -> rusqlite::Result<bool> {
     if !column(db, "conversation", "locked")? {
         db.execute_batch("ALTER TABLE conversation ADD COLUMN locked INTEGER NOT NULL DEFAULT 0")?;
     }
+    if !column(db, "conversation", "age_restricted")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN age_restricted INTEGER NOT NULL DEFAULT 0")?;
+    }
     Ok(true)
 }
 
@@ -1198,6 +1208,9 @@ impl Store {
         }
         if !column(&store.db, "conversation", "locked")? {
             store.db.execute_batch("ALTER TABLE conversation ADD COLUMN locked INTEGER NOT NULL DEFAULT 0")?;
+        }
+        if !column(&store.db, "conversation", "age_restricted")? {
+            store.db.execute_batch("ALTER TABLE conversation ADD COLUMN age_restricted INTEGER NOT NULL DEFAULT 0")?;
         }
         if !column(&store.db, "space", "can_create_channels")? {
             store.db.execute_batch("ALTER TABLE space ADD COLUMN can_create_channels INTEGER NOT NULL DEFAULT 0")?;
@@ -1767,15 +1780,23 @@ impl Store {
                 return None;
             }
             if let Some(space) = &link.space {
+                let discord = link.network == Network::Discord;
                 let lower = space.to_ascii_lowercase();
                 if let Some(hit) = candidates.iter().find(|c| {
-                    c.space.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(space))
-                        || c.space_title.to_ascii_lowercase().contains(&lower)
-                        || c.key.account.to_ascii_lowercase().contains(&lower)
+                    let same_space = c.space.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(space));
+                    if discord {
+                        same_space
+                    } else {
+                        same_space
+                            || c.space_title.to_ascii_lowercase().contains(&lower)
+                            || c.key.account.to_ascii_lowercase().contains(&lower)
+                    }
                 }) {
                     return Some(hit.clone());
                 }
-                if link.network == Network::Slack {
+                // A Discord guild that did not match must not fall through to another row
+                // that happens to share the channel id.
+                if link.network == Network::Slack || discord {
                     return None;
                 }
             }
@@ -1887,7 +1908,7 @@ impl Store {
         let mut stmt = self.db.prepare(
             "SELECT id, kind, title, space, section, position, avatar, peer, call, voice_limit,
                     listed, topic, read_only, private, encryption, bot, meeting, special, mark,
-                    opted_out, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin, joined, call_video, shared, slowmode_seconds, locked
+                    opted_out, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin, joined, call_video, shared, slowmode_seconds, locked, age_restricted
                FROM conversation
               WHERE network = ?1 AND account = ?2 AND space = ?3 AND parent = ''
               ORDER BY position, id",
@@ -1943,6 +1964,7 @@ impl Store {
                         shared: row.get(30)?,
                         slowmode_seconds: row.get(31)?,
                         locked: row.get(32)?,
+                        age_restricted: row.get(33)?,
                     },
                 ))
             })?
@@ -2388,7 +2410,7 @@ impl Store {
         let pattern = format!("%{}%", like_prefix(query));
         let mut stmt = self.db.prepare(
             "SELECT m.network, m.account, m.conversation, m.id, m.sent, m.text, m.body, c.title,
-                    COALESCE(s.name, '')
+                    COALESCE(s.name, ''), c.age_restricted
                FROM message m
                JOIN conversation c ON c.network = m.network AND c.account = m.account
                   AND c.id = m.conversation
@@ -2429,6 +2451,7 @@ impl Store {
                         title: row.get(7)?,
                         space_title: row.get(8)?,
                         outgoing: message.outgoing,
+                        age_restricted: row.get(9)?,
                     },
                     message,
                 ))
@@ -2487,7 +2510,7 @@ impl Store {
         self.db
             .prepare(&format!(
                 "SELECT m.network, m.account, m.conversation, m.id, m.sent, m.text, m.body, c.title,
-                        COALESCE(s.name, '')
+                        COALESCE(s.name, ''), c.age_restricted
                    FROM message m
                    JOIN conversation c ON c.network = m.network AND c.account = m.account
                       AND c.id = m.conversation
@@ -2526,6 +2549,7 @@ impl Store {
                         title: row.get(7)?,
                         space_title: row.get(8)?,
                         outgoing: message.outgoing,
+                        age_restricted: row.get(9)?,
                     })
                 },
             )?

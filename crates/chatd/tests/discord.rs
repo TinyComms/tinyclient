@@ -1815,6 +1815,8 @@ fn nitro_plain_text_uses_the_four_thousand_character_limit() {
         message_id: "1300000000000000009".into(),
         text: three.clone(),
         spans: Vec::new(),
+        suppress_embeds: false,
+        keep_attachments: None,
     });
     match edit {
         Response::Error { detail, .. } => assert!(detail.contains("2000"), "{detail}"),
@@ -1850,7 +1852,7 @@ fn nitro_plain_text_uses_the_four_thousand_character_limit() {
     assert_eq!(posted.len(), 2);
     assert_eq!(posted.last().unwrap().body["content"].as_str().map(|text| text.chars().count()), Some(3000));
 
-    let edited = nitro.ask(Request::Edit { conversation: nitro.key("3002"), message_id: sent.id, text: three, spans: Vec::new() });
+    let edited = nitro.ask(Request::Edit { conversation: nitro.key("3002"), message_id: sent.id, text: three, spans: Vec::new(), suppress_embeds: false, keep_attachments: None });
     assert_eq!(edited, Response::Ok);
     let patched = nitro.discord.requests_to("PATCH", "/channels/3002/messages");
     assert_eq!(patched.last().unwrap().body["content"].as_str().map(|text| text.chars().count()), Some(3000));
@@ -2783,7 +2785,7 @@ fn reactions_edits_and_deletes_go_to_discord_and_the_store_follows_its_word() {
 
     // An edit changes nothing until Discord accepts it; then the store has Discord's version.
     let edit = |text: &str| {
-        world.ask(Request::Edit { conversation: world.key(dm), message_id: mine.to_owned(), text: text.to_owned(), spans: Vec::new() })
+        world.ask(Request::Edit { conversation: world.key(dm), message_id: mine.to_owned(), text: text.to_owned(), spans: Vec::new(), suppress_embeds: false, keep_attachments: None })
     };
     assert_eq!(edit("is the *deploy* done yet?"), Response::Ok);
     let patched = world.discord.requests_to("PATCH", &format!("{reactions}/{mine}"));
@@ -7141,4 +7143,610 @@ fn person_note_reads_writes_clears_validates_and_updates_live() {
         world.discord.requests_to("GET", "/users/2001/profile").len() > profile_gets,
         "USER_NOTE_UPDATE must refetch the profile"
     );
+}
+
+#[test]
+fn age_restricted_channels_threads_account_flag_and_explicit_media() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    ready["user"]["nsfw_allowed"] = json!(false);
+    // Mark channel 4101 as age-restricted and attach a thread 4199 under it.
+    let guild = ready["guilds"].as_array_mut().unwrap().iter_mut().find(|g| g["id"] == "4000").unwrap();
+    for ch in guild["channels"].as_array_mut().unwrap() {
+        if ch["id"] == "4101" {
+            ch["nsfw"] = json!(true);
+        }
+    }
+    guild["threads"] = json!([{
+        "id": "4199",
+        "type": 11,
+        "guild_id": "4000",
+        "parent_id": "4101",
+        "name": "spoiler-thread",
+        "nsfw": false,
+        "thread_metadata": {"archived": false}
+    }]);
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    // Account reports age_restricted_blocked = true when Discord sends nsfw_allowed = false.
+    let status = world.ask(Request::Status);
+    let account = match status {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key.network == Network::Discord).unwrap(),
+        other => panic!("expected status, got {other:?}"),
+    };
+    assert!(account.can.age_restricted_blocked, "nsfw_allowed=false must set age_restricted_blocked");
+
+    // Channel 4101 and its thread 4199 both carry age_restricted = true.
+    let ch = match world.ask(Request::Conversation { conversation: world.key("4101") }) {
+        Response::Conversation { conversation } => conversation,
+        other => panic!("expected conversation 4101, got {other:?}"),
+    };
+    assert!(ch.age_restricted, "nsfw channel must be age_restricted");
+
+    let thread = match world.ask(Request::Conversation { conversation: world.key("4199") }) {
+        Response::Conversation { conversation } => conversation,
+        other => panic!("expected thread 4199, got {other:?}"),
+    };
+    assert!(thread.age_restricted, "thread under nsfw channel must inherit age_restricted");
+
+    // Non-nsfw channel stays false.
+    let dm = match world.ask(Request::Conversation { conversation: world.key("3001") }) {
+        Response::Conversation { conversation } => conversation,
+        other => panic!("expected dm 3001, got {other:?}"),
+    };
+    assert!(!dm.age_restricted);
+
+    // Live message with CONTAINS_EXPLICIT_MEDIA (flag bit 4) blurs behind spoiler cover.
+    world.discord.push("MESSAGE_CREATE", json!({
+        "id": "1300000010000000999",
+        "channel_id": "3001",
+        "type": 0,
+        "author": {"id": "2001", "username": "mara", "global_name": "Mara", "discriminator": "0", "avatar": null},
+        "content": "look",
+        "timestamp": "2026-10-13T08:15:00.000000+00:00",
+        "mentions": [],
+        "mention_roles": [],
+        "mention_everyone": false,
+        "embeds": [],
+        "pinned": false,
+        "attachments": [{
+            "id": "99001",
+            "filename": "flagged.png",
+            "size": 1024,
+            "url": "https://cdn.discordapp.com/attachments/3001/99001/flagged.png",
+            "proxy_url": "https://media.discordapp.net/attachments/3001/99001/flagged.png",
+            "width": 640,
+            "height": 480,
+            "content_type": "image/png",
+            "flags": 16
+        }]
+    }));
+    let flagged = wait("explicit attachment message", || {
+        world.messages("3001").into_iter().find(|m| m.id == "1300000010000000999")
+    });
+    assert!(flagged.attachments[0].spoiler, "explicit-flagged attachment must be blurred as spoiler");
+}
+
+#[test]
+fn announcement_publish_crosspost_source_and_follow() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    // Grant MANAGE_WEBHOOKS (1 << 29 = 536_870_912) on @everyone in guild 4000,
+    // and add an announcement channel 4109 (type 5) alongside text channel 4101.
+    let guild = ready["guilds"].as_array_mut().unwrap().iter_mut().find(|g| g["id"] == "4000").unwrap();
+    let everyone = guild["roles"].as_array_mut().unwrap().iter_mut().find(|r| r["id"] == "4000").unwrap();
+    let perms: u64 = everyone["permissions"].as_str().unwrap().parse().unwrap();
+    everyone["permissions"] = json!((perms | (1u64 << 29)).to_string());
+    guild["channels"].as_array_mut().unwrap().push(json!({
+        "id": "4109",
+        "type": 5,
+        "name": "news",
+        "position": 9,
+        "permission_overwrites": []
+    }));
+
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    // Capabilities advertises announcement_follow and channel 4101 carries manage_webhooks.
+    let status = world.ask(Request::Status);
+    let account = match status {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key.network == Network::Discord).unwrap(),
+        other => panic!("expected status, got {other:?}"),
+    };
+    assert!(account.can.announcement_follow);
+    let target = match world.ask(Request::Conversation { conversation: world.key("4101") }) {
+        Response::Conversation { conversation } => conversation,
+        other => panic!("expected conversation 4101, got {other:?}"),
+    };
+    assert!(target.rights.manage_webhooks, "MANAGE_WEBHOOKS bit must set rights.manage_webhooks");
+
+    // Seed an unpublished announcement message in 4109.
+    let ann_msg = json!({
+        "id": "1300000010000001100",
+        "channel_id": "4109",
+        "type": 0,
+        "author": me(),
+        "content": "v1.0 is out!",
+        "timestamp": "2026-10-13T09:00:00.000000+00:00",
+        "mentions": [],
+        "mention_roles": [],
+        "mention_everyone": false,
+        "embeds": [],
+        "attachments": [],
+        "pinned": false,
+        "flags": 0
+    });
+    world.discord.push("MESSAGE_CREATE", ann_msg.clone());
+    let before = wait("announcement message", || {
+        world.messages("4109").into_iter().find(|m| m.id == "1300000010000001100")
+    });
+    assert!(!before.published);
+
+    // 1. Publish hits POST /channels/4109/messages/{id}/crosspost and marks message published.
+    let mut crossposted = ann_msg.clone();
+    crossposted["flags"] = json!(1); // CROSSPOSTED
+    world.discord.script("/channels/4109/messages/1300000010000001100/crosspost", 200, crossposted);
+    assert_eq!(
+        world.ask(Request::Publish {
+            conversation: world.key("4109"),
+            message_id: "1300000010000001100".into(),
+        }),
+        Response::Ok
+    );
+    let crosspost_reqs = world.discord.requests_to("POST", "/channels/4109/messages/1300000010000001100/crosspost");
+    assert_eq!(crosspost_reqs.len(), 1);
+    let after = wait("published flag update", || {
+        world.messages("4109").into_iter().find(|m| m.id == "1300000010000001100" && m.published)
+    });
+    assert!(after.published);
+
+    // A second publish of the same message does not call Discord again.
+    assert_eq!(
+        world.ask(Request::Publish {
+            conversation: world.key("4109"),
+            message_id: "1300000010000001100".into(),
+        }),
+        Response::Ok
+    );
+    assert_eq!(
+        world.discord.requests_to("POST", "/channels/4109/messages/1300000010000001100/crosspost").len(),
+        1,
+        "an already published message must not crosspost again"
+    );
+
+    // A 2xx body that is not this message is refused and does not count as published.
+    world.discord.script(
+        "/channels/4109/messages/1300000010000001109/crosspost",
+        200,
+        json!({"id": "1300"}),
+    );
+    match world.ask(Request::Publish {
+        conversation: world.key("4109"),
+        message_id: "1300000010000001109".into(),
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("not a message"), "{detail}"),
+        other => panic!("expected an unreadable publish, got {other:?}"),
+    }
+
+    // 2. Rate-limited crosspost (429) surfaces Discord's refusal.
+    world.discord.script(
+        "/channels/4109/messages/1300000010000001101/crosspost",
+        429,
+        json!({"message": "You are being rate limited.", "retry_after": 3600.0}),
+    );
+    match world.ask(Request::Publish {
+        conversation: world.key("4109"),
+        message_id: "1300000010000001101".into(),
+    }) {
+        Response::Error { detail, .. } => assert!(!detail.is_empty()),
+        other => panic!("expected rate-limit error, got {other:?}"),
+    }
+
+    // 3. Incoming crossposted message (IS_CROSSPOST = bit 1) labels crosspost_source from message_reference.
+    world.discord.push("MESSAGE_CREATE", json!({
+        "id": "1300000010000001102",
+        "channel_id": "4101",
+        "type": 0,
+        "author": {"id": "7777", "username": "Server #news", "bot": true, "discriminator": "0000", "avatar": null},
+        "content": "v1.0 is out!",
+        "timestamp": "2026-10-13T09:01:00.000000+00:00",
+        "mentions": [],
+        "mention_roles": [],
+        "mention_everyone": false,
+        "embeds": [],
+        "attachments": [],
+        "pinned": false,
+        "flags": 2,
+        "message_reference": {
+            "guild_id": "4000",
+            "channel_id": "4109",
+            "message_id": "1300000010000001100"
+        }
+    }));
+    let received = wait("crosspost message", || {
+        world.messages("4101").into_iter().find(|m| m.id == "1300000010000001102")
+    });
+    assert!(received.crosspost_source.contains("#news"), "expected #news in crosspost_source, got {:?}", received.crosspost_source);
+
+    // 4. Follow posts {"webhook_channel_id": "4101"} to POST /channels/4109/followers.
+    world.discord.script("/channels/4109/followers", 200, json!({"channel_id": "4109", "webhook_id": "8888"}));
+    assert_eq!(
+        world.ask(Request::Follow {
+            conversation: world.key("4109"),
+            into: world.key("4101"),
+        }),
+        Response::Ok
+    );
+    let follow_reqs = world.discord.requests_to("POST", "/channels/4109/followers");
+    assert_eq!(follow_reqs.len(), 1);
+    assert_eq!(follow_reqs[0].body, json!({"webhook_channel_id": "4101"}));
+
+    // A text channel is not an announcement source, so nothing is posted.
+    match world.ask(Request::Follow {
+        conversation: world.key("4101"),
+        into: world.key("4101"),
+    }) {
+        Response::Error { code: ErrorCode::Refused, .. } => {}
+        other => panic!("expected refusal for a non-announcement source, got {other:?}"),
+    }
+    assert!(
+        world.discord.requests_to("POST", "/channels/4101/followers").is_empty(),
+        "a refused follow must not call Discord"
+    );
+
+    // An announcement followed into a channel without Manage Webhooks is refused too.
+    match world.ask(Request::Follow {
+        conversation: world.key("4109"),
+        into: world.key("3001"),
+    }) {
+        Response::Error { code: ErrorCode::Refused, .. } => {}
+        other => panic!("expected refusal without manage webhooks, got {other:?}"),
+    }
+    assert_eq!(
+        world.discord.requests_to("POST", "/channels/4109/followers").len(),
+        1,
+        "the refused follow must not post another followers request"
+    );
+}
+
+#[test]
+fn channel_mentions_message_links_and_special_tokens_resolve_in_app() {
+    let world = World::launch(&[], |_| {});
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    world.discord.push("MESSAGE_CREATE", json!({
+        "id": "1300000010000001200",
+        "channel_id": "4101",
+        "guild_id": "4000",
+        "type": 0,
+        "author": {"id": "2001", "username": "mara", "global_name": "Mara", "discriminator": "0", "avatar": null},
+        "content": "check <#4102> and <#999999> plus https://discord.com/channels/4000/4102/1300000010000000005 and <id:browse> <id:customize> <id:guide>",
+        "timestamp": "2026-10-13T09:10:00.000000+00:00",
+        "mentions": [],
+        "mention_roles": [],
+        "mention_everyone": false,
+        "embeds": [],
+        "attachments": [],
+        "pinned": false
+    }));
+    let msg = wait("in-app links message", || {
+        world.messages("4101").into_iter().find(|m| m.id == "1300000010000001200")
+    });
+    assert!(msg.text.contains("#announcements"), "got: {}", msg.text);
+    assert!(msg.text.contains("# No Access"), "got: {}", msg.text);
+    assert!(msg.text.contains("#announcements › message"), "got: {}", msg.text);
+    assert!(msg.text.contains("Browse Channels"), "got: {}", msg.text);
+    assert!(msg.text.contains("Channels & Roles"), "got: {}", msg.text);
+    assert!(msg.text.contains("Server Guide"), "got: {}", msg.text);
+
+    // Known message link resolves to the conversation + message id for in-app jump.
+    match world.ask(Request::Resolve {
+        url: "https://discord.com/channels/4000/4102/1300000010000000005".into(),
+    }) {
+        Response::Resolved { conversation, message_id, .. } => {
+            assert_eq!(conversation, Some(world.key("4102")));
+            assert_eq!(message_id.as_deref(), Some("1300000010000000005"));
+        }
+        other => panic!("expected Response::Resolved, got {other:?}"),
+    }
+
+    // Unknown server/channel link returns conversation: None so the shell falls back to browser.
+    match world.ask(Request::Resolve {
+        url: "https://discord.com/channels/8888/8889/1300000010000000005".into(),
+    }) {
+        Response::Resolved { conversation, .. } => assert_eq!(conversation, None),
+        other => panic!("expected Response::Resolved, got {other:?}"),
+    }
+
+    // A guild that is not a snowflake does not parse, and a real channel id under the wrong
+    // guild must not fall through to that channel's newest row.
+    match world.ask(Request::Resolve {
+        url: "https://discord.com/channels/G7/4102/1300000010000000005".into(),
+    }) {
+        Response::Resolved { conversation, .. } => assert_eq!(conversation, None),
+        other => panic!("expected Response::Resolved, got {other:?}"),
+    }
+    match world.ask(Request::Resolve {
+        url: "https://discord.com/channels/9999/4102/1300000010000000005".into(),
+    }) {
+        Response::Resolved { conversation, .. } => assert_eq!(conversation, None, "wrong guild must not match channel 4102"),
+        other => panic!("expected Response::Resolved, got {other:?}"),
+    }
+}
+
+#[test]
+fn edit_suppresses_embeds_merging_existing_flags_and_removes_attachments() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    // Grant MANAGE_MESSAGES (1 << 13 = 8192) on @everyone in guild 4000 so moderator suppress works.
+    let guild = ready["guilds"].as_array_mut().unwrap().iter_mut().find(|g| g["id"] == "4000").unwrap();
+    let everyone = guild["roles"].as_array_mut().unwrap().iter_mut().find(|r| r["id"] == "4000").unwrap();
+    let perms: u64 = everyone["permissions"].as_str().unwrap().parse().unwrap();
+    everyone["permissions"] = json!((perms | (1u64 << 13)).to_string());
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    // 1. Seed another user's message with an embed and existing flags = 1 (CROSSPOSTED) | 4096 (SUPPRESS_NOTIFICATIONS).
+    let other_id = "1300000010000001300";
+    let other_msg = json!({
+        "id": other_id,
+        "channel_id": "4101",
+        "type": 0,
+        "author": {"id": "2001", "username": "mara", "global_name": "Mara", "discriminator": "0", "avatar": null},
+        "content": "see https://example.org",
+        "timestamp": "2026-10-13T09:20:00.000000+00:00",
+        "mentions": [],
+        "mention_roles": [],
+        "mention_everyone": false,
+        "embeds": [{"type": "link", "url": "https://example.org", "title": "Example"}],
+        "attachments": [],
+        "pinned": false,
+        "flags": 4097
+    });
+    world.discord.push("MESSAGE_CREATE", other_msg.clone());
+    wait("other user message with embed", || {
+        world.messages("4101").into_iter().find(|m| m.id == other_id && !m.previews.is_empty())
+    });
+
+    // Moderator suppresses embeds on another user's message: merges SUPPRESS_EMBEDS (4) with 4097 -> 4101,
+    // and omits "content" from the PATCH body. The flags read is GET of that one message.
+    let message_path = format!("/channels/4101/messages/{other_id}");
+    world.discord.script(&message_path, 200, other_msg.clone());
+    let mut suppressed = other_msg.clone();
+    suppressed["flags"] = json!(4101);
+    suppressed["embeds"] = json!([]);
+    world.discord.script(&message_path, 200, suppressed);
+    assert_eq!(
+        world.ask(Request::Edit {
+            conversation: world.key("4101"),
+            message_id: other_id.into(),
+            text: String::new(),
+            spans: Vec::new(),
+            suppress_embeds: true,
+            keep_attachments: None,
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", &format!("/channels/4101/messages/{other_id}"));
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0].body["flags"], json!(4097 | 4));
+    assert!(patches[0].body.get("content").is_none(), "suppress-only PATCH must omit content: {}", patches[0].body);
+
+    // 2. Own message with two attachments: removing one attachment and clearing text is allowed
+    //    because one attachment remains, and PATCH sends attachments: [{"id": "7002"}].
+    let own_id = "1300000010000001301";
+    let own_msg = json!({
+        "id": own_id,
+        "channel_id": "4101",
+        "type": 0,
+        "author": me(),
+        "content": "two files",
+        "timestamp": "2026-10-13T09:21:00.000000+00:00",
+        "mentions": [],
+        "mention_roles": [],
+        "mention_everyone": false,
+        "embeds": [],
+        "attachments": [
+            {"id": "7001", "filename": "a.txt", "size": 10, "url": "https://cdn.discordapp.com/attachments/4101/7001/a.txt"},
+            {"id": "7002", "filename": "b.txt", "size": 20, "url": "https://cdn.discordapp.com/attachments/4101/7002/b.txt"}
+        ],
+        "pinned": false,
+        "flags": 0
+    });
+    world.discord.push("MESSAGE_CREATE", own_msg.clone());
+    wait("own message with two attachments", || {
+        world.messages("4101").into_iter().find(|m| m.id == own_id && m.attachments.len() == 2)
+    });
+
+    let mut one_left = own_msg.clone();
+    one_left["content"] = json!("");
+    one_left["attachments"] = json!([
+        {"id": "7002", "filename": "b.txt", "size": 20, "url": "https://cdn.discordapp.com/attachments/4101/7002/b.txt"}
+    ]);
+    world.discord.script(&format!("/channels/4101/messages/{own_id}"), 200, one_left);
+    assert_eq!(
+        world.ask(Request::Edit {
+            conversation: world.key("4101"),
+            message_id: own_id.into(),
+            text: String::new(),
+            spans: Vec::new(),
+            suppress_embeds: false,
+            keep_attachments: Some(vec!["att:7002".into()]),
+        }),
+        Response::Ok
+    );
+    let att_patches = world.discord.requests_to("PATCH", &format!("/channels/4101/messages/{own_id}"));
+    assert_eq!(att_patches.len(), 1);
+    assert_eq!(att_patches[0].body["content"], json!(""));
+    assert_eq!(att_patches[0].body["attachments"], json!([{"id": "7002"}]));
+
+    // 3. Clearing both text AND all attachments is refused (offer Delete instead).
+    match world.ask(Request::Edit {
+        conversation: world.key("4101"),
+        message_id: own_id.into(),
+        text: String::new(),
+        spans: Vec::new(),
+        suppress_embeds: false,
+        keep_attachments: Some(Vec::new()),
+    }) {
+        Response::Error { code: ErrorCode::Refused, .. } => {}
+        other => panic!("expected Refused for empty text + empty attachments, got {other:?}"),
+    }
+
+    // A flags GET that misses must not PATCH. The around list would have answered 200 without
+    // this id and the old code would have sent flags 4.
+    let gone = "1300000010000001399";
+    let gone_path = format!("/channels/4101/messages/{gone}");
+    world.discord.push("MESSAGE_CREATE", json!({
+        "id": gone,
+        "channel_id": "4101",
+        "type": 0,
+        "author": me(),
+        "content": "https://example.org/gone",
+        "timestamp": "2026-10-13T09:22:00.000000+00:00",
+        "mentions": [],
+        "mention_roles": [],
+        "mention_everyone": false,
+        "embeds": [{"type": "link", "url": "https://example.org/gone", "title": "Gone"}],
+        "attachments": [],
+        "pinned": false,
+        "flags": 4097
+    }));
+    wait("message whose flags read will miss", || {
+        world.messages("4101").into_iter().find(|m| m.id == gone)
+    });
+    world.discord.script(&gone_path, 404, json!({"message": "Unknown Message", "code": 10008}));
+    match world.ask(Request::Edit {
+        conversation: world.key("4101"),
+        message_id: gone.into(),
+        text: String::new(),
+        spans: Vec::new(),
+        suppress_embeds: true,
+        keep_attachments: None,
+    }) {
+        Response::Error { code: ErrorCode::Refused, .. } => {}
+        other => panic!("expected Refused when the flags read misses, got {other:?}"),
+    }
+    assert_eq!(world.discord.requests_to("GET", &gone_path).len(), 1, "suppress reads that one message");
+    assert!(
+        world.discord.requests_to("PATCH", &gone_path).is_empty(),
+        "a missed flags read must not patch"
+    );
+}
+
+#[test]
+fn text_attachment_head_preview_uses_range_request_and_keeps_full_download_separate() {
+    use std::io::{BufRead, BufReader, Write as _};
+    use std::sync::mpsc::channel;
+
+    let payload: Vec<u8> = (1..=2500).flat_map(|n| format!("log line {n:04}: ok\n").into_bytes()).collect();
+    let payload_len = payload.len();
+    assert!(payload_len > protocol::TEXT_PREVIEW_MAX_BYTES as usize);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = channel::<Option<String>>();
+    let body_for_srv = payload.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(&stream);
+            let mut req_line = String::new();
+            if reader.read_line(&mut req_line).is_err() {
+                continue;
+            }
+            let mut range_hdr = None;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some((k, v)) = line.split_once(':') {
+                    if k.eq_ignore_ascii_case("range") {
+                        range_hdr = Some(v.trim().to_owned());
+                    }
+                }
+            }
+            let _ = tx.send(range_hdr.clone());
+            let mut out = stream;
+            if let Some(hdr) = range_hdr {
+                let end = hdr
+                    .strip_prefix("bytes=0-")
+                    .and_then(|n| n.parse::<usize>().ok())
+                    .unwrap_or(0)
+                    .min(body_for_srv.len() - 1);
+                let slice = &body_for_srv[..=end];
+                let _ = write!(
+                    out,
+                    "HTTP/1.1 206 Partial Content\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    slice.len()
+                );
+                let _ = out.write_all(slice);
+            } else {
+                let _ = write!(
+                    out,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body_for_srv.len()
+                );
+                let _ = out.write_all(&body_for_srv);
+            }
+        }
+    });
+
+    let world = World::launch(&[], |_| {});
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    let url = format!("http://127.0.0.1:{port}/attachments/4101/88001/server.log");
+    world.discord.push("MESSAGE_CREATE", json!({
+        "id": "1300000010000001400",
+        "channel_id": "4101",
+        "type": 0,
+        "author": {"id": "2001", "username": "mara", "global_name": "Mara", "discriminator": "0", "avatar": null},
+        "content": "",
+        "timestamp": "2026-10-13T09:30:00.000000+00:00",
+        "mentions": [],
+        "mention_roles": [],
+        "mention_everyone": false,
+        "embeds": [],
+        "pinned": false,
+        "attachments": [{
+            "id": "88001",
+            "filename": "server.log",
+            "size": payload_len,
+            "url": url,
+            "content_type": "text/plain"
+        }]
+    }));
+    let msg = wait("log attachment message", || {
+        world.messages("4101").into_iter().find(|m| m.id == "1300000010000001400")
+    });
+    assert_eq!(msg.attachments[0].file.id, "att:88001");
+
+    // 1. FetchPreview asks for only the first 100 KB via Range header and caches under head:att:88001.
+    let head_file = wait("head preview to land", || {
+        match world.ask(Request::FetchPreview {
+            account: world.account(),
+            ids: vec!["att:88001".into()],
+            max_bytes: protocol::TEXT_PREVIEW_MAX_BYTES,
+        }) {
+            Response::Media { files } => files.into_iter().find(|f| f.id == "head:att:88001" && f.path.is_some()),
+            other => panic!("unexpected: {other:?}"),
+        }
+    });
+    let head_bytes = std::fs::read(head_file.path.as_deref().unwrap()).unwrap();
+    assert_eq!(head_bytes.len(), protocol::TEXT_PREVIEW_MAX_BYTES as usize);
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        Some(format!("bytes=0-{}", protocol::TEXT_PREVIEW_MAX_BYTES - 1))
+    );
+
+    // 2. Full download via Request::Fetch still fetches the whole file separately (no Range header).
+    let full = world.fetched("att:88001", None, false);
+    let full_bytes = std::fs::read(full.path.as_deref().unwrap()).unwrap();
+    assert_eq!(full_bytes.len(), payload_len);
+    assert_eq!(rx.try_recv().unwrap(), None);
 }

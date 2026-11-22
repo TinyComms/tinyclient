@@ -90,6 +90,13 @@ const OWN_EVERY: Duration = Duration::from_secs(2);
 const OWN_FOR: Duration = Duration::from_secs(120);
 /// What marks a picker's preview among an account's files.
 const PICK: &str = "pick:";
+/// What marks a ranged head preview of a text/code attachment among an account's files.
+pub const HEAD_PREFIX: &str = "head:";
+
+/// The cache id for an attachment's ranged head preview, distinct from the full download id.
+pub fn head_id(id: &str) -> String {
+    format!("{HEAD_PREFIX}{id}")
+}
 /// While a row's picture waits for its row to come back, the screen is looked at this often:
 /// `Watch` goes to the server, which does not tell the cache.
 const PARKED_LOOK: Duration = Duration::from_secs(1);
@@ -177,6 +184,8 @@ struct Job {
     adapter: Option<Sender<Command>>,
     /// Asked for as the picture of a row on screen: it waits while that row is scrolled away.
     row: bool,
+    /// When set, fetches at most this many bytes via an HTTP `Range` request (for text previews).
+    max_bytes: Option<u64>,
     /// When it was asked for.
     at: Instant,
 }
@@ -355,7 +364,25 @@ impl Blobs {
         ids: &[String],
         adapter: Option<Sender<Command>>,
     ) -> rusqlite::Result<Vec<MediaFile>> {
-        self.cache.request(account, ids, adapter)
+        self.cache.request(account, ids, None, adapter)
+    }
+
+    /// Requests ranged head previews (at most `max_bytes`, clamped to [`protocol::TEXT_PREVIEW_MAX_BYTES`])
+    /// for registered file attachments. If an original file is already on disk, returns its path
+    /// immediately under the `"head:"` id without another network request.
+    pub fn request_preview(
+        &self,
+        account: &AccountKey,
+        ids: &[String],
+        max_bytes: u32,
+        adapter: Option<Sender<Command>>,
+    ) -> rusqlite::Result<Vec<MediaFile>> {
+        let limit = if max_bytes == 0 {
+            protocol::TEXT_PREVIEW_MAX_BYTES
+        } else {
+            max_bytes.min(protocol::TEXT_PREVIEW_MAX_BYTES)
+        } as u64;
+        self.cache.request_preview(account, ids, limit, adapter)
     }
 
     /// The user asked for these again (`Fetch` with `retry`): whatever rest they were taking
@@ -453,8 +480,49 @@ impl Cache {
         });
     }
 
+    /// [`Blobs::request_preview`].
+    fn request_preview(
+        &self,
+        account: &AccountKey,
+        ids: &[String],
+        limit: u64,
+        adapter: Option<Sender<Command>>,
+    ) -> rusqlite::Result<Vec<MediaFile>> {
+        let originals = self.hub.store().media(account, ids)?;
+        let mut ready = Vec::new();
+        let mut to_register: Vec<(MediaFile, String)> = Vec::new();
+        let mut head_ids = Vec::new();
+        for (orig, url) in originals {
+            let preview_id = head_id(&orig.id);
+            if orig.path.as_ref().is_some_and(|p| Path::new(p).exists()) {
+                ready.push(MediaFile { id: preview_id, ..orig });
+                continue;
+            }
+            if url.is_empty() || kept_by_adapter(&url) {
+                continue;
+            }
+            let mut preview_file = MediaFile::new(preview_id.clone(), protocol::MediaKind::File);
+            preview_file.bytes = orig.bytes.min(limit);
+            to_register.push((preview_file, url));
+            head_ids.push(preview_id);
+        }
+        if !to_register.is_empty() {
+            self.hub.store().register_media(account, &to_register)?;
+        }
+        if !head_ids.is_empty() {
+            ready.extend(self.request(account, &head_ids, Some(limit), adapter)?);
+        }
+        Ok(ready)
+    }
+
     /// [`Blobs::request`].
-    fn request(&self, account: &AccountKey, ids: &[String], adapter: Option<Sender<Command>>) -> rusqlite::Result<Vec<MediaFile>> {
+    fn request(
+        &self,
+        account: &AccountKey,
+        ids: &[String],
+        max_bytes: Option<u64>,
+        adapter: Option<Sender<Command>>,
+    ) -> rusqlite::Result<Vec<MediaFile>> {
         let mut files: Vec<(MediaFile, String)> = {
             let mut store = self.hub.store();
             store.media_used(account, ids, now())?;
@@ -516,6 +584,7 @@ impl Cache {
                 queue.waiting.push(Job {
                     at,
                     row: screen.rows.contains(&key),
+                    max_bytes,
                     file: key,
                     epoch,
                     picker_generation,
@@ -708,7 +777,7 @@ impl Cache {
                 if url.is_none_or(|url| self.hosts.trust(account.network, &url) != Some(fetch::Trust::Open)) {
                     continue;
                 }
-                if let Err(err) = self.request(account, &[avatar.id], None) {
+                if let Err(err) = self.request(account, &[avatar.id], None, None) {
                     tracing::warn!("chatd: {}: own picture: {err}", account.network.label());
                 }
             }
@@ -947,13 +1016,19 @@ impl Cache {
             if let Err(err) = protocol::private::dir(&dir) {
                 return failed(&file, format!("The cache directory could not be made: {err}."));
             }
+            let cache_cap = self.cap.load(Ordering::Relaxed);
             let want = fetch::Want {
                 network: account.network,
                 file: &file,
                 url: &url,
                 adapter: job.adapter.as_ref(),
                 part: &part,
-                cap: fetch::cap(&file, self.cap.load(Ordering::Relaxed)),
+                cap: match job.max_bytes {
+                    Some(limit) => limit.min(cache_cap),
+                    None => fetch::cap(&file, cache_cap),
+                },
+                max_bytes: job.max_bytes,
+                renew_id: id.strip_prefix(HEAD_PREFIX),
                 also: &|| self.waiting_with(job),
             };
             let (bytes, from) = match fetch::download(&self.hosts, agent, &want, buffer) {
