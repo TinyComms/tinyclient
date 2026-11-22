@@ -348,6 +348,22 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             (201, ch)
         }
         // A thread's own edit (ids 45xx here, or thread-only fields) is answered by the thread arm below.
+        ("GET", ["voice", "regions"]) => (200, json!([{"id":"us-east","name":"US East","deprecated":false}])),
+        ("GET", ["channels", "4201"]) => (200, json!({
+            "id":"4201", "type":2, "bitrate":64000, "user_limit":0, "rtc_region":"us-east", "video_quality_mode":1
+        })),
+        ("PATCH", ["channels", channel]) if seen.body.get("bitrate").is_some() => {
+            let mut row = seen.body.clone();
+            row["id"] = json!(channel);
+            row["guild_id"] = json!("4000");
+            row["type"] = json!(2);
+            row["name"] = json!("Lounge");
+            (200, row)
+        }
+        ("PATCH", ["channels", channel, "call"]) => {
+            shared.push("CALL_UPDATE", json!({"channel_id":channel,"region":seen.body["region"],"ringing":[]}));
+            (204, Value::Null)
+        }
         ("PATCH", ["channels", channel])
             if !(channel.starts_with("45") || ["archived", "locked", "auto_archive_duration"].iter().any(|field| seen.body.get(field).is_some())) =>
         {
@@ -367,9 +383,21 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             (200, ch)
         }
         ("PATCH", ["guilds", _guild, "channels"]) => (204, Value::Null),
+        ("PATCH", ["guilds", _guild, "members", _member])
+            if ["mute", "deaf", "channel_id"].iter().any(|field| seen.body.get(field).is_some()) => (204, Value::Null),
         ("PUT", ["channels", _channel, "permissions", _target]) => (204, Value::Null),
+        ("PUT", ["channels", channel, "voice-status"]) => {
+            shared.push("VOICE_CHANNEL_STATUS_UPDATE", json!({"id": channel, "guild_id": "4000", "status": seen.body["status"]}));
+            (204, Value::Null)
+        }
         ("DELETE", ["channels", _channel, "permissions", _target]) => (204, Value::Null),
         ("PUT", ["channels", channel, "recipients", "@me"]) => (200, json!({"id": channel, "type": 1, "is_message_request": false})),
+        // Pinning tells every session: the message says it is pinned, and the channel's pins changed.
+        ("PUT" | "DELETE", ["channels", channel, "messages", "pins", message] | ["channels", channel, "pins", message]) => {
+            shared.push("MESSAGE_UPDATE", json!({"id": message, "channel_id": channel, "pinned": seen.method == "PUT"}));
+            shared.push("CHANNEL_PINS_UPDATE", json!({"channel_id": channel, "guild_id": "4000", "last_pin_timestamp": "2026-10-13T09:00:00.000000+00:00"}));
+            (204, Value::Null)
+        }
         ("GET", ["channels", channel, "messages", "pins"]) => {
             let pinned = json!({
                 "id": "1300000000000000700", "channel_id": channel, "type": 0, "author": me(), "content": "Read the rules first",
@@ -453,6 +481,22 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
         }
         ("POST", ["auth", "logout"]) => (204, Value::Null),
         ("GET", ["channels", channel, "messages"]) => (200, serde_json::from_str(history(channel)).unwrap()),
+        ("GET", ["channels", _, "polls", _, "answers", _]) => (200, json!({"users":[{"id":"2001","username":"mara"}]})),
+        ("PUT", ["channels", channel, "polls", id, "answers", "@me"]) => {
+            let route = format!("/channels/{channel}/polls/{id}/answers/@me");
+            let writes = shared.requests_to("PUT", &route);
+            let ids = |body: &Value| body["answer_ids"].as_array().cloned().unwrap_or_default();
+            let previous = writes.iter().rev().nth(1).map_or_else(Vec::new, |seen| ids(&seen.body));
+            let current = ids(&seen.body);
+            for (kind, from, into) in [("REMOVE", &previous, &current), ("ADD", &current, &previous)] {
+                for answer in from.iter().filter(|answer| !into.contains(answer)) {
+                    shared.push(&format!("MESSAGE_POLL_VOTE_{kind}"), json!({
+                        "channel_id":channel,"message_id":id,"user_id":"1000","answer_id":answer
+                    }));
+                }
+            }
+            (204, Value::Null)
+        }
         ("POST", ["channels", channel, "messages"]) => {
             let mut message = json!({
                 "id": shared.snowflake(),
@@ -501,6 +545,16 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
                 })
                 .collect();
             message["attachments"] = json!(attached);
+            if let Some(poll) = seen.body.get("poll") {
+                let mut poll = poll.clone();
+                if let Some(answers) = poll["answers"].as_array_mut() {
+                    for (ix, answer) in answers.iter_mut().enumerate() {
+                        answer["answer_id"] = json!(ix + 1);
+                    }
+                }
+                poll["expiry"] = json!("2099-01-01T00:00:00Z");
+                message["poll"] = poll;
+            }
             if let Some(stickers) = seen.body["sticker_ids"].as_array() {
                 let items: Vec<Value> = stickers.iter().map(|id| json!({"id": id, "name": "wave", "format_type": 1})).collect();
                 message["sticker_items"] = json!(items);
@@ -1971,11 +2025,13 @@ fn messages_map_to_the_one_model_and_follow_live_events() {
     let quoted = rich.reply_to.as_ref().unwrap();
     assert_eq!((quoted.id.as_str(), quoted.sender.as_str(), quoted.snippet.as_str()), ("1300000000000000009", "Justin", "is the deploy done?"));
 
-    // Our own message, a system line, a poll we cannot draw, a sticker.
+    // Our own message, a system line, a native poll, a sticker.
     assert!(messages[3].outgoing);
     assert_eq!((messages[2].kind.clone(), messages[2].text.as_str()), (MessageKind::System, "Missed call from Mara O"));
-    let poll_link = "https://discord.com/channels/@me/3001/1300000000000000007".to_owned();
-    assert_eq!((messages[1].kind.clone(), messages[1].text.as_str()), (MessageKind::Unsupported { link: poll_link }, "Poll: Lunch?"));
+    assert_eq!(messages[1].kind, MessageKind::Normal);
+    let poll = messages[1].poll.as_deref().expect("the Discord poll");
+    assert_eq!(poll.question, "Lunch?");
+    assert_eq!(poll.choices.iter().map(|choice| choice.text.as_str()).collect::<Vec<_>>(), ["Tacos", "Ramen"]);
     assert_eq!(messages[0].attachments[0].name, "Wave");
     assert_eq!(messages[0].attachments[0].file.id, "sticker:9001");
 
@@ -3129,6 +3185,192 @@ fn a_move_to_another_voice_channel_is_followed() {
 }
 
 #[test]
+fn voice_channel_status_loads_on_open_and_clears_when_the_last_person_leaves() {
+    let world = World::start();
+    assert!(world.discord.frames_of(36).is_empty());
+    world.ask(Request::Tree { space: world.key("4000"), offset: 0, limit: 500, peek: false });
+    let request = wait("the status request", || world.discord.frames_of(36).pop());
+    assert_eq!(request["d"]["guild_id"], "4000");
+    world.discord.push("CHANNEL_STATUSES", json!({"guild_id": "4000", "channels": [{"id": "4201", "status": "Studying"}]}));
+    wait("the initial voice status", || (world.conversation("4201").topic == "Studying").then_some(()));
+    world.discord.push("VOICE_CHANNEL_STATUS_UPDATE", json!({"id": "4201", "guild_id": "4000", "status": "Two more"}));
+    wait("the changed voice status", || (world.conversation("4201").topic == "Two more").then_some(()));
+    let set = || world.ask(Request::SetVoiceChannelStatus { conversation: world.key("4201"), status: Some("é".repeat(510)) });
+    assert!(matches!(set(), Response::Error { .. }));
+    assert!(world.discord.requests_to("PUT", "/channels/4201/voice-status").is_empty());
+    world.discord.push("GUILD_ROLE_UPDATE", json!({
+        "guild_id": "4000", "role": {"id": "4000", "name": "@everyone", "permissions": ((1u64 << 48) | (1 << 20) | (1 << 10) | (1 << 4)).to_string()}
+    }));
+    wait("the channel status permission", || world.conversation("4201").rights.set_voice_status.then_some(()));
+    assert_eq!(set(), Response::Ok);
+    let put = world.discord.requests_to("PUT", "/channels/4201/voice-status").pop().unwrap();
+    assert_eq!(put.body["status"], "é".repeat(500));
+    wait("the status from the gateway", || (world.conversation("4201").topic == "é".repeat(500)).then_some(()));
+    world.discord.push("VOICE_STATE_UPDATE", json!({"guild_id": "4000", "channel_id": null, "user_id": "2002", "session_id": "voice-dev"}));
+    wait("the empty channel to clear its status", || world.conversation("4201").topic.is_empty().then_some(()));
+}
+
+#[test]
+fn voice_moderation_checks_channel_permissions_and_waits_for_the_gateway() {
+    let world = World::start();
+    let lounge = world.key("4201");
+    let person = world.key("2002");
+    let modify = |server_muted: Option<bool>, server_deafened: Option<bool>| {
+        world.ask(serde_json::from_value(json!({
+            "op": "call_moderate", "conversation": lounge, "person": person, "server_muted": server_muted, "server_deafened": server_deafened
+        })).unwrap())
+    };
+    let move_to = |to: Option<Key>| world.ask(serde_json::from_value(json!({
+        "op": "call_move", "conversation": lounge, "person": person, "to": to
+    })).unwrap());
+    let route = "/guilds/4000/members/2002";
+    assert!(matches!(modify(Some(true), None), Response::Error { .. }));
+    assert!(matches!(modify(None, Some(true)), Response::Error { .. }));
+    assert!(matches!(move_to(None), Response::Error { .. }));
+    assert!(world.discord.requests_to("PATCH", route).is_empty());
+    world.discord.push("GUILD_ROLE_UPDATE", json!({
+        "guild_id": "4000",
+        "role": {"id": "4000", "name": "@everyone", "permissions": ((1u64 << 10) | (1 << 20) | (1 << 22) | (1 << 23) | (1 << 24)).to_string()}
+    }));
+    wait("the moderation permissions", || {
+        let rights = serde_json::to_value(world.conversation("4201").rights).unwrap();
+        (rights["voice_mute"] == true && rights["voice_deafen"] == true && rights["voice_move"] == true).then_some(())
+    });
+    world.discord.push("CHANNEL_CREATE", json!({
+        "id":"4203", "guild_id":"4000", "type":2, "name":"Studio", "parent_id":"4200", "permission_overwrites":[]
+    }));
+    wait("a joinable destination", || {
+        matches!(world.ask(Request::Conversation { conversation: world.key("4203") }),
+            Response::Conversation { conversation } if conversation.call == CallSupport::Native).then_some(())
+    });
+    assert_eq!(modify(Some(true), None), Response::Ok);
+    assert_eq!(modify(None, Some(true)), Response::Ok);
+    assert_eq!(move_to(Some(world.key("4203"))), Response::Ok);
+    assert_eq!(move_to(None), Response::Ok);
+    let sent: Vec<_> = world.discord.requests_to("PATCH", route).into_iter().map(|seen| seen.body).collect();
+    assert_eq!(sent, [json!({"mute": true}), json!({"deaf": true}), json!({"channel_id": "4203"}), json!({"channel_id": null})]);
+    let dev = || world.conversation("4201").occupants.and_then(|inside| inside.people.into_iter().find(|who| who.person == person));
+    assert!(!dev().unwrap().server_muted);
+    assert!(!dev().unwrap().server_deafened);
+    world.discord.push("VOICE_STATE_UPDATE", json!({
+        "guild_id": "4000", "channel_id": "4201", "user_id": "2002", "session_id": "voice-dev", "mute": true, "deaf": true
+    }));
+    wait("server mute and deafen", || dev().filter(|dev| dev.server_muted && dev.server_deafened));
+    assert_ne!(serde_json::to_value(world.conversation("3001").rights).unwrap()["voice_move"], true);
+}
+
+#[test]
+fn discord_voice_settings_are_loaded_on_demand_and_apply_to_the_right_route() {
+    let world = World::start();
+    let channel = world.key("4201");
+    let dm = world.key("3001");
+    let get = || world.ask(Request::DiscordVoiceSettings { conversation: channel.clone() });
+    assert!(world.discord.requests_to("GET", "/voice/regions").is_empty());
+    let settings = match get() {
+        Response::DiscordVoiceSettings { settings } => settings,
+        other => panic!("{other:?}"),
+    };
+    assert!(settings.channel.is_none());
+    assert!(world.discord.requests_to("GET", "/channels/4201").is_empty());
+    let edit = protocol::DiscordChannelVoice { bitrate: 32000, user_limit: 12, rtc_region: None, video_quality_mode: 2 };
+    let save = || world.ask(Request::EditDiscordVoiceChannel { conversation: channel.clone(), edit: edit.clone() });
+    assert!(matches!(save(), Response::Error { .. }));
+    assert!(world.discord.requests_to("PATCH", "/channels/4201").is_empty());
+    world.discord.push("GUILD_ROLE_UPDATE", json!({
+        "guild_id":"4000", "role":{"id":"4000", "name":"@everyone", "permissions": ((1u64 << 10) | (1 << 20) | (1 << 4)).to_string()}
+    }));
+    wait("manage channel permissions", || world.conversation("4201").rights.rename.then_some(()));
+    match get() {
+        Response::DiscordVoiceSettings { settings } => {
+            assert_eq!(settings.channel.unwrap().rtc_region.as_deref(), Some("us-east"));
+            assert_eq!(settings.regions[0].id, "us-east");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(save(), Response::Ok);
+    assert_eq!(world.conversation("4201").limit, 12);
+    assert_eq!(world.discord.requests_to("PATCH", "/channels/4201")[0].body,
+        json!({"bitrate":32000, "user_limit":12, "rtc_region":null, "video_quality_mode":2}));
+    world.discord.push("CALL_CREATE", json!({"channel_id":"3001", "region":"us-east", "ringing":[]}));
+    wait("the direct call's region", || match world.ask(Request::DiscordVoiceSettings { conversation: dm.clone() }) {
+        Response::DiscordVoiceSettings { settings } => (settings.current_region.as_deref() == Some("us-east")).then_some(()),
+        _ => None,
+    });
+    assert_eq!(world.ask(Request::SetDiscordCallRegion { conversation: dm, region: "us-east".into() }), Response::Ok);
+    assert_eq!(world.discord.requests_to("PATCH", "/channels/3001/call")[0].body, json!({"region":"us-east"}));
+    assert_eq!(world.discord.requests_to("GET", "/voice/regions").len(), 1);
+}
+
+#[test]
+fn discord_polls_have_live_answers_and_use_discord_answer_ids_for_votes() {
+    let world = World::start();
+    let channel = world.key("3001");
+    // Above this fixture's newest history id, so static backfill cannot interpret it as deleted.
+    let id = "1300000090000042010";
+    let poll = || world.messages("3001").into_iter().find(|message| message.id == id).and_then(|message| message.poll);
+    let vote = |votes| world.ask(Request::Poll { conversation: channel.clone(), message_id: id.into(), votes });
+    let answer = |answer_id, text, emoji| json!({"answer_id":answer_id,"poll_media":{"text":text,"emoji":emoji}});
+    let raw = json!({
+        "question":{"text":"Where next?"}, "answers":[answer(3,"Lounge",json!({"name":"🎧"})),answer(7,"Studio",Value::Null)],
+        "allow_multiselect":true, "expiry":"2099-01-01T00:00:00Z", "results":{"is_finalized":false,"answer_counts":[{"id":7,"count":2,"me_voted":false}]}
+    });
+    world.discord.push("MESSAGE_CREATE", json!({"channel_id":"3001","id":id,"author":me(),"poll":raw,"content":"","type":0,
+        "timestamp":"2026-10-13T08:15:00Z"}));
+    let first = wait("a real poll card", poll);
+    assert_eq!(first.question, "Where next?");
+    assert!(first.multiple && !first.closed && first.closes_at.is_some());
+    assert_eq!(first.choices[0].emoji, "🎧");
+    assert_eq!(first.choices[1].count, 2);
+    let event = |name, user, answer| world.discord.push(name, json!({"channel_id":"3001","message_id":id,"user_id":user,"answer_id":answer}));
+    event("MESSAGE_POLL_VOTE_ADD", "2001", 7);
+    wait("another user's vote", || poll().filter(|poll| poll.choices[1].count == 3));
+    event("MESSAGE_POLL_VOTE_REMOVE", "2001", 7);
+    wait("another user's retraction", || poll().filter(|poll| poll.choices[1].count == 2));
+    assert_eq!(vote(Some(vec![1])), Response::Ok);
+    let route = format!("/channels/3001/polls/{id}/answers/@me");
+    assert_eq!(world.discord.requests_to("PUT", &route)[0].body, json!({"answer_ids":[7]}));
+    wait("our vote", || poll().filter(|poll| poll.mine == [1] && poll.choices[1].count == 3));
+    assert_eq!(vote(Some(vec![])), Response::Ok);
+    assert_eq!(world.discord.requests_to("PUT", &route)[1].body, json!({"answer_ids":[]}));
+    wait("our vote to retract", || poll().filter(|poll| poll.mine.is_empty() && poll.choices[1].count == 2));
+    match world.ask(Request::PollVoters { conversation: channel.clone(), message_id: id.into(), choice: 1, after: None }) {
+        Response::PollVoters { voters, .. } => assert_eq!(voters[0].key.id, "2001"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(world.discord.requests_to("GET", &format!("/channels/3001/polls/{id}/answers/7")).len(), 1);
+    let mut finished = raw.clone();
+    finished["results"]["is_finalized"] = json!(true);
+    world.discord.script(&format!("/channels/3001/polls/{id}/expire"), 200, json!({"channel_id":"3001","id":id,"poll":finished}));
+    assert_eq!(vote(None), Response::Ok);
+    wait("the finalized poll", || poll().filter(|poll| poll.closed));
+    let result_id = "1300000090000042011";
+    world.discord.push("MESSAGE_CREATE", json!({
+        "channel_id":"3001","id":result_id,"author":me(),"type":46,"message_reference":{"message_id":id,"channel_id":"3001"},
+        "embeds":[{"type":"poll_result","fields":[{"name":"victor_answer_text","value":"Studio"}]}]
+    }));
+    let result = wait("the poll's result", || world.messages("3001").into_iter().find(|message| message.id == result_id));
+    assert_eq!(result.jump.as_deref(), Some(id));
+    assert!(result.text.contains("Studio"));
+}
+
+#[test]
+fn discord_posts_a_poll_from_the_shared_composer_payload() {
+    let world = World::start();
+    assert!(can(&world).polls.is_some());
+    let draft = protocol::PollDraft { question: "Where next?".into(), options: vec!["Lounge".into(), "Studio".into()],
+        multiple: true, duration_secs: Some(3600), ..protocol::PollDraft::default() };
+    let client_id = "1730000000000042012";
+    world.ask(Request::Send { conversation: world.key("3001"), client_id: client_id.into(), text: "Poll: Where next?".into(),
+        reply_to: None, with: protocol::Outgoing { poll: Some(draft), ..protocol::Outgoing::default() } });
+    let sent = wait("the poll POST", || world.discord.requests_to("POST", "/channels/3001/messages").pop());
+    assert_eq!(sent.body["content"], "");
+    assert_eq!(sent.body["poll"], json!({"question":{"text":"Where next?"},"answers":[{"poll_media":{"text":"Lounge"}},{"poll_media":{"text":"Studio"}}],
+        "duration":1, "allow_multiselect":true,"layout_type":1}));
+    wait("the poll from Discord", || world.messages("3001").into_iter()
+        .find(|message| message.client_id.as_deref() == Some(client_id) && message.state == protocol::SendState::Sent && message.poll.is_some()));
+}
+
+#[test]
 fn a_voice_channel_lists_its_people_friends_first_then_by_name() {
     let world = World::start();
     let in_voice = || match world.ask(Request::InVoice { network: Some(Network::Discord) }) {
@@ -4124,6 +4366,7 @@ fn a_ready_of_real_size_connects_quickly_within_the_memory_budget_and_is_not_kep
     };
     assert_eq!(spaces.len(), 100);
     // 27 channels, three of them hidden from us.
+    assert!(world.discord.frames_of(36).is_empty(), "voice statuses are not fetched at READY");
     assert_eq!(world.tree("1000000").1.len(), 24);
     assert_eq!(world.people(Some(Relation::Friend), None).len(), 100, "a page of the thousand friends");
 
@@ -4155,8 +4398,9 @@ fn a_ready_of_real_size_connects_quickly_within_the_memory_budget_and_is_not_kep
     // A RESUME (op 6) is allowed here: on a loaded runner the client can miss a heartbeat ACK
     // while it is still parsing a READY this large, and then reconnects. The point of this
     // check is the single identify and the single server opened, so count those.
-    let sent: Vec<u64> = world.discord.frames.lock().unwrap().iter().filter_map(|frame| frame["op"].as_u64()).filter(|op| *op != 1 && *op != 6).collect();
-    assert_eq!(sent, [2, 37], "one identify, heartbeats, and the one server this test opened");
+    let mut sent: Vec<u64> = world.discord.frames.lock().unwrap().iter().filter_map(|frame| frame["op"].as_u64()).filter(|op| *op != 1 && *op != 6).collect();
+    sent.sort_unstable();
+    assert_eq!(sent, [2, 36, 37], "one identify, and statuses and subscription for the one server opened");
 }
 
 #[test]
@@ -4921,7 +5165,7 @@ fn send_with(world: &World, conversation: &str, client_id: &str, text: &str, rep
 }
 
 fn file(path: &str, spoiler: bool) -> protocol::OutgoingFile {
-    protocol::OutgoingFile { path: path.to_owned(), name: String::new(), spoiler, as_file: false, original: false, view_once: false, media: None }
+    protocol::OutgoingFile { alt: String::new(), path: path.to_owned(), name: String::new(), spoiler, as_file: false, original: false, view_once: false, media: None }
 }
 
 #[test]
@@ -5181,6 +5425,7 @@ fn upload_limit_honors_server_boost_tier() {
     std::fs::File::create(&big).unwrap().set_len(40 << 20).unwrap();
     let outgoing = || protocol::Outgoing {
         files: vec![protocol::OutgoingFile {
+            alt: String::new(),
             path: big.to_string_lossy().into_owned(),
             name: String::new(),
             spoiler: false,
@@ -12896,4 +13141,202 @@ fn a_site_player_stays_a_card_and_a_byte_window_is_not_stored_as_the_file() {
         (windows >= 2).then_some(seen)
     });
     assert_eq!(seen[0].headers.get("range").map(String::as_str), Some("bytes=0-65535"));
+}
+
+/// What the account may do, as the shell is told.
+fn can(world: &World) -> protocol::Capabilities {
+    match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|account| account.key == world.account()).unwrap().can,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A picture's description arrives as its alt text, and a description we type is sent with the
+/// message, clipped, and not with the upload request.
+#[test]
+fn an_image_description_is_kept_on_the_way_in_and_sent_on_the_way_out() {
+    let world = polished();
+    assert!(can(&world).alt_text);
+    open_channel(&world, "4101");
+    let picture = |id: &str, name: &str, title: &str, description: &str| {
+        let url = format!("{}/media/attachments/4101/{id}/{name}", world.api);
+        let attached = json!({"id": id, "filename": name, "title": title, "description": description, "content_type": "image/png",
+            "width": 800, "height": 600, "size": 1200, "url": url, "proxy_url": url});
+        let message = world.incoming("4101", Some("4000"), "", json!({"attachments": [attached]}));
+        wait("the picture", || world.messages("4101").into_iter().find(|found| found.id == message)).attachments.remove(0)
+    };
+    let titled = picture("9301", "map.png", "Trail map", "the north ridge");
+    assert_eq!((titled.name.as_str(), titled.alt.as_str()), ("Trail map", "the north ridge"));
+    // A title of only spaces is no title: the file's own name stays.
+    let untitled = picture("9302", "ridge.png", "   ", "  fog on the ridge  ");
+    assert_eq!((untitled.name.as_str(), untitled.alt.as_str()), ("ridge.png", "fog on the ridge"));
+
+    let photo = staged(&world, "ridge.png", 1000);
+    let mut described = file(&photo, false);
+    described.alt = format!("{}{}", "é", "a".repeat(1024));
+    send_with(&world, "4101", "77010", "", None, protocol::Outgoing { files: vec![described], ..Default::default() });
+    world.outcome("4101", "77010");
+    let named = &world.discord.requests_to("POST", "/channels/4101/attachments")[0].body["files"][0];
+    assert!(named.get("description").is_none(), "the upload request does not carry a description: {named}");
+    let posted = &world.discord.requests_to("POST", "/channels/4101/messages")[0].body["attachments"][0];
+    let description = posted["description"].as_str().unwrap_or("");
+    assert_eq!(description.chars().count(), 1024);
+    assert!(description.starts_with('é'), "{description}");
+
+    let plain = staged(&world, "notes.txt", 4);
+    send_with(&world, "4101", "77011", "", None, protocol::Outgoing { files: vec![file(&plain, false)], ..Default::default() });
+    world.outcome("4101", "77011");
+    let posted = &world.discord.requests_to("POST", "/channels/4101/messages")[1].body["attachments"][0];
+    assert!(posted.get("description").is_none(), "an empty description is left off: {posted}");
+}
+
+/// A CI bot's embeds keep what they said: the author and its picture, the title's link, a
+/// masked link in the description, which fields share a row, the thumbnail, the footer's
+/// picture and time, and every embed of the message, with a repeated address as one gallery.
+#[test]
+fn a_bots_embeds_keep_their_links_author_pictures_time_and_every_embed() {
+    let world = polished();
+    open_channel(&world, "4101");
+    let proxied = |name: &str| format!("{}/media/external/{name}", world.api);
+    let picture = |name: &str| json!({"url": format!("https://ci.example/{name}"), "proxy_url": proxied(name), "width": 800, "height": 400});
+    let bot = json!({"id": "2900", "username": "ci", "global_name": null, "discriminator": "0000", "avatar": null, "bot": true});
+    let embeds = json!([
+        {
+            "type": "rich",
+            "url": "https://ci.example/runs/812",
+            "title": "Build **#812** passed",
+            "description": "[View run](https://ci.example/runs/812/log) on `main`",
+            "color": 0x2ecc71,
+            "timestamp": "2026-10-13T08:15:00.000000+00:00",
+            "author": {"name": "Rustaceans CI", "url": "https://ci.example", "icon_url": "https://ci.example/a.png", "proxy_icon_url": proxied("author.png")},
+            "thumbnail": picture("thumb.png"),
+            "image": picture("one.png"),
+            "footer": {"text": "ci.example", "icon_url": "https://ci.example/f.png", "proxy_icon_url": proxied("footer.png")},
+            "fields": [
+                {"name": "Duration", "value": "3m 12s", "inline": true},
+                {"name": "Branch", "value": "main", "inline": true},
+                {"name": "Commit", "value": "4f2a9c1 fix the flaky test"},
+            ],
+        },
+        // The same address again: one more picture of the first card, not a card of its own.
+        {"type": "rich", "url": "https://ci.example/runs/812", "image": picture("two.png")},
+        {"type": "rich", "title": "Coverage", "description": "81.4%", "author": {"name": "Unproxied", "icon_url": "https://elsewhere.example/a.png"}},
+    ]);
+    let id = world.incoming("4101", Some("4000"), "", json!({"author": bot, "embeds": embeds}));
+    let message = wait("the bot's message", || world.messages("4101").into_iter().find(|message| message.id == id));
+    let cards: Vec<&protocol::Card> = message.all_cards().collect();
+    assert_eq!(cards.len(), 2, "{cards:?}");
+    let run = cards[0];
+    assert_eq!((run.author.as_str(), run.author_link.as_str()), ("Rustaceans CI", "https://ci.example"));
+    assert_eq!((run.title.as_str(), run.title_link.as_str()), ("Build #812 passed", "https://ci.example/runs/812"));
+    assert_eq!(run.text, "View run on main");
+    let linked: Vec<&str> = run.text_spans.iter().filter_map(|span| match &span.style {
+        Style::Link { url } if url == "https://ci.example/runs/812/log" => Some(&run.text[span.start as usize..span.end as usize]),
+        _ => None,
+    }).collect();
+    assert_eq!(linked, ["View run"]);
+    assert!(run.text_spans.iter().any(|span| span.style == Style::Code && &run.text[span.start as usize..span.end as usize] == "main"));
+    assert_eq!(run.fields.len(), 3);
+    assert_eq!(run.inline, [true, true, false]);
+    assert_eq!((run.footer.as_str(), run.time), ("ci.example", Some(1_791_879_300)));
+    assert_eq!(run.color, Some(0x2ecc71));
+    let (author_icon, footer_icon, thumbnail) = (run.author_icon.as_ref().unwrap(), run.footer_icon.as_ref().unwrap(), run.thumbnail.as_ref().unwrap());
+    // Both pictures of the gallery ride under the card.
+    assert_eq!(message.previews.len(), 2, "{:?}", message.previews);
+    assert!(message.previews.iter().all(|preview| preview.image.is_some() && preview.title.is_empty()));
+
+    let coverage = cards[1];
+    assert_eq!((coverage.author.as_str(), coverage.title.as_str(), coverage.text.as_str()), ("Unproxied", "Coverage", "81.4%"));
+    assert!(coverage.author_icon.is_none() && coverage.inline.is_empty(), "a picture Discord does not proxy is never fetched");
+
+    // Every picture comes from Discord's proxy, and only once it is asked for.
+    settled(&world);
+    assert!(world.discord.requests_to("GET", "/media/external/author.png").is_empty());
+    for (file, path) in [(author_icon, "author.png"), (footer_icon, "footer.png"), (thumbnail, "thumb.png")] {
+        world.fetched(&file.id, None, false);
+        assert_eq!(world.discord.requests_to("GET", &format!("/media/external/{path}")).len(), 1, "{path}");
+    }
+    let asked: Vec<String> = world.discord.requests.lock().unwrap().iter().map(|seen| seen.path.clone()).collect();
+    assert!(!asked.iter().any(|path| path.contains("elsewhere") || path.contains("ci.example")), "{asked:?}");
+}
+
+/// Whether a change like `wanted` has been told since `seq`.
+fn told(world: &World, seq: u64, wanted: &Change) -> bool {
+    match world.ask(Request::Wait { since: seq }) {
+        Response::Changes { changes, .. } => changes.contains(wanted),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A pin goes to the route the pins are read from, or to the older one where Discord has no
+/// such route; the shell hears that the pins changed, from us or anyone; and the list is read
+/// page after page.
+#[test]
+fn pinning_takes_either_route_tells_the_pins_list_and_the_list_is_read_in_pages() {
+    let world = polished();
+    let general = world.key("4101");
+    let plan = "1300000000000000100";
+    wait("the channel's history", || world.messages("4101").into_iter().find(|message| message.id == plan));
+    // Offered in every DM, and in a server channel only with Pin Messages or Manage Messages.
+    assert!(can(&world).pins && world.conversation("3001").rights.pin && !world.conversation("4101").rights.pin);
+    let pin = |pinned: bool| world.ask(Request::Pin { conversation: general.clone(), message_id: plan.into(), pinned, notify: false, me_only: false });
+    let pinned_in_store = |want: bool| {
+        wait("the message to follow", || world.messages("4101").into_iter().find(|message| message.id == plan && message.pinned == want));
+    };
+
+    let seq = world.status().4;
+    assert_eq!(pin(true), Response::Ok);
+    pinned_in_store(true);
+    assert_eq!(world.discord.requests_to("PUT", &format!("/channels/4101/messages/pins/{plan}")).len(), 1);
+    assert!(world.discord.requests_to("PUT", "/channels/4101/pins/").is_empty(), "the older route is only the fallback");
+    wait("the pins list to be told", || told(&world, seq, &Change::Pins { conversation: general.clone() }).then_some(()));
+
+    // A server without the newer route answers 404: the older one is tried, once.
+    world.discord.script(&format!("/channels/4101/messages/pins/{plan}"), 404, json!({"message": "404: Not Found", "code": 0}));
+    assert_eq!(pin(false), Response::Ok);
+    pinned_in_store(false);
+    assert_eq!(world.discord.requests_to("DELETE", &format!("/channels/4101/pins/{plan}")).len(), 1);
+
+    // Someone else pins in a channel: nothing is fetched, the shell is only told.
+    let seq = world.status().4;
+    let before = world.discord.requests_to("GET", "/channels/4101/messages/pins").len();
+    world.discord.push("CHANNEL_PINS_UPDATE", json!({"channel_id": "4101", "guild_id": "4000", "last_pin_timestamp": null}));
+    wait("the pins list to be told again", || told(&world, seq, &Change::Pins { conversation: general.clone() }).then_some(()));
+    settled(&world);
+    assert_eq!(world.discord.requests_to("GET", "/channels/4101/messages/pins").len(), before);
+
+    // What Discord refuses is said, and the message stays as it was.
+    world.discord.forbidden.lock().unwrap().push("/channels/4101/messages/pins/".to_owned());
+    assert!(matches!(pin(true), Response::Error { .. }));
+    world.discord.forbidden.lock().unwrap().clear();
+    assert!(!world.messages("4101").into_iter().find(|message| message.id == plan).unwrap().pinned);
+
+    // Two pages: the second is asked for with the first's oldest pin time, escaped.
+    let page = |ids: std::ops::Range<u64>, at: &str, more: bool| {
+        let items: Vec<Value> = ids
+            .map(|id| {
+                let message = json!({
+                    "id": format!("13000000000000{id:05}"), "channel_id": "4101", "type": 0, "author": me(), "content": format!("pin {id}"),
+                    "timestamp": "2026-10-13T08:15:00.000000+00:00", "edited_timestamp": null, "mentions": [], "mention_roles": [],
+                    "mention_everyone": false, "attachments": [], "embeds": [], "pinned": true,
+                });
+                json!({"pinned_at": at, "message": message})
+            })
+            .collect();
+        json!({"items": items, "has_more": more})
+    };
+    world.discord.script("/channels/4101/messages/pins", 200, page(0..50, "2026-10-12T09:00:00.000000+00:00", true));
+    world.discord.script("/channels/4101/messages/pins", 200, page(50..60, "2026-10-11T09:00:00.000000+00:00", false));
+    let asked = world.discord.requests_to("GET", "/channels/4101/messages/pins").len();
+    let pins = match world.ask(Request::Pinned { conversation: general.clone() }) {
+        Response::Pinned { messages, .. } => messages,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(pins.len(), 60);
+    assert!(pins.iter().all(|message| message.pinned));
+    assert_eq!((pins[0].text.as_str(), pins[59].text.as_str()), ("pin 0", "pin 59"));
+    let pages = world.discord.requests_to("GET", "/channels/4101/messages/pins");
+    assert_eq!(pages.len(), asked + 2);
+    assert!(pages[asked].path.ends_with("pins?limit=50"), "{}", pages[asked].path);
+    assert!(pages[asked + 1].path.ends_with("pins?limit=50&before=2026-10-12T09%3A00%3A00.000000%2B00%3A00"), "{}", pages[asked + 1].path);
 }

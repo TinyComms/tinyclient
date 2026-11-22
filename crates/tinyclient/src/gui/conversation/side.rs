@@ -1897,6 +1897,11 @@ impl Shell {
             return;
         }
         side.pins = Some(Pins { conversation: conversation.clone(), messages: None });
+        self.read_pins(conversation, cx);
+    }
+
+    /// Asks the network for the pins. What is listed stays until the answer replaces it.
+    fn read_pins(&mut self, conversation: &Key, cx: &mut Context<Self>) {
         let request = Request::Pinned { conversation: conversation.clone() };
         let conversation = conversation.clone();
         cx.spawn(async move |this, cx| {
@@ -1920,8 +1925,9 @@ impl Shell {
     /// A pin was clicked: the conversation shows it, as a reply quote would.
     /// Reloads the pins pane if it is currently showing `conversation`.
     pub(in crate::gui) fn refresh_pins(&mut self, conversation: &Key, cx: &mut Context<Self>) {
+        // Asked again here: opening the pane a second time reads nothing, its list is already held.
         if self.conversation_state.side.pins.as_ref().is_some_and(|pins| pins.conversation == *conversation) {
-            self.open_pins(cx);
+            self.read_pins(conversation, cx);
         }
     }
 

@@ -389,6 +389,10 @@ impl GuildInfo {
         let (locked, read_only_reason) = self.lock_reason(clock, me);
         let read_only = locked || (written && perms & SEND_MESSAGES == 0);
         let rights = protocol::ConversationRights {
+            set_voice_status: channel.kind == model::VOICE && timed_out.is_none() && perms & model::SET_VOICE_CHANNEL_STATUS != 0,
+            voice_mute: channel.is_voice() && timed_out.is_none() && perms & model::MUTE_MEMBERS != 0,
+            voice_deafen: channel.is_voice() && timed_out.is_none() && perms & model::DEAFEN_MEMBERS != 0,
+            voice_move: channel.is_voice() && timed_out.is_none() && perms & model::MOVE_MEMBERS != 0,
             pin: timed_out.is_none() && (perms & (MANAGE_MESSAGES | PIN_MESSAGES) != 0),
             delete_others: timed_out.is_none() && (perms & MANAGE_MESSAGES != 0),
             manage_members: timed_out.is_none() && (perms & (KICK_MEMBERS | BAN_MEMBERS | MANAGE_ROLES) != 0),
@@ -1003,6 +1007,8 @@ impl Discord {
         }
         let mut row = ConversationRow::new(&channel.id, kind, names.join(", "));
         row.call = super::private_call(false);
+        // Anyone in a DM or a group DM may pin there; a server channel asks its permissions.
+        row.rights.pin = true;
         // Unverified against a real account: the flags are the community's names. A request
         // and one Discord judged spam both wait behind Message Requests.
         if channel.is_message_request || channel.is_spam {
@@ -1207,6 +1213,7 @@ impl Discord {
             edit_window: 0,
             file_scan: false,
             allow_archives: false,
+            alt_text: true,
             voice_notes: true,
             direct_calls: false,
             revisions: false,
@@ -1221,7 +1228,9 @@ impl Discord {
             pins: true,
             forward: true,
             abuse_reports: true,
-            polls: None,
+            polls: Some(protocol::PollCapabilities {
+                max_options: 10, max_duration_secs: 7 * 24 * 3600, multiple: true, anonymous: false,
+            }),
             reactions: true,
             reactors: true,
             gif_file: false,

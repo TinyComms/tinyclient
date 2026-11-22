@@ -3431,7 +3431,7 @@ fn files_go_up_from_their_paths_and_the_socket_names_the_message() {
     let path = dir.join("notes.txt");
     std::fs::write(&path, b"abc").unwrap();
     let with = protocol::Outgoing {
-        files: vec![protocol::OutgoingFile { path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: false, as_file: false, original: false, view_once: false, media: None }],
+        files: vec![protocol::OutgoingFile { alt: String::new(), path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: false, as_file: false, original: false, view_once: false, media: None }],
         ..Default::default()
     };
     let asked = Request::Send { conversation: alpha("C0GEN"), client_id: "71".into(), text: "the notes".into(), reply_to: None, with };
@@ -7212,6 +7212,7 @@ fn slack_records_and_sends_audio_and_video_clips() {
     std::fs::write(&audio_path, b"OggS-fake-audio").unwrap();
     let with_audio = protocol::Outgoing {
         files: vec![protocol::OutgoingFile {
+            alt: String::new(),
             path: audio_path.to_string_lossy().into_owned(),
             name: String::new(),
             spoiler: false,

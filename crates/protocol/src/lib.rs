@@ -3040,6 +3040,13 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         votes: Option<Vec<u32>>,
     },
+    PollVoters {
+        conversation: Key,
+        message_id: String,
+        choice: u32,
+        #[serde(default)]
+        after: Option<String>,
+    },
 
     /// Custom emoji, stickers or GIFs for the picker, asked when its tab opens and never before,
     /// kept five minutes. `space` narrows custom emoji to one Space's; `query` searches;
@@ -3177,6 +3184,27 @@ pub enum Request {
         network: Network,
     },
 
+    /// Sets or clears the ephemeral status of a voice channel.
+    SetVoiceChannelStatus {
+        conversation: Key,
+        status: Option<String>,
+    },
+    DiscordVoiceSettings { conversation: Key },
+    EditDiscordVoiceChannel { conversation: Key, edit: DiscordChannelVoice },
+    SetDiscordCallRegion { conversation: Key, region: String },
+    /// Changes server mute or deafen for a participant in a server voice channel.
+    CallModerate {
+        conversation: Key,
+        person: Key,
+        server_muted: Option<bool>,
+        server_deafened: Option<bool>,
+    },
+    /// Moves a participant from their voice channel, or disconnects them when `to` is absent.
+    CallMove {
+        conversation: Key,
+        person: Key,
+        to: Option<Key>,
+    },
     /// Joins or rings. Starts mediad. One call at a time. Refused with `Unsupported`, and no
     /// mediad, unless the conversation's `call` is `Native`.
     CallStart {
@@ -4146,6 +4174,9 @@ pub enum Change {
     /// Rows of a conversation's member list were added, removed or moved: ask `Members` again
     /// for the rows on screen.
     Members { conversation: Key },
+    /// Something was pinned or unpinned in a conversation, by anyone: ask `Pinned` again if its
+    /// pins are on screen.
+    Pins { conversation: Key },
     /// A requested file is on disk (`path`), or could not be fetched (`failed` says why).
     Media { account: AccountKey, file: MediaFile },
     /// Ephemeral. Who is in a voice channel now; no people and a total of 0 when it emptied.
@@ -4231,6 +4262,7 @@ impl Change {
             | (Change::Messages { conversation: a }, Change::Messages { conversation: b })
             | (Change::Typing { conversation: a, .. }, Change::Typing { conversation: b, .. })
             | (Change::Members { conversation: a }, Change::Members { conversation: b })
+            | (Change::Pins { conversation: a }, Change::Pins { conversation: b })
             | (Change::Occupants { conversation: a, .. }, Change::Occupants { conversation: b, .. })
             | (Change::Tree { space: a }, Change::Tree { space: b })
             | (Change::Events { space: a }, Change::Events { space: b })
@@ -4356,6 +4388,8 @@ pub fn language_name(tag: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Response {
+    PollVoters { voters: Vec<Reactor>, more: bool },
+    DiscordVoiceSettings { settings: DiscordVoiceSettings },
     Pong,
     /// Done, with nothing to say.
     Ok,
@@ -5638,6 +5672,10 @@ mod tests {
         assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&set_as).unwrap()).unwrap(), set_as);
 
         let all = ConversationRights {
+            set_voice_status: true,
+            voice_mute: true,
+            voice_deafen: true,
+            voice_move: true,
             pin: true,
             delete_others: true,
             manage_members: true,

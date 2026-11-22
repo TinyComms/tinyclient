@@ -438,6 +438,8 @@ impl Shell {
                     }
                 }
             }
+            // Someone pinned or unpinned: a pins list that is open reads itself again.
+            Change::Pins { conversation } => self.refresh_pins(conversation, cx),
             Change::Members { conversation } => {
                 if let Some(members) = state.members.get() {
                     members.update(cx, |members, cx| members.members_changed(conversation, cx));

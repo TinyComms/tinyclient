@@ -917,6 +917,8 @@ impl Demo {
                 };
                 let _ = reply.send(Ok(link));
             }
+            Command::DiscordVoiceSettings { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::PollVoters { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallJoin(conversation_id) => Demo::call_join(demo, &conversation_id),
             Command::CallLeave(conversation_id) => demo.call_leave(&conversation_id),
             Command::CallPicture(_) => {}
@@ -1410,7 +1412,12 @@ impl Demo {
             Command::SetSpaceOptions { reply, .. } | Command::SetSpacePrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::GetNetworkPrivacy { reply } | Command::SetNetworkPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CreateCategory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::EditChannel { reply, .. }
+            Command::SetVoiceChannelStatus { reply, .. }
+            | Command::EditDiscordVoiceChannel { reply, .. }
+            | Command::SetDiscordCallRegion { reply, .. }
+            | Command::CallModerate { reply, .. }
+            | Command::CallMove { reply, .. }
+            | Command::EditChannel { reply, .. }
             | Command::MoveChannels { reply, .. }
             | Command::DeleteChannel { reply, .. }
             | Command::SetOverwrite { reply, .. }

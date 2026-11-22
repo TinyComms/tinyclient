@@ -6,6 +6,29 @@
 use crate::{is_false, Key, Network};
 use serde::{Deserialize, Serialize};
 
+/// The settings Discord returns when a voice channel editor is opened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscordChannelVoice {
+    pub bitrate: u32,
+    pub user_limit: u32,
+    pub rtc_region: Option<String>,
+    pub video_quality_mode: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscordVoiceRegion {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscordVoiceSettings {
+    pub channel: Option<DiscordChannelVoice>,
+    pub max_bitrate: u32,
+    pub regions: Vec<DiscordVoiceRegion>,
+    pub current_region: Option<String>,
+}
+
 /// One entry in a network's recent calls list (`Request::CallHistory`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallLogEntry {

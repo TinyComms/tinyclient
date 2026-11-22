@@ -537,6 +537,7 @@ struct PollComposer {
     multiple: bool,
     allow_multiple: bool,
     max_options: usize,
+    duration_secs: Option<u32>,
 }
 
 struct ThreadComposer {
@@ -675,6 +676,8 @@ pub struct Composer {
     tray: Vec<Staged>,
     next_chip: u64,
     chip_menu: Option<u64>,
+    /// The chip whose description is being typed, and the field.
+    alt_for: Option<(u64, Entity<TextInput>)>,
     thumbs: Images,
     drag: Option<DragOver>,
     // The picker and `:`.
@@ -952,6 +955,7 @@ impl Composer {
             tray: Vec::new(),
             next_chip: 1,
             chip_menu: None,
+            alt_for: None,
             // Chips and the `:` list are small: each moving one holds little.
             thumbs: Images::with_limits(crate::frames::SMALL),
             drag: None,
@@ -1579,6 +1583,7 @@ impl Composer {
         self.thread_settings = None;
         self.close_picker(cx);
         self.chip_menu = None;
+        self.alt_for = None;
         let files = std::mem::take(&mut self.tray);
         let Some(old) = self.target.as_ref().map(|old| old.key.clone()) else {
             return;
@@ -3280,6 +3285,7 @@ impl Composer {
             multiple: false,
             allow_multiple: caps.multiple,
             max_options,
+            duration_secs: self.target.as_ref().filter(|target| target.key.network == Network::Discord).map(|_| 24 * 3600),
         });
         cx.notify();
     }
@@ -3301,6 +3307,7 @@ impl Composer {
             question: question.clone(),
             options,
             multiple: form.multiple && form.allow_multiple,
+            duration_secs: form.duration_secs,
             ..protocol::PollDraft::default()
         };
         self.poll_composer = None;
@@ -3417,6 +3424,22 @@ impl Composer {
                     .child(if mult { "☑ Multiple choices" } else { "☐ Multiple choices" }),
             );
         }
+        if let Some(duration) = form.duration_secs {
+            let choices = [(1, "1 hour"), (4, "4 hours"), (8, "8 hours"), (24, "1 day"), (72, "3 days"), (168, "1 week")];
+            left = left.child(div()
+                .id("poll-duration")
+                .type_small()
+                .text_color(theme::accent())
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(form) = this.poll_composer.as_mut() {
+                        let ix = choices.iter().position(|(hours, _)| *hours * 3600 == duration).unwrap_or(0);
+                        form.duration_secs = Some(choices[(ix + 1) % choices.len()].0 * 3600);
+                        cx.notify();
+                    }
+                }))
+                .child(format!("Duration · {}", choices.iter().find(|(hours, _)| *hours * 3600 == duration).map_or("1 day", |(_, label)| *label))));
+        }
         footer = footer.child(left).child(
             div()
                 .flex()
@@ -3520,6 +3543,9 @@ impl Composer {
             delete_later(chip.made());
         }
         self.chip_menu = None;
+        if self.alt_for.as_ref().is_some_and(|(open, _)| !self.tray.iter().any(|chip| chip.id == *open)) {
+            self.alt_for = None;
+        }
         self.caption = None;
         self.focus_next = true;
         cx.notify();

@@ -1478,6 +1478,7 @@ fn message(account: &Account, note: &bugle::Note, page: &[bugle::Note]) -> Messa
         let described = if still { &[][..] } else { piece.inline.as_slice() };
         let (duration, waveform) = facts(&piece.mime, described);
         shown.push(Attachment {
+            alt: String::new(),
             name: label,
             file,
             thumb,
@@ -2751,6 +2752,7 @@ fn deliver_files(
             let _ = std::fs::remove_file(tmp);
         }
         attachments.push(Attachment {
+            alt: String::new(),
             name: part.name.clone(),
             file,
             thumb: None,

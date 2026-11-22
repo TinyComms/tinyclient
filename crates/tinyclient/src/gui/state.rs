@@ -181,6 +181,7 @@ impl Dirty {
             | Change::Ephemeral { .. }
             | Change::Presence { .. }
             | Change::Members { .. }
+            | Change::Pins { .. }
             | Change::Occupants { .. }
             | Change::Searched { .. }
             | Change::SignIn { .. }

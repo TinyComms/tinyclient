@@ -287,6 +287,12 @@ impl Shell {
         } else {
             "icons/phone.svg"
         };
+        let voice_row = snapshot.open.as_ref().filter(|row| row.key == call.conversation).cloned()
+            .or_else(|| self.sidebar_state.find(&self.trees, &call.conversation));
+        let voice_status = voice_row.as_ref().and_then(crate::gui::sidebar::discord_voice_status);
+        let voice_details = call.conversation.network == Network::Discord && call.state == CallState::Joined
+            && subject.kind == ConversationKind::Voice;
+        let details_key = call.conversation.clone();
         let title_row = div()
             .flex_1()
             .min_w_0()
@@ -309,6 +315,7 @@ impl Shell {
                     .child(subject.title.clone()),
             )
             .children(place_chip)
+            .children(voice_status.map(|status| self.voice_status_line(&call.conversation, &status, cx)))
             .child(chip(count_label, theme::text_soft(), theme::hover()))
             .children(self.call_security(&call, Place::TopBar, cx));
         let add_people = can_add_people.then(|| {
@@ -334,6 +341,9 @@ impl Shell {
             .gap(px(8.))
             .when(!phone, |bar| bar.child(self.strip_controls(window, cx)))
             .child(title_row)
+            .children(voice_details.then(|| icon_button("call-voice-region", "icons/info.svg", false)
+                .tooltip(tip("Connection details", None))
+                .on_click(cx.listener(move |this, _, _, cx| this.open_discord_voice_settings(details_key.clone(), false, cx)))))
             .children(add_people);
 
         let held = if call.server_muted {

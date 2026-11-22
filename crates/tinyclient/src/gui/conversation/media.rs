@@ -291,6 +291,20 @@ pub enum Tone {
     Neutral,
 }
 
+/// A card's last line: its footer, then the time it names, with a dot between when both are there.
+pub fn card_footer(card: &protocol::Card, stamp: impl Fn(i64) -> String) -> String {
+    let time = card.time.map(stamp).unwrap_or_default();
+    match (card.footer.is_empty(), time.is_empty()) {
+        (false, false) => format!("{} \u{2022} {time}", card.footer),
+        _ => format!("{}{time}", card.footer),
+    }
+}
+
+/// Whether a card's field shares its row. A card that does not say (`inline` empty) lets all of them.
+pub fn card_field_inline(card: &protocol::Card, index: usize) -> bool {
+    card.inline.get(index).copied().unwrap_or(true)
+}
+
 /// Snaps `0xRRGGBB` to the nearest of the three semantic colors, or to none for a grey, so a
 /// card never brings a network's palette into the conversation.
 pub fn card_tone(color: Option<u32>) -> Tone {
@@ -399,6 +413,7 @@ mod tests {
     #[test]
     fn an_attachment_is_drawn_by_what_it_is() {
         let attachment = |name: &str, kind, mime: &str, thumb: bool, duration| Attachment {
+            alt: String::new(),
             spoiler: false,
             sticker: false,
             waveform: Vec::new(),
@@ -496,5 +511,20 @@ mod tests {
         assert_eq!(card_tone(Some(0x5865f2)), Tone::Neutral);
         assert_eq!(card_tone(Some(0x808080)), Tone::Neutral);
         assert_eq!(card_tone(None), Tone::Neutral);
+    }
+
+    #[test]
+    fn a_card_says_its_footer_then_its_time_and_which_fields_take_a_whole_row() {
+        let stamp = |unix: i64| format!("at {unix}");
+        let mut card = protocol::Card { footer: "ci.example".into(), time: Some(7), ..protocol::Card::default() };
+        assert_eq!(card_footer(&card, stamp), "ci.example \u{2022} at 7");
+        card.footer.clear();
+        assert_eq!(card_footer(&card, stamp), "at 7");
+        card.time = None;
+        assert_eq!(card_footer(&card, stamp), "");
+        // Every field shares its row unless the card says which do not.
+        assert!(card_field_inline(&card, 0) && card_field_inline(&card, 9));
+        card.inline = vec![true, false];
+        assert!(card_field_inline(&card, 0) && !card_field_inline(&card, 1) && card_field_inline(&card, 2));
     }
 }

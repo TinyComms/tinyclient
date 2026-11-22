@@ -28,6 +28,7 @@ mod commands;
 mod interactions;
 mod members;
 mod model;
+mod polls;
 mod picker;
 mod proto;
 mod ready;
@@ -1772,7 +1773,11 @@ impl Discord {
 
     fn pin(&self, channel: &str, message: &str, pinned: bool) -> Result<(), Refusal> {
         let method = if pinned { "PUT" } else { "DELETE" };
-        self.call(method, &format!("/channels/{channel}/pins/{message}"), None).map_err(refusal)?;
+        // The route the pins are read from; a server that does not have it yet takes the older one.
+        match self.call(method, &format!("/channels/{channel}/messages/pins/{message}"), None) {
+            Err(Refused::Status { status: 404, .. }) => self.call(method, &format!("/channels/{channel}/pins/{message}"), None).map_err(refusal)?,
+            other => other.map_err(refusal)?,
+        };
         self.ctx.pinned(channel, message, pinned).map_err(|err| Refusal::Refused(err.to_string()))
     }
 
@@ -4197,6 +4202,31 @@ impl Discord {
             }
             Command::Download { id, url, reply } => self.download(id, url, reply),
             Command::Handoff { conversation_id, reply } => drop(reply.send(self.handoff(&conversation_id))),
+            Command::Vote { conversation_id, message_id, votes, reply } => {
+                answer(reply, self.vote_poll(&conversation_id, &message_id, votes))
+            }
+            Command::SendRules { conversation_id, reply } => answer(reply, self.poll_send_rules(&conversation_id)),
+            Command::PollVoters { conversation_id, message_id, choice, after, reply } => {
+                answer(reply, self.poll_voters(&conversation_id, &message_id, choice, after.as_deref()))
+            }
+            Command::DiscordVoiceSettings { conversation_id, reply } => {
+                answer(reply, self.discord_voice_settings(&conversation_id))
+            }
+            Command::EditDiscordVoiceChannel { conversation_id, edit, reply } => {
+                answer(reply, self.edit_discord_voice_channel(&conversation_id, edit))
+            }
+            Command::SetDiscordCallRegion { conversation_id, region, reply } => {
+                answer(reply, self.set_discord_call_region(&conversation_id, &region))
+            }
+            Command::SetVoiceChannelStatus { conversation_id, status, reply } => {
+                answer(reply, self.set_voice_status(&conversation_id, status))
+            }
+            Command::CallModerate { conversation_id, person_id, server_muted, server_deafened, reply } => {
+                answer(reply, self.moderate_voice(&conversation_id, &person_id, server_muted, server_deafened))
+            }
+            Command::CallMove { conversation_id, person_id, to, reply } => {
+                answer(reply, self.move_in_voice(&conversation_id, &person_id, to.as_deref()))
+            }
             Command::CallJoin(conversation_id) => self.call_join(&conversation_id),
             Command::CallLeave(conversation_id) => self.call_leave(&conversation_id),
             Command::CallAudio { muted, deafened } => self.call_audio(muted, deafened),

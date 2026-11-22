@@ -576,6 +576,7 @@ fn a_file_we_send_is_read_and_shown_back() {
         reply_to: None,
         with: Outgoing {
             files: vec![OutgoingFile {
+                alt: String::new(),
                 path: path.to_string_lossy().into_owned(),
                 name: "note.txt".into(),
                 spoiler: false,
@@ -621,6 +622,7 @@ fn a_file_we_send_is_read_and_shown_back() {
         reply_to: None,
         with: Outgoing {
             files: vec![OutgoingFile {
+                alt: String::new(),
                 path: photo.to_string_lossy().into_owned(),
                 name: "shot.jpg".into(),
                 spoiler: false,
@@ -672,6 +674,7 @@ fn a_mov_is_sent_as_a_video() {
         reply_to: None,
         with: Outgoing {
             files: vec![OutgoingFile {
+                alt: String::new(),
                 path: path.to_string_lossy().into_owned(),
                 name: "clip.mov".into(),
                 spoiler: false,
@@ -728,6 +731,7 @@ fn three_files_are_one_message_and_a_cancel_stops_the_send() {
         let path = dir.join(name);
         std::fs::write(&path, bytes).unwrap();
         files.push(OutgoingFile {
+            alt: String::new(),
             path: path.to_string_lossy().into_owned(),
             name: name.into(),
             spoiler: false,
@@ -808,6 +812,7 @@ fn three_files_are_one_message_and_a_cancel_stops_the_send() {
         reply_to: None,
         with: Outgoing {
             files: vec![OutgoingFile {
+                alt: String::new(),
                 path: later.to_string_lossy().into_owned(),
                 name: "later.txt".into(),
                 spoiler: false,
@@ -1055,6 +1060,7 @@ fn an_sms_chat_says_text_and_an_encrypted_rcs_chat_does_not_claim_this_computer_
         reply_to: None,
         with: Outgoing {
             files: vec![OutgoingFile {
+                alt: String::new(),
                 path: path.to_string_lossy().into_owned(),
                 name: "note.txt".into(),
                 spoiler: false,
@@ -1242,6 +1248,7 @@ fn an_rcs_reply_quotes_the_original_and_an_sms_reply_stays_plain() {
         reply_to: Some(original.id.clone()),
         with: Outgoing {
             files: vec![OutgoingFile {
+                alt: String::new(),
                 path: path.to_string_lossy().into_owned(),
                 name: "note.txt".into(),
                 spoiler: false,
