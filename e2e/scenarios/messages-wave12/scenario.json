@@ -1,0 +1,12 @@
+{
+  "id": "messages-wave12",
+  "title": "Google Messages pairs by QR code with signing-key token renewal and works on mobile",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "The phone proof build does not run this chatd check.",
+    "ios": "The phone proof build does not run this chatd check."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

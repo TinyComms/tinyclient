@@ -219,6 +219,29 @@ pub fn cancel() {
     }
 }
 
+/// Checks the dual-mode Google + QR sign-in state transitions for `TINYCLIENT_PROVE=messages-wave12`.
+pub(super) fn prove_messages_qr_state_machine() -> Result<(), String> {
+    let store = crate::store::Store::open(std::path::Path::new(":memory:"))
+        .map_err(|err| format!("failed to open memory store: {err}"))?;
+    let hub = Arc::new(Hub::new(store));
+    let begin = step(&hub, None, Box::new(|_| Ok(Vec::new())))?;
+    if !matches!(begin, SignInStep::Browser { waiting: false, .. }) {
+        cancel();
+        return Err(format!("expected initial choice step, got {begin:?}"));
+    }
+    let qr = step(&hub, Some(SignInInput::UseQr), Box::new(|_| Ok(Vec::new())))?;
+    if !matches!(qr, SignInStep::Qr { .. }) {
+        cancel();
+        return Err(format!("UseQr did not transition to Qr step: {qr:?}"));
+    }
+    let back = step(&hub, Some(SignInInput::Back), Box::new(|_| Ok(Vec::new())))?;
+    cancel();
+    if !matches!(back, SignInStep::Browser { waiting: false, .. }) {
+        return Err(format!("Back from Qr did not return to choice step: {back:?}"));
+    }
+    Ok(())
+}
+
 impl Flow {
     fn step(&self) -> MutexGuard<'_, SignInStep> {
         self.step.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
