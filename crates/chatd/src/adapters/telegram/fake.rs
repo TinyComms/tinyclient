@@ -3613,6 +3613,47 @@ impl World {
                 make(101, "Personal", true, false, "Only private chats with contacts."),
             ]);
         }
+        // Who reacted, and who read: Odalys and Tobin reacted in the group and Odalys read it.
+        // Odalys shares when she read a private message, and Tobin's chat needs mine shared.
+        if let Some(request) = asked::<f::messages::GetMessageReactionsList>(body) {
+            let peer = input_who(&request.peer);
+            let emoji = match &request.reaction {
+                Some(tl::enums::Reaction::Emoji(emoji)) => emoji.emoticon.clone(),
+                Some(tl::enums::Reaction::CustomEmoji(custom)) => format!("e{}", custom.document_id),
+                Some(tl::enums::Reaction::Paid) => "paid".to_owned(),
+                _ => "all".to_owned(),
+            };
+            self.log(&format!("GetMessageReactionsList {} {} {emoji} offset={:?} limit={}", peer.text(), request.id, request.offset, request.limit));
+            let reactions = [ODALYS, TOBIN]
+                .into_iter()
+                .filter_map(|user| {
+                    Some(tl::enums::MessagePeerReaction::Reaction(tl::types::MessagePeerReaction {
+                        big: false,
+                        unread: false,
+                        my: false,
+                        peer_id: Who::User(user).peer(),
+                        date: t0() + 90,
+                        reaction: request.reaction.clone()?,
+                    }))
+                })
+                .collect::<Vec<_>>();
+            let found = tl::types::messages::MessageReactionsList { count: reactions.len() as i32, reactions, chats: chats(), users: users(), next_offset: None };
+            return answer(tl::enums::messages::MessageReactionsList::List(found));
+        }
+        if let Some(request) = asked::<f::messages::GetMessageReadParticipants>(body) {
+            let peer = input_who(&request.peer);
+            self.log(&format!("GetMessageReadParticipants {} {}", peer.text(), request.msg_id));
+            let read: Vec<tl::enums::ReadParticipantDate> = vec![tl::types::ReadParticipantDate { user_id: ODALYS, date: t0() + 100 }.into()];
+            return answer(read);
+        }
+        if let Some(request) = asked::<f::messages::GetOutboxReadDate>(body) {
+            let peer = input_who(&request.peer);
+            self.log(&format!("GetOutboxReadDate {} {}", peer.text(), request.msg_id));
+            if peer != Who::User(ODALYS) {
+                return Err(rpc(403, "YOUR_PRIVACY_RESTRICTED", None));
+            }
+            return answer(tl::enums::OutboxReadDate::Date(tl::types::OutboxReadDate { date: t0() + 100 }));
+        }
         if let Some(request) = asked::<f::messages::ToggleDialogPin>(body) {
             let tl::enums::InputDialogPeer::Peer(dialog) = &request.peer else {
                 return Err(rpc(400, "PEER_ID_INVALID", None));

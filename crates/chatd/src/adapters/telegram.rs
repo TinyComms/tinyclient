@@ -771,6 +771,8 @@ fn offline(ctx: &Context, command: Command) {
         Command::Reschedule { reply, .. } => drop(reply.send(Err(down()))),
         Command::Pinned { reply, .. } => drop(reply.send(Err(down()))),
         Command::Pin { reply, .. } | Command::UnpinAll { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Reactors { reply, .. } => drop(reply.send(Err(down()))),
+        Command::ReadBy { reply, .. } => drop(reply.send(Err(down()))),
         Command::Forward { reply, .. } => drop(reply.send(Err(down()))),
         Command::Report { reply, .. } => drop(reply.send(Err(down()))),
         Command::ReportReasons { reply, .. } => drop(reply.send(Err(down()))),
@@ -900,6 +902,16 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::ReactionRules { conversation_id, reply } => {
             let _ = reply.send(react::rules(account, &conversation_id).map_err(refused));
+        }
+        Command::Reactors { conversation_id, message_id, emoji, burst: _, after, limit, reply } => {
+            let _ = reply.send(react::reactors(account, &conversation_id, &message_id, &emoji, after, limit).map_err(refused));
+        }
+        Command::ReadBy { conversation_id, message_id, reply } => {
+            // The same name refuses a call elsewhere; here it is about read times.
+            let _ = reply.send(react::read_by(account, &conversation_id, &message_id).map_err(|fault| match fault.is("USER_PRIVACY_RESTRICTED") {
+                true => Refusal::Refused("This person does not share when they read messages.".to_owned()),
+                false => refused(fault),
+            }));
         }
         Command::StarsBalance { reply } => {
             let _ = reply.send(react::stars_balance(account).map_err(refused));

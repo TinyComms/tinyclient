@@ -4827,6 +4827,47 @@ fn a_chat_is_pinned_unpinned_archived_and_unarchived_on_telegram() {
 }
 
 #[test]
+fn who_reacted_and_who_read_a_message_are_asked_of_telegram_only_on_demand() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.reactors && can.read_by);
+    world.arrived("g8001", "20");
+    world.arrived("u7002", "12");
+    // Nothing is asked until a list is opened.
+    assert_eq!(world.called("GetMessageReactionsList") + world.called("GetMessageReadParticipants") + world.called("GetOutboxReadDate"), 0);
+
+    // The people behind one reaction, by name.
+    let reactors = |conversation: &str, id: &str| {
+        match world.ask(Request::Reactors { conversation: key(conversation), message_id: id.into(), emoji: "\u{1F44D}".into(), burst: false, after: None, limit: 100 }) {
+            Response::Reactors { reactors, more, .. } => (reactors.into_iter().map(|reactor| (reactor.key.id, reactor.name)).collect::<Vec<_>>(), more),
+            other => panic!("{other:?}"),
+        }
+    };
+    let (who, more) = reactors("g8001", "20");
+    assert_eq!(who, [("u7002".to_owned(), "Odalys Brandt".to_owned()), ("u7003".to_owned(), "Tobin Reyes".to_owned())]);
+    assert!(!more);
+    assert_eq!(world.called("GetMessageReactionsList g8001 20 \u{1F44D} offset=None limit=100"), 1, "{:?}", world.calls());
+    // A broadcast channel only counts: nobody is listed, and Telegram is not asked.
+    world.until("the channel's page", || world.message("c9001", "5"));
+    assert_eq!(reactors("c9001", "5"), (Vec::new(), false));
+    assert_eq!(world.called("GetMessageReactionsList c9001"), 0);
+
+    // Who read a message in the group, and when the other side of a private chat read one.
+    let read_by = |conversation: &str, id: &str| world.ask(Request::ReadBy { conversation: key(conversation), message_id: id.into() });
+    let Response::ReadBy { readers } = read_by("g8001", "20") else { panic!("no readers") };
+    assert_eq!(readers.iter().map(|reader| (reader.person.id.as_str(), reader.name.as_str(), reader.at)).collect::<Vec<_>>(), [("u7002", "Odalys Brandt", t0() + 100)]);
+    assert_eq!(world.called("GetMessageReadParticipants g8001 20"), 1);
+    let Response::ReadBy { readers } = read_by("u7002", "12") else { panic!("no read time") };
+    assert_eq!((readers.len(), readers[0].at), (1, t0() + 100));
+    // Telegram's refusal is said in words: read times are shared both ways or not at all.
+    match read_by("u7003", "1") {
+        Response::Error { detail, .. } => assert!(detail.starts_with("Telegram shows read times only if you share your own."), "{detail}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
 fn copy_link_is_filled_for_channels_and_forum_topics_and_not_for_private_chats() {
     let world = World::signed_in();
     world.connected();
