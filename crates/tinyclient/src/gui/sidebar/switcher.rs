@@ -94,6 +94,10 @@ pub struct Adding {
     pub group: bool,
     /// Already in and not removable: the direct's other person, or the group's members.
     pub fixed: Vec<Person>,
+    /// The picks join the call that is up, instead of only the conversation.
+    pub for_call: bool,
+    /// One line under the title, when the confirm does more than add members.
+    pub line: Option<String>,
 }
 
 /// The picker's rows: the server's people by what was typed, by name. Never the viewer, never a
@@ -125,8 +129,9 @@ pub fn toggle_added(picked: &mut Vec<Person>, fixed: &[Person], person: Person) 
 }
 
 /// The confirm button: a direct message makes (or finds) a group, a group takes more people.
-pub fn add_people_confirm(group: bool) -> &'static str {
-    if group { "Add people" } else { "Create group" }
+/// A call says so on its own.
+pub fn add_people_confirm(group: bool, for_call: bool) -> &'static str {
+    if for_call { "Add to call" } else if group { "Add people" } else { "Create group" }
 }
 
 pub struct Switcher {
@@ -521,7 +526,7 @@ impl Shell {
             None => Vec::new(),
         };
         let conversation = open.key.clone();
-        self.open_switcher_as("", Some(Adding { conversation: conversation.clone(), group, fixed }), window, cx);
+        self.open_switcher_as("", Some(Adding { conversation: conversation.clone(), group, fixed, for_call: false, line: None }), window, cx);
         if !group {
             return;
         }
@@ -544,6 +549,35 @@ impl Shell {
         });
     }
 
+    /// "Add people" on the call that is up. Who is already seated stays fixed. A direct says
+    /// that confirming moves the call into a group.
+    pub(in crate::gui) fn open_call_people(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ready = {
+            let Some(snapshot) = self.snapshot.as_ref() else { return };
+            let Some(call) = self.call_shown(snapshot) else { return };
+            let account = call.conversation.account();
+            let row = snapshot.open.as_ref().filter(|open| open.key == call.conversation).cloned()
+                .or_else(|| self.sidebar_state.find(&self.trees, &call.conversation));
+            let group = row.as_ref().is_some_and(|row| row.kind == ConversationKind::Group);
+            let mut fixed: Vec<Person> = call.participants.iter().map(|who| Person::new(Key::new(&account, &who.id), who.name.clone())).collect();
+            if let Some(peer) = row.as_ref().and_then(|row| row.peer.clone()).filter(|id| !id.is_empty() && !group) {
+                if !fixed.iter().any(|person| person.key.id == peer) {
+                    let name = row.as_ref().map(|row| row.title.clone()).filter(|name| !name.is_empty()).unwrap_or_else(|| "Them".to_owned());
+                    fixed.push(Person::new(Key::new(&account, peer), name));
+                }
+            }
+            let line = if group {
+                None
+            } else {
+                let peer = fixed.first().map(|person| person.name.clone()).unwrap_or_else(|| "They".to_owned());
+                Some(format!("This starts a group call with everyone you pick. {peer} stays in the call."))
+            };
+            (call.conversation.clone(), group, fixed, line)
+        };
+        let (conversation, group, fixed, line) = ready;
+        self.open_switcher_as("", Some(Adding { conversation, group, fixed, for_call: true, line }), window, cx);
+    }
+
     fn toggle_added_person(&mut self, person: Person, cx: &mut Context<Self>) {
         let Some(switcher) = &mut self.sidebar_state.switcher else { return };
         let Some(adding) = &switcher.adding else { return };
@@ -559,12 +593,22 @@ impl Shell {
         if switcher.group_people.is_empty() {
             return;
         }
-        let (conversation, group) = (adding.conversation.clone(), adding.group);
+        let (conversation, group, for_call) = (adding.conversation.clone(), adding.group, adding.for_call);
         let account = conversation.account();
         let picks = switcher.group_people.clone();
         let people: Vec<Key> = adding.fixed.iter().chain(&picks).map(|person| person.key.clone()).collect();
         self.close_switcher(window, cx);
         let alert = Some(("icons/circle-alert.svg", theme::danger()));
+        if for_call {
+            let ids: Vec<String> = picks.iter().map(|person| person.key.id.clone()).collect();
+            let request = Request::CallAddPeople { people: ids };
+            self.off_thread(cx, move || ask(&request), move |this, answer, cx| match answer {
+                Ok(Response::Conversation { conversation }) => this.open_now(conversation.key, &conversation.title, cx),
+                Ok(Response::Error { detail, .. }) => this.toast(alert, detail, cx),
+                _ => {}
+            });
+            return;
+        }
         if group {
             for person in picks {
                 let request = Request::MembersAdd { conversation: conversation.clone(), people: vec![person.key.id.clone()], share_history: None };
@@ -1282,6 +1326,8 @@ impl Shell {
                     );
                 }
                 let ready = !switcher.group_people.is_empty();
+                let title = if adding.for_call { "Add people to this call" } else { "Add people to this conversation" };
+                let line = adding.line.clone();
                 div()
                     .px(px(12.))
                     .py(px(8.))
@@ -1290,10 +1336,11 @@ impl Shell {
                     .flex()
                     .flex_col()
                     .gap(px(6.))
-                    .child(div().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child("Add people to this conversation"))
+                    .child(div().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child(title))
+                    .children(line.map(|line| div().type_small().text_color(theme::text_soft()).child(line)))
                     .child(
                         div().flex().items_center().gap(px(8.)).child(chips.flex_1().min_w_0()).child(
-                            crate::gui::components::button("add-people-confirm", crate::gui::components::ButtonKind::Primary, add_people_confirm(adding.group))
+                            crate::gui::components::button("add-people-confirm", crate::gui::components::ButtonKind::Primary, add_people_confirm(adding.group, adding.for_call))
                                 .when(!ready, |button| button.opacity(0.45).cursor_default())
                                 .on_click(cx.listener(|this, _, window, cx| this.confirm_add_people(window, cx))),
                         ),
@@ -1385,7 +1432,7 @@ impl Shell {
                     .type_small()
                     .text_color(theme::text_soft())
                     .child(hint("↑↓", "Move"))
-                    .when_some(switcher.adding.as_ref(), |hints, adding| hints.child(hint("↵", "Pick")).child(hint("⌘↵", add_people_confirm(adding.group))))
+                    .when_some(switcher.adding.as_ref(), |hints, adding| hints.child(hint("↵", "Pick")).child(hint("⌘↵", add_people_confirm(adding.group, adding.for_call))))
                     .when(switcher.adding.is_none(), |hints| hints.child(hint("↵", "Open")).child(hint("#", "Channels")).child(hint("@", "People")).child(hint(">", "Commands"))),
             ));
         Some(
@@ -1548,7 +1595,10 @@ mod tests {
         assert_eq!(picked.len(), 500, "no maximum of the picker's own");
         toggle_added(&mut picked, &fixed, on(&account, "p7", "P"));
         assert_eq!(picked.len(), 499);
-        assert_eq!((add_people_confirm(false), add_people_confirm(true)), ("Create group", "Add people"));
+        assert_eq!(
+            (add_people_confirm(false, false), add_people_confirm(true, false), add_people_confirm(false, true)),
+            ("Create group", "Add people", "Add to call"),
+        );
     }
 
     fn person(id: &str) -> Person {

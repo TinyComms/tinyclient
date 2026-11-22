@@ -3395,6 +3395,11 @@ impl Context {
         self.hub.calls.set_moved_from(&self.hub, &self.key(conversation_id), moved_from);
     }
 
+    /// One sentence about a move into a group call, or why that move came back.
+    pub fn set_move_notice(&self, conversation_id: &str, notice: Option<String>) {
+        self.hub.calls.set_move_notice(&self.hub, &self.key(conversation_id), notice);
+    }
+
     /// Server-side moderation on our own voice state (server mute, server deafen, suppressed).
     pub fn self_moderation(&self, conversation_id: &str, server_muted: bool, server_deafened: bool, suppressed: bool) {
         self.hub.calls.set_self_moderation(&self.hub, &self.key(conversation_id), server_muted, server_deafened, suppressed);

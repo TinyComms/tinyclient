@@ -209,19 +209,95 @@ fn hear_started(ctx: &Context, seat: &mut Seat, frame: &Value) {
     if frame.get("rings").is_some() {
         group.rings = rings_of(frame.get("rings"));
     }
-    let moved = moved_here(seat, frame);
+    let here = moved_here(seat, frame);
+    let moved = frame.get("moved_from").is_some_and(Value::is_object);
     seat.groups.insert(group_id.to_owned(), group);
-    publish_group(ctx, seat, group_id);
-    maybe_ring_me(ctx, seat, group_id);
-    if moved {
+    // The 1:1 this device is in grew into the group. Follow it, then publish so the roster
+    // lands on the call after it has been retargeted.
+    if here {
+        let _ = follow_move(ctx, seat, group_id, frame);
+        publish_group(ctx, seat, group_id);
         return;
     }
+    // Someone else's move. A newcomer is ringing and may answer. A party already moving on
+    // another device is not rung and is not joined from here.
+    if moved {
+        publish_group(ctx, seat, group_id);
+        let ringing = seat.groups.get(group_id).is_some_and(|group| {
+            group.rings.iter().any(|(id, state)| id == &seat.me && state == "ringing")
+        });
+        if ringing {
+            maybe_ring_me(ctx, seat, group_id);
+        }
+        return;
+    }
+    publish_group(ctx, seat, group_id);
+    maybe_ring_me(ctx, seat, group_id);
     let starting = seat.starting.as_deref() == Some(group_id);
     let holding = shell_shows(ctx, group_id);
     let busy = seat.groups.get(group_id).is_some_and(|group| group.joining || group.seated);
     if (starting || holding) && !busy {
         seat.starting = None;
         seat.join_group = Some(group_id.to_owned());
+    }
+}
+
+/// Retarget the shell call onto the group and join it. False leaves the direct where it is:
+/// the server keeps that call if this device never arrives.
+fn follow_move(ctx: &Context, seat: &mut Seat, group_id: &str, frame: &Value) -> bool {
+    let Some(direct) = seat.direct.clone() else {
+        return false;
+    };
+    if !ctx.tiny_moved(&direct.direct_id, group_id) {
+        return false;
+    }
+    let words = move_words(ctx, seat, group_id, frame);
+    ctx.set_moved_from(group_id, Some(ctx.key(&direct.direct_id)));
+    ctx.hub.calls.set_state(&ctx.hub, &ctx.key(group_id), CallState::Reconnecting);
+    ctx.set_move_notice(group_id, Some(words));
+    if seat.wanted.as_deref() == Some(direct.direct_id.as_str()) {
+        seat.wanted = None;
+    }
+    seat.call_id = None;
+    if seat.starting.as_deref() == Some(group_id) {
+        seat.starting = None;
+    }
+    seat.moving = Some(direct);
+    seat.direct = None;
+    seat.join_group = Some(group_id.to_owned());
+    true
+}
+
+fn move_words(ctx: &Context, seat: &Seat, group_id: &str, frame: &Value) -> String {
+    let adder = text(frame, "started_by")
+        .filter(|id| !id.is_empty())
+        .map(|id| person_name(seat, id))
+        .unwrap_or_else(|| "Someone".to_owned());
+    let added: Vec<String> = frame
+        .get("rings")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|ring| {
+            let id = text(ring, "user_id")?;
+            if text(ring, "state").unwrap_or("ringing") == "ringing" && id != seat.me {
+                Some(person_name(seat, id))
+            } else {
+                None
+            }
+        })
+        .collect();
+    let group = ctx
+        .known(group_id)
+        .ok()
+        .flatten()
+        .map(|row| row.title)
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| "the group".to_owned());
+    if added.is_empty() {
+        format!("The call moved to {group}.")
+    } else {
+        format!("{adder} added {}. The call moved to {group}.", added.join(", "))
     }
 }
 
@@ -502,10 +578,35 @@ fn note_group_join(seat: &mut Seat, group_id: &str, frame: &Value) {
     }
 }
 
-fn group_join_refused(ctx: &Context, seat: &mut Seat, group_id: &str) {
+fn group_join_refused(ctx: &Context, seat: &mut Seat, group_id: &str, words: &str) {
     if let Some(group) = seat.groups.get_mut(group_id) {
         group.joining = false;
         group.seated = false;
+    }
+    if seat.join_group.as_deref() == Some(group_id) {
+        seat.join_group = None;
+    }
+    // The 1:1 was parked for this join. Put the shell call back on it. A refused join does
+    // not end the call the person is already in.
+    if let Some(mut direct) = seat.moving.take() {
+        direct.joining = false;
+        let direct_id = direct.direct_id.clone();
+        if ctx.tiny_moved(group_id, &direct_id) {
+            ctx.set_moved_from(&direct_id, None);
+            ctx.set_move_notice(&direct_id, Some(words.to_owned()));
+            ctx.hub.calls.set_state(&ctx.hub, &ctx.key(&direct_id), CallState::Reconnecting);
+            seat.wanted = Some(direct_id);
+            seat.call_id = None;
+            seat.direct = Some(direct);
+            seat.join_direct = true;
+        } else {
+            seat.direct = Some(direct);
+            if seat.wanted.as_deref() == Some(group_id) {
+                seat.wanted = None;
+                seat.call_id = None;
+            }
+        }
+        return;
     }
     if seat.wanted.as_deref() == Some(group_id) {
         seat.wanted = None;

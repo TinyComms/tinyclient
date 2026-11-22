@@ -312,6 +312,8 @@ struct Inner {
     held: bool,
     /// `/health`'s `media`, read at each fresh `ready`. Empty or `off` takes a seat without audio.
     media: String,
+    /// `(direct_id, ring_id)` of the 1:1 this socket is in. The ring is empty until it is accepted.
+    direct: Option<(String, String)>,
 }
 
 impl Live {
@@ -388,6 +390,15 @@ impl Live {
 
     fn held(&self) -> bool {
         lock(&self.inner).held
+    }
+
+    /// The accepted 1:1 this socket is seated in, so Add people can name it on `call.group.start`.
+    pub fn direct_here(&self) -> Option<(String, String)> {
+        lock(&self.inner).direct.clone().filter(|(_, ring)| !ring.is_empty())
+    }
+
+    fn remember_direct(&self, seat: &Seat) {
+        lock(&self.inner).direct = seat.direct.as_ref().map(|direct| (direct.direct_id.clone(), direct.ring_id.clone()));
     }
 }
 
@@ -467,6 +478,8 @@ struct Seat {
     /// The direct call this socket is ringing, accepting, or seated in. Its media room is
     /// `d:{ring_id}`. The shell's conversation stays `direct_id`.
     direct: Option<DirectSeat>,
+    /// That direct, parked while this socket follows it into a group call. A refused join puts it back.
+    moving: Option<DirectSeat>,
     /// Outgoing intent belongs to this socket, not every device of the caller.
     placed_direct: Option<(String, u64)>,
     /// Recently ended attempts, so late frames cannot revive one or end a redial.
@@ -629,6 +642,7 @@ pub(super) fn keep_live(ctx: &Context, saved: &Saved, live: &Live, timing: &Timi
         rejoining: false,
         stranded: None,
         direct: None,
+        moving: None,
         placed_direct: None,
         ended_directs: VecDeque::new(),
         leave_direct: None,
@@ -1223,6 +1237,7 @@ fn serve(
                 }
             }
         }
+        live.remember_direct(seat);
         let now = Instant::now();
         let (late, waiting): (Vec<Pending>, Vec<Pending>) = std::mem::take(pending)
             .into_iter()
@@ -3457,6 +3472,8 @@ fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &
                 if group {
                     note_group_join(seat, room, frame);
                     publish_group(ctx, seat, room);
+                    // The group join landed. The direct call is no longer somewhere to return to.
+                    seat.moving = None;
                 }
                 if (direct || group) && (seat.muted || seat.deafened) {
                     seat.say_state = true;
@@ -3521,7 +3538,7 @@ fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &
             if seat.groups.contains_key(room.as_str()) {
                 let said = group_words(code).to_owned();
                 let room = room.clone();
-                group_join_refused(ctx, seat, &room);
+                group_join_refused(ctx, seat, &room, &said);
                 if let Some(reply) = pending.reply {
                     let _ = reply.send(Err(Refusal::Refused(said)));
                 }

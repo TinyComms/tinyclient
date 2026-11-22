@@ -364,6 +364,9 @@ pub struct Call {
     /// The direct conversation this call moved out of. Set while the move is still settling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub moved_from: Option<Key>,
+    /// One sentence about that move, or why it came back. The shell shows it once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub move_notice: Option<String>,
 }
 
 /// Someone rung into a group call, and what the server last said of that ring.

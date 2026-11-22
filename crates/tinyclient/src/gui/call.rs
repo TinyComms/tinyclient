@@ -273,6 +273,10 @@ pub struct State {
     menu_closed: Option<Instant>,
     /// What mediad last said is not as chosen (`Call::device_notice`), so a new one is shown.
     device_notice: Option<String>,
+    /// The move sentence already toasted (`Call::move_notice`).
+    move_said: Option<String>,
+    /// The group this window already opened because the call moved there.
+    followed: Option<Key>,
     /// Whether I was muted when I deafened, to go back to on undeafen.
     mute_before_deafen: Option<bool>,
     /// What chatd or the adapter said about the last thing asked of the call.
@@ -667,6 +671,7 @@ fn bare_call(conversation: Key, state: CallState, muted: bool, deafened: bool) -
         video_allowed: true,
         ringing: Vec::new(),
         moved_from: None,
+        move_notice: None,
     }
 }
 
@@ -952,6 +957,8 @@ impl Shell {
                 self.call_menu_set(None, cx);
                 let state = &mut self.call_state;
                 state.device_notice = None;
+                state.move_said = None;
+                state.followed = None;
                 state.mute_before_deafen = None;
                 state.confirm = None;
                 state.notice = None;
@@ -983,6 +990,7 @@ impl Shell {
                 self.call_state.leaving = false;
             }
             Some(call) => {
+                self.call_note_group_move(call, cx);
                 // A call of chatd's own replaces anything said here about one that never began.
                 self.call_state.local = None;
                 if self.call_state.connecting.as_ref().is_some_and(|asked| asked.conversation == call.conversation && !matches!(call.state, CallState::Failed { .. })) {
@@ -1093,6 +1101,9 @@ impl Shell {
     /// channel, without my asking: said where to, as a toast that is seen whatever is on
     /// screen, and for a few seconds in the dock.
     fn call_note_moved(&mut self, call: &Call, subject: &Subject, cx: &mut Context<Self>) {
+        if call.moved_from.is_some() || call.move_notice.is_some() {
+            return;
+        }
         let Some(was) = self.call_state.was.as_ref() else {
             return;
         };
@@ -1104,6 +1115,29 @@ impl Shell {
         self.call_state.notice = Some(words.clone());
         self.call_briefly(cx);
         self.toast(Some(("icons/arrow-right-left.svg", theme::text_soft())), words, cx);
+    }
+
+    /// A 1:1 that grew into a group call: say who was added, and open the group once when the
+    /// conversation on screen is the one the call left.
+    fn call_note_group_move(&mut self, call: &Call, cx: &mut Context<Self>) {
+        if self.call_state.move_said.as_deref() != call.move_notice.as_deref() {
+            self.call_state.move_said = call.move_notice.clone();
+            if let Some(words) = call.move_notice.clone() {
+                self.call_state.notice = Some(words.clone());
+                self.call_briefly(cx);
+                self.toast(Some(("icons/arrow-right-left.svg", theme::text_soft())), words, cx);
+            }
+        }
+        let Some(from) = call.moved_from.clone() else {
+            return;
+        };
+        let open = self.snapshot.as_ref().and_then(|snapshot| snapshot.open.as_ref()).map(|open| open.key.clone());
+        if open.as_ref() != Some(&from) || self.call_state.followed.as_ref() == Some(&call.conversation) {
+            return;
+        }
+        self.call_state.followed = Some(call.conversation.clone());
+        let title = self.sidebar_state.find(&self.trees, &call.conversation).map(|row| row.title).unwrap_or_else(|| "Call".to_owned());
+        self.open_now(call.conversation.clone(), &title, cx);
     }
 
     /// Talking while muted (07 §2a): while I am muted in a call, the meter stays on so the
@@ -1708,9 +1742,11 @@ impl Shell {
             && (call.conversation.network == Network::Discord
                 || (call.conversation.network == Network::Tiny
                     && matches!(call.state, CallState::Joined | CallState::Connecting | CallState::Reconnecting)));
-        let can_add_people = call.conversation.network == Network::Discord
-            && subject.kind.is_direct()
-            && (call.participants.len() + 1) < 10;
+        let picker = self.call_add_picker(call, subject.kind);
+        let can_add_people = picker
+            || (call.conversation.network == Network::Discord
+                && subject.kind.is_direct()
+                && (call.participants.len() + 1) < 10);
         div()
             .flex()
             .flex_col()
@@ -1748,9 +1784,16 @@ impl Shell {
                                             .type_micro()
                                             .text_color(theme::text_soft())
                                             .tooltip(tip("Add friends to call", None))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                cx.stop_propagation();
-                                                this.call_menu_set(Some(Menu::AddPeople), cx);
+                                            .on_click(cx.listener({
+                                                let picker = picker;
+                                                move |this, _, window, cx| {
+                                                    cx.stop_propagation();
+                                                    if picker {
+                                                        this.open_call_people(window, cx);
+                                                    } else {
+                                                        this.call_menu_set(Some(Menu::AddPeople), cx);
+                                                    }
+                                                }
                                             }))
                                             .child("Add people"),
                                     )
@@ -2632,6 +2675,22 @@ impl Shell {
             });
         })
         .detach();
+    }
+
+    /// Tiny group calls, and the call shots, add people through the picker. No count limits it.
+    fn call_add_picker(&self, call: &Call, kind: ConversationKind) -> bool {
+        #[cfg(feature = "gui-shot")]
+        if shot::adds_people() {
+            return true;
+        }
+        call.conversation.network == Network::Tiny
+            && matches!(kind, ConversationKind::Direct | ConversationKind::Group)
+            && matches!(call.state, CallState::Joined | CallState::Reconnecting)
+            && self
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.account(&call.conversation.account()))
+                .is_some_and(|status| status.can.group_calls)
     }
 
     fn call_now(&self) -> Option<&Call> {

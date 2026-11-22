@@ -2620,3 +2620,87 @@ fn a_group_start_is_refused_when_audio_is_down() {
         Err(AUDIO_DOWN.to_owned())
     );
 }
+
+/// The direct this device is in becomes the group call. A refused join puts the call back.
+#[test]
+fn a_direct_call_follows_a_group_it_moved_into_and_returns_when_the_join_is_refused() {
+    let phase = Arc::new(AtomicU8::new(0));
+    let seen = phase.clone();
+    let fake = fake(&[], move |_, mut conn| {
+        conn.send(ready(1, &[ME, BEA], json!([])));
+        let ring = conn.next(Duration::from_secs(5)).expect("call.ring");
+        conn.send(ringing("call.ringing", ME));
+        conn.send(json!({"type": "ok", "ref": ring["ref"]}));
+        conn.send(ringing("call.accepted", ME));
+        let join = conn.next(Duration::from_secs(5)).expect("direct join");
+        assert_eq!((join["type"].as_str(), join["direct_id"].as_str()), (Some("call.join"), Some(DIRECT)));
+        conn.send(json!({"type": "ok", "ref": join["ref"], "call_id": "c-direct"}));
+        let mut started = group_started(
+            json!([]),
+            json!([{"user_id": "33333333-3333-3333-3333-333333333333", "state": "ringing"}]),
+        );
+        started["moved_from"] = json!({"direct_id": DIRECT, "ring_id": RING_ID});
+        conn.send(started);
+        let moved = conn.next(Duration::from_secs(5)).expect("group join");
+        assert_eq!((moved["type"].as_str(), moved["group_id"].as_str()), (Some("call.join"), Some(GROUP)));
+        assert!(moved.get("direct_id").is_none(), "the move joins the group: {moved}");
+        seen.store(1, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while seen.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        conn.send(json!({"type": "error", "ref": moved["ref"], "code": "room_full"}));
+        let back = conn.next(Duration::from_secs(5)).expect("back on the direct");
+        assert_eq!((back["type"].as_str(), back["direct_id"].as_str()), (Some("call.join"), Some(DIRECT)));
+        conn.send(json!({"type": "ok", "ref": back["ref"], "call_id": "c-direct"}));
+        conn.idle(Duration::from_millis(200));
+    });
+    let running = run(&fake.base, QUICK);
+    until("connected", || running.link().0 == Link::Connected);
+    running.hub.calls.place(&running.hub, running.key(DIRECT)).unwrap();
+    assert_eq!(running.ask(|reply| Ask::Ring { attempt: None, direct_id: DIRECT.into(), reply }), Ok(()));
+    until("the move is on the wire", || phase.load(Ordering::SeqCst) >= 1);
+    let call = running.hub.calls.describe().0.expect("the call was not ended");
+    assert_eq!(call.conversation, running.key(GROUP));
+    assert_eq!(call.state, protocol::CallState::Reconnecting);
+    assert_eq!(call.moved_from.as_ref(), Some(&running.key(DIRECT)));
+    assert_eq!(call.move_notice.as_deref(), Some("Bea added Someone. The call moved to the group."));
+    phase.store(2, Ordering::SeqCst);
+    until("the call is back on the direct", || {
+        running.hub.calls.describe().0.is_some_and(|call| call.conversation == running.key(DIRECT))
+    });
+    let call = running.hub.calls.describe().0.expect("the refused join did not end the call");
+    assert!(call.moved_from.is_none());
+    assert_eq!(call.move_notice.as_deref(), Some("This call is full."));
+}
+
+/// `moved_from` for a direct this device is not in does not join and does not end our call.
+#[test]
+fn a_group_start_for_another_direct_does_not_take_this_call() {
+    let phase = Arc::new(AtomicU8::new(0));
+    let seen = phase.clone();
+    let fake = fake(&[], move |_, mut conn| {
+        conn.send(ready(1, &[ME, BEA], json!([])));
+        let ring = conn.next(Duration::from_secs(5)).expect("call.ring");
+        conn.send(ringing("call.ringing", ME));
+        conn.send(json!({"type": "ok", "ref": ring["ref"]}));
+        conn.send(ringing("call.accepted", ME));
+        let join = conn.next(Duration::from_secs(5)).expect("direct join");
+        conn.send(json!({"type": "ok", "ref": join["ref"], "call_id": "c-direct"}));
+        let mut started = group_started(json!([]), json!([]));
+        started["moved_from"] = json!({"direct_id": "99999999-9999-9999-9999-999999999999", "ring_id": RING_ID});
+        conn.send(started);
+        let extra = conn.next(Duration::from_millis(400));
+        assert!(extra.is_none(), "another direct's move is not joined: {extra:?}");
+        seen.store(1, Ordering::SeqCst);
+        conn.idle(Duration::from_millis(200));
+    });
+    let running = run(&fake.base, QUICK);
+    until("connected", || running.link().0 == Link::Connected);
+    running.hub.calls.place(&running.hub, running.key(DIRECT)).unwrap();
+    assert_eq!(running.ask(|reply| Ask::Ring { attempt: None, direct_id: DIRECT.into(), reply }), Ok(()));
+    until("the other move was ignored", || phase.load(Ordering::SeqCst) == 1);
+    let call = running.hub.calls.describe().0.expect("our direct stays");
+    assert_eq!(call.conversation, running.key(DIRECT));
+    assert!(group_call(&running).is_none());
+}

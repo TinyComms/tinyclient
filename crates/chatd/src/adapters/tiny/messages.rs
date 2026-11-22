@@ -763,6 +763,9 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
             };
             let _ = reply.send(answer);
         }
+        Command::CallAddPeople { conversation_id, people, reply } => {
+            add_people_to_call(ctx, saved, live, &conversation_id, people, reply);
+        }
         other => other.unsupported(ctx),
     }
 }
@@ -4601,6 +4604,108 @@ fn new_conversation_sealed(saved: &Saved) -> Result<bool, Refusal> {
     }
 }
 
+fn live_answer(rx: std::sync::mpsc::Receiver<Result<(), Refusal>>) -> Result<(), Refusal> {
+    match rx.recv_timeout(std::time::Duration::from_secs(12)) {
+        Ok(answer) => answer,
+        Err(_) => Err(Refusal::Refused("That didn't work. Try again.".to_owned())),
+    }
+}
+
+/// Adds the picked people to the call that is up. A direct becomes a group call. A group call
+/// rings them, after they are members.
+fn add_people_to_call(
+    ctx: &Context,
+    saved: &Saved,
+    live: &Live,
+    conversation_id: &str,
+    people: Vec<String>,
+    reply: crate::adapters::Reply<String>,
+) {
+    if !groups_callable(saved) {
+        let _ = reply.send(Err(Refusal::Unsupported));
+        return;
+    }
+    let mut picked = Vec::new();
+    for id in people {
+        if !super::safe_id(&id) {
+            let _ = reply.send(Err(Refusal::Refused(super::CHECK.to_owned())));
+            return;
+        }
+        if id != saved.user_id && !picked.iter().any(|have: &String| have == &id) {
+            picked.push(id);
+        }
+    }
+    if picked.is_empty() {
+        let _ = reply.send(Err(Refusal::Refused("Nobody else to ring.".to_owned())));
+        return;
+    }
+    if is_group(ctx, conversation_id) {
+        let have = group_member_ids(saved, conversation_id);
+        let missing: Vec<String> = picked.iter().filter(|id| !have.iter().any(|member| member == *id)).cloned().collect();
+        if !missing.is_empty() {
+            let (sent, got) = std::sync::mpsc::channel();
+            add_group_members(ctx, saved, conversation_id, &missing, sent);
+            if let Err(refusal) = got.recv().unwrap_or_else(|_| Err(Refusal::Refused("That didn't work. Try again.".to_owned()))) {
+                let _ = reply.send(Err(refusal));
+                return;
+            }
+        }
+        let (sent, got) = std::sync::mpsc::channel();
+        live.ask(Ask::GroupRing { group_id: conversation_id.to_owned(), people: Some(picked), reply: sent });
+        let _ = reply.send(live_answer(got).map(|()| conversation_id.to_owned()));
+        return;
+    }
+    let row = ctx.known(conversation_id).ok().flatten();
+    if !row.as_ref().is_some_and(|row| row.kind == ConversationKind::Direct) {
+        let _ = reply.send(Err(Refusal::Refused("You are not in this call.".to_owned())));
+        return;
+    }
+    let Some((direct_id, ring_id)) = live.direct_here().filter(|(id, _)| id == conversation_id) else {
+        let _ = reply.send(Err(Refusal::Refused("You are not in this call.".to_owned())));
+        return;
+    };
+    let mut members = picked;
+    let peer = row.as_ref().and_then(|row| row.peer.clone()).filter(|id| super::safe_id(id) && id != &saved.user_id);
+    let seated = ctx.hub.calls.describe().0.filter(|call| call.conversation == ctx.key(conversation_id)).map(|call| {
+        call.participants.into_iter().map(|who| who.id).filter(|id| super::safe_id(id) && id != &saved.user_id).collect::<Vec<_>>()
+    });
+    let other = peer.or_else(|| seated.as_ref().and_then(|ids| ids.first().cloned()));
+    let Some(other) = other else {
+        let _ = reply.send(Err(Refusal::Refused("You are not in this call.".to_owned())));
+        return;
+    };
+    if !members.iter().any(|id| id == &other) {
+        members.push(other);
+    }
+    if let Some(ids) = seated {
+        for id in ids {
+            if !members.iter().any(|have| have == &id) {
+                members.push(id);
+            }
+        }
+    }
+    let (sent, got) = std::sync::mpsc::channel();
+    start_group(ctx, saved, &members, None, sent);
+    let group_id = match got.recv() {
+        Ok(Ok(id)) => id,
+        Ok(Err(refusal)) => {
+            let _ = reply.send(Err(refusal));
+            return;
+        }
+        Err(_) => {
+            let _ = reply.send(Err(Refusal::Refused("That didn't work. Try again.".to_owned())));
+            return;
+        }
+    };
+    let (sent, got) = std::sync::mpsc::channel();
+    live.ask(Ask::GroupStart {
+        group_id: group_id.clone(),
+        from_direct: Some((direct_id, ring_id)),
+        reply: sent,
+    });
+    let _ = reply.send(live_answer(got).map(|()| group_id));
+}
+
 /// Find or create the group of exactly these people and the caller. The server answers the one
 /// that exists (`200`) or a new one (`201`); either way its row is recorded and its id answered.
 fn start_group(ctx: &Context, saved: &Saved, people: &[String], title: Option<&str>, reply: crate::adapters::Reply<String>) {
@@ -5569,6 +5674,38 @@ mod tests {
         let body: Value = serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(body["e2ee"], true, "call setup never creates plaintext text history");
         assert_eq!(post_message(&ctx, &saved, "first-call", "client-call", "secret", None, &[], &[], None).unwrap_err(), NOT_SET_UP, "text enrollment is still required");
+    }
+
+    #[test]
+    fn adding_people_to_a_call_is_refused_without_group_calls_or_a_seated_direct() {
+        let refused = |features: &str, people: Vec<String>| {
+            let (_adapter, ctx, saved) = fixture({
+                let features = features.to_owned();
+                move |request| {
+                    if request.starts_with("GET /v1/capabilities ") {
+                        return Some(http(200, "OK", &format!(r#"{{"features":{features}}}"#)));
+                    }
+                    None
+                }
+            });
+            let live = super::super::live::Live::new().expect("live");
+            let (reply, answer) = std::sync::mpsc::channel();
+            serve(&ctx, &saved, &live, crate::adapters::Command::CallAddPeople {
+                conversation_id: "direct-1".into(),
+                people,
+                reply,
+            });
+            answer.recv().expect("an answer")
+        };
+        assert!(matches!(refused(r#"["groups"]"#, vec![PEER.into()]), Err(crate::adapters::Refusal::Unsupported)));
+        assert!(matches!(
+            refused(r#"["groups","group_calls"]"#, Vec::new()),
+            Err(crate::adapters::Refusal::Refused(words)) if words == "Nobody else to ring."
+        ));
+        assert!(matches!(
+            refused(r#"["groups","group_calls"]"#, vec![PEER.into()]),
+            Err(crate::adapters::Refusal::Refused(words)) if words == "You are not in this call."
+        ));
     }
 
     #[test]

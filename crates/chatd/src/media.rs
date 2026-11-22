@@ -292,6 +292,7 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         video_allowed: true,
         ringing: Vec::new(),
         moved_from: None,
+        move_notice: None,
     };
     Live {
         intent: NEXT_INTENT.fetch_add(1, Ordering::Relaxed),
@@ -1855,6 +1856,20 @@ impl Calls {
         let known = self.update(hub, conversation, |live| {
             if live.call.ringing != next {
                 live.call.ringing = std::mem::take(&mut next);
+                changed = true;
+            }
+        });
+        if known && changed {
+            self.tell(hub);
+        }
+    }
+
+    /// One sentence about a move into a group call, or why that move came back.
+    pub fn set_move_notice(&self, hub: &Hub, conversation: &Key, notice: Option<String>) {
+        let mut changed = false;
+        let known = self.update(hub, conversation, |live| {
+            if live.call.move_notice != notice {
+                live.call.move_notice = notice.clone();
                 changed = true;
             }
         });

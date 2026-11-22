@@ -260,6 +260,7 @@ mod tests {
             video_allowed: true,
         ringing: Vec::new(),
         moved_from: None,
+        move_notice: None,
         }
     }
 
