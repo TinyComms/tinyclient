@@ -1,9 +1,10 @@
 //! First run on a phone (`docs/design/08-first-run-settings.md` §1 in one column): the app's
 //! mark, the welcome and its line, then one card with a row per network that signs in on a
 //! phone. Each row is the network's Dashboard Icons logo, its name, one line that wraps under
-//! the name, and a quiet "Sign in"; the whole row is the target. Signal and Google Messages link
-//! from a computer (a helper there pairs them), so they are not offered here; the footnote says
-//! where they are.
+//! the name, and a quiet "Sign in"; the whole row is the target. Google Messages pairs by QR
+//! code directly from an Android phone (receiving texts while tinyclient is open). Signal still
+//! links from a computer (a helper there pairs it), so it is not offered here; the footnote says
+//! where it is.
 
 use crate::gui::components::{brand_mark, network_icon};
 use crate::gui::layout::NETWORK_ORDER;
@@ -13,10 +14,10 @@ use crate::gui::theme;
 use gpui::{div, prelude::*, px, Context, Div, SharedString};
 use protocol::Network;
 
-/// Whether a phone can sign in to `network`. Signal and Messages link this device from the phone
-/// that holds the account, through a helper only the desktop app has.
+/// Whether a phone or tablet can sign in to `network`. Google Messages pairs by QR code from an
+/// Android phone without a browser helper. Signal still links from a computer.
 pub fn on_phone(network: Network) -> bool {
-    !matches!(network, Network::Signal | Network::Messages)
+    !matches!(network, Network::Signal)
 }
 
 /// The networks a phone offers, in the desktop's fixed order.
@@ -31,8 +32,9 @@ fn line(network: Network) -> &'static str {
         Network::Slack => "All your workspaces",
         Network::Telegram => "Your number and a code",
         Network::Teams => "Work, school or personal",
+        Network::Messages => "Pair by QR from an Android phone; arrives while open",
         Network::Tiny => "An invite, or your own",
-        Network::Signal | Network::Messages => "Link from tinyclient on a computer",
+        Network::Signal => "Link from tinyclient on a computer",
     }
 }
 
@@ -155,7 +157,7 @@ impl Shell {
                                 .child("Sign in to one network to start. Add the others whenever you like."),
                         )
                         .child(div().mt(px(32.)).w_full().child(card))
-                        .child(div().mt(px(20.)).w_full().flex().flex_col().gap(px(6.)).child(note("Signal and Google Messages link from tinyclient on a computer.")).child(note("Your sign-ins stay on this phone."))),
+                        .child(div().mt(px(20.)).w_full().flex().flex_col().gap(px(6.)).child(note("Signal links from tinyclient on a computer.")).child(note("Your sign-ins stay on this phone."))),
                 ),
         )
     }
@@ -166,10 +168,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_phone_offers_every_network_but_the_two_a_computer_links() {
+    fn a_phone_offers_every_network_but_signal() {
         let offered: Vec<Network> = phone_networks().collect();
-        assert_eq!(offered, vec![Network::Discord, Network::Slack, Network::Telegram, Network::Teams, Network::Tiny]);
-        assert!(!on_phone(Network::Signal) && !on_phone(Network::Messages));
+        assert_eq!(offered, vec![Network::Discord, Network::Slack, Network::Telegram, Network::Teams, Network::Messages, Network::Tiny]);
+        assert!(on_phone(Network::Messages));
+        assert!(!on_phone(Network::Signal));
+        assert!(line(Network::Messages).contains("QR"));
+        assert!(line(Network::Messages).contains("while open"));
         assert!(offered.iter().all(|network| !line(*network).is_empty()));
     }
 

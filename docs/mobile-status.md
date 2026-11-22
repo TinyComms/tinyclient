@@ -69,7 +69,7 @@ All are in `reports/` (ignored by git, kept on disk). Both dimensions and conten
 | Conversation | Send failure is 12 pt: `Not sent. Slow mode; wait 8 s before sending again.` at `x 8, y 407`, with `Retry` / `Delete` links at `x 310–370` — far under 44 pt and outside the 16 pt gutter | `uat-conversation-long-390.png` |
 | Conversation | The poll card's second line is clipped/blank under "Poll: Where should the aut…" | `uat-conversation-long-390.png`, `x 56–370, y 300–323` |
 | Welcome | `Sign in` buttons render about 34 pt tall (target floor is 44) | `uat-welcome-390.png`, e.g. `x 272–345, y 289–323` |
-| First run / scope | Signal and Google Messages are offered although the brief defers both for v1; the scope sheet also lists Signal | welcome rows `y 512–565`, `y 637–691`; scope `y 515` |
+| First run / scope | Signal is deferred until mobile device linking is built; Google Messages is now offered on phone/tablet via QR pairing from an Android phone (with an open-app delivery notice) | welcome rows; `gui/signin/welcome.rs` |
 | 200 % nav | The 34 pt title fills a 52 pt strip; at 300 % it would spill. It fits at 200 % but has no headroom | `uat-text200-inbox-390.png`, `y 44–96` |
 | All lists | A row scrolled past the top could paint over the nav strip (seen once at 200 %); fixed below and re-shot | n/a after fix |
 
@@ -158,7 +158,7 @@ Empty first run: point `TINYCLIENT_DIR` at a fresh directory, start `chatd` ther
 | 7 | **44 pt target floor is not universal.** First-run `Sign in` (~34), send-failure `Retry`/`Delete` (~16), several strip buttons; the brief's accessibility floor is 44/48. | High | welcome + long-conversation shots |
 | 8 | **Back is not a real gesture.** Edge drag uses mouse move/down, not `TouchEvent`; `--back` still drives desktop history, not `phone_back`. No Android back hook. | Medium | `phone/mod.rs`; map §3.5 |
 | 9 | **Text size is a global zoom, not dynamic type.** `--text-scale` is an atomic used by phone tokens; it does not follow the OS setting, and at 300 % the nav strip is too short. | Medium | `phone/tokens.rs`; shot at 300 % during UAT |
-| 10 | **v1 scope leakage.** Signal and Google Messages appear in first run/demo data though the brief defers them; the demo includes a Telegram login code in a preview (local only, but must never reach a relay). | Medium | welcome shot; brief "Networks" / constraints |
+| 10 | **v1 scope status.** Google Messages is now supported on phone/tablet via QR-code pairing (no browser helper; texts arrive only while tinyclient is open). Signal remains hidden on phone until #735. | Low | `gui/signin/welcome.rs`, `gui/signin.rs` |
 | 11 | **Settings is still a desktop second window** from the phone `You` rows (720×560, `WindowOptions`). It happens to open on this host, but it is not a phone route. | Medium | `phone/you.rs`; `settings/mod.rs:32,219` |
 | 12 | **iOS is unbuilt and unsigned.** Floor fixed to 16.0 but unproven; `ITSAppUsesNonExemptEncryption` is a placeholder; no team, keystore or export plist. | Medium | `mobile/ios/`; `docs/mobile-build.md` §6–7 |
 | 13 | **Gradle wrapper jar absent.** A fresh checkout has no `gradlew`; CI supplies Gradle, local users must bootstrap it. | Low | `docs/mobile-build.md` §3 |

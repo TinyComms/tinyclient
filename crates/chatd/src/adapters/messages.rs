@@ -466,6 +466,13 @@ pub fn prove_messages_sign_out() -> Result<(), String> {
     bugle::prove_sign_out()
 }
 
+/// The lab sets `TINYCLIENT_PROVE=messages-wave12`. A build from before this ignores that
+/// and keeps serving, so the same driver fails there.
+pub fn prove_messages_wave12() -> Result<(), String> {
+    bugle::prove_messages_qr_pairing()?;
+    signin::prove_messages_qr_state_machine()
+}
+
 /// The lab sets `TINYCLIENT_PROVE=messages-media`. A build from before this ignores that and
 /// keeps serving, so the same driver fails there.
 pub fn prove_message_media() -> Result<(), String> {

@@ -9,7 +9,7 @@ use cipher::{KeyIvInit, StreamCipher};
 use ctr::Ctr128BE;
 pub use google::pair_google;
 use hmac::{Hmac, Mac};
-use p256::ecdsa::SigningKey;
+use p256::ecdsa::{signature::Signer, DerSignature, SigningKey};
 use p256::pkcs8::EncodePublicKey;
 use sha2::Sha256;
 use std::io::Read;
@@ -20,8 +20,43 @@ use std::time::{Duration, Instant};
 const API_KEY: &str = "AIzaSyCA4RsOZUFrm9whhtGosPlJLmVPnfSHKz8";
 const USER_AGENT: &str = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36";
 const ORIGIN: &str = "https://messages.google.com";
+const QR_BASE: &str = "https://support.google.com/messages/?p=web_computer#?c=";
+const QR_TTL: Duration = Duration::from_secs(180);
 const RELAY: &str = "https://instantmessaging-pa.googleapis.com/$rpc/google.internal.communications.instantmessaging.v1";
 const UPLOAD: &str = "https://instantmessaging-pa.googleapis.com/upload";
+
+fn relay_base() -> String {
+    if !crate::session::enabled() {
+        if let Ok(url) = std::env::var("TINYCLIENT_MESSAGES_RELAY") {
+            let trimmed = url.trim().trim_end_matches('/');
+            if !trimmed.is_empty() {
+                return trimmed.to_owned();
+            }
+        }
+    }
+    RELAY.to_owned()
+}
+
+fn qr_ttl() -> Duration {
+    if !crate::session::enabled() {
+        if let Ok(ms) = std::env::var("TINYCLIENT_MESSAGES_QR_TTL_MS") {
+            if let Ok(ms) = ms.trim().parse::<u64>() {
+                if ms > 0 {
+                    return Duration::from_millis(ms);
+                }
+            }
+        }
+    }
+    QR_TTL
+}
+
+fn pair_settle_delay() -> Duration {
+    if !crate::session::enabled() && std::env::var_os("TINYCLIENT_MESSAGES_RELAY").is_some() {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(2)
+    }
+}
 /// A guard for this client, not a limit Google publishes.
 pub(super) const FILE_CAP: u64 = 100 * 1024 * 1024;
 const NETWORK: &str = "Bugle";
@@ -80,10 +115,13 @@ impl Gate {
         }
     }
 
-    /// A 401, a 403, or the cookie refresh giving up counts as auth. Two in a row end the session.
-    /// One `Sign in again` can be a Google hiccup, so it retries.
+    /// A 401, a 403, or a token refresh giving up counts as auth. Two in a row end the session.
+    /// One `Sign in again` or `Pair again.` can be a Google hiccup, so it retries.
     pub fn fail(&mut self, words: &str) -> crate::adapters::Failure {
-        let auth = words.contains("(401)") || words.contains("(403)") || cookie_failure_ends(words);
+        let auth = words.contains("(401)")
+            || words.contains("(403)")
+            || cookie_failure_ends(words)
+            || words.contains("Pair again.");
         let stop = if auth { Stop::Auth } else { Stop::Closed };
         match self.observe(stop) {
             Step::End => crate::adapters::Failure::SignedOut(UNPAIRED.to_owned()),
@@ -255,6 +293,52 @@ fn browser_details() -> Vec<u8> {
     buf.int(2, 1); // OTHER
     buf.text(3, "tinyclient");
     buf.int(6, 2); // TABLET, so a browser session can stay signed in beside this one
+    buf.0
+}
+
+fn register_body(public_der: &[u8]) -> Vec<u8> {
+    let mut ecdsa = Buf::new();
+    ecdsa.int(1, 2); // PUBLIC_KEY_TYPE_ECDSA
+    ecdsa.bytes(2, public_der);
+    let mut keys = Buf::new();
+    keys.msg(6, &ecdsa.0);
+    let mut body = Buf::new();
+    body.msg(1, &auth_message(&uuid(), &[]));
+    body.msg(3, &browser_details());
+    body.msg(4, &keys.0);
+    body.0
+}
+
+fn url_data(pairing: &[u8], aes_key: &[u8], hmac_key: &[u8]) -> String {
+    let mut buf = Buf::new();
+    buf.bytes(1, pairing);
+    buf.bytes(2, aes_key);
+    buf.bytes(3, hmac_key);
+    format!("{QR_BASE}{}", b64(&buf.0))
+}
+
+fn device_message(device: &Device) -> Vec<u8> {
+    let mut buf = Buf::new();
+    buf.int(1, device.user as u64);
+    buf.text(2, &device.source);
+    buf.text(3, NETWORK);
+    buf.0
+}
+
+/// ECDSA-P256 SHA-256 ASN.1 DER signature over `"{source}:{unix_micros}"` for `RegisterRefresh`.
+fn sign_refresh(signing: &SigningKey, source: &str, unix_micros: i64) -> Vec<u8> {
+    let payload = format!("{source}:{unix_micros}");
+    let sig: DerSignature = signing.sign(payload.as_bytes());
+    sig.as_bytes().to_vec()
+}
+
+fn refresh_body(browser: &Device, token: &[u8], unix_micros: i64, signature: &[u8]) -> Vec<u8> {
+    let mut buf = Buf::new();
+    buf.msg(1, &auth_message(&uuid(), token));
+    buf.msg(2, &device_message(browser));
+    buf.int(3, unix_micros as u64);
+    buf.bytes(4, signature);
+    buf.int(16, 2);
     buf.0
 }
 
@@ -430,6 +514,103 @@ fn decode_device(bytes: &[u8]) -> Device {
 fn decode_token(bytes: &[u8]) -> (Vec<u8>, i64) {
     let list = fields(bytes);
     (field_bytes(&list, 1), field_int(&list, 2) as i64)
+}
+
+struct RelayReply {
+    browser: Device,
+    pairing: Vec<u8>,
+    token: Vec<u8>,
+    ttl: i64,
+}
+
+fn decode_register(bytes: &[u8]) -> Option<RelayReply> {
+    let list = fields(bytes);
+    let browser = decode_device(&field_bytes(&list, 2));
+    let pairing = field_bytes(&list, 3);
+    let (token, ttl) = decode_token(&field_bytes(&list, 5));
+    if pairing.is_empty() || token.is_empty() || browser.source.is_empty() {
+        return None;
+    }
+    Some(RelayReply {
+        browser,
+        pairing,
+        token,
+        ttl,
+    })
+}
+
+struct RefreshReply {
+    token: Vec<u8>,
+    ttl: i64,
+    retry_timestamp: Option<i64>,
+}
+
+fn decode_refresh(bytes: &[u8]) -> RefreshReply {
+    let list = fields(bytes);
+    let (token, ttl) = decode_token(&field_bytes(&list, 2));
+    let retry = field_int(&list, 3) != 0;
+    let server_ts = field_int(&list, 4) as i64;
+    RefreshReply {
+        token,
+        ttl,
+        retry_timestamp: (retry && server_ts > 0).then_some(server_ts),
+    }
+}
+
+fn unix_micros_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros() as i64)
+}
+
+fn can_refresh(saved: &Saved) -> bool {
+    !saved.cookies.is_empty() || (!saved.key.is_empty() && !saved.browser.is_empty())
+}
+
+/// Renews the Tachyon auth token for a QR-paired session using its P-256 signing key
+/// (`Registration/RegisterRefresh`), retrying once with the server timestamp on clock skew.
+pub(super) fn refresh_qr(saved: &mut Saved) -> Result<(), String> {
+    let key_bytes = unhex(&saved.key).ok_or("The Messages signing key is unreadable.")?;
+    let signing =
+        SigningKey::from_slice(&key_bytes).map_err(|_| "The Messages signing key is unreadable.")?;
+    if saved.browser.is_empty() {
+        return Err("The Messages session has no paired device identifier. Pair again.".into());
+    }
+    let current_token = unb64(&saved.token).unwrap_or_default();
+    let browser = Device {
+        user: saved.browser_user,
+        source: saved.browser.clone(),
+    };
+    let endpoint = format!("{}.Registration/RegisterRefresh", relay_base());
+    let http = agent(Duration::from_secs(30));
+    let request_once = |ts: i64| -> Result<RefreshReply, String> {
+        let sig = sign_refresh(&signing, &browser.source, ts);
+        let body = refresh_body(&browser, &current_token, ts, &sig);
+        let response = post(&http, &endpoint, "application/x-protobuf", &body, "")?;
+        Ok(decode_refresh(&response.body))
+    };
+    let mut reply = request_once(unix_micros_now())?;
+    if reply.token.is_empty() {
+        if let Some(server_ts) = reply.retry_timestamp {
+            reply = request_once(server_ts)?;
+        }
+    }
+    if reply.token.is_empty() {
+        return Err("Messages did not renew the session token. Pair again.".into());
+    }
+    saved.token = b64(&reply.token);
+    saved.ttl = reply.ttl;
+    Ok(())
+}
+
+fn refresh_session(saved: &mut Saved) -> Result<(), String> {
+    if !saved.cookies.is_empty() {
+        google::refresh(saved)
+    } else if !saved.key.is_empty() && !saved.browser.is_empty() {
+        refresh_qr(saved)
+    } else {
+        Ok(())
+    }
 }
 
 /// What the keychain holds after a phone has paired. `key` is the ECDSA signing key, hex scalar,
@@ -1709,11 +1890,141 @@ pub struct Session {
     inbox: Mutex<Inbox>,
 }
 
+/// Registers a fresh browser key pair with Google's Bugle relay, emits the QR code URL and its
+/// expiry timestamp, and waits on the long-poll for the phone's paired message (route 14).
+/// No Google account cookies are involved.
+pub fn pair_qr(
+    show: &dyn Fn(String, i64),
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Saved, String> {
+    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+        return Err("cancelled".into());
+    }
+    let signing = SigningKey::from_slice(&random(32))
+        .map_err(|_| "Could not create a Messages pairing key.".to_owned())?;
+    let public = signing
+        .verifying_key()
+        .to_public_key_der()
+        .map_err(|_| "Could not encode the Messages pairing key.".to_owned())?;
+    let aes_key = random(32);
+    let hmac_key = random(32);
+    let http = agent(Duration::from_secs(30));
+    let mut cookies = String::new();
+    let body = register_body(public.as_bytes());
+    let response = post(
+        &http,
+        &format!("{}.Pairing/RegisterPhoneRelay", relay_base()),
+        "application/x-protobuf",
+        &body,
+        &cookies,
+    )?;
+    cookies = merge_cookies(&cookies, &response.cookies);
+    let registered = decode_register(&response.body)
+        .ok_or_else(|| "Messages did not start a QR pairing session. Try again.".to_owned())?;
+    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+        return Err("cancelled".into());
+    }
+    let ttl = qr_ttl();
+    let expires = crate::hub::now() + ttl.as_secs().max(1) as i64;
+    let qr = url_data(&registered.pairing, &aes_key, &hmac_key);
+    show(qr, expires);
+    let (events, inbox) = channel();
+    let saved = Saved {
+        cookies: std::collections::HashMap::new(),
+        session_id: String::new(),
+        dest_reg_id: String::new(),
+        pairing_id: String::new(),
+        dest_phone_id: 0,
+        account: String::new(),
+        name: "Messages".into(),
+        aes: hex(&aes_key),
+        hmac: hex(&hmac_key),
+        token: b64(&registered.token),
+        ttl: registered.ttl,
+        mobile_user: 0,
+        mobile: String::new(),
+        browser_user: registered.browser.user,
+        browser: registered.browser.source.clone(),
+        key: hex(signing.to_bytes().as_slice()),
+    };
+    let live = Arc::new(Mutex::new(Live {
+        saved,
+        aes: aes_key,
+        hmac: hmac_key,
+        token: registered.token,
+        ttl: registered.ttl,
+        session: uuid(),
+        chats: Vec::new(),
+        cookies,
+        token_refreshed: Instant::now(),
+    }));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let poll_live = live.clone();
+    let poll_stop = stop.clone();
+    let (paired_tx, paired_rx) = channel::<Saved>();
+    std::thread::Builder::new()
+        .name("messages-pair".into())
+        .spawn(move || {
+            while !poll_stop.load(std::sync::atomic::Ordering::Acquire) {
+                let failed = poll(
+                    poll_live.clone(),
+                    events.clone(),
+                    Arc::default(),
+                    poll_stop.clone(),
+                    false,
+                    Some(paired_tx.clone()),
+                );
+                if failed || poll_stop.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                wait_or_stop(&poll_stop, Duration::from_millis(200));
+            }
+        })
+        .map_err(|err| err.to_string())?;
+    let deadline = Instant::now() + ttl;
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::Acquire) {
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            return Err("cancelled".into());
+        }
+        if Instant::now() >= deadline {
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            return Err("The QR code expired before your phone scanned it.".into());
+        }
+        match paired_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(saved) => {
+                let settle = pair_settle_delay();
+                if !settle.is_zero() {
+                    wait_or_stop(cancel, settle);
+                }
+                stop.store(true, std::sync::atomic::Ordering::Release);
+                return Ok(saved);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                while let Ok(event) = inbox.try_recv() {
+                    if let crate::adapters::messages::Event::Ended(why) = event {
+                        stop.store(true, std::sync::atomic::Ordering::Release);
+                        return Err(why);
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                while let Ok(event) = inbox.try_recv() {
+                    match event {
+                        crate::adapters::messages::Event::Ended(why)
+                        | crate::adapters::messages::Event::Closed(why) => return Err(why),
+                        _ => {}
+                    }
+                }
+                return Err("Messages closed the pairing connection. Try again.".into());
+            }
+        }
+    }
+}
+
 impl Session {
     pub fn open(mut saved: Saved) -> Result<Session, String> {
-        if !saved.cookies.is_empty() {
-            google::refresh(&mut saved)?;
-        }
+        refresh_session(&mut saved)?;
         let (aes, hmac, token) = saved
             .keys()
             .ok_or_else(|| "the Messages session is unreadable".to_owned())?;
@@ -1909,7 +2220,7 @@ impl Session {
         let agent = agent(Duration::from_secs(30));
         let sent = post(
             &agent,
-            &format!("{RELAY}.Messaging/SendMessage"),
+            &format!("{}.Messaging/SendMessage", relay_base()),
             "application/json+protobuf",
             &body,
             &cookies,
@@ -2401,19 +2712,22 @@ fn poll(
         } else {
             Duration::from_secs(86400)
         };
-        (!live.saved.cookies.is_empty()
+        (paired.is_none()
+            && can_refresh(&live.saved)
             && live.token_refreshed.elapsed() >= lifetime.saturating_sub(Duration::from_secs(3600)))
         .then(|| live.saved.clone())
     };
     if let Some(mut saved) = refresh {
-        if let Err(reason) = google::refresh(&mut saved) {
+        if let Err(reason) = refresh_session(&mut saved) {
             let _ = events.send(crate::adapters::messages::Event::Closed(reason));
             return true;
         }
         let mut live = live.lock().unwrap_or_else(|p| p.into_inner());
         live.token = unb64(&saved.token).unwrap_or_default();
         live.ttl = saved.ttl;
-        live.cookies = google::cookie_header(&saved.cookies);
+        if !saved.cookies.is_empty() {
+            live.cookies = google::cookie_header(&saved.cookies);
+        }
         live.saved = saved;
         live.token_refreshed = Instant::now();
     }
@@ -2429,10 +2743,11 @@ fn poll(
     }
     let payload = serde_json::json!([auth, null, null, [null, serde_json::json!([])]]);
     let body = serde_json::to_vec(&payload).unwrap_or_default();
+    let base = relay_base();
     let relay = if google::authorization(&cookies).is_some() {
-        RELAY.replace("googleapis.com", "clients6.google.com")
+        base.replace("googleapis.com", "clients6.google.com")
     } else {
-        RELAY.to_owned()
+        base
     };
     let mut request = agent
         .post(&format!("{relay}.Messaging/ReceiveMessages"))
@@ -2589,11 +2904,14 @@ fn on_payload(
     let route = at(data, 2).map(as_i64).unwrap_or(0);
     let message = at(data, 12).map(as_bytes).unwrap_or_default();
     if route == 14 {
-        if on_pair(&message, live, paired) {
-            let _ = events.send(crate::adapters::messages::Event::Ended(UNPAIRED.into()));
-            return true;
+        match on_pair(&message, live, paired) {
+            PairOutcome::Revoked => {
+                let _ = events.send(crate::adapters::messages::Event::Ended(UNPAIRED.into()));
+                return true;
+            }
+            PairOutcome::Paired => return true,
+            PairOutcome::Ignored => return false,
         }
-        return false;
     }
     if route != 19 || message.is_empty() {
         return false;
@@ -2637,19 +2955,30 @@ fn on_payload(
     false
 }
 
-/// True when this notice is a revoke, so the caller ends the session.
-fn on_pair(message: &[u8], live: &Mutex<Live>, paired: &Option<Sender<Saved>>) -> bool {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PairOutcome {
+    Ignored,
+    Paired,
+    Revoked,
+}
+
+/// Decodes `RPCPairData` on route 14: either a completed QR pairing (`paired`, field 4) or a revoke (`revoked`, field 5).
+fn on_pair(message: &[u8], live: &Mutex<Live>, paired: &Option<Sender<Saved>>) -> PairOutcome {
     let list = fields(message);
     let paired_bytes = field_bytes(&list, 4);
     if paired_bytes.is_empty() {
-        return revoked_pair(message);
+        return if revoked_pair(message) {
+            PairOutcome::Revoked
+        } else {
+            PairOutcome::Ignored
+        };
     }
     let inner = fields(&paired_bytes);
     let mobile = decode_device(&field_bytes(&inner, 1));
     let (token, ttl) = decode_token(&field_bytes(&inner, 2));
     let browser = decode_device(&field_bytes(&inner, 3));
     if mobile.source.is_empty() {
-        return false;
+        return PairOutcome::Ignored;
     }
     let mut held = live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     held.saved.account = mobile.source.clone();
@@ -2667,8 +2996,9 @@ fn on_pair(message: &[u8], live: &Mutex<Live>, paired: &Option<Sender<Saved>>) -
     }
     if let Some(paired) = paired {
         let _ = paired.send(held.saved.clone());
+        return PairOutcome::Paired;
     }
-    false
+    PairOutcome::Ignored
 }
 
 /// Messages, then the conversation row, then typing. A read flag in the same batch must not
@@ -3783,6 +4113,106 @@ pub(super) fn prove_sign_out() -> Result<(), String> {
     Ok(())
 }
 
+/// Checks the QR registration, URL encoding, signing-key refresh, and paired-event handling
+/// for `TINYCLIENT_PROVE=messages-wave12`.
+pub(super) fn prove_messages_qr_pairing() -> Result<(), String> {
+    use p256::ecdsa::{signature::Verifier, VerifyingKey};
+    use p256::pkcs8::DecodePublicKey;
+
+    let signing = SigningKey::from_slice(&random(32))
+        .map_err(|_| "failed to construct P-256 signing key".to_owned())?;
+    let public = signing
+        .verifying_key()
+        .to_public_key_der()
+        .map_err(|_| "failed to encode P-256 public key".to_owned())?;
+    let reg = register_body(public.as_bytes());
+    let reg_fields = fields(&reg);
+    let keys = fields(&field_bytes(&reg_fields, 4));
+    let ecdsa = fields(&field_bytes(&keys, 6));
+    if field_int(&ecdsa, 1) != 2 || field_bytes(&ecdsa, 2) != public.as_bytes() {
+        return Err("RegisterPhoneRelay did not encode the ECDSA SPKI public key".into());
+    }
+    let decoded_pub = VerifyingKey::from_public_key_der(&field_bytes(&ecdsa, 2))
+        .map_err(|_| "RegisterPhoneRelay public key was not valid SPKI DER".to_owned())?;
+
+    let pairing_key = b"pairing-key-bytes-for-wave12";
+    let aes_key = [0x11u8; 32];
+    let hmac_key = [0x22u8; 32];
+    let qr = url_data(pairing_key, &aes_key, &hmac_key);
+    let encoded = qr
+        .strip_prefix(QR_BASE)
+        .ok_or_else(|| "QR URL did not start with Google Messages QR base".to_owned())?;
+    let url_proto = unb64(encoded).ok_or_else(|| "QR URL payload was not valid base64".to_owned())?;
+    let url_fields = fields(&url_proto);
+    if field_bytes(&url_fields, 1) != pairing_key
+        || field_bytes(&url_fields, 2) != aes_key
+        || field_bytes(&url_fields, 3) != hmac_key
+    {
+        return Err("QR URL protobuf lost pairing, AES, or HMAC key bytes".into());
+    }
+
+    let browser = Device {
+        user: 42,
+        source: "browser-qr-1".into(),
+    };
+    let ts: i64 = 1_795_000_000_123_456;
+    let sig_bytes = sign_refresh(&signing, &browser.source, ts);
+    let sig = DerSignature::from_bytes(&sig_bytes)
+        .map_err(|_| "RegisterRefresh signature was not valid ASN.1 DER".to_owned())?;
+    decoded_pub
+        .verify(format!("{}:{ts}", browser.source).as_bytes(), &sig)
+        .map_err(|_| "RegisterRefresh signature failed verification".to_owned())?;
+
+    let refresh_req = refresh_body(&browser, b"old-token", ts, &sig_bytes);
+    let req_fields = fields(&refresh_req);
+    let req_dev = decode_device(&field_bytes(&req_fields, 2));
+    if req_dev.source != "browser-qr-1" || field_int(&req_fields, 3) as i64 != ts {
+        return Err("RegisterRefreshRequest dropped device or timestamp".into());
+    }
+
+    let mut tok = Buf::new();
+    tok.bytes(1, b"new-tachyon-token");
+    tok.int(2, 86_400_000_000);
+    let mut ok_resp = Buf::new();
+    ok_resp.msg(2, &tok.0);
+    let parsed_ok = decode_refresh(&ok_resp.0);
+    if parsed_ok.token != b"new-tachyon-token" || parsed_ok.ttl != 86_400_000_000 {
+        return Err("RegisterRefreshResponse token did not decode".into());
+    }
+
+    let mut skew_resp = Buf::new();
+    skew_resp.int(3, 1);
+    skew_resp.int(4, (ts + 5_000_000) as u64);
+    let parsed_skew = decode_refresh(&skew_resp.0);
+    if parsed_skew.retry_timestamp != Some(ts + 5_000_000) {
+        return Err("RegisterRefreshResponse clock-skew timestamp did not decode".into());
+    }
+
+    let qr_saved = Saved {
+        cookies: std::collections::HashMap::new(),
+        session_id: String::new(),
+        dest_reg_id: String::new(),
+        pairing_id: String::new(),
+        dest_phone_id: 0,
+        account: "phone-1".into(),
+        name: "Messages".into(),
+        aes: hex(&aes_key),
+        hmac: hex(&hmac_key),
+        token: b64(b"old-token"),
+        ttl: 86_400_000_000,
+        mobile_user: 1,
+        mobile: "phone-1".into(),
+        browser_user: 42,
+        browser: "browser-qr-1".into(),
+        key: hex(signing.to_bytes().as_slice()),
+    };
+    if !can_refresh(&qr_saved) {
+        return Err("cookie-less QR session with signing key was not eligible for refresh".into());
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4401,5 +4831,39 @@ mod tests {
 
         let sim2_req = fields(&send_request("c1", "hi", "t2", "me", None, Some("sim-work")));
         assert_eq!(field_text(&fields(&field_bytes(&sim2_req, 4)), 1), "sim-work");
+    }
+
+    #[test]
+    fn qr_registration_url_and_signing_key_refresh_round_trip() {
+        prove_messages_qr_pairing().unwrap();
+
+        // Decode RegisterPhoneRelayResponse: device (2), pairing key (3), token (5).
+        let mut dev = Buf::new();
+        dev.int(1, 7);
+        dev.text(2, "browser-id-7");
+        let mut tok = Buf::new();
+        tok.bytes(1, b"reg-token");
+        tok.int(2, 3_600_000_000);
+        let mut reply = Buf::new();
+        reply.msg(2, &dev.0);
+        reply.bytes(3, b"pair-secret");
+        reply.msg(5, &tok.0);
+        let decoded = decode_register(&reply.0).expect("register reply");
+        assert_eq!(decoded.browser.user, 7);
+        assert_eq!(decoded.browser.source, "browser-id-7");
+        assert_eq!(decoded.pairing, b"pair-secret");
+        assert_eq!(decoded.token, b"reg-token");
+        assert_eq!(decoded.ttl, 3_600_000_000);
+
+        // Missing pairing key or browser source is rejected.
+        let mut bad = Buf::new();
+        bad.msg(5, &tok.0);
+        assert!(decode_register(&bad.0).is_none());
+
+        // Two consecutive QR refresh failures end the session, one retries.
+        let mut gate = Gate::default();
+        let words = "Messages did not renew the session token. Pair again.";
+        assert!(matches!(gate.fail(words), crate::adapters::Failure::Dropped(_)));
+        assert!(matches!(gate.fail(words), crate::adapters::Failure::SignedOut(_)));
     }
 }
