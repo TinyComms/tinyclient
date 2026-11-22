@@ -1113,7 +1113,6 @@ impl InfoPane {
 
     fn head(&self, person: &Person, banner_path: Option<String>, accent: Option<u32>, calling: bool, more: Option<AnyElement>, cx: &mut Context<Self>) -> Div {
         let ring = Ring::on(theme::sidebar());
-        let banner_path = banner.and_then(|file| self.hub.file(&person.key.account(), file, cx).path);
         // The band's slot is kept with or without a colour, so nothing below moves.
         div()
             .relative()

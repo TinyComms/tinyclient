@@ -897,7 +897,7 @@ impl Floating {
                 let who = person.key.clone();
                 let role_id = role.id.clone();
                 row = row.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
-                    this.toggle_member_role(who, role_id, cx);
+                    this.toggle_member_role(who.clone(), role_id.clone(), cx);
                 }));
             } else {
                 row = row.opacity(0.55).cursor_default();

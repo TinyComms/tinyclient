@@ -1566,15 +1566,15 @@ impl Pane {
                 Ok(Response::Ok) => {
                     match evict_emoji {
                         Some(emoji) => {
-                            let cache_key = (mid, emoji);
-                            this.fetched_reactors.remove(&cache_key);
-                            if this.reactors_loading.as_ref() == Some(&cache_key) {
+                            // A moderator's removal takes the ordinary and the super reaction alike.
+                            this.fetched_reactors.retain(|(id, kept, _), _| !(id == &mid && kept == &emoji));
+                            if this.reactors_loading.as_ref().is_some_and(|(id, kept, _)| id == &mid && kept == &emoji) {
                                 this.reactors_loading = None;
                             }
                         }
                         None => {
-                            this.fetched_reactors.retain(|(id, _), _| id != &mid);
-                            if this.reactors_loading.as_ref().is_some_and(|(id, _)| id == &mid) {
+                            this.fetched_reactors.retain(|(id, _, _), _| id != &mid);
+                            if this.reactors_loading.as_ref().is_some_and(|(id, _, _)| id == &mid) {
                                 this.reactors_loading = None;
                             }
                         }
@@ -4058,7 +4058,7 @@ mod tests {
         let moderated = can_with_network(&theirs, Network::Discord, &discord_caps(), mod_rights, channel, false, 1_100);
         assert!(moderated.delete && moderated.delete_everyone && moderated.pin && !moderated.edit && !moderated.clear_reactions);
         let mut reacted = theirs.clone();
-        reacted.reactions.push(protocol::Reaction { emoji: "👍".into(), file: None, count: 2, mine: false, who: Vec::new() });
+        reacted.reactions.push(protocol::Reaction { emoji: "👍".into(), file: None, count: 2, mine: false, who: Vec::new(), burst: 0, mine_burst: false, burst_colors: Vec::new() });
         assert!(can_with_network(&reacted, Network::Discord, &discord_caps(), mod_rights, channel, false, 1_100).clear_reactions);
         assert!(!can_with_network(&reacted, Network::Discord, &discord_caps(), none, channel, false, 1_100).clear_reactions);
         assert!(!can_with_network(&reacted, Network::Tiny, &tiny_caps(), mod_rights, channel, false, 1_100).clear_reactions);
@@ -4266,7 +4266,7 @@ mod tests {
         // Own unpublished message in an announcement channel can be published.
         let mine_ann = can(&mine, &caps, plain, ConversationKind::Announcement, false, 20);
         assert!(mine_ann.publish);
-        assert!(menu_acts(mine_ann, false, 0, false, true, false, false, false, false).contains(&MenuAct::Publish));
+        assert!(menu_acts(mine_ann, false, 0, false, true, false, false, false, false, false).contains(&MenuAct::Publish));
 
         // Not offered in a regular text channel.
         assert!(!can(&mine, &caps, plain, ConversationKind::Channel, false, 20).publish);

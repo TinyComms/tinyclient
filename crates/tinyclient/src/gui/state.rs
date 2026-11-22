@@ -1226,6 +1226,7 @@ mod tests {
             spaces: false,
             inbox: true,
             trees: HashSet::from([key("server")]),
+            events: HashSet::new(),
             rows: vec![key("a")],
         };
         assert_eq!(dirty, expected);

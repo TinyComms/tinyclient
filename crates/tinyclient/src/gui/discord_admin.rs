@@ -654,7 +654,7 @@ impl Shell {
             )
             .child(div().flex().flex_wrap().gap(px(6.)).children(filters))
             .children(modal.error.as_ref().map(|error| div().type_small().text_color(theme::danger()).child(error.clone())))
-            .child(div().max_h(px(360.)).overflow_y_scroll().flex().flex_col().gap(px(4.)).child(body).when(more, |list| {
+            .child(div().id("discord-audit-list").max_h(px(360.)).overflow_y_scroll().flex().flex_col().gap(px(4.)).child(body).when(more, |list| {
                 list.child(
                     div().flex().justify_center().py(px(8.)).child(
                         button("discord-audit-more", ButtonKind::Secondary, if loading { "Loading…" } else { "Load older entries" }).when(!loading, |button| {
@@ -750,7 +750,7 @@ impl Shell {
                         .px(px(8.))
                         .py(px(6.))
                         .rounded(px(theme::R_CONTROL))
-                        .bg(if is_sel { theme::active() } else { theme::canvas() })
+                        .bg(if is_sel { theme::selected() } else { theme::canvas() })
                         .hover(|s| s.bg(theme::hover()))
                         .cursor_pointer()
                         .flex()
@@ -897,7 +897,7 @@ impl Shell {
                                             })),
                                     )
                                     .child(
-                                        pill(SharedString::from(format!("perm-inh-{ix}")), "Inherit", is_inherit, theme::active())
+                                        pill(SharedString::from(format!("perm-inh-{ix}")), "Inherit", is_inherit, theme::selected())
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 if let Some(m) = this.discord_admin_state.perms.as_mut() {
                                                     m.draft_allow &= !bit;
@@ -1518,7 +1518,7 @@ impl Shell {
                     .px(px(8.))
                     .py(px(6.))
                     .rounded(px(theme::R_CONTROL))
-                    .bg(if selected_row { theme::active() } else { theme::canvas() })
+                    .bg(if selected_row { theme::selected() } else { theme::canvas() })
                     .hover(|row| row.bg(theme::hover()))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| this.select_automod_rule(ix, cx)))
@@ -1643,6 +1643,7 @@ impl Shell {
             .children(modal.error.as_ref().map(|error| div().type_small().text_color(theme::danger()).child(error.clone())))
             .child(
                 div()
+                    .id("discord-admin-scroll")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()

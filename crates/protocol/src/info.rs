@@ -21,7 +21,7 @@ pub const ROWS_WATCHED: usize = 100;
 pub const PROFILE_ROLES: usize = 12;
 /// Discord permission bits the Roles page labels. Values are Discord's; keep this table when
 /// Discord adds a bit the page should name. Bits absent here still round-trip as a number.
-pub const DISCORD_PERMISSIONS: &[(u64, &str)] = &[
+pub const DISCORD_ROLE_PERMISSIONS: &[(u64, &str)] = &[
     (1 << 0, "Create invite"),
     (1 << 1, "Kick members"),
     (1 << 2, "Ban members"),

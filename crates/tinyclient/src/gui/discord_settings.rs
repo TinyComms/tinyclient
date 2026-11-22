@@ -1518,7 +1518,7 @@ impl Shell {
                     })),
             );
             let mut perms = div().flex().flex_wrap().gap(px(6.));
-            for (ix, (bit, label)) in protocol::DISCORD_PERMISSIONS.iter().copied().enumerate() {
+            for (ix, (bit, label)) in protocol::DISCORD_ROLE_PERMISSIONS.iter().copied().enumerate() {
                 let on = open.role_permissions & bit != 0;
                 perms = perms.child(
                     div()
@@ -1655,7 +1655,7 @@ impl Shell {
         on: bool,
         cx: &mut Context<Self>,
         toggle: impl Fn(&mut Open) + 'static,
-    ) -> Div {
+    ) -> gpui::Stateful<Div> {
         div()
             .id(id)
             .h(px(28.))

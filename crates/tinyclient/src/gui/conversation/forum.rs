@@ -208,7 +208,7 @@ impl Board {
             self.asked.insert(id.clone());
         }
         let forum_id = forum.id.clone();
-        let request = Request::Fetch { retry: false, size: Some(THUMB), account: forum.account(), ids: ids.clone() };
+        let request = Request::Fetch { retry: false, size: Some(THUMB), account: forum.account(), ids: ids.clone(), span: None };
         cx.spawn(async move |this, cx| {
             let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
             let _ = this.update(cx, |this, cx| {

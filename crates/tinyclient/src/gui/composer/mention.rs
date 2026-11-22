@@ -229,7 +229,7 @@ pub fn source(message: &Message) -> (String, Vec<Token>) {
             }
             Style::Mention { kind, id } => {
                 // Skip message-link chips that also carry a Style::Link on the same range.
-                if spans.iter().any(|other| {
+                if message.spans.iter().any(|other| {
                     other.start == span.start && other.end == span.end && matches!(other.style, Style::Link { .. })
                 }) {
                     continue;

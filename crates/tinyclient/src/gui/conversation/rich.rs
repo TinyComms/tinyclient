@@ -260,12 +260,12 @@ pub fn blocks_at(text: &str, spans: &[Span], now: i64) -> Vec<Block> {
                 numbers = [0; 3];
                 out.push(Block::Heading {
                     level: (*level).clamp(1, 3),
-                    text: inline(text, spans, body),
+                    text: inline(text, spans, body, now),
                 });
             }
             Style::Small => {
                 numbers = [0; 3];
-                out.push(Block::Small(inline(text, spans, body)));
+                out.push(Block::Small(inline(text, spans, body, now)));
             }
             _ => {}
         }

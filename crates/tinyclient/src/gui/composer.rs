@@ -5545,7 +5545,7 @@ impl Shell {
                 }
                 self.recording_ticking(cx);
             }
-            Change::People { account } => {
+            Change::People { account, .. } => {
                 for composer in [self.composer_state.main.get(), self.composer_state.thread.get()].into_iter().flatten() {
                     let (composer, account) = (composer.clone(), account.clone());
                     cx.defer(move |cx| composer.update(cx, |composer, cx| composer.forget_peer_away_account(&account, cx)));

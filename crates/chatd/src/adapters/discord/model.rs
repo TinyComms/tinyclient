@@ -2197,7 +2197,7 @@ mod tests {
 
         let (file, url) = guild_banner("4000", "a_banhash");
         assert_eq!(file.id, "banner:4000:a_banhash");
-        assert_eq!(url, format!("{}/banners/4000/a_banhash.webp?size=600", cdn()));
+        assert_eq!(url, format!("{}/banners/4000/a_banhash.webp?size=512&animated=true", cdn()));
         assert_eq!(guild_mark(&["PARTNERED".to_owned()]), Some(protocol::Mark::Verified));
         assert_eq!(guild_mark(&["COMMUNITY".to_owned()]), None);
     }

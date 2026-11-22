@@ -909,6 +909,10 @@ impl Shell {
                                     super::sidebar::CreateInviteTarget::Space(invite_space.clone(), invite_name.clone()),
                                     cx,
                                 );
+                            }))
+                            .into_any_element(),
+                    );
+                }
                 if can_settings {
                     let settings_space = space.clone();
                     items.push(

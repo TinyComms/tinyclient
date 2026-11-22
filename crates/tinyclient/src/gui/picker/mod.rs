@@ -1870,13 +1870,14 @@ mod tests {
 
     #[test]
     fn gif_sections_follow_the_packs_the_network_sent() {
-        let item = |id: &str, pack: &str| CatalogItem { id: id.into(), name: id.into(), file: None, pack: pack.into(), animated: false };
+        let item = |id: &str, pack: &str| CatalogItem { id: id.into(), name: id.into(), file: None, pack: pack.into(), animated: false, set: String::new(), locked: false };
         let home = vec![
             item("https://tenor.com/view/fav", "Favorites"),
             item("cat:happy", "Categories"),
             item("https://tenor.com/view/trend", "Trending"),
         ];
-        let labels: Vec<&str> = gif_lines(&home, 400., true, &[]).iter().filter_map(|line| line.label.as_deref()).collect();
+        let lines = gif_lines(&home, 400., true, &[]);
+        let labels: Vec<&str> = lines.iter().filter_map(|line| line.label.as_deref()).collect();
         assert_eq!(labels, ["Favorites", "Categories", "Trending"]);
         let search = vec![item("https://tenor.com/view/wave-0", ""), item("cat:otter", "Suggestions")];
         let lines = gif_lines(&search, 400., true, &[]);
@@ -1967,7 +1968,7 @@ mod tests {
 
     #[test]
     fn a_favorites_pack_is_not_listed_twice_when_its_ids_already_lead() {
-        let sticker = |id: &str, name: &str, pack: &str| CatalogItem { id: id.into(), name: name.into(), file: None, pack: pack.into(), animated: false };
+        let sticker = |id: &str, name: &str, pack: &str| CatalogItem { id: id.into(), name: name.into(), file: None, pack: pack.into(), animated: false, set: String::new(), locked: false };
         let items = vec![sticker("a", "wave", "Favorites"), sticker("b", "dance", "Frequently used"), sticker("c", "hi", "Forest Friends")];
         let lines = sticker_lines(&items, "", None, &["a".into()], &[]);
         let labels: Vec<&str> = lines.iter().filter_map(|line| line.label.as_deref()).collect();
