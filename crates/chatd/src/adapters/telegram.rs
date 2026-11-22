@@ -271,6 +271,10 @@ struct Live {
     ads: Vec<(String, Instant)>,
     /// Sponsored messages recorded: the channel, the ad's id, and whether it was told as viewed.
     shown: Vec<(String, Vec<u8>, bool)>,
+    /// The message effects Telegram offers, once asked on this connection (`catalog::effects`),
+    /// and whether a message that carries one has already made us ask.
+    effects: Option<Vec<protocol::CatalogItem>>,
+    effects_asked: bool,
     /// The newest post of each broadcast channel told to Telegram as viewed (`sync::viewed`).
     viewed: HashMap<Who, i32>,
     /// What the picker's items send.
@@ -322,6 +326,8 @@ pub(super) struct Options {
     pub allow_paid_stars: Option<i64>,
     /// Optional peer to post as (channel or anonymous admin, from `channels.getSendAs`).
     pub send_as: Option<Who>,
+    /// The message effect to send with it (`messages.getAvailableEffects`).
+    pub effect: Option<i64>,
 }
 
 /// One connection's worth of an account: what every thread of the adapter shares.
@@ -765,7 +771,7 @@ fn offline(ctx: &Context, command: Command) {
         Command::LoadTopics { reply, .. } => drop(reply.send(Err(down()))),
         Command::TopicCreate { reply, .. } => drop(reply.send(Err(down()))),
         Command::TopicUpdate { reply, .. } | Command::TopicDelete { reply, .. } => drop(reply.send(Err(down()))),
-        Command::TopicIcons { reply } => drop(reply.send(Err(down()))),
+        Command::TopicIcons { reply } | Command::MessageEffects { reply } => drop(reply.send(Err(down()))),
         Command::ScheduledList { reply, .. } => drop(reply.send(Err(down()))),
         Command::CancelScheduled { reply, .. } | Command::SendScheduledNow { reply, .. } => drop(reply.send(Err(down()))),
         Command::Reschedule { reply, .. } => drop(reply.send(Err(down()))),
@@ -869,6 +875,9 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::TopicIcons { reply } => {
             let _ = reply.send(catalog::topic_icons(account).map_err(refused));
+        }
+        Command::MessageEffects { reply } => {
+            let _ = reply.send(catalog::effects(account).map(|items| crate::adapters::CatalogPage { items, cursor: None }).map_err(refused));
         }
         Command::ScheduledList { conversation_id, reply } => {
             let _ = reply.send(info::scheduled_list(account, &conversation_id).map_err(refused));
@@ -1618,7 +1627,7 @@ fn send_text(account: &Account, conversation: &str, client_id: &str, text: &str,
         schedule_repeat_period: None,
         send_as: opts.send_as.and_then(|who| account.input(who).ok()),
         quick_reply_shortcut: None,
-        effect: None,
+        effect: opts.effect,
         allow_paid_stars: opts.allow_paid_stars,
         suggested_post: None,
         rich_message: None,

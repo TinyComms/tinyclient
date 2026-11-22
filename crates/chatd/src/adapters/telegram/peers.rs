@@ -640,6 +640,8 @@ pub struct Directory {
     /// Honored when a message's full file is classified. The stored gates are applied when the
     /// account connects, before a message is mapped. Until then every gate is off.
     pub download: DownloadRules,
+    /// The emoji of each message effect, by its id, once Telegram was asked (`catalog::effects`).
+    pub effects: HashMap<i64, String>,
 }
 
 pub fn note_key(who: Who) -> String {
@@ -648,7 +650,7 @@ pub fn note_key(who: Who) -> String {
 
 impl Directory {
     pub fn new(me: i64) -> Directory {
-        Directory { map: HashMap::new(), me, download: DownloadRules::default() }
+        Directory { map: HashMap::new(), me, download: DownloadRules::default(), effects: HashMap::new() }
     }
 
     pub fn get(&self, who: Who) -> Option<&Known> {

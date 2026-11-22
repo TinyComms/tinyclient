@@ -1383,6 +1383,21 @@ impl Demo {
             Command::TopicUpdate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::TopicDelete { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::TopicIcons { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MessageEffects { reply } => {
+                let items = [("confetti", "\u{1F389}"), ("fire", "\u{1F525}"), ("hearts", "\u{2764}\u{FE0F}")]
+                    .into_iter()
+                    .map(|(id, emoji)| protocol::CatalogItem {
+                        id: id.to_owned(),
+                        name: emoji.to_owned(),
+                        file: None,
+                        pack: String::new(),
+                        animated: false,
+                        set: String::new(),
+                        locked: false,
+                    })
+                    .collect();
+                let _ = reply.send(Ok(crate::adapters::CatalogPage { items, cursor: None }));
+            }
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CancelScheduled { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendScheduledNow { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

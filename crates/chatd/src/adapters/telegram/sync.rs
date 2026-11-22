@@ -470,7 +470,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         folders_edit: true,
         disappearing: true,
         groups: 200,
-        effects: false,
+        effects: true,
         view_once: false,
         blocks: true,
         join_space_by_invite: true,
@@ -1099,6 +1099,7 @@ pub(super) fn previews(account: &Account, ids: &[String]) {
                 continue;
             }
         };
+        super::catalog::name_effects(account, raw.iter());
         let mut mapped: Vec<Mapped> = {
             let dir = account.dir();
             raw.iter().filter_map(|message| content::map(&dir, message)).collect()
@@ -1963,6 +1964,7 @@ pub(super) fn history(account: &Account, conversation: &str, around: Around) -> 
             complete_group(account, who, topic, &mut raw, false);
         }
     }
+    super::catalog::name_effects(account, raw.iter());
     let mapped: Vec<Mapped> = {
         let dir = account.dir();
         raw.iter().filter_map(|message| content::map(&dir, message)).collect()
@@ -2297,6 +2299,7 @@ fn random_of(message_id: &str) -> Option<Vec<u8>> {
 /// A list of Telegram's messages as the contract's, for the conversation they are in, and the
 /// pictures they show. Nothing is recorded.
 pub(super) fn mapped(account: &Account, conversation: &str, raw: &[tl::enums::Message]) -> (Vec<Message>, Vec<Want>) {
+    super::catalog::name_effects(account, raw.iter());
     let mut mapped: Vec<Mapped> = {
         let dir = account.dir();
         raw.iter().filter_map(|message| content::map(&dir, message)).collect()

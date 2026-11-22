@@ -1235,6 +1235,10 @@ pub enum Command {
     TopicIcons {
         reply: Reply<CatalogPage>,
     },
+    /// The message effects the account can send.
+    MessageEffects {
+        reply: Reply<CatalogPage>,
+    },
     /// Fetch network-suggested chat folders.
     SuggestedFolders {
         reply: Reply<Vec<protocol::SuggestedFolder>>,
@@ -2114,7 +2118,7 @@ impl Command {
             Command::FolderSave { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::LoadTopics { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::TopicCreate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::TopicIcons { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::TopicIcons { reply } | Command::MessageEffects { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SuggestedFolders { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

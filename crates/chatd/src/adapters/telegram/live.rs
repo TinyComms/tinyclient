@@ -23,6 +23,7 @@ fn place(account: &Account, who: Who, topic: Option<i32>) -> String {
 /// Maps a message and makes sure its conversation is recorded. `None` for one that cannot be
 /// placed (an empty message, a chat Telegram never described).
 fn placed(account: &Account, raw: &tl::enums::Message) -> Option<(String, Mapped)> {
+    super::catalog::name_effects(account, std::iter::once(raw));
     let mut mapped = content::map(&account.dir(), raw)?;
     let conversation = conversation_of(account, &mapped);
     // A topic's first message has the forum's row made for it (`ensure_row`); a comment of

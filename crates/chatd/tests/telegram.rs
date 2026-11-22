@@ -4827,6 +4827,61 @@ fn a_chat_is_pinned_unpinned_archived_and_unarchived_on_telegram() {
 }
 
 #[test]
+fn message_effects_are_listed_sent_and_shown_by_their_emoji() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.effects, "the composer offers effects only where the account has them");
+    world.arrived("u7002", "12");
+
+    // The effects Telegram offers: the Premium one is locked for this account.
+    let effects = || match world.ask(Request::MessageEffects { account: account() }) {
+        Response::Catalog { items, .. } => items.into_iter().map(|item| (item.id, item.name, item.locked)).collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    let party = "5046509860389126442".to_owned();
+    assert_eq!(effects(), [(party.clone(), "\u{1F389}".to_owned(), false), ("5104841245755180586".to_owned(), "\u{1F525}".to_owned(), true)]);
+
+    // Sent with the effect: the request names it, and the message that comes back shows its emoji.
+    let asked = Request::Send {
+        conversation: key("u7002"),
+        client_id: "fx-1".into(),
+        text: "Congratulations".into(),
+        reply_to: None,
+        with: protocol::Outgoing { effect: Some(party.clone()), ..protocol::Outgoing::default() },
+    };
+    assert!(matches!(world.ask(asked), Response::Sent { .. }));
+    world.until("the send to name the effect", || (world.called(&format!("SendMessage u7002 Congratulations [effect={party}]")) == 1).then_some(()));
+    let sent = world.until("the sent message", || world.messages("u7002").into_iter().find(|message| message.text == "Congratulations" && message.state == SendState::Sent));
+    assert_eq!(sent.effect.as_deref(), Some("\u{1F389}"));
+
+    // One that arrives with an effect is shown the same way, and one without has none.
+    world.steer("effect");
+    assert_eq!(world.arrived("u7002", "71").effect.as_deref(), Some("\u{1F389}"));
+    assert_eq!(world.message("u7002", "12").unwrap().effect, None);
+
+    // Telegram was asked for its effects once on this connection, however often they were used.
+    assert_eq!(effects().len(), 2);
+    world.steer("effects-asked");
+    assert_eq!(world.called("effects asked 1"), 1, "{:?}", world.calls());
+
+    // Telegram plays effects in private chats only, and says so in words.
+    world.arrived("g8001", "20");
+    let refused = Request::Send {
+        conversation: key("g8001"),
+        client_id: "fx-2".into(),
+        text: "Party".into(),
+        reply_to: None,
+        with: protocol::Outgoing { effect: Some(party), ..protocol::Outgoing::default() },
+    };
+    world.ask(refused);
+    let failed = world.until("the refusal on the message", || {
+        world.messages("g8001").into_iter().find(|message| message.text == "Party" && matches!(message.state, SendState::Failed { .. }))
+    });
+    assert!(matches!(&failed.state, SendState::Failed { reason } if reason.contains("private chats only")), "{:?}", failed.state);
+}
+
+#[test]
 fn who_reacted_and_who_read_a_message_are_asked_of_telegram_only_on_demand() {
     let world = World::signed_in();
     world.connected();

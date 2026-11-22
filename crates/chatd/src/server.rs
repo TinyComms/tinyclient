@@ -4419,6 +4419,15 @@ impl Chat {
             Request::TopicDelete { topic } => {
                 self.act(&topic, |conversation_id, reply| Command::TopicDelete { conversation_id, reply })
             }
+            Request::MessageEffects { account } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::MessageEffects { reply }) {
+                    Ok(page) => Response::Catalog { items: page.items, cursor: page.cursor },
+                    Err(refused) => *refused,
+                }
+            }
             Request::TopicIcons { account } => {
                 if let Err(refused) = self.online(&account) {
                     return *refused;

@@ -735,7 +735,10 @@ pub struct Composer {
     /// Per-message send options (Issue #776): Teams importance, Slack thread broadcast, Telegram effect.
     importance: protocol::Importance,
     broadcast: bool,
+    /// The effect the next send carries: its id (`Outgoing::effect`).
     effect: Option<String>,
+    /// The effects one account offers (`Request::MessageEffects`), asked when its option first shows.
+    effects: Option<(protocol::AccountKey, Vec<protocol::CatalogItem>)>,
     /// Cached out-of-office `(fetched_at, Option<(note, until)>)` for 1:1 direct chat peers.
     peer_away: HashMap<Key, (Instant, Option<(String, Option<i64>)>)>,
     /// Peers whose out-of-office profile fetch is currently in flight.
@@ -984,6 +987,7 @@ impl Composer {
             importance: protocol::Importance::Normal,
             broadcast: false,
             effect: None,
+            effects: None,
             peer_away: HashMap::new(),
             peer_away_asked: HashSet::new(),
             peer_away_gen: HashMap::new(),
@@ -1081,6 +1085,8 @@ impl Composer {
         match &self.target {
             Some(target) => {
                 let mut c = controls(&target.can, self.editing.is_some());
+                // An effect plays in a private chat only.
+                c.effects = c.effects && target.kind == ConversationKind::Direct;
                 if target.can.edit_media && target.can.max_file_bytes > 0 && self.editing.as_ref().is_some_and(|e| e.has_media) {
                     c.attach = true;
                 }
@@ -1123,6 +1129,7 @@ impl Composer {
             self.undo_join = None;
             self.no_preview = false;
             self.broadcast = false;
+            self.effect = None;
             self.armed = None;
             self.paid_confirmed = None;
             self.slowmode_timer = None;
@@ -2718,6 +2725,35 @@ impl Composer {
         .detach();
     }
 
+    /// Asks the account's effects once, when its composer first offers them.
+    fn load_effects(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.target.as_ref() else {
+            return;
+        };
+        if !live() || target.link != Link::Connected {
+            return;
+        }
+        let account = target.key.account();
+        if !self.controls().effects || self.effects.as_ref().is_some_and(|(held, _)| *held == account) {
+            return;
+        }
+        self.effects = Some((account.clone(), Vec::new()));
+        self.effect = None;
+        cx.spawn(async move |this, cx| {
+            let request = Request::MessageEffects { account: account.clone() };
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| {
+                if let (Ok(Response::Catalog { items, .. }), Some((held, effects))) = (answer, this.effects.as_mut()) {
+                    if *held == account {
+                        *effects = items;
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
     /// ⌘U: the system's file panel, several at once.
     fn send_options_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
         let controls = self.controls();
@@ -2791,9 +2827,10 @@ impl Composer {
             );
         }
         if show_effects {
+            let offered = self.effects.as_ref().map(|(_, items)| items.as_slice()).unwrap_or_default();
             let label = match self.effect.as_deref() {
                 None => "✨ Effect: None".to_owned(),
-                Some(e) => format!("✨ Effect: {e}"),
+                Some(id) => format!("✨ Effect: {}", offered.iter().find(|item| item.id == id).map_or(id, |item| item.name.as_str())),
             };
             let active = self.effect.is_some();
             bar = bar.child(
@@ -2808,12 +2845,9 @@ impl Composer {
                     .cursor_pointer()
                     .hover(|s| s.bg(theme::hover()))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.effect = match this.effect.as_deref() {
-                            None => Some("confetti".to_owned()),
-                            Some("confetti") => Some("fire".to_owned()),
-                            Some("fire") => Some("hearts".to_owned()),
-                            _ => None,
-                        };
+                        // Each click takes the next effect the account may send, then none again.
+                        let offered = this.effects.as_ref().map(|(_, items)| items.as_slice()).unwrap_or_default();
+                        this.effect = next_effect(offered, this.effect.as_deref());
                         cx.notify();
                     }))
                     .child(label),
@@ -5942,6 +5976,40 @@ impl Composer {
                     }
                 }
             }
+            if controls.effects {
+                let offered = self.effects.as_ref().map(|(_, list)| list.as_slice()).unwrap_or_default();
+                if !offered.is_empty() {
+                    if controls.silent || controls.schedule {
+                        items = items.child(menu_separator());
+                    }
+                    items = items.child(menu_label("Message effect"));
+                    if self.effect.is_some() {
+                        items = items.child(menu_item("send-effect-none", None, "No effect", None).on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.effect = None;
+                                this.send_menu = false;
+                                cx.notify();
+                            },
+                        )));
+                    }
+                    for item in offered.iter().take(12) {
+                        let row_id = format!("send-effect-{}", item.id);
+                        if item.locked {
+                            items = items.child(menu_item_disabled(row_id, None, format!("✨ {}", item.name), Some("Premium")));
+                        } else {
+                            let id = item.id.clone();
+                            let picked = (self.effect.as_deref() == Some(item.id.as_str())).then_some("✓");
+                            items = items.child(menu_item(row_id, None, format!("✨ {}", item.name), picked).on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.effect = Some(id.clone());
+                                    this.send_menu = false;
+                                    cx.notify();
+                                },
+                            )));
+                        }
+                    }
+                }
+            }
         }
         let items = items.on_mouse_down_out(cx.listener(|this, _, _, cx| {
             this.send_menu = false;
@@ -6241,6 +6309,17 @@ fn shot_pictures() -> Vec<PathBuf> {
 }
 
 /// Formats a UTC Unix timestamp as a compact date like `"Mon, Oct 19"` for OOO banners.
+/// The effect after `current` among those the account may send: the first for none, none
+/// after the last, and a locked (Premium) one is passed over.
+fn next_effect(offered: &[protocol::CatalogItem], current: Option<&str>) -> Option<String> {
+    let mut open = offered.iter().filter(|item| !item.locked);
+    match current {
+        None => open.next(),
+        Some(id) => open.skip_while(|item| item.id != id).nth(1),
+    }
+    .map(|item| item.id.clone())
+}
+
 fn format_ooo_until(unix_secs: i64) -> String {
     const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
@@ -6338,6 +6417,7 @@ impl Render for Composer {
         }
         #[cfg(feature = "gui-shot")]
         self.stage_picker(window, cx);
+        self.load_effects(cx);
 
         let phone = crate::gui::phone::active();
         let dock = div()
@@ -7247,6 +7327,27 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_effect_option_steps_through_what_the_account_may_send_and_back_to_none() {
+        let item = |id: &str, locked: bool| protocol::CatalogItem {
+            id: id.into(),
+            name: String::new(),
+            file: None,
+            pack: String::new(),
+            animated: false,
+            set: String::new(),
+            locked,
+        };
+        let offered = [item("1", false), item("2", true), item("3", false)];
+        assert_eq!(next_effect(&offered, None).as_deref(), Some("1"));
+        // A Premium effect this account cannot send is passed over.
+        assert_eq!(next_effect(&offered, Some("1")).as_deref(), Some("3"));
+        assert_eq!(next_effect(&offered, Some("3")), None);
+        // One that is no longer offered, or nothing offered at all: none.
+        assert_eq!(next_effect(&offered, Some("9")), None);
+        assert_eq!(next_effect(&[], None), None);
+    }
 
     #[test]
     fn client_ids_are_digits_and_never_repeat() {

@@ -1315,7 +1315,7 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
         Request::Settings => Response::Settings { values: Vec::new() },
         Request::GetDefaultDisappearing { .. } => Response::DefaultDisappearing { seconds: 0 },
         Request::SuggestedFolders { .. } => Response::SuggestedFolders { folders: Vec::new() },
-        Request::TopicIcons { .. } => Response::Catalog { items: Vec::new(), cursor: None },
+        Request::TopicIcons { .. } | Request::MessageEffects { .. } => Response::Catalog { items: Vec::new(), cursor: None },
         Request::Storage => Response::Storage { messages: 48_213, files: 734_003_200, chats: Vec::new() },
         Request::Prunable { .. } => Response::Prunable { messages: 0, bytes: 0 },
         Request::SignIn { .. } => Response::Error { code: protocol::ErrorCode::SignIn, detail: "The sign-in window was closed.".into() },

@@ -2819,6 +2819,8 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
             message.edited_at = if raw.edit_hide { None } else { raw.edit_date.map(i64::from) };
             message.edited = message.edited_at.is_some();
             message.pinned = raw.pinned;
+            // The effect it was sent with, by its emoji; one Telegram has not named yet is a bare mark.
+            message.effect = raw.effect.map(|id| dir.effects.get(&id).cloned().unwrap_or_default());
             // A signed channel post names its author; an anonymous admin's message, their title.
             message.signature = raw.post_author.clone().unwrap_or_default();
             message.shares = raw.forwards.filter(|_| raw.post).map(|count| count.max(0) as u32);

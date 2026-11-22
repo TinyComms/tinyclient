@@ -43,6 +43,9 @@ const ME: i64 = 7001;
 const ODALYS: i64 = 7002;
 const TOBIN: i64 = 7003;
 const CREW: i64 = 8001;
+/// Message effects: one anyone may send, and one that needs Premium.
+const EFFECT_PARTY: i64 = 5_046_509_860_389_126_442;
+const EFFECT_PREMIUM: i64 = 5_104_841_245_755_180_586;
 const NOTES: i64 = 9001;
 const WORKSHOP: i64 = 9002;
 /// "Field Notes chat", the channel's linked discussion group: where its post's comments live.
@@ -630,6 +633,10 @@ struct World {
     /// The next `upload.GetFile` is refused with a flood wait of this many seconds, once.
     flood_file: Option<u32>,
     revoked: bool,
+    /// The effect the send being delivered carries.
+    send_effect: Option<i64>,
+    /// How many times `getAvailableEffects` was asked.
+    effects_asked: u32,
     /// How many times `getMessagesViews` was asked to count a view.
     viewed_posts: i32,
     /// The account has as many pinned chats as Telegram allows (`pins-full`).
@@ -815,6 +822,8 @@ impl World {
             revoked: false,
             pins_full: false,
             viewed_posts: 0,
+            send_effect: None,
+            effects_asked: 0,
             family_grew: false,
             lost_reads: false,
             unread_marks: HashMap::new(),
@@ -1082,6 +1091,7 @@ impl World {
             self.next += 1;
             let id = self.next;
             let mut sent = message(peer, id, ME, schedule.unwrap_or(crate::hub::now() as i32), &text);
+            sent.effect = self.send_effect.take();
             sent.media = media;
             sent.entities = entities;
             sent.grouped_id = group;
@@ -2901,6 +2911,17 @@ impl World {
             // Telegram's own apps pinned the group; then reordered the pins without saying how.
             "pin" => vec![update(tl::types::UpdateDialogPinned { pinned: true, folder_id: None, peer: tl::types::DialogPeer { peer: Who::Group(CREW).peer() }.into() }.into())],
             "pins" => vec![update(tl::types::UpdatePinnedDialogs { folder_id: None, order: None }.into())],
+            // Odalys sends a message with the party effect.
+            "effect" => {
+                let mut said = message(odalys, 71, ODALYS, t0() + 71, "Happy birthday!");
+                said.effect = Some(EFFECT_PARTY);
+                self.store(None, said.clone());
+                vec![new(said)]
+            }
+            "effects-asked" => {
+                self.log(&format!("effects asked {}", self.effects_asked));
+                Vec::new()
+            }
             "pins-full" => {
                 self.pins_full = true;
                 Vec::new()
@@ -3613,6 +3634,28 @@ impl World {
                 make(101, "Personal", true, false, "Only private chats with contacts."),
             ]);
         }
+        // Two effects: one anyone may send and one that needs Premium. The ask is not logged
+        // (a message that carries an effect makes it, whenever one is mapped); `effects-asked`
+        // says how many there were.
+        if asked::<f::messages::GetAvailableEffects>(body).is_some() {
+            self.effects_asked += 1;
+            let effect = |id: i64, emoticon: &str, premium_required: bool| {
+                tl::enums::AvailableEffect::Effect(tl::types::AvailableEffect {
+                    premium_required,
+                    id,
+                    emoticon: emoticon.to_owned(),
+                    static_icon_id: None,
+                    effect_sticker_id: id + 1,
+                    effect_animation_id: None,
+                })
+            };
+            let found = tl::types::messages::AvailableEffects {
+                hash: 1,
+                effects: vec![effect(EFFECT_PARTY, "\u{1F389}", false), effect(EFFECT_PREMIUM, "\u{1F525}", true)],
+                documents: Vec::new(),
+            };
+            return answer(tl::enums::messages::AvailableEffects::Effects(found));
+        }
         // Who reacted, and who read: Odalys and Tobin reacted in the group and Odalys read it.
         // Odalys shares when she read a private message, and Tobin's chat needs mine shared.
         if let Some(request) = asked::<f::messages::GetMessageReactionsList>(body) {
@@ -4136,6 +4179,14 @@ impl World {
                 true => key(peer, reply),
                 false => key(peer, topic),
             };
+            if let Some(effect) = request.effect {
+                // Telegram plays an effect in a private chat only.
+                if !matches!(peer, Who::User(_)) || ![EFFECT_PARTY, EFFECT_PREMIUM].contains(&effect) {
+                    return Err(rpc(400, "EFFECT_ID_INVALID", None));
+                }
+                options.push_str(&format!(" [effect={effect}]"));
+            }
+            self.send_effect = request.effect;
             let noted = super::content::entity_note(request.entities.as_deref().unwrap_or(&[]));
             self.log(&format!("SendMessage {said} {}{noted}{options}", request.message));
             return self.deliver(events, peer, topic, reply, vec![(request.random_id, request.message, None, request.entities)], request.schedule_date);
@@ -6272,7 +6323,14 @@ impl World {
             let peer = input_who(&request.peer);
             let (kind, media) = held_media(&request.media, self.next + 2_000);
             let options = [("silent", request.silent), ("scheduled", request.schedule_date.is_some())];
-            let options: String = options.iter().filter(|(_, on)| *on).map(|(name, _)| format!(" [{name}]")).collect();
+            let mut options: String = options.iter().filter(|(_, on)| *on).map(|(name, _)| format!(" [{name}]")).collect();
+            if let Some(effect) = request.effect {
+                if !matches!(peer, Who::User(_)) || ![EFFECT_PARTY, EFFECT_PREMIUM].contains(&effect) {
+                    return Some(Err(rpc(400, "EFFECT_ID_INVALID", None)));
+                }
+                options.push_str(&format!(" [effect={effect}]"));
+            }
+            self.send_effect = request.effect;
             let noted = super::content::entity_note(request.entities.as_deref().unwrap_or(&[]));
             self.log(&format!("SendMedia {} {kind} {}{noted}{options}", peer.text(), request.message));
             if kind.starts_with("voice-note") {

@@ -1229,7 +1229,7 @@ impl Pane {
                                 .bg(tokens::card())
                                 .type_micro()
                                 .text_color(theme::accent())
-                                .child(format!("✨ {effect}")),
+                                .child(if effect.is_empty() { "✨".to_owned() } else { format!("✨ {effect}") }),
                         )
                 }))
                 .children(message.sent_via.as_deref().map(|via| {

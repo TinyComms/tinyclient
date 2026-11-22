@@ -128,6 +128,7 @@ impl Fault {
                 "YOUR_PRIVACY_RESTRICTED" => "Telegram shows read times only if you share your own. Change who sees your Last Seen in Telegram's privacy settings.".to_owned(),
                 "CHAT_TOO_BIG" => "Telegram only says who read a message in small groups.".to_owned(),
                 "MESSAGE_TOO_OLD" => "Telegram no longer keeps who read this message.".to_owned(),
+                "EFFECT_ID_INVALID" => "That effect can't be sent here. Telegram plays effects in private chats only.".to_owned(),
                 "PINNED_DIALOGS_TOO_MUCH" => "You've pinned as many chats as Telegram allows. Unpin one first.".to_owned(),
                 "ICON_EMOJI_INVALID" => "That topic icon isn't valid.".to_owned(),
                 "DATE_INVALID" => "Choose a valid date.".to_owned(),

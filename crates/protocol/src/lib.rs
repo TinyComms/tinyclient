@@ -1878,6 +1878,12 @@ pub enum Request {
     TopicDelete {
         topic: Key,
     },
+    /// The message effects this account can send (`Capabilities::effects`): each item's `id` is
+    /// what `Outgoing::effect` names and its `name` the emoji it is shown as. A `locked` one
+    /// needs the network's paid plan. Answers `Response::Catalog`.
+    MessageEffects {
+        account: AccountKey,
+    },
     /// Lists the default forum topic icons offered by the network (`inputStickerSetEmojiDefaultTopicIcons`).
     TopicIcons {
         account: AccountKey,
