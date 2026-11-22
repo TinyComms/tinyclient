@@ -4101,6 +4101,37 @@ impl Store {
         Ok(true)
     }
 
+    /// Writes a stored post's view and share counts. True if the message existed and one changed.
+    pub fn set_post_counts(&mut self, conversation: &Key, id: &str, views: Option<u32>, shares: Option<u32>) -> rusqlite::Result<bool> {
+        let Some(mut message) = self.message(conversation, id)? else {
+            return Ok(false);
+        };
+        let before = (message.views, message.shares);
+        message.views = views.or(message.views);
+        message.shares = shares.or(message.shares);
+        if before == (message.views, message.shares) {
+            return Ok(false);
+        }
+        self.ingest(conversation, &message, false)?;
+        Ok(true)
+    }
+
+    /// Clears the pin on every stored message of a conversation. True when one was pinned.
+    pub fn unpin_all(&mut self, conversation: &Key) -> rusqlite::Result<bool> {
+        let ids: Vec<String> = self
+            .db
+            .prepare(
+                "SELECT id FROM message
+                  WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND json_extract(body, '$.pinned') = 1",
+            )?
+            .query_map(params![word(&conversation.network), conversation.account.as_str(), conversation.id.as_str()], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for id in &ids {
+            self.set_pinned(conversation, id, false)?;
+        }
+        Ok(!ids.is_empty())
+    }
+
     /// Ephemeral rows do not outlive the session. Returns the conversations that lost one.
     pub fn drop_ephemeral(&mut self, account: &AccountKey) -> rusqlite::Result<Vec<String>> {
         let network = word(&account.network);

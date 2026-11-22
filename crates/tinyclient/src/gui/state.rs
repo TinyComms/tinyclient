@@ -177,6 +177,7 @@ impl Dirty {
             Change::Messages { .. }
             | Change::People { .. }
             | Change::Media { .. }
+            | Change::MediaProgress { .. }
             | Change::Typing { .. }
             | Change::Ephemeral { .. }
             | Change::Presence { .. }
@@ -186,6 +187,7 @@ impl Dirty {
             | Change::Searched { .. }
             | Change::SignIn { .. }
             | Change::Call { .. }
+            | Change::CallRating { .. }
             | Change::Upload { .. }
             | Change::Playback { .. }
             | Change::Recording { .. }

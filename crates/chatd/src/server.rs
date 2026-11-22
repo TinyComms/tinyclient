@@ -4422,6 +4422,42 @@ impl Chat {
             Request::TopicDelete { topic } => {
                 self.act(&topic, |conversation_id, reply| Command::TopicDelete { conversation_id, reply })
             }
+            Request::MessageEffects { account } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::MessageEffects { reply }) {
+                    Ok(page) => Response::Catalog { items: page.items, cursor: page.cursor },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::CallRate { account, call_id, rating, mut reasons, mut comment, user_initiative } => {
+                if !(1..=5).contains(&rating) {
+                    return error(ErrorCode::Refused, "Choose a rating between one and five stars.");
+                }
+                if call_id.trim().is_empty() {
+                    return error(ErrorCode::Refused, "Missing call id.");
+                }
+                reasons.truncate(8);
+                for reason in &mut reasons {
+                    protocol::clip(reason, 64);
+                }
+                protocol::clip(&mut comment, 512);
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::CallRate {
+                    call_id,
+                    rating,
+                    reasons,
+                    comment,
+                    user_initiative,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::TopicIcons { account } => {
                 if let Err(refused) = self.online(&account) {
                     return *refused;
@@ -5732,6 +5768,7 @@ impl Chat {
                     reply,
                 })
             }
+            Request::UnpinAll { conversation } => self.act(&conversation, |conversation_id, reply| Command::UnpinAll { conversation_id, reply }),
             Request::StarMessage { conversation, message_id, starred } => {
                 let account = conversation.account();
                 if let Err(refused) = self.online(&account) {
@@ -6143,7 +6180,11 @@ impl Chat {
                         // What the cache has never heard of may be the adapter's to fetch itself.
                         let unknown: Vec<String> = ids.iter().filter(|id| !files.iter().any(|file| file.id == **id)).cloned().collect();
                         if let (false, Some(adapter)) = (unknown.is_empty(), adapter) {
-                            let _ = adapter.send(Command::Wanted(unknown));
+                            let command = match span {
+                                Some(span) => Command::WantedSpan { ids: unknown, span },
+                                None => Command::Wanted(unknown),
+                            };
+                            let _ = adapter.send(command);
                         }
                         Response::Media { files }
                     }

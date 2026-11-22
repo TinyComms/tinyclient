@@ -226,6 +226,32 @@ pub(super) struct Ended {
     pub seconds: i64,
 }
 
+/// Issue chips offered for ratings below five stars (Telegram call rating, #447).
+pub(super) const CALL_RATING_REASONS: &[&str] = &[
+    "Echo",
+    "Noise",
+    "Interruptions",
+    "Distorted speech",
+    "Silence",
+    "Dropped",
+];
+
+/// How long an untouched post-call rating card stays in the dock before going away on its own.
+const RATING_IDLE: Duration = Duration::from_secs(45);
+
+/// Post-call rating card shown in the dock when Telegram asks (`need_rating`) or when the user
+/// clicks Rate on a finished call's row. Never blocks starting the next call.
+pub(super) struct CallRatingCard {
+    pub prompt: protocol::CallRatingPrompt,
+    pub title: String,
+    pub user_initiative: bool,
+    pub stars: u8,
+    pub reasons: Vec<&'static str>,
+    pub comment_input: Entity<super::input::TextInput>,
+    pub sending: bool,
+    pub error: Option<String>,
+}
+
 /// A call to start once the user agrees to leave the one that is up.
 #[derive(Clone)]
 pub(super) struct Confirm {
@@ -285,6 +311,10 @@ pub struct State {
     /// Leaving was asked for here, so the call going away is not the other side ending it.
     leaving: bool,
     ended: Option<Ended>,
+    /// Post-call rating prompt (`Change::CallRating`) or user-initiated row rating.
+    pub(super) rating: Option<CallRatingCard>,
+    /// Auto-dismisses an untouched `rating` card after [`RATING_IDLE`].
+    rating_timer: Option<Task<()>>,
     confirm: Option<Confirm>,
     /// A call that could not be asked for at all: the microphone is not allowed. Drawn as any
     /// failed call is, and gone when dismissed or when the next call starts.
@@ -930,6 +960,13 @@ impl Shell {
     /// Offered every change chatd reports, after `Shell` has applied its own part.
     pub(super) fn call_changed(&mut self, change: &Change, cx: &mut Context<Self>) {
         ensure_keys(cx);
+        if let Change::CallRating { prompt } = change {
+            // Never interrupt an active call with a rating card.
+            if self.snapshot.as_ref().and_then(|s| s.call.as_ref()).is_none() {
+                self.call_open_rating(prompt.clone(), false, cx);
+            }
+            return;
+        }
         let Change::Call { call, .. } = change else {
             return;
         };
@@ -984,6 +1021,8 @@ impl Shell {
                     self.call_state.connecting = None;
                 }
                 self.call_state.ended = None;
+                self.call_state.rating = None;
+                self.call_state.rating_timer = None;
                 let menus = matches!(call.state, CallState::RingingOut | CallState::Connecting | CallState::Joined);
                 if !menus {
                     self.call_menu_set(None, cx);
@@ -1082,6 +1121,131 @@ impl Shell {
             });
         }));
         cx.notify();
+    }
+
+    /// Opens the post-call rating card in the dock (either from `Change::CallRating` or from a
+    /// finished call row's Rate button). Untouched prompts auto-dismiss after [`RATING_IDLE`].
+    pub(in crate::gui) fn call_open_rating(
+        &mut self,
+        prompt: protocol::CallRatingPrompt,
+        user_initiative: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let title = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.open.as_ref())
+            .filter(|open| open.key == prompt.conversation)
+            .cloned()
+            .or_else(|| self.sidebar_state.find(&self.trees, &prompt.conversation))
+            .map(|c| c.title)
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "Call".to_owned());
+        let comment_input = cx.new(|cx| super::input::TextInput::new("Optional comment…", cx));
+        self.call_state.ended = None;
+        self.call_state.rating = Some(CallRatingCard {
+            prompt,
+            title,
+            user_initiative,
+            stars: 0,
+            reasons: Vec::new(),
+            comment_input,
+            sending: false,
+            error: None,
+        });
+        self.call_state.rating_timer = if user_initiative {
+            None
+        } else {
+            Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(RATING_IDLE).await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.call_state.rating.as_ref().is_some_and(|r| r.stars == 0 && !r.sending) {
+                        this.call_state.rating = None;
+                        this.call_state.rating_timer = None;
+                        cx.notify();
+                    }
+                });
+            }))
+        };
+        cx.notify();
+    }
+
+    pub(super) fn call_rating_star(&mut self, stars: u8, cx: &mut Context<Self>) {
+        if let Some(rating) = self.call_state.rating.as_mut() {
+            rating.stars = stars.clamp(1, 5);
+            if rating.stars == 5 {
+                rating.reasons.clear();
+            }
+            rating.error = None;
+            // Once the person interacts with the card, stop the auto-dismiss timer.
+            self.call_state.rating_timer = None;
+            cx.notify();
+        }
+    }
+
+    pub(super) fn call_rating_toggle_reason(&mut self, reason: &'static str, cx: &mut Context<Self>) {
+        if let Some(rating) = self.call_state.rating.as_mut() {
+            if let Some(pos) = rating.reasons.iter().position(|r| *r == reason) {
+                rating.reasons.remove(pos);
+            } else {
+                rating.reasons.push(reason);
+            }
+            rating.error = None;
+            self.call_state.rating_timer = None;
+            cx.notify();
+        }
+    }
+
+    pub(super) fn call_rating_skip(&mut self, cx: &mut Context<Self>) {
+        self.call_state.rating = None;
+        self.call_state.rating_timer = None;
+        cx.notify();
+    }
+
+    pub(super) fn call_rating_send(&mut self, cx: &mut Context<Self>) {
+        let Some(rating) = self.call_state.rating.as_mut() else {
+            return;
+        };
+        if rating.stars == 0 || rating.sending {
+            return;
+        }
+        rating.sending = true;
+        rating.error = None;
+        let comment = rating.comment_input.read(cx).text().to_owned();
+        let request = Request::CallRate {
+            account: rating.prompt.conversation.account(),
+            call_id: rating.prompt.call_id.clone(),
+            rating: rating.stars,
+            reasons: rating.reasons.iter().map(|r| (*r).to_owned()).collect(),
+            comment,
+            user_initiative: rating.user_initiative,
+        };
+        self.call_state.rating_timer = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| match answer {
+                Ok(Response::Ok) => {
+                    this.call_state.rating = None;
+                    cx.notify();
+                }
+                Ok(Response::Error { detail, .. }) => {
+                    if let Some(rating) = this.call_state.rating.as_mut() {
+                        rating.sending = false;
+                        rating.error = Some(detail);
+                    }
+                    cx.notify();
+                }
+                Ok(_) | Err(_) => {
+                    if let Some(rating) = this.call_state.rating.as_mut() {
+                        rating.sending = false;
+                        rating.error = Some("Couldn't send the rating.".to_owned());
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// A Tiny server moved the call to another room, or Discord moved it to another voice
@@ -2773,7 +2937,7 @@ impl Shell {
             self.call_state.connecting = Some(bare_call(conversation.clone(), CallState::Connecting, false, false));
         }
         let state = &mut self.call_state;
-        (state.error, state.local, state.ended) = (None, None, None);
+        (state.error, state.local, state.ended, state.rating, state.rating_timer) = (None, None, None, None, None);
         // A call asked for here opens full-screen on a phone.
         state.phone.minimised = false;
         // The phone's platform says when the microphone is refused (`phone::hooks`).

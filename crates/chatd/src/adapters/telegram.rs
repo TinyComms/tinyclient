@@ -271,6 +271,15 @@ struct Live {
     ads: Vec<(String, Instant)>,
     /// Sponsored messages recorded: the channel, the ad's id, and whether it was told as viewed.
     shown: Vec<(String, Vec<u8>, bool)>,
+    /// The message effects Telegram offers, once asked on this connection (`catalog::effects`),
+    /// and whether a message that carries one has already made us ask.
+    effects: Option<Vec<protocol::CatalogItem>>,
+    effects_asked: bool,
+    /// Recent phone calls seen on this connection: `(call_id, access_hash, peer)` so
+    /// `phoneCallDiscarded` can prompt for a rating and `phone.setCallRating` can name the call.
+    phone_calls: VecDeque<(i64, i64, Option<Who>)>,
+    /// The newest post of each broadcast channel told to Telegram as viewed (`sync::viewed`).
+    viewed: HashMap<Who, i32>,
     /// What the picker's items send.
     picks: VecDeque<(String, catalog::Pick)>,
     /// Sticker tab pages, from the first page: recent, favourites, featured, then installed packs.
@@ -320,6 +329,8 @@ pub(super) struct Options {
     pub allow_paid_stars: Option<i64>,
     /// Optional peer to post as (channel or anonymous admin, from `channels.getSendAs`).
     pub send_as: Option<Who>,
+    /// The message effect to send with it (`messages.getAvailableEffects`).
+    pub effect: Option<i64>,
 }
 
 /// One connection's worth of an account: what every thread of the adapter shares.
@@ -763,12 +774,15 @@ fn offline(ctx: &Context, command: Command) {
         Command::LoadTopics { reply, .. } => drop(reply.send(Err(down()))),
         Command::TopicCreate { reply, .. } => drop(reply.send(Err(down()))),
         Command::TopicUpdate { reply, .. } | Command::TopicDelete { reply, .. } => drop(reply.send(Err(down()))),
-        Command::TopicIcons { reply } => drop(reply.send(Err(down()))),
+        Command::TopicIcons { reply } | Command::MessageEffects { reply } => drop(reply.send(Err(down()))),
+        Command::CallRate { reply, .. } => drop(reply.send(Err(down()))),
         Command::ScheduledList { reply, .. } => drop(reply.send(Err(down()))),
         Command::CancelScheduled { reply, .. } | Command::SendScheduledNow { reply, .. } => drop(reply.send(Err(down()))),
         Command::Reschedule { reply, .. } => drop(reply.send(Err(down()))),
         Command::Pinned { reply, .. } => drop(reply.send(Err(down()))),
-        Command::Pin { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Pin { reply, .. } | Command::UnpinAll { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Reactors { reply, .. } => drop(reply.send(Err(down()))),
+        Command::ReadBy { reply, .. } => drop(reply.send(Err(down()))),
         Command::Forward { reply, .. } => drop(reply.send(Err(down()))),
         Command::Report { reply, .. } => drop(reply.send(Err(down()))),
         Command::ReportReasons { reply, .. } => drop(reply.send(Err(down()))),
@@ -866,6 +880,12 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::TopicIcons { reply } => {
             let _ = reply.send(catalog::topic_icons(account).map_err(refused));
         }
+        Command::MessageEffects { reply } => {
+            let _ = reply.send(catalog::effects(account).map(|items| crate::adapters::CatalogPage { items, cursor: None }).map_err(refused));
+        }
+        Command::CallRate { call_id, rating, reasons, comment, user_initiative, reply } => {
+            let _ = reply.send(rate_call(account, &call_id, rating, &reasons, &comment, user_initiative).map_err(refused));
+        }
         Command::ScheduledList { conversation_id, reply } => {
             let _ = reply.send(info::scheduled_list(account, &conversation_id).map_err(refused));
         }
@@ -881,6 +901,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             );
         }
         Command::Wanted(ids) => drop(account.files.asked(&ids)),
+        Command::WantedSpan { ids, span } => drop(account.files.asked_span(&ids, span)),
         Command::Previews(ids) => sync::previews(account, &ids),
         Command::MarkRead { conversation_id, message_id } => mark_read(account, &conversation_id, &message_id),
         Command::MarkUnread { conversation_id, .. } => mark_dialog_unread(account, &conversation_id, true),
@@ -898,6 +919,16 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::ReactionRules { conversation_id, reply } => {
             let _ = reply.send(react::rules(account, &conversation_id).map_err(refused));
+        }
+        Command::Reactors { conversation_id, message_id, emoji, burst: _, after, limit, reply } => {
+            let _ = reply.send(react::reactors(account, &conversation_id, &message_id, &emoji, after, limit).map_err(refused));
+        }
+        Command::ReadBy { conversation_id, message_id, reply } => {
+            // The same name refuses a call elsewhere; here it is about read times.
+            let _ = reply.send(react::read_by(account, &conversation_id, &message_id).map_err(|fault| match fault.is("USER_PRIVACY_RESTRICTED") {
+                true => Refusal::Refused("This person does not share when they read messages.".to_owned()),
+                false => refused(fault),
+            }));
         }
         Command::StarsBalance { reply } => {
             let _ = reply.send(react::stars_balance(account).map_err(refused));
@@ -1121,6 +1152,9 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::Pin { conversation_id, message_id, pinned, notify, me_only, reply } => {
             let _ = reply.send(info::pin(account, &conversation_id, &message_id, pinned, notify, me_only).map_err(refused));
+        }
+        Command::UnpinAll { conversation_id, reply } => {
+            let _ = reply.send(info::unpin_all(account, &conversation_id).map_err(refused));
         }
         Command::Forward { from_conversation_id, message_ids, to_conversation_ids, note, reply } => {
             let _ = reply.send(info::forward(account, &from_conversation_id, &message_ids, &to_conversation_ids, &note).map_err(refused));
@@ -1433,6 +1467,9 @@ fn mark_read(account: &Account, conversation: &str, message: &str) {
     if let Err(fault) = told {
         tracing::warn!("chatd: Telegram: read: {fault}");
     }
+    if read && topic.is_none() {
+        sync::viewed(account, conversation, who, max_id);
+    }
     // Reading does not clear a manual unread mark. Telegram's own apps send both.
     if topic.is_none() {
         mark_dialog_unread(account, conversation, false);
@@ -1598,7 +1635,7 @@ fn send_text(account: &Account, conversation: &str, client_id: &str, text: &str,
         schedule_repeat_period: None,
         send_as: opts.send_as.and_then(|who| account.input(who).ok()),
         quick_reply_shortcut: None,
-        effect: None,
+        effect: opts.effect,
         allow_paid_stars: opts.allow_paid_stars,
         suggested_post: None,
         rich_message: None,
@@ -2471,4 +2508,82 @@ pub fn prove_telegram_block_contact() -> Result<(), String> {
 /// The lab's telegram-checklist driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_checklist() -> Result<(), String> {
     content::prove_checklist()
+}
+
+/// Formats Telegram's `phone.setCallRating` comment from selected issue tags and optional note.
+/// Reason chips apply only below five stars; five-star ratings send the trimmed note alone.
+pub(super) fn format_call_rating_comment(rating: u8, reasons: &[String], comment: &str) -> String {
+    let mut tags = Vec::new();
+    if rating < 5 {
+        for raw in reasons {
+            let slug: String = raw
+                .trim()
+                .to_ascii_lowercase()
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
+            let slug = slug.trim_matches('_');
+            if !slug.is_empty() {
+                let tag = format!("#{slug}");
+                if !tags.contains(&tag) {
+                    tags.push(tag);
+                }
+            }
+        }
+    }
+    let note = comment.trim();
+    match (tags.is_empty(), note.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => note.to_owned(),
+        (false, true) => tags.join(" "),
+        (false, false) => format!("{}\n{note}", tags.join(" ")),
+    }
+}
+
+/// Sends `phone.setCallRating` for a call seen on this connection.
+fn rate_call(
+    account: &Account,
+    call_id: &str,
+    rating: u8,
+    reasons: &[String],
+    comment: &str,
+    user_initiative: bool,
+) -> Result<(), Fault> {
+    if !(1..=5).contains(&rating) {
+        return Err(Fault::Refused("Choose a rating between one and five stars.".to_owned()));
+    }
+    let id: i64 = call_id
+        .trim()
+        .parse()
+        .map_err(|_| Fault::Refused("That call couldn't be identified.".to_owned()))?;
+    let access_hash = account
+        .live()
+        .phone_calls
+        .iter()
+        .rev()
+        .find_map(|(known_id, hash, _)| (*known_id == id).then_some(*hash))
+        .ok_or_else(|| Fault::Refused("Telegram only accepts ratings for calls from this session.".to_owned()))?;
+    let comment = format_call_rating_comment(rating, reasons, comment);
+    let answer = account.ask(&tl::functions::phone::SetCallRating {
+        user_initiative,
+        peer: tl::types::InputPhoneCall { id, access_hash }.into(),
+        rating: i32::from(rating),
+        comment,
+    })?;
+    live::answered(account, &answer);
+    Ok(())
+}
+
+#[cfg(test)]
+mod call_rating_tests {
+    use super::format_call_rating_comment;
+
+    #[test]
+    fn rating_comment_formats_reason_tags_only_below_five_stars() {
+        let reasons = vec!["Echo".into(), "Distorted speech".into(), "echo".into()];
+        assert_eq!(format_call_rating_comment(3, &reasons, "  kept dropping  "), "#echo #distorted_speech\nkept dropping");
+        assert_eq!(format_call_rating_comment(2, &reasons, "   "), "#echo #distorted_speech");
+        assert_eq!(format_call_rating_comment(5, &reasons, "  Crystal clear  "), "Crystal clear");
+        assert_eq!(format_call_rating_comment(5, &reasons, ""), "");
+    }
 }

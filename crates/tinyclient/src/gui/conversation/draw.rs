@@ -652,6 +652,42 @@ impl Pane {
             Some(div().flex_none().flex().items_center().gap(px(3.)).children(shown))
         });
         let call_support = self.open.as_ref().map_or(protocol::CallSupport::None, |open| open.call);
+        let rate_pill = message
+            .call
+            .as_ref()
+            .filter(|note| note.outcome == protocol::CallOutcome::Ended)
+            .and_then(|note| {
+                let call_id = note.call_id.clone()?;
+                let key = open_key.clone()?;
+                let shell = self.shell.clone();
+                let prompt = protocol::CallRatingPrompt {
+                    conversation: key,
+                    call_id,
+                    video: note.video,
+                    seconds: note.seconds,
+                };
+                Some(
+                    div()
+                        .id(SharedString::from(format!("call-row-rate-{}", message.id)))
+                        .flex_none()
+                        .h(px(24.))
+                        .px(px(10.))
+                        .rounded_full()
+                        .bg(theme::quiet_fill())
+                        .text_color(theme::text_soft())
+                        .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .type_micro()
+                        .font_weight(theme::SEMIBOLD)
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            let prompt = prompt.clone();
+                            let _ = shell.update(cx, |shell, cx| shell.call_open_rating(prompt, true, cx));
+                        }))
+                        .child("Rate"),
+                )
+            });
         let shell = self.shell.clone();
         let pill = spec.pill.and_then(|words| {
             let key = open_key?;
@@ -728,6 +764,7 @@ impl Pane {
                     .children(faces)
                     .child(div().type_micro().text_color(theme::text_faint()).child(short_clock(message.sent))),
             )
+            .children(rate_pill)
             .children(pill)
     }
 
@@ -1247,7 +1284,7 @@ impl Pane {
                                 .bg(tokens::card())
                                 .type_micro()
                                 .text_color(theme::accent())
-                                .child(format!("✨ {effect}")),
+                                .child(if effect.is_empty() { "✨".to_owned() } else { format!("✨ {effect}") }),
                         )
                 }))
                 .children(message.sent_via.as_deref().map(|via| {
@@ -5082,15 +5119,8 @@ impl Pane {
     /// A channel post's footer: how many people saw it, as Telegram's apps say it. Telegram
     /// counts views for channel posts only, so a message without a count draws nothing.
     fn views_line(&self, message: &Message) -> Option<AnyElement> {
-        let views = message.views?;
-        Some(
-            div()
-                .h(px(16.))
-                .type_micro()
-                .text_color(theme::text_faint())
-                .child(format!("{} views", views_short(views)))
-                .into_any_element(),
-        )
+        let words = post_line(&message.signature, message.views, message.shares)?;
+        Some(div().h(px(16.)).type_micro().text_color(theme::text_faint()).child(words).into_any_element())
     }
 
     fn thread_line(&mut self, message: &Rc<Message>, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -5451,6 +5481,20 @@ fn last_reply_label(now: i64, last: i64) -> Option<String> {
 
 /// A view count the way Telegram's apps say it: "987", "12.4K", "1.2M". The number is cut,
 /// not rounded, so a count never reads as more than Telegram said.
+/// A channel post's footer: who signed it, how many saw it, how many times it was forwarded.
+/// Each part is said only when the network gave it; a share count of none is not said.
+fn post_line(signature: &str, views: Option<u32>, shares: Option<u32>) -> Option<String> {
+    let parts: Vec<String> = [
+        (!signature.is_empty()).then(|| signature.to_owned()),
+        views.map(|views| format!("{} views", views_short(views))),
+        shares.filter(|shares| *shares > 0).map(|shares| format!("{} {}", views_short(shares), if shares == 1 { "share" } else { "shares" })),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 fn views_short(views: u32) -> String {
     let (divisor, suffix) = match views {
         0..=999 => return views.to_string(),
@@ -5496,6 +5540,17 @@ mod tests {
 
     fn face(message: &Message, messages: &[Rc<Message>], account: Option<&str>) -> Option<String> {
         own_face(message, None, messages, "me", || account.map(picture)).map(|file| file.id)
+    }
+
+    #[test]
+    fn a_post_says_its_signature_views_and_shares_and_nothing_it_was_not_given() {
+        assert_eq!(post_line("", None, None), None);
+        assert_eq!(post_line("", Some(12_400), None).as_deref(), Some("12.4K views"));
+        assert_eq!(post_line("Mira K.", Some(12_400), Some(31)).as_deref(), Some("Mira K. · 12.4K views · 31 shares"));
+        assert_eq!(post_line("", Some(7), Some(1)).as_deref(), Some("7 views · 1 share"));
+        assert_eq!(post_line("", Some(7), Some(0)).as_deref(), Some("7 views"));
+        // An anonymous admin's title in a group, where nothing is counted.
+        assert_eq!(post_line("Trail boss", None, None).as_deref(), Some("Trail boss"));
     }
 
     #[test]
@@ -5569,7 +5624,7 @@ mod tests {
         let make = |outcome, outgoing, seconds| {
             let mut m = Message::plain("r1", "Bea", "fallback", 100, outgoing);
             m.kind = MessageKind::System;
-            m.call = Some(protocol::CallNote { outcome, caller_id: "u1".into(), seconds, participants: Vec::new(), video: false });
+            m.call = Some(protocol::CallNote { outcome, caller_id: "u1".into(), seconds, participants: Vec::new(), video: false, call_id: None });
             m
         };
         let missed_in = call_line_spec(&make(protocol::CallOutcome::Missed, false, None), "Bea");

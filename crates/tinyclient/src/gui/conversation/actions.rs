@@ -187,6 +187,29 @@ pub struct Can {
     pub clear_reactions: bool,
     /// May translate this message inline on demand (`Capabilities::translate`, non-E2EE, non-empty text).
     pub translate: bool,
+    /// My own sent message where the network says who read it (`Capabilities::read_by`).
+    pub seen_by: bool,
+}
+
+/// The reaction's people are asked of the network: the account can list them, and the message
+/// names none of them or (Telegram's few recent reactors) fewer than reacted.
+pub(super) fn reactors_asked(reaction: &protocol::Reaction, burst: bool, can_reactors: bool) -> bool {
+    can_reactors && (burst || (reaction.who.len() as u32) < reaction.count.max(1))
+}
+
+/// What "Seen by" says: when the other side of a private chat read it, or who in a group did.
+pub(super) fn seen_by_words(readers: &[protocol::ReadBy], direct: bool, now: i64) -> String {
+    match readers {
+        [] => "Not seen yet.".to_owned(),
+        [one] if direct && one.at > 0 => format!("Seen {}.", crate::gui::time::stamp(now, one.at)),
+        _ => {
+            let names: Vec<&str> = readers.iter().map(|reader| if reader.name.is_empty() { "Someone" } else { reader.name.as_str() }).collect();
+            match names.len() > REACTORS_SHOWN {
+                true => format!("Seen by {} and {} more.", names[..REACTORS_SHOWN].join(", "), names.len() - REACTORS_SHOWN),
+                false => format!("Seen by {}.", names.join(", ")),
+            }
+        }
+    }
 }
 
 /// What the menu and the toolbar call this message's thread.
@@ -390,6 +413,8 @@ pub fn can_with_network_context(
         report: act && network == Network::Tiny && !message.outgoing && caps.abuse_reports,
         clear_reactions: act && network == Network::Discord && caps.reactions && rights.delete_others && !message.reactions.is_empty(),
         translate: act && caps.translate && network != Network::Signal && !message.text.trim().is_empty(),
+        // Telegram counts readers in private chats and small groups, never in a channel.
+        seen_by: act && caps.read_by && message.outgoing && !matches!(kind, ConversationKind::Channel | ConversationKind::Announcement),
     }
 }
 
@@ -436,6 +461,8 @@ enum MenuAct {
     Edit,
     /// Pin or unpin a message when `can.pin` is true.
     Pin,
+    /// Who read my message (`can.seen_by`).
+    SeenBy,
     /// Publish (crosspost) an announcement-channel message to following servers.
     Publish,
     /// Forward natively (`can.forward`) or "Copy to…" fallback (`can.act && !can.forward`).
@@ -675,6 +702,9 @@ fn menu_acts(
     }
     if can.remind {
         acts.push(MenuAct::Remind);
+    }
+    if can.seen_by {
+        acts.push(MenuAct::SeenBy);
     }
     if can.report {
         acts.push(MenuAct::Report);
@@ -1311,7 +1341,7 @@ impl Pane {
         self.hover = Some(message.id.clone());
         let can_reactors = self.open.as_ref().is_some_and(|open| open.can.reactors);
         let needs_fetch = message.reactions.get(reaction).and_then(|r| {
-            if (burst || r.who.is_empty()) && can_reactors {
+            if reactors_asked(r, burst, can_reactors) {
                 let emoji = r.file.as_ref().map_or_else(|| r.emoji.clone(), |file| file.id.clone());
                 Some((message.id.clone(), emoji))
             } else {
@@ -1356,6 +1386,29 @@ impl Pane {
         cx.notify();
     }
 
+    /// Asks the network who read my message and says the answer, or its refusal, in a line.
+    fn seen_by(&mut self, message: &Message, cx: &mut Context<Self>) {
+        let Some(open) = self.open.as_ref() else {
+            return;
+        };
+        let direct = open.kind == ConversationKind::Direct;
+        let request = Request::ReadBy { conversation: open.key.clone(), message_id: message.id.clone() };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| {
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| since.as_secs() as i64);
+                let words = match answer {
+                    Ok(Response::ReadBy { readers }) => seen_by_words(&readers, direct, now),
+                    Ok(Response::Error { detail, .. }) => detail,
+                    Ok(_) => return,
+                    Err(err) => crate::client::trouble_words("read who saw this", &err),
+                };
+                this.say(words, cx);
+            });
+        })
+        .detach();
+    }
+
     /// Pins or unpins a message on the network. Never mutates `message.pinned` optimistically:
     /// chatd emits `Change::Messages` and the pins pane reloads once the network confirms.
     fn toggle_pin(&mut self, message: &Message, cx: &mut Context<Self>) {
@@ -1367,7 +1420,8 @@ impl Pane {
             conversation: conversation.clone(),
             message_id: message.id.clone(),
             pinned,
-            notify: true,
+            // A pin from the menu does not notify the whole group: there is no box to ask in.
+            notify: false,
             me_only: false,
         };
         cx.spawn(async move |this, cx| {
@@ -1375,6 +1429,7 @@ impl Pane {
             let _ = this.update(cx, |this, cx| {
                 match answer {
                     Ok(Response::Ok) => {
+                        this.refresh_pin_bar(cx);
                         let _ = this.shell.update(cx, |shell, cx| shell.refresh_pins(&conversation, cx));
                     }
                     Ok(Response::Error { detail, .. }) => {
@@ -1524,6 +1579,7 @@ impl Pane {
             MenuAct::React => self.open_picker(&message.id, at, window, cx),
             MenuAct::Edit => self.edit(&message, window, cx),
             MenuAct::Pin => self.toggle_pin(&message, cx),
+            MenuAct::SeenBy => self.seen_by(&message, cx),
             MenuAct::Publish => self.publish_message(&message, cx),
             MenuAct::Forward => {
                 let native = self.can(&message).forward;
@@ -2486,6 +2542,13 @@ impl Pane {
                         .on_click(go(MenuAct::Remind)),
                 );
             }
+            if can.seen_by {
+                items = items.child(
+                    menu_item("seen-by", Some("icons/check-check.svg"), "Seen by…", None)
+                        .when(lit(MenuAct::SeenBy), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::SeenBy)),
+                );
+            }
             if can.report {
                 items = items.child(menu_separator()).child(
                     menu_item_danger("report", Some("icons/triangle-alert.svg"), "Report…")
@@ -2563,7 +2626,8 @@ impl Pane {
             .is_some_and(|open| open.key.network == Network::Discord && (open.rights.delete_others || open.moderate));
         let emoji_key = reaction.file.as_ref().map_or_else(|| reaction.emoji.clone(), |file| file.id.clone());
         let mut list = menu().w(px(248.));
-        if !burst && !reaction.who.is_empty() {
+        let asked = reactors_asked(reaction, burst, self.open.as_ref().is_some_and(|open| open.can.reactors));
+        if !asked && !reaction.who.is_empty() {
             for (ix, id) in reaction.who.iter().enumerate() {
                 if ix == REACTORS_SHOWN {
                     list = list.child(menu_separator()).child(menu_item(
@@ -4384,6 +4448,43 @@ mod tests {
         assert!(!menu_acts(signal, false, 0, true, true, false, false, false, false, false, false).contains(&MenuAct::Translate));
         let blank = Message::plain("2", "Mara", "  ", 1, false);
         assert!(!can_with_network(&blank, Network::Telegram, &caps, rights, ConversationKind::Direct, false, 10).translate);
+    }
+
+    #[test]
+    fn seen_by_is_offered_on_my_own_messages_where_the_network_says_who_read() {
+        let caps = Capabilities { read_by: true, ..telegram_caps() };
+        let rights = ConversationRights::default();
+        let mine = Message::plain("1", "Me", "hello", 1, true);
+        let theirs = Message::plain("2", "Mara", "hello", 1, false);
+        let offered = can_with_network(&mine, Network::Telegram, &caps, rights, ConversationKind::Group, false, 10);
+        assert!(offered.seen_by);
+        assert!(menu_acts(offered, false, 0, true, true, false, false, false, false, false, false).contains(&MenuAct::SeenBy));
+        assert!(!can_with_network(&theirs, Network::Telegram, &caps, rights, ConversationKind::Group, false, 10).seen_by);
+        assert!(!can_with_network(&mine, Network::Telegram, &caps, rights, ConversationKind::Channel, false, 10).seen_by);
+        assert!(!can_with_network(&mine, Network::Telegram, &telegram_caps(), rights, ConversationKind::Group, false, 10).seen_by);
+
+        let reader = |name: &str, at: i64| protocol::ReadBy {
+            person: protocol::Key { network: Network::Telegram, account: "7001".into(), id: "u7002".into() },
+            name: name.into(),
+            avatar: None,
+            at,
+        };
+        assert_eq!(seen_by_words(&[], true, 0), "Not seen yet.");
+        assert_eq!(seen_by_words(&[reader("Odalys", 0), reader("", 0)], false, 0), "Seen by Odalys, Someone.");
+        assert!(seen_by_words(&[reader("Odalys", 1_700_000_000)], true, 1_700_000_100).starts_with("Seen "));
+        assert!(!seen_by_words(&[reader("Odalys", 1_700_000_000)], true, 1_700_000_100).contains("Odalys"));
+    }
+
+    #[test]
+    fn a_reactions_people_are_asked_when_the_message_names_fewer_than_reacted() {
+        let reaction = |who: &[&str], count| protocol::Reaction { emoji: "+".into(), count, who: who.iter().map(|id| (*id).to_owned()).collect(), ..protocol::Reaction::default() };
+        // Telegram sends the few most recent with the message; the rest are asked for.
+        assert!(reactors_asked(&reaction(&["u1", "u2"], 9), false, true));
+        assert!(reactors_asked(&reaction(&[], 2), false, true));
+        // Everyone is already named, or the account cannot list them: the message's own list stands.
+        assert!(!reactors_asked(&reaction(&["u1", "u2"], 2), false, true));
+        assert!(!reactors_asked(&reaction(&["u1"], 9), false, false));
+        assert!(reactors_asked(&reaction(&["u1"], 1), true, true));
     }
 
     #[test]

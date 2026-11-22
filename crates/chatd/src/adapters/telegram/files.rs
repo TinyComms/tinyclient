@@ -62,6 +62,10 @@ const LARGEST_FILE: u64 = 200 * 1024 * 1024;
 const KEEP_LARGEST: u64 = 4 * 1024 * 1024 * 1024;
 /// Telegram's pieces start on this boundary, and a resumed part does too.
 const PIECE_ALIGN: u64 = 4_096;
+/// Bytes asked for at a time when streaming a video range: a 4 KB multiple that divides 1 MB.
+const STREAM_PIECE: i32 = 256 * 1024;
+/// Parallel range pieces per session on the file's datacenter (conservative against `FLOOD_WAIT`).
+const STREAM_PARALLEL: usize = 2;
 /// Bytes asked for at a time for such a file, which the user is waiting on: the most Telegram
 /// gives in one piece, at the same pace as everything else.
 const FILE_PIECE: i32 = 1024 * 1024;
@@ -81,6 +85,9 @@ enum Job {
     Fetch(Box<Want>),
     /// The viewer is waiting on it: it goes before every row's picture.
     First(Box<Want>),
+    /// A byte range `[start, end)` the video player asked for: fetched into a sparse `.stream`
+    /// file ahead of background work so playback starts after the first pieces land.
+    Span(Box<Want>, (u64, u64)),
     /// A picture a message shows, which the shell asked for at that moment because it was on
     /// screen: it goes before every picture that is not, the latest asked first.
     Seen(Box<Want>, Instant),
@@ -147,6 +154,16 @@ impl Held {
         }
         jobs
     }
+    /// The shell asked for a byte range `[start, end)` of these files (video streaming).
+    fn asked_span(&mut self, ids: &[String], span: (u64, u64)) -> Vec<Job> {
+        let mut jobs = Vec::new();
+        for id in ids {
+            if let Some(want) = self.places.get(id) {
+                jobs.push(Job::Span(Box::new(want.clone()), span));
+            }
+        }
+        jobs
+    }
 }
 
 /// Values by id that forget the oldest first. Once the newer half is full it becomes the older
@@ -192,6 +209,8 @@ fn message_picture(want: &Want) -> bool {
 /// What waits its turn, in the order it goes.
 #[derive(Default)]
 struct Line {
+    /// Ranged video windows the player is waiting on, latest asked first.
+    spans: VecDeque<(Box<Want>, (u64, u64))>,
     /// Originals the viewer is waiting on, the latest asked first.
     first: VecDeque<Box<Want>>,
     /// Pictures the shell asked for while they were on screen, with when, the latest first.
@@ -200,9 +219,14 @@ struct Line {
     rest: VecDeque<Box<Want>>,
 }
 
+enum NextWork {
+    Span(Box<Want>, (u64, u64)),
+    Full(Box<Want>),
+}
+
 impl Line {
     fn len(&self) -> usize {
-        self.first.len() + self.seen.len() + self.rest.len()
+        self.spans.len() + self.first.len() + self.seen.len() + self.rest.len()
     }
 
     fn is_empty(&self) -> bool {
@@ -211,6 +235,23 @@ impl Line {
 
     fn pop(&mut self) -> Option<Box<Want>> {
         self.first.pop_front().or_else(|| self.seen.pop_front().map(|(_, want)| want)).or_else(|| self.rest.pop_front())
+    }
+
+    fn pop_work(&mut self) -> Option<NextWork> {
+        if let Some((want, span)) = self.spans.pop_front() {
+            return Some(NextWork::Span(want, span));
+        }
+        self.pop().map(NextWork::Full)
+    }
+
+    /// A ranged video read the player asked for: replaces any older pending span for the same file
+    /// and goes to the front. `true` when an older span for that file was replaced.
+    fn span(&mut self, want: Box<Want>, span: (u64, u64)) -> bool {
+        let before = self.spans.len();
+        self.spans.retain(|(held, _)| held.file.id != want.file.id);
+        let replaced = self.spans.len() < before;
+        self.spans.push_front((want, span));
+        replaced
     }
 
     /// A page named it: at the back, or, if it is waiting already, where it waits, with the
@@ -284,6 +325,8 @@ impl Files {
             let mut account = Weak::new();
             // Datacenters this connection's sign-in has been carried to.
             let mut carried = HashSet::new();
+            // Sparse cache coverage per file id for ranged video playback.
+            let mut streams: HashMap<String, StreamState> = HashMap::new();
             let mut line = Line::default();
             // Rows' pictures asked for and since scrolled away, with when each was parked.
             let mut parked: Vec<(Instant, Box<Want>)> = Vec::new();
@@ -329,6 +372,11 @@ impl Files {
                                 counted.fetch_sub(1, Ordering::Relaxed);
                             }
                         }
+                        Job::Span(want, span) => {
+                            if line.span(want, span) {
+                                counted.fetch_sub(1, Ordering::Relaxed);
+                            }
+                        }
                         Job::Seen(want, at) => {
                             if line.seen(want, at) {
                                 counted.fetch_sub(1, Ordering::Relaxed);
@@ -344,7 +392,7 @@ impl Files {
                 }
                 // Nothing new at the wire: rows that came back go ahead of the rest, then the line.
                 rows_back(&account, &mut parked, &mut line.rest, &counted);
-                let Some(want) = line.pop() else {
+                let Some(work) = line.pop_work() else {
                     // The wire is gone and nothing is left to fetch: the thread ends,
                     // whatever still waits for a row.
                     if gone {
@@ -359,24 +407,37 @@ impl Files {
                 if ctx.stopped() {
                     return;
                 }
-                // A row's picture whose row scrolled away waits for it to come back,
-                // unfetched — still counted, so the resume cannot spend the same turn twice.
-                if want.watched && want.row.as_deref().is_none_or(|row| !row_shown(&account, row)) {
-                    parked.push((Instant::now(), want));
-                    continue;
-                }
-                counted.fetch_sub(1, Ordering::Relaxed);
-                if let Err(fault) = fetch(&account, &want, &mut carried) {
-                    // A reference that ran out is renewed by the next page that names the file.
-                    if !fault.is("FILE_REFERENCE_EXPIRED") {
-                        tracing::warn!("chatd: Telegram: file {}: {fault}", want.file.id);
+                match work {
+                    NextWork::Span(mut want, span) => {
+                        counted.fetch_sub(1, Ordering::Relaxed);
+                        if let Err(fault) = fetch_span(&account, &mut want, span, &mut carried, &mut streams) {
+                            tracing::warn!("chatd: Telegram: stream {}: {fault}", want.file.id);
+                            let mut file = want.file.clone();
+                            file.failed = Some("Telegram did not send the video.".to_owned());
+                            ctx.hub.changed(Change::Media { account: ctx.account.clone(), file });
+                        }
                     }
-                    // The viewer is waiting on an original: it is told, and keeps the still.
-                    if want.original {
-                        let mut file = want.file.clone();
-                        let what = if want.file.kind == MediaKind::Image { "the full picture" } else { "the file" };
-                        file.failed = Some(format!("Telegram did not send {what}."));
-                        ctx.hub.changed(Change::Media { account: ctx.account.clone(), file });
+                    NextWork::Full(want) => {
+                        // A row's picture whose row scrolled away waits for it to come back,
+                        // unfetched — still counted, so the resume cannot spend the same turn twice.
+                        if want.watched && want.row.as_deref().is_none_or(|row| !row_shown(&account, row)) {
+                            parked.push((Instant::now(), want));
+                            continue;
+                        }
+                        counted.fetch_sub(1, Ordering::Relaxed);
+                        if let Err(fault) = fetch(&account, &want, &mut carried) {
+                            // A reference that ran out is renewed by the next page that names the file.
+                            if !fault.is("FILE_REFERENCE_EXPIRED") {
+                                tracing::warn!("chatd: Telegram: file {}: {fault}", want.file.id);
+                            }
+                            // The viewer is waiting on an original: it is told, and keeps the still.
+                            if want.original {
+                                let mut file = want.file.clone();
+                                let what = if want.file.kind == MediaKind::Image { "the full picture" } else { "the file" };
+                                file.failed = Some(format!("Telegram did not send {what}."));
+                                ctx.hub.changed(Change::Media { account: ctx.account.clone(), file });
+                            }
+                        }
                     }
                 }
             }
@@ -443,6 +504,15 @@ impl Files {
         count
     }
 
+    /// The video player asked for a byte window `[start, end)` of these files: fetched into a
+    /// sparse `.stream` file without waiting for the whole file to download.
+    pub fn asked_span(&self, ids: &[String], span: (u64, u64)) -> usize {
+        let jobs = crate::hub::lock(&self.held).asked_span(ids, span);
+        let count = jobs.len();
+        self.ahead(jobs);
+        count
+    }
+
     /// Sends what the shell asked for: never refused here, however many wait. The fetching
     /// thread keeps the line to [`WAITING`] by letting go of what matters least (`Line::trim`).
     fn ahead(&self, jobs: Vec<Job>) {
@@ -489,6 +559,299 @@ fn rows_back(account: &Weak<Account>, parked: &mut Vec<(Instant, Box<Want>)>, qu
     for (_, want) in back.into_iter().rev() {
         queue.push_front(want);
     }
+}
+
+/// Tracks which byte ranges of a streaming video are already written into its sparse `.stream` file.
+#[derive(Default)]
+struct StreamState {
+    /// Sorted, non-overlapping half-open intervals `[start, end)` written to disk.
+    covered: Vec<(u64, u64)>,
+    /// Total unique bytes written so far.
+    loaded: u64,
+}
+
+/// Aligns a byte offset down to Telegram's 4 KB boundary (`PIECE_ALIGN`).
+pub(super) fn align_down(offset: u64) -> u64 {
+    offset - (offset % PIECE_ALIGN)
+}
+
+/// Merges `[start, end)` into `ranges` (keeping them sorted and non-overlapping) and returns the
+/// total unique bytes covered across all intervals.
+pub(super) fn merge_ranges(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64) -> u64 {
+    if end > start {
+        ranges.push((start, end));
+        ranges.sort_by_key(|&(s, _)| s);
+        let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+        for (s, e) in ranges.drain(..) {
+            if let Some(last) = merged.last_mut() {
+                if s <= last.1 {
+                    last.1 = last.1.max(e);
+                    continue;
+                }
+            }
+            merged.push((s, e));
+        }
+        *ranges = merged;
+    }
+    ranges.iter().map(|&(s, e)| e.saturating_sub(s)).sum()
+}
+
+fn is_covered(ranges: &[(u64, u64)], start: u64, end: u64) -> bool {
+    ranges.iter().any(|&(s, e)| s <= start && end <= e)
+}
+
+/// Plans 4 KB-aligned `(offset, limit)` pieces to satisfy a ranged read `[start, end)` of a file
+/// of size `total` (0 when unknown). When `supports_streaming` is false and the read starts at 0
+/// on a file larger than one piece, schedules the trailing `moov` window first so non-fast-start
+/// MP4s can initialize playback without downloading the entire file.
+pub(super) fn plan_span_chunks(
+    start: u64,
+    end: u64,
+    total: u64,
+    supports_streaming: bool,
+    covered: &[(u64, u64)],
+) -> Vec<(u64, i32)> {
+    let piece = STREAM_PIECE as u64;
+    let mut windows = Vec::new();
+    // Non-fast-start MP4 (`moov` at the end): grab the tail first on initial open.
+    if !supports_streaming && start == 0 && total > piece {
+        let tail_start = align_down(total.saturating_sub(piece));
+        windows.push((tail_start, total));
+    }
+    let req_end = if end <= start { start.saturating_add(piece) } else { end };
+    let clamped_end = if total > 0 { req_end.min(total) } else { req_end };
+    if clamped_end > start {
+        windows.push((align_down(start), clamped_end));
+    }
+    let mut chunks = Vec::new();
+    for (w_start, w_end) in windows {
+        let mut at = align_down(w_start);
+        while at < w_end {
+            let chunk_end = if total > 0 { at.saturating_add(piece).min(total) } else { at.saturating_add(piece) };
+            if chunk_end > at && !is_covered(covered, at, chunk_end) && !chunks.iter().any(|&(off, _)| off == at) {
+                chunks.push((at, STREAM_PIECE));
+            }
+            at = at.saturating_add(piece);
+        }
+    }
+    chunks
+}
+
+/// Refreshes a document's `file_reference` from its source message after `FILE_REFERENCE_EXPIRED`.
+fn refresh_reference(account: &Account, want: &mut Want) -> bool {
+    let Some((peer, msg_id)) = want.source else {
+        return false;
+    };
+    let doc_id = match &want.location {
+        tl::enums::InputFileLocation::InputDocumentFileLocation(loc) => loc.id,
+        _ => return false,
+    };
+    let fetched = match peer {
+        super::peers::Who::Channel(_) => {
+            let Ok(channel) = account.input_channel(peer) else { return false };
+            account.ask(&tl::functions::channels::GetMessages {
+                channel,
+                id: vec![tl::types::InputMessageId { id: msg_id }.into()],
+            })
+        }
+        _ => account.ask(&tl::functions::messages::GetMessages {
+            id: vec![tl::types::InputMessageId { id: msg_id }.into()],
+        }),
+    };
+    let Ok(answer) = fetched else {
+        return false;
+    };
+    let messages = match answer {
+        tl::enums::messages::Messages::Messages(m) => m.messages,
+        tl::enums::messages::Messages::Slice(m) => m.messages,
+        tl::enums::messages::Messages::ChannelMessages(m) => m.messages,
+        tl::enums::messages::Messages::NotModified(_) => return false,
+    };
+    for raw in messages {
+        let tl::enums::Message::Message(msg) = raw else { continue };
+        let Some(tl::enums::MessageMedia::Document(media)) = msg.media else { continue };
+        let candidates = media.document.into_iter().chain(media.alt_documents.into_iter().flatten());
+        for doc in candidates {
+            let tl::enums::Document::Document(doc) = doc else { continue };
+            if doc.id == doc_id {
+                if let tl::enums::InputFileLocation::InputDocumentFileLocation(loc) = &mut want.location {
+                    loc.file_reference = doc.file_reference;
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn ensure_dc(account: &Account, dc_id: i32, carried: &mut HashSet<i32>) -> Result<Option<i32>, Fault> {
+    let wire = account.wire.as_ref();
+    let home = wire.home();
+    let dc = (dc_id != 0 && dc_id != home).then_some(dc_id);
+    if let Some(dc) = dc {
+        if !carried.contains(&dc) {
+            let tl::enums::auth::ExportedAuthorization::Authorization(pass) =
+                account.ask(&tl::functions::auth::ExportAuthorization { dc_id: dc })?;
+            wire::call_in(wire, Some(dc), &tl::functions::auth::ImportAuthorization { id: pass.id, bytes: pass.bytes })?;
+            carried.insert(dc);
+        }
+    }
+    Ok(dc)
+}
+
+fn fetch_one_piece(
+    account: &Account,
+    dc: Option<i32>,
+    location: &tl::enums::InputFileLocation,
+    offset: u64,
+    limit: i32,
+) -> Result<Vec<u8>, Fault> {
+    let wire = account.wire.as_ref();
+    let request = tl::functions::upload::GetFile {
+        precise: true,
+        cdn_supported: false,
+        location: location.clone(),
+        offset: offset as i64,
+        limit,
+    };
+    let pause = |time| account.ctx.pause(time);
+    let piece = match wire::call_in(wire, dc, &request) {
+        Err(fault) => match fault.flood() {
+            Some(seconds) if seconds <= wire::PATIENCE && !pause(Duration::from_secs(seconds)) => {
+                wire::call_in(wire, dc, &request)?
+            }
+            _ => return Err(fault),
+        },
+        Ok(piece) => piece,
+    };
+    match piece {
+        tl::enums::upload::File::File(file) => Ok(file.bytes),
+        tl::enums::upload::File::CdnRedirect(_) => Err(Fault::Net("CDN redirect on ranged piece".to_owned())),
+    }
+}
+
+/// Serves one ranged read `[start, end)` into a sparse `.stream` file, emitting
+/// `Change::MediaProgress` immediately after the window's pieces land so playback starts without
+/// waiting for the rest of the file. Promotes the file to the media cache once every byte lands.
+fn fetch_span(
+    account: &Account,
+    want: &mut Want,
+    span: (u64, u64),
+    carried: &mut HashSet<i32>,
+    streams: &mut HashMap<String, StreamState>,
+) -> Result<(), Fault> {
+    let ctx = &account.ctx;
+    let id = std::slice::from_ref(&want.file.id);
+    // Already landed whole in the media cache: report complete immediately.
+    if let Some(existing) = ctx.hub.store().media(&ctx.account, id).unwrap_or_default().first().and_then(|(f, _)| f.path.clone()) {
+        if std::path::Path::new(&existing).exists() {
+            let total = std::fs::metadata(&existing).map(|m| m.len()).unwrap_or(want.file.bytes);
+            ctx.hub.changed(Change::MediaProgress {
+                account: ctx.account.clone(),
+                id: want.file.id.clone(),
+                path: existing,
+                loaded: total,
+                total,
+                complete: true,
+            });
+            return Ok(());
+        }
+    }
+    let final_path = blobs::path_of(&media_dir(), &ctx.account, &want.file.id);
+    std::fs::create_dir_all(blobs::dir_under(&media_dir(), &ctx.account)).map_err(local)?;
+    let stream_path = final_path.with_extension("stream");
+    let state = streams.entry(want.file.id.clone()).or_default();
+    let chunks = plan_span_chunks(span.0, span.1, want.file.bytes, want.supports_streaming, &state.covered);
+    if !chunks.is_empty() {
+        let dc = ensure_dc(account, want.dc, carried)?;
+        let mut out = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&stream_path).map_err(local)?;
+        let mut refreshed = false;
+        let mut batch_idx = 0;
+        while batch_idx < chunks.len() {
+            let end_idx = (batch_idx + STREAM_PARALLEL).min(chunks.len());
+            let batch = &chunks[batch_idx..end_idx];
+            let location = want.location.clone();
+            let results: Vec<(u64, Result<Vec<u8>, Fault>)> = if batch.len() == 1 {
+                let (off, lim) = batch[0];
+                vec![(off, fetch_one_piece(account, dc, &location, off, lim))]
+            } else {
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = batch
+                        .iter()
+                        .map(|&(off, lim)| {
+                            let loc = location.clone();
+                            scope.spawn(move || (off, fetch_one_piece(account, dc, &loc, off, lim)))
+                        })
+                        .collect();
+                    handles.into_iter().map(|h| h.join().unwrap_or_else(|_| (0, Err(Fault::Net("stream worker panicked".into()))))).collect()
+                })
+            };
+            let mut retry_batch = false;
+            for (off, res) in results {
+                match res {
+                    Ok(bytes) => {
+                        if !bytes.is_empty() {
+                            out.seek(SeekFrom::Start(off)).map_err(local)?;
+                            out.write_all(&bytes).map_err(local)?;
+                            state.loaded = merge_ranges(&mut state.covered, off, off + bytes.len() as u64);
+                        }
+                    }
+                    Err(fault) if fault.is("FILE_REFERENCE_EXPIRED") && !refreshed => {
+                        refreshed = true;
+                        if refresh_reference(account, want) {
+                            retry_batch = true;
+                            break;
+                        }
+                        return Err(fault);
+                    }
+                    Err(fault) => return Err(fault),
+                }
+            }
+            if !retry_batch {
+                batch_idx = end_idx;
+            }
+        }
+        out.flush().map_err(local)?;
+    }
+    let loaded = state.loaded;
+    let total = want.file.bytes;
+    let complete = total > 0 && loaded >= total;
+    if complete {
+        streams.remove(&want.file.id);
+        if std::fs::rename(&stream_path, &final_path).is_ok() {
+            let stored = |err: rusqlite::Error| Fault::Net(err.to_string());
+            let address = format!("tg://file/{}", want.file.id);
+            let landed = {
+                let mut store = ctx.hub.store();
+                store.register_media(&ctx.account, &[(want.file.clone(), address)]).map_err(stored)?;
+                store.media_landed(&ctx.account, &want.file.id, &final_path.to_string_lossy(), total, now()).map_err(stored)?
+            };
+            let path_str = final_path.to_string_lossy().into_owned();
+            ctx.hub.changed(Change::MediaProgress {
+                account: ctx.account.clone(),
+                id: want.file.id.clone(),
+                path: path_str,
+                loaded: total,
+                total,
+                complete: true,
+            });
+            if let Some(file) = landed {
+                ctx.hub.changed(Change::Media { account: ctx.account.clone(), file });
+            }
+            account.keep_session();
+            return Ok(());
+        }
+    }
+    ctx.hub.changed(Change::MediaProgress {
+        account: ctx.account.clone(),
+        id: want.file.id.clone(),
+        path: stream_path.to_string_lossy().into_owned(),
+        loaded,
+        total,
+        complete: false,
+    });
+    account.keep_session();
+    Ok(())
 }
 
 /// One file, from Telegram to the cache's directory.
@@ -888,6 +1251,8 @@ mod tests {
             row: Some("chat".into()),
             watched: true,
             original: false,
+            supports_streaming: false,
+            source: None,
         });
         let mut parked = vec![(Instant::now() - PARKED_FOR, want()), (Instant::now(), want())];
         let mut queue = VecDeque::new();
@@ -912,6 +1277,8 @@ mod tests {
             row: None,
             watched: false,
             original,
+            supports_streaming: false,
+            source: None,
         })
     }
 
@@ -936,6 +1303,30 @@ mod tests {
         assert!(line.seen(thumb("b2"), Instant::now()), "it was waiting: counted once");
         assert!(!line.first(file("original", MediaKind::Image, true, 1)));
         assert_eq!(order(line), ["original", "b2", "a1", "a2", "a3", "b1"]);
+    }
+
+    #[test]
+    fn ranged_stream_planner_aligns_to_4kb_fetches_moov_first_when_not_streaming_and_skips_covered() {
+        let fifty_mb = 50 * 1024 * 1024;
+        // Fast-start video: only the requested head window, 4 KB aligned.
+        let fast = plan_span_chunks(0, 256 * 1024, fifty_mb, true, &[]);
+        assert_eq!(fast, vec![(0, STREAM_PIECE)]);
+
+        // Unaligned scrub target rounds down to 4 KB.
+        let scrubbed = plan_span_chunks(26_214_405, 26_214_405 + 256 * 1024, fifty_mb, true, &[]);
+        assert_eq!(scrubbed[0].0 % PIECE_ALIGN, 0);
+        assert_eq!(scrubbed[0].0, 26_214_400);
+
+        // Non-fast-start video (`supports_streaming = false`): tail (`moov`) is scheduled BEFORE offset 0.
+        let moov_first = plan_span_chunks(0, 256 * 1024, fifty_mb, false, &[]);
+        assert_eq!(moov_first, vec![(fifty_mb - STREAM_PIECE as u64, STREAM_PIECE), (0, STREAM_PIECE)]);
+
+        // Covered ranges merge cleanly and are not re-fetched.
+        let mut covered = Vec::new();
+        assert_eq!(merge_ranges(&mut covered, 0, 262_144), 262_144);
+        assert_eq!(merge_ranges(&mut covered, 131_072, 393_216), 393_216);
+        assert_eq!(covered, vec![(0, 393_216)]);
+        assert!(plan_span_chunks(0, 262_144, fifty_mb, true, &covered).is_empty());
     }
 
     #[test]
@@ -1025,6 +1416,7 @@ mod tests {
         jobs.into_iter().map(|job| match job {
             Job::Fetch(want) => ("fetch", want.file.id),
             Job::First(want) => ("first", want.file.id),
+            Job::Span(want, _) => ("span", want.file.id),
             Job::Seen(want, _) => ("seen", want.file.id),
             Job::Attach(_) => ("attach", String::new()),
             Job::Look => ("look", String::new()),

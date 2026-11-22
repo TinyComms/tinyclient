@@ -1235,6 +1235,19 @@ pub enum Command {
     TopicIcons {
         reply: Reply<CatalogPage>,
     },
+    /// The message effects the account can send.
+    MessageEffects {
+        reply: Reply<CatalogPage>,
+    },
+    /// Rates a finished call on Telegram (`phone.setCallRating`).
+    CallRate {
+        call_id: String,
+        rating: u8,
+        reasons: Vec<String>,
+        comment: String,
+        user_initiative: bool,
+        reply: Reply<()>,
+    },
     /// Fetch network-suggested chat folders.
     SuggestedFolders {
         reply: Reply<Vec<protocol::SuggestedFolder>>,
@@ -1413,6 +1426,8 @@ pub enum Command {
         me_only: bool,
         reply: Reply<()>,
     },
+    /// Unpins every message of a conversation on the network.
+    UnpinAll { conversation_id: String, reply: Reply<()> },
     /// Executes an interactive control on a message (Slack `blocks.actions`, Telegram giveaways / games / callbacks).
     MessageAction {
         conversation_id: String,
@@ -1791,6 +1806,12 @@ pub enum Command {
     /// also takes it as what is on screen: a picture a message shows goes ahead of those that
     /// are not, even one no page has named yet. Others ignore it.
     Wanted(Vec<String>),
+    /// A byte range `[start, end)` of files the player asked for (`Fetch { span }`), for
+    /// progressive/ranged playback without downloading the entire file first.
+    WantedSpan {
+        ids: Vec<String>,
+        span: (u64, u64),
+    },
     /// The link that opens this conversation's call in the official app.
     Handoff { conversation_id: String, reply: Reply<String> },
     /// Today's meetings, soonest first. A calendar the account cannot read answers with what
@@ -2131,13 +2152,14 @@ impl Command {
             Command::FolderSave { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::LoadTopics { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::TopicCreate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::TopicIcons { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::TopicIcons { reply } | Command::MessageEffects { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CallRate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SuggestedFolders { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StarredMessages { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Pinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::Pin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Pin { reply, .. } | Command::UnpinAll { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MessageAction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::PressButton { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::GetNotifyDefaults { reply }
@@ -2874,6 +2896,24 @@ impl Context {
     pub fn pinned(&self, conversation_id: &str, message_id: &str, pinned: bool) -> Stores {
         let conversation = self.key(conversation_id);
         if self.hub.store().set_pinned(&conversation, message_id, pinned)? {
+            self.hub.changed(Change::Messages { conversation });
+        }
+        Ok(())
+    }
+
+    /// A channel post's views and shares as the network now counts them. `None` leaves one as it is.
+    pub fn post_counts(&self, conversation_id: &str, message_id: &str, views: Option<u32>, shares: Option<u32>) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().set_post_counts(&conversation, message_id, views, shares)? {
+            self.hub.changed(Change::Messages { conversation });
+        }
+        Ok(())
+    }
+
+    /// Clears the pin on every stored message of a conversation.
+    pub fn unpin_all(&self, conversation_id: &str) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().unpin_all(&conversation)? {
             self.hub.changed(Change::Messages { conversation });
         }
         Ok(())
