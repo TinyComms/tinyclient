@@ -4007,6 +4007,9 @@ fn save_and_unsave_gif() {
 fn paid_star_reactions_big_reaction_and_default_quick_reaction() {
     let world = World::signed_in();
     world.connected();
+    // The dialog list only previews the forum. Opening it lists the topic, and the topic's posts arrive once that row exists.
+    let _ = world.messages("c9002");
+    world.until("the tools topic", || world.conversation("c9002_31"));
     world.until("workshop tools topic", || world.message("c9002_31", "41"));
 
     // Read reaction rules for Workshop: paid reactions enabled, big enabled, and default quick reaction from help.getConfig.
