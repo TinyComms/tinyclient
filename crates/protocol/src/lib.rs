@@ -1093,6 +1093,10 @@ pub enum Compose {
     UploadingFile,
     ChoosingSticker,
     PlayingGame,
+    /// Speaking in a group call or video chat (`speakingInGroupCallAction`).
+    Speaking,
+    /// Stopped typing, recording, or uploading (`sendMessageCancelAction`).
+    Cancel,
 }
 
 impl Compose {
@@ -3512,6 +3516,10 @@ pub enum Response {
         network: Network,
         step: SignInStep,
     },
+    /// Answers `MessageAction` when the network returned structured details, an alert, or a link.
+    ActionResult {
+        result: ActionResult,
+    },
     Error {
         code: ErrorCode,
         detail: String,
@@ -4371,5 +4379,30 @@ mod sock_path_tests {
         let old: Capabilities = serde_json::from_str("{}").unwrap();
         assert!(!old.follow_threads);
         assert!(!old.dnd_snooze);
+    }
+
+    #[test]
+    fn compose_activities_round_trip_and_default_to_typing() {
+        let conv = Key::new(&AccountKey { network: Network::Telegram, account: "1".into() }, "u7002");
+        for activity in [
+            Compose::Typing,
+            Compose::RecordingVoice,
+            Compose::RecordingVideo,
+            Compose::UploadingPhoto,
+            Compose::UploadingVideo,
+            Compose::UploadingAudio,
+            Compose::UploadingFile,
+            Compose::ChoosingSticker,
+            Compose::PlayingGame,
+            Compose::Speaking,
+            Compose::Cancel,
+        ] {
+            let req = Request::Typing { conversation: conv.clone(), activity };
+            let encoded = serde_json::to_string(&req).unwrap();
+            assert_eq!(serde_json::from_str::<Request>(&encoded).unwrap(), req);
+        }
+        // Older Typist JSON without `activity` defaults to `Compose::Typing`.
+        let legacy: Typist = serde_json::from_str(r#"{"id":"u1","name":"Ada","until":100}"#).unwrap();
+        assert_eq!(legacy.activity, Compose::Typing);
     }
 }

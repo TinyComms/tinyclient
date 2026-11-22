@@ -5,8 +5,8 @@
 use super::peers::{is_replies, message_link, thread_id, Directory, DownloadClass, DownloadRules, Who};
 use grammers_tl_types as tl;
 use protocol::{
-    Attachment, BotKey, BotKeyKind, Card, Forwarded, MediaFile, MediaKind, MentionKind, Message, MessageKind, Preview, Reaction, ReplyKeyboard,
-    ReplyTo, Sender, Span, Style, ThreadSummary,
+    Attachment, BotKey, BotKeyKind, Card, ControlKind, ControlStyle, Forwarded, MediaFile, MediaKind, MentionKind, Message, MessageControl, MessageKind, Preview,
+    Reaction, ReplyKeyboard, ReplyTo, Sender, Span, Style, ThreadSummary,
 };
 use std::collections::HashSet;
 use tl::enums::{DocumentAttribute, MessageAction, MessageEntity, MessageMedia, PhotoSize};
@@ -1335,13 +1335,8 @@ fn unsupported(media: &MessageMedia) -> Option<String> {
             let tl::enums::Poll::Poll(poll) = &media.poll;
             format!("Poll: {}", plain(&poll.question))
         }
-        MessageMedia::Game(media) => {
-            let tl::enums::Game::Game(game) = &media.game;
-            format!("Game: {}", game.title)
-        }
         MessageMedia::Invoice(invoice) => format!("Invoice: {}", invoice.title),
         MessageMedia::Story(_) => "Story".to_owned(),
-        MessageMedia::Giveaway(_) | MessageMedia::GiveawayResults(_) => "Giveaway".to_owned(),
         MessageMedia::PaidMedia(_) => "Paid media".to_owned(),
         MessageMedia::VideoStream(_) => "Live stream".to_owned(),
         MessageMedia::Unsupported => "A message this version of tinyclient cannot show".to_owned(),
@@ -1363,6 +1358,37 @@ fn stars(amount: i64) -> String {
     } else {
         format!("{amount} Stars")
     }
+}
+
+/// Public-within-adapter helper for Stars wording (used by giveaway status responses too).
+pub(super) fn stars_label(amount: i64) -> String {
+    stars(amount)
+}
+
+/// Whether a Telegram slug (gift code, mini app, etc.) is safe to interpolate into a `https://t.me/` URL.
+pub(super) fn is_safe_slug(slug: &str) -> bool {
+    !slug.is_empty() && slug.len() <= 128 && slug.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Formats a Unix timestamp (seconds) as `YYYY-MM-DD HH:MM UTC` without external date crates.
+pub(super) fn format_utc(unix: i32) -> String {
+    let secs = i64::from(unix);
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let hour = tod / 3_600;
+    let minute = (tod % 3_600) / 60;
+    // Civil date from days since 1970-01-01 (Howard Hinnant algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = y + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC")
 }
 
 /// How many decimal places the currency's minor unit has. Stars are not a currency here.
@@ -1532,6 +1558,563 @@ fn shared_contact(contact: &tl::types::MessageMediaContact) -> protocol::SharedC
         organization,
         avatar: None,
         person_id,
+    }
+}
+
+/// Structured card and "Check status" button for a Telegram giveaway or giveaway results message.
+fn giveaway_card(dir: &Directory, media: &MessageMedia, msg_id: i32) -> Option<(Card, Vec<MessageControl>)> {
+    let check_button = |target_msg_id: i32| MessageControl {
+        block_id: String::new(),
+        action_id: "tg:giveaway_info".to_owned(),
+        element_type: "telegram_giveaway".to_owned(),
+        label: "Check status".to_owned(),
+        value: target_msg_id.to_string(),
+        confirm: None,
+        kind: ControlKind::Button { url: String::new(), style: ControlStyle::Default },
+    };
+    let channel_label = |id: i64| {
+        let name = dir.name(Who::Channel(id));
+        if name == "Unknown" { format!("Channel {id}") } else { name }
+    };
+    match media {
+        MessageMedia::Giveaway(g) => {
+            let qty = g.quantity.max(1);
+            let (title, prize) = if let Some(s) = g.stars.filter(|&s| s > 0) {
+                (
+                    format!("{} Giveaway", stars(s)),
+                    format!("{} among {}", stars(s), count_words(qty, "winner", "winners")),
+                )
+            } else if let Some(months) = g.months.filter(|&m| m > 0) {
+                let period = count_words(months, "month", "months");
+                (
+                    format!("{qty} × {period} of Telegram Premium"),
+                    format!("{qty} × {period} Telegram Premium"),
+                )
+            } else {
+                (
+                    format!("Giveaway ({})", count_words(qty, "prize", "prizes")),
+                    count_words(qty, "prize", "prizes"),
+                )
+            };
+            let mut card = Card {
+                author: "Giveaway".to_owned(),
+                title,
+                text: g.prize_description.clone().unwrap_or_default(),
+                footer: "Telegram Giveaway".to_owned(),
+                ..Card::default()
+            };
+            card.fields.push(("Prizes".to_owned(), prize));
+            if !g.channels.is_empty() {
+                let names: Vec<String> = g.channels.iter().map(|&id| channel_label(id)).collect();
+                card.fields.push(("Channels".to_owned(), names.join(", ")));
+            }
+            card.fields.push((
+                "Eligibility".to_owned(),
+                if g.only_new_subscribers { "New subscribers only" } else { "All subscribers" }.to_owned(),
+            ));
+            if let Some(countries) = g.countries_iso2.as_ref().filter(|list| !list.is_empty()) {
+                card.fields.push(("Countries".to_owned(), countries.join(", ")));
+            }
+            card.fields.push((
+                "Winners".to_owned(),
+                if g.winners_are_visible { "Public" } else { "Private" }.to_owned(),
+            ));
+            if g.until_date > 0 {
+                card.fields.push(("Ends".to_owned(), format_utc(g.until_date)));
+            }
+            Some((card, vec![check_button(msg_id)]))
+        }
+        MessageMedia::GiveawayResults(r) => {
+            let title = if r.refunded {
+                "Giveaway refunded".to_owned()
+            } else {
+                format!("{} selected", count_words(r.winners_count, "winner", "winners"))
+            };
+            let mut card = Card {
+                author: "Giveaway results".to_owned(),
+                title,
+                text: r.prize_description.clone().unwrap_or_default(),
+                footer: if r.refunded { "Refunded" } else { "Finished" }.to_owned(),
+                ..Card::default()
+            };
+            let mut ch = channel_label(r.channel_id);
+            if let Some(extra) = r.additional_peers_count.filter(|&n| n > 0) {
+                ch.push_str(&format!(" (+{extra} more)"));
+            }
+            card.fields.push(("Channel".to_owned(), ch));
+            if let Some(s) = r.stars.filter(|&s| s > 0) {
+                card.fields.push(("Prize".to_owned(), stars(s)));
+            } else if let Some(months) = r.months.filter(|&m| m > 0) {
+                card.fields.push(("Prize".to_owned(), format!("{} of Telegram Premium", count_words(months, "month", "months"))));
+            }
+            if !r.winners.is_empty() {
+                let names: Vec<String> = r
+                    .winners
+                    .iter()
+                    .map(|&id| {
+                        let name = dir.name(Who::User(id));
+                        if name == "Unknown" { format!("User {id}") } else { name }
+                    })
+                    .collect();
+                card.fields.push(("Winners".to_owned(), names.join(", ")));
+            }
+            if r.unclaimed_count > 0 {
+                card.fields.push(("Unclaimed".to_owned(), r.unclaimed_count.to_string()));
+            }
+            if r.until_date > 0 {
+                card.fields.push(("Ended".to_owned(), format_utc(r.until_date)));
+            }
+            let target = if r.launch_msg_id > 0 { r.launch_msg_id } else { msg_id };
+            Some((card, vec![check_button(target)]))
+        }
+        _ => None,
+    }
+}
+
+/// A bot game: the picture, title and description Telegram already sent, and two buttons.
+/// Play asks `messages.getBotCallbackAnswer { game: true }` and opens that web address outside
+/// the app. High scores asks `messages.getGameHighScores`. The reply keyboard is not mapped,
+/// so the button says Play rather than a label this message did not carry. The game's
+/// animation document stays with Telegram: it is not a video to play here.
+fn game_card(media: &tl::types::MessageMediaGame, msg_id: i32, wants: &mut Vec<Want>, peer: Who, megagroup: bool, rules: DownloadRules) -> (Card, Vec<MessageControl>, Option<Attachment>) {
+    let tl::enums::Game::Game(game) = &media.game;
+    let mut card = Card {
+        author: "Game".to_owned(),
+        title: game.title.clone(),
+        text: game.description.clone(),
+        footer: "Opens in your browser".to_owned(),
+        ..Card::default()
+    };
+    let picture = match &game.photo {
+        tl::enums::Photo::Photo(picture) => photo(picture, false, wants, peer, megagroup, rules),
+        _ => None,
+    };
+    if let Some(picture) = &picture {
+        card.image = picture.thumb.clone().or_else(|| Some(picture.file.clone()));
+    }
+    let button = |action_id: &str, label: &str, style: ControlStyle| MessageControl {
+        block_id: String::new(),
+        action_id: action_id.to_owned(),
+        element_type: "telegram_game".to_owned(),
+        label: label.to_owned(),
+        value: msg_id.to_string(),
+        confirm: None,
+        kind: ControlKind::Button { url: String::new(), style },
+    };
+    let controls = vec![
+        button("tg:game", "Play", ControlStyle::Primary),
+        button("tg:game_scores", "High scores", ControlStyle::Default),
+    ];
+    (card, controls, picture)
+}
+
+/// What Play opens. A web address is handed to the shell with no title, so it opens in the
+/// system browser. Anything else is dropped. The address can carry a per-user token; it is
+/// not written to a log here.
+pub(super) fn game_launch(answer: &tl::types::messages::BotCallbackAnswer) -> protocol::ActionResult {
+    let mut result = protocol::ActionResult {
+        text: answer.message.clone().unwrap_or_default(),
+        url: answer.url.clone(),
+        url_label: "Play".to_owned(),
+        alert: answer.alert,
+        title: if answer.alert { "Game".to_owned() } else { String::new() },
+        ..protocol::ActionResult::default()
+    };
+    let offered = result.url.clone();
+    result.bound();
+    if result.url.is_none() && result.text.is_empty() && offered.is_some() {
+        result.text = "The game link is not a web address.".to_owned();
+    }
+    result
+}
+
+/// The leaderboard `messages.getGameHighScores` already returned. Names come from the users
+/// in that answer. A missing name stays "User N". Nothing here asks the network again.
+pub(super) fn game_high_scores(scores: &tl::types::messages::HighScores) -> protocol::ActionResult {
+    let mut result = protocol::ActionResult {
+        title: "High scores".to_owned(),
+        alert: true,
+        ..protocol::ActionResult::default()
+    };
+    if scores.scores.is_empty() {
+        result.text = "No scores yet.".to_owned();
+        return result;
+    }
+    for row in scores.scores.iter().take(24) {
+        let tl::enums::HighScore::Score(row) = row;
+        result.fields.push((format!("{}. {}", row.pos.max(0), score_name(&scores.users, row.user_id)), row.score.to_string()));
+    }
+    result.bound();
+    result
+}
+
+fn score_name(users: &[tl::enums::User], id: i64) -> String {
+    for user in users {
+        let tl::enums::User::User(user) = user else {
+            continue;
+        };
+        if user.id != id {
+            continue;
+        }
+        if user.deleted {
+            return "Deleted Account".to_owned();
+        }
+        let first = user.first_name.as_deref().unwrap_or("").trim();
+        let last = user.last_name.as_deref().unwrap_or("").trim();
+        let name = match (first.is_empty(), last.is_empty()) {
+            (false, false) => format!("{first} {last}"),
+            (false, true) => first.to_owned(),
+            (true, false) => last.to_owned(),
+            (true, true) => user.username.clone().unwrap_or_default(),
+        };
+        if !name.is_empty() {
+            return name;
+        }
+    }
+    format!("User {id}")
+}
+
+/// How often a mini app that is actually open asks Telegram to keep the session. This build
+/// does not load the page, so nothing here waits on the clock.
+pub(super) const WEBAPP_PROLONG_SECS: u64 = 60;
+
+/// The platform string Telegram expects from a desktop client.
+pub(super) const WEBAPP_PLATFORM: &str = "tdesktop";
+
+/// `tg://resolve?domain=<bot>&appname=<app>` when both names are safe to put in a link.
+/// A token never belongs in this string.
+pub(super) fn webapp_link(domain: &str, app: &str) -> Option<String> {
+    if !is_safe_slug(domain) || !is_safe_slug(app) {
+        return None;
+    }
+    Some(format!("tg://resolve?domain={domain}&appname={app}"))
+}
+
+/// An https address a web-app button may send to Telegram. Anything else is dropped, and the
+/// address is not written to a log by the caller.
+pub(super) fn web_button_url(url: &str) -> Option<&str> {
+    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
+    if rest.is_empty() || url.len() > 2_000 || url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return None;
+    }
+    Some(url)
+}
+
+/// A `t.me/bot/app` or `tg://resolve` button as the hand-off link, when it names both.
+fn named_app(url: &str) -> Option<String> {
+    if let Some(query) = url.strip_prefix("tg://resolve?") {
+        let mut domain = "";
+        let mut app = "";
+        for pair in query.split('&') {
+            let (key, value) = pair.split_once('=')?;
+            match key {
+                "domain" if domain.is_empty() => domain = value,
+                "appname" if app.is_empty() => app = value,
+                _ => return None,
+            }
+        }
+        return webapp_link(domain, app);
+    }
+    let rest = url.strip_prefix("https://t.me/").or_else(|| url.strip_prefix("http://t.me/"))?;
+    let path = rest.split(['?', '#']).next().unwrap_or(rest);
+    let mut parts = path.split('/');
+    let domain = parts.next().unwrap_or("");
+    let app = parts.next().unwrap_or("");
+    if parts.next().is_some() {
+        return None;
+    }
+    webapp_link(domain, app)
+}
+
+/// Events a later web view may answer. Theme, the viewport, the main and back buttons, close,
+/// opening a link, and an invoice hand-off. Everything else is refused, including the phone,
+/// the clipboard, and biometrics. No page is loaded here, so nothing is delivered.
+pub(super) fn webapp_event(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "theme_changed" => "theme",
+        "web_app_request_viewport" => "viewport",
+        "web_app_setup_main_button" => "main_button",
+        "web_app_setup_back_button" => "back_button",
+        "web_app_close" => "close",
+        "web_app_open_link" => "open_link",
+        "web_app_open_invoice" => "invoice",
+        _ => return None,
+    })
+}
+
+fn web_control(text: &str, url: &str, simple: bool, bot: Option<i64>, style: ControlStyle) -> Option<MessageControl> {
+    if let Some(link) = named_app(url) {
+        return Some(app_control("tg:webapp", "telegram_webapp", text, "", &link, bot, style));
+    }
+    if web_button_url(url).is_none() {
+        return None;
+    }
+    let action = if simple { "tg:webapp_simple" } else { "tg:webapp" };
+    Some(app_control(action, "telegram_webapp", text, url, "", bot, style))
+}
+
+fn app_control(action_id: &str, element: &str, label: &str, value: &str, url: &str, bot: Option<i64>, style: ControlStyle) -> MessageControl {
+    let label = if label.trim().is_empty() {
+        if element == "telegram_login" { "Log in" } else { "Open" }
+    } else {
+        label.trim()
+    };
+    MessageControl {
+        block_id: bot.filter(|id| *id > 0).map(|id| id.to_string()).unwrap_or_default(),
+        action_id: action_id.to_owned(),
+        element_type: element.to_owned(),
+        label: label.to_owned(),
+        value: value.to_owned(),
+        confirm: None,
+        kind: ControlKind::Button { url: url.to_owned(), style },
+    }
+}
+
+/// Mini-app and login buttons only. The rest of the keyboard stays unmapped.
+fn webapp_controls(markup: &tl::enums::ReplyMarkup, bot: Option<i64>) -> Vec<MessageControl> {
+    let rows: &[tl::enums::KeyboardButtonRow] = match markup {
+        tl::enums::ReplyMarkup::ReplyInlineMarkup(markup) => &markup.rows,
+        tl::enums::ReplyMarkup::ReplyKeyboardMarkup(markup) => &markup.rows,
+        _ => return Vec::new(),
+    };
+    let mut controls = Vec::new();
+    for row in rows {
+        let tl::enums::KeyboardButtonRow::Row(row) = row;
+        for button in &row.buttons {
+            if controls.len() >= 8 {
+                return controls;
+            }
+            let style = if controls.is_empty() { ControlStyle::Primary } else { ControlStyle::Default };
+            let pushed = match button {
+                tl::enums::KeyboardButton::WebView(button) => web_control(&button.text, &button.url, false, bot, style),
+                tl::enums::KeyboardButton::SimpleWebView(button) => web_control(&button.text, &button.url, true, bot, style),
+                tl::enums::KeyboardButton::UrlAuth(button) if button.button_id > 0 => {
+                    Some(app_control("tg:url_auth", "telegram_login", &button.text, &button.button_id.to_string(), "", bot, style))
+                }
+                _ => None,
+            };
+            if let Some(control) = pushed {
+                controls.push(control);
+            }
+        }
+    }
+    controls
+}
+
+/// What opening a mini app shows. The address Telegram returned can carry a per-user token, so
+/// it is not copied onto the result and not written to a log. `query_id` is what a prolong
+/// call sends back while a view is open.
+pub(super) fn web_view_kept(result: &tl::types::WebViewResultUrl) -> (Option<i64>, protocol::ActionResult) {
+    (
+        result.query_id,
+        protocol::ActionResult {
+            title: "Mini app".to_owned(),
+            text: "This mini app opens in Telegram. This build does not load the page.".to_owned(),
+            alert: true,
+            ..protocol::ActionResult::default()
+        },
+    )
+}
+
+fn login_site(domain: &str) -> String {
+    if domain.is_empty() || domain.len() > 253 || domain.chars().any(|c| c.is_control() || c.is_whitespace() || c == '/' || c == '?' || c == '@') {
+        "Log in with Telegram.".to_owned()
+    } else {
+        format!("Log in at {domain}.")
+    }
+}
+
+/// The confirm after `messages.requestUrlAuth`. It names the site and whether the bot may
+/// message you. A phone number or a match code is refused. An accepted https redirect is
+/// opened by the shell and is not copied into the text.
+pub(super) fn login_prompt(result: &tl::enums::UrlAuthResult, button_id: i32) -> protocol::ActionResult {
+    match result {
+        tl::enums::UrlAuthResult::Request(ask) => {
+            let name = score_name(std::slice::from_ref(&ask.bot), ask.bot.id());
+            let who = if name.starts_with("User ") { "This bot".to_owned() } else { name };
+            let messages = if ask.request_write_access {
+                format!("{who} will be able to message you.")
+            } else {
+                format!("{who} will not message you.")
+            };
+            let mut text = format!("{} {messages}", login_site(&ask.domain));
+            let mut follow_action = String::new();
+            let mut follow_value = String::new();
+            if ask.request_phone_number {
+                text.push_str(" This login also asks for your phone number, which this app does not share.");
+            } else if ask.match_codes_first || ask.match_codes.is_some() {
+                text.push_str(" This login needs a code this app does not ask for.");
+            } else if button_id > 0 {
+                follow_action = "tg:url_auth_accept".to_owned();
+                follow_value = format!("{button_id}:{}", u8::from(ask.request_write_access));
+            }
+            protocol::ActionResult {
+                title: "Log in with Telegram".to_owned(),
+                text,
+                alert: true,
+                follow_action,
+                follow_value,
+                ..protocol::ActionResult::default()
+            }
+        }
+        tl::enums::UrlAuthResult::Accepted(accepted) => {
+            let mut result = protocol::ActionResult {
+                url: accepted.url.clone(),
+                url_label: "Continue".to_owned(),
+                ..protocol::ActionResult::default()
+            };
+            let offered = result.url.clone();
+            result.bound();
+            if result.url.is_none() && offered.is_some() {
+                result.text = "The login link is not a web address.".to_owned();
+                result.alert = true;
+                result.title = "Log in with Telegram".to_owned();
+            }
+            result
+        }
+        tl::enums::UrlAuthResult::Default => protocol::ActionResult {
+            title: "Log in with Telegram".to_owned(),
+            text: "Telegram declined this login.".to_owned(),
+            alert: true,
+            ..protocol::ActionResult::default()
+        },
+    }
+}
+
+fn bot_handle(users: &[tl::enums::User], id: i64) -> Option<String> {
+    for user in users {
+        let tl::enums::User::User(user) = user else { continue };
+        if user.id != id || user.deleted {
+            continue;
+        }
+        let handle = user.username.as_deref().unwrap_or("").trim();
+        if is_safe_slug(handle) {
+            return Some(handle.to_owned());
+        }
+    }
+    None
+}
+
+/// Attach-menu bots as hand-off links. Inactive bots and unsafe names are left out. Icons
+/// stay with Telegram.
+pub(super) fn attach_menu_links(bots: &tl::types::AttachMenuBots) -> Vec<(String, String)> {
+    let mut links = Vec::new();
+    for bot in &bots.bots {
+        let tl::enums::AttachMenuBot::Bot(bot) = bot;
+        if bot.inactive {
+            continue;
+        }
+        let Some(handle) = bot_handle(&bots.users, bot.bot_id) else { continue };
+        let Some(link) = webapp_link(&handle, &bot.short_name) else { continue };
+        let name = score_name(&bots.users, bot.bot_id);
+        let label = if name.starts_with("User ") { bot.short_name.clone() } else { name };
+        links.push((label, link));
+        if links.len() == 24 {
+            break;
+        }
+    }
+    links
+}
+
+pub(super) fn webapp_open_request(peer: tl::enums::InputPeer, bot: tl::enums::InputUser, url: &str) -> tl::functions::messages::RequestWebView {
+    tl::functions::messages::RequestWebView {
+        from_bot_menu: false,
+        silent: false,
+        compact: false,
+        fullscreen: false,
+        peer,
+        bot,
+        url: Some(url.to_owned()),
+        start_param: None,
+        theme_params: None,
+        platform: WEBAPP_PLATFORM.to_owned(),
+        reply_to: None,
+        send_as: None,
+    }
+}
+
+pub(super) fn webapp_simple_request(bot: tl::enums::InputUser, url: &str) -> tl::functions::messages::RequestSimpleWebView {
+    tl::functions::messages::RequestSimpleWebView {
+        from_switch_webview: false,
+        from_side_menu: false,
+        compact: false,
+        fullscreen: false,
+        bot,
+        url: Some(url.to_owned()),
+        start_param: None,
+        theme_params: None,
+        platform: WEBAPP_PLATFORM.to_owned(),
+    }
+}
+
+pub(super) fn webapp_main_request(peer: tl::enums::InputPeer, bot: tl::enums::InputUser, start_param: Option<String>) -> tl::functions::messages::RequestMainWebView {
+    tl::functions::messages::RequestMainWebView {
+        compact: false,
+        fullscreen: false,
+        peer,
+        bot,
+        start_param,
+        theme_params: None,
+        platform: WEBAPP_PLATFORM.to_owned(),
+    }
+}
+
+pub(super) fn webapp_app_request(peer: tl::enums::InputPeer, bot: tl::enums::InputUser, short_name: &str) -> tl::functions::messages::RequestAppWebView {
+    tl::functions::messages::RequestAppWebView {
+        write_allowed: false,
+        compact: false,
+        fullscreen: false,
+        peer,
+        app: tl::types::InputBotAppShortName { bot_id: bot, short_name: short_name.to_owned() }.into(),
+        start_param: None,
+        theme_params: None,
+        platform: WEBAPP_PLATFORM.to_owned(),
+    }
+}
+
+pub(super) fn webapp_prolong_request(peer: tl::enums::InputPeer, bot: tl::enums::InputUser, query_id: i64) -> tl::functions::messages::ProlongWebView {
+    tl::functions::messages::ProlongWebView { silent: false, peer, bot, query_id, reply_to: None, send_as: None }
+}
+
+pub(super) fn webapp_data_request(bot: tl::enums::InputUser, random_id: i64, data: &str) -> tl::functions::messages::SendWebViewData {
+    tl::functions::messages::SendWebViewData { bot, random_id, button_text: "Send".to_owned(), data: data.to_owned() }
+}
+
+pub(super) fn webapp_result_request(bot_query_id: &str, short_name: &str) -> tl::functions::messages::SendWebViewResultMessage {
+    tl::functions::messages::SendWebViewResultMessage {
+        bot_query_id: bot_query_id.to_owned(),
+        result: tl::types::InputBotInlineResultGame {
+            id: "1".to_owned(),
+            short_name: short_name.to_owned(),
+            send_message: tl::types::InputBotInlineMessageGame { reply_markup: None }.into(),
+        }
+        .into(),
+    }
+}
+
+pub(super) fn attach_menu_request() -> tl::functions::messages::GetAttachMenuBots {
+    tl::functions::messages::GetAttachMenuBots { hash: 0 }
+}
+
+pub(super) fn url_auth_request(peer: tl::enums::InputPeer, msg_id: i32, button_id: i32) -> tl::functions::messages::RequestUrlAuth {
+    tl::functions::messages::RequestUrlAuth {
+        peer: Some(peer),
+        msg_id: Some(msg_id),
+        button_id: Some(button_id),
+        url: None,
+        in_app_origin: None,
+    }
+}
+
+pub(super) fn url_auth_accept_request(peer: tl::enums::InputPeer, msg_id: i32, button_id: i32, write_allowed: bool) -> tl::functions::messages::AcceptUrlAuth {
+    tl::functions::messages::AcceptUrlAuth {
+        write_allowed,
+        share_phone_number: false,
+        peer: Some(peer),
+        msg_id: Some(msg_id),
+        button_id: Some(button_id),
+        url: None,
+        match_code: None,
     }
 }
 
@@ -1888,7 +2471,9 @@ fn action(dir: &Directory, who: &str, action: &MessageAction) -> (String, bool) 
         A::ChannelMigrateFrom(migrated) => named(format!("This group was upgraded from \"{}\"", migrated.title)),
         A::PinMessage => named(format!("{who} pinned a message")),
         A::HistoryClear => named("History was cleared".to_owned()),
-        A::GameScore(game) => named(format!("{who} scored {}", game.score)),
+        // The action names a game id and a score, not a title. Mapping does not ask the network,
+        // and there is no local title, so the line does not invent one.
+        A::GameScore(game) => named(format!("{who} scored {} in a game", game.score)),
         A::PaymentSent(paid) => named(match price_of(&paid.currency, paid.total_amount) {
             Some(price) => format!("{who} sent a payment of {price}"),
             None => format!("{who} sent a payment"),
@@ -1974,7 +2559,15 @@ fn action(dir: &Directory, who: &str, action: &MessageAction) -> (String, bool) 
         } else {
             format!("{who} started a giveaway")
         }),
-        A::GiveawayResults(results) => named(format!("A giveaway finished with {}", count_words(results.winners_count, "winner", "winners"))),
+        A::GiveawayResults(results) => named(if results.unclaimed_count > 0 {
+            format!(
+                "A giveaway finished with {}, {} unclaimed",
+                count_words(results.winners_count, "winner", "winners"),
+                results.unclaimed_count
+            )
+        } else {
+            format!("A giveaway finished with {}", count_words(results.winners_count, "winner", "winners"))
+        }),
         A::BoostApply(boost) => named(if boost.boosts == 1 {
             format!("{who} boosted this channel")
         } else {
@@ -2144,6 +2737,22 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
             let mut message = Message::plain(service.id.to_string(), "", text, i64::from(service.date), outgoing);
             message.sender = sender(dir, from);
             message.call = call_note;
+            if let MessageAction::GiftCode(gift) = &service.action {
+                if is_safe_slug(&gift.slug) {
+                    message.controls.push(MessageControl {
+                        block_id: String::new(),
+                        action_id: "tg:giftcode".to_owned(),
+                        element_type: "telegram_link".to_owned(),
+                        label: "Redeem gift code".to_owned(),
+                        value: String::new(),
+                        confirm: None,
+                        kind: ControlKind::Button {
+                            url: format!("https://t.me/giftcode/{}", gift.slug),
+                            style: ControlStyle::Primary,
+                        },
+                    });
+                }
+            }
             // A named event is the grey line. One this build does not word opens in Telegram,
             // the same way a poll or a story does.
             message.kind = if known {
@@ -2286,6 +2895,18 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                 Some(MessageMedia::Contact(contact)) => {
                     message.contacts.push(shared_contact(contact));
                 }
+                Some(media @ (MessageMedia::Giveaway(_) | MessageMedia::GiveawayResults(_))) => {
+                    if let Some((card, controls)) = giveaway_card(dir, media, raw.id) {
+                        message.card = Some(Box::new(card));
+                        message.controls.extend(controls);
+                    }
+                }
+                Some(MessageMedia::Game(media)) => {
+                    let (card, controls, picture) = game_card(media, raw.id, &mut wants, peer, megagroup, rules);
+                    message.card = Some(Box::new(card));
+                    message.controls.extend(controls);
+                    message.attachments.extend(picture);
+                }
                 Some(media) => {
                     if let Some(label) = unsupported(media) {
                         // The caption follows the label; its styles no longer line up, so they go.
@@ -2307,6 +2928,13 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                         message.card = Some(Box::new(poll_card(poll, results)));
                     }
                 }
+            }
+            if let Some(markup) = &raw.reply_markup {
+                let bot = raw.via_bot_id.filter(|id| *id > 0).or(match peer {
+                    Who::User(id) if id > 0 => Some(id),
+                    _ => None,
+                });
+                message.controls.extend(webapp_controls(markup, bot));
             }
             let (topic, reply) = topic_of(raw.reply_to.as_ref());
             let discussion_top = match &raw.reply_to {
@@ -3249,6 +3877,575 @@ pub(super) fn prove_invoices() -> Result<(), String> {
     let (line, known) = action(&Directory::new(1), "Ada", &sent.into());
     if !known || line != "Ada sent a payment of 50 Stars" {
         return Err(format!("a Star payment is unnamed, got {line}"));
+    }
+    Ok(())
+}
+
+/// The lab's telegram-giveaways check. An announcement and its results are cards with the
+/// prizes and rules, a status button asks who is taking part, and the service lines name
+/// the launch, the results, and a gift code. A build from before this says only "Giveaway".
+pub(super) fn prove_giveaways() -> Result<(), String> {
+    use grammers_tl_types::{Deserializable, Serializable};
+    let mut bytes = Vec::new();
+    0u32.serialize(&mut bytes);
+    0u32.serialize(&mut bytes);
+    9i32.serialize(&mut bytes);
+    Who::User(7_002).peer().serialize(&mut bytes);
+    1_700_000_000i32.serialize(&mut bytes);
+    String::new().serialize(&mut bytes);
+    let blank = || tl::types::Message::from_bytes(&bytes).map_err(|_| "a blank message reads back".to_owned());
+    fn field<'a>(card: &'a Card, label: &str) -> Option<&'a str> {
+        card.fields.iter().find(|row| row.0 == label).map(|row| row.1.as_str())
+    }
+
+    let mut premium = blank()?;
+    premium.media = Some(
+        tl::types::MessageMediaGiveaway {
+            only_new_subscribers: true,
+            winners_are_visible: false,
+            channels: vec![-100],
+            countries_iso2: Some(vec!["US".into(), "CA".into()]),
+            prize_description: Some("A year on the ridge".into()),
+            quantity: 3,
+            months: Some(1),
+            stars: None,
+            until_date: 1_700_000_000,
+        }
+        .into(),
+    );
+    let mapped = map(&Directory::new(7_001), &premium.into()).ok_or("the giveaway maps")?;
+    let card = mapped.message.card.ok_or("a giveaway is a card")?;
+    if card.title != "3 × 1 month of Telegram Premium" || card.text != "A year on the ridge" || card.author != "Giveaway" {
+        return Err(format!("the giveaway card is unnamed, got {}", card.title));
+    }
+    if field(&card, "Prizes") != Some("3 × 1 month Telegram Premium")
+        || field(&card, "Channels") != Some("Channel -100")
+        || field(&card, "Eligibility") != Some("New subscribers only")
+        || field(&card, "Countries") != Some("US, CA")
+        || field(&card, "Winners") != Some("Private")
+        || field(&card, "Ends") != Some("2023-11-14 22:12 UTC")
+    {
+        return Err(format!("the giveaway fields are wrong: {:?}", card.fields));
+    }
+    match mapped.message.controls.first() {
+        Some(control) if control.action_id == "tg:giveaway_info" && control.value == "9" && control.label == "Check status" => {}
+        _ => return Err("a giveaway has no status button".into()),
+    }
+    if matches!(mapped.message.kind, MessageKind::Unsupported { .. }) {
+        return Err("a giveaway still opens only in Telegram".into());
+    }
+
+    let mut stars_msg = blank()?;
+    stars_msg.id = 11;
+    stars_msg.media = Some(
+        tl::types::MessageMediaGiveaway {
+            only_new_subscribers: false,
+            winners_are_visible: true,
+            channels: vec![],
+            countries_iso2: None,
+            prize_description: None,
+            quantity: 2,
+            months: None,
+            stars: Some(100),
+            until_date: 0,
+        }
+        .into(),
+    );
+    let mapped = map(&Directory::new(7_001), &stars_msg.into()).ok_or("the Stars giveaway maps")?;
+    let card = mapped.message.card.ok_or("a Stars giveaway is a card")?;
+    if card.title != "100 Stars Giveaway" || field(&card, "Prizes") != Some("100 Stars among 2 winners") || field(&card, "Winners") != Some("Public") {
+        return Err(format!("the Stars giveaway is unnamed, got {} {:?}", card.title, card.fields));
+    }
+
+    let mut results = blank()?;
+    results.id = 41;
+    results.media = Some(
+        tl::types::MessageMediaGiveawayResults {
+            only_new_subscribers: false,
+            refunded: false,
+            channel_id: 100,
+            additional_peers_count: Some(1),
+            launch_msg_id: 40,
+            winners_count: 2,
+            unclaimed_count: 1,
+            winners: vec![9],
+            months: None,
+            stars: Some(50),
+            prize_description: None,
+            until_date: 1_700_000_000,
+        }
+        .into(),
+    );
+    let mapped = map(&Directory::new(7_001), &results.into()).ok_or("the results map")?;
+    let card = mapped.message.card.ok_or("giveaway results are a card")?;
+    if card.author != "Giveaway results"
+        || card.title != "2 winners selected"
+        || field(&card, "Channel") != Some("Channel 100 (+1 more)")
+        || field(&card, "Prize") != Some("50 Stars")
+        || field(&card, "Winners") != Some("User 9")
+        || field(&card, "Unclaimed") != Some("1")
+        || field(&card, "Ended") != Some("2023-11-14 22:12 UTC")
+    {
+        return Err(format!("the results card is wrong: {} {:?}", card.title, card.fields));
+    }
+    match mapped.message.controls.first() {
+        Some(control) if control.action_id == "tg:giveaway_info" && control.value == "40" => {}
+        _ => return Err("results do not ask about the launch message".into()),
+    }
+
+    let (launch, known) = action(
+        &Directory::new(1),
+        "Ada",
+        &tl::types::MessageActionGiveawayLaunch { stars: Some(10) }.into(),
+    );
+    if !known || launch != "Ada started a Stars giveaway" {
+        return Err(format!("a launch is unnamed, got {launch}"));
+    }
+    let (finished, known) = action(
+        &Directory::new(1),
+        "Ada",
+        &tl::types::MessageActionGiveawayResults { stars: false, winners_count: 3, unclaimed_count: 2 }.into(),
+    );
+    if !known || finished != "A giveaway finished with 3 winners, 2 unclaimed" {
+        return Err(format!("results are unnamed, got {finished}"));
+    }
+
+    let code = tl::types::MessageActionGiftCode {
+        via_giveaway: true,
+        unclaimed: false,
+        boost_peer: None,
+        days: 30,
+        slug: "Winter-2023".into(),
+        currency: None,
+        amount: None,
+        crypto_currency: None,
+        crypto_amount: None,
+        message: None,
+    };
+    let service = tl::types::MessageService {
+        out: false,
+        mentioned: false,
+        media_unread: false,
+        reactions_are_possible: false,
+        silent: false,
+        post: false,
+        legacy: false,
+        id: 12,
+        from_id: Some(Who::User(7_002).peer()),
+        peer_id: Who::User(7_002).peer(),
+        saved_peer_id: None,
+        reply_to: None,
+        date: 1_700_000_000,
+        action: code.into(),
+        reactions: None,
+        ttl_period: None,
+    };
+    let mapped = map(&Directory::new(1), &service.into()).ok_or("a gift code maps")?;
+    if mapped.message.text != "A giveaway sent a Premium gift code for 30 days" {
+        return Err(format!("a gift code is unnamed, got {}", mapped.message.text));
+    }
+    match mapped.message.controls.first().and_then(|control| match &control.kind {
+        ControlKind::Button { url, .. } => Some(url.as_str()),
+        _ => None,
+    }) {
+        Some("https://t.me/giftcode/Winter-2023") => {}
+        other => return Err(format!("a gift code has no redeem link, got {other:?}")),
+    }
+    if !is_safe_slug("Winter-2023") || is_safe_slug("bad slug") || is_safe_slug("../x") {
+        return Err("a gift-code slug was not checked".into());
+    }
+    if format_utc(1_700_000_000) != "2023-11-14 22:12 UTC" {
+        return Err(format!("a giveaway date is wrong, got {}", format_utc(1_700_000_000)));
+    }
+    Ok(())
+}
+
+/// The lab's telegram-games check. A game message is a card with its picture, title and
+/// description, Play asks for a web address, and a score line does not invent a title.
+/// A build from before this says only "Game: …".
+pub(super) fn prove_games() -> Result<(), String> {
+    use grammers_tl_types::{Deserializable, Serializable};
+    let mut bytes = Vec::new();
+    0u32.serialize(&mut bytes);
+    0u32.serialize(&mut bytes);
+    9i32.serialize(&mut bytes);
+    Who::User(7_002).peer().serialize(&mut bytes);
+    1_700_000_000i32.serialize(&mut bytes);
+    String::new().serialize(&mut bytes);
+    let mut message = tl::types::Message::from_bytes(&bytes).map_err(|_| "a blank message reads back".to_owned())?;
+    let photo = tl::types::Photo {
+        has_stickers: false,
+        id: 42,
+        access_hash: 7,
+        file_reference: vec![1, 2],
+        date: 1_700_000_000,
+        sizes: vec![tl::types::PhotoSize { r#type: "m".into(), w: 320, h: 180, size: 4_000 }.into()],
+        video_sizes: None,
+        dc_id: 2,
+    };
+    message.media = Some(
+        tl::types::MessageMediaGame {
+            game: tl::types::Game {
+                id: 9,
+                access_hash: 3,
+                short_name: "ridge".into(),
+                title: "Ridge Run".into(),
+                description: "A lap around the ridge".into(),
+                photo: photo.into(),
+                document: None,
+            }
+            .into(),
+        }
+        .into(),
+    );
+    let mapped = map(&Directory::new(7_001), &message.into()).ok_or("the game maps")?;
+    let card = mapped.message.card.ok_or("a game is a card")?;
+    if card.title != "Ridge Run" || card.text != "A lap around the ridge" || card.author != "Game" {
+        return Err(format!("the game card is unnamed, got {} / {}", card.title, card.text));
+    }
+    if card.image.as_ref().map(|image| image.id.as_str()) != Some("p42m") {
+        return Err("the game card has no picture".into());
+    }
+    if mapped.message.attachments.first().map(|file| file.file.id.as_str()) != Some("p42m") {
+        return Err("the game picture is not on the message".into());
+    }
+    if !mapped.wants.iter().any(|want| want.file.id == "p42m") {
+        return Err("the game picture is not fetched".into());
+    }
+    match mapped.message.controls.as_slice() {
+        [play, scores]
+            if play.action_id == "tg:game"
+                && play.label == "Play"
+                && play.value == "9"
+                && scores.action_id == "tg:game_scores"
+                && scores.label == "High scores"
+                && scores.value == "9" => {}
+        _ => return Err("a game has no Play and high scores".into()),
+    }
+    if matches!(mapped.message.kind, MessageKind::Unsupported { .. }) {
+        return Err("a game still opens only in Telegram".into());
+    }
+
+    let opened = game_launch(&tl::types::messages::BotCallbackAnswer {
+        alert: false,
+        has_url: true,
+        native_ui: false,
+        message: None,
+        url: Some("https://games.example/play?user=9".into()),
+        cache_time: 0,
+    });
+    if opened.alert || !opened.title.is_empty() || !opened.fields.is_empty() {
+        return Err("a game address would not open in the browser".into());
+    }
+    if opened.url.as_deref() != Some("https://games.example/play?user=9") {
+        return Err("the play address was not kept".into());
+    }
+    let refused = game_launch(&tl::types::messages::BotCallbackAnswer {
+        alert: false,
+        has_url: true,
+        native_ui: false,
+        message: None,
+        url: Some("javascript:alert(1)".into()),
+        cache_time: 0,
+    });
+    if refused.url.is_some() || refused.text.is_empty() {
+        return Err("a game link that is not a web address was kept".into());
+    }
+
+    let mut player = Vec::new();
+    0u32.serialize(&mut player);
+    0u32.serialize(&mut player);
+    9i64.serialize(&mut player);
+    let mut ada = tl::types::User::from_bytes(&player).map_err(|_| "a player reads back".to_owned())?;
+    ada.first_name = Some("Ada".into());
+    let board = game_high_scores(&tl::types::messages::HighScores {
+        scores: vec![tl::types::HighScore { pos: 1, user_id: 9, score: 40 }.into()],
+        users: vec![ada.into()],
+    });
+    if board.title != "High scores" || board.fields.first().map(|(label, value)| (label.as_str(), value.as_str())) != Some(("1. Ada", "40")) {
+        return Err(format!("the high scores are unnamed, got {:?}", board.fields));
+    }
+    let (line, known) = action(&Directory::new(1), "Ada", &tl::types::MessageActionGameScore { game_id: 9, score: 40 }.into());
+    if !known || line != "Ada scored 40 in a game" {
+        return Err(format!("a score invented a title, got {line}"));
+    }
+    Ok(())
+}
+
+/// The lab's telegram-webapps check. A named mini app is a hand-off link, a login names the
+/// site and whether the bot may message you, and a request/prolong cycle never carries the
+/// page token. A build from before this shows no button.
+pub(super) fn prove_webapps() -> Result<(), String> {
+    use grammers_tl_types::{Deserializable, Serializable};
+    let mut bytes = Vec::new();
+    0u32.serialize(&mut bytes);
+    0u32.serialize(&mut bytes);
+    9i32.serialize(&mut bytes);
+    Who::User(7_002).peer().serialize(&mut bytes);
+    1_700_000_000i32.serialize(&mut bytes);
+    String::new().serialize(&mut bytes);
+    let mut message = tl::types::Message::from_bytes(&bytes).map_err(|_| "a blank message reads back".to_owned())?;
+    message.reply_markup = Some(
+        tl::types::ReplyInlineMarkup {
+            rows: vec![tl::types::KeyboardButtonRow {
+                buttons: vec![
+                    tl::types::KeyboardButtonWebView { style: None, text: "Ridge".into(), url: "https://t.me/trail_bot/ridge".into() }.into(),
+                    tl::types::KeyboardButtonCallback { requires_password: false, style: None, text: "Nope".into(), data: vec![1] }.into(),
+                    tl::types::KeyboardButtonUrlAuth {
+                        style: None,
+                        text: "Log in".into(),
+                        fwd_text: None,
+                        url: "https://example.com/login".into(),
+                        button_id: 4,
+                    }
+                    .into(),
+                    tl::types::KeyboardButtonWebView { style: None, text: "Other".into(), url: "https://games.example/play".into() }.into(),
+                    tl::types::KeyboardButtonSimpleWebView { style: None, text: "Bad".into(), url: "javascript:alert(1)".into() }.into(),
+                ],
+            }
+            .into()],
+        }
+        .into(),
+    );
+    let mapped = map(&Directory::new(7_001), &message.into()).ok_or("the mini app maps")?;
+    let link = "tg://resolve?domain=trail_bot&appname=ridge";
+    match mapped.message.controls.as_slice() {
+        [ridge, login, other]
+            if ridge.label == "Ridge"
+                && matches!(&ridge.kind, ControlKind::Button { url, .. } if url == link)
+                && login.action_id == "tg:url_auth"
+                && login.label == "Log in"
+                && login.value == "4"
+                && other.action_id == "tg:webapp"
+                && other.value == "https://games.example/play" => {}
+        _ => return Err(format!("a mini app button was not drawn, got {:?}", mapped.message.controls.iter().map(|c| c.label.as_str()).collect::<Vec<_>>())),
+    }
+    if mapped.message.controls.iter().any(|control| control.label == "Nope" || control.label == "Bad") {
+        return Err("a keyboard button that is not a mini app was drawn".into());
+    }
+    if matches!(mapped.message.kind, MessageKind::Unsupported { .. }) {
+        return Err("a mini app still opens only as an unnamed message".into());
+    }
+
+    let token = "secret-token-9";
+    let peer = tl::types::InputPeerUser { user_id: 7_002, access_hash: 7 }.into();
+    let bot = tl::types::InputUser { user_id: 9, access_hash: 3 }.into();
+    let open = webapp_open_request(peer, bot, "https://t.me/trail_bot/ridge");
+    let open_back = read_back(&open)?;
+    if open_back.url.as_deref() != Some("https://t.me/trail_bot/ridge") || open_back.platform != WEBAPP_PLATFORM {
+        return Err("the web view request dropped its page".into());
+    }
+    let kept = tl::types::WebViewResultUrl {
+        fullsize: false,
+        fullscreen: false,
+        same_origin: false,
+        query_id: Some(77),
+        url: format!("https://games.example/play?hash={token}"),
+    };
+    let (query, shown) = web_view_kept(&kept);
+    if query != Some(77) || shown.text.contains(token) || shown.url.is_some() || format!("{:?}", shown.fields).contains(token) {
+        return Err("the page token was kept".into());
+    }
+    let prolong = webapp_prolong_request(open.peer.clone(), open.bot.clone(), query.unwrap_or(0));
+    let mut prolong_bytes = Vec::new();
+    prolong.serialize(&mut prolong_bytes);
+    if prolong.query_id != 77 || String::from_utf8_lossy(&prolong_bytes).contains(token) {
+        return Err("prolong carried the page token".into());
+    }
+    let prolong_back = read_back(&prolong)?;
+    if prolong_back.query_id != 77 {
+        return Err("prolong dropped the query".into());
+    }
+    if WEBAPP_PROLONG_SECS != 60 {
+        return Err("a mini app is not prolonged once a minute".into());
+    }
+    let simple = read_back(&webapp_simple_request(open.bot.clone(), "https://games.example/play"))?;
+    if simple.url.as_deref() != Some("https://games.example/play") {
+        return Err("the simple web view dropped its page".into());
+    }
+    let main = read_back(&webapp_main_request(open.peer.clone(), open.bot.clone(), None))?;
+    if main.start_param.is_some() {
+        return Err("a main web view invented a start parameter".into());
+    }
+    let app = read_back(&webapp_app_request(open.peer.clone(), open.bot.clone(), "ridge"))?;
+    if app.write_allowed {
+        return Err("opening an app allowed the bot to message you".into());
+    }
+    let tl::enums::InputBotApp::ShortName(named) = &app.app else {
+        return Err("the app request dropped its name".into());
+    };
+    if named.short_name != "ridge" {
+        return Err("the app request dropped its name".into());
+    }
+    let data = read_back(&webapp_data_request(open.bot.clone(), 9, "ping"))?;
+    if data.random_id != 9 || data.data != "ping" {
+        return Err("the web view data was not the button".into());
+    }
+    let sent = webapp_result_request("q77", "ridge");
+    let sent_back = read_back(&sent)?;
+    if sent_back.bot_query_id != "q77" {
+        return Err("a web view result dropped its query".into());
+    }
+    let tl::enums::InputBotInlineResult::Game(game) = &sent_back.result else {
+        return Err("a web view result was not the named app".into());
+    };
+    if game.short_name != "ridge" {
+        return Err("a web view result dropped its name".into());
+    }
+    let menu = read_back(&attach_menu_request())?;
+    if menu.hash != 0 {
+        return Err("the attach menu was not asked for".into());
+    }
+    let asked = read_back(&url_auth_request(open.peer.clone(), 9, 4))?;
+    if asked.button_id != Some(4) || asked.url.is_some() {
+        return Err("the login request was not the button".into());
+    }
+    let allow = read_back(&url_auth_accept_request(open.peer.clone(), 9, 4, true))?;
+    if !allow.write_allowed || allow.share_phone_number || allow.url.is_some() {
+        return Err("the login accept shared more than the confirm".into());
+    }
+    if !link.contains("trail_bot") || link.contains(token) {
+        return Err("the hand-off link carried a token".into());
+    }
+
+    let mut player = Vec::new();
+    0u32.serialize(&mut player);
+    0u32.serialize(&mut player);
+    9i64.serialize(&mut player);
+    let mut ada = tl::types::User::from_bytes(&player).map_err(|_| "a bot reads back".to_owned())?;
+    ada.first_name = Some("Ada".into());
+    ada.username = Some("trail_bot".into());
+    let prompt = login_prompt(
+        &tl::types::UrlAuthResultRequest {
+            request_write_access: true,
+            request_phone_number: false,
+            match_codes_first: false,
+            is_app: false,
+            bot: ada.clone().into(),
+            domain: "example.com".into(),
+            browser: None,
+            platform: None,
+            ip: None,
+            region: None,
+            match_codes: None,
+            user_id_hint: None,
+            verified_app_name: None,
+        }
+        .into(),
+        4,
+    );
+    if prompt.title != "Log in with Telegram"
+        || !prompt.text.contains("example.com")
+        || !prompt.text.contains("Ada will be able to message you.")
+        || prompt.follow_action != "tg:url_auth_accept"
+        || prompt.follow_value != "4:1"
+        || prompt.text.contains(token)
+    {
+        return Err(format!("the login confirm did not name the site, got {}", prompt.text));
+    }
+    let phone = login_prompt(
+        &tl::types::UrlAuthResultRequest {
+            request_write_access: false,
+            request_phone_number: true,
+            match_codes_first: false,
+            is_app: false,
+            bot: ada.clone().into(),
+            domain: "example.com".into(),
+            browser: None,
+            platform: None,
+            ip: None,
+            region: None,
+            match_codes: None,
+            user_id_hint: None,
+            verified_app_name: None,
+        }
+        .into(),
+        4,
+    );
+    if !phone.follow_action.is_empty() || !phone.text.contains("phone number") {
+        return Err("a phone login was offered".into());
+    }
+    let opened = login_prompt(
+        &tl::types::UrlAuthResultAccepted { url: Some(format!("https://example.com/back?hash={token}")) }.into(),
+        4,
+    );
+    if opened.url.as_deref() != Some(&format!("https://example.com/back?hash={token}")) || opened.text.contains(token) {
+        return Err("the login redirect was written into the text".into());
+    }
+    let refused = login_prompt(&tl::types::UrlAuthResultAccepted { url: Some("javascript:alert(1)".into()) }.into(), 4);
+    if refused.url.is_some() || refused.text.is_empty() {
+        return Err("a login link that is not a web address was kept".into());
+    }
+    let declined = login_prompt(&tl::enums::UrlAuthResult::Default, 4);
+    if declined.text != "Telegram declined this login." {
+        return Err("a declined login was not said".into());
+    }
+    if webapp_event("theme_changed") != Some("theme")
+        || webapp_event("web_app_request_viewport") != Some("viewport")
+        || webapp_event("web_app_setup_main_button") != Some("main_button")
+        || webapp_event("web_app_setup_back_button") != Some("back_button")
+        || webapp_event("web_app_close") != Some("close")
+        || webapp_event("web_app_open_link") != Some("open_link")
+        || webapp_event("web_app_open_invoice") != Some("invoice")
+        || webapp_event("web_app_request_phone").is_some()
+        || webapp_event("web_app_read_text_from_clipboard").is_some()
+        || webapp_event("web_app_biometry_get_info").is_some()
+        || webapp_event("web_app_invoke_custom_method").is_some()
+        || webapp_event("web_app_open_tg_link").is_some()
+    {
+        return Err("a mini app event was answered that this build refuses".into());
+    }
+    let menu_bots = tl::types::AttachMenuBots {
+        hash: 1,
+        bots: vec![
+            tl::types::AttachMenuBot {
+                inactive: false,
+                has_settings: false,
+                request_write_access: false,
+                show_in_attach_menu: true,
+                show_in_side_menu: false,
+                side_menu_disclaimer_needed: false,
+                bot_id: 9,
+                short_name: "ridge".into(),
+                peer_types: None,
+                icons: Vec::new(),
+            }
+            .into(),
+            tl::types::AttachMenuBot {
+                inactive: true,
+                has_settings: false,
+                request_write_access: true,
+                show_in_attach_menu: false,
+                show_in_side_menu: false,
+                side_menu_disclaimer_needed: false,
+                bot_id: 8,
+                short_name: "hidden".into(),
+                peer_types: None,
+                icons: Vec::new(),
+            }
+            .into(),
+        ],
+        users: vec![ada.into()],
+    };
+    let links = attach_menu_links(&menu_bots);
+    if links != vec![("Ada".to_owned(), link.to_owned())] {
+        return Err(format!("an attach-menu bot was not a hand-off, got {links:?}"));
+    }
+    fn read_back<T>(value: &T) -> Result<T, String>
+    where
+        T: grammers_tl_types::Serializable + grammers_tl_types::Deserializable + grammers_tl_types::Identifiable,
+    {
+        use grammers_tl_types::{Deserializable, Identifiable, Serializable};
+        let mut bytes = Vec::new();
+        value.serialize(&mut bytes);
+        if bytes.len() < 4 {
+            return Err("a request was empty".into());
+        }
+        let id = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if id != T::CONSTRUCTOR_ID {
+            return Err("a request had the wrong constructor".into());
+        }
+        T::from_bytes(&bytes[4..]).map_err(|_| "a request did not read back".to_owned())
     }
     Ok(())
 }
@@ -4439,7 +5636,7 @@ mod tests {
         );
         let call = tl::types::InputGroupCall { id: 1, access_hash: 2 }.into();
         assert_eq!(said(tl::types::MessageActionGroupCallScheduled { call, schedule_date: 1_700_000_000 }.into()), "Ada scheduled a video chat");
-        assert_eq!(said(tl::types::MessageActionGameScore { game_id: 1, score: 40 }.into()), "Ada scored 40");
+        assert_eq!(said(tl::types::MessageActionGameScore { game_id: 1, score: 40 }.into()), "Ada scored 40 in a game");
         assert_eq!(
             said(tl::types::MessageActionRequestedPeer { button_id: 1, peers: vec![Who::User(9).peer()] }.into()),
             "Ada shared a chat"
@@ -4497,6 +5694,21 @@ mod tests {
             }
             MessageKind::System | MessageKind::Normal => panic!("an unnamed action needs a link into Telegram"),
         }
+    }
+
+    #[test]
+    fn giveaway_media_maps_to_card_fields() {
+        prove_giveaways().unwrap();
+    }
+
+    #[test]
+    fn a_bot_game_is_a_card_with_a_play_link() {
+        prove_games().unwrap();
+    }
+
+    #[test]
+    fn a_bot_mini_app_is_a_hand_off_and_a_login() {
+        prove_webapps().unwrap();
     }
 
     fn text_message(text: &str, reply_to: Option<tl::enums::MessageReplyHeader>) -> tl::enums::Message {

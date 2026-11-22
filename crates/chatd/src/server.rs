@@ -302,6 +302,19 @@ impl Chat {
                 adapter.command(Command::Tiny(adapters::tiny::live::Ask::Settled));
             }
         });
+        let adapters = chat.adapters.clone();
+        let hub_for_rec = chat.hub.clone();
+        chat.hub.recorder.on_activity(move |conversation, activity| {
+            if conversation.network != Network::Telegram {
+                return;
+            }
+            let account = conversation.account();
+            if hub_for_rec.link(&account) == Link::Connected && hub_for_rec.settings().typing(&account) {
+                if let Some(adapter) = lock(&adapters).get(&account) {
+                    adapter.command(Command::Typing { conversation_id: conversation.id.clone(), activity });
+                }
+            }
+        });
         let (searches, adapters) = (chat.searches.clone(), chat.adapters.clone());
         let spawned = std::thread::Builder::new().name("search".into()).stack_size(256 * 1024).spawn(move || searches.run(&adapters));
         if let Err(err) = spawned {
@@ -4221,6 +4234,9 @@ impl Chat {
                 self.drop_unsent(conversation, &client_id, &message)
             }
             Request::Typing { conversation, activity } => {
+                if activity == protocol::Compose::Cancel && conversation.network != Network::Telegram {
+                    return Response::Ok;
+                }
                 let account = conversation.account();
                 // P1: off, the network never hears it.
                 if self.hub.link(&account) == Link::Connected && self.hub.settings().typing(&account) {
@@ -4664,8 +4680,19 @@ impl Chat {
                     }
                     _ => None,
                 };
+                // A round note is listened to when it starts, the same receipt a voice message
+                // owes. Muted autoplay counts: the picture is playing. Telegram is idempotent.
+                let played = match &request {
+                    protocol::PlayRequest::Start { account, conversation, message, round, .. } if *round && account.network == Network::Telegram => {
+                        Some((account.clone(), conversation.id.clone(), message.clone()))
+                    }
+                    _ => None,
+                };
                 match self.hub.player.request(&self.hub, &support_dir().join("media"), request) {
                     Ok(()) => {
+                        if let Some((account, conversation_id, message_id)) = played {
+                            self.command(&account, Command::Played { conversation_id, message_id });
+                        }
                         if let Some((conversation, message_id)) = viewed {
                             self.mark_played(conversation.clone(), message_id.clone());
                             let account = conversation.account();
@@ -4925,16 +4952,33 @@ impl Chat {
                 element_type,
                 value,
                 values,
-            } => self.act(&conversation, |conversation_id, reply| Command::MessageAction {
-                conversation_id,
-                message_id,
-                block_id,
-                action_id,
-                element_type,
-                value,
-                values,
-                reply,
-            }),
+            } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::MessageAction {
+                    conversation_id,
+                    message_id,
+                    block_id,
+                    action_id,
+                    element_type,
+                    value,
+                    values,
+                    reply,
+                }) {
+                    Ok(Some(mut result)) => {
+                        result.bound();
+                        Response::ActionResult { result }
+                    }
+                    Ok(None) => {
+                        self.hub.infos.forget(&conversation);
+                        Response::Ok
+                    }
+                    Err(refused) => *refused,
+                }
+            }
             Request::PressButton { conversation, message_id, data } => {
                 let account = conversation.account();
                 let conversation_id = conversation.id;

@@ -237,7 +237,7 @@ struct Live {
     /// Messages we sent and the id the shell knows each by, until the echo has passed.
     sent: VecDeque<(i32, String)>,
     random: VecDeque<(i64, String)>,
-    typed: HashMap<String, Instant>,
+    typed: HashMap<String, (Instant, protocol::Compose)>,
     here: Option<Instant>,
     /// Whether people, groups and channels are muted when a chat has no setting of its own.
     muted: [bool; 3],
@@ -1179,6 +1179,38 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::Translate { conversation_id, message_ids, to, reply } => {
             let _ = reply.send(translate::translate(account, &conversation_id, &message_ids, &to).map_err(refused));
         }
+        Command::MessageAction { conversation_id, message_id, block_id, action_id, value, reply, .. } => {
+            let action = action_id.as_str();
+            let answer = match action {
+                "tg:giveaway_info" => {
+                    let target_id = value.parse::<i32>().ok().or_else(|| message_id.parse::<i32>().ok()).unwrap_or(0);
+                    info::giveaway_info(account, &conversation_id, target_id).map(Some).map_err(refused)
+                }
+                "tg:game" => {
+                    let target_id = value.parse::<i32>().ok().or_else(|| message_id.parse::<i32>().ok()).unwrap_or(0);
+                    info::game_play(account, &conversation_id, target_id).map(Some).map_err(refused)
+                }
+                "tg:game_scores" => {
+                    let target_id = value.parse::<i32>().ok().or_else(|| message_id.parse::<i32>().ok()).unwrap_or(0);
+                    info::game_scores(account, &conversation_id, target_id).map(Some).map_err(refused)
+                }
+                "tg:webapp"
+                | "tg:webapp_simple"
+                | "tg:webapp_main"
+                | "tg:webapp_app"
+                | "tg:webapp_prolong"
+                | "tg:webapp_data"
+                | "tg:webapp_result"
+                | "tg:attach_menu"
+                | "tg:url_auth"
+                | "tg:url_auth_accept" => {
+                    let target_id = message_id.parse::<i32>().unwrap_or(0);
+                    info::webapp_action(account, &conversation_id, target_id, action, &block_id, &value).map(Some).map_err(refused)
+                }
+                _ => Err(Refusal::Unsupported),
+            };
+            let _ = reply.send(answer);
+        }
         Command::SaveGif { id, unsave, reply } => {
             let _ = reply.send(catalog::save_gif(account, &id, unsave).map_err(refused));
         }
@@ -1257,6 +1289,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             };
             let _ = reply.send(answer);
         }
+        Command::Played { conversation_id, message_id } => played(account, &conversation_id, &message_id),
         Command::SignOut(reply) => {
             // Ends the session on Telegram, so the device list no longer shows it. What the
             // link was down for belongs to this session and not the next.
@@ -1338,6 +1371,27 @@ fn resolve_username(account: &Account, username: &str) -> Result<Option<(String,
         return Ok(None);
     }
     Ok(Some((who.text(), account.dir().name(who))))
+}
+
+/// A round video message started. Telegram is told the contents were played, the same call
+/// the official apps send for a voice or video message. A channel uses the channel form.
+fn played(account: &Account, conversation: &str, message: &str) {
+    let (Some((who, _)), Ok(id)) = (Who::parse(conversation), message.parse::<i32>()) else {
+        return;
+    };
+    if id <= 0 {
+        return;
+    }
+    let told = match who {
+        Who::Channel(_) => match account.input_channel(who) {
+            Ok(channel) => account.ask(&tl::functions::channels::ReadMessageContents { channel, id: vec![id] }).map(drop),
+            Err(fault) => Err(fault),
+        },
+        _ => account.ask(&tl::functions::messages::ReadMessageContents { id: vec![id] }).map(drop),
+    };
+    if let Err(fault) = told {
+        tracing::warn!("chatd: Telegram: played: {fault}");
+    }
 }
 
 fn mark_read(account: &Account, conversation: &str, message: &str) {
@@ -1677,31 +1731,37 @@ fn delete_many(account: &Account, conversation: &str, message_ids: &[String], sc
 }
 
 fn typing(account: &Account, conversation: &str, activity: protocol::Compose) {
-    // Keystrokes are paced. A recording or an upload is not: the other person should see it now.
-    deliver(account, conversation, activity_action(activity, 0), activity == protocol::Compose::Typing);
+    if activity == protocol::Compose::Cancel {
+        deliver_cancel(account, conversation);
+        return;
+    }
+    // Repeated signals for the same activity are paced at TYPING_EVERY (8 s); switching activities
+    // (e.g. typing -> recording a voice message) goes out right away.
+    deliver(account, conversation, activity_action(activity, 0), Some(activity));
 }
 
 /// An upload's progress, 0 to 100. Not paced: each new percent is one signal.
 pub(super) fn show_upload(account: &Account, conversation: &str, activity: protocol::Compose, progress: i32) {
-    deliver(account, conversation, activity_action(activity, progress), false);
+    deliver(account, conversation, activity_action(activity, progress), None);
 }
 
-/// The other person should see that an upload was abandoned.
+/// The other person should see that a recording or upload was abandoned.
 pub(super) fn deliver_cancel(account: &Account, conversation: &str) {
-    deliver(account, conversation, tl::enums::SendMessageAction::SendMessageCancelAction, false);
+    account.live().typed.remove(conversation);
+    deliver(account, conversation, tl::enums::SendMessageAction::SendMessageCancelAction, None);
 }
 
-fn deliver(account: &Account, conversation: &str, action: tl::enums::SendMessageAction, paced: bool) {
+fn deliver(account: &Account, conversation: &str, action: tl::enums::SendMessageAction, pace_as: Option<protocol::Compose>) {
     let Some((who, topic)) = Who::parse(conversation) else {
         return;
     };
-    if paced {
+    if let Some(activity) = pace_as {
         let mut live = account.live();
-        if live.typed.get(conversation).is_some_and(|told| told.elapsed() < TYPING_EVERY) {
+        if live.typed.get(conversation).is_some_and(|(told, prev)| *prev == activity && told.elapsed() < TYPING_EVERY) {
             return;
         }
-        live.typed.retain(|_, told| told.elapsed() < TYPING_EVERY);
-        live.typed.insert(conversation.to_owned(), Instant::now());
+        live.typed.retain(|_, (told, _)| told.elapsed() < TYPING_EVERY);
+        live.typed.insert(conversation.to_owned(), (Instant::now(), activity));
     }
     account.here();
     if let Ok(peer) = account.input(who) {
@@ -1717,13 +1777,15 @@ fn activity_action(activity: protocol::Compose, progress: i32) -> tl::enums::Sen
     match activity {
         protocol::Compose::Typing => SendMessageTypingAction,
         protocol::Compose::RecordingVoice => SendMessageRecordAudioAction,
-        protocol::Compose::RecordingVideo => SendMessageRecordVideoAction,
+        protocol::Compose::RecordingVideo => SendMessageRecordRoundAction,
         protocol::Compose::UploadingPhoto => SendMessageUploadPhotoAction(tl::types::SendMessageUploadPhotoAction { progress }),
         protocol::Compose::UploadingVideo => SendMessageUploadVideoAction(tl::types::SendMessageUploadVideoAction { progress }),
         protocol::Compose::UploadingAudio => SendMessageUploadAudioAction(tl::types::SendMessageUploadAudioAction { progress }),
         protocol::Compose::UploadingFile => SendMessageUploadDocumentAction(tl::types::SendMessageUploadDocumentAction { progress }),
         protocol::Compose::ChoosingSticker => SendMessageChooseStickerAction,
         protocol::Compose::PlayingGame => SendMessageGamePlayAction,
+        protocol::Compose::Speaking => SpeakingInGroupCallAction,
+        protocol::Compose::Cancel => SendMessageCancelAction,
     }
 }
 
@@ -2037,6 +2099,29 @@ pub fn prove_telegram_invoices() -> Result<(), String> {
     content::prove_invoices()
 }
 
+/// The lab's telegram-giveaways driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_giveaways() -> Result<(), String> {
+    content::prove_giveaways()
+}
+
+/// The lab's telegram-games driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_games() -> Result<(), String> {
+    content::prove_games()
+}
+
+/// The lab's telegram-webapps driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_webapps() -> Result<(), String> {
+    content::prove_webapps()
+}
+
+pub fn prove_telegram_round() -> Result<(), String> {
+    protocol::prove_round_video()
+}
+
+pub fn prove_telegram_round_record() -> Result<(), String> {
+    protocol::prove_round_record()
+}
+
 /// The lab's telegram-location driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_location() -> Result<(), String> {
     content::prove_location()?;
@@ -2234,8 +2319,20 @@ pub fn prove_telegram_typing_activity() -> Result<(), String> {
     if live::noted(&SendMessageChooseStickerAction) != Some(protocol::Compose::ChoosingSticker) {
         return Err("choosing a sticker was read as typing".into());
     }
+    if live::noted(&SendMessageRecordRoundAction) != Some(protocol::Compose::RecordingVideo) {
+        return Err("recording a round video was read as typing".into());
+    }
+    if live::noted(&SpeakingInGroupCallAction) != Some(protocol::Compose::Speaking) {
+        return Err("speaking in a call was read as typing".into());
+    }
     if live::action_word(&activity_action(protocol::Compose::RecordingVoice, 0)) != "record-audio" {
         return Err("recording a voice note was not told as a recording".into());
+    }
+    if live::action_word(&activity_action(protocol::Compose::RecordingVideo, 0)) != "record-video" {
+        return Err("recording a video note was not told as a recording".into());
+    }
+    if live::action_word(&activity_action(protocol::Compose::Cancel, 0)) != "cancel" {
+        return Err("cancelling a recording was not told as cancel".into());
     }
     Ok(())
 }

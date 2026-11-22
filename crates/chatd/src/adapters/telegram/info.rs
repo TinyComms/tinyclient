@@ -2719,6 +2719,266 @@ pub(super) fn rate_transcript(
     Ok(())
 }
 
+/// Queries `payments.getGiveawayInfo` for a giveaway message (or launch message referenced by
+/// a giveaway results message) and formats participation, eligibility, or win status for display.
+pub(super) fn giveaway_info(account: &Account, conversation: &str, msg_id: i32) -> Result<protocol::ActionResult, Fault> {
+    if msg_id <= 0 {
+        return Err(invalid("MESSAGE_ID_INVALID"));
+    }
+    let Some((who, _)) = Who::parse(conversation) else {
+        return Err(invalid("PEER_ID_INVALID"));
+    };
+    let peer = account.input(who)?;
+    let info = account.ask(&tl::functions::payments::GetGiveawayInfo { peer, msg_id })?;
+    let mut result = protocol::ActionResult { alert: true, ..protocol::ActionResult::default() };
+    match info {
+        tl::enums::payments::GiveawayInfo::Info(info) => {
+            result.title = "Giveaway status".to_owned();
+            result.text = if info.preparing_results {
+                "The giveaway has ended and Telegram is selecting winners.".to_owned()
+            } else if info.participating {
+                "You are participating in this giveaway.".to_owned()
+            } else if let Some(country) = &info.disallowed_country {
+                format!("Not eligible: giveaways are not available in {country}.")
+            } else if let Some(chat_id) = info.admin_disallowed_chat_id {
+                let name = account.dir().name(Who::Channel(chat_id));
+                let chat = if name == "Unknown" { format!("channel {chat_id}") } else { name };
+                format!("Not eligible: you are an admin of {chat}.")
+            } else if let Some(joined) = info.joined_too_early_date {
+                format!(
+                    "Not eligible: only new subscribers qualify (joined {}).",
+                    super::content::format_utc(joined)
+                )
+            } else {
+                "You are not participating in this giveaway.".to_owned()
+            };
+            if info.start_date > 0 {
+                result.fields.push(("Started".to_owned(), super::content::format_utc(info.start_date)));
+            }
+        }
+        tl::enums::payments::GiveawayInfo::Results(res) => {
+            result.title = "Giveaway results".to_owned();
+            result.text = if res.refunded {
+                "This giveaway was cancelled and refunded.".to_owned()
+            } else if res.winner {
+                if let Some(stars) = res.stars_prize.filter(|&s| s > 0) {
+                    format!("Congratulations! You won {}.", super::content::stars_label(stars))
+                } else {
+                    "Congratulations! You won Telegram Premium in this giveaway.".to_owned()
+                }
+            } else {
+                "You did not win this giveaway.".to_owned()
+            };
+            result.fields.push(("Winners".to_owned(), res.winners_count.max(0).to_string()));
+            if let Some(activated) = res.activated_count {
+                result.fields.push(("Claimed".to_owned(), format!("{} / {}", activated.max(0), res.winners_count.max(0))));
+            }
+            if res.start_date > 0 {
+                result.fields.push(("Started".to_owned(), super::content::format_utc(res.start_date)));
+            }
+            if res.finish_date > 0 {
+                result.fields.push(("Finished".to_owned(), super::content::format_utc(res.finish_date)));
+            }
+            if let Some(slug) = res.gift_code_slug.as_deref().filter(|s| super::content::is_safe_slug(s)) {
+                result.url = Some(format!("https://t.me/giftcode/{slug}"));
+                result.url_label = "Redeem gift code".to_owned();
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// Play on a game message. Telegram returns a web address for this user; the shell opens it
+/// outside the app. The address is not logged.
+pub(super) fn game_play(account: &Account, conversation: &str, msg_id: i32) -> Result<protocol::ActionResult, Fault> {
+    let peer = game_peer(account, conversation, msg_id)?;
+    let answer = account.ask(&tl::functions::messages::GetBotCallbackAnswer {
+        game: true,
+        peer,
+        msg_id,
+        data: None,
+        password: None,
+    })?;
+    let tl::enums::messages::BotCallbackAnswer::Answer(answer) = answer;
+    Ok(super::content::game_launch(&answer))
+}
+
+/// High scores for the game on `msg_id`, around this account.
+pub(super) fn game_scores(account: &Account, conversation: &str, msg_id: i32) -> Result<protocol::ActionResult, Fault> {
+    let peer = game_peer(account, conversation, msg_id)?;
+    let scores = account.ask(&tl::functions::messages::GetGameHighScores {
+        peer,
+        id: msg_id,
+        user_id: tl::enums::InputUser::UserSelf,
+    })?;
+    let tl::enums::messages::HighScores::Scores(scores) = scores;
+    Ok(super::content::game_high_scores(&scores))
+}
+
+fn game_peer(account: &Account, conversation: &str, msg_id: i32) -> Result<tl::enums::InputPeer, Fault> {
+    if msg_id <= 0 {
+        return Err(invalid("MESSAGE_ID_INVALID"));
+    }
+    let Some((who, _)) = Who::parse(conversation) else {
+        return Err(invalid("PEER_ID_INVALID"));
+    };
+    account.input(who)
+}
+
+/// The bot a mini-app button named. The button carries the id; a direct chat can stand in
+/// when it did not. The access hash has to be one this account already learned.
+fn webapp_bot(account: &Account, conversation: &str, block_id: &str) -> Result<tl::enums::InputUser, Fault> {
+    let id = block_id.parse::<i64>().ok().filter(|id| *id > 0).or_else(|| match Who::parse(conversation) {
+        Some((Who::User(id), _)) if id > 0 => Some(id),
+        _ => None,
+    });
+    let Some(id) = id else {
+        return Err(invalid("PEER_ID_INVALID"));
+    };
+    account.dir().input_user(Who::User(id)).ok_or_else(|| invalid("PEER_ID_INVALID"))
+}
+
+fn button_id(value: &str) -> Result<i32, Fault> {
+    value.parse::<i32>().ok().filter(|id| *id > 0).ok_or_else(|| invalid("BUTTON_ID_INVALID"))
+}
+
+/// `button_id:0` or `button_id:1`. The digit is whether the bot may message you.
+fn allow_choice(value: &str) -> Result<(i32, bool), Fault> {
+    let Some((id, flag)) = value.split_once(':') else {
+        return Err(invalid("BUTTON_ID_INVALID"));
+    };
+    let id = button_id(id)?;
+    match flag {
+        "1" => Ok((id, true)),
+        "0" => Ok((id, false)),
+        _ => Err(invalid("BUTTON_ID_INVALID")),
+    }
+}
+
+fn kept_view(answer: tl::enums::WebViewResult) -> protocol::ActionResult {
+    let tl::enums::WebViewResult::Url(url) = answer;
+    super::content::web_view_kept(&url).1
+}
+
+fn mini_apps(fields: Vec<(String, String)>) -> protocol::ActionResult {
+    if fields.is_empty() {
+        protocol::ActionResult {
+            title: "Mini apps".to_owned(),
+            text: "No mini apps.".to_owned(),
+            alert: true,
+            ..protocol::ActionResult::default()
+        }
+    } else {
+        protocol::ActionResult {
+            title: "Mini apps".to_owned(),
+            fields,
+            alert: true,
+            ..protocol::ActionResult::default()
+        }
+    }
+}
+
+fn stayed(open: bool) -> protocol::ActionResult {
+    protocol::ActionResult {
+        title: "Mini app".to_owned(),
+        text: if open {
+            "The mini app stayed open.".to_owned()
+        } else {
+            "Telegram did not keep this mini app open.".to_owned()
+        },
+        alert: true,
+        ..protocol::ActionResult::default()
+    }
+}
+
+fn told(text: &str) -> protocol::ActionResult {
+    protocol::ActionResult {
+        title: "Mini app".to_owned(),
+        text: text.to_owned(),
+        alert: true,
+        ..protocol::ActionResult::default()
+    }
+}
+
+/// A mini app or a site login. The address Telegram returns can carry a per-user token, so it
+/// is not copied onto the result and not written to a log. This build does not load the page.
+pub(super) fn webapp_action(
+    account: &Account,
+    conversation: &str,
+    msg_id: i32,
+    action_id: &str,
+    block_id: &str,
+    value: &str,
+) -> Result<protocol::ActionResult, Fault> {
+    let peer = game_peer(account, conversation, msg_id)?;
+    match action_id {
+        "tg:webapp" => {
+            let url = super::content::web_button_url(value).ok_or_else(|| invalid("URL_INVALID"))?;
+            let bot = webapp_bot(account, conversation, block_id)?;
+            Ok(kept_view(account.ask(&super::content::webapp_open_request(peer, bot, url))?))
+        }
+        "tg:webapp_simple" => {
+            let url = super::content::web_button_url(value).ok_or_else(|| invalid("URL_INVALID"))?;
+            let bot = webapp_bot(account, conversation, block_id)?;
+            Ok(kept_view(account.ask(&super::content::webapp_simple_request(bot, url))?))
+        }
+        "tg:webapp_main" => {
+            let bot = webapp_bot(account, conversation, block_id)?;
+            let start = super::content::is_safe_slug(value).then(|| value.to_owned());
+            Ok(kept_view(account.ask(&super::content::webapp_main_request(peer, bot, start))?))
+        }
+        "tg:webapp_app" => {
+            if !super::content::is_safe_slug(value) {
+                return Err(invalid("SHORT_NAME_INVALID"));
+            }
+            let bot = webapp_bot(account, conversation, block_id)?;
+            Ok(kept_view(account.ask(&super::content::webapp_app_request(peer, bot, value))?))
+        }
+        "tg:webapp_prolong" => {
+            let query_id = value.parse::<i64>().ok().filter(|id| *id != 0).ok_or_else(|| invalid("QUERY_ID_INVALID"))?;
+            let bot = webapp_bot(account, conversation, block_id)?;
+            Ok(stayed(account.ask(&super::content::webapp_prolong_request(peer, bot, query_id))?))
+        }
+        "tg:webapp_data" => {
+            if value.is_empty() || value.len() > 4_096 {
+                return Err(invalid("DATA_INVALID"));
+            }
+            let bot = webapp_bot(account, conversation, block_id)?;
+            let answer = account.ask(&super::content::webapp_data_request(bot, i64::from(msg_id), value))?;
+            super::live::answered(account, &answer);
+            Ok(told("The mini app sent its data."))
+        }
+        "tg:webapp_result" => {
+            let Some((query, short)) = value.split_once('\n') else {
+                return Err(invalid("RESULT_INVALID"));
+            };
+            if query.is_empty() || !super::content::is_safe_slug(short) {
+                return Err(invalid("RESULT_INVALID"));
+            }
+            account.ask(&super::content::webapp_result_request(query, short))?;
+            Ok(told("The mini app sent its result."))
+        }
+        "tg:attach_menu" => match account.ask(&super::content::attach_menu_request())? {
+            tl::enums::AttachMenuBots::NotModified => Ok(mini_apps(Vec::new())),
+            tl::enums::AttachMenuBots::Bots(bots) => {
+                account.learn(&bots.users, &[]);
+                Ok(mini_apps(super::content::attach_menu_links(&bots)))
+            }
+        },
+        "tg:url_auth" => {
+            let button = button_id(value)?;
+            let answer = account.ask(&super::content::url_auth_request(peer, msg_id, button))?;
+            Ok(super::content::login_prompt(&answer, button))
+        }
+        "tg:url_auth_accept" => {
+            let (button, write_allowed) = allow_choice(value)?;
+            let answer = account.ask(&super::content::url_auth_accept_request(peer, msg_id, button, write_allowed))?;
+            Ok(super::content::login_prompt(&answer, button))
+        }
+        _ => Err(invalid("ACTION_INVALID")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

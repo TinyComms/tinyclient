@@ -776,7 +776,7 @@ pub struct ReplyKeyboard {
     pub placeholder: Option<String>,
 }
 
-/// One interactive Block Kit control attached to a bot/app message (button, menu, picker, etc.).
+/// One interactive Block Kit or bot keyboard control attached to a message (button, menu, picker, etc.).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageControl {
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -840,6 +840,68 @@ pub struct ButtonAnswer {
     pub alert: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+}
+
+/// What an interactive message control answered when it has details to display or a link to open
+/// (Telegram giveaway status, bot game launch / high scores, callback answers).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionResult {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    /// Label/value rows shown in a details modal (e.g. giveaway status, high scores).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<(String, String)>,
+    /// Validated `https://` or `http://` link to open (or offer as a button when `alert` is true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Label for the `url` action button inside a details modal (defaults to `"Open"` when empty).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url_label: String,
+    /// True when the answer should open a modal dialog rather than a brief toast or immediate open.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub alert: bool,
+    /// When set, the modal's primary button sends this action in the same conversation.
+    /// Empty means the button opens `url`, or the modal only closes.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub follow_action: String,
+    /// The value sent with [`ActionResult::follow_action`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub follow_value: String,
+}
+
+fn is_http_url(url: &str) -> bool {
+    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"));
+    rest.is_some_and(|rest| !rest.is_empty() && !url.chars().any(|c| c.is_control() || c.is_whitespace()))
+}
+
+impl ActionResult {
+    pub fn bound(&mut self) {
+        clip(&mut self.title, 256);
+        clip(&mut self.text, 4_000);
+        clip(&mut self.url_label, 120);
+        if let Some(url) = &mut self.url {
+            clip(url, 2_000);
+        }
+        if !self.url.as_deref().is_some_and(is_http_url) {
+            self.url = None;
+            self.url_label.clear();
+        }
+        self.fields.truncate(24);
+        for (label, value) in &mut self.fields {
+            clip(label, 256);
+            clip(value, 1_000);
+        }
+        clip(&mut self.follow_action, 64);
+        clip(&mut self.follow_value, 64);
+        let follow_ok = !self.follow_action.is_empty()
+            && self.follow_action.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-'));
+        if !follow_ok {
+            self.follow_action.clear();
+            self.follow_value.clear();
+        }
+    }
 }
 
 /// One message. Which conversation it is in comes from the answer that carries it.

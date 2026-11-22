@@ -1,0 +1,12 @@
+{
+  "id": "telegram-webapps",
+  "title": "A bot mini app is a hand-off and a login names the site",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same hand-off is what a mini app maps to.",
+    "ios": "The phone proof build does not run desktop chatd. The same hand-off is what a mini app maps to."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

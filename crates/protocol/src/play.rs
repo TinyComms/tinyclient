@@ -11,6 +11,150 @@ use serde::{Deserialize, Serialize};
 /// Speeds a voice message can play at, in percent.
 pub const RATES: [u16; 4] = [50, 100, 150, 200];
 
+/// One decoded frame of a round video message: a JPEG mediad wrote, the way a call picture is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlayPicture {
+    pub path: String,
+    pub width: u32,
+    pub height: u32,
+    pub generation: u64,
+}
+
+/// Where a round video message is, for the click and the muted autoplay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoundPhase {
+    /// Not the file playing.
+    Idle,
+    /// On screen, looping, with no sound.
+    Muted,
+    /// Playing with sound.
+    Sound,
+    Paused,
+    Ended,
+    /// mediad could not decode it. The system player is the fallback.
+    Failed,
+}
+
+/// What a click on a round video message does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoundClick {
+    Pause,
+    /// Play with sound. `Some(0)` starts over (a muted loop, or the end); `None` resumes.
+    Sound { at: Option<u32> },
+    /// Hand the file to the system's player.
+    System,
+}
+
+/// A click pauses sound, resumes a pause, and starts a muted loop or the end over with sound.
+/// A file mediad could not decode goes to the system player.
+pub fn round_click(phase: RoundPhase) -> RoundClick {
+    match phase {
+        RoundPhase::Failed => RoundClick::System,
+        RoundPhase::Sound => RoundClick::Pause,
+        RoundPhase::Paused => RoundClick::Sound { at: None },
+        RoundPhase::Muted | RoundPhase::Idle | RoundPhase::Ended => RoundClick::Sound { at: Some(0) },
+    }
+}
+
+/// Muted autoplay follows "Play GIFs and animated stickers": always, only under the pointer,
+/// or never. Reduce Motion and a window that is not key hold it. A file the user paused, or
+/// that is already playing, is left as they left it.
+pub fn round_should_autoplay(always: bool, hover_setting: bool, hovered: bool, reduce_motion: bool, window_active: bool, phase: RoundPhase) -> bool {
+    if reduce_motion || !window_active {
+        return false;
+    }
+    let allowed = always || (hover_setting && hovered);
+    allowed && matches!(phase, RoundPhase::Idle | RoundPhase::Ended)
+}
+
+/// AVCDecoderConfigurationRecord (`avcC`): the NAL length size, and the SPS and PPS as Annex B.
+pub struct AvcConfig {
+    pub nal_length: usize,
+    pub parameter_sets: Vec<u8>,
+}
+
+/// Reads an `avcC` payload. `None` when it is not one this player can turn into Annex B.
+pub fn avc_config(record: &[u8]) -> Option<AvcConfig> {
+    if record.len() < 7 || record[0] != 1 {
+        return None;
+    }
+    let nal_length = (record[4] & 0x03) as usize + 1;
+    if !matches!(nal_length, 1 | 2 | 4) {
+        return None;
+    }
+    let mut sets = Vec::new();
+    let mut at = 5;
+    let sps_count = (*record.get(at)? & 0x1f) as usize;
+    at += 1;
+    for _ in 0..sps_count {
+        push_nal(record, &mut at, &mut sets)?;
+    }
+    let pps_count = *record.get(at)? as usize;
+    at += 1;
+    for _ in 0..pps_count {
+        push_nal(record, &mut at, &mut sets)?;
+    }
+    (!sets.is_empty()).then_some(AvcConfig { nal_length, parameter_sets: sets })
+}
+
+fn push_nal(record: &[u8], at: &mut usize, sets: &mut Vec<u8>) -> Option<()> {
+    let len = u16::from_be_bytes([*record.get(*at)?, *record.get(*at + 1)?]) as usize;
+    *at += 2;
+    let nal = record.get(*at..*at + len)?;
+    if nal.is_empty() {
+        return None;
+    }
+    sets.extend_from_slice(&[0, 0, 0, 1]);
+    sets.extend_from_slice(nal);
+    *at += len;
+    Some(())
+}
+
+/// Length-prefixed MP4 NALs (AVCC) as Annex B. `with_sets` puts the SPS and PPS in front,
+/// which a seek and a keyframe need. A buffer that is already Annex B is kept.
+pub fn annex_b_from_avcc(packet: &[u8], nal_length: usize, parameter_sets: &[u8], with_sets: bool) -> Option<Vec<u8>> {
+    if packet.starts_with(&[0, 0, 0, 1]) || packet.starts_with(&[0, 0, 1]) {
+        let mut out = Vec::new();
+        if with_sets {
+            out.extend_from_slice(parameter_sets);
+        }
+        out.extend_from_slice(packet);
+        return Some(out);
+    }
+    if !matches!(nal_length, 1 | 2 | 4) || packet.is_empty() {
+        return None;
+    }
+    let mut nals = Vec::new();
+    let mut at = 0;
+    let mut idr = false;
+    while at + nal_length <= packet.len() {
+        let mut len = 0usize;
+        for byte in &packet[at..at + nal_length] {
+            len = (len << 8) | *byte as usize;
+        }
+        at += nal_length;
+        if len == 0 || at + len > packet.len() {
+            return None;
+        }
+        let nal = &packet[at..at + len];
+        if nal.first().is_some_and(|byte| byte & 0x1f == 5) {
+            idr = true;
+        }
+        nals.extend_from_slice(&[0, 0, 0, 1]);
+        nals.extend_from_slice(nal);
+        at += len;
+    }
+    if nals.is_empty() || packet[at..].iter().any(|byte| *byte != 0) {
+        return None;
+    }
+    let mut out = Vec::new();
+    if with_sets || idr {
+        out.extend_from_slice(parameter_sets);
+    }
+    out.extend_from_slice(&nals);
+    Some(out)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum PlayState {
@@ -53,6 +197,12 @@ pub struct Playback {
     /// Another playable voice or round message immediately precedes this one in the conversation.
     #[serde(default, skip_serializing_if = "crate::is_false")]
     pub has_previous: bool,
+    /// Sound is held back: a round video looping on screen before a click.
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub muted: bool,
+    /// The newest frame of a round video message. Absent for a voice message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub picture: Option<PlayPicture>,
 }
 
 impl Playback {
@@ -93,6 +243,15 @@ pub enum PlayRequest {
         /// The speaker picked in the call menu. `None` follows the system default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
+        /// A round video message: demux the picture as well as the sound. Anything else is audio.
+        #[serde(default, skip_serializing_if = "crate::is_false")]
+        round: bool,
+        /// Play the picture and hold the sound. A click starts it again with sound.
+        #[serde(default, skip_serializing_if = "crate::is_false")]
+        muted: bool,
+        /// At the end, start again from the beginning. Round notes loop.
+        #[serde(default, skip_serializing_if = "crate::is_false")]
+        looped: bool,
     },
     Pause,
     /// Moves to `at` milliseconds, playing or paused.
@@ -117,6 +276,15 @@ pub enum PlayerRequest {
         rate: u16,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
+        /// Decode the H.264 picture of a round video message and send it as [`PlayerEvent::Frame`].
+        #[serde(default, skip_serializing_if = "crate::is_false")]
+        round: bool,
+        /// The picture plays and the speaker is fed silence.
+        #[serde(default, skip_serializing_if = "crate::is_false")]
+        muted: bool,
+        /// Seek back to the start when the file ends, instead of [`PlayerEvent::Ended`].
+        #[serde(default, skip_serializing_if = "crate::is_false")]
+        looped: bool,
     },
     Seek { at: u32 },
     Rate { rate: u16 },
@@ -135,6 +303,67 @@ pub enum PlayerEvent {
     Stopped { at: u32 },
     /// The file or the speaker could not be used. mediad exits.
     Failed { detail: String },
+    /// One frame of a round video message, as a JPEG. The shell draws `generation` inside the circle.
+    Frame { path: String, width: u32, height: u32, generation: u64 },
+}
+
+/// What the lab's round-video driver checks, with no file and no decoder: a length-prefixed
+/// picture becomes Annex B with its parameter sets, a click pauses sound and falls back when
+/// the picture cannot be decoded, and a frame tells the shell its JPEG.
+pub fn prove_round_video() -> Result<(), String> {
+    let sps = [0x67, 0x42, 0x00, 0x0a];
+    let pps = [0x68, 0xce, 0x38, 0x80];
+    let mut record = vec![1, 0x42, 0x00, 0x0a, 0xff];
+    record.push(0xe1);
+    record.extend_from_slice(&4u16.to_be_bytes());
+    record.extend_from_slice(&sps);
+    record.push(1);
+    record.extend_from_slice(&4u16.to_be_bytes());
+    record.extend_from_slice(&pps);
+    let config = avc_config(&record).ok_or("avcC did not read")?;
+    if config.nal_length != 4 {
+        return Err(format!("nal length {}", config.nal_length));
+    }
+    let mut packet = Vec::new();
+    packet.extend_from_slice(&4u32.to_be_bytes());
+    packet.extend_from_slice(&[0x65, 0x88, 0x84, 0x00]);
+    let annex = annex_b_from_avcc(&packet, config.nal_length, &config.parameter_sets, false).ok_or("AVCC did not become Annex B")?;
+    if !annex.windows(4).any(|code| code == [0, 0, 0, 1]) {
+        return Err("Annex B has no start code".to_owned());
+    }
+    if &annex[..4] != [0, 0, 0, 1] || annex.get(4) != Some(&0x67) {
+        return Err("a keyframe was not given its parameter sets".to_owned());
+    }
+    if round_click(RoundPhase::Sound) != RoundClick::Pause {
+        return Err("a click did not pause".to_owned());
+    }
+    if round_click(RoundPhase::Failed) != RoundClick::System {
+        return Err("a file that cannot be decoded did not fall back".to_owned());
+    }
+    if round_click(RoundPhase::Muted) != (RoundClick::Sound { at: Some(0) }) {
+        return Err("a muted loop did not start over with sound".to_owned());
+    }
+    if round_click(RoundPhase::Paused) != (RoundClick::Sound { at: None }) {
+        return Err("a pause did not resume".to_owned());
+    }
+    if !round_should_autoplay(true, false, false, false, true, RoundPhase::Idle) {
+        return Err("autoplay did not start a round note".to_owned());
+    }
+    if round_should_autoplay(true, false, false, true, true, RoundPhase::Idle) {
+        return Err("Reduce Motion did not hold autoplay".to_owned());
+    }
+    if round_should_autoplay(false, true, false, false, true, RoundPhase::Idle) {
+        return Err("hover autoplay started with the pointer away".to_owned());
+    }
+    let event = PlayerEvent::Frame { path: "round.jpg".into(), width: 384, height: 384, generation: 2 };
+    let json = serde_json::to_string(&event).map_err(|err| err.to_string())?;
+    if !json.contains(r#""player":"frame""#) {
+        return Err(format!("frame was not a player event: {json}"));
+    }
+    if serde_json::from_str::<PlayerEvent>(&json).map_err(|err| err.to_string())? != event {
+        return Err("a frame did not read back".to_owned());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -156,6 +385,8 @@ mod tests {
             rate: 150,
             has_next: false,
             has_previous: false,
+            muted: false,
+            picture: None,
         }
     }
 
@@ -185,6 +416,9 @@ mod tests {
             at: None,
             rate: 50,
             output: None,
+            round: false,
+            muted: false,
+            looped: false,
         };
         let json = serde_json::to_string(&start).unwrap();
         assert!(json.contains(r#""play":"start""#), "{json}");
@@ -198,5 +432,10 @@ mod tests {
         assert!(json.contains(r#""state":"failed""#), "{json}");
         assert!(!json.contains("has_next") && !json.contains("has_previous"), "{json}");
         assert_eq!(serde_json::from_str::<Playback>(&json).unwrap(), shown);
+    }
+
+    #[test]
+    fn a_round_note_clicks_pauses_and_falls_back() {
+        prove_round_video().unwrap();
     }
 }

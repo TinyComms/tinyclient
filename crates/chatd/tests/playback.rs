@@ -102,6 +102,9 @@ fn start(path: &Path, at: Option<u32>, rate: u16) -> PlayRequest {
         at,
         rate,
         output: None,
+        round: false,
+        muted: false,
+        looped: false,
     }
 }
 
@@ -344,6 +347,9 @@ fn three_voice_messages_in_a_row_auto_play_at_chosen_speed_and_stop_before_text_
             at: None,
             rate: 200,
             output: None,
+            round: false,
+            muted: false,
+            looped: false,
         })
         .unwrap();
 

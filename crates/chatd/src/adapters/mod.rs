@@ -902,7 +902,7 @@ pub enum Command {
         me_only: bool,
         reply: Reply<()>,
     },
-    /// Executes an interactive Block Kit control on a message (Slack `blocks.actions`).
+    /// Executes an interactive control on a message (Slack `blocks.actions`, Telegram giveaways / games / callbacks).
     MessageAction {
         conversation_id: String,
         message_id: String,
@@ -911,7 +911,7 @@ pub enum Command {
         element_type: String,
         value: String,
         values: Vec<String>,
-        reply: Reply<()>,
+        reply: Reply<Option<protocol::ActionResult>>,
     },
     /// Presses an inline callback button under a bot message (Telegram `messages.getBotCallbackAnswer`).
     PressButton {
@@ -1233,6 +1233,9 @@ pub enum Command {
     /// The user signed out: end the session on the network, best effort, then answer. chatd
     /// waits five seconds for the answer and forgets the account either way.
     SignOut(Reply<()>),
+    /// A round video message started playing. Telegram tells the network it was listened to
+    /// (`readMessageContents`). Nothing answers, and every other network ignores it.
+    Played { conversation_id: String, message_id: String },
     /// The adapter is being dropped. `serve_commands` returns on it; an adapter never sees it.
     Stop,
     /// Open a `t.me` or `telegram.me` link as a chat this account already has, or a preview of a

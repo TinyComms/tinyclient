@@ -208,6 +208,7 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<()> {
         search_global: true,
         edit_window: 48 * 3_600,
         voice_notes: true,
+        video_notes: true,
         reply: true,
         edit: true,
         delete: true,

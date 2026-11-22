@@ -409,6 +409,10 @@ pub struct Pane {
     pending_actions: HashMap<(String, String), Instant>,
     /// Pending confirmation dialog for a Block Kit control.
     action_confirm: Option<PendingControlAction>,
+    /// Details modal returned by an interactive control (giveaway status, game high scores, alerts).
+    action_result: Option<protocol::ActionResult>,
+    /// Conversation and message that modal came from, so its Allow button can send a follow-up.
+    action_origin: Option<(Key, String)>,
     /// Currently open select/overflow/date/time picker popover for a Block Kit control.
     open_select: Option<OpenSelect>,
     /// On-demand reactors fetched for messages in the open conversation, keyed by `(message_id, emoji)`.
@@ -456,6 +460,19 @@ pub struct Pane {
     transcript_collapsed: HashSet<(String, usize)>,
     /// Transcriptions currently awaiting the initial RPC reply, keyed by `(message_id, attachment_index)`.
     transcribing: HashSet<(String, usize)>,
+    /// That press was a round video message, so it plays in the circle when the file lands.
+    round_after: bool,
+    /// The round note muted autoplay started, stopped once it leaves the screen.
+    round_auto: Option<String>,
+    /// The round tile under the pointer, for hover autoplay.
+    round_hover: Option<String>,
+    /// The JPEG currently drawn in a round note, so the one before it can be dropped.
+    round_frame: Option<(String, String)>,
+    /// Bumped at each draw. A round tile sets [`Self::round_mark`] to it while it is laid out.
+    round_stamp: u64,
+    round_mark: u64,
+    /// Draws in a row that did not lay the round tile out. A few of them and muted autoplay stops.
+    round_miss: u8,
 
     /// How wide the list was when last drawn; 0 before the first draw.
     width: f32,
@@ -535,6 +552,8 @@ impl Pane {
             tag_popover: None,
             pending_actions: HashMap::new(),
             action_confirm: None,
+            action_result: None,
+            action_origin: None,
             open_select: None,
             fetched_reactors: HashMap::new(),
             reactors_loading: None,
@@ -551,6 +570,13 @@ impl Pane {
             play_after: None,
             transcript_collapsed: HashSet::new(),
             transcribing: HashSet::new(),
+            round_after: false,
+            round_auto: None,
+            round_hover: None,
+            round_frame: None,
+            round_stamp: 0,
+            round_mark: 0,
+            round_miss: 0,
             width: 0.,
             opening: false,
             seen: Rc::default(),
@@ -838,6 +864,8 @@ impl Pane {
         self.confirm = None;
         self.paid_react = None;
         self.action_confirm = None;
+        self.action_result = None;
+        self.action_origin = None;
         self.open_select = None;
         self.pending_actions.clear();
         self.forward = None;
@@ -1449,7 +1477,37 @@ impl Pane {
         }
     }
 
+    /// Muted autoplay stops once the round note has not been laid out for a few draws.
+    /// Sound keeps going: the now-playing bar is the circle that stays.
+    fn settle_round(&mut self, cx: &mut Context<Self>) {
+        let Some(file) = self.round_auto.clone() else {
+            return;
+        };
+        if self.round_mark == self.round_stamp {
+            self.round_miss = 0;
+            return;
+        }
+        self.round_miss = self.round_miss.saturating_add(1);
+        if self.round_miss < 8 {
+            return;
+        }
+        let account = self.key().map(protocol::Key::account);
+        let muted = account.as_ref().is_some_and(|account| {
+            self.shell.upgrade().is_some_and(|shell| {
+                shell.read(cx).playing_state.of(account, &file).is_some_and(|playback| {
+                    playback.muted && matches!(playback.state, protocol::PlayState::Playing | protocol::PlayState::Loading)
+                })
+            })
+        });
+        if muted {
+            let _ = self.shell.update(cx, |shell, cx| shell.play_stop(cx));
+        }
+        self.round_auto = None;
+        self.round_miss = 0;
+    }
+
     fn after_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settle_round(cx);
         self.images.sweep(window, cx);
         let scale = window.scale_factor();
         if scale != self.scale {
@@ -1758,6 +1816,7 @@ impl Pane {
         value: String,
         values: Vec<String>,
         confirm: Option<protocol::ConfirmDialog>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.open_select = None;
@@ -1779,7 +1838,7 @@ impl Pane {
             cx.notify();
             return;
         }
-        self.execute_control(conversation, message_id, block_id, action_id, element_type, value, values, cx);
+        self.execute_control(conversation, message_id, block_id, action_id, element_type, value, values, window, cx);
     }
 
     /// Triggers a Block Kit link button, showing its confirmation dialog first if required.
@@ -1811,10 +1870,16 @@ impl Pane {
             cx.notify();
             return;
         }
+        // A mini app is handed to Telegram's own app. Every other tg:// link stays closed:
+        // a login token must not be opened from a message.
+        if links::telegram_app_link(&url) {
+            cx.open_url(&url);
+            return;
+        }
         self.open_external_link(&url, window, cx);
     }
 
-    /// Sends `Request::MessageAction` off-thread, tracking pending state and toasting any refusal.
+    /// Sends `Request::MessageAction` off-thread, tracking pending state and handling alerts/links/toasts.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn execute_control(
         &mut self,
@@ -1825,6 +1890,7 @@ impl Pane {
         element_type: String,
         value: String,
         values: Vec<String>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.key() != Some(&conversation) {
@@ -1833,6 +1899,7 @@ impl Pane {
         let key = (message_id.clone(), action_id.clone());
         self.pending_actions.insert(key.clone(), Instant::now());
         cx.notify();
+        let origin = (conversation.clone(), message_id.clone());
         let request = Request::MessageAction {
             conversation,
             message_id,
@@ -1842,12 +1909,24 @@ impl Pane {
             value,
             values,
         };
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
-            let _ = this.update(cx, |this, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
                 this.pending_actions.remove(&key);
                 match answer {
                     Ok(Response::Ok) => {}
+                    Ok(Response::ActionResult { result }) => {
+                        if !result.alert && result.title.is_empty() && result.fields.is_empty() && result.follow_action.is_empty() {
+                            if let Some(url) = &result.url {
+                                this.open_external_link(url, window, cx);
+                            } else if !result.text.is_empty() {
+                                this.say(result.text, cx);
+                            }
+                        } else {
+                            this.action_origin = Some(origin);
+                            this.action_result = Some(result);
+                        }
+                    }
                     Ok(Response::Error { detail, .. }) => this.say(detail, cx),
                     Err(err) => this.say(crate::client::trouble_words("run action", &err), cx),
                     _ => {}
@@ -2354,6 +2433,7 @@ impl Render for Pane {
         if std::mem::take(&mut self.wants_focus) {
             window.focus(&self.focus, cx);
         }
+        self.round_stamp = self.round_stamp.wrapping_add(1);
         self.seen.borrow_mut().clear();
         let this = cx.entity();
         let rows = gpui::list(self.list.clone(), cx.processor(|this: &mut Pane, ix: usize, window, cx| this.row(ix, window, cx)))

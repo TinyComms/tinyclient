@@ -1011,7 +1011,7 @@ impl Teams {
                 let _ = reply.send(self.vote(&conversation_id, &message_id, votes.as_deref()).map_err(refuse));
             }
             Command::MessageAction { conversation_id, message_id, block_id, action_id, element_type: _, value, values: _, reply } => {
-                let _ = reply.send(self.invoke_card_action(&conversation_id, &message_id, &block_id, &action_id, &value).map_err(refuse));
+                let _ = reply.send(self.invoke_card_action(&conversation_id, &message_id, &block_id, &action_id, &value).map(|()| None).map_err(refuse));
             }
             Command::ReactionRules { reply, .. } => drop(reply.send(Ok(message::reaction_rules()))),
             Command::Edit { conversation_id, message_id, text, spans, reply } => {

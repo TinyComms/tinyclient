@@ -70,7 +70,7 @@ impl Player {
             .unwrap();
         let out = BufReader::new(child.stdout.take().unwrap());
         let mut player = Player { child, out, sink, dir };
-        player.ask(&PlayerRequest::Open { path: path.to_owned(), at, rate, output: None });
+        player.ask(&PlayerRequest::Open { path: path.to_owned(), at, rate, output: None, round: false, muted: false, looped: false });
         player
     }
 

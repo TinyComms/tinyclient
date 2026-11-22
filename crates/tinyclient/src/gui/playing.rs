@@ -28,6 +28,10 @@ pub struct Play {
     pub message: String,
     pub title: String,
     pub at: Option<u32>,
+    /// A round video message. A voice message leaves these false.
+    pub round: bool,
+    pub muted: bool,
+    pub looped: bool,
 }
 
 #[derive(Default)]
@@ -155,6 +159,8 @@ impl Shell {
             rate,
             has_next: false,
             has_previous: false,
+            muted: play.muted,
+            picture: None,
         });
         self.playing_state.refused = None;
         self.playing_state.path = Some(play.path.clone());
@@ -168,6 +174,9 @@ impl Shell {
             at: Some(at),
             rate,
             output: self.chosen_output(),
+            round: play.round,
+            muted: play.muted,
+            looped: play.looped,
         };
         self.play_ask(request, Some(file), cx);
         self.conversation_redraw(cx);
@@ -393,6 +402,9 @@ impl Shell {
                 message: shown.message,
                 title: shown.title,
                 at: None,
+                round: false,
+                muted: false,
+                looped: false,
             },
             cx,
         );

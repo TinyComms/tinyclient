@@ -1884,11 +1884,42 @@ fn a_voice_recording_is_told_as_a_recording_and_heard_as_one() {
     world.steer("record-audio");
     let typists = world.until("a voice recording", || Some(watch()).filter(|typists| !typists.is_empty()));
     assert_eq!(typists[0].activity, protocol::Compose::RecordingVoice);
+
+    // Incoming round-video, upload-photo, sticker, and speaking-in-call activities map cleanly.
+    for (steer, expected) in [
+        ("record-round", protocol::Compose::RecordingVideo),
+        ("upload-photo", protocol::Compose::UploadingPhoto),
+        ("choose-sticker", protocol::Compose::ChoosingSticker),
+        ("speaking", protocol::Compose::Speaking),
+    ] {
+        world.steer(steer);
+        let got = world.until(steer, || {
+            let list = watch();
+            list.first().filter(|t| t.activity == expected).cloned()
+        });
+        assert_eq!(got.activity, expected);
+    }
+
+    // Outgoing: explicit Typing(RecordingVoice) is sent and paced, and Cancel clears it immediately.
     assert_eq!(
         world.ask(Request::Typing { conversation: key("u7003"), activity: protocol::Compose::RecordingVoice }),
         Response::Ok
     );
     world.until("the recording to be told", || (world.called("SetTyping u7003 record-audio") == 1).then_some(()));
+    assert_eq!(
+        world.ask(Request::Typing { conversation: key("u7003"), activity: protocol::Compose::Cancel }),
+        Response::Ok
+    );
+    world.until("the cancel to be told", || (world.called("SetTyping u7003 cancel") == 1).then_some(()));
+
+    // Starting the recorder sends record-audio for the Telegram chat, and discarding sends cancel.
+    assert_eq!(
+        world.ask(Request::Record(protocol::RecordRequest::Start { conversation: key("u7002"), input: None, video: false })),
+        Response::Ok
+    );
+    world.until("recorder start to send record-audio", || (world.called("SetTyping u7002 record-audio") >= 1).then_some(()));
+    assert_eq!(world.ask(Request::Record(protocol::RecordRequest::Forget)), Response::Ok);
+    world.until("recorder discard to send cancel", || (world.called("SetTyping u7002 cancel") >= 1).then_some(()));
 }
 
 #[test]

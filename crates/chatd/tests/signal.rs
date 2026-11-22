@@ -3027,6 +3027,9 @@ fn voice_messages_download_populate_waveform_send_viewed_receipt_and_can_be_sent
         title: "Voice message".into(),
         at: Some(0),
         rate: 100,
+        round: false,
+        muted: false,
+        looped: false,
         output: None,
     }));
     assert_eq!(play_resp, Response::Ok);
@@ -3060,6 +3063,9 @@ fn voice_messages_download_populate_waveform_send_viewed_receipt_and_can_be_sent
             title: "Voice message".into(),
             at: Some(0),
             rate: 100,
+            round: false,
+            muted: false,
+            looped: false,
             output: None,
         })),
         Response::Ok
@@ -3147,6 +3153,9 @@ fn voice_note_with_a_bad_digest_fails_and_sends_no_viewed_receipt() {
         title: "Voice message".into(),
         at: Some(0),
         rate: 100,
+        round: false,
+        muted: false,
+        looped: false,
         output: None,
     }));
     assert!(

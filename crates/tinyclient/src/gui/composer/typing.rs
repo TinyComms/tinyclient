@@ -7,7 +7,7 @@ use crate::gui::people::Hub;
 use crate::gui::theme::{self, Type};
 use crate::view::now;
 use gpui::{div, prelude::*, px, Context, Div, Window};
-use protocol::Key;
+use protocol::{Compose, Key, Typist};
 use std::time::{Duration, Instant};
 
 /// The slot is always this tall, so messages never move when someone starts typing.
@@ -16,7 +16,75 @@ const STEP: Duration = Duration::from_millis(400);
 /// After this long of unbroken typing the dots hold still.
 const MOVING: Duration = Duration::from_secs(30);
 
+/// Present-participle phrasing for one activity: `(singular, plural, bare direct preview)`.
+fn activity_verbs(activity: Compose) -> (&'static str, &'static str, &'static str) {
+    match activity {
+        Compose::Typing | Compose::Cancel => (" is typing…", " are typing…", "typing…"),
+        Compose::RecordingVoice => (
+            " is recording a voice message…",
+            " are recording voice messages…",
+            "recording a voice message…",
+        ),
+        Compose::RecordingVideo => (
+            " is recording a video message…",
+            " are recording video messages…",
+            "recording a video message…",
+        ),
+        Compose::UploadingPhoto => (" is sending a photo…", " are sending photos…", "sending a photo…"),
+        Compose::UploadingVideo => (" is sending a video…", " are sending videos…", "sending a video…"),
+        Compose::UploadingAudio => (
+            " is sending a voice message…",
+            " are sending voice messages…",
+            "sending a voice message…",
+        ),
+        Compose::UploadingFile => (" is sending a file…", " are sending files…", "sending a file…"),
+        Compose::ChoosingSticker => (" is choosing a sticker…", " are choosing stickers…", "choosing a sticker…"),
+        Compose::PlayingGame => (" is playing a game…", " are playing a game…", "playing a game…"),
+        Compose::Speaking => (" is speaking…", " are speaking…", "speaking…"),
+    }
+}
+
+/// What the row says for the active typists, carrying each person's activity verb, as
+/// `(names, rest)` so the names can be set heavier.
+pub fn wording_for(typists: &[Typist]) -> Option<(String, &'static str)> {
+    let active: Vec<&Typist> = typists.iter().filter(|t| t.activity != Compose::Cancel).collect();
+    match active.as_slice() {
+        [] => None,
+        [one] => Some((one.name.clone(), activity_verbs(one.activity).0)),
+        [one, two] => {
+            let verb = if one.activity == two.activity {
+                activity_verbs(one.activity).1
+            } else {
+                " are typing…"
+            };
+            Some((format!("{} and {}", one.name, two.name), verb))
+        }
+        many => {
+            let first = many[0].activity;
+            let verb = if many.iter().all(|t| t.activity == first) {
+                activity_verbs(first).1
+            } else {
+                " are typing…"
+            };
+            Some(("Several people".to_owned(), verb))
+        }
+    }
+}
+
+/// The sidebar's or header's preview for a conversation someone is active in: no name where there
+/// is only one other person in a direct chat, and the right verb for recording, uploading, etc.
+pub fn preview_for(typists: &[Typist], group: bool) -> Option<String> {
+    let active: Vec<&Typist> = typists.iter().filter(|t| t.activity != Compose::Cancel).collect();
+    match (active.as_slice(), group) {
+        ([], _) => None,
+        ([one], false) => Some(activity_verbs(one.activity).2.to_owned()),
+        (_, false) => Some(activity_verbs(active[0].activity).2.to_owned()),
+        (_, true) => wording_for(typists).map(|(names, rest)| format!("{names}{rest}")),
+    }
+}
+
 /// What the row says for the people typing, as (names, rest), so the names can be set heavier.
+#[cfg(test)]
 pub fn wording(names: &[&str]) -> Option<(String, &'static str)> {
     match names {
         [] => None,
@@ -28,6 +96,7 @@ pub fn wording(names: &[&str]) -> Option<(String, &'static str)> {
 
 /// The sidebar's preview for a direct conversation someone is typing in: no name where there
 /// is only one other person.
+#[cfg(test)]
 pub fn preview(names: &[&str], group: bool) -> Option<String> {
     match (names, group) {
         ([], _) => None,
@@ -79,15 +148,18 @@ impl TypingRow {
         self.run(cx);
     }
 
-    fn names(&self) -> Vec<String> {
+    fn typists(&self) -> Vec<Typist> {
         #[cfg(feature = "gui-shot")]
         if let Some(staged) = &self.staged {
-            return staged.clone();
+            return staged
+                .iter()
+                .map(|name| Typist { id: name.clone(), name: name.clone(), until: 0, activity: Compose::Typing })
+                .collect();
         }
         let Some(conversation) = &self.conversation else {
             return Vec::new();
         };
-        self.hub.typists_in(conversation).into_iter().map(|typist| typist.name).collect()
+        self.hub.typists_in(conversation)
     }
 
     fn moving(&self) -> bool {
@@ -171,10 +243,9 @@ impl TypingRow {
 
 impl Render for TypingRow {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        let names = self.names();
-        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let typists = self.typists();
         let row = div().h(px(HEIGHT)).flex_none().flex().items_center().gap(px(6.));
-        let Some((names, rest)) = wording(&names) else {
+        let Some((names, rest)) = wording_for(&typists) else {
             return row;
         };
         row.type_small()
@@ -209,5 +280,24 @@ mod tests {
         assert_eq!(preview(&[], false), None);
         assert_eq!(preview(&["Ines"], false).as_deref(), Some("typing…"));
         assert_eq!(preview(&["Ines"], true).as_deref(), Some("Ines is typing…"));
+    }
+
+    #[test]
+    fn activity_verbs_show_recording_uploading_sticker_and_speaking() {
+        let one = |name: &str, activity: Compose| Typist { id: name.into(), name: name.into(), until: 0, activity };
+        let say = |list: &[Typist]| wording_for(list).map(|(n, r)| format!("{n}{r}"));
+        assert_eq!(say(&[one("Odalys", Compose::RecordingVoice)]).as_deref(), Some("Odalys is recording a voice message…"));
+        assert_eq!(say(&[one("Odalys", Compose::RecordingVideo)]).as_deref(), Some("Odalys is recording a video message…"));
+        assert_eq!(say(&[one("Odalys", Compose::UploadingPhoto)]).as_deref(), Some("Odalys is sending a photo…"));
+        assert_eq!(say(&[one("Odalys", Compose::UploadingFile)]).as_deref(), Some("Odalys is sending a file…"));
+        assert_eq!(say(&[one("Odalys", Compose::ChoosingSticker)]).as_deref(), Some("Odalys is choosing a sticker…"));
+        assert_eq!(say(&[one("Odalys", Compose::Speaking)]).as_deref(), Some("Odalys is speaking…"));
+        assert_eq!(preview_for(&[one("Odalys", Compose::RecordingVoice)], false).as_deref(), Some("recording a voice message…"));
+        assert_eq!(preview_for(&[one("Odalys", Compose::RecordingVoice)], true).as_deref(), Some("Odalys is recording a voice message…"));
+        assert_eq!(
+            say(&[one("Odalys", Compose::RecordingVoice), one("Tobin", Compose::RecordingVoice)]).as_deref(),
+            Some("Odalys and Tobin are recording voice messages…")
+        );
+        assert_eq!(say(&[one("Odalys", Compose::Cancel)]), None);
     }
 }

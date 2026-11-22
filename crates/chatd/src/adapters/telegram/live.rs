@@ -437,6 +437,7 @@ pub(super) fn noted(action: &tl::enums::SendMessageAction) -> Option<protocol::C
         SendMessageUploadDocumentAction(_) | SendMessageHistoryImportAction(_) => Some(protocol::Compose::UploadingFile),
         SendMessageChooseStickerAction => Some(protocol::Compose::ChoosingSticker),
         SendMessageGamePlayAction => Some(protocol::Compose::PlayingGame),
+        SpeakingInGroupCallAction => Some(protocol::Compose::Speaking),
         _ => Some(protocol::Compose::Typing),
     }
 }
@@ -454,6 +455,8 @@ pub(super) fn action_word(action: &tl::enums::SendMessageAction) -> &'static str
         Some(protocol::Compose::UploadingFile) => "upload-file",
         Some(protocol::Compose::ChoosingSticker) => "sticker",
         Some(protocol::Compose::PlayingGame) => "game",
+        Some(protocol::Compose::Speaking) => "speaking",
+        Some(protocol::Compose::Cancel) => "cancel",
     }
 }
 

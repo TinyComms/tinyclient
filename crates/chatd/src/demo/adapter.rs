@@ -1043,8 +1043,8 @@ impl Demo {
             Command::RateTranscript { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::PreviewChannel { reply, .. }
             | Command::Join { reply, .. }
-            | Command::DeleteFile { reply, .. }
-            | Command::MessageAction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            | Command::DeleteFile { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MessageAction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::AccountFiles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallRing { reply, .. } | Command::CallStopRinging { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)));
@@ -1132,6 +1132,7 @@ impl Demo {
             | Command::Draft { .. }
             | Command::Watch(_)
             | Command::Wanted(_)
+            | Command::Played { .. }
             | Command::Stop => {}
         }
     }
