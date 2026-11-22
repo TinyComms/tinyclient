@@ -3928,6 +3928,7 @@ fn slack_invite_and_kick_channel_members() {
     let added = world.ask(Request::MembersAdd {
         conversation: rnd.clone(),
         people: vec!["U0NEW1".into(), "U0NEW2".into()],
+        share_history: None,
     });
     assert_eq!(added, Response::Ok);
     let invites = world.fake.calls(ALPHA, "conversations.invite");
@@ -3951,6 +3952,7 @@ fn slack_invite_and_kick_channel_members() {
     match world.ask(Request::MembersAdd {
         conversation: rnd.clone(),
         people: vec!["U0ALREADY".into()],
+        share_history: None,
     }) {
         Response::Error { code: ErrorCode::Refused, detail } => {
             assert!(detail.to_lowercase().contains("already"), "got: {detail}");
