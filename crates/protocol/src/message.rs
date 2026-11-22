@@ -458,6 +458,9 @@ pub struct Attachment {
     /// Optional clip transcript preview and lazy caption track (Slack clips).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript: Option<Transcript>,
+    /// Alternative video quality variants offered by the network (Telegram `alt_documents`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variants: Vec<MediaFile>,
 }
 
 impl Attachment {
@@ -479,6 +482,7 @@ impl Attachment {
             page: String::new(),
             transcription: None,
             transcript: None,
+            variants: Vec::new(),
             alt: String::new(),
         }
     }
@@ -1487,6 +1491,12 @@ pub struct Message {
     /// How many people saw a channel's post, when the network counts them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub views: Option<u32>,
+    /// How many times a channel's post was forwarded, when the network counts them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shares: Option<u32>,
+    /// Who signed a channel's post, or an anonymous admin's title, when the network says.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub signature: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub mentions_me: bool,
     #[serde(default, skip_serializing_if = "MessageKind::is_normal")]
@@ -1608,6 +1618,9 @@ pub struct CallNote {
     pub participants: Vec<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub video: bool,
+    /// Network call id for rating a finished call from its row (`Request::CallRate`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
 }
 
 /// An earlier wording of one message, oldest first when several are kept. Only a network that
@@ -1672,6 +1685,8 @@ impl Message {
             pinned_at: None,
             starred: false,
             views: None,
+            shares: None,
+            signature: String::new(),
             mentions_me: false,
             kind: MessageKind::Normal,
             state: SendState::Sent,
@@ -1787,6 +1802,7 @@ impl Message {
         if let Some(via) = &mut self.sent_via {
             clip(via, 64);
         }
+        clip(&mut self.signature, 128);
         if let Some(jump) = &mut self.jump {
             clip(jump, 128);
         }

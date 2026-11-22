@@ -408,7 +408,10 @@ impl Shell {
                     _ => div().child(self.call_bar(&call, &subject, cx)),
                 }
             }
-            None => self.call_ended(ended?, cx),
+            None => match self.call_state.rating.as_ref() {
+                Some(rating) => self.call_rating(rating, cx),
+                None => self.call_ended(ended?, cx),
+            },
         };
         let dock_picture = self
             .call_shown(snapshot)
@@ -498,6 +501,129 @@ impl Shell {
                     ),
             );
         card().child(title).child(div().min_h(px(32.)).flex().flex_wrap().items_center().child(dismiss.ml_auto()))
+    }
+
+    /// Post-call rating card: five stars, issue chips below five, optional comment, Send and Skip.
+    fn call_rating(&self, rating: &super::CallRatingCard, cx: &mut Context<Self>) -> Div {
+        let subtitle = match rating.prompt.seconds {
+            Some(secs) => format!("{} · {}", rating.title, clock(i64::from(secs))),
+            None => rating.title.clone(),
+        };
+        let header = div()
+            .flex()
+            .flex_col()
+            .gap(px(1.))
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .line_height(px(18.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::text())
+                    .child("Rate call quality"),
+            )
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .line_height(px(15.))
+                    .text_color(theme::text_soft())
+                    .child(subtitle),
+            );
+        let mut stars_row = div().flex().items_center().gap(px(4.));
+        for n in 1..=5u8 {
+            let filled = n <= rating.stars;
+            stars_row = stars_row.child(
+                div()
+                    .id(gpui::SharedString::from(format!("call-rate-star-{n}")))
+                    .size(px(26.))
+                    .rounded(px(6.))
+                    .bg(if filled { theme::accent_soft() } else { theme::hover() })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .text_size(px(14.))
+                    .text_color(if filled { theme::accent() } else { theme::text_faint() })
+                    .hover(|s| s.bg(theme::selected()))
+                    .on_click(cx.listener(move |this, _, _, cx| this.call_rating_star(n, cx)))
+                    .child(if filled { "★" } else { "☆" }),
+            );
+        }
+        let reasons = (rating.stars > 0 && rating.stars < 5).then(|| {
+            let mut wrap = div().flex().flex_wrap().gap(px(4.));
+            for &reason in super::CALL_RATING_REASONS {
+                let picked = rating.reasons.contains(&reason);
+                wrap = wrap.child(
+                    div()
+                        .id(gpui::SharedString::from(format!("call-rate-reason-{reason}")))
+                        .px(px(7.))
+                        .py(px(3.))
+                        .rounded(px(6.))
+                        .bg(if picked { theme::accent_soft() } else { theme::hover() })
+                        .text_size(px(11.))
+                        .text_color(if picked { theme::accent_text() } else { theme::text_soft() })
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::selected()))
+                        .on_click(cx.listener(move |this, _, _, cx| this.call_rating_toggle_reason(reason, cx)))
+                        .child(reason),
+                );
+            }
+            wrap
+        });
+        let comment = (rating.stars > 0).then(|| {
+            div()
+                .w_full()
+                .px(px(8.))
+                .py(px(4.))
+                .rounded(px(6.))
+                .bg(theme::raised())
+                .border_1()
+                .border_color(theme::hairline())
+                .text_size(px(12.))
+                .text_color(theme::text())
+                .child(rating.comment_input.clone())
+        });
+        let error = rating.error.as_ref().map(|msg| {
+            div()
+                .text_size(px(11.))
+                .text_color(theme::danger())
+                .child(msg.clone())
+        });
+        let can_send = rating.stars > 0 && !rating.sending;
+        let skip = div()
+            .id("call-rate-skip")
+            .h(px(28.))
+            .px(px(10.))
+            .rounded(px(7.))
+            .bg(theme::hover())
+            .flex()
+            .items_center()
+            .text_size(px(12.))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme::text())
+            .cursor_pointer()
+            .hover(|s| s.bg(theme::selected()))
+            .on_click(cx.listener(|this, _, _, cx| this.call_rating_skip(cx)))
+            .child("Skip");
+        let send = div()
+            .id("call-rate-send")
+            .h(px(28.))
+            .px(px(12.))
+            .rounded(px(7.))
+            .bg(if can_send { theme::accent() } else { theme::hover() })
+            .flex()
+            .items_center()
+            .text_size(px(12.))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(if can_send { theme::on_accent() } else { theme::text_faint() })
+            .when(can_send, |d| d.cursor_pointer().on_click(cx.listener(|this, _, _, cx| this.call_rating_send(cx))))
+            .child(if rating.sending { "Sending…" } else { "Send" });
+        card()
+            .child(header)
+            .child(stars_row)
+            .children(reasons)
+            .children(comment)
+            .children(error)
+            .child(div().flex().items_center().justify_end().gap(px(6.)).child(skip).child(send))
     }
 
     /// "Leave Lounge and call Mara Okafor?": asked in the card, where the call is, before a

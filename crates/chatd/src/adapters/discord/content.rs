@@ -611,6 +611,7 @@ fn attachment(rich: &mut Rich, attached: &Attached, blur_explicit: bool) -> Atta
         page: String::new(),
         transcription: None,
         transcript: None,
+        variants: Vec::new(),
     }
 }
 
@@ -650,6 +651,7 @@ fn sticker(rich: &mut Rich, sticker: &model::Sticker) -> Attachment {
         page: String::new(),
         transcription: None,
         transcript: None,
+        variants: Vec::new(),
     }
 }
 
@@ -1161,6 +1163,7 @@ fn build_call_note(
             seconds,
             participants,
             video: false,
+            call_id: None,
         },
         text,
     )
@@ -1436,6 +1439,8 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         effect: None,
         contacts: Vec::new(),
         sent_via: None,
+        shares: None,
+        signature: String::new(),
         permalink: link,
         controls,
         via: command_via(posted),
@@ -1767,6 +1772,7 @@ fn component_media_attachment(
         page: String::new(),
         transcript: None,
         transcription: None,
+        variants: Vec::new(),
     })
 }
 

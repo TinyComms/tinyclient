@@ -532,6 +532,17 @@ mod tests {
     }
 
     #[test]
+    fn copy_link_is_offered_in_a_telegram_channel_or_supergroup_and_not_in_a_private_chat() {
+        let key = protocol::Key { network: protocol::Network::Telegram, account: "7001".into(), id: "c9002_31".into() };
+        let mut said = protocol::Message::plain("41", "Tobin", "Who has the torque wrench?", 1, false);
+        // A private chat's or a basic group's message carries no address: no item.
+        assert_eq!(message_link(&key, None, &said), None);
+        // The adapter fills the address for channels and supergroups: the item copies it as it is.
+        said.permalink = "https://t.me/c/9002/31/41".into();
+        assert_eq!(message_link(&key, None, &said).as_deref(), Some("https://t.me/c/9002/31/41"));
+    }
+
+    #[test]
     fn message_link_round_trips_through_parse_network_link() {
         let mut key = protocol::Key { network: protocol::Network::Discord, account: "1".into(), id: "12345".into() };
         let said = protocol::Message::plain("67890", "Mara", "hello", 1, false);

@@ -50,6 +50,21 @@ pub struct CallLogEntry {
     pub time: i64,
 }
 
+/// The network asked for a quality rating after a call ended (Telegram `phoneCallDiscarded.need_rating`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallRatingPrompt {
+    /// The conversation the call belonged to.
+    pub conversation: Key,
+    /// Network-specific call identifier passed back to `Request::CallRate`.
+    pub call_id: String,
+    /// True when the call carried video.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub video: bool,
+    /// Duration of the call in seconds, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seconds: Option<u32>,
+}
+
 /// Most device names of one kind a call lists.
 pub const DEVICES_LIMIT: usize = 32;
 

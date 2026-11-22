@@ -1489,6 +1489,15 @@ pub(super) fn pin(
     Ok(())
 }
 
+/// Unpins everything in a chat, or in one forum topic when the conversation is a topic.
+pub(super) fn unpin_all(account: &Account, conversation: &str) -> Result<(), Fault> {
+    let (who, topic) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    let peer = account.input(who)?;
+    account.ask(&tl::functions::messages::UnpinAllMessages { peer, top_msg_id: topic, saved_peer_id: None })?;
+    let _ = account.ctx.unpin_all(conversation);
+    Ok(())
+}
+
 pub(super) fn forward(
     account: &Account,
     from: &str,
