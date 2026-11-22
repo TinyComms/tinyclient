@@ -4530,6 +4530,11 @@ fn verifying_phone_or_email_unlocks_the_composer_without_a_new_ready() {
     wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
     assert_eq!(world.conversation("4101").read_only_reason, "This server needs a verified phone");
     assert_eq!(world.conversation("5001").read_only_reason, "This server needs a verified email");
+    // A thread under general, and a forum post, were planted with the same phone gate.
+    assert!(world.conversation("4500").read_only);
+    assert_eq!(world.conversation("4500").read_only_reason, "This server needs a verified phone");
+    assert!(world.conversation("4601").read_only);
+    assert_eq!(world.conversation("4601").read_only_reason, "This server needs a verified phone");
 
     // Clearing the challenge, with no user on it, does not refresh the snapshot READY stored.
     world.discord.push("USER_REQUIRED_ACTION_UPDATE", json!({"required_action": null}));
@@ -4539,6 +4544,8 @@ fn verifying_phone_or_email_unlocks_the_composer_without_a_new_ready() {
     });
     assert_eq!(world.conversation("4101").read_only_reason, "This server needs a verified phone");
     assert_eq!(world.conversation("5001").read_only_reason, "This server needs a verified email");
+    assert_eq!(world.conversation("4500").read_only_reason, "This server needs a verified phone");
+    assert_eq!(world.conversation("4601").read_only_reason, "This server needs a verified phone");
 
     world.discord.push("USER_UPDATE", json!({
         "id": "1000", "username": "justin", "global_name": "Justin", "discriminator": "0", "verified": true
@@ -4546,13 +4553,28 @@ fn verifying_phone_or_email_unlocks_the_composer_without_a_new_ready() {
     wait("the email lock to lift", || world.conversation("5001").read_only_reason.is_empty().then_some(()));
     assert!(!world.conversation("5001").read_only);
     assert_eq!(world.conversation("4101").read_only_reason, "This server needs a verified phone");
+    // This server still wants a phone, so its thread and forum post stay locked.
+    assert!(world.conversation("4500").read_only);
+    assert_eq!(world.conversation("4500").read_only_reason, "This server needs a verified phone");
+    assert!(world.conversation("4601").read_only);
+    assert_eq!(world.conversation("4601").read_only_reason, "This server needs a verified phone");
 
     world.discord.push("USER_REQUIRED_ACTION_UPDATE", json!({
         "required_action": null,
         "user": {"id": "1000", "username": "justin", "global_name": "Justin", "discriminator": "0", "phone": "+15555550100"}
     }));
-    wait("the phone lock to lift", || world.conversation("4101").read_only_reason.is_empty().then_some(()));
+    wait("the phone lock to lift", || {
+        let open = |id| {
+            let row = world.conversation(id);
+            row.read_only_reason.is_empty() && !row.read_only
+        };
+        (open("4101") && open("4500") && open("4601")).then_some(())
+    });
     assert!(!world.conversation("4101").read_only);
+    assert!(!world.conversation("4500").read_only);
+    assert!(world.conversation("4500").read_only_reason.is_empty());
+    assert!(!world.conversation("4601").read_only);
+    assert!(world.conversation("4601").read_only_reason.is_empty());
 
     // A server joined after that copies the new snapshot, not the one from READY.
     world.discord.push("GUILD_CREATE", json!({

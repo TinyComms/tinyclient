@@ -1177,6 +1177,18 @@ impl Context {
         Ok(())
     }
 
+    /// Writes this server's composer lock onto threads and forum posts already stored.
+    /// A tree replacement does not touch a row that names its parent.
+    pub fn restamp_threads(&self, space_id: &str, read_only: bool, reason: &str) -> Stores {
+        let space = self.key(space_id);
+        let changed = self.hub.store().restamp_threads(&space, read_only, reason)?;
+        for (id, stored_space) in &changed {
+            let place = (!stored_space.is_empty()).then_some(stored_space.as_str());
+            self.row_changed(id, place);
+        }
+        Ok(())
+    }
+
     /// One group of a Space created, renamed or moved, without sending the whole tree again.
     pub fn group(&self, space_id: &str, group: &Group) -> Stores {
         let space = self.key(space_id);

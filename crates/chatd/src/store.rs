@@ -2112,6 +2112,33 @@ impl Store {
         Ok((rows, total))
     }
 
+    /// The composer lock on threads and forum posts already stored under this server.
+    /// A tree replacement leaves a row that names its parent, so the gate has to be written
+    /// onto those rows itself. Each pair is the conversation and the space it sits in, empty
+    /// when a post has no place in the tree. Only rows whose lock changed are returned.
+    pub fn restamp_threads(&mut self, space: &Key, read_only: bool, reason: &str) -> rusqlite::Result<Vec<(String, String)>> {
+        let belongs = "network = ?1 AND account = ?2 AND kind = 'thread' AND parent != ''
+            AND (space = ?3 OR parent IN (
+                SELECT parent_row.id FROM conversation AS parent_row
+                 WHERE parent_row.network = ?1 AND parent_row.account = ?2 AND parent_row.space = ?3
+            ))
+            AND (read_only != ?4 OR read_only_reason != ?5)";
+        let network = word(&space.network);
+        let changed: Vec<(String, String)> = self
+            .db
+            .prepare(&format!("SELECT id, space FROM conversation WHERE {belongs}"))?
+            .query_map(params![network, space.account, space.id, read_only, reason], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        if changed.is_empty() {
+            return Ok(changed);
+        }
+        self.db.execute(
+            &format!("UPDATE conversation SET read_only = ?4, read_only_reason = ?5 WHERE {belongs}"),
+            params![network, space.account, space.id, read_only, reason],
+        )?;
+        Ok(changed)
+    }
+
     /// Where the network files a conversation. True if anything changed.
     pub fn set_filing(&mut self, conversation: &Key, filing: &Filing) -> rusqlite::Result<bool> {
         let changed = self.db.execute(

@@ -607,8 +607,9 @@ impl Discord {
     }
 
     /// Works out a server's visible channels again from what is kept of them, after a role's
-    /// permissions or our own roles changed. Unread state and threads stay as they are: the
-    /// store keeps both through a tree replacement.
+    /// permissions or our own roles changed. Unread state stays through the replacement, and so
+    /// does a thread: it is not in what is kept. The gate is written onto those rows here, or a
+    /// phone that just became verified would leave a thread and a forum post locked.
     pub(super) fn replant(&self, guild_id: &str) -> rusqlite::Result<()> {
         let kept: Vec<Kept> = match self.ctx.note(&format!("kept:{guild_id}")).map(|kept| serde_json::from_str(&kept)) {
             Some(Ok(kept)) => kept,
@@ -620,7 +621,7 @@ impl Discord {
             ..Guild::default()
         };
         let me = self.me();
-        let (tree, muted) = {
+        let (tree, muted, locked, reason) = {
             let mut state = self.state.lock().unwrap();
             let Some(info) = state.guilds.get_mut(guild_id) else {
                 return Ok(());
@@ -632,13 +633,17 @@ impl Discord {
             let threads = threads.into_iter().filter(|(id, parent)| !visible.contains(id) && visible.contains(parent));
             info.channels.extend(threads);
             let now = now();
+            let (locked, reason) = info.lock_reason(now, &me);
             let muted: Vec<bool> = tree.rows.iter().map(|row| info.quiet.mutes(&row.id, row.group.as_deref(), now)).collect();
-            (tree, muted)
+            (tree, muted, locked, reason)
         };
         self.ctx.tree(guild_id, &tree.groups, &tree.rows)?;
         for (row, muted) in tree.rows.iter().zip(muted) {
             self.ctx.muted(&row.id, muted)?;
         }
+        // Forum posts never take a tree place, and a channel's threads name their parent, so
+        // the replacement above leaves both. The gate they were planted with is written again.
+        self.ctx.restamp_threads(guild_id, locked, &reason)?;
         let flags = self.state.lock().unwrap().guilds.get(guild_id).map(|info| (info.quiet.server_muted(now()), info.quiet.hide_muted));
         if let Some((muted, hide)) = flags {
             self.ctx.space_flags(guild_id, muted, hide)?;
@@ -851,7 +856,7 @@ impl Discord {
     /// A phone or email Discord has just said is verified. The account snapshot is what a server
     /// joined later copies. Every server already joined keeps its own copy, which is what the
     /// composer lock reads, and one that was blocking is replanted so the lock lifts without a
-    /// reconnect.
+    /// reconnect, on its channels and on the threads and forum posts already planted.
     pub(super) fn note_verified(&self, user: &User) -> Result<(), Failure> {
         let email = user.verified == Some(true);
         let phone = user.phone == Some(true);
