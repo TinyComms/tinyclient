@@ -6,18 +6,21 @@ use super::info::profile::draw;
 use super::info::profile::facts::{self, Act, Call, CardBody, Item, Seen, Surface};
 use super::presence::Ring;
 use super::{existing_direct, in_call, only_draws, person_avatar, shown_presence, Hub, Scene};
+use crate::gui::components::place::{placed, Layer, Place};
 use crate::gui::components::{
-    button, button_with_icon, fade_in, menu, menu_item, menu_item_danger, menu_separator, modal_body,
-    modal_buttons, network_icon, scrim, search_field, Avatar, ButtonKind, Shape as Plate,
+    button, button_with_icon, fade_in, menu, menu_item, menu_item_danger, menu_item_more, menu_label, menu_separator,
+    modal_body, modal_buttons, network_icon, scrim, search_field, Avatar, ButtonKind, Shape as Plate,
 };
 use crate::gui::input::{InputEvent, TextInput};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use gpui::{
-    anchored, deferred, div, point, prelude::*, px, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable,
-    KeyDownEvent, Pixels, Point, WeakEntity, Window,
+    anchored, canvas, deferred, div, point, prelude::*, px, AnyElement, Bounds, ClipboardItem, Context, Div, Entity,
+    FocusHandle, Focusable, KeyDownEvent, MouseDownEvent, Pixels, Point, WeakEntity, Window,
 };
-use protocol::{AccountKey, Conversation, Key, Link, Network, Notify, Person, Profile, RelateAction, Request, Response, SpaceRole};
+use protocol::{AccountKey, AppCommand, CommandKind, Conversation, Key, Link, Network, Notify, Person, Profile, RelateAction, Request, Response, SpaceRole};
+use std::cell::Cell;
+use std::rc::Rc;
 
 const CARD_WIDTH: f32 = 300.;
 const CONFIRM_WIDTH: f32 = 360.;
@@ -156,6 +159,10 @@ pub struct Floating {
     roles_loaded: bool,
     roles_error: Option<String>,
     manage_roles: bool,
+    /// The Apps submenu of a person menu is open.
+    apps: bool,
+    apps_anchor: Rc<Cell<Option<Bounds<Pixels>>>>,
+    apps_menu: Rc<Cell<Option<Bounds<Pixels>>>>,
 }
 
 impl Floating {
@@ -182,6 +189,9 @@ impl Floating {
             roles_loaded: false,
             roles_error: None,
             manage_roles: false,
+            apps: false,
+            apps_anchor: Rc::default(),
+            apps_menu: Rc::default(),
         }
     }
 
@@ -219,6 +229,9 @@ impl Floating {
         if let Float::Card(person) | Float::Menu(person) = &float {
             self.learn_place(person.clone(), matches!(float, Float::Card(_)), cx);
         }
+        self.apps = false;
+        self.apps_anchor.set(None);
+        self.apps_menu.set(None);
         self.open = Some((float, anchor));
         self.opened += 1;
         cx.notify();
@@ -1187,6 +1200,73 @@ impl Floating {
         }
     }
 
+    /// Discord user commands for the open conversation, when this person is on that account.
+    fn user_app_commands(&self, person: &Person, cx: &Context<Self>) -> Option<(Key, Vec<AppCommand>)> {
+        let shell = self.shell.upgrade()?;
+        let shell = shell.read(cx);
+        let open = shell.snapshot.as_ref()?.open.as_ref()?;
+        if open.key.network != protocol::Network::Discord || open.key.account() != person.key.account() {
+            return None;
+        }
+        let mut commands = shell.user_commands.get(&open.key).cloned().unwrap_or_default();
+        commands.retain(|command| command.kind == CommandKind::User && !command.application_id.is_empty());
+        commands.sort_by(|a, b| {
+            a.app_name
+                .to_ascii_lowercase()
+                .cmp(&b.app_name.to_ascii_lowercase())
+                .then(a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+        });
+        Some((open.key.clone(), commands))
+    }
+
+    /// The row is measured while painting, so the submenu is placed on the next frame.
+    fn show_apps(&mut self, cx: &mut Context<Self>) {
+        if self.apps {
+            return;
+        }
+        self.apps = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(16)).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
+    }
+
+    fn apps_flyout(&self, person: &Person, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.apps {
+            return None;
+        }
+        let anchor = self.apps_anchor.get()?;
+        let (channel, commands) = self.user_app_commands(person, cx)?;
+        if commands.is_empty() {
+            return None;
+        }
+        let mark = self.apps_menu.clone();
+        let mut list = menu().w(px(220.)).relative().child(
+            canvas(move |bounds, _, _| mark.set(Some(bounds)), |_, _, _, _| {}).absolute().top_0().left_0().size_full(),
+        );
+        let mut last = String::new();
+        let target = person.key.id.clone();
+        for (ix, command) in commands.iter().enumerate() {
+            if !command.app_name.is_empty() && command.app_name != last {
+                if !last.is_empty() {
+                    list = list.child(menu_separator());
+                }
+                list = list.child(menu_label(command.app_name.clone()));
+                last = command.app_name.clone();
+            }
+            let (chosen, channel, target) = (command.clone(), channel.clone(), target.clone());
+            list = list.child(menu_item(("person-app", ix), None, command.name.clone(), None).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    let (chosen, channel, target) = (chosen.clone(), channel.clone(), target.clone());
+                    this.shell_do(cx, move |shell, cx| shell.run_app_command(channel, chosen, target, cx));
+                },
+            )));
+        }
+        Some(placed("person-apps", Place::Beside(anchor), Layer::Menu, window, list))
+    }
+
     fn person_menu(&self, person: &Person, seen: &Seen, alt: bool, with_profile: bool, cx: &mut Context<Self>) -> Div {
         let items = facts::person_menu(person, seen, alt, !with_profile);
         let link = (!person.link.is_empty()).then(|| person.link.clone());
@@ -1205,6 +1285,27 @@ impl Floating {
         }
         for item in items {
             list = list.child(self.item(item, Some(person), None, link.clone(), cx));
+        }
+        if self.user_app_commands(person, cx).is_some_and(|(_, commands)| !commands.is_empty()) {
+            let open = self.apps;
+            let mut row = menu_item_more("menu-apps", Some("icons/bot.svg"), "Apps", open)
+                .on_hover(cx.listener(|this, over: &bool, _, cx| {
+                    if *over {
+                        this.show_apps(cx);
+                    }
+                }))
+                .on_click(cx.listener(|this, _, _, cx| this.show_apps(cx)));
+            if open {
+                let anchor = self.apps_anchor.clone();
+                row = row.relative().child(
+                    canvas(move |bounds, _, _| anchor.set(Some(bounds)), |_, _, _, _| {})
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                );
+            }
+            list = list.child(menu_separator()).child(row);
         }
         list
     }
@@ -1646,18 +1747,35 @@ impl Render for Floating {
         }
         let surface = surface.track_focus(&focus).on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
             if event.keystroke.key == "escape" {
+                if this.apps {
+                    this.apps = false;
+                    this.apps_anchor.set(None);
+                    this.apps_menu.set(None);
+                    cx.notify();
+                    return;
+                }
                 this.close(cx);
             }
         }));
         if modal {
             return div().child(deferred(anchored().position(point(px(0.), px(0.))).child(fade_in(("float", self.opened), 160, surface))).priority(3));
         }
-        let surface = surface.on_mouse_down_out(cx.listener(|this, _, _, cx| this.close(cx)));
+        let (row_at, menu_at) = (self.apps_anchor.clone(), self.apps_menu.clone());
+        let surface = surface.on_mouse_down_out(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+            let at = event.position;
+            let on_apps = row_at.get().is_some_and(|bounds| bounds.contains(&at)) || menu_at.get().is_some_and(|bounds| bounds.contains(&at));
+            if !on_apps {
+                this.close(cx);
+            }
+        }));
         let offset = if matches!(float, Float::Card(_)) { point(px(8.), px(0.)) } else { point(px(2.), px(2.)) };
-        div().child(
-            deferred(anchored().position(anchor + offset).snap_to_window_with_margin(px(8.)).child(fade_in(("float", self.opened), 120, surface)))
-                .priority(2),
-        )
+        let flyout = person.as_ref().and_then(|person| self.apps_flyout(person, window, cx));
+        div()
+            .child(
+                deferred(anchored().position(anchor + offset).snap_to_window_with_margin(px(8.)).child(fade_in(("float", self.opened), 120, surface)))
+                    .priority(2),
+            )
+            .children(flyout)
     }
 }
 

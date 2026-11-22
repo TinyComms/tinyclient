@@ -50,7 +50,7 @@ use protocol::{
     PAGE_LIMIT,
 };
 use rows::Item;
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::rc::Rc;
@@ -99,6 +99,18 @@ impl Shell {
         if let Some(dest) = protocol::link::Destination::parse(url) {
             let target = dest.target(crate::gui::app::prefs::choices().strip_tracking);
             cx.open_url(&target);
+        }
+    }
+}
+
+impl State {
+    /// The message menu reads commands the shell just stored.
+    pub(in crate::gui) fn wake_panes(&self, cx: &mut gpui::App) {
+        if let Some(pane) = self.pane.get() {
+            pane.update(cx, |_, cx| cx.notify());
+        }
+        if let Some(thread) = self.thread.borrow().clone() {
+            thread.update(cx, |_, cx| cx.notify());
         }
     }
 }
@@ -276,7 +288,7 @@ pub(super) struct PendingControlAction {
     pub confirm: protocol::ConfirmDialog,
 }
 
-/// An open popover menu for a Block Kit select/overflow/date/time control.
+/// An open popover menu for a Block Kit / Discord select/overflow/date/time control.
 #[derive(Clone)]
 pub(super) struct OpenSelect {
     pub conversation: Key,
@@ -286,8 +298,20 @@ pub(super) struct OpenSelect {
     pub element_type: String,
     pub options: Vec<protocol::ControlOption>,
     pub selected: Option<String>,
+    pub multi_selected: Vec<String>,
+    pub min_values: u8,
+    pub max_values: u8,
     pub confirm: Option<protocol::ConfirmDialog>,
     pub at: Point<Pixels>,
+}
+
+/// An active interaction modal form popped up by a bot/app (`Change::InteractionModal`).
+pub(super) struct ActiveModal {
+    pub conversation: Key,
+    pub modal: protocol::InteractionModal,
+    pub inputs: Vec<Entity<crate::gui::input::TextInput>>,
+    pub error: Option<String>,
+    pub submitting: bool,
 }
 
 /// The one rule for telling the network how far the user has read: a real window that is
@@ -437,6 +461,9 @@ pub struct Pane {
     /// if it holds still (`actions::LONG_PRESS`). Dropping the task cancels it.
     press: Option<(gpui::Task<()>, (f32, f32))>,
     menu: Option<actions::Menu>,
+    /// Where the Apps row and its submenu were painted, so a click on the submenu is not outside.
+    apps_anchor: Rc<Cell<Option<Bounds<Pixels>>>>,
+    apps_menu: Rc<Cell<Option<Bounds<Pixels>>>>,
     picker: Option<actions::Picking>,
     /// The message the delete dialog asks about.
     confirm: Option<Rc<Message>>,
@@ -458,8 +485,10 @@ pub struct Pane {
     pending_actions: HashMap<(String, String), Instant>,
     /// Pending confirmation dialog for a Block Kit control.
     action_confirm: Option<PendingControlAction>,
-    /// Currently open select/overflow/date/time picker popover for a Block Kit control.
+    /// Currently open select/overflow/date/time picker popover for a Block Kit / Discord control.
     open_select: Option<OpenSelect>,
+    /// Active interaction modal form opened by a bot/app.
+    interaction_modal: Option<ActiveModal>,
     /// On-demand reactors fetched for messages in the open conversation, keyed by `(message_id, emoji, burst)`.
     fetched_reactors: HashMap<(String, String, bool), (Vec<protocol::Reactor>, bool)>,
     /// Reactor fetch currently in flight, keyed by `(message_id, emoji, burst)`.
@@ -593,6 +622,8 @@ impl Pane {
             hover: None,
             press: None,
             menu: None,
+            apps_anchor: Rc::default(),
+            apps_menu: Rc::default(),
             picker: None,
             confirm: None,
             paid_react: None,
@@ -605,6 +636,7 @@ impl Pane {
             pending_actions: HashMap::new(),
             action_confirm: None,
             open_select: None,
+            interaction_modal: None,
             fetched_reactors: HashMap::new(),
             reactors_loading: None,
             invite_previews: HashMap::new(),
@@ -871,6 +903,7 @@ impl Pane {
         self.paid_react = None;
         self.action_confirm = None;
         self.open_select = None;
+        self.interaction_modal = None;
         self.pending_actions.clear();
         self.forward = None;
         self.follow = None;
@@ -1407,6 +1440,48 @@ impl Pane {
                 cx.notify();
             }
             Change::Media { account, file } if *account == key.account() => self.landed(file, true, cx),
+            Change::InteractionModal { conversation, modal } if conversation == key => {
+                let inputs = modal
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        let placeholder = field.placeholder.clone();
+                        let initial = field.value.clone();
+                        let multiline = field.multiline;
+                        cx.new(|cx| {
+                            let mut input = if multiline {
+                                crate::gui::input::TextInput::multiline(placeholder, cx)
+                            } else {
+                                crate::gui::input::TextInput::new(placeholder, cx)
+                            };
+                            if !initial.is_empty() {
+                                input.set_text(&initial, cx);
+                            }
+                            input
+                        })
+                    })
+                    .collect();
+                self.pending_actions.clear();
+                self.interaction_modal = Some(ActiveModal {
+                    conversation: conversation.clone(),
+                    modal: modal.clone(),
+                    inputs,
+                    error: None,
+                    submitting: false,
+                });
+                cx.notify();
+            }
+            Change::InteractionFailed { conversation, message_id, action_id, reason } if conversation == key => {
+                if !message_id.is_empty() && !action_id.is_empty() {
+                    self.pending_actions.remove(&(message_id.clone(), action_id.clone()));
+                } else {
+                    self.pending_actions.clear();
+                }
+                if !reason.is_empty() {
+                    self.say(reason.clone(), cx);
+                }
+                cx.notify();
+            }
             _ => {}
         }
     }
@@ -2725,6 +2800,77 @@ impl Pane {
         Some(bar)
     }
 
+    /// Validates and submits the active bot/app interaction modal (`Request::ModalSubmit`).
+    pub(super) fn submit_modal(&mut self, cx: &mut Context<Self>) {
+        let Some(active) = self.interaction_modal.as_mut() else {
+            return;
+        };
+        if active.submitting {
+            return;
+        }
+        let mut values = Vec::with_capacity(active.modal.fields.len());
+        for (field, input) in active.modal.fields.iter().zip(&active.inputs) {
+            let text = input.read(cx).text().to_owned();
+            let count = text.chars().count();
+            if field.required && text.trim().is_empty() {
+                active.error = Some(format!("{} is required.", field.label));
+                cx.notify();
+                return;
+            }
+            if let Some(min) = field.min_length {
+                if (!text.is_empty() || field.required) && count < min as usize {
+                    active.error = Some(format!("{} must be at least {min} characters.", field.label));
+                    cx.notify();
+                    return;
+                }
+            }
+            if let Some(max) = field.max_length {
+                if count > max as usize {
+                    active.error = Some(format!("{} must be at most {max} characters.", field.label));
+                    cx.notify();
+                    return;
+                }
+            }
+            values.push((field.custom_id.clone(), text));
+        }
+        active.error = None;
+        active.submitting = true;
+        let request = Request::ModalSubmit {
+            conversation: active.conversation.clone(),
+            modal_id: active.modal.id.clone(),
+            application_id: active.modal.application_id.clone(),
+            custom_id: active.modal.custom_id.clone(),
+            values,
+        };
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| {
+                match answer {
+                    Ok(Response::Ok) => {
+                        this.interaction_modal = None;
+                    }
+                    Ok(Response::Error { detail, .. }) => {
+                        if let Some(active) = this.interaction_modal.as_mut() {
+                            active.submitting = false;
+                            active.error = Some(detail);
+                        }
+                    }
+                    Err(err) => {
+                        if let Some(active) = this.interaction_modal.as_mut() {
+                            active.submitting = false;
+                            active.error = Some(crate::client::trouble_words("submit form", &err));
+                        }
+                    }
+                    _ => {
+                        this.interaction_modal = None;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
     fn live_call_row(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
         if self.thread {
             return None;

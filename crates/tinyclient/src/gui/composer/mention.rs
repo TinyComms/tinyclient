@@ -239,6 +239,7 @@ pub fn source(message: &Message) -> (String, Vec<Token>) {
                     MentionKind::Channel => (Kind::Channel, id.clone()),
                     MentionKind::Role => (Kind::Role, id.clone()),
                     MentionKind::Everyone => (Kind::Role, "everyone".to_owned()),
+                    MentionKind::Command => continue,
                 };
                 mentions.push((start..end, kind, id));
                 continue;
@@ -323,7 +324,7 @@ pub fn from_source(raw: &str, message: &Message) -> (String, Vec<Token>) {
                 MentionKind::User => Kind::Person,
                 MentionKind::Channel => Kind::Channel,
                 MentionKind::Role => Kind::Role,
-                MentionKind::Everyone => continue,
+                MentionKind::Everyone | MentionKind::Command => continue,
             };
             let (start, end) = (span.start as usize, span.end as usize);
             if let Some(label) = message.text.get(start..end) {

@@ -27,7 +27,7 @@ use gpui::{
 };
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use protocol::{Attachment, Card, Forwarded, InviteState, Key, MediaFile, MentionKind, Message, MessageInvite, MessageKind, Network, Preview, Receipt, Request, Response, ScheduledEvent, SendState};
+use protocol::{Attachment, Card, Forwarded, InviteState, Key, MediaFile, MentionKind, Message, MessageInvite, MessageKind, Network, Preview, Receipt, Request, Response, ScheduledEvent, SendState, Via};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -272,6 +272,8 @@ fn system_line_div(pane: &Pane, message: &Message, cx: &mut Context<Pane>) -> Di
         div()
             .id(SharedString::from(format!("sys-jump-{}", message.id)))
             .max_w(px(MEASURE))
+            .text_center()
+            .whitespace_normal()
             .cursor_pointer()
             .hover(|style| style.text_color(theme::text()).underline())
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -279,7 +281,7 @@ fn system_line_div(pane: &Pane, message: &Message, cx: &mut Context<Pane>) -> Di
             .child(message.text.clone())
             .into_any_element()
     } else {
-        div().max_w(px(MEASURE)).child(message.text.clone()).into_any_element()
+        div().max_w(px(MEASURE)).text_center().whitespace_normal().child(message.text.clone()).into_any_element()
     };
     let quote_el = message.reply_to.as_ref().map(|reply| {
         let target = message.jump.as_ref().filter(|id| !id.is_empty()).cloned();
@@ -526,7 +528,7 @@ impl Pane {
             Item::New => new_line(metrics).into_any_element(),
             Item::Message { message, head } => self.message_row(message, *head, false, window, cx),
             Item::System(message) if message.call.is_some() => self.call_line(message, cx).into_any_element(),
-            Item::System(message) => system_line_div(self, message, cx).into_any_element(),
+            Item::System(message) => self.system_row(message, cx).into_any_element(),
         };
         let seen = self.seen.clone();
         let mark = canvas(move |bounds, _, _| seen.borrow_mut().push((ix, bounds)), |_, (), _, _| {});
@@ -549,6 +551,28 @@ impl Pane {
         } else {
             self.metrics.media.min(room).max(120.).floor()
         }
+    }
+
+    /// AutoMod alerts are system rows. Their buttons are not drawn here, so the alert opens in Discord.
+    fn system_row(&self, message: &Message, cx: &mut Context<Self>) -> Div {
+        let link = message
+            .text
+            .starts_with("AutoMod ")
+            .then(|| message.permalink.clone())
+            .filter(|link| link.starts_with("https://") || link.starts_with("http://"));
+        let mut row = system_line_div(self, message, cx);
+        if let Some(link) = link {
+            let id = SharedString::from(format!("automod-{}", message.id));
+            row = row.child(
+                div()
+                    .id(id)
+                    .cursor_pointer()
+                    .hover(|style| style.underline())
+                    .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&link)))
+                    .child("Open in Discord"),
+            );
+        }
+        row
     }
 
     fn call_line(&self, message: &Message, cx: &mut Context<Self>) -> Div {
@@ -1112,6 +1136,7 @@ impl Pane {
             .min_w_0()
             .flex()
             .flex_col()
+            .children(message.via.as_ref().map(command_used))
             .children(head.then(|| self.header(message, in_header, cx)))
             .child(sent)
             .children(self.otp_chip(message, cx))
@@ -1120,7 +1145,8 @@ impl Pane {
             .children(self.reactions(message, window, cx))
             .children(self.thread_line(message, window, cx))
             .children(self.sending(message, cx))
-            .children(self.unsent(message, cx));
+            .children(self.unsent(message, cx))
+            .children(self.ephemeral_note(message, cx));
 
         let menu = message.clone();
         let inner = div()
@@ -1137,6 +1163,7 @@ impl Pane {
             // The row that owns an open menu, picker or dialog keeps `selected` (polish/01 §2).
             .when(owns && !editing, |row| row.bg(theme::selected()))
             .when(!mentioned && !editing && !owns, |row| row.hover(|style| style.bg(tokens::row_hover())))
+            .when(message.ephemeral && !editing, |row| row.bg(theme::warning_soft()))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
@@ -2061,6 +2088,16 @@ impl Pane {
                 } else if let Some((MentionKind::Channel, channel_id)) = &run.mention {
                     let channel_id = channel_id.clone();
                     self.open_channel_mention(&channel_id, alt, window, cx);
+                } else if matches!(run.mention, Some((MentionKind::Command, _))) {
+                    let shown = inline
+                        .ranges()
+                        .find(|(_, one)| std::ptr::eq(*one, run))
+                        .map(|(range, _)| &inline.text[range])
+                        .unwrap_or("");
+                    let name = shown.trim().trim_start_matches('/').to_owned();
+                    if !name.is_empty() {
+                        let _ = self.shell.update(cx, |shell, cx| shell.composer_fill_command(&name, window, cx));
+                    }
                 }
             }
         }
@@ -3155,30 +3192,107 @@ impl Pane {
         Some(grid.into_any_element())
     }
 
-    /// Interactive Block Kit controls attached to a message (buttons, menus, pickers, radios, checkboxes).
+    /// Users, roles, and channels the shell already holds, so an entity select with no stored
+    /// options can still post a picked id.
+    fn entity_choices(&self, element_type: &str, cx: &mut Context<Self>) -> Vec<protocol::ControlOption> {
+        let Some(shell) = self.shell.upgrade() else {
+            return Vec::new();
+        };
+        let shell = shell.read(cx);
+        let Some(open) = self.open.as_ref() else {
+            return Vec::new();
+        };
+        let account = open.key.account();
+        let mut rows = Vec::new();
+        if matches!(element_type, "discord_user_select" | "discord_mentionable_select") {
+            for person in shell.people_state.hub().friends(&account) {
+                if person.name.is_empty() || person.key.id.is_empty() {
+                    continue;
+                }
+                rows.push(protocol::ControlOption {
+                    label: person.name,
+                    value: person.key.id,
+                    description: String::new(),
+                });
+            }
+        }
+        if element_type == "discord_channel_select" {
+            let space = shell
+                .snapshot
+                .as_ref()
+                .and_then(|snap| snap.open.as_ref())
+                .filter(|row| row.key == open.key)
+                .and_then(|row| row.space.clone());
+            if let Some(space) = space {
+                if let Some(tree) = shell.trees.get(&Key::new(&account, space.as_str())) {
+                    for conv in &tree.conversations {
+                        if matches!(
+                            conv.kind,
+                            protocol::ConversationKind::Thread
+                                | protocol::ConversationKind::Direct
+                                | protocol::ConversationKind::Group
+                        ) {
+                            continue;
+                        }
+                        let name = conv.title.trim_start_matches('#').trim();
+                        if name.is_empty() || conv.key.id.is_empty() {
+                            continue;
+                        }
+                        rows.push(protocol::ControlOption {
+                            label: name.to_owned(),
+                            value: conv.key.id.clone(),
+                            description: String::new(),
+                        });
+                    }
+                }
+            }
+        }
+        rows.truncate(100);
+        rows
+    }
+
+    /// Interactive controls attached to a message (buttons, menus, pickers, radios, checkboxes).
     fn message_controls(&self, message: &Rc<Message>, cx: &mut Context<Self>) -> Option<AnyElement> {
         if message.controls.is_empty() {
             return None;
         }
         let conversation = self.key()?.clone();
-        let mut row = div().pt(px(6.)).flex().flex_wrap().items_center().gap(px(6.));
+        let mut container = div().pt(px(6.)).flex().flex_col().gap(px(6.));
+        let mut current_row_id: Option<u8> = None;
+        let mut row = div().flex().flex_wrap().items_center().gap(px(6.));
         for (idx, control) in message.controls.iter().enumerate() {
+            if let Some(prev) = current_row_id {
+                if prev != control.row {
+                    container = container.child(row);
+                    row = div().flex().flex_wrap().items_center().gap(px(6.));
+                }
+            }
+            current_row_id = Some(control.row);
             let pending = self
                 .pending_actions
                 .get(&(message.id.clone(), control.action_id.clone()))
                 .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(10));
+            let disabled = control.disabled;
             let el_id = SharedString::from(format!("ctrl-{}-{idx}", message.id));
             match &control.kind {
                 protocol::ControlKind::Button { url, style } => {
-                    let label = if pending {
-                        format!("{}…", control.label)
-                    } else if !url.is_empty() {
-                        format!("{} ↗", control.label)
-                    } else {
+                    let base = if control.emoji.is_empty() {
                         control.label.clone()
+                    } else if control.label.is_empty() {
+                        control.emoji.clone()
+                    } else {
+                        format!("{} {}", control.emoji, control.label)
+                    };
+                    let label = if pending {
+                        format!("{base}…")
+                    } else if !url.is_empty() {
+                        format!("{base} ↗")
+                    } else {
+                        base
                     };
                     let (bg, fg, border, hover_bg) = match style {
                         protocol::ControlStyle::Primary => (theme::accent(), theme::on_accent(), theme::accent(), theme::accent()),
+                        protocol::ControlStyle::Success => (theme::online(), theme::on_accent(), theme::online(), theme::online()),
                         protocol::ControlStyle::Danger => (theme::danger(), theme::on_accent(), theme::danger(), theme::danger()),
                         protocol::ControlStyle::Default => (tokens::card(), theme::text(), tokens::border_strong(), theme::hover()),
                     };
@@ -3195,12 +3309,14 @@ impl Pane {
                         .type_small()
                         .font_weight(theme::MEDIUM)
                         .text_color(fg)
-                        .cursor_pointer()
-                        .when(pending, |d| d.opacity(0.6))
-                        .hover(move |s| s.bg(hover_bg))
+                        .when(!disabled, |d| d.cursor_pointer().hover(move |s| s.bg(hover_bg)))
+                        .when(disabled, |d| d.cursor_default().opacity(0.45))
+                        .when(pending && !disabled, |d| d.opacity(0.6))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(label);
-                    if !url.is_empty() {
+                    if disabled {
+                        // Disabled button: drawn dimmed and inert.
+                    } else if !url.is_empty() {
                         let conv = conversation.clone();
                         let msg_id = message.id.clone();
                         let target = url.clone();
@@ -3235,9 +3351,23 @@ impl Pane {
                     row = row.child(btn);
                 }
                 protocol::ControlKind::Select { placeholder, options, selected, external } => {
+                    let entity = matches!(
+                        control.element_type.as_str(),
+                        "discord_user_select"
+                            | "discord_role_select"
+                            | "discord_mentionable_select"
+                            | "discord_channel_select"
+                    );
+                    let menu_options = if !options.is_empty() {
+                        options.clone()
+                    } else if entity {
+                        self.entity_choices(&control.element_type, cx)
+                    } else {
+                        Vec::new()
+                    };
                     let current_label = selected
                         .as_deref()
-                        .and_then(|val| options.iter().find(|o| o.value == val).map(|o| o.label.as_str()))
+                        .and_then(|val| menu_options.iter().find(|o| o.value == val).map(|o| o.label.as_str()))
                         .unwrap_or_else(|| if placeholder.is_empty() { "Select…" } else { placeholder.as_str() });
                     let shown = if pending {
                         format!("{current_label}…")
@@ -3256,20 +3386,26 @@ impl Pane {
                         .items_center()
                         .type_small()
                         .text_color(theme::text())
-                        .cursor_pointer()
-                        .when(pending, |d| d.opacity(0.6))
-                        .hover(|s| s.bg(theme::hover()))
+                        .when(!disabled, |d| d.cursor_pointer().hover(|s| s.bg(theme::hover())))
+                        .when(disabled, |d| d.cursor_default().opacity(0.45))
+                        .when(pending && !disabled, |d| d.opacity(0.6))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(shown);
-                    if !options.is_empty() && !pending {
+                    if disabled {
+                        // Disabled select: inert.
+                    } else if !menu_options.is_empty() && !pending {
+                        let initial_multi = selected.iter().cloned().collect();
                         let open = super::OpenSelect {
                             conversation: conversation.clone(),
                             message_id: message.id.clone(),
                             block_id: control.block_id.clone(),
                             action_id: control.action_id.clone(),
                             element_type: control.element_type.clone(),
-                            options: options.clone(),
+                            options: menu_options,
                             selected: selected.clone(),
+                            multi_selected: initial_multi,
+                            min_values: control.min_values,
+                            max_values: control.max_values,
                             confirm: control.confirm.clone(),
                             at: gpui::Point::default(),
                         };
@@ -3280,7 +3416,7 @@ impl Pane {
                             this.open_select = Some(next);
                             cx.notify();
                         }));
-                    } else if *external && !message.permalink.is_empty() {
+                    } else if !entity && *external && !message.permalink.is_empty() {
                         let link = message.permalink.clone();
                         chip = chip.on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
@@ -3298,12 +3434,20 @@ impl Pane {
                     let now = crate::view::now();
                     let mut opts = Vec::new();
                     if let Some(init) = initial.as_ref().filter(|s| !s.is_empty()) {
-                        opts.push(protocol::ControlOption { label: format!("Keep ({init})"), value: init.clone() });
+                        opts.push(protocol::ControlOption {
+                            label: format!("Keep ({init})"),
+                            value: init.clone(),
+                            description: String::new(),
+                        });
                     }
                     for (name, days) in [("Today", 0i64), ("Tomorrow", 1), ("In 3 days", 3), ("In 7 days", 7)] {
                         let ymd = format_ymd(now + days * 86_400);
                         if !opts.iter().any(|o| o.value == ymd) {
-                            opts.push(protocol::ControlOption { label: format!("{name} ({ymd})"), value: ymd });
+                            opts.push(protocol::ControlOption {
+                                label: format!("{name} ({ymd})"),
+                                value: ymd,
+                                description: String::new(),
+                            });
                         }
                     }
                     let open = super::OpenSelect {
@@ -3314,6 +3458,9 @@ impl Pane {
                         element_type: control.element_type.clone(),
                         options: opts,
                         selected: initial.clone(),
+                        multi_selected: Vec::new(),
+                        min_values: 0,
+                        max_values: 0,
                         confirm: control.confirm.clone(),
                         at: gpui::Point::default(),
                     };
@@ -3351,11 +3498,19 @@ impl Pane {
                     let shown = if pending { format!("🕒 {label}…") } else { format!("🕒 {label} ▾") };
                     let mut opts = Vec::new();
                     if let Some(init) = initial.as_ref().filter(|s| !s.is_empty()) {
-                        opts.push(protocol::ControlOption { label: init.clone(), value: init.clone() });
+                        opts.push(protocol::ControlOption {
+                            label: init.clone(),
+                            value: init.clone(),
+                            description: String::new(),
+                        });
                     }
                     for slot in ["09:00", "12:00", "14:00", "17:00"] {
                         if !opts.iter().any(|o| o.value == slot) {
-                            opts.push(protocol::ControlOption { label: slot.to_owned(), value: slot.to_owned() });
+                            opts.push(protocol::ControlOption {
+                                label: slot.to_owned(),
+                                value: slot.to_owned(),
+                                description: String::new(),
+                            });
                         }
                     }
                     let open = super::OpenSelect {
@@ -3366,6 +3521,9 @@ impl Pane {
                         element_type: control.element_type.clone(),
                         options: opts,
                         selected: initial.clone(),
+                        multi_selected: Vec::new(),
+                        min_values: 0,
+                        max_values: 0,
                         confirm: control.confirm.clone(),
                         at: gpui::Point::default(),
                     };
@@ -3488,7 +3646,7 @@ impl Pane {
                 }
             }
         }
-        Some(row.into_any_element())
+        Some(container.child(row).into_any_element())
     }
 
     /// Shared contact card: name, organization, masked phone numbers (click to reveal), emails, and copy actions.
@@ -4685,6 +4843,42 @@ impl Pane {
             .child(actions);
         Some(line.into_any_element())
     }
+
+    /// The tinted foot of an only-you reply. Dismiss removes it here, and on Discord when that is allowed.
+    fn ephemeral_note(&self, message: &Rc<Message>, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !message.ephemeral || message.deleted {
+            return None;
+        }
+        let conversation = self.key()?.clone();
+        let message_id = message.id.clone();
+        let dismiss = div()
+            .id(name_id("dismiss", &message.id))
+            .flex_none()
+            .cursor_pointer()
+            .text_color(tokens::link())
+            .hover(|style| style.underline())
+            .child("Dismiss")
+            .on_click(cx.listener(move |_, _, _, cx| {
+                let request = Request::Delete {
+                    conversation: conversation.clone(),
+                    message_id: message_id.clone(),
+                    scope: protocol::DeleteScope::Everyone,
+                };
+                cx.background_executor().spawn(async move { crate::client::ask(&request) }).detach();
+            }));
+        Some(
+            div()
+                .mt(px(4.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .type_small()
+                .text_color(theme::text_faint())
+                .child("Only you can see this ·")
+                .child(dismiss)
+                .into_any_element(),
+        )
+    }
 }
 
 /// Bytes as the upload line says them: "3.1 MB", "820 KB".
@@ -4730,17 +4924,34 @@ fn receipt_mark(id: &str, receipt: Receipt) -> AnyElement {
 
 /// The bell-off after a message's time when it went without notification.
 fn silent_mark(message: &Message) -> Option<AnyElement> {
-    let client_id = message.client_id.as_deref()?;
-    crate::gui::composer::sent_silently(client_id).then(|| {
+    let from_send = message.client_id.as_deref().is_some_and(crate::gui::composer::sent_silently);
+    if !message.silent && !from_send {
+        return None;
+    }
+    let id = message.client_id.as_deref().unwrap_or(message.id.as_str());
+    Some(
         div()
-            .id(name_id("silent", client_id))
+            .id(name_id("silent", id))
             .flex_none()
             .flex()
             .items_center()
             .tooltip(tip("Sent without notification", None))
             .child(glyph("icons/bell-off.svg", 12., theme::text_faint()))
-            .into_any_element()
-    })
+            .into_any_element(),
+    )
+}
+
+/// "<person> used /command" above a bot's answer.
+fn command_used(via: &Via) -> Div {
+    let command = via.command.trim_start_matches('/');
+    div()
+        .h(px(18.))
+        .mb(px(2.))
+        .flex()
+        .items_center()
+        .type_small()
+        .text_color(theme::text_faint())
+        .child(format!("{} used /{command}", via.who))
 }
 
 fn megabytes(bytes: u64) -> String {

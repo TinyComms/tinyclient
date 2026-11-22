@@ -5306,6 +5306,82 @@ impl Chat {
                     reply,
                 })
             }
+            Request::Commands { conversation, query, kind } => {
+                if let Err(refused) = self.online(&conversation.account()) {
+                    return *refused;
+                }
+                match self.ask(&conversation.account(), |reply| Command::Commands {
+                    conversation_id: conversation.id.clone(),
+                    query,
+                    kind,
+                    reply,
+                }) {
+                    Ok(commands) => Response::Commands { commands },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::CommandAutocomplete {
+                conversation,
+                command_id,
+                application_id,
+                version,
+                name,
+                options,
+                focused,
+            } => {
+                if let Err(refused) = self.online(&conversation.account()) {
+                    return *refused;
+                }
+                match self.ask(&conversation.account(), |reply| Command::CommandAutocomplete {
+                    conversation_id: conversation.id.clone(),
+                    command_id,
+                    application_id,
+                    version,
+                    name,
+                    options,
+                    focused,
+                    reply,
+                }) {
+                    Ok(choices) => Response::CommandChoices { choices },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::RunCommand {
+                conversation,
+                command_id,
+                application_id,
+                version,
+                kind,
+                name,
+                arguments,
+                target_id,
+                files,
+            } => self.act(&conversation, |conversation_id, reply| Command::RunCommand {
+                conversation_id,
+                command_id,
+                application_id,
+                version,
+                kind,
+                name,
+                arguments,
+                target_id,
+                files,
+                reply,
+            }),
+            Request::ModalSubmit {
+                conversation,
+                modal_id,
+                application_id,
+                custom_id,
+                values,
+            } => self.act(&conversation, |conversation_id, reply| Command::ModalSubmit {
+                conversation_id,
+                modal_id,
+                application_id,
+                custom_id,
+                values,
+                reply,
+            }),
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
                     Some(id) => self.hub.settings().custom_sound(id).is_some(),

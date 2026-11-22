@@ -1314,6 +1314,11 @@ pub(super) fn compose_with_mentions(text: &str, spans: &[Span]) -> (String, Vec<
             MentionKind::User => "person",
             MentionKind::Role => "tag",
             MentionKind::Channel | MentionKind::Everyone => "channel",
+            MentionKind::Command => {
+                escape_text(&mut out, &text[start..end], false);
+                cursor = end;
+                continue;
+            }
         };
         out.push_str("<span itemscope=\"\" itemtype=\"http://schema.skype.com/Mention\" itemid=\"");
         out.push_str(&item_id);

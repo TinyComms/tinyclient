@@ -1027,8 +1027,202 @@ impl Demo {
             | Command::SetDefaultReaction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::PreviewChannel { reply, .. }
             | Command::Join { reply, .. }
-            | Command::DeleteFile { reply, .. }
-            | Command::MessageAction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            | Command::DeleteFile { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MessageAction { conversation_id, message_id, action_id, value, values, reply, .. } => {
+                let outcome = (|| -> Result<(), Refusal> {
+                    let stored = demo.ctx.stored_message(&conversation_id, &message_id).ok().flatten();
+                    let mut message = stored.ok_or_else(|| Refusal::Refused("That message is gone.".to_owned()))?;
+                    let picked = if !values.is_empty() {
+                        values.join(", ")
+                    } else if !value.is_empty() {
+                        value.clone()
+                    } else {
+                        action_id.clone()
+                    };
+                    for ctrl in &mut message.controls {
+                        if ctrl.action_id == action_id {
+                            match &mut ctrl.kind {
+                                protocol::ControlKind::Select { selected, .. }
+                                | protocol::ControlKind::RadioButtons { selected, .. } => {
+                                    *selected = Some(picked.clone());
+                                }
+                                protocol::ControlKind::Checkboxes { selected, .. } => {
+                                    *selected = values.clone();
+                                }
+                                protocol::ControlKind::Button { .. } => {
+                                    if !ctrl.label.ends_with(" ✓") {
+                                        ctrl.label.push_str(" ✓");
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    if action_id == "demo_open_modal" {
+                        demo.ctx.interaction_modal(
+                            &conversation_id,
+                            protocol::InteractionModal {
+                                id: format!("modal-{message_id}"),
+                                application_id: "demo-bot".into(),
+                                custom_id: "demo_feedback".into(),
+                                title: "Submit note".into(),
+                                fields: vec![protocol::ModalField {
+                                    custom_id: "note".into(),
+                                    label: "Your note".into(),
+                                    value: String::new(),
+                                    placeholder: "Type something…".into(),
+                                    required: true,
+                                    multiline: false,
+                                    min_length: Some(1),
+                                    max_length: Some(200),
+                                }],
+                                nonce: String::new(),
+                            },
+                        );
+                    }
+                    demo.ctx.message(&conversation_id, &message).map_err(|err| Refusal::Refused(err.to_string()))
+                })();
+                let _ = reply.send(outcome);
+            }
+            Command::Commands { query, kind, reply, .. } => {
+                let mut cmds = vec![
+                    protocol::AppCommand {
+                        id: "demo-shrug".into(),
+                        application_id: "builtin".into(),
+                        version: "1".into(),
+                        kind: protocol::CommandKind::ChatInput,
+                        name: "shrug".into(),
+                        description: "Append ¯\\_(ツ)_/¯ to your message".into(),
+                        app_name: "Built-in".into(),
+                        options: vec![protocol::CommandOption {
+                            name: "message".into(),
+                            description: "Text before the shrug".into(),
+                            kind: protocol::CommandOptionKind::String,
+                            required: false,
+                            ..Default::default()
+                        }],
+                        built_in: true,
+                    },
+                    protocol::AppCommand {
+                        id: "demo-deploy".into(),
+                        application_id: "demo-bot".into(),
+                        version: "1".into(),
+                        kind: protocol::CommandKind::ChatInput,
+                        name: "deploy".into(),
+                        description: "Post a demo deployment approval with buttons".into(),
+                        app_name: "DeployBot".into(),
+                        options: vec![protocol::CommandOption {
+                            name: "env".into(),
+                            description: "Target environment".into(),
+                            kind: protocol::CommandOptionKind::String,
+                            required: true,
+                            autocomplete: true,
+                            choices: vec![
+                                protocol::CommandChoice { name: "Staging".into(), value: "staging".into() },
+                                protocol::CommandChoice { name: "Production".into(), value: "production".into() },
+                            ],
+                            ..Default::default()
+                        }],
+                        built_in: false,
+                    },
+                ];
+                if let Some(k) = kind {
+                    cmds.retain(|c| c.kind == k);
+                }
+                let q = query.trim().to_ascii_lowercase();
+                if !q.is_empty() {
+                    cmds.retain(|c| c.name.to_ascii_lowercase().contains(&q) || c.description.to_ascii_lowercase().contains(&q));
+                }
+                let _ = reply.send(Ok(cmds));
+            }
+            Command::CommandAutocomplete { focused, options, reply, .. } => {
+                let typed = options
+                    .iter()
+                    .find(|a| a.name == focused)
+                    .map(|a| a.value.to_ascii_lowercase())
+                    .unwrap_or_default();
+                let all = [
+                    ("Staging", "staging"),
+                    ("Canary", "canary"),
+                    ("Production", "production"),
+                ];
+                let choices = all
+                    .into_iter()
+                    .filter(|(name, val)| typed.is_empty() || name.to_ascii_lowercase().contains(&typed) || val.contains(&typed))
+                    .map(|(name, val)| protocol::CommandChoice { name: name.into(), value: val.into() })
+                    .collect();
+                let _ = reply.send(Ok(choices));
+            }
+            Command::RunCommand { conversation_id, name, arguments, reply, .. } => {
+                let now = crate::hub::now();
+                let outcome = match name.as_str() {
+                    "shrug" => {
+                        let text = arguments.first().map(|a| a.value.trim()).unwrap_or("");
+                        let body = if text.is_empty() {
+                            "¯\\_(ツ)_/¯".to_owned()
+                        } else {
+                            format!("{text} ¯\\_(ツ)_/¯")
+                        };
+                        let msg = demo.accepted(&conversation_id, body, None, Vec::new());
+                        demo.ctx.message(&conversation_id, &msg).map_err(|err| Refusal::Refused(err.to_string()))
+                    }
+                    "deploy" => {
+                        let env = arguments
+                            .iter()
+                            .find(|a| a.name == "env")
+                            .or_else(|| arguments.first())
+                            .map(|a| a.value.as_str())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("staging");
+                        let id = format!("demo-cmd-{}", demo.made.fetch_add(1, Ordering::Relaxed) + 1);
+                        let mut msg = Message::plain(id, "DeployBot", format!("Deploy to `{env}`?"), now, false);
+                        msg.sender.bot = true;
+                        msg.controls = vec![
+                            protocol::MessageControl {
+                                block_id: "demo-deploy".into(),
+                                action_id: "approve".into(),
+                                element_type: "button".into(),
+                                label: "Approve".into(),
+                                value: "approved".into(),
+                                confirm: None,
+                                kind: protocol::ControlKind::Button { url: String::new(), style: protocol::ControlStyle::Success },
+                                disabled: false,
+                                emoji: String::new(),
+                                row: 0,
+                                min_values: 0,
+                                max_values: 0,
+                            },
+                            protocol::MessageControl {
+                                block_id: "demo-deploy".into(),
+                                action_id: "reject".into(),
+                                element_type: "button".into(),
+                                label: "Cancel".into(),
+                                value: "cancelled".into(),
+                                confirm: None,
+                                kind: protocol::ControlKind::Button { url: String::new(), style: protocol::ControlStyle::Danger },
+                                disabled: false,
+                                emoji: String::new(),
+                                row: 0,
+                                min_values: 0,
+                                max_values: 0,
+                            },
+                        ];
+                        demo.ctx.message(&conversation_id, &msg).map_err(|err| Refusal::Refused(err.to_string()))
+                    }
+                    _ => Err(Refusal::Refused(format!("Unknown command /{name}."))),
+                };
+                let _ = reply.send(outcome);
+            }
+            Command::ModalSubmit { conversation_id, values, reply, .. } => {
+                let summary = values
+                    .iter()
+                    .map(|(k, v)| format!("{k}: {v}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let msg = demo.accepted(&conversation_id, format!("Submitted form ({summary})"), None, Vec::new());
+                let res = demo.ctx.message(&conversation_id, &msg).map_err(|err| Refusal::Refused(err.to_string()));
+                let _ = reply.send(res);
+            }
             Command::AccountFiles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallRing { reply, .. } | Command::CallStopRinging { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)));

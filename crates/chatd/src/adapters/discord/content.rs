@@ -1,12 +1,13 @@
 //! Discord's messages into the one message model: markdown to text and spans, attachments,
 //! embeds, stickers, reactions, replies, system lines.
 
-use super::model::{self, seconds, Attachment as Attached, Embed, EmbedImage, Posted};
+use super::model::{self, seconds, Attachment as Attached, Component, Embed, EmbedImage, Posted, UnfurledMedia};
 use crate::adapters::Context;
 use base64::Engine;
 use protocol::{
-    AccountKey, Attachment, Card, Forwarded, InviteState, Key, MediaFile, MediaKind, MentionKind, Message,
-    MessageInvite, MessageKind, Preview, Reaction, ReplyTo, ScheduledEvent, Sender, Span, Style, ThreadSummary,
+    AccountKey, Attachment, Card, ControlKind, ControlOption, ControlStyle, Forwarded, InviteState, Key, MediaFile, MediaKind,
+    MentionKind, Message, MessageControl, MessageInvite, MessageKind, Preview, Reaction, ReplyTo, ScheduledEvent, Sender, Span, Style,
+    ThreadSummary, Via, MESSAGE_CONTROLS_LIMIT,
 };
 
 /// Names for what a message only gives ids for.
@@ -16,6 +17,10 @@ pub trait Names {
     fn channel(&self, id: &str) -> Option<String>;
     /// A server's name.
     fn space(&self, id: &str) -> Option<String>;
+    /// People, roles, or channels an entity select (component types 5–8) can offer, as `(id, name)`.
+    fn choices(&self, _kind: u8) -> Vec<(String, String)> {
+        Vec::new()
+    }
 }
 
 /// The files something refers to: each with the address it is fetched from, and the other
@@ -237,10 +242,10 @@ fn angle(rich: &mut Rich, text: &str, names: &dyn Names, guild: Option<&str>) ->
         rich.span(start, Style::Time { unix, form });
     } else if let Some(command) = inner.strip_prefix('/') {
         let (name, id) = command.rsplit_once(':')?;
-        if !digits(id) {
+        if !digits(id) || name.is_empty() {
             return None;
         }
-        rich.text.push_str(&format!("/{name}"));
+        mention(rich, format!("/{name}"), MentionKind::Command, id);
     } else if inner.starts_with("https://") || inner.starts_with("http://") {
         if !discord_channel_link(rich, inner, None, names, guild) {
             rich.text.push_str(inner);
@@ -820,7 +825,6 @@ fn system_line(posted: &Posted, kind: u8, who: &str, content: &str, mentioned: &
         18 => format!("{who} started a thread: {content}"),
         21 => format!("{who} started a thread."),
         22 => "Sending invites to your server is the best way to grow your community.".to_owned(),
-        24 => "AutoMod flagged a message.".to_owned(),
         25 => match posted.role_subscription_data.as_ref() {
             Some(sub) if !sub.tier_name.is_empty() && sub.is_renewal && sub.total_months_subscribed > 1 => {
                 format!(
@@ -878,6 +882,55 @@ fn system_line(posted: &Posted, kind: u8, who: &str, content: &str, mentioned: &
     })
 }
 
+fn embed_field(embed: &Embed, name: &str) -> Option<String> {
+    embed
+        .fields
+        .iter()
+        .find(|field| field.name == name)
+        .map(|field| field.value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn push_quote(line: &mut String, seen: &mut Vec<String>, text: &str) {
+    let text = text.trim();
+    if text.is_empty() || seen.iter().any(|have| have == text) {
+        return;
+    }
+    seen.push(text.to_owned());
+    line.push('\n');
+    line.push('"');
+    line.push_str(text);
+    line.push('"');
+}
+
+/// Type 24, from the alert embed. Missing pieces drop out of the sentence.
+fn automod_alert(who: &str, posted: &Posted, names: &dyn Names) -> String {
+    let Some(embed) = posted.embeds.as_deref().and_then(|embeds| embeds.first()) else {
+        return "AutoMod flagged a message.".to_owned();
+    };
+    let name = if who.is_empty() { "someone" } else { who };
+    let mut line = format!("AutoMod blocked a message from {name}");
+    if let Some(id) = embed_field(embed, "channel_id") {
+        let title = names.channel(&id).filter(|title| !title.is_empty()).unwrap_or(id);
+        line.push_str(" in #");
+        line.push_str(title.trim_start_matches('#'));
+    }
+    if let Some(rule) = embed_field(embed, "rule_name") {
+        line.push_str(" — rule ");
+        line.push_str(&rule);
+    }
+    let mut seen = Vec::new();
+    if let Some(text) = embed.description.as_deref() {
+        push_quote(&mut line, &mut seen, text);
+    }
+    if let Some(text) = embed_field(embed, "keyword_matched_content") {
+        push_quote(&mut line, &mut seen, &text);
+    }
+    if let Some(text) = embed_field(embed, "keyword") {
+        push_quote(&mut line, &mut seen, &text);
+    }
+    line
+}
 /// Extracts Discord server invite links (`discord.gg/{code}`, `discord.com/invite/{code}`,
 /// `discordapp.com/invite/{code}`, with optional `?event={id}`) and scheduled event links
 /// (`discord.com/events/{guild}/{event}`) from translated link spans. No network calls are made.
@@ -1067,6 +1120,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
     let content = posted.content.as_deref().unwrap_or("");
     let kind = posted.kind.unwrap_or(0);
     let link = jump_link(place.guild, &posted.channel_id, &posted.id);
+    let flags = posted.flags.unwrap_or(0);
 
     let has_snapshots = !posted.message_snapshots.is_empty();
     let mut message_kind = MessageKind::Normal;
@@ -1076,27 +1130,33 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         .and_then(|guild| place.names.space(guild))
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "This server".to_owned());
-    match system_line(posted, kind, &who, content, mentioned, &server) {
-        None => {
-            markdown_in(&mut rich, content, place.names, place.guild);
-            // What was forwarded is the message's own text; a forward has none of its own.
-            for snapshot in &posted.message_snapshots {
-                let snap_text = snapshot.message.content.as_deref().unwrap_or("");
-                if !snap_text.is_empty() {
-                    if !rich.text.is_empty() {
-                        rich.text.push('\n');
+    if kind == 24 {
+        // Posted by the member AutoMod caught. The row is the alert, not their message.
+        rich.text = automod_alert(&who, posted, place.names);
+        message_kind = MessageKind::System;
+    } else {
+        match system_line(posted, kind, &who, content, mentioned, &server) {
+            None => {
+                markdown_in(&mut rich, content, place.names, place.guild);
+                // What was forwarded is the message's own text; a forward has none of its own.
+                for snapshot in &posted.message_snapshots {
+                    let snap_text = snapshot.message.content.as_deref().unwrap_or("");
+                    if !snap_text.is_empty() {
+                        if !rich.text.is_empty() {
+                            rich.text.push('\n');
+                        }
+                        markdown_in(&mut rich, snap_text, place.names, place.guild);
                     }
-                    markdown_in(&mut rich, snap_text, place.names, place.guild);
                 }
             }
-        }
-        Some(line) if line.is_empty() => {
-            rich.text = if content.is_empty() { "A message tinyclient cannot show.".to_owned() } else { content.to_owned() };
-            message_kind = MessageKind::Unsupported { link: link.clone() };
-        }
-        Some(line) => {
-            rich.text = line;
-            message_kind = MessageKind::System;
+            Some(line) if line.is_empty() => {
+                rich.text = if content.is_empty() { "A message tinyclient cannot show.".to_owned() } else { content.to_owned() };
+                message_kind = MessageKind::Unsupported { link: link.clone() };
+            }
+            Some(line) => {
+                rich.text = line;
+                message_kind = MessageKind::System;
+            }
         }
     }
 
@@ -1113,26 +1173,41 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
             attachments.push(attachment(&mut rich, attached, place.blur_explicit));
         }
         attachments.extend(part.sticker_items.iter().map(|item| sticker(&mut rich, item)));
-        embeds.extend(part.embeds.as_deref().unwrap_or(&[]).iter().cloned());
+        // The alert's embed is the system line. A preview would glue those fields back on.
+        if kind != 24 {
+            embeds.extend(part.embeds.as_deref().unwrap_or(&[]).iter().cloned());
+        }
         composed |= part.author.as_ref().is_some_and(|author| author.bot) || part.webhook_id.is_some();
     }
     let (card, previews, moving_pictures) = cards(&mut rich, &posted.id, &embeds, place.names, composed, place.blur_explicit);
     attachments.extend(moving_pictures);
+    if flags & model::FLAG_IS_VOICE_MESSAGE != 0 {
+        for attachment in &mut attachments {
+            if attachment.file.kind == MediaKind::File {
+                attachment.file.kind = MediaKind::Audio;
+            }
+        }
+    }
     let reactions = reactions(&mut rich, posted.reactions.as_deref().unwrap_or(&[]));
+    let app_id = posted.application_id.as_deref().unwrap_or(&author.id);
+    let (controls, _dropped_components) = match carried.first().and_then(|part| part.components.as_deref()) {
+        Some(comps) if kind != 24 && !comps.is_empty() => extract_components(
+            comps,
+            &posted.id,
+            app_id,
+            flags,
+            &link,
+            place.names,
+            &mut rich,
+            &mut attachments,
+        ),
+        _ => (Vec::new(), false),
+    };
     let origin = posted.message_reference.as_ref().filter(|reference| reference.kind == 1 && has_snapshots);
-    let forwarded_from = origin.map(|origin| {
-        let channel = origin.channel_id.as_deref().unwrap_or("");
-        let elsewhere = origin.guild_id.as_deref().filter(|guild| Some(*guild) != place.guild);
-        Box::new(Forwarded {
-            from_title: place.names.channel(channel).map_or_else(String::new, |name| format!("#{name}")),
-            from_space: elsewhere.and_then(|guild| place.names.space(guild)).unwrap_or_default(),
-            link: match &origin.message_id {
-                Some(message) if !channel.is_empty() => jump_link(origin.guild_id.as_deref(), channel, message),
-                _ => String::new(),
-            },
-            ..Forwarded::default()
-        })
-    });
+    let mut forwarded_from = origin.map(|origin| Box::new(referenced(origin, place)));
+    if forwarded_from.is_none() && flags & model::FLAG_IS_CROSSPOST != 0 {
+        forwarded_from = posted.message_reference.as_ref().map(|origin| Box::new(referenced(origin, place)));
+    }
 
     if let Some(poll) = &posted.poll {
         let question = poll.question.as_ref().and_then(|question| question.text.as_deref()).unwrap_or("");
@@ -1144,14 +1219,20 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         && attachments.is_empty()
         && previews.is_empty()
         && card.is_none()
+        && controls.is_empty()
     {
-        // Buttons, menus, or something newer than this build: never a blank row.
-        rich.text = if posted.components.is_empty() {
-            "A message tinyclient cannot show.".to_owned()
+        if flags & model::FLAG_LOADING != 0 {
+            rich.text = format!("{who} is thinking…");
         } else {
-            "Interactive message".to_owned()
-        };
-        message_kind = MessageKind::Unsupported { link };
+            // Buttons, menus, or something newer than this build: never a blank row.
+            let has_components = posted.components.as_deref().is_some_and(|c| !c.is_empty());
+            rich.text = if !has_components {
+                "A message tinyclient cannot show.".to_owned()
+            } else {
+                "Interactive message".to_owned()
+            };
+            message_kind = MessageKind::Unsupported { link: link.clone() };
+        }
     }
 
     let reply_to = match (&posted.message_reference, &posted.referenced_message) {
@@ -1292,8 +1373,12 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         effect: None,
         contacts: Vec::new(),
         sent_via: None,
-        permalink: String::new(),
-        controls: Vec::new(),
+        permalink: link,
+        controls,
+        via: command_via(posted),
+        ephemeral: flags & model::FLAG_EPHEMERAL != 0,
+        silent: flags & model::FLAG_SUPPRESS_NOTIFICATIONS != 0,
+        loading: flags & model::FLAG_LOADING != 0,
         invites,
         buttons: Vec::new(),
         jump,
@@ -1314,6 +1399,52 @@ fn jump_target(posted: &Posted, kind: u8) -> Option<String> {
         return None;
     }
     reference.and_then(|item| item.message_id.clone()).or_else(|| (kind == 21).then(|| referenced.map(|item| item.id.clone())).flatten())
+}
+/// Where a crosspost or a forward was first said.
+fn referenced(origin: &model::Reference, place: &Place) -> Forwarded {
+    let channel = origin.channel_id.as_deref().unwrap_or("");
+    let elsewhere = origin.guild_id.as_deref().filter(|guild| Some(*guild) != place.guild);
+    Forwarded {
+        from_title: place.names.channel(channel).map_or_else(String::new, |name| format!("#{name}")),
+        from_space: elsewhere.and_then(|guild| place.names.space(guild)).unwrap_or_default(),
+        link: match &origin.message_id {
+            Some(message) if !channel.is_empty() => jump_link(origin.guild_id.as_deref(), channel, message),
+            _ => String::new(),
+        },
+        ..Forwarded::default()
+    }
+}
+
+/// The person and command behind an application-command reply. Component interactions have no command name here.
+fn command_via(posted: &Posted) -> Option<Via> {
+    let meta = posted.interaction_metadata.as_ref().or(posted.interaction.as_ref())?;
+    if meta.kind != 0 && meta.kind != 2 {
+        return None;
+    }
+    let command = meta.name.as_deref().filter(|name| !name.is_empty())?;
+    let who = meta.user.as_ref().map(|user| user.name().to_owned()).filter(|name| !name.is_empty())?;
+    Some(Via { who, command: command.trim_start_matches('/').to_owned() })
+}
+
+/// Flags a partial update left out, rebuilt from what the row already stored.
+fn remembered_flags(message: &Message) -> u64 {
+    let mut flags = message
+        .controls
+        .iter()
+        .find_map(|control| {
+            control.block_id.starts_with("discord:").then(|| super::interactions::parse_block_meta(&control.block_id).1)
+        })
+        .unwrap_or(0);
+    if message.ephemeral {
+        flags |= model::FLAG_EPHEMERAL;
+    }
+    if message.loading {
+        flags |= model::FLAG_LOADING;
+    }
+    if message.silent {
+        flags |= model::FLAG_SUPPRESS_NOTIFICATIONS;
+    }
+    flags
 }
 
 /// The first embed a bot or webhook composed (`by_bot`, type `rich`) is the message's card;
@@ -1392,11 +1523,62 @@ pub fn patch(stored: &mut Message, update: &Posted, place: &Place) -> Files {
     if let Some(reacted) = &update.reactions {
         stored.reactions = reactions(&mut rich, reacted);
     }
+    if let Some(components) = &update.components {
+        let app_id = update
+            .application_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .unwrap_or(&stored.sender.id);
+        let link = if stored.permalink.is_empty() {
+            jump_link(place.guild, &update.channel_id, &stored.id)
+        } else {
+            stored.permalink.clone()
+        };
+        let mut comp_rich = Rich::default();
+        let mut comp_attachments = Vec::new();
+        let (controls, _) = extract_components(
+            components,
+            &stored.id,
+            app_id,
+            update.flags.unwrap_or_else(|| remembered_flags(stored)),
+            &link,
+            place.names,
+            &mut comp_rich,
+            &mut comp_attachments,
+        );
+        stored.controls = controls;
+        if !comp_rich.text.is_empty() && update.content.as_deref().unwrap_or("").is_empty() {
+            stored.text = comp_rich.text;
+            stored.spans = comp_rich.spans;
+            if matches!(stored.kind, MessageKind::Unsupported { .. }) {
+                stored.kind = MessageKind::Normal;
+            }
+        } else if !stored.controls.is_empty() && matches!(stored.kind, MessageKind::Unsupported { .. }) {
+            stored.kind = MessageKind::Normal;
+        }
+        rich.files.merge(comp_rich.files);
+        if !comp_attachments.is_empty() {
+            stored.attachments.retain(|kept| !kept.file.id.starts_with("comp:"));
+            stored.attachments.extend(comp_attachments);
+        }
+    }
     if let Some(pinned) = update.pinned {
         stored.pinned = pinned;
     }
     if let Some(flags) = update.flags {
         stored.published = flags & model::CROSSPOSTED != 0;
+        stored.ephemeral = flags & model::FLAG_EPHEMERAL != 0;
+        stored.silent = flags & model::FLAG_SUPPRESS_NOTIFICATIONS != 0;
+        stored.loading = flags & model::FLAG_LOADING != 0;
+        if stored.loading && stored.text.is_empty() && stored.attachments.is_empty() {
+            stored.text = format!("{} is thinking…", stored.sender.name);
+            if matches!(stored.kind, MessageKind::Unsupported { .. }) {
+                stored.kind = MessageKind::Normal;
+            }
+        }
+    }
+    if update.interaction_metadata.is_some() || update.interaction.is_some() {
+        stored.via = command_via(update);
     }
     if update.edited_timestamp.is_some() {
         stored.edited = true;
@@ -1417,6 +1599,408 @@ pub fn patch(stored: &mut Message, update: &Posted, place: &Place) -> Files {
         stored.call = Some(note);
     }
     rich.files
+}
+
+/// Returns `true` only for safe external HTTP(S) URLs.
+fn is_safe_http_url(url: &str) -> bool {
+    url.starts_with("https://") || url.starts_with("http://")
+}
+
+/// Formats a component's emoji as a short display string (Unicode glyph or `:name:`).
+fn component_emoji(emoji: Option<&model::Emoji>) -> String {
+    let Some(emoji) = emoji else {
+        return String::new();
+    };
+    match (&emoji.id, &emoji.name) {
+        (None, Some(name)) => name.clone(),
+        (Some(_), Some(name)) => format!(":{name}:"),
+        _ => String::new(),
+    }
+}
+
+/// Converts a Discord v2 unfurled media item into an attachment when it has a safe HTTP(S) URL.
+fn component_media_attachment(
+    rich: &mut Rich,
+    message_id: &str,
+    index: usize,
+    media: &UnfurledMedia,
+    as_file: bool,
+    spoiler: bool,
+    caption: Option<&str>,
+) -> Option<Attachment> {
+    let fetch_url = media
+        .proxy_url
+        .as_deref()
+        .filter(|u| is_safe_http_url(u))
+        .or_else(|| is_safe_http_url(&media.url).then_some(media.url.as_str()))?;
+    let mime = media.content_type.clone().unwrap_or_else(|| {
+        if as_file {
+            "application/octet-stream".to_owned()
+        } else {
+            "image/png".to_owned()
+        }
+    });
+    let kind = if as_file {
+        MediaKind::File
+    } else if mime.starts_with("video/") {
+        MediaKind::Video
+    } else if mime == "image/gif" {
+        MediaKind::Gif
+    } else {
+        MediaKind::Image
+    };
+    let name = caption
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            fetch_url
+                .split('?')
+                .next()
+                .and_then(|s| s.rsplit('/').next())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| format!("media-{index}"));
+    let file = MediaFile {
+        width: media.width,
+        height: media.height,
+        ..MediaFile::new(format!("comp:{message_id}:{index}"), kind)
+    };
+    rich.files.push((file.clone(), fetch_url.to_owned()));
+    Some(Attachment {
+        name,
+        file,
+        thumb: None,
+        preview: None,
+        mime,
+        duration: 0,
+        spoiler,
+        sticker: false,
+        waveform: Vec::new(),
+        round: false,
+        view_once: false,
+        sticker_set: String::new(),
+    })
+}
+
+/// Parses Discord message components (both v1 interactive action rows and v2 layout/display
+/// components) into `MessageControl`s, v2 text/attachments, and whether any component was dropped.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn extract_components(
+    components: &[Component],
+    message_id: &str,
+    app_id: &str,
+    flags: u64,
+    link: &str,
+    names: &dyn Names,
+    rich: &mut Rich,
+    attachments: &mut Vec<Attachment>,
+) -> (Vec<MessageControl>, bool) {
+    let block_id = format!("discord:{app_id}:{flags}");
+    let mut controls: Vec<MessageControl> = Vec::new();
+    let mut dropped = false;
+    let mut row_idx: u8 = 0;
+    let mut media_idx: usize = 0;
+
+    #[allow(clippy::too_many_arguments)]
+    fn visit(
+        comp: &Component,
+        row: u8,
+        row_idx: &mut u8,
+        media_idx: &mut usize,
+        message_id: &str,
+        block_id: &str,
+        names: &dyn Names,
+        rich: &mut Rich,
+        attachments: &mut Vec<Attachment>,
+        controls: &mut Vec<MessageControl>,
+        dropped: &mut bool,
+    ) {
+        if controls.len() >= MESSAGE_CONTROLS_LIMIT {
+            *dropped = true;
+            return;
+        }
+        match comp.kind {
+            // Type 1: Action Row
+            1 => {
+                let this_row = *row_idx;
+                *row_idx = row_idx.saturating_add(1);
+                for child in &comp.components {
+                    visit(child, this_row, row_idx, media_idx, message_id, block_id, names, rich, attachments, controls, dropped);
+                }
+            }
+            // Type 2: Button
+            2 => {
+                let style_num = comp.style.unwrap_or(2);
+                let label = comp.label.as_deref().unwrap_or("").trim().to_owned();
+                let emoji = component_emoji(comp.emoji.as_ref());
+                if style_num == 5 {
+                    // Link button: validate URL strictly (http/https only).
+                    if let Some(url) = comp.url.as_deref().filter(|u| is_safe_http_url(u)) {
+                        controls.push(MessageControl {
+                            block_id: block_id.to_owned(),
+                            action_id: format!("link_{}", controls.len()),
+                            element_type: "discord_button".to_owned(),
+                            label: if label.is_empty() && emoji.is_empty() { "Open link".to_owned() } else { label },
+                            value: String::new(),
+                            confirm: None,
+                            kind: ControlKind::Button { url: url.to_owned(), style: ControlStyle::Default },
+                            disabled: comp.disabled,
+                            emoji,
+                            row,
+                            min_values: 0,
+                            max_values: 0,
+                        });
+                    } else {
+                        *dropped = true;
+                    }
+                } else if style_num == 6 {
+                    // Premium / SKU purchase button: not supported.
+                    *dropped = true;
+                } else if let Some(custom_id) = comp.custom_id.as_deref().filter(|id| !id.is_empty()) {
+                    let style = match style_num {
+                        1 => ControlStyle::Primary,
+                        3 => ControlStyle::Success,
+                        4 => ControlStyle::Danger,
+                        _ => ControlStyle::Default,
+                    };
+                    controls.push(MessageControl {
+                        block_id: block_id.to_owned(),
+                        action_id: custom_id.to_owned(),
+                        element_type: "discord_button".to_owned(),
+                        label: if label.is_empty() && emoji.is_empty() { "Action".to_owned() } else { label },
+                        value: String::new(),
+                        confirm: None,
+                        kind: ControlKind::Button { url: String::new(), style },
+                        disabled: comp.disabled,
+                        emoji,
+                        row,
+                        min_values: 0,
+                        max_values: 0,
+                    });
+                } else {
+                    *dropped = true;
+                }
+            }
+            // Type 3: String Select
+            3 => {
+                if let Some(custom_id) = comp.custom_id.as_deref().filter(|id| !id.is_empty()) {
+                    let placeholder = comp
+                        .placeholder
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or("Make a selection")
+                        .trim()
+                        .to_owned();
+                    let mut selected = None;
+                    let options: Vec<ControlOption> = comp
+                        .options
+                        .iter()
+                        .map(|opt| {
+                            if opt.default && selected.is_none() {
+                                selected = Some(opt.value.clone());
+                            }
+                            let prefix = component_emoji(opt.emoji.as_ref());
+                            let label = if prefix.is_empty() {
+                                opt.label.clone()
+                            } else {
+                                format!("{prefix} {}", opt.label)
+                            };
+                            ControlOption {
+                                label,
+                                value: opt.value.clone(),
+                                description: opt.description.clone().unwrap_or_default(),
+                            }
+                        })
+                        .collect();
+                    controls.push(MessageControl {
+                        block_id: block_id.to_owned(),
+                        action_id: custom_id.to_owned(),
+                        element_type: "discord_string_select".to_owned(),
+                        label: String::new(),
+                        value: selected.clone().unwrap_or_default(),
+                        confirm: None,
+                        kind: ControlKind::Select {
+                            placeholder,
+                            options,
+                            selected,
+                            external: false,
+                        },
+                        disabled: comp.disabled,
+                        emoji: String::new(),
+                        row,
+                        min_values: comp.min_values.unwrap_or(1),
+                        max_values: comp.max_values.unwrap_or(1),
+                    });
+                } else {
+                    *dropped = true;
+                }
+            }
+            // Types 5..=8: User, Role, Mentionable, Channel selects. The shell posts the picked
+            // ids the same way a string select posts its value. They are not permalinks.
+            5 | 6 | 7 | 8 => {
+                let (element_type, fallback_placeholder) = match comp.kind {
+                    5 => ("discord_user_select", "Select a user"),
+                    6 => ("discord_role_select", "Select a role"),
+                    7 => ("discord_mentionable_select", "Select a user or role"),
+                    _ => ("discord_channel_select", "Select a channel"),
+                };
+                if let Some(custom_id) = comp.custom_id.as_deref().filter(|id| !id.is_empty()) {
+                    let placeholder = comp
+                        .placeholder
+                        .as_deref()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or(fallback_placeholder)
+                        .trim()
+                        .to_owned();
+                    let options = names
+                        .choices(comp.kind)
+                        .into_iter()
+                        .map(|(value, label)| ControlOption {
+                            label,
+                            value,
+                            description: String::new(),
+                        })
+                        .collect();
+                    controls.push(MessageControl {
+                        block_id: block_id.to_owned(),
+                        action_id: custom_id.to_owned(),
+                        element_type: element_type.to_owned(),
+                        label: String::new(),
+                        value: String::new(),
+                        confirm: None,
+                        kind: ControlKind::Select {
+                            placeholder,
+                            options,
+                            selected: None,
+                            external: false,
+                        },
+                        disabled: comp.disabled,
+                        emoji: String::new(),
+                        row,
+                        min_values: comp.min_values.unwrap_or(1),
+                        max_values: comp.max_values.unwrap_or(1),
+                    });
+                } else {
+                    // No custom id, so the menu cannot be sent. The shell offers Open in Discord.
+                    *dropped = true;
+                }
+            }
+            // Type 9: Section (v2) — child text displays + optional accessory (button or thumbnail)
+            9 => {
+                for child in &comp.components {
+                    visit(child, row, row_idx, media_idx, message_id, block_id, names, rich, attachments, controls, dropped);
+                }
+                if let Some(accessory) = comp.accessory.as_deref() {
+                    let this_row = *row_idx;
+                    if accessory.kind == 2 {
+                        *row_idx = row_idx.saturating_add(1);
+                    }
+                    visit(accessory, this_row, row_idx, media_idx, message_id, block_id, names, rich, attachments, controls, dropped);
+                }
+            }
+            // Type 10: Text Display (v2)
+            10 => {
+                if let Some(text) = comp.content.as_deref().filter(|s| !s.is_empty()) {
+                    if !rich.text.is_empty() && !rich.text.ends_with('\n') {
+                        rich.text.push('\n');
+                    }
+                    markdown(rich, text, names);
+                }
+            }
+            // Type 11: Thumbnail (v2)
+            11 => {
+                if let Some(media) = comp.media.as_ref() {
+                    let idx = *media_idx;
+                    *media_idx += 1;
+                    if let Some(att) = component_media_attachment(rich, message_id, idx, media, false, false, None) {
+                        attachments.push(att);
+                    }
+                }
+            }
+            // Type 12: Media Gallery (v2)
+            12 => {
+                for item in &comp.items {
+                    if let Some(media) = item.media.as_ref() {
+                        let idx = *media_idx;
+                        *media_idx += 1;
+                        if let Some(att) = component_media_attachment(
+                            rich,
+                            message_id,
+                            idx,
+                            media,
+                            false,
+                            item.spoiler,
+                            item.description.as_deref(),
+                        ) {
+                            attachments.push(att);
+                        }
+                    }
+                }
+            }
+            // Type 13: File (v2)
+            13 => {
+                if let Some(media) = comp.file.as_ref() {
+                    let idx = *media_idx;
+                    *media_idx += 1;
+                    if let Some(att) = component_media_attachment(rich, message_id, idx, media, true, false, None) {
+                        attachments.push(att);
+                    }
+                }
+            }
+            // Type 14: Separator (v2)
+            14 => {
+                if !rich.text.is_empty() && !rich.text.ends_with("\n\n") {
+                    rich.text.push('\n');
+                }
+            }
+            // Type 17: Container (v2)
+            17 => {
+                for child in &comp.components {
+                    visit(child, row, row_idx, media_idx, message_id, block_id, names, rich, attachments, controls, dropped);
+                }
+            }
+            _ => {
+                *dropped = true;
+            }
+        }
+    }
+
+    for comp in components {
+        visit(
+            comp,
+            row_idx,
+            &mut row_idx,
+            &mut media_idx,
+            message_id,
+            &block_id,
+            names,
+            rich,
+            attachments,
+            &mut controls,
+            &mut dropped,
+        );
+    }
+
+    // Always offer "Open in Discord" when any component could not be rendered locally.
+    if dropped && is_safe_http_url(link) && controls.len() < MESSAGE_CONTROLS_LIMIT {
+        controls.push(MessageControl {
+            block_id,
+            action_id: "open_in_discord".to_owned(),
+            element_type: "discord_open_link".to_owned(),
+            label: "Open in Discord".to_owned(),
+            value: String::new(),
+            confirm: None,
+            kind: ControlKind::Button { url: link.to_owned(), style: ControlStyle::Default },
+            disabled: false,
+            emoji: String::new(),
+            row: row_idx,
+            min_values: 0,
+            max_values: 0,
+        });
+    }
+
+    (controls, dropped)
 }
 
 #[cfg(test)]
@@ -1485,12 +2069,14 @@ mod tests {
 
     #[test]
     fn mentions_read_as_names_and_emoji_as_their_name() {
-        let rich = parsed("<@7> <@!9> in <#5> cc <@&3> @everyone <:party:42> <a:spin:43>");
-        assert_eq!(rich.text, "@Priya @someone in #deploys cc @mods @everyone :party: :spin:");
+        let rich = parsed("<@7> <@!9> in <#5> cc <@&3> @everyone <:party:42> <a:spin:43> </ship:123>");
+        assert_eq!(rich.text, "@Priya @someone in #deploys cc @mods @everyone :party: :spin: /ship");
         let user = Style::Mention { kind: MentionKind::User, id: "7".into() };
         assert_eq!(styled(&rich, &user), ["@Priya"]);
         let everyone = Style::Mention { kind: MentionKind::Everyone, id: "everyone".into() };
         assert_eq!(styled(&rich, &everyone), ["@everyone"]);
+        let command = Style::Mention { kind: MentionKind::Command, id: "123".into() };
+        assert_eq!(styled(&rich, &command), ["/ship"]);
         let emoji: Vec<&str> = rich.files.files.iter().map(|(file, _)| file.id.as_str()).collect();
         assert_eq!(emoji, ["emoji:42", "emoji:43"]);
     }
@@ -1660,6 +2246,234 @@ mod tests {
         assert_eq!(m.call.as_ref().and_then(|c| c.seconds), Some(720));
         assert_eq!(m.call.as_ref().map(|c| c.participants.len()), Some(2));
         assert_eq!(m.text, "Call with Bea · 12 min");
+    }
+
+    #[test]
+    fn entity_selects_offer_ids_instead_of_a_permalink() {
+        struct Listed;
+        impl Names for Listed {
+            fn user(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn role(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn channel(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn space(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn choices(&self, kind: u8) -> Vec<(String, String)> {
+                match kind {
+                    5 => vec![("2001".into(), "Mara".into())],
+                    6 => vec![("4000".into(), "mods".into())],
+                    8 => vec![("4101".into(), "general".into())],
+                    _ => Vec::new(),
+                }
+            }
+        }
+        let comps: Vec<Component> = serde_json::from_value(serde_json::json!([
+            {"type": 5, "custom_id": "who", "placeholder": "Who"},
+            {"type": 6, "custom_id": "which_role"},
+            {"type": 8, "custom_id": "which_channel"}
+        ]))
+        .unwrap();
+        let mut rich = Rich::default();
+        let mut attachments = Vec::new();
+        let (controls, dropped) = extract_components(&comps, "m1", "app", 0, "https://discord.com/channels/g/c/m1", &Listed, &mut rich, &mut attachments);
+        assert!(!dropped);
+        assert_eq!(controls.len(), 3);
+        assert!(matches!(
+            &controls[0].kind,
+            ControlKind::Select { external: false, options, .. }
+                if options.iter().any(|opt| opt.value == "2001" && opt.label == "Mara")
+        ));
+        assert_eq!(controls[0].element_type, "discord_user_select");
+        assert!(matches!(
+            &controls[1].kind,
+            ControlKind::Select { external: false, options, .. } if options.iter().any(|opt| opt.value == "4000")
+        ));
+        assert!(matches!(
+            &controls[2].kind,
+            ControlKind::Select { external: false, options, .. } if options.iter().any(|opt| opt.value == "4101" && opt.label == "general")
+        ));
+        assert_eq!(controls[2].element_type, "discord_channel_select");
+    }
+
+    #[test]
+    fn components_v1_and_v2_extract_controls_text_and_open_in_discord_fallback() {
+        struct Empty;
+        impl Names for Empty {
+            fn user(&self, _: &str) -> Option<String> { None }
+            fn role(&self, _: &str) -> Option<String> { None }
+            fn channel(&self, _: &str) -> Option<String> { None }
+            fn space(&self, _: &str) -> Option<String> { None }
+        }
+        let account = AccountKey { network: protocol::Network::Discord, account: "acct".into() };
+        let place = Place { account: &account, me: "me", guild: Some("4000"), names: &Empty, author: None, blur_explicit: false };
+
+        // 1. V1 action rows: primary/success/danger/link buttons (invalid link rejected) + string select.
+        let posted: Posted = serde_json::from_value(serde_json::json!({
+            "id": "1300000000000000100",
+            "channel_id": "4101",
+            "application_id": "9001",
+            "author": {"id": "9001", "username": "DeployBot", "bot": true},
+            "content": "Choose a target:",
+            "flags": 0,
+            "components": [
+                {
+                    "type": 1,
+                    "components": [
+                        {"type": 2, "style": 3, "label": "Approve", "custom_id": "approve_1", "emoji": {"name": "✅"}},
+                        {"type": 2, "style": 4, "label": "Reject", "custom_id": "reject_1", "disabled": true},
+                        {"type": 2, "style": 5, "label": "Docs", "url": "https://example.com/docs"},
+                        {"type": 2, "style": 5, "label": "BadLink", "url": "javascript:alert(1)"}
+                    ]
+                },
+                {
+                    "type": 1,
+                    "components": [
+                        {
+                            "type": 3,
+                            "custom_id": "env_pick",
+                            "placeholder": "Pick env",
+                            "min_values": 1,
+                            "max_values": 2,
+                            "options": [
+                                {"label": "Staging", "value": "staging", "description": "Pre-prod", "default": true},
+                                {"label": "Prod", "value": "prod"}
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }))
+        .unwrap();
+        let (mut m, _) = message(&posted, &place);
+        assert_eq!(m.kind, MessageKind::Normal);
+        // 3 valid buttons + 1 string select + 1 "Open in Discord" fallback (because BadLink was dropped).
+        assert_eq!(m.controls.len(), 5);
+        assert_eq!(m.controls[0].action_id, "approve_1");
+        assert_eq!(m.controls[0].emoji, "✅");
+        assert_eq!(m.controls[0].row, 0);
+        assert_eq!(m.controls[0].block_id, "discord:9001:0");
+        assert_eq!(m.controls[0].kind, ControlKind::Button { url: String::new(), style: ControlStyle::Success });
+        assert!(m.controls[1].disabled);
+        assert_eq!(m.controls[2].kind, ControlKind::Button { url: "https://example.com/docs".into(), style: ControlStyle::Default });
+        assert_eq!(m.controls[3].row, 1);
+        assert_eq!((m.controls[3].min_values, m.controls[3].max_values), (1, 2));
+        assert!(matches!(&m.controls[3].kind, ControlKind::Select { selected: Some(s), options, .. } if s == "staging" && options[0].description == "Pre-prod"));
+        assert_eq!(m.controls[4].label, "Open in Discord");
+        assert!(matches!(&m.controls[4].kind, ControlKind::Button { url, .. } if url == "https://discord.com/channels/4000/4101/1300000000000000100"));
+
+        // 2. Partial MESSAGE_UPDATE replaces controls (e.g. disabling button after press).
+        let upd: Posted = serde_json::from_value(serde_json::json!({
+            "id": "1300000000000000100",
+            "channel_id": "4101",
+            "components": [
+                {"type": 1, "components": [{"type": 2, "style": 3, "label": "Approved", "custom_id": "approve_1", "disabled": true}]}
+            ]
+        }))
+        .unwrap();
+        patch(&mut m, &upd, &place);
+        assert_eq!(m.controls.len(), 1);
+        assert_eq!(m.controls[0].label, "Approved");
+        assert!(m.controls[0].disabled);
+
+        // 3. Components V2: Container + Section + Text Display + Button accessory + Media Gallery.
+        let v2: Posted = serde_json::from_value(serde_json::json!({
+            "id": "1300000000000000101",
+            "channel_id": "4101",
+            "author": {"id": "9001", "username": "Bot", "bot": true},
+            "content": "",
+            "flags": 32768,
+            "components": [
+                {
+                    "type": 17,
+                    "components": [
+                        {
+                            "type": 9,
+                            "components": [{"type": 10, "content": "**Release v2** is ready"}],
+                            "accessory": {"type": 2, "style": 1, "label": "Ship", "custom_id": "ship_v2"}
+                        },
+                        {
+                            "type": 12,
+                            "items": [{"media": {"url": "https://cdn.discordapp.com/a.png", "width": 640, "height": 480, "content_type": "image/png"}}]
+                        }
+                    ]
+                }
+            ]
+        }))
+        .unwrap();
+        let (m2, files2) = message(&v2, &place);
+        assert_eq!(m2.kind, MessageKind::Normal);
+        assert_eq!(m2.text, "Release v2 is ready");
+        assert_eq!(m2.controls.len(), 1);
+        assert_eq!(m2.controls[0].label, "Ship");
+        assert_eq!(m2.attachments.len(), 1);
+        assert!(files2.files.iter().any(|(_, url)| url == "https://cdn.discordapp.com/a.png"));
+    }
+
+    #[test]
+    fn a_command_reply_names_who_used_it_and_marks_ephemeral_silent_and_thinking() {
+        let account = AccountKey { network: protocol::Network::Discord, account: "test".into() };
+        let place = Place { account: &account, me: "400", guild: Some("4000"), names: &Nobody, author: None, blur_explicit: false };
+        let posted: Posted = serde_json::from_value(serde_json::json!({
+            "id": "1300000000000000200",
+            "channel_id": "4101",
+            "type": 20,
+            "content": "shipped",
+            "flags": 64,
+            "author": {"id": "9001", "username": "helper", "global_name": "Helper", "bot": true},
+            "interaction_metadata": {
+                "id": "9100",
+                "type": 2,
+                "name": "ship",
+                "user": {"id": "7", "username": "priya", "global_name": "Priya"}
+            },
+            "message_reference": {"type": 0, "channel_id": "4101", "guild_id": "5000", "message_id": "1300000000000000100"}
+        }))
+        .unwrap();
+        let (mut decoded, _) = message(&posted, &place);
+        assert!(decoded.ephemeral);
+        assert!(!decoded.loading && !decoded.silent);
+        assert_eq!(decoded.kind, MessageKind::Normal);
+        assert_eq!(decoded.text, "shipped");
+        let via = decoded.via.as_ref().unwrap();
+        assert_eq!((via.who.as_str(), via.command.as_str()), ("Priya", "ship"));
+
+        let mut quiet = posted.clone();
+        quiet.flags = Some(model::FLAG_SUPPRESS_NOTIFICATIONS | 2);
+        quiet.interaction_metadata = None;
+        quiet.content = Some("followed".into());
+        let (cross, _) = message(&quiet, &place);
+        assert!(cross.silent);
+        let from = cross.forwarded.unwrap();
+        assert_eq!((from.from_title.as_str(), from.from_space.as_str()), ("#deploys", "Moss"));
+
+        let mut thinking = posted.clone();
+        thinking.content = Some(String::new());
+        thinking.flags = Some(model::FLAG_LOADING);
+        thinking.interaction = Some(model::InteractionMeta {
+            kind: 2,
+            name: Some("ship".into()),
+            user: Some(model::User { id: "7".into(), username: "priya".into(), global_name: Some("Priya".into()), ..Default::default() }),
+        });
+        thinking.interaction_metadata = None;
+        let (thought, _) = message(&thinking, &place);
+        assert!(thought.loading);
+        assert_eq!(thought.text, "Helper is thinking…");
+        assert_eq!(thought.kind, MessageKind::Normal);
+        assert_eq!(thought.via.unwrap().command, "ship");
+
+        // A partial update that omits flags must not clear the only-you mark.
+        let update = Posted { content: Some("still here".into()), ..Posted::default() };
+        assert!(update.flags.is_none());
+        patch(&mut decoded, &update, &place);
+        assert!(decoded.ephemeral);
+        assert_eq!(decoded.text, "still here");
+        assert_eq!(decoded.via.as_ref().map(|via| via.command.as_str()), Some("ship"));
     }
 
     #[test]

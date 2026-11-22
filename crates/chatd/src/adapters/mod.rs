@@ -1363,6 +1363,46 @@ pub enum Command {
     /// The user signed out: end the session on the network, best effort, then answer. chatd
     /// waits five seconds for the answer and forgets the account either way.
     SignOut(Reply<()>),
+    /// List slash or context-menu commands usable in `conversation_id`.
+    Commands {
+        conversation_id: String,
+        query: String,
+        kind: Option<protocol::CommandKind>,
+        reply: Reply<Vec<protocol::AppCommand>>,
+    },
+    /// Ask the network for live autocomplete choices on `focused` option.
+    CommandAutocomplete {
+        conversation_id: String,
+        command_id: String,
+        application_id: String,
+        version: String,
+        name: String,
+        options: Vec<protocol::CommandArg>,
+        focused: String,
+        reply: Reply<Vec<protocol::CommandChoice>>,
+    },
+    /// Execute a slash command or context-menu command (`kind`, `target_id`).
+    RunCommand {
+        conversation_id: String,
+        command_id: String,
+        application_id: String,
+        version: String,
+        kind: protocol::CommandKind,
+        name: String,
+        arguments: Vec<protocol::CommandArg>,
+        target_id: Option<String>,
+        files: Vec<protocol::OutgoingFile>,
+        reply: Reply<()>,
+    },
+    /// Submit an interaction modal form.
+    ModalSubmit {
+        conversation_id: String,
+        modal_id: String,
+        application_id: String,
+        custom_id: String,
+        values: Vec<(String, String)>,
+        reply: Reply<()>,
+    },
     /// The adapter is being dropped. `serve_commands` returns on it; an adapter never sees it.
     Stop,
 }
@@ -1480,6 +1520,10 @@ impl Command {
             Command::EndSession { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::UnreadItems { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MarkUnreadItemsRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Commands { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CommandAutocomplete { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::RunCommand { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ModalSubmit { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Forward { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SaveGif { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StickerSet { reply, .. } | Command::FaveSticker { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -2105,6 +2149,15 @@ impl Context {
         Ok(())
     }
 
+    /// Drops every ephemeral message of this account and tells the shell which chats changed.
+    pub fn drop_ephemeral(&self) -> rusqlite::Result<Vec<String>> {
+        let conversations = self.hub.store().drop_ephemeral(&self.account)?;
+        for id in &conversations {
+            self.hub.changed(Change::Messages { conversation: self.key(id) });
+        }
+        Ok(conversations)
+    }
+
     /// A message is gone. One with a thread hanging off it stays as a tombstone, and replies to
     /// it say their original was deleted.
     pub fn deleted(&self, conversation_id: &str, message_id: &str) -> Stores {
@@ -2396,6 +2449,24 @@ impl Context {
             activity: Compose::Typing,
         };
         self.hub.set_typing(self.key(conversation_id), typist, false);
+    }
+
+    /// A bot/app opened a modal form in response to a control or command.
+    pub fn interaction_modal(&self, conversation_id: &str, modal: protocol::InteractionModal) {
+        self.hub.changed(Change::InteractionModal {
+            conversation: self.key(conversation_id),
+            modal,
+        });
+    }
+
+    /// An asynchronous interaction failed (button, select, slash command, or modal).
+    pub fn interaction_failed(&self, conversation_id: &str, message_id: &str, action_id: &str, reason: &str) {
+        self.hub.changed(Change::InteractionFailed {
+            conversation: self.key(conversation_id),
+            message_id: message_id.to_owned(),
+            action_id: action_id.to_owned(),
+            reason: reason.to_owned(),
+        });
     }
 
     /// What the shell has on screen, across every account. Also arrives as `Command::Watch`.

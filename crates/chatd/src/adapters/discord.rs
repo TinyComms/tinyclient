@@ -22,6 +22,8 @@ pub(super) fn prove_code_colors() -> Result<(), String> {
 pub(super) mod gateway;
 mod info;
 mod manage;
+mod commands;
+mod interactions;
 mod members;
 mod model;
 mod picker;
@@ -637,6 +639,12 @@ struct State {
     nsfw_channels: HashSet<String>,
     /// Debounced category collapse/expand writes waiting to PATCH guild settings.
     collapses: CollapseQueue,
+    /// In-flight interaction nonces waiting on gateway settlement or modal popups.
+    pending_interactions: HashMap<String, interactions::PendingInteraction>,
+    /// Application-command indexes for this session: `guild:{id}`, `dm:{channel}`, or `user`.
+    command_index: HashMap<String, Vec<protocol::AppCommand>>,
+    /// Autocomplete waiters keyed by interaction nonce. The command thread waits; the gateway sends.
+    autocomplete: HashMap<String, std::sync::mpsc::Sender<Vec<protocol::CommandChoice>>>,
 }
 
 /// One channel's read acknowledgements.
@@ -797,7 +805,101 @@ struct Lookup<'a> {
     mentions: &'a [User],
 }
 
+const ENTITY_CHOICES: usize = 100;
+
+impl Lookup<'_> {
+    fn user_choices(&self) -> Vec<(String, String)> {
+        let state = crate::hub::lock(&self.discord.state);
+        let mut rows: Vec<(String, String)> = state
+            .users
+            .iter()
+            .filter(|(id, name)| !id.is_empty() && !name.is_empty())
+            .map(|(id, name)| (id.clone(), name.clone()))
+            .collect();
+        for user in self.mentions {
+            if user.id.is_empty() || rows.iter().any(|(id, _)| id == &user.id) {
+                continue;
+            }
+            let nick = user.member.as_ref().and_then(|member| member.nick.clone());
+            let name = nick.filter(|nick| !nick.is_empty()).unwrap_or_else(|| user.name().to_owned());
+            if !name.is_empty() {
+                rows.push((user.id.clone(), name));
+            }
+        }
+        rows
+    }
+
+    fn role_choices(&self) -> Vec<(String, String)> {
+        let state = crate::hub::lock(&self.discord.state);
+        let Some(guild) = self.guild.and_then(|id| state.guilds.get(id)) else {
+            return Vec::new();
+        };
+        guild
+            .roles
+            .iter()
+            .filter(|(id, role)| **id != 0 && !role.name.is_empty())
+            .map(|(id, role)| (id.to_string(), role.name.clone()))
+            .collect()
+    }
+
+    fn channel_choices(&self) -> Vec<(String, String)> {
+        let ids: Vec<String> = {
+            let state = crate::hub::lock(&self.discord.state);
+            let Some(guild) = self.guild.and_then(|id| state.guilds.get(id)) else {
+                return Vec::new();
+            };
+            guild.channels.iter().map(|(id, _)| id.to_string()).collect()
+        };
+        let mut rows = Vec::new();
+        for id in ids {
+            if rows.iter().any(|(known, _)| known == &id) {
+                continue;
+            }
+            let Ok(Some(row)) = self.discord.ctx.known(&id) else {
+                continue;
+            };
+            if !matches!(
+                row.kind,
+                ConversationKind::Channel | ConversationKind::Announcement | ConversationKind::Voice | ConversationKind::Forum
+            ) {
+                continue;
+            }
+            let name = row.title.trim_start_matches('#').trim();
+            if name.is_empty() {
+                continue;
+            }
+            rows.push((id, name.to_owned()));
+        }
+        rows
+    }
+}
+
+fn sort_choices(rows: &mut Vec<(String, String)>) {
+    rows.sort_by(|a, b| a.1.to_ascii_lowercase().cmp(&b.1.to_ascii_lowercase()).then(a.0.cmp(&b.0)));
+    rows.truncate(ENTITY_CHOICES);
+}
+
 impl Names for Lookup<'_> {
+    fn choices(&self, kind: u8) -> Vec<(String, String)> {
+        let mut rows = match kind {
+            5 => self.user_choices(),
+            6 => self.role_choices(),
+            7 => {
+                let mut rows = self.user_choices();
+                for role in self.role_choices() {
+                    if !rows.iter().any(|(id, _)| id == &role.0) {
+                        rows.push(role);
+                    }
+                }
+                rows
+            }
+            8 => self.channel_choices(),
+            _ => return Vec::new(),
+        };
+        sort_choices(&mut rows);
+        rows
+    }
+
     fn user(&self, id: &str) -> Option<String> {
         if let Some(user) = self.mentions.iter().find(|user| user.id == id) {
             let nick = user.member.as_ref().and_then(|member| member.nick.clone());
@@ -1559,7 +1661,14 @@ impl Discord {
     }
 
     fn delete(&self, channel: &str, message: &str) -> Result<(), Refusal> {
-        self.call("DELETE", &format!("/channels/{channel}/messages/{message}"), None).map_err(refusal)?;
+        let ephemeral = self.ctx.stored_message(channel, message).ok().flatten().is_some_and(|stored| stored.ephemeral);
+        let removed = self.call("DELETE", &format!("/channels/{channel}/messages/{message}"), None).map_err(refusal);
+        // Dismiss always drops an only-you reply. Discord may refuse the DELETE.
+        if ephemeral {
+            self.ctx.deleted(channel, message).map_err(|err| Refusal::Refused(err.to_string()))?;
+            return Ok(());
+        }
+        removed?;
         self.ctx.deleted(channel, message).map_err(|err| Refusal::Refused(err.to_string()))
     }
 
@@ -3668,9 +3777,85 @@ impl Discord {
             Command::CallAddPeople { conversation_id, people, reply } => {
                 answer(reply, self.call_add_people(&conversation_id, people))
             }
+            Command::MessageAction {
+                conversation_id,
+                message_id,
+                block_id,
+                action_id,
+                element_type,
+                value,
+                values,
+                reply,
+            } => answer(
+                reply,
+                self.message_action(
+                    &conversation_id,
+                    &message_id,
+                    &block_id,
+                    &action_id,
+                    &element_type,
+                    &value,
+                    values,
+                ),
+            ),
+            Command::Commands { conversation_id, query, kind, reply } => {
+                answer(reply, self.commands(&conversation_id, &query, kind))
+            }
+            Command::CommandAutocomplete {
+                conversation_id,
+                command_id,
+                application_id,
+                version,
+                name,
+                options,
+                focused,
+                reply,
+            } => answer(
+                reply,
+                self.command_autocomplete(&conversation_id, &command_id, &application_id, &version, &name, &options, &focused),
+            ),
+            Command::RunCommand {
+                conversation_id,
+                command_id,
+                application_id,
+                version,
+                kind,
+                name,
+                arguments,
+                target_id,
+                files,
+                reply,
+            } => answer(
+                reply,
+                self.run_command(
+                    &conversation_id,
+                    &command_id,
+                    &application_id,
+                    &version,
+                    kind,
+                    &name,
+                    &arguments,
+                    target_id.as_deref(),
+                    &files,
+                ),
+            ),
+            Command::ModalSubmit {
+                conversation_id,
+                modal_id,
+                application_id,
+                custom_id,
+                values,
+                reply,
+            } => answer(
+                reply,
+                self.modal_submit(&conversation_id, &modal_id, &application_id, &custom_id, values),
+            ),
             // The user asked to sign out, so the token should stop working, not just be
             // forgotten: the answer goes once Discord has ended the session, or refused to.
             Command::SignOut(done) => {
+                if let Err(err) = self.ctx.drop_ephemeral() {
+                    self.log("sign out", err);
+                }
                 let body = json!({"provider": null, "voip_provider": null});
                 if let Err(refused) = self.call("POST", "/auth/logout", Some(body)) {
                     self.log("sign out", refused);

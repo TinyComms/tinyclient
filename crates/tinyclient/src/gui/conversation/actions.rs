@@ -9,16 +9,20 @@ use super::{Pane, PaneEvent};
 use crate::client::ask;
 use crate::gui::components::place::{max_height, placed, Layer, Place};
 use crate::gui::components::{
-    button, fade_in, menu, menu_item, menu_item_danger, menu_separator, menu_step, modal, modal_body, modal_buttons, popover, tip,
-    ButtonKind,
+    button, fade_in, menu, menu_item, menu_item_danger, menu_item_more, menu_label, menu_separator, menu_step, modal, modal_body,
+    modal_buttons, popover, tip, ButtonKind,
 };
 use crate::gui::theme::{self, Type};
 use crate::gui::time;
 use gpui::{
-    anchored, deferred, div, point, prelude::*, px, AnyElement, Bounds, ClipboardItem, Context, Div, ElementId, Entity,
-    KeyDownEvent, MouseButton, Pixels, Point, SharedString, Stateful, Subscription, Window,
+    anchored, canvas, deferred, div, point, prelude::*, px, AnyElement, Bounds, ClipboardItem, Context, Div, ElementId, Entity,
+    KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, SharedString, Stateful, Subscription, Window,
 };
-use protocol::{Capabilities, ConversationKind, ConversationRights, ErrorCode, Message, MessageKind, Network, ReactionRules, Request, Response, SendState};
+use protocol::{
+    AppCommand, Capabilities, CommandKind, ConversationKind, ConversationRights, ErrorCode, Message, MessageKind, Network,
+    ReactionRules, Request, Response, SendState,
+};
+use std::cell::Cell;
 use std::rc::Rc;
 
 /// Pending confirmation sheet for spending Telegram Stars on a paid reaction (#517).
@@ -109,6 +113,8 @@ pub struct Menu {
     /// The reaction whose reactors the menu lists, by its place on the message and whether it is a super reaction.
     /// `None` for the message's own menu.
     pub reactor: Option<(usize, bool)>,
+    /// The Apps submenu is open beside this menu.
+    pub apps: bool,
 }
 
 /// The forward / copy-to picker, open for one message.
@@ -746,6 +752,7 @@ impl Pane {
             || self.follow.is_some()
             || self.action_confirm.is_some()
             || self.open_select.is_some()
+            || self.interaction_modal.is_some()
             || self.link_ask.is_some()
             || self.viewer.is_some()
             || self.text_viewer.is_some()
@@ -780,6 +787,7 @@ impl Pane {
             || self.follow.is_some()
             || self.action_confirm.is_some()
             || self.open_select.is_some()
+            || self.interaction_modal.is_some()
             || self.link_ask.is_some()
             || self.viewer.is_some()
             || self.text_viewer.is_some();
@@ -849,6 +857,8 @@ impl Pane {
             cx.notify();
         } else if self.follow.is_some() {
             self.follow = None;
+        } else if self.interaction_modal.is_some() {
+            self.interaction_modal = None;
             cx.notify();
         } else if self.action_confirm.is_some() {
             self.action_confirm = None;
@@ -1222,8 +1232,12 @@ impl Pane {
         self.close_picker(cx);
         self.revisions = None;
         self.hover = Some(message.id.clone());
-        self.menu = Some(Menu { message, at,
-            cursor: 0, reactor: None });
+        self.apps_anchor.set(None);
+        self.apps_menu.set(None);
+        self.menu = Some(Menu { message, at, cursor: 0, reactor: None, apps: false });
+        if let Some(key) = self.key().filter(|key| key.network == Network::Discord).cloned() {
+            let _ = self.shell.update(cx, |shell, cx| shell.ask_app_commands(key, CommandKind::Message, cx));
+        }
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -1276,8 +1290,9 @@ impl Pane {
                 }
             }
         }
-        self.menu = Some(Menu { message, at,
-            cursor: 0, reactor: Some((reaction, burst)) });
+        self.apps_anchor.set(None);
+        self.apps_menu.set(None);
+        self.menu = Some(Menu { message, at, cursor: 0, reactor: Some((reaction, burst)), apps: false });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -1648,6 +1663,30 @@ impl Pane {
                         .child(words),
                 )
         };
+        let row_app = |ix: usize, words: String| {
+            div()
+                .id(("sheet-app", ix))
+                .h(px(row_height))
+                .mx(px(8.))
+                .px(px(12.))
+                .rounded(px(theme::R_CARD))
+                .flex()
+                .items_center()
+                .gap(px(14.))
+                .cursor_pointer()
+                .active(|style| style.bg(theme::pressed()))
+                .child(crate::gui::components::glyph("icons/bot.svg", 20., theme::text_soft()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(tokens::scaled(16.)))
+                        .line_height(px(tokens::scaled(22.)))
+                        .text_color(theme::text())
+                        .child(words),
+                )
+        };
         let rule = || div().flex_none().h(px(1.)).mx(px(20.)).my(px(4.)).bg(theme::hairline());
         let then = |act: fn(&mut Pane, &Rc<Message>, &mut Window, &mut Context<Pane>)| {
             let message = message.clone();
@@ -1801,6 +1840,34 @@ impl Pane {
                         .into_any_element(),
                 );
             }
+            let apps = self.message_app_commands(cx);
+            if !apps.is_empty() {
+                rows.push(rule().into_any_element());
+                rows.push(
+                    div()
+                        .px(px(20.))
+                        .py(px(6.))
+                        .text_size(px(tokens::scaled(13.)))
+                        .text_color(theme::text_faint())
+                        .child("Apps")
+                        .into_any_element(),
+                );
+                for (ix, command) in apps.into_iter().enumerate() {
+                    let words = if command.app_name.is_empty() {
+                        command.name.clone()
+                    } else {
+                        format!("{} · {}", command.app_name, command.name)
+                    };
+                    let target = message.id.clone();
+                    rows.push(
+                        row_app(ix, words)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.run_message_app(command.clone(), target.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
+            }
             if can.report {
                 rows.push(rule().into_any_element());
                 rows.push(
@@ -1924,6 +1991,83 @@ impl Pane {
             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.close_menu(cx)))
             .child(panel);
         Some(deferred(anchored().position(point(px(0.), px(0.))).child(fade_in("message-sheet", 160, scrim))).priority(1).into_any_element())
+    }
+
+    /// Discord message commands for the open conversation, apps then names.
+    fn message_app_commands(&self, cx: &Context<Self>) -> Vec<AppCommand> {
+        let Some(key) = self.key().filter(|key| key.network == Network::Discord) else {
+            return Vec::new();
+        };
+        let mut commands = self
+            .shell
+            .upgrade()
+            .and_then(|shell| shell.read(cx).message_commands.get(key).cloned())
+            .unwrap_or_default();
+        commands.retain(|command| command.kind == CommandKind::Message && !command.application_id.is_empty());
+        commands.sort_by(|a, b| {
+            a.app_name
+                .to_ascii_lowercase()
+                .cmp(&b.app_name.to_ascii_lowercase())
+                .then(a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+        });
+        commands
+    }
+
+    /// Opens the Apps submenu. Its row is measured while painting, so the list is placed on the next frame.
+    fn show_apps(&mut self, cx: &mut Context<Self>) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        if menu.apps {
+            return;
+        }
+        menu.apps = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(16)).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
+    }
+
+    fn run_message_app(&mut self, command: AppCommand, target: String, cx: &mut Context<Self>) {
+        let Some(conversation) = self.key().cloned() else {
+            return;
+        };
+        self.close_menu(cx);
+        let _ = self.shell.update(cx, |shell, cx| shell.run_app_command(conversation, command, target, cx));
+    }
+
+    fn apps_submenu(&self, message_id: &str, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.menu.as_ref().is_some_and(|menu| menu.apps) {
+            return None;
+        }
+        let anchor = self.apps_anchor.get()?;
+        let commands = self.message_app_commands(cx);
+        if commands.is_empty() {
+            return None;
+        }
+        let mark = self.apps_menu.clone();
+        let mut list = menu().w(px(220.)).relative().child(
+            canvas(move |bounds, _, _| mark.set(Some(bounds)), |_, _, _, _| {}).absolute().top_0().left_0().size_full(),
+        );
+        let mut last = String::new();
+        for (ix, command) in commands.iter().enumerate() {
+            if !command.app_name.is_empty() && command.app_name != last {
+                if !last.is_empty() {
+                    list = list.child(menu_separator());
+                }
+                list = list.child(menu_label(command.app_name.clone()));
+                last = command.app_name.clone();
+            }
+            let (chosen, target) = (command.clone(), message_id.to_owned());
+            list = list.child(menu_item(("app-cmd", ix), None, command.name.clone(), None).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.run_message_app(chosen.clone(), target.clone(), cx);
+                },
+            )));
+        }
+        Some(placed("message-apps", Place::Beside(anchor), Layer::Menu, window, list))
     }
 
     fn menu_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -2101,14 +2245,45 @@ impl Pane {
                 );
             }
         }
-        let items = items.on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_menu(cx)));
-        Some(placed(
+        let commands = if can.unsent { Vec::new() } else { self.message_app_commands(cx) };
+        if !commands.is_empty() {
+            let open = self.menu.as_ref().is_some_and(|menu| menu.apps);
+            let mut row = menu_item_more("apps", Some("icons/bot.svg"), "Apps", open)
+                .on_hover(cx.listener(|this, over: &bool, _, cx| {
+                    if *over {
+                        this.show_apps(cx);
+                    }
+                }))
+                .on_click(cx.listener(|this, _, _, cx| this.show_apps(cx)));
+            if open {
+                let anchor = self.apps_anchor.clone();
+                row = row.relative().child(
+                    canvas(move |bounds, _, _| anchor.set(Some(bounds)), |_, _, _, _| {})
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                );
+            }
+            items = items.child(menu_separator()).child(row);
+        }
+        let (row_at, menu_at) = (self.apps_anchor.clone(), self.apps_menu.clone());
+        let items = items.on_mouse_down_out(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+            let at = event.position;
+            let on_apps = row_at.get().is_some_and(|bounds| bounds.contains(&at)) || menu_at.get().is_some_and(|bounds| bounds.contains(&at));
+            if !on_apps {
+                this.close_menu(cx);
+            }
+        }));
+        let main = placed(
             "message-menu-scroll",
             Place::Pointer(at),
             Layer::Menu,
             window,
             fade_in("message-menu", 120, items),
-        ))
+        );
+        let submenu = self.apps_submenu(&message.id, window, cx);
+        Some(div().child(main).children(submenu).into_any_element())
     }
 
     /// Who one reaction came from, where the pointer was: the names the network sent with the
@@ -2917,34 +3092,113 @@ impl Pane {
 
     fn select_menu_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let open = self.open_select.as_ref()?;
-        let mut list = menu().w(px(240.));
+        let multi = open.max_values > 1 || open.element_type.starts_with("multi_");
+        let mut list = menu().w(px(260.));
         for (ix, opt) in open.options.iter().enumerate() {
-            let active = open.selected.as_deref() == Some(opt.value.as_str());
+            let active = if multi {
+                open.multi_selected.iter().any(|v| v == &opt.value)
+            } else {
+                open.selected.as_deref() == Some(opt.value.as_str())
+            };
             let conversation = open.conversation.clone();
             let msg_id = open.message_id.clone();
             let block_id = open.block_id.clone();
             let action_id = open.action_id.clone();
             let element_type = open.element_type.clone();
             let val = opt.value.clone();
-            let values = if element_type.starts_with("multi_") { vec![val.clone()] } else { Vec::new() };
             let confirm = open.confirm.clone();
             let label = if active { format!("✓ {}", opt.label) } else { opt.label.clone() };
-            list = list.child(
-                menu_item(("ctrl-opt", ix), None, label, None)
-                    .when(active, |row| row.bg(theme::selected()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.trigger_control(
-                            conversation.clone(),
-                            msg_id.clone(),
-                            block_id.clone(),
-                            action_id.clone(),
-                            element_type.clone(),
-                            val.clone(),
-                            values.clone(),
-                            confirm.clone(),
-                            cx,
-                        );
-                    })),
+            let mut row = div()
+                .id(SharedString::from(format!("ctrl-opt-{ix}")))
+                .px(px(10.))
+                .py(px(6.))
+                .rounded(px(theme::R_CONTROL))
+                .cursor_pointer()
+                .when(active, |d| d.bg(theme::selected()))
+                .hover(|s| s.bg(theme::hover()))
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(div().type_small().text_color(theme::text()).child(label));
+            if !opt.description.is_empty() {
+                row = row.child(
+                    div()
+                        .type_micro()
+                        .text_color(theme::text_soft())
+                        .child(opt.description.clone()),
+                );
+            }
+            if multi {
+                let max = if open.max_values > 0 { open.max_values as usize } else { usize::MAX };
+                row = row.on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    if let Some(open) = this.open_select.as_mut() {
+                        if open.multi_selected.iter().any(|v| v == &val) {
+                            open.multi_selected.retain(|v| v != &val);
+                        } else if open.multi_selected.len() < max {
+                            open.multi_selected.push(val.clone());
+                        }
+                        cx.notify();
+                    }
+                }));
+            } else {
+                row = row.on_click(cx.listener(move |this, _, _, cx| {
+                    this.trigger_control(
+                        conversation.clone(),
+                        msg_id.clone(),
+                        block_id.clone(),
+                        action_id.clone(),
+                        element_type.clone(),
+                        val.clone(),
+                        vec![val.clone()],
+                        confirm.clone(),
+                        cx,
+                    );
+                }));
+            }
+            list = list.child(row);
+        }
+        if multi {
+            let min = open.min_values as usize;
+            let count = open.multi_selected.len();
+            let can_submit = count >= min && (min == 0 || count > 0);
+            let conversation = open.conversation.clone();
+            let msg_id = open.message_id.clone();
+            let block_id = open.block_id.clone();
+            let action_id = open.action_id.clone();
+            let element_type = open.element_type.clone();
+            let values = open.multi_selected.clone();
+            let confirm = open.confirm.clone();
+            list = list.child(menu_separator()).child(
+                div()
+                    .px(px(6.))
+                    .py(px(4.))
+                    .flex()
+                    .justify_end()
+                    .child(
+                        button(
+                            "ctrl-multi-apply",
+                            ButtonKind::Primary,
+                            if count == 0 { "Apply".to_owned() } else { format!("Apply ({count})") },
+                        )
+                        .when(!can_submit, |b| b.opacity(0.5))
+                        .when(can_submit, |b| {
+                            b.on_click(cx.listener(move |this, _, _, cx| {
+                                let first = values.first().cloned().unwrap_or_default();
+                                this.trigger_control(
+                                    conversation.clone(),
+                                    msg_id.clone(),
+                                    block_id.clone(),
+                                    action_id.clone(),
+                                    element_type.clone(),
+                                    first,
+                                    values.clone(),
+                                    confirm.clone(),
+                                    cx,
+                                );
+                            }))
+                        }),
+                    ),
             );
         }
         let list = list.on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -2958,6 +3212,93 @@ impl Pane {
             window,
             fade_in("control-select", 120, list),
         ))
+    }
+
+    fn interaction_modal_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let active = self.interaction_modal.as_ref()?;
+        let title = if active.modal.title.is_empty() {
+            "Form".to_owned()
+        } else {
+            active.modal.title.clone()
+        };
+        let room = f32::from(window.viewport_size().width) - 32.;
+        let mut fields_col = div().flex().flex_col().gap(px(10.)).pt(px(4.));
+        for (field, input) in active.modal.fields.iter().zip(&active.inputs) {
+            let label = if field.required {
+                format!("{} *", field.label)
+            } else {
+                field.label.clone()
+            };
+            let box_el = div()
+                .rounded(px(theme::R_CONTROL))
+                .bg(theme::canvas())
+                .border_1()
+                .border_color(super::tokens::border_strong())
+                .px(px(8.))
+                .py(px(6.))
+                .when(field.multiline, |d| d.min_h(px(72.)))
+                .child(input.clone());
+            fields_col = fields_col.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(div().type_small().font_weight(theme::MEDIUM).text_color(theme::text_soft()).child(label))
+                    .child(box_el),
+            );
+        }
+        let error_line = active.error.as_ref().map(|err| {
+            div()
+                .pt(px(6.))
+                .type_small()
+                .text_color(theme::danger())
+                .child(err.clone())
+        });
+        let submitting = active.submitting;
+        let panel = modal(title)
+            .w(px(if crate::gui::phone::active() { room.min(440.) } else { 440. }))
+            .child(fields_col)
+            .children(error_line)
+            .child(
+                modal_buttons()
+                    .child(button("interaction-modal-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                        this.interaction_modal = None;
+                        cx.notify();
+                    })))
+                    .child(
+                        button(
+                            "interaction-modal-submit",
+                            ButtonKind::Primary,
+                            if submitting { "Submitting…" } else { "Submit" },
+                        )
+                        .when(submitting, |b| b.opacity(0.6))
+                        .when(!submitting, |b| {
+                            b.on_click(cx.listener(|this, _, _, cx| {
+                                this.submit_modal(cx);
+                            }))
+                        }),
+                    ),
+            )
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        let size = window.viewport_size();
+        let scrim = div()
+            .id("interaction-modal-scrim")
+            .w(size.width)
+            .h(size.height)
+            .bg(theme::scrim())
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.interaction_modal = None;
+                    cx.notify();
+                }),
+            )
+            .child(fade_in("interaction-modal-panel", 160, panel));
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
     }
 
     fn action_confirm_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -3122,6 +3463,7 @@ impl Pane {
                 self.confirm_layer(window, cx),
                 self.paid_react_layer(window, cx),
                 self.action_confirm_layer(window, cx),
+                self.interaction_modal_layer(window, cx),
                 self.bulk_confirm_layer(window, cx),
                 self.forward_layer(window, cx),
                 self.follow_layer(window, cx),
@@ -3139,6 +3481,7 @@ impl Pane {
             self.confirm_layer(window, cx),
             self.paid_react_layer(window, cx),
             self.action_confirm_layer(window, cx),
+            self.interaction_modal_layer(window, cx),
             self.bulk_confirm_layer(window, cx),
             self.forward_layer(window, cx),
             self.follow_layer(window, cx),
@@ -3345,6 +3688,11 @@ impl Pane {
             cx.notify();
             return true;
         }
+        if key == "escape" && self.interaction_modal.is_some() {
+            self.interaction_modal = None;
+            cx.notify();
+            return true;
+        }
         if key == "escape" && self.action_confirm.is_some() {
             self.action_confirm = None;
             cx.notify();
@@ -3390,8 +3738,20 @@ impl Pane {
             let bare = !event.keystroke.modifiers.modified();
             match key {
                 "escape" => {
+                    if self.menu.as_ref().is_some_and(|menu| menu.apps) {
+                        if let Some(menu) = self.menu.as_mut() {
+                            menu.apps = false;
+                        }
+                        self.apps_anchor.set(None);
+                        self.apps_menu.set(None);
+                        cx.notify();
+                        return true;
+                    }
                     self.close_menu(cx);
                     self.close_picker(cx);
+                    return true;
+                }
+                "up" | "down" | "enter" if bare && self.menu.as_ref().is_some_and(|menu| menu.apps) => {
                     return true;
                 }
                 "up" | "down" if bare => {

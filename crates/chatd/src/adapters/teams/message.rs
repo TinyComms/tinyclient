@@ -2431,6 +2431,11 @@ mod tests {
             value: r#"{"action":"approve"}"#.to_owned(),
             confirm: None,
             kind: protocol::ControlKind::Button { url: String::new(), style: protocol::ControlStyle::Primary },
+            disabled: false,
+            emoji: String::new(),
+            row: 0,
+            min_values: 0,
+            max_values: 0,
         });
         assert!(matching_control(&message, "app", "approve", r#"{"action":"approve"}"#).is_some());
         assert!(matching_control(&message, "app", "approve", r#"{"action":"reject"}"#).is_none());

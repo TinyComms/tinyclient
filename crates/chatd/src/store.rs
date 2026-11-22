@@ -2540,6 +2540,7 @@ impl Store {
                  AND (?6 IS NULL OR m.sent < ?6)
                  AND (?7 IS NULL OR m.sent > ?7)
                  AND (m.expires IS NULL OR m.expires > ?8)
+                 AND IFNULL(json_extract(m.body, '$.ephemeral'), 0) != 1
                  AND NOT c.hidden AND c.special != 'request'
                ORDER BY m.sent DESC, length(m.id) DESC, m.id DESC",
         )?;
@@ -2658,6 +2659,7 @@ impl Store {
                      AND (?2 IS NULL OR (m.network = ?2 AND m.account = ?3 AND m.conversation = ?4))
                      AND (?5 IS NULL OR (c.network = ?5 AND c.account = ?6 AND c.space = ?7))
                      AND (m.expires IS NULL OR m.expires > ?10)
+                     AND IFNULL(json_extract(m.body, '$.ephemeral'), 0) != 1
                      AND NOT c.hidden AND c.special != 'request'
                    ORDER BY m.sent DESC, length(m.id) DESC, m.id DESC LIMIT ?9",
             ))?
@@ -3790,6 +3792,30 @@ impl Store {
         message.pinned = pinned;
         self.ingest(conversation, &message, false)?;
         Ok(true)
+    }
+
+    /// Ephemeral rows do not outlive the session. Returns the conversations that lost one.
+    pub fn drop_ephemeral(&mut self, account: &AccountKey) -> rusqlite::Result<Vec<String>> {
+        let network = word(&account.network);
+        let rows: Vec<(String, String)> = self
+            .db
+            .prepare(
+                "SELECT conversation, id FROM message
+                  WHERE network = ?1 AND account = ?2 AND json_extract(body, '$.ephemeral') = 1",
+            )?
+            .query_map(params![network, account.account.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut conversations = Vec::new();
+        for (conversation, id) in rows {
+            self.db.execute(
+                "DELETE FROM message WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4",
+                params![network, account.account.as_str(), conversation, id],
+            )?;
+            if !conversations.contains(&conversation) {
+                conversations.push(conversation);
+            }
+        }
+        Ok(conversations)
     }
 
     pub fn delete_message(&mut self, conversation: &Key, id: &str) -> rusqlite::Result<bool> {
