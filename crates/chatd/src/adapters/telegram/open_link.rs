@@ -25,7 +25,9 @@ pub(super) fn open(account: &Account, url: &str) -> Result<Option<OpenedLink>, F
     if let Some(opened) = stored(account, &parsed.channel, message_id.clone())? {
         return Ok(Some(opened));
     }
-    let who = match account.dir().by_handle(&parsed.channel) {
+    // Bound first: the directory is free again before the answer is learned into it.
+    let known = account.dir().by_handle(&parsed.channel);
+    let who = match known {
         Some(who) => Some(who),
         None => resolve_username(account, &parsed.channel)?,
     };
@@ -56,16 +58,26 @@ fn stored(account: &Account, id: &str, message_id: Option<String>) -> Result<Opt
 }
 
 /// A read of `contacts.resolveUsername`. A flood or a network failure is returned; a missing
-/// name is "not this chat", not an error the shell has to show.
+/// name is "not this chat", not an error the shell has to show. Hits and misses are kept for
+/// the connection, so a second click on the same name does not repeat the flood-limited call.
 fn resolve_username(account: &Account, username: &str) -> Result<Option<Who>, Fault> {
-    let request = tl::functions::contacts::ResolveUsername { username: username.to_owned(), referer: None };
-    match wire::call(account.wire.as_ref(), &request) {
-        Ok(tl::enums::contacts::ResolvedPeer::Peer(found)) => {
-            let who = Who::of(&found.peer);
-            account.learn(&found.users, &found.chats);
-            Ok(Some(who))
-        }
-        Err(fault) if fault.is("USERNAME_NOT_OCCUPIED") || fault.is("USERNAME_INVALID") => Ok(None),
-        Err(fault) => Err(fault),
+    let lower = username.to_ascii_lowercase();
+    if let Some(cached) = account.live().resolved_usernames.get(&lower).copied() {
+        return Ok(cached);
     }
+    let request = tl::functions::contacts::ResolveUsername { username: username.to_owned(), referer: None };
+    let found = match wire::call(account.wire.as_ref(), &request) {
+        Ok(tl::enums::contacts::ResolvedPeer::Peer(found)) => {
+            account.learn(&found.users, &found.chats);
+            Some(Who::of(&found.peer))
+        }
+        Err(fault) if fault.is("USERNAME_NOT_OCCUPIED") || fault.is("USERNAME_INVALID") => None,
+        Err(fault) => return Err(fault),
+    };
+    let mut live = account.live();
+    if live.resolved_usernames.len() >= super::RESOLVED_CACHE {
+        live.resolved_usernames.clear();
+    }
+    live.resolved_usernames.insert(lower, found);
+    Ok(found)
 }

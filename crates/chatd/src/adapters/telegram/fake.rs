@@ -3243,7 +3243,10 @@ impl World {
         }
         if let Some(request) = asked::<f::channels::ReadMessageContents>(body) {
             let joined = request.id.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
-            self.log(&format!("channels.ReadMessageContents {joined}"));
+            let tl::enums::InputChannel::Channel(channel) = &request.channel else {
+                return Err(rpc(400, "CHANNEL_INVALID", None));
+            };
+            self.log(&format!("channels.ReadMessageContents c{} {joined}", channel.channel_id));
             for list in self.unread_mentions.values_mut() {
                 list.retain(|id| !request.id.contains(id));
             }
@@ -4307,19 +4310,6 @@ impl World {
                 return Err(rpc(400, "CHANNEL_INVALID", None));
             };
             self.log(&format!("channels.ReadHistory c{} {}", channel.channel_id, request.max_id));
-            return answer(true);
-        }
-        if let Some(request) = asked::<f::messages::ReadMessageContents>(body) {
-            let ids: Vec<String> = request.id.iter().map(i32::to_string).collect();
-            self.log(&format!("ReadMessageContents {}", ids.join(",")));
-            return answer(tl::enums::messages::AffectedMessages::Messages(tl::types::messages::AffectedMessages { pts: 4, pts_count: 1 }));
-        }
-        if let Some(request) = asked::<f::channels::ReadMessageContents>(body) {
-            let tl::enums::InputChannel::Channel(channel) = &request.channel else {
-                return Err(rpc(400, "CHANNEL_INVALID", None));
-            };
-            let ids: Vec<String> = request.id.iter().map(i32::to_string).collect();
-            self.log(&format!("channels.ReadMessageContents c{} {}", channel.channel_id, ids.join(",")));
             return answer(true);
         }
         if let Some(request) = asked::<f::messages::ReadDiscussion>(body) {

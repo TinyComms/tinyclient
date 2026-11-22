@@ -3923,7 +3923,7 @@ pub(super) fn prove_giveaways() -> Result<(), String> {
         || field(&card, "Eligibility") != Some("New subscribers only")
         || field(&card, "Countries") != Some("US, CA")
         || field(&card, "Winners") != Some("Private")
-        || field(&card, "Ends") != Some("2023-11-14 22:12 UTC")
+        || field(&card, "Ends") != Some("2023-11-14 22:13 UTC")
     {
         return Err(format!("the giveaway fields are wrong: {:?}", card.fields));
     }
@@ -3984,7 +3984,7 @@ pub(super) fn prove_giveaways() -> Result<(), String> {
         || field(&card, "Prize") != Some("50 Stars")
         || field(&card, "Winners") != Some("User 9")
         || field(&card, "Unclaimed") != Some("1")
-        || field(&card, "Ended") != Some("2023-11-14 22:12 UTC")
+        || field(&card, "Ended") != Some("2023-11-14 22:13 UTC")
     {
         return Err(format!("the results card is wrong: {} {:?}", card.title, card.fields));
     }
@@ -4054,7 +4054,7 @@ pub(super) fn prove_giveaways() -> Result<(), String> {
     if !is_safe_slug("Winter-2023") || is_safe_slug("bad slug") || is_safe_slug("../x") {
         return Err("a gift-code slug was not checked".into());
     }
-    if format_utc(1_700_000_000) != "2023-11-14 22:12 UTC" {
+    if format_utc(1_700_000_000) != "2023-11-14 22:13 UTC" {
         return Err(format!("a giveaway date is wrong, got {}", format_utc(1_700_000_000)));
     }
     Ok(())

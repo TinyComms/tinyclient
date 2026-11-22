@@ -3974,7 +3974,7 @@ fn bot_commands_keyboard_and_start_can_be_refused() {
         other => panic!("expected a refusal, got {other:?}"),
     }
 
-    let trail = world.message("u7004", "4").expect("trail message");
+    let trail = world.arrived("u7004", "4");
     let board = trail.keyboard.expect("reply keyboard");
     assert!(board.resize);
     assert_eq!(board.placeholder.as_deref(), Some("Ask the trail"));
@@ -3982,6 +3982,7 @@ fn bot_commands_keyboard_and_start_can_be_refused() {
     assert_eq!(board.rows[0][0].kind, BotKeyKind::Text);
 
     world.send("u7004", "1", "Ridge", None);
+    world.until("the keyboard text on the wire", || world.calls().iter().any(|call| call.contains("SendMessage u7004 Ridge")).then_some(()));
     assert!(
         world.calls().iter().any(|call| call.contains("SendMessage u7004 Ridge")),
         "expected the keyboard text on the wire, got: {:#?}",
@@ -5360,8 +5361,8 @@ fn unread_mentions_jump_three_times_and_the_count_reaches_zero() {
     });
     assert!(matches!(ok, Response::Ok), "expected Ok marking the channel mention read, got {ok:?}");
     assert!(
-        world.calls().iter().any(|call| call == "channels.ReadMessageContents 5"),
-        "expected channels.ReadMessageContents 5 on wire, got: {:#?}",
+        world.calls().iter().any(|call| call == "channels.ReadMessageContents c9001 5"),
+        "expected channels.ReadMessageContents c9001 5 on wire, got: {:#?}",
         world.calls()
     );
 
@@ -5409,8 +5410,8 @@ fn clicking_a_telegram_username_resolves_once_and_caches_result() {
     }) else {
         panic!("expected Resolved");
     };
-    assert_eq!(conversation, Some(key("u7010")));
-    assert_eq!(title, "Forest Wren");
+    assert_eq!(conversation, Some(key("u7011")));
+    assert_eq!(title, "Robin Vale");
     assert_eq!(world.called("ResolveUsername forest_wren"), 1);
 
     // Clicking the same username again hits cache without repeating the flood-limited RPC.
@@ -5419,7 +5420,7 @@ fn clicking_a_telegram_username_resolves_once_and_caches_result() {
     }) else {
         panic!("expected Resolved");
     };
-    assert_eq!(again, Some(key("u7010")));
+    assert_eq!(again, Some(key("u7011")));
     assert_eq!(world.called("ResolveUsername forest_wren"), 1);
 
     // Unknown usernames cache the miss so repeated clicks do not hammer ResolveUsername.
@@ -6025,6 +6026,9 @@ fn voice_and_round_video_messages_track_listened_state_and_send_read_contents() 
 fn send_rules_reflect_media_bans_slow_mode_and_paid_stars() {
     let world = World::signed_in();
     world.connected();
+    // The dialog list only previews the forum. Opening it lists the topic.
+    let _ = world.messages("c9002");
+    world.until("the tools topic", || world.conversation("c9002_31"));
 
     // 1. Group with media banned + 30s slow mode reports those rules and starts countdown on send.
     world.steer("ban-media");

@@ -2467,7 +2467,9 @@ impl Chat {
 
     fn resolve_link(&self, url: &str) -> Response {
         if let Some(parsed) = protocol::link::telegram_app_link(url) {
-            return match self.hub.store().resolve_link(&parsed) {
+            // Bound first: the store is free again before an adapter that reads it is asked.
+            let stored = self.hub.store().resolve_link(&parsed);
+            return match stored {
                 Ok(Some(conv)) => Response::Resolved {
                     conversation: Some(conv.key),
                     message_id: parsed.message_id,
@@ -2484,7 +2486,9 @@ impl Chat {
         let Some(parsed) = protocol::link::parse_network_link(url) else {
             return Response::Resolved { conversation: None, message_id: None, title: String::new() };
         };
-        match self.hub.store().resolve_link(&parsed) {
+        // Bound first: the store is free again before an adapter that reads it is asked.
+        let stored = self.hub.store().resolve_link(&parsed);
+        match stored {
             Ok(Some(conv)) => Response::Resolved {
                 conversation: Some(conv.key),
                 message_id: parsed.message_id,
