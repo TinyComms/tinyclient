@@ -7607,10 +7607,55 @@ mod tests {
         assert_eq!(unread(), 2);
         heard("call-cancelled", PEER, "cancelled", json!([]), json!({ME: "missed"}));
         assert_eq!(line("call-cancelled"), None);
+        // I was never rung, and group messages still notify: that counts as missed.
+        heard("call-unrung", PEER, "ended", json!([PEER]), json!({ME: "not_rung"}));
+        assert_eq!(line("call-unrung").unwrap().0, "Missed call from Bea · 40 sec");
+        assert_eq!(unread(), 3);
+        // I started it and other people joined: my name, and not unread.
+        heard("call-mine", ME, "ended", json!([ME, PEER, CY]), json!({ME: "joined", PEER: "joined", CY: "joined"}));
+        assert_eq!(line("call-mine").unwrap().0, "You started a call · 40 sec · Bea, Cy");
+        assert_eq!(unread(), 3, "a call I was in is not unread");
+        // The server names only `id`. That is the line's id.
+        on_live(&ctx, &saved, &names, "group.call", &json!({"group_id": "group-1", "id": "call-by-id", "started_by": PEER, "outcome": "ended",
+            "started_at": "2024-01-02T04:00:00Z", "ended_at": "2024-01-02T04:00:40Z", "joined": [PEER], "outcomes": {ME: "declined"}}));
+        assert_eq!(line("call-by-id").unwrap().0, "Bea started a call · 40 sec");
+        // A call for a group this account does not have leaves no line.
+        on_live(&ctx, &saved, &names, "group.call", &json!({"group_id": "group-missing", "call_id": "call-missing", "started_by": PEER, "outcome": "ended",
+            "started_at": "2024-01-02T04:00:00Z", "ended_at": "2024-01-02T04:00:40Z", "joined": [PEER], "mine": "missed"}));
+        assert!(ctx.stored_message("group-missing", "call-missing").unwrap().is_none());
         // With group messages switched off, a missed group call does not count either.
         ctx.hub.settings().set(protocol::settings::GLOBAL, protocol::settings::NOTIFY_GROUPS, Some("off".to_owned()));
         heard("call-quiet", PEER, "ended", json!([PEER]), json!({ME: "not_rung"}));
         assert_eq!(line("call-quiet").unwrap().0, "Missed call from Bea · 40 sec");
-        assert_eq!(unread(), 2);
+        assert_eq!(unread(), 3);
+    }
+
+    /// The live frame and a later list of the same call are one line, and the list does not
+    /// count it unread a second time.
+    #[test]
+    fn a_live_group_call_and_the_lists_last_call_are_one_line() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let later = Arc::new(AtomicBool::new(false));
+        let flag = later.clone();
+        let (_adapter, ctx, saved) = group_fixture(move |request| {
+            if request.starts_with("GET /v1/groups ") && flag.load(Ordering::SeqCst) {
+                let mut group = group_json("group-1");
+                group["unread"] = json!(0);
+                group["last_call"] = json!({"id": "call-live", "call_id": "call-live", "started_by": ME, "outcome": "ended",
+                    "started_at": "2024-01-02T04:00:00Z", "ended_at": "2024-01-02T04:00:40Z", "joined": [ME, PEER, CY], "mine": "joined"});
+                return Some(http(200, "OK", &json!({"groups": [group]}).to_string()));
+            }
+            None
+        });
+        let names = HashMap::from([(PEER.to_owned(), "Bea".to_owned())]);
+        on_live(&ctx, &saved, &names, "group.call", &json!({"group_id": "group-1", "call_id": "call-live", "started_by": ME, "outcome": "ended",
+            "started_at": "2024-01-02T04:00:00Z", "ended_at": "2024-01-02T04:00:40Z", "joined": [ME, PEER, CY], "outcomes": {ME: "joined"}}));
+        let line = || ctx.stored_message("group-1", "call-live").unwrap().map(|message| message.text);
+        assert_eq!(line().as_deref(), Some("You started a call · 40 sec · Bea, Cy"));
+        assert_eq!(ctx.known("group-1").unwrap().unwrap().unread, 2, "the group's own unread, not the call");
+        later.store(true, Ordering::SeqCst);
+        refresh(&ctx, &saved);
+        assert_eq!(line().as_deref(), Some("You started a call · 40 sec · Bea, Cy"));
+        assert_eq!(ctx.known("group-1").unwrap().unwrap().unread, 0, "the list's unread replaces the local count and the same line does not add one");
     }
 }
