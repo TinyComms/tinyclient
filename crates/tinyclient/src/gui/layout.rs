@@ -126,12 +126,10 @@ pub enum Menu {
     Own,
     Network(Network),
     Space(Key),
-    /// A server folder's context menu, where the pointer was.
+    /// A server folder's context menu, where the pointer was. The key is that account's folder.
     Folder(Key, Point<Pixels>),
     /// A conversation row's context menu, where the pointer was.
     Row(Rc<Conversation>, Point<Pixels>),
-    /// A Discord server folder, where the pointer was. The key is that account's folder.
-    Folder(Key, Point<Pixels>),
 }
 
 /// Discord folder colours, `0xRRGGBB`.
