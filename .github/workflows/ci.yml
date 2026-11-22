@@ -137,7 +137,9 @@ jobs:
         artifact: ${{ fromJSON(github.event_name != 'pull_request' && '["linux-x86_64","linux-aarch64","macos","windows"]' || '["linux-x86_64"]') }}
     # Ubuntu 22.04 is the oldest glibc the release packages promise.
     runs-on: ${{ fromJSON('{"linux-x86_64":"ubuntu-22.04","linux-aarch64":"ubuntu-22.04-arm","macos":"macos-latest","windows":"windows-latest"}')[matrix.artifact] }}
-    timeout-minutes: 30
+    # The macOS release build of the workspace alone passed 30 minutes once waves 7-10 landed
+    # (rustc was still compiling when the job was cancelled), which left main without a green run.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
       # Linux aarch64 builds without a cache. It runs only on main, beside the longer macOS
