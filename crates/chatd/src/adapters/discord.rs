@@ -513,6 +513,9 @@ struct State {
     /// Per conversation, the stretches of history fetched whole in this session, as message
     /// ids from and to: reading on inside one asks Discord nothing.
     covered: HashMap<String, Vec<(u64, u64)>>,
+    /// Server channels the shell has opened. A live message is kept from then on, even when
+    /// the channel had nothing cached yet.
+    opened: HashSet<String>,
     /// Files whose addresses ran out, waiting to be renewed together.
     renewing: Vec<(String, String, Reply<Download>)>,
     /// The last addresses renewed, old to fresh.
@@ -1204,6 +1207,9 @@ impl Discord {
     }
 
     fn backfill(&self, channel: &str) {
+        // The shell asked for this channel. Live messages are kept from here, including the
+        // ones that arrive while the history page is still empty.
+        crate::hub::lock(&self.state).opened.insert(channel.to_owned());
         // Warming is nobody's click, so it does not run at a machine's pace.
         if crate::hub::lock(&self.state).warming.remove(channel) {
             std::thread::sleep(jitter(400, 2500));

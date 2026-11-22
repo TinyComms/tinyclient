@@ -945,6 +945,14 @@ fn allow_typing(world: &World, conversation: &Key) {
 
 /// Polls until `probe` has an answer. Everything here is the adapter reacting to the fake, so
 /// nothing is assumed to have happened by the time a request returns.
+/// A server channel keeps a live message once the shell has opened it. Opening is the history
+/// request: this channel has nothing cached, so the message has to be pushed after that request.
+fn open_channel(world: &World, id: &str) {
+    let _ = world.messages(id);
+    let path = format!("/channels/{id}/messages");
+    wait("the channel to be opened", || (!world.discord.requests_to("GET", &path).is_empty()).then_some(()));
+}
+
 fn wait<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -5566,6 +5574,7 @@ fn super_reactions_split_counts_follow_burst_events_and_send_with_nitro() {
     wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
 
     let dm = "5001";
+    open_channel(&world, dm);
     let msg_id = world.incoming(dm, None, "burst test", json!({
         "reactions": [{
             "count": 5,
@@ -5640,6 +5649,7 @@ fn invite_and_event_cards_detect_resolve_cache_and_toggle_interest() {
 
     // 1. Incoming message with an invite+event link and a standalone event link attaches MessageInvite cards lazily.
     let dm = "5001";
+    open_channel(&world, dm);
     let msg_id = world.incoming(
         dm,
         None,

@@ -313,7 +313,8 @@ impl Discord {
         let guild = posted.guild_id.clone().or_else(|| self.guild_of(&conversation));
         let (message, files) = self.convert(&posted, guild.as_deref(), conversation.kind);
         let always = conversation.kind.is_direct() || conversation.kind == ConversationKind::Thread;
-        if always || message.mentions_me || message.outgoing || self.ctx.newest(&channel)?.is_some() {
+        let opened = crate::hub::lock(&self.state).opened.contains(&channel);
+        if always || message.mentions_me || message.outgoing || opened || self.ctx.newest(&channel)?.is_some() {
             files.register(&self.ctx)?;
             self.thread_of(&posted, &conversation)?;
             self.ctx.message(&channel, &message)?;

@@ -974,6 +974,7 @@ impl Discord {
             // Whatever happened between the sessions was not heard: nothing fetched before
             // is known to be whole any more.
             state.covered.clear();
+            state.opened.clear();
             // A new session starts with no subscriptions and no voice connection.
             state.members.forget_sent();
             state.voice.reset();
