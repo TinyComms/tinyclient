@@ -1492,11 +1492,19 @@ fn one_sign_in_is_a_tenant_each_with_teams_channels_chats_and_their_unread_state
     assert_eq!(partners, [("Ana Ruiz", "ana@contoso.com", "msteams:/l/chat/0/0?users=ana%40contoso.com")]);
 
     // Connecting listed everything from one call, looked the chats' people up together, and
-    // fetched history only for the one unread chat.
+    // fetched history only for the one unread chat. The blocklist names Bob and also a bare
+    // MRI the chat batch never saw, so that person is a second lookup.
     world.until("the unread chat to be warmed", || world.fake.calls("GET", &format!("{CHAT_ANA}/messages")).pop());
     let calls = world.fake.calls.lock().unwrap().clone();
     let asked = |method: &str, ending: &str| calls.iter().filter(|call| call.method == method && call.path.ends_with(ending)).count();
-    assert_eq!(asked("POST", "/beta/users/fetchShortProfile"), 1);
+    let profiles: Vec<Value> = calls
+        .iter()
+        .filter(|call| call.method == "POST" && call.path.ends_with("/beta/users/fetchShortProfile"))
+        .map(|call| call.json())
+        .collect();
+    assert_eq!(profiles.len(), 2);
+    assert!(profiles.iter().any(|body| body.as_array().is_some_and(|ids| ids.len() > 1)), "the chats' people are one batch");
+    assert!(profiles.iter().any(|body| body == &json!(["8:live:bare_blocked_user"])));
     assert_eq!(asked("GET", "/v1/users/ME/conversations"), 0);
     assert_eq!(asked("GET", &format!("{GENERAL}/messages")) + asked("GET", "19:grp1@thread.v2/messages"), 0);
     assert_eq!(asked("POST", "/beta/users/searchV2"), 0, "the directory is never listed");
@@ -2013,15 +2021,23 @@ fn mentions_missed_while_closed_info_mute_seen_hidden_chats_and_files_through_on
     };
     assert_eq!(counts.mentions, 1);
 
-    // What connecting asked, once each: the token audiences, authz, the one list, one lookup of
-    // the chats' people, and one page of the Activity stream; history for the unread chats only.
+    // What connecting asked: the token audiences, authz, the one list, one lookup of the chats'
+    // people, one lookup of the blocklist's unnamed person, and one page of the Activity stream.
+    // History is fetched for the unread chats only.
     world.until("the unread chat to be warmed", || world.fake.calls("GET", &format!("{CHAT_ANA}/messages")).pop());
     let calls = world.fake.calls.lock().unwrap().clone();
     let at_connect: Vec<String> = calls.iter().map(|call| format!("{} {}", call.method, call.path.rsplit('/').next().unwrap_or(""))).collect();
     let lists = calls.iter().filter(|call| call.path.ends_with("/teams/users/me")).count();
     // The list is answered 401 once by the fake (a stale token), so twice.
     assert_eq!(lists, 2, "{at_connect:#?}");
-    assert_eq!(calls.iter().filter(|call| call.path.ends_with("/fetchShortProfile")).count(), 1);
+    let profiles: Vec<Value> = calls
+        .iter()
+        .filter(|call| call.method == "POST" && call.path.ends_with("/fetchShortProfile"))
+        .map(|call| call.json())
+        .collect();
+    assert_eq!(profiles.len(), 2, "{at_connect:#?}");
+    assert!(profiles.iter().any(|body| body.as_array().is_some_and(|ids| ids.len() > 1)), "the chats' people are one batch");
+    assert!(profiles.iter().any(|body| body == &json!(["8:live:bare_blocked_user"])));
     assert_eq!(calls.iter().filter(|call| call.path.contains("/48:")).count(), 1, "the call log is not read");
 
     // The info pane: one description of the thread.
