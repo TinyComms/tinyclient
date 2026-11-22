@@ -22,6 +22,9 @@ mod log_tail;
 mod tiny_setup;
 #[cfg(feature = "gui")]
 mod gui;
+#[cfg(all(test, feature = "gui"))]
+#[path = "mobile/share.rs"]
+mod mobile_share;
 #[cfg(feature = "gui")]
 mod lottie;
 #[cfg(all(feature = "gui", target_os = "linux"))]

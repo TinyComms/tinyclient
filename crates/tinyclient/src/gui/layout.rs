@@ -2175,8 +2175,10 @@ impl Render for Shell {
             chrome::clear_end();
             self.note_room(true, Some(width));
             let screen = self.phone_screen(snapshot, window, cx);
+            let root = root.child(screen);
+            #[cfg(any(target_os = "android", target_os = "ios"))]
+            let root = root.children(self.phone_share_layer(window, cx));
             return root
-                .child(screen)
                 .children(self.toast_layer(width, cx))
                 .children(super::settings::phone_page(window, cx))
                 .children(self.streamer_mark(window, cx));
@@ -2215,7 +2217,7 @@ impl Render for Shell {
         };
         chrome::set_end(end, window);
 
-        root.child(self.rail(snapshot, window, cx))
+        let desktop = root.child(self.rail(snapshot, window, cx))
             .when(overview > 0., |root| root.child(self.discord_overview(snapshot, overview, window, cx)))
             .children(plan.sidebar.map(|width| {
                 self.sidebar(snapshot, width, window, cx).child(self.resize_handle(Edge::Sidebar, cx))
@@ -2290,7 +2292,10 @@ impl Render for Shell {
             .children(self.menu_layer(snapshot, plan.sidebar.unwrap_or(state.sidebar_width), overview, window, cx))
             .children(self.toast_layer(width, cx))
             .children(window_chrome(window))
-            .children(self.streamer_mark(window, cx))
+            .children(self.streamer_mark(window, cx));
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let desktop = desktop.children(self.phone_share_layer(window, cx));
+        desktop
     }
 }
 

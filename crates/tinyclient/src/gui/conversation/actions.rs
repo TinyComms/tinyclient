@@ -2068,6 +2068,16 @@ impl Pane {
                 }
             }
             if let Some((path, name)) = self.saveable_file(message) {
+                #[cfg(any(target_os = "android", target_os = "ios"))]
+                rows.push(
+                    row("sheet-share-file", "icons/external-link.svg", "Share file…".into(), false)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            crate::mobile_share::share_file(&path, &name);
+                        }))
+                        .into_any_element(),
+                );
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 rows.push(
                     row("sheet-save-as", "icons/folder-plus.svg", "Save as…".into(), false)
                         .on_click(cx.listener(move |this, _, _, cx| {

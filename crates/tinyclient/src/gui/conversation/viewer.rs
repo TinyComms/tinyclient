@@ -174,6 +174,17 @@ fn side_button(id: impl Into<ElementId>, which: Icon) -> Stateful<Div> {
 }
 
 impl Pane {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    fn share_viewed(&mut self, cx: &mut Context<Self>) {
+        let Some((_, attachment)) = self.viewed() else { return };
+        let path = attachment.file.path.as_ref().or_else(|| self.known.get(&attachment.file.id));
+        if let Some(path) = path {
+            crate::mobile_share::share_file(path, &media::disk_name(&attachment));
+        } else {
+            self.say("Wait for the attachment to finish downloading.".into(), cx);
+        }
+    }
+
     /// Every picture held, oldest first: single pictures, grid tiles, GIFs and videos. The
     /// viewer is where an MP4 plays. A spoiler nobody opened stays closed.
     fn pictures(&self) -> Vec<(Rc<Message>, usize)> {
@@ -1067,6 +1078,11 @@ impl Pane {
     fn phone_bar(&self, message: &Rc<Message>, sender: &str, facts: &[String], cx: &mut Context<Self>) -> Div {
         use crate::gui::phone::tokens::{self as phone, PhoneType};
         let action = |id: &'static str, which: Icon| bar_button(id, which).size(px(phone::TOUCH));
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let trailing = action("share-file", Icon::External).aria_label("Share attachment")
+            .on_click(cx.listener(|this, _, _, cx| this.share_viewed(cx)));
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let trailing = action("save", Icon::Download).on_click(cx.listener(|this, _, _, cx| this.save_viewed(cx)));
         div()
             .flex_none()
             .pt(px(phone::safe_top()))
@@ -1090,7 +1106,7 @@ impl Pane {
                             .child(div().truncate().phone_stamp().font_weight(theme::REGULAR).text_color(theme::text_soft()).child(facts.join(" · "))),
                     )
                     .child(action("copy", Icon::Copy).on_click(cx.listener(|this, _, _, cx| this.copy_viewed(cx))))
-                    .child(action("save", Icon::Download).on_click(cx.listener(|this, _, _, cx| this.save_viewed(cx)))),
+                    .child(trailing),
             )
     }
 

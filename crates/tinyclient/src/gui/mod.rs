@@ -1183,6 +1183,18 @@ pub(crate) fn run_with(application: gpui::Application, invite: Option<String>, a
                             if !queue.contains(&link) { queue.push_back(link); }
                         }
                     }
+                    #[cfg(any(target_os = "android", target_os = "ios"))]
+                    {
+                        while links.borrow().len() < 8 {
+                            let Some(link) = crate::mobile_share::next_link() else { break };
+                            links.borrow_mut().push_back(link);
+                        }
+                        let _ = window.update(cx, |shell, window, cx| {
+                            if window.is_window_active() {
+                                shell.receive_phone_share(cx);
+                            }
+                        });
+                    }
                     let next = links.borrow().front().cloned();
                     if let Some(next) = next {
                         if let Some(action) = crate::quick::parse_link(&next) {

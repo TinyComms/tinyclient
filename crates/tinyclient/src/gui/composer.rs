@@ -3528,13 +3528,33 @@ impl Composer {
         if !self.controls().attach {
             return;
         }
-        let asked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: Some("Attach".into()) });
-        cx.spawn(async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = asked.await {
-                let _ = this.update(cx, |this, cx| this.stage_files_for(target, paths, false, cx));
-            }
-        })
-        .detach();
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        {
+            let Some(picked) = crate::mobile_share::pick() else { return };
+            cx.spawn(async move |this, cx| {
+                match picked.await {
+                    Ok(Ok(mut items)) => {
+                        let _ = this.update(cx, |this, cx| {
+                            this.stage_files_for(target, std::mem::take(&mut items.files), true, cx);
+                        });
+                    }
+                    Ok(Err(message)) => {
+                        let _ = this.update(cx, |this, cx| this.tell(&target.key, (message.into(), Tone::Refused), cx));
+                    }
+                    Err(_) => {}
+                }
+            }).detach();
+        }
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            let asked = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: true, prompt: Some("Attach".into()) });
+            cx.spawn(async move |this, cx| {
+                if let Ok(Ok(Some(paths))) = asked.await {
+                    let _ = this.update(cx, |this, cx| this.stage_files_for(target, paths, false, cx));
+                }
+            })
+            .detach();
+        }
     }
 
     /// When a network has no GIF catalog (`!can.gifs`), the button asks for a `.gif` file and stages it like any other attachment.
@@ -6607,6 +6627,33 @@ impl Shell {
             archived: open.archived,
             locked: open.locked,
         }
+    }
+
+    /// Imports the handoff into the chosen draft without initiating a send.
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    pub(in crate::gui) fn stage_phone_share(
+        &self, row: &Conversation, mut items: crate::mobile_share::Items, cx: &mut Context<Self>,
+    ) -> Result<(), crate::mobile_share::Items> {
+        let link = self.snapshot.as_ref().map_or(Link::SignedOut, |snapshot| snapshot.account_link(&row.key));
+        let target = self.target_of(row, link);
+        self.composer_in(false, cx).update(cx, |composer, cx| {
+            if composer.locked_for(&target).is_some()
+                || (!items.files.is_empty() && !controls(&target.can, false).attach)
+            {
+                return Err(items);
+            }
+            composer.aim(target.clone(), &row.draft, cx);
+            composer.end_edit(cx);
+            if !items.text.is_empty() {
+                let merged = crate::mobile_share::draft_with_share(composer.input.read(cx).text(), &items.text);
+                composer.input.update(cx, |input, cx| input.set_text(&merged, cx));
+                composer.follow_text(cx);
+                composer.save_draft(cx);
+            }
+            composer.stage_files_for(target, std::mem::take(&mut items.files), true, cx);
+            cx.notify();
+            Ok(())
+        })
     }
 
     /// The composer dock of the open conversation.
