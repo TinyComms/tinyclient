@@ -99,6 +99,7 @@ Download from [tinyclient.io](https://tinyclient.io), or from the [latest releas
 | OS | Download | What it is |
 | --- | --- | --- |
 | macOS 13 or later, Apple silicon | [`tinyclient-macos.dmg`](https://tinyclient.io/download/macos) ([`.zip`](https://tinyclient.io/download/macos-zip)) | `tinyclient.app`, to drag to Applications |
+| macOS 13 or later, Intel | [`tinyclient-macos-x86_64.dmg`](https://tinyclient.io/download/macos-intel) ([`.zip`](https://tinyclient.io/download/macos-intel-zip)) | `tinyclient.app`, to drag to Applications |
 | Debian, Ubuntu, x86_64 | [`tinyclient-linux-x86_64.deb`](https://tinyclient.io/download/deb) | `sudo apt install ./tinyclient-linux-x86_64.deb` |
 | Debian, Ubuntu, arm64 | [`tinyclient-linux-aarch64.deb`](https://tinyclient.io/download/deb-arm64) | `sudo apt install ./tinyclient-linux-aarch64.deb` |
 | Fedora, openSUSE, x86_64 | [`tinyclient-linux-x86_64.rpm`](https://tinyclient.io/download/rpm) | `sudo dnf install ./tinyclient-linux-x86_64.rpm` |
@@ -109,9 +110,10 @@ Download from [tinyclient.io](https://tinyclient.io), or from the [latest releas
 | Any Linux, arm64 | [`tinyclient-linux-aarch64.tar.gz`](https://tinyclient.io/download/linux-tar-arm64) | The four programs and `install.sh` |
 | NixOS, Nix on Linux | [`flake.nix`](flake.nix) | Built from source. See [Nix](#nix). |
 | Windows 10 or later, x86_64 | [`tinyclient-windows-x86_64-setup.exe`](https://tinyclient.io/download/windows) | Installer for the current user. Settings, Apps uninstalls it. |
-| Windows, portable | [`tinyclient-windows-x86_64.zip`](https://tinyclient.io/download/windows-portable) | The four `.exe` files, run in place |
+| Windows 11 on Arm | [`tinyclient-windows-aarch64-setup.exe`](https://tinyclient.io/download/windows-arm64) | Native Arm64 installer for the current user |
+| Windows, portable | [x86_64 `.zip`](https://tinyclient.io/download/windows-portable) or [Arm64 `.zip`](https://tinyclient.io/download/windows-arm64-portable) | The four `.exe` files, run in place |
 
-There is no macOS Intel build and no Windows arm64 build. Linux arm64 files use `aarch64` in the name. The `.deb` and `.rpm` package name is `tinyclient` on both architectures.
+Linux and Windows Arm64 files use `aarch64` in the name. The Linux `.deb` and `.rpm` package name is `tinyclient` on both architectures.
 
 Tiny device linking verifies the owner through the operating system before approving another
 device. Windows desktop verification is documented for Windows 11 (build 22000) and later.
@@ -171,15 +173,18 @@ While the window is open it asks GitHub whether a newer release exists, shortly 
 
 The address compiled into this copy is the old repository feed in `crates/tinyclient/src/update.rs`. GitHub currently redirects that request to [TinyComms/tinyclient](https://github.com/TinyComms/tinyclient), and the release it returns is the one the site serves.
 
-The in-app download exists for three builds:
+The in-app updater chooses the archive for the running build.
 
 | This copy | Archive it downloads |
 | --- | --- |
 | macOS, Apple silicon | `tinyclient-macos.zip` |
+| macOS, Intel | `tinyclient-macos-x86_64.zip` |
 | Linux x86_64 | `tinyclient-linux-x86_64.tar.gz` |
+| Linux arm64 | `tinyclient-linux-aarch64.tar.gz` |
 | Windows x86_64 | `tinyclient-windows-x86_64.zip` |
+| Windows Arm64 | `tinyclient-windows-aarch64.zip` |
 
-Linux arm64 does not ask GitHub. A development build under `target/`, and any copy in the Nix store, is never replaced. A directory this user cannot write, including `/usr/lib/tinyclient` from the `.deb` and `.rpm`, is not replaced either. The window can still say a release is available. Install the newer package, or the newer archive, yourself.
+A development build under `target/`, and any copy in the Nix store, is never replaced. A directory this user cannot write, including `/usr/lib/tinyclient` from the `.deb` and `.rpm`, is not replaced either. The window can still say a release is available. Install the newer package, or the newer archive, yourself.
 
 When a download is allowed, it is checked against that release's `SHA256SUMS`. On macOS the new app is checked with `codesign --verify --deep --strict` before it is kept. It replaces this copy when you quit. The menu then says Restart to Update. On Windows the swap waits until the programs from that folder have stopped, puts the old programs back if a step fails, and opens tinyclient again either way.
 

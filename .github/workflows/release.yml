@@ -51,7 +51,7 @@ jobs:
           RELEASE_URL: https://github.com/${{ github.repository }}/releases/tag/v${{ inputs.announce }}
         run: packaging/release-note.sh
 
-  # One job waits for CI, so the four build jobs do not each poll for it. The waits are long
+  # One job waits for CI on behalf of every desktop build. The waits are long
   # because macOS runners can queue for over an hour: a dispatched Mobile run took 2h24m.
   wait-for-ci:
     if: github.event_name == 'push' || inputs.announce == ''
@@ -104,7 +104,17 @@ jobs:
 
   macos:
     needs: wait-for-ci
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: macos
+            runner: macos-latest
+            arch: arm64
+          - package: macos-x86_64
+            runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
@@ -115,17 +125,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CI_RUN: ${{ needs.wait-for-ci.outputs.run }}
-        run: packaging/ci/reuse-binaries.sh macos "$CI_RUN"
+        run: packaging/ci/reuse-binaries.sh ${{ matrix.package }} "$CI_RUN"
       - uses: ./.github/actions/setup-rust
         if: steps.reuse.outputs.found != 'true'
         with:
-          cache-key: release
+          cache-key: ${{ matrix.arch == 'x86_64' && 'none' || 'release' }}
       - name: Build release
         if: steps.reuse.outputs.found != 'true'
         env:
           TINYCLIENT_TELEGRAM_API_ID: ${{ secrets.TINYCLIENT_TELEGRAM_API_ID }}
           TINYCLIENT_TELEGRAM_API_HASH: ${{ secrets.TINYCLIENT_TELEGRAM_API_HASH }}
         run: |
+          rustc -vV | grep -Fx 'host: ${{ matrix.arch == 'arm64' && 'aarch64' || 'x86_64' }}-apple-darwin'
           cargo build --release \
             -p tinyclient --features tinyclient/gui \
             -p chatd -p mediad -p login
@@ -134,27 +145,59 @@ jobs:
       - name: Zip and disk image
         run: |
           mkdir -p dist
-          ditto -c -k --keepParent target/release/tinyclient.app "dist/tinyclient-$LABEL-macos.zip"
-          packaging/dmg.sh "dist/tinyclient-$LABEL-macos.dmg"
-      # Mounted as a user would: the Applications link is there, the app's ad hoc signature holds,
-      # and every program in it runs.
-      - name: Smoke test the disk image
-        run: |
-          mnt=$(mktemp -d)
-          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "dist/tinyclient-$LABEL-macos.dmg"
-          test "$(readlink "$mnt/Applications")" = /Applications
-          codesign --verify --deep --strict --verbose=2 "$mnt/tinyclient.app"
-          codesign -dv "$mnt/tinyclient.app" 2>&1 | grep -q 'Signature=adhoc'
-          for program in tinyclient chatd mediad tinyclient-login; do
-            out=$("$mnt/tinyclient.app/Contents/MacOS/$program" --version)
-            echo "$out"
-            test "$out" = "$program $VERSION"
-          done
-          hdiutil detach "$mnt"
+          ditto -c -k --keepParent target/release/tinyclient.app "dist/tinyclient-$LABEL-${{ matrix.package }}.zip"
+          packaging/dmg.sh "dist/tinyclient-$LABEL-${{ matrix.package }}.dmg"
       - uses: actions/upload-artifact@v6
         with:
-          name: release-macos
+          name: release-${{ matrix.package }}
           path: dist/*
+
+  macos-smoke:
+    needs: macos
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: macos
+            runner: macos-latest
+            arch: arm64
+          - package: macos-x86_64
+            runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: Name the files
+        run: packaging/ci-label.sh >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v7
+        with:
+          name: release-${{ matrix.package }}
+          path: dist
+      - name: Install and run the disk image and updater zip
+        run: |
+          test "$(uname -m)" = "${{ matrix.arch }}"
+          mnt=$(mktemp -d)
+          stage=$(mktemp -d)
+          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "dist/tinyclient-$LABEL-${{ matrix.package }}.dmg"
+          trap 'hdiutil detach "$mnt"; rm -rf "$stage"' EXIT
+          test "$(readlink "$mnt/Applications")" = /Applications
+          ditto "$mnt/tinyclient.app" "$stage/Applications/tinyclient.app"
+          ditto -x -k "dist/tinyclient-$LABEL-${{ matrix.package }}.zip" "$stage/portable"
+          for app in "$stage/Applications/tinyclient.app" "$stage/portable/tinyclient.app"; do
+            codesign --verify --deep --strict --verbose=2 "$app"
+            codesign -dv "$app" 2>&1 | grep -q 'Signature=adhoc'
+            for program in tinyclient chatd mediad tinyclient-login; do
+              bin="$app/Contents/MacOS/$program"
+              lipo -verify_arch ${{ matrix.arch }} "$bin"
+              out=$("$bin" --version)
+              echo "$out"
+              test "$out" = "$program $VERSION"
+            done
+          done
+          if [ "${{ matrix.arch }}" = x86_64 ]; then
+            python3 packaging/ci/microphone-smoke.py "$stage/Applications/tinyclient.app/Contents/MacOS/mediad"
+          fi
 
   linux:
     needs: wait-for-ci
@@ -262,7 +305,17 @@ jobs:
 
   windows:
     needs: wait-for-ci
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: windows-latest
+            artifact: windows
+          - arch: aarch64
+            runner: windows-11-arm
+            artifact: windows-aarch64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
@@ -275,17 +328,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CI_RUN: ${{ needs.wait-for-ci.outputs.run }}
-        run: packaging/ci/reuse-binaries.sh windows "$CI_RUN"
+        run: packaging/ci/reuse-binaries.sh ${{ matrix.artifact }} "$CI_RUN"
       - uses: ./.github/actions/setup-rust
         if: steps.reuse.outputs.found != 'true'
         with:
-          cache-key: release
+          cache-key: ${{ matrix.arch == 'aarch64' && 'none' || 'release' }}
       - name: Build release
         if: steps.reuse.outputs.found != 'true'
         env:
           TINYCLIENT_TELEGRAM_API_ID: ${{ secrets.TINYCLIENT_TELEGRAM_API_ID }}
           TINYCLIENT_TELEGRAM_API_HASH: ${{ secrets.TINYCLIENT_TELEGRAM_API_HASH }}
         run: |
+          if ((rustc -vV) -notcontains "host: ${{ matrix.arch }}-pc-windows-msvc") {
+            throw "Rust toolchain does not match Windows ${{ matrix.arch }}"
+          }
           cargo build --release `
             -p tinyclient --features tinyclient/gui `
             -p chatd -p mediad -p login
@@ -297,17 +353,41 @@ jobs:
           }
       - name: Installer and portable zip
         shell: pwsh
-        run: packaging/windows.ps1 -NoBuild -Label $env:LABEL
-      - name: Smoke test the installer and the zip
-        shell: pwsh
-        run: packaging/windows/smoke.ps1 -Label $env:LABEL -Version $env:VERSION
+        run: packaging/windows.ps1 -NoBuild -Label $env:LABEL -Arch ${{ matrix.arch }}
       - uses: actions/upload-artifact@v6
         with:
-          name: release-windows
+          name: release-${{ matrix.artifact }}
           path: dist/*
 
+  windows-smoke:
+    needs: windows
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: windows-latest
+            artifact: windows
+          - arch: aarch64
+            runner: windows-11-arm
+            artifact: windows-aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: Name the files
+        shell: bash
+        run: packaging/ci-label.sh >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v7
+        with:
+          name: release-${{ matrix.artifact }}
+          path: dist
+      - name: Smoke test the installer and the zip
+        shell: pwsh
+        run: packaging/windows/smoke.ps1 -Label $env:LABEL -Version $env:VERSION -Arch ${{ matrix.arch }}
+
   publish:
-    needs: [macos, linux, linux-smoke, windows, phones]
+    needs: [macos-smoke, linux-smoke, windows-smoke, phones]
     runs-on: ubuntu-latest
     permissions:
       contents: write

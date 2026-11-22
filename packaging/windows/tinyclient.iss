@@ -38,9 +38,15 @@ DisableDirPage=auto
 ; For the current user (%LOCALAPPDATA%\Programs) unless an administrator chooses everyone.
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog commandline
+#ifdef Arm64Package
+ArchitecturesAllowed=arm64
+ArchitecturesInstallIn64BitMode=arm64
+MinVersion=10.0.22000
+#else
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
+#endif
 SetupIconFile=tinyclient.ico
 UninstallDisplayIcon={app}\tinyclient.ico
 UninstallDisplayName=tinyclient

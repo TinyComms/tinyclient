@@ -5,12 +5,10 @@
 # With no run id, or a run without this platform's package, found=false and the caller compiles.
 set -eu
 
-kind=${1:?usage: reuse-binaries.sh macos|linux-x86_64|linux-aarch64|windows [CI run id]}
+kind=${1:?usage: reuse-binaries.sh macos|macos-x86_64|linux-x86_64|linux-aarch64|windows|windows-aarch64 [CI run id]}
 run=${2:-}
 case "$kind" in
-    macos) artifact=tinyclient-macos ;;
-    linux-x86_64) artifact=tinyclient-linux-x86_64 ;;
-    linux-aarch64) artifact=tinyclient-linux-aarch64 ;;
+    macos | macos-x86_64 | linux-x86_64 | linux-aarch64 | windows-aarch64) artifact=tinyclient-$kind ;;
     windows) artifact=tinyclient-windows-x86_64 ;;
     *)
         echo "reuse-binaries.sh: nothing to reuse for $kind"
@@ -26,7 +24,7 @@ take() {
     stage=$1
     mkdir -p target/release
     case "$kind" in
-        macos)
+        macos | macos-x86_64)
             # CI uploads target/release/tinyclient.app as a directory, and upload-artifact keeps
             # what is inside it: the download is Contents/ with no tinyclient.app around it.
             macos=$(find "$stage" -type d -path '*/Contents/MacOS' | head -1)
@@ -47,7 +45,7 @@ take() {
             done
             rm -rf "$unpack"
             ;;
-        windows)
+        windows | windows-aarch64)
             archive=$(find "$stage" -name '*.zip' | head -1)
             [ -n "$archive" ] || return 1
             if command -v unzip >/dev/null 2>&1; then
@@ -60,7 +58,7 @@ take() {
             ;;
     esac
     for program in $programs; do
-        if [ "$kind" = windows ]; then
+        if [ "${kind%%-*}" = windows ]; then
             [ -f "target/release/$program.exe" ] || return 1
         else
             [ -x "target/release/$program" ] || return 1
