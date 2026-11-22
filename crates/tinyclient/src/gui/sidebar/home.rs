@@ -472,6 +472,8 @@ mod tests {
                 Item::Space { index, child, .. } => format!("{}{}", if child.is_some() { "." } else { "" }, spaces[*index].name),
                 Item::Folder { name, open, lit, .. } => format!("{}{name}{}", if *open { "v" } else { ">" }, if *lit { "*" } else { "" }),
                 Item::Call(c) => format!("call:{}", c.latest.name),
+                Item::UnreadGroupHeader(group) => format!("[{}]", group.conversation.title),
+                Item::UnreadMessage { title, message, .. } => format!("{title}:{}", message.id),
             })
             .collect()
     }

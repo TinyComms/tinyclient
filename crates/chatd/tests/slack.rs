@@ -571,7 +571,7 @@ impl Fake {
                 Some(listed)
             }
             "users.conversations" => {
-                let mut listed = self.fixture(token, "users.conversations")?;
+                let mut listed = self.fixture(token, "users.conversations").unwrap();
                 let extra = self.extra_conversations.lock().unwrap().clone();
                 if !extra.is_empty() {
                     if let Some(arr) = listed["channels"].as_array_mut() {
@@ -771,7 +771,7 @@ impl Fake {
                 Some(json!({"ok": true}))
             }
             "emoji.list" => {
-                let mut base = self.fixture(token, "emoji.list")?;
+                let mut base = self.fixture(token, "emoji.list").unwrap();
                 let added = self.added_emoji.lock().unwrap().clone();
                 if let Some(map) = base["emoji"].as_object_mut() {
                     for (k, v) in added {
