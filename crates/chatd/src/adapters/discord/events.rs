@@ -537,6 +537,9 @@ impl Discord {
         if let Some(privacy) = proto::privacy_settings(&update.settings.proto) {
             self.state.lock().unwrap().privacy_settings = privacy;
         }
+        if let Some(text) = proto::text_and_images_settings(&update.settings.proto) {
+            self.state.lock().unwrap().text_and_images = text;
+        }
         if update.partial {
             return Ok(());
         }

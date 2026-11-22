@@ -310,21 +310,37 @@ impl Discord {
         })
     }
 
-    /// Reads our Privacy & Safety settings from the cached `PreloadedUserSettings.privacy` block.
+    /// Reads our Privacy & Safety settings from the cached privacy block (field 8) and the
+    /// explicit-content and DM-spam fields of the cached text-and-images block (field 6).
     pub(super) fn get_network_privacy(&self) -> Result<protocol::NetworkPrivacy, Refusal> {
-        let raw = crate::hub::lock(&self.state).privacy_settings.clone();
-        Ok(super::proto::decode_privacy(&raw))
+        let state = crate::hub::lock(&self.state);
+        let mut privacy = super::proto::decode_privacy(&state.privacy_settings);
+        super::proto::apply_content_filters(&state.text_and_images, &mut privacy);
+        Ok(privacy)
     }
 
-    /// Writes updated Privacy & Safety settings to `PATCH /users/@me/settings-proto/1` with
-    /// every unknown protobuf field preserved untouched.
+    /// Writes updated Privacy & Safety settings to `PATCH /users/@me/settings-proto/1`.
+    /// Privacy is field 8. Explicit content and the DM spam filter are merged into the cached
+    /// text-and-images block and sent as field 6. Every other protobuf field is copied.
     pub(super) fn set_network_privacy(&self, privacy: protocol::NetworkPrivacy) -> Result<protocol::NetworkPrivacy, Refusal> {
-        let kept = crate::hub::lock(&self.state).privacy_settings.clone();
+        let (kept, kept_text) = {
+            let state = crate::hub::lock(&self.state);
+            (state.privacy_settings.clone(), state.text_and_images.clone())
+        };
         let updated = super::proto::with_privacy(&kept, &privacy);
-        let body = json!({"settings": super::proto::privacy_update_settings(&updated)});
+        let updated_text = (!kept_text.is_empty()).then(|| super::proto::with_content_filters(&kept_text, &privacy));
+        let body = json!({"settings": super::proto::privacy_update_settings(&updated, updated_text.as_deref())});
         self.call("PATCH", "/users/@me/settings-proto/1", Some(body)).map_err(refusal)?;
-        crate::hub::lock(&self.state).privacy_settings = updated.clone();
-        Ok(super::proto::decode_privacy(&updated))
+        {
+            let mut state = crate::hub::lock(&self.state);
+            state.privacy_settings = updated.clone();
+            if let Some(text) = &updated_text {
+                state.text_and_images = text.clone();
+            }
+        }
+        let mut decoded = super::proto::decode_privacy(&updated);
+        super::proto::apply_content_filters(updated_text.as_deref().unwrap_or(&[]), &mut decoded);
+        Ok(decoded)
     }
 
     /// Updates a single server's "Allow direct messages" / "Allow message requests" switches
@@ -348,7 +364,7 @@ impl Discord {
             net.request_restricted_spaces.push(guild.to_owned());
         }
         let updated = super::proto::with_privacy(&kept, &net);
-        let body = json!({"settings": super::proto::privacy_update_settings(&updated)});
+        let body = json!({"settings": super::proto::privacy_update_settings(&updated, None)});
         self.call("PATCH", "/users/@me/settings-proto/1", Some(body)).map_err(refusal)?;
         crate::hub::lock(&self.state).privacy_settings = updated;
         Ok(())

@@ -5271,37 +5271,30 @@ fn space_notification_switches_thread_settings_and_channel_overrides() {
 
 #[test]
 fn privacy_safety_decode_write_and_per_server_dm_switches() {
-    // Craft a PreloadedUserSettings blob containing field 6 (PrivacySettings):
-    // - field 3 (restricted_guild_ids): [4000]
-    // - field 4 (default_guilds_restricted): 1 (true)
-    // - field 8 (unknown BoolValue): 1
-    // - field 12 (friend_source_flags): 8 (mutual guilds only)
-    // - field 18 (default_message_request_restricted): 1 (true)
-    // - field 26 (explicit_content_filter): 2 (non-friends)
-    // - field 27 (dm_spam_filter_v2): 3 (everyone)
+    // PreloadedUserSettings. Text-and-images is field 6; privacy is field 8.
+    // PrivacySettings:
+    // - field 3 restricted_guild_ids: [4000]
+    // - field 4 default_guilds_restricted: true
+    // - field 8 detect_platform_accounts: BoolValue true (left alone)
+    // - field 11 friend_source_flags: 4 (mutual guilds only, bit 2)
+    // - field 17 default_message_request_restricted: true
+    // TextAndImagesSettings:
+    // - field 3 use_thread_sidebar: BoolValue true (left alone)
+    // - field 19 explicit_content_filter: UInt32Value 1 (non-friends)
+    // - field 27 dm_spam_filter_v2: 3 (everyone)
     let mut priv_block = Vec::new();
-    // field 3: packed fixed64 [4000]
-    let g4000 = 4000u64.to_le_bytes();
-    priv_block.extend_from_slice(&[0x1a, 8]);
-    priv_block.extend_from_slice(&g4000);
-    // field 4: varint 1
-    priv_block.extend_from_slice(&[0x20, 1]);
-    // field 8 (unknown): length-delimited [0x08, 0x01]
-    priv_block.extend_from_slice(&[0x42, 2, 0x08, 0x01]);
-    // field 12: UInt32Value(8) => tag (12<<3|2)=0x62, len 2, [0x08, 8]
-    priv_block.extend_from_slice(&[0x62, 2, 0x08, 8]);
-    // field 18: BoolValue(true) => tag (18<<3|2)=0x92,0x01, len 2, [0x08, 1]
-    priv_block.extend_from_slice(&[0x92, 0x01, 2, 0x08, 1]);
-    // field 26: varint 2 => tag (26<<3)=0xd0,0x01, val 2
-    priv_block.extend_from_slice(&[0xd0, 0x01, 2]);
-    // field 27: varint 3 => tag (27<<3)=0xd8,0x01, val 3
-    priv_block.extend_from_slice(&[0xd8, 0x01, 3]);
-
+    proto_bytes(&mut priv_block, 3, &4000u64.to_le_bytes());
+    proto_varint_field(&mut priv_block, 4, 1);
+    proto_bytes(&mut priv_block, 8, &[0x08, 0x01]);
+    proto_bytes(&mut priv_block, 11, &[0x08, 0x04]);
+    proto_bytes(&mut priv_block, 17, &[0x08, 0x01]);
+    let mut text = Vec::new();
+    proto_bytes(&mut text, 3, &[0x08, 0x01]);
+    proto_bytes(&mut text, 19, &[0x08, 0x01]);
+    proto_varint_field(&mut text, 27, 3);
     let mut outer = Vec::new();
-    // field 6: tag (6<<3|2)=0x32
-    outer.push(0x32);
-    outer.push(priv_block.len() as u8);
-    outer.extend_from_slice(&priv_block);
+    proto_bytes(&mut outer, 6, &text);
+    proto_bytes(&mut outer, 8, &priv_block);
     let encoded_proto = base64::engine::general_purpose::STANDARD.encode(&outer);
 
     let mut ready: Value = serde_json::from_str(READY).unwrap();
@@ -5333,7 +5326,9 @@ fn privacy_safety_decode_write_and_per_server_dm_switches() {
     };
     assert_eq!(s4000.privacy, Some(protocol::SpacePrivacy { allow_dms: false, allow_requests: true }));
 
-    // 2. SetNetworkPrivacy sends PATCH /users/@me/settings-proto/1 and preserves unknown field 8.
+    // 2. SetNetworkPrivacy sends PATCH /users/@me/settings-proto/1.
+    // detect_platform_accounts (privacy field 8) and use_thread_sidebar (text field 3) survive.
+    // The privacy block is field 8 of the outer message, not field 6.
     let mut updated = initial.clone();
     updated.friend_requests_everyone = true;
     updated.allow_dms_from_spaces = true;
@@ -5348,8 +5343,11 @@ fn privacy_safety_decode_write_and_per_server_dm_switches() {
     let sent_bytes = base64::engine::general_purpose::STANDARD
         .decode(patches[0].body["settings"].as_str().unwrap())
         .unwrap();
-    // Unknown field 8 bytes [0x42, 0x02, 0x08, 0x01] must survive intact inside the patched blob.
-    assert!(sent_bytes.windows(4).any(|w| w == [0x42, 2, 0x08, 0x01]), "unknown field 8 was lost on write");
+    assert!(sent_bytes.windows(4).any(|w| w == [0x42, 2, 0x08, 0x01]), "detect_platform_accounts was lost on write");
+    assert!(sent_bytes.windows(4).any(|w| w == [0x1a, 2, 0x08, 0x01]), "use_thread_sidebar was lost on write");
+    assert_eq!(sent_bytes.first().copied(), Some(0x32), "text-and-images must be outer field 6");
+    let privacy_at = sent_bytes.iter().position(|byte| *byte == 0x42).expect("privacy field");
+    assert!(privacy_at > 0, "privacy must be outer field 8, after text-and-images");
 
     // 3. SetSpacePrivacy toggles allow_dms=true and allow_requests=false for guild 4000.
     assert_eq!(

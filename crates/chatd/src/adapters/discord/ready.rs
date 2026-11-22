@@ -989,8 +989,14 @@ impl Discord {
         if let Some(status) = ready.user_settings_proto.as_deref().and_then(proto::status_settings) {
             self.own_status(status);
         }
-        if let Some(privacy) = ready.user_settings_proto.as_deref().and_then(proto::privacy_settings) {
-            self.state.lock().unwrap().privacy_settings = privacy;
+        if let Some(proto) = ready.user_settings_proto.as_deref() {
+            let mut state = self.state.lock().unwrap();
+            if let Some(privacy) = proto::privacy_settings(proto) {
+                state.privacy_settings = privacy;
+            }
+            if let Some(text) = proto::text_and_images_settings(proto) {
+                state.text_and_images = text;
+            }
         }
 
         // A few unread conversations are fetched ahead, once per run and never on a reconnect.

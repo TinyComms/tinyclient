@@ -372,8 +372,12 @@ struct State {
     /// Discord sent them (`proto::status_settings`), to change one part and send back the rest.
     own: (Presence, String),
     status_settings: Vec<u8>,
-    /// Raw `PreloadedUserSettings.privacy` bytes (field 6), preserved across updates.
+    /// Raw `PreloadedUserSettings.privacy` bytes (field 8), preserved across updates.
     privacy_settings: Vec<u8>,
+    /// Raw `PreloadedUserSettings.text_and_images` bytes (field 6). Explicit content and the
+    /// DM spam filter are written back into this block. Empty until Discord sends one: a
+    /// made-up field 6 would reset every other text-and-image setting.
+    text_and_images: Vec<u8>,
     /// Raw `FrecencyUserSettings` (`settings-proto/2`). Empty until the picker first opens.
     /// Favourite lists are the only part written back. Frecency scores are read for the
     /// "Frequently used" section and never written: a wrong score would replace the account's
