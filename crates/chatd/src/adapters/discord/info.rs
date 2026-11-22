@@ -771,10 +771,13 @@ impl Discord {
             fields.push(("Boosting since".to_owned(), date));
         }
 
+        // Read before the `if`: a guard taken in an `else if let` is held through the last branch,
+        // which locks the state again.
+        let cached_note = crate::hub::lock(&self.state).notes.get(person).cloned();
         let note = if let Some(inline) = profile.note.clone() {
             crate::hub::lock(&self.state).notes.insert(person.to_owned(), inline.clone());
             inline
-        } else if let Some(cached) = crate::hub::lock(&self.state).notes.get(person).cloned() {
+        } else if let Some(cached) = cached_note {
             cached
         } else {
             match self.call("GET", &format!("/users/@me/notes/{person}"), None) {

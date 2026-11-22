@@ -7881,7 +7881,8 @@ fn thread_settings_rename_archive_lock_delete_notifications_and_members() {
     );
     let notif = world.discord.requests_to("PATCH", "/channels/4500/thread-members/@me/settings");
     assert_eq!(notif.len(), 1);
-    assert_eq!(notif[0].body["flags"], json!(4));
+    // READY marks our seat in 4500 with HAS_INTERACTED (1), which a level change keeps.
+    assert_eq!(notif[0].body["flags"], json!(5));
     assert_eq!(notif[0].body["muted"], json!(false));
     assert!(!world.conversation("4500").muted);
 
@@ -7895,7 +7896,7 @@ fn thread_settings_rename_archive_lock_delete_notifications_and_members() {
     );
     let notif = world.discord.requests_to("PATCH", "/channels/4500/thread-members/@me/settings");
     assert_eq!(notif.len(), 2);
-    assert_eq!(notif[1].body["flags"], json!(8));
+    assert_eq!(notif[1].body["flags"], json!(9));
     assert_eq!(notif[1].body["muted"], json!(true));
     assert!(world.conversation("4500").muted);
     let info = match world.ask(Request::ConversationInfo { conversation: world.key("4500") }) {
