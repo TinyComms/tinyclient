@@ -3639,6 +3639,13 @@ impl Store {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
+        // What the shell called a send of ours stays when a fetched page repeats the message:
+        // no network carries it, and the shell still finds its send by it.
+        if incoming.outgoing && incoming.client_id.is_none() {
+            if let Some((_, old)) = &before {
+                incoming.client_id = serde_json::from_str::<Message>(old).ok().and_then(|had| had.client_id);
+            }
+        }
         // A sealed conversation's wire rows never carry reactions — they are folded ciphertexts
         // of their own, on a route of theirs — so what this store folded stays when a fetched
         // page replaces the row.
@@ -6329,6 +6336,22 @@ mod tests {
         let failed = store.message(&key, "c-2").unwrap().unwrap();
         assert_eq!(failed.state, SendState::Failed { reason: "no answer".into() });
         assert_eq!(store.fail_pending(i64::MAX, "no answer").unwrap(), []);
+    }
+
+    #[test]
+    fn a_fetched_page_keeps_what_the_shell_called_a_sent_message() {
+        let (mut store, key) = store();
+        let mut echoed = Message::plain("777", "me", "on it", 101, true);
+        echoed.client_id = Some("c-1".into());
+        store.ingest(&key, &echoed, true).unwrap();
+        // History read after the send repeats the message. The network never carries the client id.
+        let fetched = Message::plain("777", "me", "on it", 101, true);
+        store.ingest(&key, &fetched, false).unwrap();
+        assert_eq!(store.message(&key, "777").unwrap().unwrap().client_id.as_deref(), Some("c-1"));
+        // Somebody else's message has none to keep.
+        let theirs = Message::plain("778", "Ana", "ok", 102, false);
+        store.ingest(&key, &theirs, true).unwrap();
+        assert_eq!(store.message(&key, "778").unwrap().unwrap().client_id, None);
     }
 
     #[test]
