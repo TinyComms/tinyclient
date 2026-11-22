@@ -310,6 +310,9 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
     }
     for group in &listed_groups {
         group_listed(ctx, saved, group);
+        if let Some(call) = &group.last_call {
+            record_group_call(ctx, saved, names, &group.id, call);
+        }
     }
     for direct in &directs {
         if let Some(call) = &direct.last_call {
@@ -361,6 +364,11 @@ pub(crate) fn on_live(
         "direct.call" => {
             if let Ok(call) = serde_json::from_value::<WireCall>(frame.clone()) {
                 record_call(ctx, saved, names, &call.direct_id, &call);
+            }
+        }
+        "group.call" => {
+            if let Ok(call) = serde_json::from_value::<WireGroupCall>(frame.clone()) {
+                record_group_call(ctx, saved, names, &call.group_id, &call);
             }
         }
         "e2ee.upgraded" => upgraded(ctx, saved, frame),
@@ -495,6 +503,7 @@ pub(crate) fn live_kind(kind: &str) -> bool {
             | "group.member_left"
             | "group.deleted"
             | "group.member_reachable"
+            | "group.call"
             | "direct.call"
             | "e2ee.upgraded"
             | "message.created"
@@ -4127,6 +4136,100 @@ struct WireGroup {
     last_read: Option<String>,
     #[serde(default)]
     last_message: Option<WireLast>,
+    /// The newest finished call in the group. Absent until one has ended.
+    #[serde(default)]
+    last_call: Option<WireGroupCall>,
+}
+
+/// One finished group call. A live `group.call` names the group and everyone's part in it
+/// (`outcomes`); a group's `last_call` names only the viewer's (`mine`).
+#[derive(Clone, Deserialize, Default)]
+struct WireGroupCall {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    call_id: String,
+    #[serde(default)]
+    group_id: String,
+    #[serde(default)]
+    started_by: String,
+    #[serde(default)]
+    outcome: String,
+    #[serde(default)]
+    started_at: String,
+    #[serde(default)]
+    ended_at: String,
+    #[serde(default)]
+    joined: Vec<String>,
+    #[serde(default)]
+    mine: Option<String>,
+    #[serde(default)]
+    outcomes: HashMap<String, String>,
+}
+
+/// At most three names, then how many more.
+fn names_then_more(names: &[String]) -> String {
+    let shown = names.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+    match names.len().saturating_sub(3) {
+        0 => shown,
+        more => format!("{shown} and {more} more"),
+    }
+}
+
+/// The line a finished group call leaves in the group, one per call: the call's id is the
+/// line's id, so the live event and the list's `last_call` do not double up. Only a call the
+/// viewer missed counts as unread, and only while group messages notify.
+fn record_group_call(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, group_id: &str, call: &WireGroupCall) {
+    let call_id = if call.call_id.is_empty() { call.id.as_str() } else { call.call_id.as_str() };
+    if !super::safe_id(group_id) || !super::safe_id(call_id) || !super::safe_id(&call.started_by) {
+        return;
+    }
+    // Cancelled before anyone sat: nothing happened to say.
+    if call.outcome != "ended" && call.outcome != "missed" {
+        return;
+    }
+    if ctx.known(group_id).ok().flatten().is_none() {
+        return;
+    }
+    let me = saved.user_id.as_str();
+    let kept = kept_group(saved, group_id).unwrap_or_default();
+    let name_of = |id: &str| {
+        if id == me {
+            return "You".to_owned();
+        }
+        names
+            .get(id)
+            .filter(|name| !name.is_empty())
+            .cloned()
+            .or_else(|| kept.members.iter().find(|member| member.user_id == id).map(member_name))
+            .unwrap_or_else(|| "Someone".to_owned())
+    };
+    let mine = call.mine.as_deref().or_else(|| call.outcomes.get(me).map(String::as_str)).unwrap_or("");
+    let started = call.started_by == me;
+    let starter = name_of(&call.started_by);
+    let seconds = match (rfc3339(&call.started_at), rfc3339(&call.ended_at)) {
+        (Some(from), Some(to)) if to > from => Some((to - from) as u32),
+        _ => None,
+    };
+    let length = seconds.map(|seconds| format!(" · {}", format_call_duration(seconds))).unwrap_or_default();
+    let others: Vec<String> = call.joined.iter().filter(|id| id.as_str() != me && **id != call.started_by).map(|id| name_of(id)).collect();
+    let (text, outcome, missed) = if started && call.joined.iter().all(|id| id == me) {
+        ("Nobody joined your call.".to_owned(), protocol::CallOutcome::Missed, false)
+    } else if mine == "joined" || started {
+        let with = if others.is_empty() { String::new() } else { format!(" · {}", names_then_more(&others)) };
+        (format!("{starter} started a call{length}{with}"), protocol::CallOutcome::Ended, false)
+    } else if matches!(mine, "missed" | "busy" | "not_rung") {
+        (format!("Missed call from {starter}{length}"), protocol::CallOutcome::Missed, true)
+    } else {
+        // Declined, or no part of mine the server names.
+        (format!("{starter} started a call{length}"), if mine == "declined" { protocol::CallOutcome::Declined } else { protocol::CallOutcome::Ended }, false)
+    };
+    let mut message = Message::plain(call_id, starter, text, rfc3339(&call.ended_at).unwrap_or(0), started);
+    message.kind = MessageKind::System;
+    message.sender.id = call.started_by.clone();
+    message.call = Some(protocol::CallNote { outcome, caller_id: call.started_by.clone(), seconds, participants: call.joined.clone(), video: false });
+    let counts = missed && ctx.hub.settings().on(protocol::settings::NOTIFY_GROUPS);
+    let _ = ctx.quiet_line(group_id, &message, counts);
 }
 
 #[derive(Clone, Deserialize)]
@@ -4325,6 +4428,9 @@ fn group_upsert(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, g
     if snapshot {
         group_note(saved, group).apply(ctx, saved, names);
         group_listed(ctx, saved, group);
+        if let Some(call) = &group.last_call {
+            record_group_call(ctx, saved, names, &group.id, call);
+        }
     } else if known.is_none() {
         let _ = ctx.counts(&group.id, 0, 0, None, group.created_at.as_deref().and_then(rfc3339).unwrap_or(1));
     }
@@ -7460,5 +7566,51 @@ mod tests {
         let (reply, deleted) = std::sync::mpsc::channel();
         delete(&ctx, &saved, "group-1", "g-1", reply);
         assert_eq!(deleted.recv().unwrap(), Ok(()));
+    }
+
+    #[test]
+    fn a_finished_group_call_leaves_one_line_and_only_a_missed_one_is_unread() {
+        let (_adapter, ctx, saved) = group_fixture(|request| {
+            request.starts_with("GET /v1/groups ").then(|| {
+                let mut group = group_json("group-1");
+                group["unread"] = json!(0);
+                group["last_call"] = json!({"id": "call-missed", "call_id": "call-missed", "started_by": PEER, "outcome": "ended",
+                    "started_at": "2024-01-02T03:04:05Z", "ended_at": "2024-01-02T03:16:05Z", "joined": [PEER, CY], "mine": "missed"});
+                http(200, "OK", &json!({"groups": [group]}).to_string())
+            })
+        });
+        assert!(live_kind("group.call"));
+        let names = HashMap::from([(PEER.to_owned(), "Bea".to_owned())]);
+        let line = |id: &str| ctx.stored_message("group-1", id).unwrap().map(|message| (message.text, message.kind));
+        let unread = || ctx.known("group-1").unwrap().unwrap().unread;
+        // The list's last call: I was rung and did not answer.
+        assert_eq!(line("call-missed"), Some(("Missed call from Bea · 12 min".to_owned(), MessageKind::System)));
+        assert_eq!(unread(), 1, "a missed call is unread");
+        let heard = |call_id: &str, started_by: &str, outcome: &str, joined: Value, outcomes: Value| {
+            on_live(&ctx, &saved, &names, "group.call", &json!({"group_id": "group-1", "call_id": call_id, "started_by": started_by, "outcome": outcome,
+                "started_at": "2024-01-02T04:00:00Z", "ended_at": "2024-01-02T04:00:40Z", "joined": joined, "outcomes": outcomes}));
+        };
+        // The live frame for the same call yields no second line and no second count.
+        heard("call-missed", PEER, "ended", json!([PEER, CY]), json!({ME: "missed", PEER: "joined", CY: "joined"}));
+        assert_eq!(unread(), 1);
+        // I was in it: who else joined, three names and then how many more. Not unread.
+        heard("call-in", PEER, "ended", json!([PEER, ME, CY, DEE, "55555555-5555-5555-5555-555555555555", "66666666-6666-6666-6666-666666666666"]), json!({ME: "joined"}));
+        assert_eq!(line("call-in").unwrap().0, "Bea started a call · 40 sec · Cy, Dee, Someone and 1 more");
+        // I declined; I started it and nobody came; I was busy; cancelled before anyone sat.
+        heard("call-declined", PEER, "ended", json!([PEER, CY]), json!({ME: "declined"}));
+        assert_eq!(line("call-declined").unwrap().0, "Bea started a call · 40 sec");
+        heard("call-alone", ME, "missed", json!([ME]), json!({ME: "joined", PEER: "missed"}));
+        assert_eq!(line("call-alone").unwrap().0, "Nobody joined your call.");
+        assert_eq!(unread(), 1, "none of those is unread");
+        heard("call-busy", PEER, "ended", json!([PEER, CY]), json!({ME: "busy"}));
+        assert_eq!(line("call-busy").unwrap().0, "Missed call from Bea · 40 sec");
+        assert_eq!(unread(), 2);
+        heard("call-cancelled", PEER, "cancelled", json!([]), json!({ME: "missed"}));
+        assert_eq!(line("call-cancelled"), None);
+        // With group messages switched off, a missed group call does not count either.
+        ctx.hub.settings().set(protocol::settings::GLOBAL, protocol::settings::NOTIFY_GROUPS, Some("off".to_owned()));
+        heard("call-quiet", PEER, "ended", json!([PEER]), json!({ME: "not_rung"}));
+        assert_eq!(line("call-quiet").unwrap().0, "Missed call from Bea · 40 sec");
+        assert_eq!(unread(), 2);
     }
 }
