@@ -1059,8 +1059,8 @@ impl Command {
             | Command::SetAvatar { reply, .. }
             | Command::SetNickname { reply, .. }
             | Command::SetFriendNickname { reply, .. }
-            | Command::AnswerMessageRequest { reply, .. }
-            | Command::OpenForum { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            | Command::AnswerMessageRequest { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::OpenForum { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Source { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReportReasons { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             // Nothing to end on the network: the session is simply forgotten.

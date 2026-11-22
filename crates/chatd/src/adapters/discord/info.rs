@@ -811,6 +811,54 @@ impl Discord {
             total: found.total_results,
         })
     }
+
+    /// Kicks, bans, times out, untimes out, or renames a guild member, gated by
+    /// computed guild permissions and role hierarchy.
+    pub(super) fn moderate(
+        &self,
+        guild: &str,
+        target: &str,
+        action: protocol::ModerateAction,
+        reason: &str,
+    ) -> Result<(), Refusal> {
+        let me = self.me();
+        {
+            let state = crate::hub::lock(&self.state);
+            let info = state.guilds.get(guild).ok_or_else(|| refused("This server is gone."))?;
+            info.can_moderate(guild, &me, target, &action).map_err(refused)?;
+        }
+        let (method, path, body) = moderate_request(guild, target, &action);
+        if reason.trim().is_empty() {
+            self.call(method, &path, body).map_err(refusal)?;
+        } else {
+            let encoded = encode_audit_reason(reason.trim());
+            self.rest
+                .call_with(method, &path, body, &[("X-Audit-Log-Reason", &encoded)])
+                .map_err(refusal)?;
+        }
+        Ok(())
+    }
+
+    /// Lifts a ban on `target` in `guild`, gated by `BAN_MEMBERS`.
+    pub(super) fn unban(&self, guild: &str, target: &str, reason: &str) -> Result<(), Refusal> {
+        {
+            let state = crate::hub::lock(&self.state);
+            let info = state.guilds.get(guild).ok_or_else(|| refused("This server is gone."))?;
+            if info.guild_permissions(guild) & model::BAN_MEMBERS == 0 {
+                return Err(refused("You don't have permission to unban members."));
+            }
+        }
+        let path = format!("/guilds/{guild}/bans/{target}");
+        if reason.trim().is_empty() {
+            self.call("DELETE", &path, None).map_err(refusal)?;
+        } else {
+            let encoded = encode_audit_reason(reason.trim());
+            self.rest
+                .call_with("DELETE", &path, None, &[("X-Audit-Log-Reason", &encoded)])
+                .map_err(refusal)?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -891,54 +939,6 @@ mod tests {
         let sf = model::snowflake_from_unix(ts);
         assert_eq!(model::seconds(&sf.to_string()), ts);
         assert_eq!(model::snowflake_from_unix(0), 0);
-    }
-
-    /// Kicks, bans, times out, untimes out, or renames a guild member, gated by
-    /// computed guild permissions and role hierarchy.
-    pub(super) fn moderate(
-        &self,
-        guild: &str,
-        target: &str,
-        action: protocol::ModerateAction,
-        reason: &str,
-    ) -> Result<(), Refusal> {
-        let me = self.me();
-        {
-            let state = crate::hub::lock(&self.state);
-            let info = state.guilds.get(guild).ok_or_else(|| refused("This server is gone."))?;
-            info.can_moderate(guild, &me, target, &action).map_err(refused)?;
-        }
-        let (method, path, body) = moderate_request(guild, target, &action);
-        if reason.trim().is_empty() {
-            self.call(method, &path, body).map_err(refusal)?;
-        } else {
-            let encoded = encode_audit_reason(reason.trim());
-            self.rest
-                .call_with(method, &path, body, &[("X-Audit-Log-Reason", &encoded)])
-                .map_err(refusal)?;
-        }
-        Ok(())
-    }
-
-    /// Lifts a ban on `target` in `guild`, gated by `BAN_MEMBERS`.
-    pub(super) fn unban(&self, guild: &str, target: &str, reason: &str) -> Result<(), Refusal> {
-        {
-            let state = crate::hub::lock(&self.state);
-            let info = state.guilds.get(guild).ok_or_else(|| refused("This server is gone."))?;
-            if info.guild_permissions(guild) & model::BAN_MEMBERS == 0 {
-                return Err(refused("You don't have permission to unban members."));
-            }
-        }
-        let path = format!("/guilds/{guild}/bans/{target}");
-        if reason.trim().is_empty() {
-            self.call("DELETE", &path, None).map_err(refusal)?;
-        } else {
-            let encoded = encode_audit_reason(reason.trim());
-            self.rest
-                .call_with("DELETE", &path, None, &[("X-Audit-Log-Reason", &encoded)])
-                .map_err(refusal)?;
-        }
-        Ok(())
     }
 }
 
