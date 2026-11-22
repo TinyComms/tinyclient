@@ -412,6 +412,14 @@ pub struct SettingsWindow {
     /// Never written back until loaded so existing exceptions are always preserved.
     pub(super) tg_privacy: HashMap<(protocol::AccountKey, protocol::PrivacyKey), protocol::PrivacyPolicy>,
     pub(super) tg_privacy_requested: std::collections::HashSet<protocol::AccountKey>,
+    /// Loaded Telegram account default auto-delete timer (`GetDefaultDisappearing`).
+    pub(super) tg_default_ttl: HashMap<protocol::AccountKey, u32>,
+    pub(super) tg_default_ttl_requested: std::collections::HashSet<protocol::AccountKey>,
+    /// Loaded Telegram chat folders for Settings › Accounts folder management.
+    pub(super) tg_folders: HashMap<protocol::AccountKey, Vec<protocol::Folder>>,
+    pub(super) tg_folders_requested: std::collections::HashSet<protocol::AccountKey>,
+    pub(super) tg_folder_name: HashMap<protocol::AccountKey, Entity<TextInput>>,
+    pub(super) tg_folder_error: HashMap<protocol::AccountKey, String>,
     /// Loaded account-wide notification defaults and exceptions (Telegram).
     pub(super) tg_notify_defaults: HashMap<protocol::AccountKey, protocol::NotifyDefaults>,
     pub(super) tg_notify_requested: std::collections::HashSet<protocol::AccountKey>,
@@ -564,6 +572,12 @@ impl SettingsWindow {
             tiny,
             tg_privacy: HashMap::new(),
             tg_privacy_requested: std::collections::HashSet::new(),
+            tg_default_ttl: HashMap::new(),
+            tg_default_ttl_requested: std::collections::HashSet::new(),
+            tg_folders: HashMap::new(),
+            tg_folders_requested: std::collections::HashSet::new(),
+            tg_folder_name: HashMap::new(),
+            tg_folder_error: HashMap::new(),
             tg_notify_defaults: HashMap::new(),
             tg_notify_requested: std::collections::HashSet::new(),
             tg_sessions: HashMap::new(),
@@ -639,6 +653,8 @@ impl SettingsWindow {
             Section::Accounts => {
                 self.tiny.forget_names();
                 self.read_tiny_names(cx);
+                self.tg_default_ttl_requested.clear();
+                self.tg_folders_requested.clear();
             }
             _ => {}
         }

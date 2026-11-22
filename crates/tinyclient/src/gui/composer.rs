@@ -50,7 +50,7 @@ pub use typing::preview as typing_preview;
 use super::components::place::{max_height, placed, Layer, Place};
 use super::components::{button, glyph, menu, menu_item, menu_item_disabled, menu_label, menu_separator, tip, ButtonKind};
 use super::input::{InputEvent, InputKey, InputList, InputPaste, PickEmoji, PickGifs, SubmitSilently, TextInput};
-use super::people::{ask_later, Hub};
+use super::people::{ask_later, rough_last_seen, Hub};
 use super::playing;
 use super::state::Shell;
 use super::theme::{self, Type};
@@ -283,6 +283,9 @@ struct Target {
     /// When this direct conversation's peer is blocked, the composer is replaced by an unblock bar.
     blocked_peer: Option<protocol::Person>,
     special: protocol::Special,
+    bot: bool,
+    /// The direct peer hides an exact last-seen time (Telegram's rough "last seen …" words).
+    hidden_last_seen: bool,
     /// What the account may send.
     can: Capabilities,
     /// Selectable sending identities or lines (e.g. dual-SIM cards on Messages).
@@ -3668,6 +3671,21 @@ impl Composer {
                 if self.target.as_ref().is_some_and(|t| t.key.network == Network::Messages) {
                     items = items.child(menu_label("Sends while this computer is on and your phone is reachable."));
                 }
+                let can_when_online = self.target.as_ref().is_some_and(|t| {
+                    schedule::when_online_for(
+                        t.key.network,
+                        t.kind,
+                        t.special != protocol::Special::None || t.bot,
+                        t.hidden_last_seen,
+                    )
+                });
+                if can_when_online {
+                    items = items.child(
+                        menu_item("schedule-when-online", Some("icons/clock.svg"), "Send when online", None).on_click(
+                            cx.listener(|this, _, _, cx| this.choose_schedule(protocol::SCHEDULE_WHEN_ONLINE, cx)),
+                        ),
+                    );
+                }
                 for (index, moment) in presets.into_iter().enumerate() {
                     let at = moment.at;
                     items = items.child(menu_item(schedule::preset_id(index), Some("icons/calendar.svg"), moment.label, None).on_click(
@@ -4183,6 +4201,14 @@ impl Shell {
                 (person.relation == protocol::Relation::Blocked).then_some(person)
             })
             .flatten();
+        let hidden_last_seen = kind == ConversationKind::Direct
+            && open.peer.as_deref().is_some_and(|peer_id| {
+                let peer_key = Key::new(&open.key.account(), peer_id);
+                let hub = self.people_state.hub();
+                let live = hub.status_of(&peer_key);
+                let status = if live.is_empty() { hub.person(&peer_key).map(|person| person.status).unwrap_or_default() } else { live };
+                rough_last_seen(&status)
+            });
         let target = Target {
             key: open.key.clone(),
             title: open.title.clone(),
@@ -4195,6 +4221,8 @@ impl Shell {
             joined: open.joined,
             blocked_peer,
             special: open.special,
+            bot: open.bot,
+            hidden_last_seen,
             can,
             send_as: self.send_as_of(&open.key),
         };
@@ -4227,6 +4255,8 @@ impl Shell {
             joined: true,
             blocked_peer: None,
             special: protocol::Special::None,
+            bot: false,
+            hidden_last_seen: false,
             can: self.can_of(thread),
             send_as: self.send_as_of(thread),
         };
@@ -4861,6 +4891,8 @@ mod tests {
             read_only_reason: String::new(),
             blocked_peer: None,
             special: protocol::Special::None,
+            bot: false,
+            hidden_last_seen: false,
             joined: true,
             can: Capabilities::default(),
             send_as: Vec::new(),

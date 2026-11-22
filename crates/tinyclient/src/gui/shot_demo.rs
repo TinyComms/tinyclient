@@ -1120,9 +1120,10 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
         Request::Topics { .. } | Request::InVoice { .. } => conversations(Vec::new(), 0, 1),
         Request::Folders { .. } => Response::Folders { folders: Vec::new() },
         Request::SearchMessages { conversation, query, limit, .. } => {
-            Response::MessageHits { hits: hits(query, conversation.as_ref()).into_iter().take(*limit as usize).collect(), cursor: None, not_searched: Vec::new() }
+            Response::MessageHits { hits: hits(query, conversation.as_ref()).into_iter().take(*limit as usize).collect(), cursor: None, not_searched: Vec::new(), total: None }
         }
-        Request::SearchNetwork { conversation, query, .. } => Response::MessageHits { hits: hits(query, conversation.as_ref()), cursor: None, not_searched: Vec::new() },
+        Request::SearchNetwork { conversation, query, .. } => Response::MessageHits { hits: hits(query, conversation.as_ref()), cursor: None, not_searched: Vec::new(), total: None },
+        Request::SearchCalendar { .. } => Response::SearchCalendar { days: Vec::new() },
         Request::Messages { conversation, page: at, limit } => page(conversation, at, *limit),
         Request::Pinned { conversation } => Response::Pinned {
             conversation: conversation.clone(),
@@ -1217,6 +1218,9 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
         },
         Request::Fetch { .. } => Response::Media { files: Vec::new() },
         Request::Settings => Response::Settings { values: Vec::new() },
+        Request::GetDefaultDisappearing { .. } => Response::DefaultDisappearing { seconds: 0 },
+        Request::SuggestedFolders { .. } => Response::SuggestedFolders { folders: Vec::new() },
+        Request::TopicIcons { .. } => Response::Catalog { items: Vec::new(), cursor: None },
         Request::Storage => Response::Storage { messages: 48_213, files: 734_003_200 },
         Request::Prunable { .. } => Response::Prunable { messages: 0, bytes: 0 },
         Request::SignIn { .. } => Response::Error { code: protocol::ErrorCode::SignIn, detail: "The sign-in window was closed.".into() },

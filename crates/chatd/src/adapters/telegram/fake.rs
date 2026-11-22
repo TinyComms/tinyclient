@@ -206,7 +206,17 @@ fn chats() -> Vec<tl::enums::Chat> {
             notes.verified = true;
             notes
         }),
-        tl::enums::Chat::Channel(a_channel(WORKSHOP, "Workshop", false, true, "")),
+        tl::enums::Chat::Channel({
+            let mut workshop = a_channel(WORKSHOP, "Workshop", false, true, "");
+            if std::env::var("TINYCLIENT_TELEGRAM_ADMIN").ok().as_deref() == Some("1") {
+                let mut rights: tl::types::ChatAdminRights = blank(&[&put(0u32)]);
+                rights.delete_messages = true;
+                rights.pin_messages = true;
+                rights.manage_topics = true;
+                workshop.admin_rights = Some(rights.into());
+            }
+            workshop
+        }),
     ]
 }
 
@@ -500,6 +510,21 @@ fn packed(member: &[u8]) -> Vec<u8> {
     held
 }
 
+#[derive(Clone)]
+struct FakeTopic {
+    id: i32,
+    title: String,
+    date: i32,
+    top_message: i32,
+    unread: i32,
+    icon_color: i32,
+    icon_emoji_id: Option<i64>,
+    closed: bool,
+    pinned: bool,
+    hidden: bool,
+    my: bool,
+}
+
 struct World {
     signed_in: bool,
     /// Messages by conversation, oldest first by id.
@@ -595,6 +620,16 @@ struct World {
     show_recent: bool,
     /// `messages.getFeaturedStickers` returns one Premium pack.
     featured_premium: bool,
+    /// Per-chat auto-delete timer in seconds (`messages.setHistoryTTL`).
+    ttl_periods: HashMap<Who, i32>,
+    /// Account-wide default auto-delete timer for new chats (`messages.get/setDefaultHistoryTTL`).
+    default_ttl: i32,
+    /// Custom/mutated dialog filters once modified via `UpdateDialogFilter` / `UpdateDialogFiltersOrder`.
+    custom_folders: Option<Vec<tl::enums::DialogFilter>>,
+    /// Mutable forum topics per forum channel (initialized on demand for `WORKSHOP`).
+    forum_topics: HashMap<Who, Vec<FakeTopic>>,
+    /// Pending scheduled messages by conversation key (`messages.getScheduledHistory`).
+    scheduled: BTreeMap<String, BTreeMap<i32, tl::enums::Message>>,
     /// Account-wide notification defaults: `[users_muted, groups_muted, channels_muted]`.
     notify_defaults: [bool; 3],
     /// Per-peer notification exceptions (`account.getNotifyExceptions`).
@@ -686,6 +721,11 @@ impl World {
             faved: Vec::new(),
             show_recent: false,
             featured_premium: false,
+            ttl_periods: HashMap::new(),
+            default_ttl: 0,
+            custom_folders: None,
+            forum_topics: HashMap::new(),
+            scheduled: BTreeMap::new(),
             notify_defaults: [false, false, false],
             notify_exceptions: vec![(Who::Channel(NOTES), true)],
             sessions: vec![
@@ -725,6 +765,19 @@ impl World {
         for at in 0..crowd() {
             let who = Who::User(CROWD + at);
             world.store(None, message(who, 1, CROWD + at, t0() - 200_000 - at as i32 * 60, &format!("Hello from {at}")));
+        }
+        let search_bulk: usize = std::env::var("TINYCLIENT_TELEGRAM_SEARCH_BULK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        for i in 0..search_bulk {
+            let id = 1_000 + i as i32;
+            let sender = if i % 2 == 0 { ODALYS } else { TOBIN };
+            let date = t0() - (search_bulk as i32 - i as i32) * 86_400;
+            world.store(
+                None,
+                message(Who::Group(CREW), id, sender, date, &format!("Bulk note {i} #ridge")),
+            );
         }
         world
     }
@@ -822,6 +875,13 @@ impl World {
                 sent = in_topic(sent, topic);
             }
             if schedule.is_some() {
+                if schedule == Some(protocol::SCHEDULE_WHEN_ONLINE as i32) && peer == Who::User(TOBIN) {
+                    return Err(rpc(400, "SCHEDULE_STATUS_PRIVATE", None));
+                }
+                self.scheduled
+                    .entry(key(peer, topic))
+                    .or_default()
+                    .insert(id, sent.clone().into());
                 all.push(tl::types::UpdateMessageId { id, random_id }.into());
                 all.push(tl::types::UpdateNewScheduledMessage { message: sent.into() }.into());
                 continue;
@@ -1098,51 +1158,102 @@ fn discussion_answer(place: &str, unread: i32, left: bool) -> Result<Vec<u8>, Fa
 /// whole. This runs on its own always-outlined body so the dispatcher above stays under a
 /// debug build's 256 KiB connection stack.
 #[inline(never)]
-fn topics_answer(world: &mut World, forum: Who) -> Result<Vec<u8>, Fault> {
-    // One topic, as Telegram's list carries it: the account has read the topic up to what
-    // its last ReadDiscussion said, and a read past its newest post is a read whole. The
-    // date is the topic's own; the caller reads the activity from the messages the answer
-    // carries.
-    let topic = |world: &World, id: i32, title: &str, top: i32, date: i32, unread: i32, icon: i64| {
-        let read = world.topic_reads.get(&(forum, id)).copied().unwrap_or(0);
-        let unread = if read >= top { 0 } else { unread };
-        let mut topic: tl::types::ForumTopic = blank(&[
-            &put(1u32),
-            &put(id),
-            &put(date),
-            &put(forum.peer()),
-            &put(title.to_owned()),
-            &put(3i32),
-            &put(icon),
-            &put(top),
-            &put(read),
-            &put(0i32),
-            &put(unread),
-            &put(0i32),
-            &put(0i32),
-            &put(0i32),
-            &put(Who::User(TOBIN).peer()),
-            &put(settings(None)),
-        ]);
-        topic.my = false;
-        tl::enums::ForumTopic::Topic(topic)
+fn topics_answer(world: &mut World, forum: Who, request: &tl::functions::messages::GetForumTopics) -> Result<Vec<u8>, Fault> {
+    let held = |messages: &BTreeMap<String, BTreeMap<i32, tl::enums::Message>>, id: i32| {
+        messages.get(&key(forum, Some(id))).and_then(|list| list.values().next_back().cloned())
     };
-    let held = |world: &World, id: i32| world.messages.get(&key(forum, Some(id))).and_then(|list| list.values().next_back().cloned());
-    let newest = held(world, TOOLS);
-    let top = match &newest {
+    let newest = held(&world.messages, TOOLS);
+    let top_tools = match &newest {
         Some(tl::enums::Message::Message(message)) => message.id,
         _ => 41,
     };
-    // The topics Telegram lists first, which here is their activity: Jigs newest.
-    let messages: Vec<tl::enums::Message> = held(world, JIGS).into_iter().chain(newest).collect();
+    let extra_topics: usize = std::env::var("TINYCLIENT_TELEGRAM_TOPICS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let list = world.forum_topics.entry(forum).or_insert_with(|| {
+        let mut base = vec![
+            FakeTopic { id: JIGS, title: "Jigs".to_owned(), date: t0() - 200, top_message: JIGS, unread: 2, icon_color: 3, icon_emoji_id: Some(5000), closed: false, pinned: false, hidden: false, my: false },
+            FakeTopic { id: TOOLS, title: "Tools".to_owned(), date: t0() - 40_000, top_message: top_tools, unread: 1, icon_color: 3, icon_emoji_id: Some(5001), closed: false, pinned: false, hidden: false, my: false },
+            FakeTopic { id: 1, title: "General".to_owned(), date: t0() - 90_000, top_message: 1, unread: 0, icon_color: 3, icon_emoji_id: Some(5002), closed: false, pinned: false, hidden: false, my: false },
+        ];
+        if extra_topics > base.len() {
+            let need = extra_topics - base.len();
+            for i in 0..need {
+                let id = 200 + i as i32;
+                base.push(FakeTopic {
+                    id,
+                    title: format!("Topic #{:03}", i + 4),
+                    date: t0() - 100_000 - (i as i32) * 60,
+                    top_message: id,
+                    unread: 0,
+                    icon_color: 3,
+                    icon_emoji_id: None,
+                    closed: false,
+                    pinned: false,
+                    hidden: false,
+                    my: false,
+                });
+            }
+        }
+        base
+    });
+    if let Some(t) = list.iter_mut().find(|t| t.id == TOOLS) {
+        t.top_message = top_tools;
+    }
+    let query = request.q.as_deref().map(str::trim).filter(|q| !q.is_empty()).map(str::to_lowercase);
+    let mut ordered: Vec<FakeTopic> = list
+        .iter()
+        .filter(|t| query.as_ref().is_none_or(|q| t.title.to_lowercase().contains(q)))
+        .cloned()
+        .collect();
+    ordered.sort_by(|a, b| b.pinned.cmp(&a.pinned).then_with(|| b.date.cmp(&a.date)).then_with(|| b.id.cmp(&a.id)));
+    let total = ordered.len() as i32;
+    let start = if request.offset_topic != 0 {
+        ordered
+            .iter()
+            .position(|t| t.id == request.offset_topic)
+            .map_or(ordered.len(), |at| at + 1)
+    } else {
+        0
+    };
+    let limit = if request.limit <= 0 { 50 } else { request.limit as usize };
+    let slice: Vec<FakeTopic> = ordered.into_iter().skip(start).take(limit).collect();
+    let topics: Vec<tl::enums::ForumTopic> = slice
+        .iter()
+        .map(|ft| {
+            let read = world.topic_reads.get(&(forum, ft.id)).copied().unwrap_or(0);
+            let unread = if read >= ft.top_message { 0 } else { ft.unread };
+            let mut topic: tl::types::ForumTopic = blank(&[
+                &put(0u32),
+                &put(ft.id),
+                &put(ft.date),
+                &put(forum.peer()),
+                &put(ft.title.clone()),
+                &put(ft.icon_color),
+                &put(ft.top_message),
+                &put(read),
+                &put(0i32),
+                &put(unread),
+                &put(0i32),
+                &put(0i32),
+                &put(0i32),
+                &put(Who::User(TOBIN).peer()),
+                &put(settings(None)),
+            ]);
+            topic.icon_emoji_id = ft.icon_emoji_id;
+            topic.closed = ft.closed;
+            topic.pinned = ft.pinned;
+            topic.hidden = ft.hidden;
+            topic.my = ft.my;
+            tl::enums::ForumTopic::Topic(topic)
+        })
+        .collect();
+    let messages: Vec<tl::enums::Message> = held(&world.messages, JIGS).into_iter().chain(newest).collect();
     let found = tl::types::messages::ForumTopics {
         order_by_create_date: false,
-        count: 3,
-        topics: vec![
-            topic(world, JIGS, "Jigs", JIGS, t0() - 200, 2, 5000),
-            topic(world, TOOLS, "Tools", top, t0() - 40_000, 1, 5001),
-            topic(world, 1, "General", 1, t0() - 90_000, 0, 5002),
-        ],
+        count: total,
+        topics,
         messages,
         chats: chats(),
         users: users(),
@@ -2691,6 +2802,9 @@ impl World {
                 let mut dialog = dialog.clone();
                 drafted(self, &mut dialog, *who);
                 self.flag_unread(&mut dialog);
+                if let tl::enums::Dialog::Dialog(plain) = &mut dialog {
+                    plain.ttl_period = self.ttl_periods.get(who).copied().filter(|&p| p > 0);
+                }
                 dialog
             }).collect();
             let mut chats = chats();
@@ -2706,8 +2820,116 @@ impl World {
         }
         if asked::<f::messages::GetDialogFilters>(body).is_some() {
             self.log("GetDialogFilters");
-            let filters = vec![tl::enums::DialogFilter::Default, self.folder(WORK), self.folder(FAMILY)];
+            let mut filters = vec![tl::enums::DialogFilter::Default];
+            if let Some(custom) = &self.custom_folders {
+                filters.extend(custom.iter().cloned());
+            } else {
+                filters.push(self.folder(WORK));
+                filters.push(self.folder(FAMILY));
+            }
             return answer(tl::enums::messages::DialogFilters::Filters(tl::types::messages::DialogFilters { tags_enabled: false, filters }));
+        }
+        if let Some(request) = asked::<f::messages::UpdateDialogFilter>(body) {
+            if self.custom_folders.is_none() {
+                let defaults = vec![self.folder(WORK), self.folder(FAMILY)];
+                self.custom_folders = Some(defaults);
+            }
+            let id_of = |f: &tl::enums::DialogFilter| match f {
+                tl::enums::DialogFilter::Filter(f) => Some(f.id),
+                tl::enums::DialogFilter::Chatlist(c) => Some(c.id),
+                tl::enums::DialogFilter::Default => None,
+            };
+            match request.filter {
+                None => {
+                    self.log(&format!("UpdateDialogFilter {} delete", request.id));
+                    self.custom_folders.as_mut().unwrap().retain(|f| id_of(f) != Some(request.id));
+                    return answer(true);
+                }
+                Some(filter) => {
+                    let (title_text, empty_include) = match &filter {
+                        tl::enums::DialogFilter::Filter(f) => {
+                            let tl::enums::TextWithEntities::Entities(t) = &f.title;
+                            let any_kind = f.contacts || f.non_contacts || f.groups || f.broadcasts || f.bots;
+                            let any_peer = !f.include_peers.is_empty() || !f.pinned_peers.is_empty();
+                            (t.text.clone(), !any_kind && !any_peer)
+                        }
+                        tl::enums::DialogFilter::Chatlist(c) => {
+                            let tl::enums::TextWithEntities::Entities(t) = &c.title;
+                            (t.text.clone(), c.include_peers.is_empty() && c.pinned_peers.is_empty())
+                        }
+                        tl::enums::DialogFilter::Default => (String::new(), true),
+                    };
+                    if title_text.trim().is_empty() {
+                        return Err(rpc(400, "FILTER_TITLE_EMPTY", None));
+                    }
+                    if empty_include {
+                        return Err(rpc(400, "FILTER_INCLUDE_EMPTY", None));
+                    }
+                    let existing = self.custom_folders.as_ref().unwrap().iter().position(|f| id_of(f) == Some(request.id));
+                    let count = self.custom_folders.as_ref().unwrap().len();
+                    let premium = std::env::var("TINYCLIENT_TELEGRAM_PREMIUM").ok().as_deref() == Some("1");
+                    let limit = if premium { 30 } else { 10 };
+                    if existing.is_none() && count >= limit {
+                        self.log(&format!("UpdateDialogFilter {} refused FILTERS_TOO_MUCH", request.id));
+                        return Err(rpc(400, "FILTERS_TOO_MUCH", None));
+                    }
+                    self.log(&format!("UpdateDialogFilter {} {}", request.id, title_text));
+                    let folders = self.custom_folders.as_mut().unwrap();
+                    if let Some(pos) = existing {
+                        folders[pos] = filter;
+                    } else {
+                        folders.push(filter);
+                    }
+                    return answer(true);
+                }
+            }
+        }
+        if let Some(request) = asked::<f::messages::UpdateDialogFiltersOrder>(body) {
+            self.log(&format!(
+                "UpdateDialogFiltersOrder {}",
+                request.order.iter().map(i32::to_string).collect::<Vec<_>>().join(",")
+            ));
+            if self.custom_folders.is_none() {
+                let defaults = vec![self.folder(WORK), self.folder(FAMILY)];
+                self.custom_folders = Some(defaults);
+            }
+            let folders = self.custom_folders.as_mut().unwrap();
+            let id_of = |f: &tl::enums::DialogFilter| match f {
+                tl::enums::DialogFilter::Filter(f) => f.id,
+                tl::enums::DialogFilter::Chatlist(c) => c.id,
+                tl::enums::DialogFilter::Default => 0,
+            };
+            folders.sort_by_key(|f| request.order.iter().position(|id| *id == id_of(f)).unwrap_or(usize::MAX));
+            return answer(true);
+        }
+        if asked::<f::messages::GetSuggestedDialogFilters>(body).is_some() {
+            self.log("GetSuggestedDialogFilters");
+            let make = |id: i32, name: &str, contacts: bool, exclude_read: bool, desc: &str| {
+                let title = tl::enums::TextWithEntities::Entities(tl::types::TextWithEntities {
+                    text: name.to_owned(),
+                    entities: Vec::new(),
+                });
+                let mut filter: tl::types::DialogFilter = blank(&[
+                    &put(0u32),
+                    &put(id),
+                    &put(title),
+                    &put(Vec::<tl::enums::InputPeer>::new()),
+                    &put(Vec::<tl::enums::InputPeer>::new()),
+                    &put(Vec::<tl::enums::InputPeer>::new()),
+                ]);
+                filter.contacts = contacts;
+                filter.non_contacts = !contacts;
+                filter.groups = exclude_read;
+                filter.exclude_read = exclude_read;
+                tl::enums::DialogFilterSuggested::Suggested(tl::types::DialogFilterSuggested {
+                    filter: filter.into(),
+                    description: desc.to_owned(),
+                })
+            };
+            return answer(vec![
+                make(100, "Unread", false, true, "Only unread chats."),
+                make(101, "Personal", true, false, "Only private chats with contacts."),
+            ]);
         }
         if let Some(request) = asked::<f::messages::GetPinnedDialogs>(body) {
             self.log(&format!("GetPinnedDialogs {}", request.folder_id));
@@ -2862,6 +3084,29 @@ impl World {
         }
         if let Some(request) = asked::<f::messages::GetHistory>(body) {
             let peer = input_who(&request.peer);
+            if request.offset_date > 0 && request.offset_id == 0 {
+                self.log(&format!("GetHistory {} date={}", peer.text(), request.offset_date));
+                let target = request.offset_date;
+                let picked = self.messages.get(&peer.text()).and_then(|held| {
+                    held.values()
+                        .min_by_key(|m| {
+                            let d = match m {
+                                tl::enums::Message::Message(m) => m.date,
+                                tl::enums::Message::Service(m) => m.date,
+                                tl::enums::Message::Empty(_) => 0,
+                            };
+                            (d - target).abs()
+                        })
+                        .cloned()
+                });
+                let messages: Vec<tl::enums::Message> = picked.into_iter().collect();
+                return answer(tl::enums::messages::Messages::Messages(tl::types::messages::Messages {
+                    messages,
+                    topics: Vec::new(),
+                    chats: chats(),
+                    users: users(),
+                }));
+            }
             self.log(&format!("GetHistory {} {} {}", peer.text(), request.offset_id, request.add_offset));
             return answer(self.page(&peer.text(), request.offset_id, request.add_offset, request.limit));
         }
@@ -2919,8 +3164,123 @@ impl World {
         }
         if let Some(request) = asked::<f::messages::GetForumTopics>(body) {
             let forum = input_who(&request.peer);
-            self.log(&format!("GetForumTopics {}", forum.text()));
-            return topics_answer(self, forum);
+            if request.q.is_none() && request.offset_topic == 0 {
+                self.log(&format!("GetForumTopics {}", forum.text()));
+            } else {
+                self.log(&format!(
+                    "GetForumTopics {} offset={} q={:?}",
+                    forum.text(),
+                    request.offset_topic,
+                    request.q
+                ));
+            }
+            return topics_answer(self, forum, &request);
+        }
+        if let Some(request) = asked::<f::messages::CreateForumTopic>(body) {
+            let forum = input_who(&request.peer);
+            self.log(&format!("CreateForumTopic {} {}", forum.text(), request.title));
+            self.next += 1;
+            let id = self.next;
+            let now = crate::hub::now() as i32;
+            let ft = FakeTopic {
+                id,
+                title: request.title.clone(),
+                date: now,
+                top_message: id,
+                unread: 0,
+                icon_color: request.icon_color.unwrap_or(0x6FB9F0),
+                icon_emoji_id: request.icon_emoji_id,
+                closed: false,
+                pinned: false,
+                hidden: false,
+                my: true,
+            };
+            self.forum_topics.entry(forum).or_default().push(ft);
+            let service = tl::types::MessageService {
+                out: true,
+                mentioned: false,
+                media_unread: false,
+                reactions_are_possible: false,
+                silent: false,
+                post: false,
+                legacy: false,
+                id,
+                from_id: Some(Who::User(ME).peer()),
+                peer_id: forum.peer(),
+                saved_peer_id: None,
+                reply_to: None,
+                date: now,
+                action: tl::types::MessageActionTopicCreate {
+                    title_missing: false,
+                    title: request.title,
+                    icon_color: request.icon_color.unwrap_or(0x6FB9F0),
+                    icon_emoji_id: request.icon_emoji_id,
+                }
+                .into(),
+                reactions: None,
+                ttl_period: None,
+            };
+            let upd: tl::enums::Update =
+                tl::types::UpdateNewChannelMessage { message: service.into(), pts: 0, pts_count: 0 }.into();
+            return answer(updates(vec![
+                tl::types::UpdateMessageId { id, random_id: request.random_id }.into(),
+                upd,
+            ]));
+        }
+        if let Some(request) = asked::<f::messages::EditForumTopic>(body) {
+            let forum = input_who(&request.peer);
+            self.log(&format!(
+                "EditForumTopic {} {} title={:?} closed={:?} hidden={:?}",
+                forum.text(),
+                request.topic_id,
+                request.title,
+                request.closed,
+                request.hidden
+            ));
+            if let Some(list) = self.forum_topics.get_mut(&forum) {
+                if let Some(ft) = list.iter_mut().find(|t| t.id == request.topic_id) {
+                    if let Some(ref title) = request.title {
+                        ft.title = title.clone();
+                    }
+                    if let Some(icon) = request.icon_emoji_id {
+                        ft.icon_emoji_id = (icon != 0).then_some(icon);
+                    }
+                    if let Some(closed) = request.closed {
+                        ft.closed = closed;
+                    }
+                    if let Some(hidden) = request.hidden {
+                        ft.hidden = hidden;
+                    }
+                }
+            }
+            return answer(updates(Vec::new()));
+        }
+        if let Some(request) = asked::<f::messages::UpdatePinnedForumTopic>(body) {
+            let forum = input_who(&request.peer);
+            self.log(&format!("UpdatePinnedForumTopic {} {} {}", forum.text(), request.topic_id, request.pinned));
+            if let Some(list) = self.forum_topics.get_mut(&forum) {
+                if let Some(ft) = list.iter_mut().find(|t| t.id == request.topic_id) {
+                    ft.pinned = request.pinned;
+                }
+            }
+            let upd: tl::enums::Update = tl::types::UpdatePinnedForumTopic {
+                pinned: request.pinned,
+                peer: forum.peer(),
+                topic_id: request.topic_id,
+            }
+            .into();
+            return answer(updates(vec![upd]));
+        }
+        if let Some(request) = asked::<f::messages::DeleteTopicHistory>(body) {
+            let forum = input_who(&request.peer);
+            self.log(&format!("DeleteTopicHistory {} {}", forum.text(), request.top_msg_id));
+            if let Some(list) = self.forum_topics.get_mut(&forum) {
+                list.retain(|t| t.id != request.top_msg_id);
+            }
+            self.messages.remove(&key(forum, Some(request.top_msg_id)));
+            return answer(tl::enums::messages::AffectedHistory::History(
+                tl::types::messages::AffectedHistory { pts: 1, pts_count: 1, offset: 0 },
+            ));
         }
         if let Some(request) = asked::<f::messages::GetSponsoredMessages>(body) {
             self.log(&format!("GetSponsoredMessages {}", input_who(&request.peer).text()));
@@ -2992,6 +3352,25 @@ impl World {
             let peer = input_who(&request.peer);
             let noted = super::content::entity_note(request.entities.as_deref().unwrap_or(&[]));
             self.log(&format!("EditMessage {} {}{noted}", peer.text(), request.id));
+            if let Some(tl::enums::Message::Message(mut sched)) = self
+                .scheduled
+                .get(&peer.text())
+                .and_then(|held| held.get(&request.id))
+                .cloned()
+            {
+                if let Some(ref text) = request.message {
+                    sched.message = text.clone();
+                }
+                if let Some(date) = request.schedule_date {
+                    sched.date = date;
+                }
+                sched.entities = request.entities.clone();
+                self.scheduled
+                    .entry(peer.text())
+                    .or_default()
+                    .insert(request.id, sched.clone().into());
+                return answer(updates(vec![tl::types::UpdateNewScheduledMessage { message: sched.into() }.into()]));
+            }
             let Some(tl::enums::Message::Message(mut edited)) = self.messages.get(&peer.text()).and_then(|held| held.get(&request.id)).cloned() else {
                 return Err(rpc(400, "MESSAGE_ID_INVALID", None));
             };
@@ -3004,12 +3383,136 @@ impl World {
             self.store(None, edited.clone());
             return answer(updates(vec![tl::types::UpdateEditMessage { message: edited.into(), pts: 0, pts_count: 0 }.into()]));
         }
+        if let Some(request) = asked::<f::messages::GetScheduledHistory>(body) {
+            let peer = input_who(&request.peer);
+            self.log(&format!("GetScheduledHistory {}", peer.text()));
+            let prefix = format!("{}_", peer.text());
+            let messages: Vec<tl::enums::Message> = self
+                .scheduled
+                .iter()
+                .filter(|(k, _)| k.as_str() == peer.text() || k.starts_with(&prefix))
+                .flat_map(|(_, held)| held.values().cloned())
+                .collect();
+            return answer(tl::enums::messages::Messages::Messages(tl::types::messages::Messages {
+                messages,
+                topics: Vec::new(),
+                chats: chats(),
+                users: users(),
+            }));
+        }
+        if let Some(request) = asked::<f::messages::SendScheduledMessages>(body) {
+            let peer = input_who(&request.peer);
+            self.log(&format!("SendScheduledMessages {} {:?}", peer.text(), request.id));
+            let mut upds: Vec<tl::enums::Update> = Vec::new();
+            let mut sent_ids: Vec<i32> = Vec::new();
+            let prefix = format!("{}_", peer.text());
+            for (k, held) in self.scheduled.iter_mut() {
+                if k.as_str() != peer.text() && !k.starts_with(&prefix) {
+                    continue;
+                }
+                for &id in &request.id {
+                    if let Some(tl::enums::Message::Message(mut msg)) = held.remove(&id) {
+                        msg.from_scheduled = true;
+                        msg.date = crate::hub::now() as i32;
+                        let topic = msg.reply_to.as_ref().and_then(|r| match r {
+                            tl::enums::MessageReplyHeader::Header(h) if h.forum_topic => h.reply_to_top_id.or(h.reply_to_msg_id),
+                            _ => None,
+                        });
+                        self.messages.entry(key(peer, topic)).or_default().insert(msg.id, msg.clone().into());
+                        sent_ids.push(id);
+                        let new: tl::enums::Update = match peer {
+                            Who::Channel(_) => tl::types::UpdateNewChannelMessage { message: msg.into(), pts: 0, pts_count: 0 }.into(),
+                            _ => tl::types::UpdateNewMessage { message: msg.into(), pts: 0, pts_count: 0 }.into(),
+                        };
+                        let _ = events.send(update(new.clone()));
+                        upds.push(new);
+                    }
+                }
+            }
+            if !sent_ids.is_empty() {
+                upds.push(tl::types::UpdateDeleteScheduledMessages {
+                    peer: peer.peer(),
+                    messages: sent_ids,
+                    sent_messages: None,
+                }.into());
+            }
+            return answer(updates(upds));
+        }
+        if let Some(request) = asked::<f::messages::DeleteScheduledMessages>(body) {
+            let peer = input_who(&request.peer);
+            self.log(&format!("DeleteScheduledMessages {} {:?}", peer.text(), request.id));
+            let prefix = format!("{}_", peer.text());
+            for (k, held) in self.scheduled.iter_mut() {
+                if k.as_str() != peer.text() && !k.starts_with(&prefix) {
+                    continue;
+                }
+                for &id in &request.id {
+                    held.remove(&id);
+                }
+            }
+            return answer(updates(vec![tl::types::UpdateDeleteScheduledMessages {
+                peer: peer.peer(),
+                messages: request.id,
+                sent_messages: None,
+            }.into()]));
+        }
         if let Some(request) = asked::<f::messages::DeleteMessages>(body) {
             self.log(&format!("DeleteMessages {:?} revoke {}", request.id, request.revoke));
+            if request.revoke && request.id.contains(&20) && std::env::var("TINYCLIENT_TELEGRAM_OLD_GROUP").ok().as_deref() == Some("1") {
+                return Err(rpc(403, "MESSAGE_DELETE_FORBIDDEN", None));
+            }
             for held in self.messages.values_mut() {
                 request.id.iter().for_each(|id| drop(held.remove(id)));
             }
             return answer(tl::enums::messages::AffectedMessages::Messages(tl::types::messages::AffectedMessages { pts: 2, pts_count: 1 }));
+        }
+        if let Some(request) = asked::<f::channels::DeleteMessages>(body) {
+            let tl::enums::InputChannel::Channel(channel) = &request.channel else {
+                return Err(rpc(400, "CHANNEL_INVALID", None));
+            };
+            self.log(&format!("channels.DeleteMessages c{} {:?}", channel.channel_id, request.id));
+            let is_admin = std::env::var("TINYCLIENT_TELEGRAM_ADMIN").ok().as_deref() == Some("1");
+            let prefix = format!("c{}", channel.channel_id);
+            for (place, held) in self.messages.iter_mut() {
+                if place == &prefix || place.starts_with(&format!("{prefix}_")) {
+                    for id in &request.id {
+                        if let Some(tl::enums::Message::Message(msg)) = held.get(id) {
+                            if !msg.out && !is_admin {
+                                return Err(rpc(403, "MESSAGE_DELETE_FORBIDDEN", None));
+                            }
+                        }
+                        held.remove(id);
+                    }
+                }
+            }
+            return answer(tl::enums::messages::AffectedMessages::Messages(tl::types::messages::AffectedMessages { pts: 2, pts_count: 1 }));
+        }
+        if let Some(request) = asked::<f::channels::DeleteParticipantHistory>(body) {
+            let tl::enums::InputChannel::Channel(channel) = &request.channel else {
+                return Err(rpc(400, "CHANNEL_INVALID", None));
+            };
+            let who = input_who(&request.participant);
+            self.log(&format!("channels.DeleteParticipantHistory c{} {}", channel.channel_id, who.text()));
+            let prefix = format!("c{}", channel.channel_id);
+            for (place, held) in self.messages.iter_mut() {
+                if place == &prefix || place.starts_with(&format!("{prefix}_")) {
+                    held.retain(|_, msg| match msg {
+                        tl::enums::Message::Message(m) => m.from_id.as_ref().is_none_or(|p| Who::of(p) != who),
+                        _ => true,
+                    });
+                }
+            }
+            return answer(tl::enums::messages::AffectedHistory::History(
+                tl::types::messages::AffectedHistory { pts: 2, pts_count: 1, offset: 0 },
+            ));
+        }
+        if let Some(request) = asked::<f::channels::ReportSpam>(body) {
+            let tl::enums::InputChannel::Channel(channel) = &request.channel else {
+                return Err(rpc(400, "CHANNEL_INVALID", None));
+            };
+            let who = input_who(&request.participant);
+            self.log(&format!("channels.ReportSpam c{} {} {:?}", channel.channel_id, who.text(), request.id));
+            return answer(true);
         }
         if asked::<f::messages::GetAvailableReactions>(body).is_some() {
             self.log("GetAvailableReactions");
@@ -3264,6 +3767,7 @@ impl World {
                 &put(settings(None)),
             ]);
             full.about = "Weekend routes.".to_owned();
+            full.ttl_period = self.ttl_periods.get(&Who::Group(request.chat_id)).copied().filter(|&p| p > 0);
             // Its admins allow three reactions.
             let three = ["👍", "❤", "🔥"].map(|emoticon| tl::types::ReactionEmoji { emoticon: emoticon.to_owned() }.into());
             full.available_reactions = Some(tl::types::ChatReactionsSome { reactions: three.to_vec() }.into());
@@ -3278,6 +3782,7 @@ impl World {
             let peer_settings: tl::types::PeerSettings = blank(&[&put(0u32)]);
             let mut full: tl::types::UserFull = blank(&[&put(0u32), &put(0u32), &put(id), &put(tl::enums::PeerSettings::from(peer_settings)), &put(settings(None)), &put(1i32)]);
             full.about = Some("Maps, mostly.".to_owned());
+            full.ttl_period = self.ttl_periods.get(&Who::User(id)).copied().filter(|&p| p > 0);
             full.blocked = self.blocked.contains(&id);
             let (phone_avail, phone_priv, video_avail) = self.call_flags.get(&id).copied().unwrap_or((true, false, false));
             full.phone_calls_available = phone_avail;
@@ -3436,6 +3941,55 @@ impl World {
             let found = tl::types::account::PrivacyRules { rules: mapped, chats: chats(), users: users() };
             return answer(tl::enums::account::PrivacyRules::Rules(found));
         }
+        if let Some(request) = asked::<f::messages::SetHistoryTtl>(body) {
+            let peer = input_who(&request.peer);
+            self.log(&format!("SetHistoryTtl {} {}", peer.text(), request.period));
+            if request.period > 0 {
+                self.ttl_periods.insert(peer, request.period);
+            } else {
+                self.ttl_periods.remove(&peer);
+            }
+            self.next += 1;
+            let service = tl::types::MessageService {
+                out: true,
+                mentioned: false,
+                media_unread: false,
+                reactions_are_possible: false,
+                silent: false,
+                post: false,
+                legacy: false,
+                id: self.next,
+                from_id: Some(Who::User(ME).peer()),
+                peer_id: peer.peer(),
+                saved_peer_id: None,
+                reply_to: None,
+                date: crate::hub::now() as i32,
+                action: tl::types::MessageActionSetMessagesTtl {
+                    period: request.period,
+                    auto_setting_from: None,
+                }
+                .into(),
+                reactions: None,
+                ttl_period: None,
+            };
+            self.messages.entry(peer.text()).or_default().insert(service.id, service.clone().into());
+            let upd: tl::enums::Update = match peer {
+                Who::Channel(_) => tl::types::UpdateNewChannelMessage { message: service.into(), pts: 0, pts_count: 0 }.into(),
+                _ => tl::types::UpdateNewMessage { message: service.into(), pts: 0, pts_count: 0 }.into(),
+            };
+            return answer(updates(vec![upd]));
+        }
+        if asked::<f::messages::GetDefaultHistoryTtl>(body).is_some() {
+            self.log("GetDefaultHistoryTtl");
+            return answer(tl::enums::DefaultHistoryTtl::Ttl(tl::types::DefaultHistoryTtl {
+                period: self.default_ttl,
+            }));
+        }
+        if let Some(request) = asked::<f::messages::SetDefaultHistoryTtl>(body) {
+            self.log(&format!("SetDefaultHistoryTtl {}", request.period));
+            self.default_ttl = request.period.max(0);
+            return answer(true);
+        }
         if let Some(answered) = self.panes(body, events) {
             return answered;
         }
@@ -3591,10 +4145,13 @@ impl World {
                 return Some(answer(tl::enums::messages::Messages::Slice(slice)));
             }
             let peer = input_who(&request.peer);
-            let (name, count, ids): (&str, i32, Vec<i32>) = match request.filter {
+            let (name, mut count, ids): (&str, i32, Vec<i32>) = match request.filter {
                 tl::enums::MessagesFilter::InputMessagesFilterPinned => ("pinned", 1, vec![12]),
                 tl::enums::MessagesFilter::InputMessagesFilterPhotoVideo => ("media", 37, vec![14]),
                 tl::enums::MessagesFilter::InputMessagesFilterUrl => ("links", 4, vec![17]),
+                tl::enums::MessagesFilter::InputMessagesFilterMusic => ("music", 1, Vec::new()),
+                tl::enums::MessagesFilter::InputMessagesFilterRoundVoice => ("voice", 1, Vec::new()),
+                tl::enums::MessagesFilter::InputMessagesFilterGif => ("gifs", 1, Vec::new()),
                 _ => ("files", 0, Vec::new()),
             };
             self.log(&format!("Search {} {name} {}", peer.text(), request.offset_id));
@@ -3603,21 +4160,127 @@ impl World {
             if matches!(request.filter, tl::enums::MessagesFilter::InputMessagesFilterEmpty) {
                 self.log(&format!("SearchText {} {} topic={:?}", peer.text(), request.q, request.top_msg_id));
                 let query = request.q.to_lowercase();
+                let from_who = request.from_id.as_ref().map(input_who);
                 let held = self.messages.get(&key(peer, request.top_msg_id));
-                messages = held.into_iter().flat_map(|held| held.values()).filter(|message| match message {
-                    tl::enums::Message::Message(message) => message.message.to_lowercase().contains(&query),
-                    _ => false,
-                }).cloned().collect();
-                messages.sort_by_key(|message| std::cmp::Reverse(match message {
+                let mut matched: Vec<tl::enums::Message> = held
+                    .into_iter()
+                    .flat_map(|held| held.values())
+                    .filter(|message| match message {
+                        tl::enums::Message::Message(msg) => {
+                            let text_ok = query.is_empty() || msg.message.to_lowercase().contains(&query);
+                            let from_ok = from_who.is_none_or(|want| {
+                                msg.from_id.as_ref().is_some_and(|p| Who::of(p) == want)
+                            });
+                            let min_ok = request.min_date <= 0 || msg.date >= request.min_date;
+                            let max_ok = request.max_date <= 0 || msg.date <= request.max_date;
+                            text_ok && from_ok && min_ok && max_ok
+                        }
+                        _ => false,
+                    })
+                    .cloned()
+                    .collect();
+                matched.sort_by_key(|message| std::cmp::Reverse(match message {
                     tl::enums::Message::Message(message) => message.id,
                     _ => 0,
                 }));
-                messages.truncate(request.limit.max(0) as usize);
+                count = matched.len() as i32;
+                if request.offset_id > 0 {
+                    matched.retain(|message| match message {
+                        tl::enums::Message::Message(msg) => msg.id < request.offset_id,
+                        _ => false,
+                    });
+                }
+                matched.truncate(request.limit.max(0) as usize);
+                messages = matched;
             }
             if name == "links" {
                 let mut linked = message(peer, 17, ODALYS, t0() - 30, "Route map");
                 linked.entities = Some(vec![tl::types::MessageEntityTextUrl { offset: 0, length: 5, url: "https://example.org/route".to_owned() }.into()]);
                 messages = vec![linked.into()];
+            } else if name == "music" {
+                let mut track = message(peer, 18, ODALYS, t0() - 25, "");
+                let doc = tl::types::Document {
+                    id: 6_601,
+                    access_hash: 6_608,
+                    file_reference: vec![1, 2, 3],
+                    date: t0() - 25,
+                    mime_type: "audio/mpeg".to_owned(),
+                    size: 120_000,
+                    thumbs: None,
+                    video_thumbs: None,
+                    dc_id: 2,
+                    attributes: vec![
+                        tl::types::DocumentAttributeAudio {
+                            voice: false,
+                            duration: 185,
+                            title: Some("Alpine Theme".to_owned()),
+                            performer: Some("Trail Band".to_owned()),
+                            waveform: None,
+                        }.into(),
+                        tl::types::DocumentAttributeFilename { file_name: "alpine.mp3".to_owned() }.into(),
+                    ],
+                };
+                track.media = Some(tl::types::MessageMediaDocument {
+                    nopremium: false,
+                    spoiler: false,
+                    video: false,
+                    round: false,
+                    voice: false,
+                    document: Some(doc.into()),
+                    alt_documents: None,
+                    video_cover: None,
+                    video_timestamp: None,
+                    ttl_seconds: None,
+                }.into());
+                messages = vec![track.into()];
+            } else if name == "voice" {
+                let mut note = message(peer, 19, ODALYS, t0() - 20, "");
+                let doc = tl::types::Document {
+                    id: 6_602,
+                    access_hash: 6_609,
+                    file_reference: vec![1, 2, 3],
+                    date: t0() - 20,
+                    mime_type: "audio/ogg".to_owned(),
+                    size: 16_000,
+                    thumbs: None,
+                    video_thumbs: None,
+                    dc_id: 2,
+                    attributes: vec![tl::types::DocumentAttributeAudio {
+                        voice: true,
+                        duration: 9,
+                        title: None,
+                        performer: None,
+                        waveform: Some(vec![1, 2, 3]),
+                    }.into()],
+                };
+                note.media = Some(tl::types::MessageMediaDocument {
+                    nopremium: false,
+                    spoiler: false,
+                    video: false,
+                    round: false,
+                    voice: true,
+                    document: Some(doc.into()),
+                    alt_documents: None,
+                    video_cover: None,
+                    video_timestamp: None,
+                    ttl_seconds: None,
+                }.into());
+                messages = vec![note.into()];
+            } else if name == "gifs" {
+                let mut animated = message(peer, 21, ODALYS, t0() - 15, "");
+                animated.media = Some(tl::types::MessageMediaDocument {
+                    nopremium: false,
+                    spoiler: false,
+                    video: false,
+                    round: false,
+                    voice: false,
+                    document: Some(gif(6_200).into()),
+                    alt_documents: None,
+                    video_cover: None,
+                    video_timestamp: None,
+                    ttl_seconds: None,
+                }.into());
+                messages = vec![animated.into()];
             }
             let slice = tl::types::messages::MessagesSlice {
                 inexact: false,
@@ -3631,6 +4294,53 @@ impl World {
                 users: users(),
             };
             return Some(answer(tl::enums::messages::Messages::Slice(slice)));
+        }
+        if let Some(request) = asked::<f::messages::GetSearchResultsCalendar>(body) {
+            let peer = input_who(&request.peer);
+            self.log(&format!("GetSearchResultsCalendar {} {}", peer.text(), request.offset_date));
+            let mut by_day: BTreeMap<i32, (i32, i32, i32)> = BTreeMap::new();
+            let mut total = 0i32;
+            if let Some(held) = self.messages.get(&peer.text()) {
+                for msg in held.values() {
+                    if let tl::enums::Message::Message(m) = msg {
+                        if request.offset_date > 0 && m.date > request.offset_date {
+                            continue;
+                        }
+                        let day = (m.date / 86_400) * 86_400;
+                        let entry = by_day.entry(day).or_insert((m.id, m.id, 0));
+                        entry.0 = entry.0.min(m.id);
+                        entry.1 = entry.1.max(m.id);
+                        entry.2 += 1;
+                        total += 1;
+                    }
+                }
+            }
+            let min_date = by_day.keys().next().copied().unwrap_or(0);
+            let min_msg_id = by_day.values().map(|(lo, _, _)| *lo).min().unwrap_or(0);
+            let periods: Vec<tl::enums::SearchResultsCalendarPeriod> = by_day
+                .into_iter()
+                .rev()
+                .map(|(date, (min_msg_id, max_msg_id, count))| {
+                    tl::enums::SearchResultsCalendarPeriod::Period(tl::types::SearchResultsCalendarPeriod {
+                        date,
+                        min_msg_id,
+                        max_msg_id,
+                        count,
+                    })
+                })
+                .collect();
+            let cal = tl::types::messages::SearchResultsCalendar {
+                inexact: false,
+                count: total,
+                min_date,
+                min_msg_id,
+                offset_id_offset: None,
+                periods,
+                messages: Vec::new(),
+                chats: chats(),
+                users: users(),
+            };
+            return Some(answer(tl::enums::messages::SearchResultsCalendar::Calendar(cal)));
         }
         if let Some(request) = asked::<f::channels::GetFullChannel>(body) {
             let tl::enums::InputChannel::Channel(channel) = &request.channel else {
@@ -3651,6 +4361,7 @@ impl World {
                 &put(1i32),
             ]);
             full.about = "Notes from the high country.".to_owned();
+            full.ttl_period = self.ttl_periods.get(&Who::Channel(channel.channel_id)).copied().filter(|&p| p > 0);
             // The channel turned reactions off; the forum allows all of them, two different
             // ones a message.
             if channel.channel_id == NOTES {
@@ -3971,6 +4682,28 @@ impl World {
             return Some(answer(tl::enums::messages::Reactions::Reactions(found)));
         }
         if let Some(request) = asked::<f::messages::GetStickerSet>(body) {
+            if matches!(&request.stickerset, tl::enums::InputStickerSet::EmojiDefaultTopicIcons) {
+                self.log("GetStickerSet topic-icons");
+                let set: tl::types::StickerSet = blank(&[
+                    &put(0u32),
+                    &put(920i64),
+                    &put(921i64),
+                    &put("Topic Icons".to_owned()),
+                    &put("topic_icons".to_owned()),
+                    &put(2i32),
+                    &put(1i32),
+                ]);
+                let found = tl::types::messages::StickerSet {
+                    set: set.into(),
+                    packs: Vec::new(),
+                    keywords: Vec::new(),
+                    documents: vec![
+                        custom_emoji(6_501, "\u{1F527}").into(),
+                        custom_emoji(6_502, "\u{1F4CC}").into(),
+                    ],
+                };
+                return Some(answer(tl::enums::messages::StickerSet::Set(found)));
+            }
             let id = set_id(&request.stickerset);
             if id == 910 {
                 self.log("GetStickerSet emoji");

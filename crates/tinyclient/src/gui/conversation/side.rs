@@ -965,7 +965,7 @@ impl Shell {
                 };
                 page.network_asking = None;
                 match answer {
-                    Ok(Response::MessageHits { hits, cursor, not_searched }) => {
+                    Ok(Response::MessageHits { hits, cursor, not_searched, .. }) => {
                         page.network_cursor = cursor;
                         if !not_searched.is_empty() || !load_more {
                             page.not_searched = not_searched;

@@ -3868,6 +3868,7 @@ fn group_rights(group: &wire::GroupInfo, me: &str) -> ConversationRights {
         rename: can_edit,
         edit_topic: can_edit,
         edit_picture: can_edit,
+        manage_topics: false,
     }
 }
 
@@ -4262,6 +4263,8 @@ fn catalog(account: &Account, kind: CatalogKind, query: &str, cursor: Option<&st
                         file: Some(file),
                         pack: pack.title.clone(),
                         animated: entry.content_type.contains("apng") || entry.content_type.contains("gif"),
+                        set: String::new(),
+                        locked: false,
                     });
                     if items.len() >= protocol::CATALOG_LIMIT {
                         break;

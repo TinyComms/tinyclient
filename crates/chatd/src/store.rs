@@ -1605,6 +1605,53 @@ impl Store {
         tx.commit()
     }
 
+    /// Drops all cached messages sent by `sender_id` in `conversation` (and any of its forum topic
+    /// child conversations) and returns the affected conversation IDs.
+    pub fn clear_sender_messages(&mut self, conversation: &Key, sender_id: &str) -> rusqlite::Result<Vec<String>> {
+        let tx = self.db.transaction()?;
+        let net = word(&conversation.network);
+        let escaped = conversation.id.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let prefix = format!("{escaped}\\_%");
+        let mut stmt = tx.prepare(
+            "SELECT conversation, id, text, body FROM message
+              WHERE network = ?1 AND account = ?2 AND (conversation = ?3 OR conversation LIKE ?4 ESCAPE '\\')",
+        )?;
+        let mut to_delete: Vec<(String, String)> = Vec::new();
+        for row in stmt.query_map(params![net, conversation.account, conversation.id, prefix], |row| {
+            let conv: String = row.get(0)?;
+            let id: String = row.get(1)?;
+            let text: String = row.get(2)?;
+            let body: String = row.get(3)?;
+            Ok((conv, id, text, body))
+        })? {
+            let (conv, id, text, body) = row?;
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
+                let matches_sender = parsed
+                    .get("sender")
+                    .and_then(|s| s.get("id"))
+                    .and_then(|s| s.as_str())
+                    == Some(sender_id);
+                let _ = text;
+                if matches_sender {
+                    to_delete.push((conv, id));
+                }
+            }
+        }
+        drop(stmt);
+        let mut affected: Vec<String> = Vec::new();
+        for (conv, id) in to_delete {
+            tx.execute(
+                "DELETE FROM message WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4",
+                params![net, conversation.account, conv, id],
+            )?;
+            if !affected.contains(&conv) {
+                affected.push(conv);
+            }
+        }
+        tx.commit()?;
+        Ok(affected)
+    }
+
     /// Drops the stored messages of a conversation while keeping its row in the list.
     pub fn clear_messages(&mut self, conversation: &Key) -> rusqlite::Result<bool> {
         let tx = self.db.transaction()?;
@@ -2082,6 +2129,31 @@ impl Store {
                  ORDER BY coalesce(c.pin, 2147483647), c.updated DESC, c.id LIMIT ?4 OFFSET ?5"
             ))?
             .query_map(params![word(&forum.network), forum.account, forum.id, limit, offset], conversation_from)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok((rows, total))
+    }
+
+    /// A forum's topics whose title matches `query` (case-insensitive substring).
+    pub fn topics_matching(&self, forum: &Key, query: &str, offset: u32, limit: u32) -> rusqlite::Result<(Vec<Conversation>, u32)> {
+        let escaped = query
+            .to_lowercase()
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let belongs = "c.network = ?1 AND c.account = ?2 AND c.parent = ?3 AND NOT c.hidden AND lower(c.title) LIKE ?4 ESCAPE '\\'";
+        let total = self.db.query_row(
+            &format!("SELECT COUNT(*) FROM conversation c WHERE {belongs}"),
+            params![word(&forum.network), forum.account, forum.id, pattern],
+            |row| row.get(0),
+        )?;
+        let rows = self
+            .db
+            .prepare(&format!(
+                "{CONVERSATION} WHERE {belongs}
+                 ORDER BY coalesce(c.pin, 2147483647), c.updated DESC, c.id LIMIT ?5 OFFSET ?6"
+            ))?
+            .query_map(params![word(&forum.network), forum.account, forum.id, pattern, limit, offset], conversation_from)?
             .collect::<rusqlite::Result<_>>()?;
         Ok((rows, total))
     }
@@ -3739,7 +3811,9 @@ impl Store {
         }
         // The body is the protocol's JSON, so a message that holds one says so in these words.
         let holds = match kind {
-            SharedKind::Media | SharedKind::Files => "instr(body, '\"attachments\"') > 0",
+            SharedKind::Media | SharedKind::Files | SharedKind::Music | SharedKind::Voice | SharedKind::Gifs => {
+                "instr(body, '\"attachments\"') > 0"
+            }
             SharedKind::Links => "(instr(body, '\"previews\"') > 0 OR instr(body, '\"style\":\"link\"') > 0)",
         };
         let below = match before {
@@ -3780,6 +3854,28 @@ impl Store {
                     let wanted = message.attachments.iter().filter(|attachment| {
                         !attachment.sticker && pictured(attachment.file.kind) == (kind == SharedKind::Media)
                     });
+                    items.extend(wanted.map(|attachment| item(Some(attachment.clone()), "", "")));
+                }
+                SharedKind::Music => {
+                    let wanted = message.attachments.iter().filter(|attachment| {
+                        !attachment.sticker
+                            && attachment.file.kind == protocol::MediaKind::Audio
+                            && attachment.waveform.is_empty()
+                            && !attachment.round
+                    });
+                    items.extend(wanted.map(|attachment| item(Some(attachment.clone()), "", "")));
+                }
+                SharedKind::Voice => {
+                    let wanted = message.attachments.iter().filter(|attachment| {
+                        attachment.round || !attachment.waveform.is_empty()
+                    });
+                    items.extend(wanted.map(|attachment| item(Some(attachment.clone()), "", "")));
+                }
+                SharedKind::Gifs => {
+                    let wanted = message
+                        .attachments
+                        .iter()
+                        .filter(|attachment| !attachment.sticker && attachment.file.kind == protocol::MediaKind::Gif);
                     items.extend(wanted.map(|attachment| item(Some(attachment.clone()), "", "")));
                 }
                 SharedKind::Links => {

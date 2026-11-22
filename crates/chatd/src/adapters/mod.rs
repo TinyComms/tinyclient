@@ -267,6 +267,20 @@ pub struct ReactorsPage {
     pub more: bool,
 }
 
+/// One page of network message search results (`Command::Search`).
+#[derive(Debug, Clone, Default)]
+pub struct SearchPage {
+    pub hits: Vec<MessageHit>,
+    pub cursor: Option<String>,
+    pub total: Option<u32>,
+}
+
+impl From<Vec<MessageHit>> for SearchPage {
+    fn from(hits: Vec<MessageHit>) -> Self {
+        Self { hits, cursor: None, total: None }
+    }
+}
+
 /// A picture on the call the user is in. Discord is the network that acts on it.
 pub enum Picture {
     /// Our camera, on or off.
@@ -395,6 +409,26 @@ pub enum Command {
         conversation_id: String,
         message_id: String,
         scope: protocol::DeleteScope,
+        reply: Reply<()>,
+    },
+    /// Delete several messages in one conversation in one batch (`messages.deleteMessages` / `channels.deleteMessages`).
+    DeleteMany {
+        conversation_id: String,
+        message_ids: Vec<String>,
+        scope: protocol::DeleteScope,
+        reply: Reply<()>,
+    },
+    /// Delete all messages from one participant in a supergroup/channel (`channels.deleteParticipantHistory`).
+    DeleteParticipantHistory {
+        conversation_id: String,
+        person_id: String,
+        reply: Reply<()>,
+    },
+    /// Report specific messages from one participant in a supergroup/channel as spam (`channels.reportSpam`).
+    ReportSpamMessages {
+        conversation_id: String,
+        person_id: String,
+        message_ids: Vec<String>,
         reply: Reply<()>,
     },
     /// Vote on a poll, retract a vote (`Some(vec![])`), or end a poll (`None`). Report the
@@ -607,6 +641,70 @@ pub enum Command {
         seconds: u32,
         reply: Reply<()>,
     },
+    /// Read the account's default disappearing-messages timer for new chats (seconds, 0 = off).
+    GetDefaultDisappearing {
+        reply: Reply<u32>,
+    },
+    /// Set the account's default disappearing-messages timer for new chats (seconds, 0 = off).
+    SetDefaultDisappearing {
+        seconds: u32,
+        reply: Reply<()>,
+    },
+    /// Create or edit a chat folder on the network (Telegram `messages.updateDialogFilter`).
+    FolderSave {
+        folder: protocol::FolderSpec,
+        reply: Reply<protocol::Folder>,
+    },
+    /// Delete a chat folder on the network.
+    FolderDelete {
+        folder_id: String,
+        reply: Reply<()>,
+    },
+    /// Reorder chat folders on the network.
+    FoldersReorder {
+        order: Vec<String>,
+        reply: Reply<()>,
+    },
+    /// Fetch additional or searched topics for a forum (Telegram `messages.getForumTopics`).
+    /// Answers with the network's total topic count for the query/forum.
+    LoadTopics {
+        conversation_id: String,
+        query: Option<String>,
+        offset: u32,
+        limit: u32,
+        reply: Reply<u32>,
+    },
+    /// Create a topic in a forum; answers with the new topic's conversation id.
+    TopicCreate {
+        conversation_id: String,
+        title: String,
+        icon_color: Option<i32>,
+        icon_emoji_id: Option<String>,
+        reply: Reply<String>,
+    },
+    /// Edit a forum topic (rename, icon, close/reopen, hide, pin/unpin).
+    TopicUpdate {
+        conversation_id: String,
+        title: Option<String>,
+        icon_emoji_id: Option<String>,
+        closed: Option<bool>,
+        hidden: Option<bool>,
+        pinned: Option<bool>,
+        reply: Reply<()>,
+    },
+    /// Delete a forum topic and its history.
+    TopicDelete {
+        conversation_id: String,
+        reply: Reply<()>,
+    },
+    /// Fetch default forum topic icons.
+    TopicIcons {
+        reply: Reply<CatalogPage>,
+    },
+    /// Fetch network-suggested chat folders.
+    SuggestedFolders {
+        reply: Reply<Vec<protocol::SuggestedFolder>>,
+    },
     /// Star or unstar a conversation on the network. Report the flag through [`Context::starred`]
     /// before answering, and only after the network has it. Answer `Err` to leave the local flag
     /// as it was. Networks that do not serve this never receive it: their star stays local.
@@ -646,8 +744,14 @@ pub enum Command {
         conversation_id: String,
         reply: Reply<Vec<protocol::ScheduledMessage>>,
     },
-    /// Cancels a pending scheduled message (Slack `chat.deleteScheduledMessage`).
+    /// Cancels a pending scheduled message (Slack `chat.deleteScheduledMessage` / Telegram `messages.deleteScheduledMessages`).
     CancelScheduled {
+        conversation_id: String,
+        scheduled_id: String,
+        reply: Reply<()>,
+    },
+    /// Sends a pending scheduled message immediately (Telegram `messages.sendScheduledMessages`).
+    SendScheduledNow {
         conversation_id: String,
         scheduled_id: String,
         reply: Reply<()>,
@@ -920,7 +1024,20 @@ pub enum Command {
         filters: protocol::SearchFilters,
         cursor: Option<String>,
         at: Instant,
-        reply: Reply<Vec<MessageHit>>,
+        reply: Reply<SearchPage>,
+    },
+    /// Jump to the message closest to `date` (Unix seconds) in a conversation; answers with the message id.
+    JumpToDate {
+        conversation_id: String,
+        date: i64,
+        reply: Reply<Option<String>>,
+    },
+    /// Calendar days with matching messages in a conversation (Telegram `messages.getSearchResultsCalendar`).
+    SearchCalendar {
+        conversation_id: String,
+        kind: Option<SharedKind>,
+        offset_date: i64,
+        reply: Reply<Vec<protocol::SearchCalendarDay>>,
     },
     /// The shell asked for these files and the media cache knows none of them, or knows them
     /// only by Telegram's name for a file it kept, since gone from disk. An adapter that fetches
@@ -989,6 +1106,11 @@ impl Command {
             | Command::Moderate { reply, .. }
             | Command::Unban { reply, .. }
             | Command::SetDisappearing { reply, .. }
+            | Command::SetDefaultDisappearing { reply, .. }
+            | Command::FolderDelete { reply, .. }
+            | Command::FoldersReorder { reply, .. }
+            | Command::TopicUpdate { reply, .. }
+            | Command::TopicDelete { reply, .. }
             | Command::Leave { reply, .. }
             | Command::LeaveSpace { reply, .. }
             | Command::CloseDirect { reply, .. }
@@ -998,9 +1120,16 @@ impl Command {
             | Command::StarMessage { reply, .. }
             | Command::Remind { reply, .. }
             | Command::CancelScheduled { reply, .. }
+            | Command::SendScheduledNow { reply, .. }
             | Command::FollowThread { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
+            Command::GetDefaultDisappearing { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::FolderSave { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::LoadTopics { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::TopicCreate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::TopicIcons { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SuggestedFolders { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StarredMessages { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1053,6 +1182,9 @@ impl Command {
             Command::React { reply, .. }
             | Command::Edit { reply, .. }
             | Command::Delete { reply, .. }
+            | Command::DeleteMany { reply, .. }
+            | Command::DeleteParticipantHistory { reply, .. }
+            | Command::ReportSpamMessages { reply, .. }
             | Command::Vote { reply, .. }
             | Command::Relate { reply, .. }
             | Command::AddFriend { reply, .. }
@@ -1070,6 +1202,8 @@ impl Command {
             Command::SignOut(reply) => drop(reply.send(Ok(()))),
             Command::Download { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Search { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::JumpToDate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SearchCalendar { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Send { conversation_id, client_id, .. } => {
                 ctx.sent(&conversation_id, &client_id, Err("Sending is not built for this network.".to_owned()));
             }
@@ -1694,6 +1828,24 @@ impl Context {
     pub fn note_newest(&self, conversation_id: &str, message_id: &str) -> Stores {
         self.hub.store().note_newest(&self.key(conversation_id), message_id)?;
         Ok(())
+    }
+
+    /// Drops cached messages sent by `sender_id` in `conversation_id` (and its child forum topics).
+    pub fn clear_sender_messages(&self, conversation_id: &str, sender_id: &str) -> Stores {
+        let conversation = self.key(conversation_id);
+        let affected = self.hub.store().clear_sender_messages(&conversation, sender_id)?;
+        for conv_id in affected {
+            let key = self.key(&conv_id);
+            self.hub.changed(Change::Messages { conversation: key.clone() });
+            self.hub.changed(Change::Conversation { conversation: key });
+        }
+        Ok(())
+    }
+
+    /// Cached pinned topics of a forum conversation.
+    pub fn pinned_topics(&self, forum_id: &str) -> rusqlite::Result<Vec<protocol::Conversation>> {
+        let (rows, _) = self.hub.store().topics(&self.key(forum_id), 0, 200)?;
+        Ok(rows.into_iter().filter(|c| c.pin.is_some()).collect())
     }
 
     /// Drops the cached messages of a conversation while keeping its row.

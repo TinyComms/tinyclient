@@ -33,6 +33,12 @@ fn options(with: &Outgoing) -> Options {
 pub(super) fn send_with(account: &Arc<Account>, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: Outgoing) {
     let ctx = account.ctx.clone();
     let opts = options(&with);
+    if let Some((who, _)) = Who::parse(conversation) {
+        if let Err(fault) = super::check_schedule_target(account, who, opts) {
+            ctx.sent(conversation, client_id, Err(fault.words()));
+            return;
+        }
+    }
     account.here();
     if super::secret::is_row(conversation) {
         let fault = Fault::Rpc { code: 400, name: "SECRET_CHAT".to_owned(), value: None };

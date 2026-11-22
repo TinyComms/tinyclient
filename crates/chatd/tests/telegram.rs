@@ -517,7 +517,7 @@ fn a_forum_opens_on_the_newest_unread_topic_else_general() {
     world.connected();
     // Opening the forum reads its topics and lands on the newest unread: Jigs here, active
     // after the unread Tools, General read all along (polish/03 §2, story T8).
-    let landing = || Request::Topics { forum: key("c9002"), offset: 0, limit: 1, landing: true };
+    let landing = || Request::Topics { forum: key("c9002"), offset: 0, limit: 1, landing: true, query: None };
     let Response::Conversations { conversations, .. } = world.ask(landing()) else {
         panic!("no landing");
     };
@@ -525,7 +525,7 @@ fn a_forum_opens_on_the_newest_unread_topic_else_general() {
     assert_eq!((conversations[0].key.id.as_str(), conversations[0].title.as_str(), conversations[0].parent.as_deref()), ("c9002_55", "Jigs", Some("c9002")));
     // What the topics drill lists: the network's pins first (none is pinned), then the
     // activity, a count on every row.
-    let drill = Request::Topics { forum: key("c9002"), offset: 0, limit: 10, landing: false };
+    let drill = Request::Topics { forum: key("c9002"), offset: 0, limit: 10, landing: false, query: None };
     let Response::Conversations { conversations: topics, total, .. } = world.ask(drill) else {
         panic!("no topics");
     };
@@ -4125,6 +4125,618 @@ fn paid_star_reactions_big_reaction_and_default_quick_reaction() {
         other => panic!("expected refreshed Reactions, got {other:?}"),
     };
     assert_eq!(refreshed.quick.as_deref(), Some("👍"));
+}
+
+#[test]
+fn auto_delete_timer_chat_and_default() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.disappearing, "Telegram must advertise disappearing capability");
+
+    // Set Odalys chat auto-delete to 1 week (604_800s).
+    assert_eq!(
+        world.ask(Request::SetDisappearing { conversation: key("u7002"), seconds: 604_800 }),
+        Response::Ok
+    );
+    assert!(
+        world.calls().iter().any(|c| c == "SetHistoryTtl u7002 604800"),
+        "expected SetHistoryTtl u7002 604800 on wire, got: {:#?}",
+        world.calls()
+    );
+    // Conversation row & ConversationInfo both report the active timer.
+    let row = world.until("conversation disappearing timer", || {
+        world.conversation("u7002").filter(|c| c.disappearing == Some(604_800))
+    });
+    assert_eq!(row.disappearing, Some(604_800));
+    match world.ask(Request::ConversationInfo { conversation: key("u7002") }) {
+        Response::ConversationInfo { info } => assert_eq!(info.disappearing, Some(604_800)),
+        other => panic!("expected ConversationInfo, got {other:?}"),
+    }
+    // Service message in the chat notes the auto-delete timer.
+    let service = world.until("auto-delete service line", || {
+        world.messages("u7002").into_iter().find(|m| m.text.contains("auto-delete after 1 week"))
+    });
+    assert_eq!(service.kind, protocol::MessageKind::System);
+
+    // Turn auto-delete off (0s).
+    assert_eq!(
+        world.ask(Request::SetDisappearing { conversation: key("u7002"), seconds: 0 }),
+        Response::Ok
+    );
+    world.until("conversation disappearing cleared", || {
+        world.conversation("u7002").filter(|c| c.disappearing.is_none())
+    });
+    match world.ask(Request::ConversationInfo { conversation: key("u7002") }) {
+        Response::ConversationInfo { info } => assert_eq!(info.disappearing, None),
+        other => panic!("expected ConversationInfo, got {other:?}"),
+    }
+
+    // Account-wide default auto-delete timer for new chats.
+    assert_eq!(
+        world.ask(Request::GetDefaultDisappearing { account: account() }),
+        Response::DefaultDisappearing { seconds: 0 }
+    );
+    assert_eq!(
+        world.ask(Request::SetDefaultDisappearing { account: account(), seconds: 86_400 }),
+        Response::Ok
+    );
+    assert_eq!(
+        world.ask(Request::GetDefaultDisappearing { account: account() }),
+        Response::DefaultDisappearing { seconds: 86_400 }
+    );
+    assert!(world.calls().iter().any(|c| c == "GetDefaultHistoryTtl"));
+    assert!(world.calls().iter().any(|c| c == "SetDefaultHistoryTtl 86400"));
+}
+
+#[test]
+fn chat_folders_create_edit_add_reorder_suggest_and_delete() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.folders_edit, "Telegram must advertise folders_edit capability");
+
+    // Create a new folder containing Odalys and Trail crew.
+    let created = match world.ask(Request::FolderSave {
+        account: account(),
+        folder: protocol::FolderSpec {
+            name: "Hiking".into(),
+            include: vec!["u7002".into(), "g8001".into()],
+            ..protocol::FolderSpec::default()
+        },
+    }) {
+        Response::Folder { folder } => folder,
+        other => panic!("expected Folder, got {other:?}"),
+    };
+    assert_eq!(created.name, "Hiking");
+    let fid = created.key.id.clone();
+    assert!(world.calls().iter().any(|c| c == &format!("UpdateDialogFilter {fid} Hiking")));
+
+    // Folders list includes it, and both chats report membership in Conversation::folders.
+    let folders = match world.ask(Request::Folders { network: Network::Telegram }) {
+        Response::Folders { folders } => folders,
+        other => panic!("expected Folders, got {other:?}"),
+    };
+    assert!(folders.iter().any(|f| f.key.id == fid && f.name == "Hiking"), "{folders:?}");
+    let odalys = world.until("Odalys in Hiking folder", || {
+        world.conversation("u7002").filter(|c| c.folders.contains(&fid))
+    });
+    assert!(odalys.folders.contains(&fid));
+    let crew = world.until("Crew in Hiking folder", || {
+        world.conversation("g8001").filter(|c| c.folders.contains(&fid))
+    });
+    assert!(crew.folders.contains(&fid));
+
+    // Edit/rename the folder.
+    match world.ask(Request::FolderSave {
+        account: account(),
+        folder: protocol::FolderSpec {
+            id: Some(fid.clone()),
+            name: "Trails".into(),
+            include: vec!["u7002".into(), "g8001".into()],
+            ..protocol::FolderSpec::default()
+        },
+    }) {
+        Response::Folder { folder } => assert_eq!((folder.key.id.as_str(), folder.name.as_str()), (fid.as_str(), "Trails")),
+        other => panic!("expected renamed Folder, got {other:?}"),
+    }
+
+    // Add Tobin to the folder via Request::File, then remove him.
+    assert_eq!(
+        world.ask(Request::File {
+            conversation: key("u7003"),
+            pinned: None,
+            archived: None,
+            folder_add: Some(fid.clone()),
+            folder_remove: None,
+        }),
+        Response::Ok
+    );
+    world.until("Tobin added to Trails", || {
+        world.conversation("u7003").filter(|c| c.folders.contains(&fid))
+    });
+    assert_eq!(
+        world.ask(Request::File {
+            conversation: key("u7003"),
+            pinned: None,
+            archived: None,
+            folder_add: None,
+            folder_remove: Some(fid.clone()),
+        }),
+        Response::Ok
+    );
+    world.until("Tobin removed from Trails", || {
+        world.conversation("u7003").filter(|c| !c.folders.contains(&fid))
+    });
+
+    // Reorder folders so the new folder is first.
+    let order = vec![fid.clone(), "3".into(), "2".into()];
+    assert_eq!(
+        world.ask(Request::FoldersReorder { account: account(), order: order.clone() }),
+        Response::Ok
+    );
+    assert!(world.calls().iter().any(|c| c == &format!("UpdateDialogFiltersOrder {fid},3,2")));
+    let reordered = match world.ask(Request::Folders { network: Network::Telegram }) {
+        Response::Folders { folders } => folders,
+        other => panic!("expected Folders, got {other:?}"),
+    };
+    assert_eq!(reordered.first().map(|f| f.key.id.as_str()), Some(fid.as_str()), "{reordered:?}");
+
+    // Suggested folders returns Telegram's suggestions.
+    match world.ask(Request::SuggestedFolders { account: account() }) {
+        Response::SuggestedFolders { folders } => {
+            assert!(folders.iter().any(|s| s.spec.name == "Unread"), "{folders:?}");
+        }
+        other => panic!("expected SuggestedFolders, got {other:?}"),
+    }
+
+    // Delete the folder and verify it disappears from Folders and from Odalys's row.
+    assert_eq!(
+        world.ask(Request::FolderDelete { account: account(), folder_id: fid.clone() }),
+        Response::Ok
+    );
+    assert!(world.calls().iter().any(|c| c == &format!("UpdateDialogFilter {fid} delete")));
+    world.until("Odalys left deleted folder", || {
+        world.conversation("u7002").filter(|c| !c.folders.contains(&fid))
+    });
+
+    // Free account folder limit (10 folders) gives a clear message mentioning limit / Premium.
+    for i in 0..8 {
+        assert!(matches!(
+            world.ask(Request::FolderSave {
+                account: account(),
+                folder: protocol::FolderSpec {
+                    name: format!("Extra {i}"),
+                    contacts: true,
+                    ..protocol::FolderSpec::default()
+                },
+            }),
+            Response::Folder { .. }
+        ));
+    }
+    match world.ask(Request::FolderSave {
+        account: account(),
+        folder: protocol::FolderSpec {
+            name: "Overflow".into(),
+            contacts: true,
+            ..protocol::FolderSpec::default()
+        },
+    }) {
+        Response::Error { detail, .. } => {
+            assert!(detail.contains("10-folder") || detail.contains("Premium"), "{detail}");
+        }
+        other => panic!("expected limit error, got {other:?}"),
+    }
+}
+
+#[test]
+fn forum_topics_crud_search_icons_and_paging_past_fifty() {
+    let world = World::with(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_TOPICS", "120")]);
+    world.connected();
+
+    // Workshop forum carries manage_topics right.
+    let forum = world.conversation("c9002").expect("Workshop forum row");
+    assert!(forum.rights.manage_topics, "expected manage_topics on Workshop: {:?}", forum.rights);
+
+    // Paging past 50 topics loads all 120 topics via GetForumTopics cursor paging.
+    let p1 = match world.ask(Request::Topics { forum: key("c9002"), offset: 0, limit: 50, landing: false, query: None }) {
+        Response::Conversations { conversations, total, .. } => {
+            assert_eq!(total, 120);
+            assert_eq!(conversations.len(), 50);
+            conversations
+        }
+        other => panic!("expected page 1 Conversations, got {other:?}"),
+    };
+    let p2 = match world.ask(Request::Topics { forum: key("c9002"), offset: 50, limit: 50, landing: false, query: None }) {
+        Response::Conversations { conversations, total, .. } => {
+            assert_eq!(total, 120);
+            assert_eq!(conversations.len(), 50);
+            conversations
+        }
+        other => panic!("expected page 2 Conversations, got {other:?}"),
+    };
+    let p3 = match world.ask(Request::Topics { forum: key("c9002"), offset: 100, limit: 50, landing: false, query: None }) {
+        Response::Conversations { conversations, total, .. } => {
+            assert_eq!(total, 120);
+            assert_eq!(conversations.len(), 20);
+            conversations
+        }
+        other => panic!("expected page 3 Conversations, got {other:?}"),
+    };
+    let unique: std::collections::HashSet<String> = p1
+        .into_iter()
+        .chain(p2)
+        .chain(p3)
+        .map(|c| c.key.id)
+        .collect();
+    assert_eq!(unique.len(), 120, "all 120 forum topics must be reachable past the first 50");
+
+    // Searching topics filters via GetForumTopics `q`.
+    match world.ask(Request::Topics {
+        forum: key("c9002"),
+        offset: 0,
+        limit: 20,
+        landing: false,
+        query: Some("Topic #115".into()),
+    }) {
+        Response::Conversations { conversations, .. } => {
+            assert_eq!(conversations.len(), 1, "{conversations:?}");
+            assert_eq!(conversations[0].title, "Topic #115");
+        }
+        other => panic!("expected searched topics, got {other:?}"),
+    }
+
+    // Default topic icons catalog.
+    match world.ask(Request::TopicIcons { account: account() }) {
+        Response::Catalog { items, .. } => {
+            assert!(items.iter().any(|i| i.id == "e6501"), "{items:?}");
+        }
+        other => panic!("expected TopicIcons Catalog, got {other:?}"),
+    }
+
+    // Create a new topic.
+    let created = match world.ask(Request::TopicCreate {
+        forum: key("c9002"),
+        title: "Sharpening".into(),
+        icon_color: Some(0x6FB9F0),
+        icon_emoji_id: Some("e6501".into()),
+    }) {
+        Response::Conversation { conversation } => conversation,
+        other => panic!("expected created topic Conversation, got {other:?}"),
+    };
+    assert_eq!(created.title, "Sharpening");
+    assert_eq!(created.parent.as_deref(), Some("c9002"));
+    assert!(world.calls().iter().any(|c| c == "CreateForumTopic c9002 Sharpening"));
+
+    // Rename, close, and pin the topic.
+    assert_eq!(
+        world.ask(Request::TopicUpdate {
+            topic: created.key.clone(),
+            title: Some("Chisels".into()),
+            icon_emoji_id: None,
+            closed: Some(true),
+            hidden: None,
+            pinned: Some(true),
+        }),
+        Response::Ok
+    );
+    let updated = world.until("topic renamed, closed, and pinned", || {
+        world.conversation(&created.key.id).filter(|c| c.title == "Chisels" && c.read_only && c.pin.is_some())
+    });
+    assert_eq!(updated.title, "Chisels");
+    assert!(updated.read_only);
+    assert!(updated.pin.is_some());
+
+    // Delete the topic.
+    assert_eq!(world.ask(Request::TopicDelete { topic: created.key.clone() }), Response::Ok);
+    world.until("deleted topic gone", || world.conversation(&created.key.id).is_none().then_some(()));
+}
+
+#[test]
+fn scheduled_messages_list_reschedule_send_now_cancel_and_when_online() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.schedule, "Telegram must advertise schedule capability");
+
+    let future = 1_900_000_000i64;
+    // A scheduled send is still a send: the row is pending until Telegram names the placeholder.
+    let scheduled = world.ask(Request::Send {
+        conversation: key("u7002"),
+        client_id: "sched-1".into(),
+        text: "Morning check-in".into(),
+        reply_to: None,
+        with: protocol::Outgoing { schedule: Some(future), ..protocol::Outgoing::default() },
+    });
+    assert!(matches!(scheduled, Response::Sent { .. }), "expected Sent, got {scheduled:?}");
+    world.until("first scheduled placeholder", || {
+        world.messages("u7002").into_iter().find(|m| m.text == "Morning check-in")
+    });
+
+    // Schedule a "when online" message to Odalys (last seen visible).
+    let when_online = world.ask(Request::Send {
+        conversation: key("u7002"),
+        client_id: "sched-2".into(),
+        text: "Ping when you are online".into(),
+        reply_to: None,
+        with: protocol::Outgoing {
+            schedule: Some(protocol::SCHEDULE_WHEN_ONLINE),
+            ..protocol::Outgoing::default()
+        },
+    });
+    assert!(matches!(when_online, Response::Sent { .. }), "expected Sent, got {when_online:?}");
+    world.until("second scheduled placeholder", || {
+        world.messages("u7002").into_iter().find(|m| m.text == "Ping when you are online")
+    });
+
+    // "Send when online" to Tobin (hidden last seen) fails with a clear message.
+    let hidden = world.ask(Request::Send {
+        conversation: key("u7003"),
+        client_id: "sched-bad".into(),
+        text: "Hidden last seen".into(),
+        reply_to: None,
+        with: protocol::Outgoing {
+            schedule: Some(protocol::SCHEDULE_WHEN_ONLINE),
+            ..protocol::Outgoing::default()
+        },
+    });
+    assert!(matches!(hidden, Response::Sent { .. }), "expected Sent, got {hidden:?}");
+    let failed = world.until("when-online refused for hidden last seen", || {
+        world
+            .messages("u7003")
+            .into_iter()
+            .find(|m| m.text == "Hidden last seen" && matches!(m.state, SendState::Failed { .. }))
+    });
+    match failed.state {
+        SendState::Failed { reason } => assert!(reason.contains("last seen"), "{reason}"),
+        other => panic!("expected Failed, got {other:?}"),
+    }
+
+    // List scheduled messages for Odalys: both pending messages appear.
+    let listed = match world.ask(Request::ScheduledMessages { conversation: key("u7002") }) {
+        Response::ScheduledMessages { messages } => messages,
+        other => panic!("expected ScheduledMessages, got {other:?}"),
+    };
+    assert_eq!(listed.len(), 2, "{listed:?}");
+    let timed = listed.iter().find(|m| m.text == "Morning check-in").expect("timed message");
+    let online = listed.iter().find(|m| m.text == "Ping when you are online").expect("when-online message");
+    assert_eq!(online.post_at, protocol::SCHEDULE_WHEN_ONLINE);
+
+    // Reschedule & edit the timed message.
+    let new_time = future + 3_600;
+    match world.ask(Request::RescheduleMessage {
+        conversation: key("u7002"),
+        scheduled_id: timed.id.clone(),
+        text: Some("Updated check-in".into()),
+        post_at: new_time,
+    }) {
+        Response::ScheduledMessage { message } => {
+            assert_eq!(message.text, "Updated check-in");
+            assert_eq!(message.post_at, new_time);
+        }
+        other => panic!("expected ScheduledMessage, got {other:?}"),
+    }
+
+    // Send the rescheduled message immediately: it moves to real history and leaves scheduled queue.
+    assert_eq!(
+        world.ask(Request::SendScheduledNow { conversation: key("u7002"), scheduled_id: timed.id.clone() }),
+        Response::Ok
+    );
+    world.until("sent scheduled message in history", || {
+        world
+            .messages("u7002")
+            .into_iter()
+            .find(|m| m.id == timed.id && m.text == "Updated check-in")
+    });
+    assert!(world.calls().iter().any(|c| c.starts_with("SendScheduledMessages u7002")));
+
+    // Cancel the remaining scheduled message.
+    assert_eq!(
+        world.ask(Request::CancelScheduled { conversation: key("u7002"), scheduled_id: online.id.clone() }),
+        Response::Ok
+    );
+    assert!(world.calls().iter().any(|c| c.starts_with("DeleteScheduledMessages u7002")));
+    match world.ask(Request::ScheduledMessages { conversation: key("u7002") }) {
+        Response::ScheduledMessages { messages } => assert!(messages.is_empty(), "{messages:?}"),
+        other => panic!("expected empty ScheduledMessages, got {other:?}"),
+    }
+}
+
+#[test]
+fn chat_search_filters_paging_hashtags_jump_to_date_calendar_and_shared_tabs() {
+    let world = World::with(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_SEARCH_BULK", "125")]);
+    world.connected();
+
+    // Hashtag search across 125 messages pages past 100 using cursor and reports total.
+    let (page1, cursor1, total1) = match world.ask(Request::SearchNetwork {
+        conversation: Some(key("g8001")),
+        space: None,
+        account: None,
+        network: None,
+        query: "#ridge".into(),
+        filters: protocol::SearchFilters::default(),
+        cursor: None,
+    }) {
+        Response::MessageHits { hits, cursor, total, .. } => (hits, cursor, total),
+        other => panic!("expected MessageHits, got {other:?}"),
+    };
+    assert_eq!(total1, Some(125));
+    assert_eq!(page1.len(), 100);
+    assert!(cursor1.is_some(), "expected continuation cursor past 100 hits");
+
+    let (page2, cursor2) = match world.ask(Request::SearchNetwork {
+        conversation: Some(key("g8001")),
+        space: None,
+        account: None,
+        network: None,
+        query: "#ridge".into(),
+        filters: protocol::SearchFilters::default(),
+        cursor: cursor1,
+    }) {
+        Response::MessageHits { hits, cursor, .. } => (hits, cursor),
+        other => panic!("expected page 2 MessageHits, got {other:?}"),
+    };
+    assert_eq!(page2.len(), 25);
+    assert!(cursor2.is_none());
+
+    // Filter by sender (Tobin u7003) + date range (last 10 days).
+    let base_t0 = 1_791_892_800i64;
+    let after = base_t0 - 10 * 86_400;
+    let before = base_t0;
+    let filtered = match world.ask(Request::SearchNetwork {
+        conversation: Some(key("g8001")),
+        space: None,
+        account: None,
+        network: None,
+        query: "#ridge".into(),
+        filters: protocol::SearchFilters {
+            from: Some(key("u7003")),
+            after: Some(after),
+            before: Some(before),
+            ..protocol::SearchFilters::default()
+        },
+        cursor: None,
+    }) {
+        Response::MessageHits { hits, .. } => hits,
+        other => panic!("expected filtered MessageHits, got {other:?}"),
+    };
+    assert!(!filtered.is_empty() && filtered.len() <= 10, "got {} hits", filtered.len());
+    assert!(filtered.iter().all(|h| h.sender.contains("Tobin") && h.sent >= after && h.sent <= before), "{filtered:?}");
+
+    // Jump to date resolves the message closest to a target timestamp.
+    let target_date = base_t0 - 50 * 86_400;
+    match world.ask(Request::JumpToDate { conversation: key("g8001"), date: target_date }) {
+        Response::Resolved { conversation, message_id, title } => {
+            assert_eq!(conversation, Some(key("g8001")));
+            assert!(message_id.is_some(), "expected a resolved message id");
+            assert!(title.is_empty());
+        }
+        other => panic!("expected Resolved, got {other:?}"),
+    }
+    assert!(world.calls().iter().any(|c| c.contains("GetHistory g8001 date=")));
+
+    // Search calendar lists day buckets with counts.
+    match world.ask(Request::SearchCalendar { conversation: key("g8001"), kind: None, offset_date: 0 }) {
+        Response::SearchCalendar { days } => {
+            assert!(days.len() >= 100, "expected >= 100 calendar days, got {}", days.len());
+            assert!(days.iter().all(|d| d.count >= 1));
+        }
+        other => panic!("expected SearchCalendar, got {other:?}"),
+    }
+
+    // Extra Telegram shared tabs: Music, Voice, GIFs.
+    for kind in [protocol::SharedKind::Music, protocol::SharedKind::Voice, protocol::SharedKind::Gifs] {
+        match world.ask(Request::Shared {
+            conversation: key("u7002"),
+            kind,
+            before: None,
+            limit: 20,
+            search: true,
+        }) {
+            Response::Shared { items, total, .. } => {
+                assert_eq!(total, Some(1), "expected total=1 for {kind:?}");
+                assert_eq!(items.len(), 1, "expected 1 item for {kind:?}: {items:?}");
+            }
+            other => panic!("expected Shared for {kind:?}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn delete_modes_admin_batch_participant_history_and_report_spam() {
+    let world = World::with(
+        Some(SESSION),
+        "30",
+        &[("TINYCLIENT_TELEGRAM_ADMIN", "1"), ("TINYCLIENT_TELEGRAM_OLD_GROUP", "1")],
+    );
+    world.connected();
+    world.until("odalys history", || world.message("u7002", "12"));
+
+    // Private 1:1 chat allows deleting the other person's messages.
+    let odalys = world.conversation("u7002").expect("Odalys row");
+    assert!(odalys.rights.delete_others, "private chat must set delete_others: {:?}", odalys.rights);
+
+    // Delete for me only sends revoke=false.
+    assert_eq!(
+        world.ask(Request::Delete {
+            conversation: key("u7002"),
+            message_id: "11".into(),
+            scope: protocol::DeleteScope::Me,
+        }),
+        Response::Ok
+    );
+    assert!(world.calls().iter().any(|c| c == "DeleteMessages [11] revoke false"));
+    world.until("message 11 deleted locally", || world.message("u7002", "11").is_none().then_some(()));
+
+    // Batch DeleteMany sends a single DeleteMessages RPC with both IDs (including peer's messages).
+    assert_eq!(
+        world.ask(Request::DeleteMany {
+            conversation: key("u7002"),
+            message_ids: vec!["10".into(), "12".into()],
+            scope: protocol::DeleteScope::Everyone,
+        }),
+        Response::Ok
+    );
+    assert!(world.calls().iter().any(|c| c == "DeleteMessages [10, 12] revoke true"));
+    world.until("batch deleted locally", || {
+        (world.message("u7002", "10").is_none() && world.message("u7002", "12").is_none()).then_some(())
+    });
+
+    // Basic group past 48h revoke returns a clear error mentioning 48-hour limit.
+    match world.ask(Request::Delete {
+        conversation: key("g8001"),
+        message_id: "20".into(),
+        scope: protocol::DeleteScope::Everyone,
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("48-hour"), "{detail}"),
+        other => panic!("expected 48-hour error, got {other:?}"),
+    }
+
+    // Supergroup/forum with admin rights advertises delete_others, refuses DeleteScope::Me,
+    // and deletes another member's message via channels.deleteMessages.
+    // The topic's posts are not on the forum row. Open it so message 41 is stored before
+    // the delete is asked: a missing row is "no such message", and the channel rule never runs.
+    let workshop = world.conversation("c9002").expect("Workshop row");
+    assert!(workshop.rights.delete_others, "admin forum must set delete_others: {:?}", workshop.rights);
+    world.messages("c9002");
+    world.until("the tools topic", || world.conversation("c9002_31"));
+    world.until("the topic's history", || world.message("c9002_31", "41"));
+    match world.ask(Request::Delete {
+        conversation: key("c9002_31"),
+        message_id: "41".into(),
+        scope: protocol::DeleteScope::Me,
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("everyone"), "{detail}"),
+        other => panic!("expected channel delete-for-everyone error, got {other:?}"),
+    }
+    assert_eq!(
+        world.ask(Request::Delete {
+            conversation: key("c9002_31"),
+            message_id: "41".into(),
+            scope: protocol::DeleteScope::Everyone,
+        }),
+        Response::Ok
+    );
+    assert!(world.calls().iter().any(|c| c == "channels.DeleteMessages c9002 [41]"));
+
+    // Report spam and delete all messages from a participant in a supergroup.
+    assert_eq!(
+        world.ask(Request::ReportSpamMessages {
+            conversation: key("c9002"),
+            person: key("u7003"),
+            message_ids: vec!["55".into()],
+        }),
+        Response::Ok
+    );
+    assert!(world.calls().iter().any(|c| c == "channels.ReportSpam c9002 u7003 [55]"));
+    assert_eq!(
+        world.ask(Request::DeleteParticipantHistory {
+            conversation: key("c9002"),
+            person: key("u7003"),
+        }),
+        Response::Ok
+    );
+    assert!(world.calls().iter().any(|c| c == "channels.DeleteParticipantHistory c9002 u7003"));
 }
 
 #[test]

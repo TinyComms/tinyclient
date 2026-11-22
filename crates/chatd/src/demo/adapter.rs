@@ -836,6 +836,7 @@ impl Demo {
                     .hub
                     .store()
                     .search_account_filtered(&demo.ctx.account, conv, space, &query, &filters, 100)
+                    .map(Into::into)
                     .map_err(|err| Refusal::Refused(err.to_string()));
                 let _ = reply.send(found);
             }
@@ -1047,8 +1048,25 @@ impl Demo {
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::LeaveSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetDefaultDisappearing { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetDefaultDisappearing { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::FolderSave { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::FolderDelete { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::FoldersReorder { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SuggestedFolders { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::LoadTopics { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::TopicCreate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::TopicUpdate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::TopicDelete { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::TopicIcons { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CancelScheduled { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SendScheduledNow { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::JumpToDate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SearchCalendar { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DeleteMany { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DeleteParticipantHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ReportSpamMessages { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::FollowThread { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::PressButton { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

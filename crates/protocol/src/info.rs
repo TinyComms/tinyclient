@@ -275,6 +275,52 @@ pub struct Folder {
     pub mentions: u32,
 }
 
+/// Specification for creating or editing a chat folder (Telegram `dialogFilter`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderSpec {
+    /// Existing folder id when editing; `None` creates a new folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Folder title (max 12 characters on Telegram).
+    pub name: String,
+    /// Optional icon / emoticon label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emoticon: Option<String>,
+    /// Explicit chat IDs always included in the folder.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<String>,
+    /// Explicit chat IDs excluded from the folder.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
+    /// Pinned chat IDs in this folder, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub contacts: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub non_contacts: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub groups: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub broadcasts: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bots: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub exclude_muted: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub exclude_read: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub exclude_archived: bool,
+}
+
+/// A suggested chat folder offered by the network (Telegram `messages.getSuggestedDialogFilters`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SuggestedFolder {
+    pub spec: FolderSpec,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
 /// How a phone number or address on a profile is drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -458,6 +504,9 @@ pub struct ConversationRights {
     /// May change this conversation's picture (`Request::ConversationPicture`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub edit_picture: bool,
+    /// May create, edit, close, pin, or delete topics in a forum (`Request::TopicCreate`, `Request::TopicUpdate`, `Request::TopicDelete`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_topics: bool,
 }
 
 impl ConversationRights {
@@ -469,6 +518,7 @@ impl ConversationRights {
     const RENAME: i64 = 1 << 5;
     const EDIT_TOPIC: i64 = 1 << 6;
     const EDIT_PICTURE: i64 = 1 << 7;
+    const MANAGE_TOPICS: i64 = 1 << 8;
 
     pub fn is_none(&self) -> bool {
         *self == ConversationRights::default()
@@ -504,6 +554,9 @@ impl ConversationRights {
         if self.edit_picture {
             bits |= Self::EDIT_PICTURE;
         }
+        if self.manage_topics {
+            bits |= Self::MANAGE_TOPICS;
+        }
         bits
     }
 
@@ -517,6 +570,7 @@ impl ConversationRights {
             rename: (bits & Self::RENAME) != 0,
             edit_topic: (bits & Self::EDIT_TOPIC) != 0,
             edit_picture: (bits & Self::EDIT_PICTURE) != 0,
+            manage_topics: (bits & Self::MANAGE_TOPICS) != 0,
         }
     }
 }
@@ -894,6 +948,9 @@ pub struct BrowsedChannel {
     pub archived: bool,
 }
 
+/// Telegram sentinel `schedule_date` value meaning "send when the recipient comes online".
+pub const SCHEDULE_WHEN_ONLINE: i64 = 0x7FFF_FFFE;
+
 /// One pending scheduled message returned by [`crate::Request::ScheduledMessages`] or
 /// [`crate::Request::RescheduleMessage`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1015,6 +1072,16 @@ pub struct SearchFilters {
     pub after: Option<i64>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub mentions_me: bool,
+}
+
+/// One calendar day with matching messages (`Request::SearchCalendar` / Telegram `messages.getSearchResultsCalendar`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchCalendarDay {
+    /// Unix timestamp for the day.
+    pub date: i64,
+    pub min_message_id: String,
+    pub max_message_id: String,
+    pub count: u32,
 }
 
 impl SearchFilters {

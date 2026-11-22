@@ -947,6 +947,12 @@ pub enum SharedKind {
     /// Every other attachment: documents, archives, audio.
     Files,
     Links,
+    /// Audio/music files (Telegram `inputMessagesFilterMusic`).
+    Music,
+    /// Voice and round video notes (Telegram `inputMessagesFilterRoundVoice`).
+    Voice,
+    /// GIF animations (Telegram `inputMessagesFilterGif`).
+    Gifs,
 }
 
 /// One thing shared in a conversation, and the message it was shared in.
@@ -1383,10 +1389,29 @@ pub enum Request {
     ScheduledMessages {
         conversation: Key,
     },
-    /// Cancels a pending scheduled message (Slack `chat.deleteScheduledMessage`).
+    /// Cancels a pending scheduled message (Slack `chat.deleteScheduledMessage` / Telegram `messages.deleteScheduledMessages`).
     CancelScheduled {
         conversation: Key,
         scheduled_id: String,
+    },
+    /// Sends a pending scheduled message immediately (Telegram `messages.sendScheduledMessages`).
+    SendScheduledNow {
+        conversation: Key,
+        scheduled_id: String,
+    },
+    /// Jumps to the message closest to `date` (Unix seconds) in a conversation (Telegram `messages.getHistory` with `offset_date`).
+    /// Answers with [`Response::Resolved`].
+    JumpToDate {
+        conversation: Key,
+        date: i64,
+    },
+    /// Lists calendar days containing messages (or matching `kind`) in a conversation (Telegram `messages.getSearchResultsCalendar`).
+    SearchCalendar {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<SharedKind>,
+        #[serde(default)]
+        offset_date: i64,
     },
     /// Edits and/or reschedules a pending scheduled message (Slack delete + `chat.scheduleMessage`).
     RescheduleMessage {
@@ -1489,6 +1514,40 @@ pub enum Request {
         limit: u32,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         landing: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
+    },
+    /// Creates a new topic in a forum (Telegram `messages.createForumTopic`). Answers with
+    /// [`Response::Conversation`] for the newly created topic row.
+    TopicCreate {
+        forum: Key,
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon_color: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon_emoji_id: Option<String>,
+    },
+    /// Edits a forum topic: rename, icon, close/reopen, hide/unhide General, or pin/unpin.
+    TopicUpdate {
+        topic: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon_emoji_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        closed: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hidden: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pinned: Option<bool>,
+    },
+    /// Deletes a forum topic and its history (Telegram `messages.deleteTopicHistory`).
+    TopicDelete {
+        topic: Key,
+    },
+    /// Lists the default forum topic icons offered by the network (`inputStickerSetEmojiDefaultTopicIcons`).
+    TopicIcons {
+        account: AccountKey,
     },
     /// Voice channels and calls with a friend in them now, across Spaces: the Discord home's
     /// "In voice". From what chatd holds live; at most 50.
@@ -1617,6 +1676,34 @@ pub enum Request {
     SetDisappearing {
         conversation: Key,
         seconds: u32,
+    },
+    /// Reads the account's default disappearing-messages timer for new chats (Telegram `messages.getDefaultHistoryTTL`).
+    GetDefaultDisappearing {
+        account: AccountKey,
+    },
+    /// Sets the account's default disappearing-messages timer for new chats (`seconds == 0` turns it off).
+    SetDefaultDisappearing {
+        account: AccountKey,
+        seconds: u32,
+    },
+    /// Creates or edits a chat folder on the network (Telegram `messages.updateDialogFilter`).
+    FolderSave {
+        account: AccountKey,
+        folder: FolderSpec,
+    },
+    /// Deletes a chat folder on the network (Telegram `messages.updateDialogFilter` with no filter).
+    FolderDelete {
+        account: AccountKey,
+        folder_id: String,
+    },
+    /// Reorders an account's chat folders (Telegram `messages.updateDialogFiltersOrder`).
+    FoldersReorder {
+        account: AccountKey,
+        order: Vec<String>,
+    },
+    /// Lists network-suggested chat folders (Telegram `messages.getSuggestedDialogFilters`).
+    SuggestedFolders {
+        account: AccountKey,
     },
     /// Leaves a group conversation on the network. The shell asks once to confirm first.
     Leave {
@@ -1998,6 +2085,24 @@ pub enum Request {
         message_id: String,
         #[serde(default, skip_serializing_if = "DeleteScope::is_everyone")]
         scope: DeleteScope,
+    },
+    /// Deletes several messages in one conversation in a single network batch where supported.
+    DeleteMany {
+        conversation: Key,
+        message_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "DeleteScope::is_everyone")]
+        scope: DeleteScope,
+    },
+    /// Deletes all messages sent by `person` in a supergroup/channel (Telegram `channels.deleteParticipantHistory`).
+    DeleteParticipantHistory {
+        conversation: Key,
+        person: Key,
+    },
+    /// Reports specific messages from `person` in a supergroup/channel as spam (Telegram `channels.reportSpam`).
+    ReportSpamMessages {
+        conversation: Key,
+        person: Key,
+        message_ids: Vec<String>,
     },
     /// Forwards one or more messages to up to [`FORWARD_LIMIT`] conversations on the same account.
     /// Cross-account targets are refused; callers use a separate re-send for "Copy to…".
@@ -3070,6 +3175,12 @@ pub enum Response {
         cursor: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         not_searched: Vec<Network>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total: Option<u32>,
+    },
+    /// Calendar days with matching messages (`Request::SearchCalendar`).
+    SearchCalendar {
+        days: Vec<SearchCalendarDay>,
     },
     /// Answers `Reminders`: what is still waiting in the conversation, due first.
     Reminders {
@@ -3329,6 +3440,18 @@ pub enum Response {
     /// One updated/rescheduled message (`Request::RescheduleMessage`).
     ScheduledMessage {
         message: ScheduledMessage,
+    },
+    /// Account's default disappearing-messages timer in seconds (`0` = off).
+    DefaultDisappearing {
+        seconds: u32,
+    },
+    /// A created or updated chat folder (`Request::FolderSave`).
+    Folder {
+        folder: Folder,
+    },
+    /// Suggested chat folders (`Request::SuggestedFolders`).
+    SuggestedFolders {
+        folders: Vec<SuggestedFolder>,
     },
     /// Members who have read a given message (`Request::ReadBy`).
     ReadBy {
@@ -3618,7 +3741,7 @@ mod tests {
             outgoing: false,
         };
         assert_eq!(
-            serde_json::to_string(&Response::MessageHits { hits: vec![hit], cursor: None, not_searched: Vec::new() }).unwrap(),
+            serde_json::to_string(&Response::MessageHits { hits: vec![hit], cursor: None, not_searched: Vec::new(), total: None }).unwrap(),
             r#"{"op":"message_hits","hits":[{"conversation":{"network":"discord","account":"1","id":"C2"},"message_id":"9","sent":20,"sender":"mara","snippet":"hello world"}]}"#
         );
         // The network's own ask: the scope is a conversation, Space, account, network, or everywhere.
@@ -3770,6 +3893,17 @@ mod tests {
         assert!(me_json.contains(r#""scope":"me""#), "{me_json}");
         assert_eq!(serde_json::from_str::<Request>(&me_json).unwrap(), mine);
 
+        let batch = Request::DeleteMany {
+            conversation: key.clone(),
+            message_ids: vec!["9".into(), "10".into()],
+            scope: DeleteScope::Me,
+        };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&batch).unwrap()).unwrap(), batch);
+        let dph = Request::DeleteParticipantHistory { conversation: key.clone(), person: key.clone() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&dph).unwrap()).unwrap(), dph);
+        let rsm = Request::ReportSpamMessages { conversation: key.clone(), person: key.clone(), message_ids: vec!["9".into()] };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&rsm).unwrap()).unwrap(), rsm);
+
         // Older shell request without `scope` decodes as `Everyone`.
         let legacy: Request = serde_json::from_str(&format!(
             r#"{{"op":"delete","conversation":{},"message_id":"9"}}"#,
@@ -3800,6 +3934,41 @@ mod tests {
         assert_eq!(format_disappearing(604_800), "1w");
         assert!(disappearing_presets(Network::Signal).contains(&30));
         assert!(disappearing_presets(Network::Telegram).contains(&86_400));
+
+        let acct = AccountKey { network: Network::Telegram, account: "7001".into() };
+        let get_def = Request::GetDefaultDisappearing { account: acct.clone() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&get_def).unwrap()).unwrap(), get_def);
+        let set_def = Request::SetDefaultDisappearing { account: acct, seconds: 604_800 };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&set_def).unwrap()).unwrap(), set_def);
+        let resp = Response::DefaultDisappearing { seconds: 604_800 };
+        assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&resp).unwrap()).unwrap(), resp);
+    }
+
+    #[test]
+    fn folder_crud_requests_and_responses_round_trip() {
+        let acct = AccountKey { network: Network::Telegram, account: "7001".into() };
+        let spec = FolderSpec {
+            id: None,
+            name: "Hiking".into(),
+            emoticon: Some("⛰".into()),
+            include: vec!["u7002".into(), "g8001".into()],
+            exclude: vec!["u7003".into()],
+            pinned: vec!["u7002".into()],
+            contacts: true,
+            ..FolderSpec::default()
+        };
+        let save = Request::FolderSave { account: acct.clone(), folder: spec.clone() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&save).unwrap()).unwrap(), save);
+        let del = Request::FolderDelete { account: acct.clone(), folder_id: "4".into() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&del).unwrap()).unwrap(), del);
+        let reorder = Request::FoldersReorder { account: acct.clone(), order: vec!["4".into(), "2".into()] };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&reorder).unwrap()).unwrap(), reorder);
+        let sug = Request::SuggestedFolders { account: acct.clone() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&sug).unwrap()).unwrap(), sug);
+        let resp_sug = Response::SuggestedFolders {
+            folders: vec![SuggestedFolder { spec, description: "Trail chats".into() }],
+        };
+        assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&resp_sug).unwrap()).unwrap(), resp_sug);
     }
 
     #[test]
@@ -3833,6 +4002,7 @@ mod tests {
             rename: true,
             edit_topic: true,
             edit_picture: true,
+            manage_topics: true,
         };
         assert_eq!(ConversationRights::from_bits(all.to_bits()), all);
     }
@@ -3880,6 +4050,7 @@ mod sock_path_tests {
         let reqs = [
             Request::ScheduledMessages { conversation: conv.clone() },
             Request::CancelScheduled { conversation: conv.clone(), scheduled_id: "Q1".into() },
+            Request::SendScheduledNow { conversation: conv.clone(), scheduled_id: "Q1".into() },
             Request::RescheduleMessage {
                 conversation: conv.clone(),
                 scheduled_id: "Q1".into(),

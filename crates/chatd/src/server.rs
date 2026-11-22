@@ -12,7 +12,7 @@ use protocol::{
     Profile, Reaction, RelateAction, Relation, Request, Response, SendState, Sender, Watching,
     MUTUAL_SPACES, PAGE_LIMIT, SEARCH_MIN_CHARS, WATCH_LIMIT,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, ErrorKind};
 use std::path::PathBuf;
 use std::sync::mpsc::channel;
@@ -959,17 +959,42 @@ impl Chat {
     /// open lands on. The landing's topics are asked of the network once first, and the
     /// answer waits for them, so it is named on what Telegram says now and not on what an
     /// earlier open left in the cache.
-    fn topics(&self, forum: Key, offset: u32, limit: u32, landing: bool) -> Response {
+    fn topics(&self, forum: Key, offset: u32, limit: u32, landing: bool, query: Option<String>) -> Response {
         if !self.shows(&forum.account()) {
             // Same refusal as Tree. An empty Conversations page looks like a real empty forum.
             return hidden_list();
         }
+        let limit = limit.min(PAGE_LIMIT);
+        let query = query.map(|q| q.trim().to_owned()).filter(|q| !q.is_empty());
+        let mut remote_total: Option<u32> = None;
         if landing && offset == 0 {
             let _ = self.ask(&forum.account(), |reply| Command::OpenForum { conversation_id: forum.id.clone(), reply });
+        } else if !landing {
+            if let Ok(total) = self.ask(&forum.account(), |reply| Command::LoadTopics {
+                conversation_id: forum.id.clone(),
+                query: query.clone(),
+                offset,
+                limit,
+                reply,
+            }) {
+                remote_total = Some(total);
+            }
         }
-        let read = if landing { self.hub.store().landing(&forum) } else { self.hub.store().topics(&forum, offset, limit.min(PAGE_LIMIT)) };
+        let read = if landing {
+            self.hub.store().landing(&forum)
+        } else if let Some(ref q) = query {
+            self.hub.store().topics_matching(&forum, q, offset, limit)
+        } else {
+            self.hub.store().topics(&forum, offset, limit)
+        };
         match read {
-            Ok((conversations, total)) => Response::Conversations { conversations: self.rows(conversations), total, counts: InboxCounts::default() },
+            Ok((conversations, total)) => {
+                let total = match (query.is_none(), remote_total) {
+                    (true, Some(remote)) => total.max(remote),
+                    _ => total,
+                };
+                Response::Conversations { conversations: self.rows(conversations), total, counts: InboxCounts::default() }
+            }
             Err(err) => internal(err),
         }
     }
@@ -2756,6 +2781,42 @@ impl Chat {
                 Ok(folders) => Response::Folders { folders },
                 Err(err) => internal(err),
             },
+            Request::FolderSave { account, folder } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::FolderSave { folder, reply }) {
+                    Ok(folder) => Response::Folder { folder },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::FolderDelete { account, folder_id } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::FolderDelete { folder_id, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::FoldersReorder { account, order } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::FoldersReorder { order, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SuggestedFolders { account } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::SuggestedFolders { reply }) {
+                    Ok(folders) => Response::SuggestedFolders { folders },
+                    Err(refused) => *refused,
+                }
+            }
             Request::Threads { space, offset, limit } => {
                 if !self.shows(&space.account()) {
                     // Same refusal as Tree. An empty Conversations page looks like a real empty list.
@@ -2785,7 +2846,52 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
-            Request::Topics { forum, offset, limit, landing } => self.topics(forum, offset, limit, landing),
+            Request::Topics { forum, offset, limit, landing, query } => self.topics(forum, offset, limit, landing, query),
+            Request::TopicCreate { forum, title, icon_color, icon_emoji_id } => {
+                if let Err(refused) = self.online(&forum.account()) {
+                    return *refused;
+                }
+                match self.ask(&forum.account(), |reply| Command::TopicCreate {
+                    conversation_id: forum.id.clone(),
+                    title,
+                    icon_color,
+                    icon_emoji_id,
+                    reply,
+                }) {
+                    Ok(topic_id) => {
+                        let key = Key::new(&forum.account(), topic_id);
+                        match self.hub.store().conversation(&key) {
+                            Ok(Some(row)) => Response::Conversation { conversation: self.row(row) },
+                            Ok(None) => error(ErrorCode::NotFound, "topic not found after creation"),
+                            Err(err) => internal(err),
+                        }
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::TopicUpdate { topic, title, icon_emoji_id, closed, hidden, pinned } => {
+                self.act(&topic, |conversation_id, reply| Command::TopicUpdate {
+                    conversation_id,
+                    title,
+                    icon_emoji_id,
+                    closed,
+                    hidden,
+                    pinned,
+                    reply,
+                })
+            }
+            Request::TopicDelete { topic } => {
+                self.act(&topic, |conversation_id, reply| Command::TopicDelete { conversation_id, reply })
+            }
+            Request::TopicIcons { account } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::TopicIcons { reply }) {
+                    Ok(page) => Response::Catalog { items: page.items, cursor: page.cursor },
+                    Err(refused) => *refused,
+                }
+            }
             Request::InVoice { network } => self.in_voice(network),
             Request::Around { network } => self.around(network),
             Request::Catalog { account, kind, space, query, cursor } => self.catalog(account, kind, space, query, cursor),
@@ -2856,7 +2962,7 @@ impl Chat {
                 match found {
                     Ok(hits) => {
                         let hits: Vec<_> = hits.into_iter().filter(|hit| self.shows(&hit.conversation.account())).collect();
-                        Response::MessageHits { hits, cursor: None, not_searched: Vec::new() }
+                        Response::MessageHits { hits, cursor: None, not_searched: Vec::new(), total: None }
                     }
                     Err(err) => internal(err),
                 }
@@ -2864,7 +2970,7 @@ impl Chat {
             Request::SearchNetwork { conversation, space, account, network, query, filters, cursor } => {
                 let query = query.trim().to_owned();
                 if query.is_empty() && filters.is_empty() {
-                    Response::MessageHits { hits: Vec::new(), cursor: None, not_searched: Vec::new() }
+                    Response::MessageHits { hits: Vec::new(), cursor: None, not_searched: Vec::new(), total: Some(0) }
                 } else if conversation.is_some() || space.is_some() {
                     let (target_account, scope) = match (&conversation, &space) {
                         (Some(key), _) => (key.account(), SearchScope::Conversation(key.id.clone())),
@@ -2872,7 +2978,7 @@ impl Chat {
                         (None, None) => unreachable!(),
                     };
                     if !self.shows(&target_account) {
-                        return Response::MessageHits { hits: Vec::new(), cursor: None, not_searched: Vec::new() };
+                        return Response::MessageHits { hits: Vec::new(), cursor: None, not_searched: Vec::new(), total: Some(0) };
                     }
                     match self.ask(&target_account, |reply| Command::Search {
                         query,
@@ -2882,7 +2988,12 @@ impl Chat {
                         at: std::time::Instant::now(),
                         reply,
                     }) {
-                        Ok(hits) => Response::MessageHits { hits, cursor: None, not_searched: Vec::new() },
+                        Ok(page) => Response::MessageHits {
+                            hits: page.hits,
+                            cursor: page.cursor,
+                            not_searched: Vec::new(),
+                            total: page.total,
+                        },
                         Err(refused) => *refused,
                     }
                 } else {
@@ -2907,7 +3018,7 @@ impl Chat {
                     for acct in accounts {
                         let can = self.hub.capabilities(&acct);
                         if self.hub.link(&acct) == Link::Connected && can.search_global {
-                            if let Ok(hits) = self.ask(&acct, |reply| Command::Search {
+                            if let Ok(page) = self.ask(&acct, |reply| Command::Search {
                                 query: query.clone(),
                                 scope: SearchScope::Account,
                                 filters: filters.clone(),
@@ -2918,7 +3029,7 @@ impl Chat {
                                 if !asked_networks.contains(&acct.network) {
                                     asked_networks.push(acct.network);
                                 }
-                                merged.extend(hits);
+                                merged.extend(page.hits);
                                 continue;
                             }
                         }
@@ -2930,9 +3041,41 @@ impl Chat {
                     merged.sort_by(|a, b| b.sent.cmp(&a.sent).then_with(|| b.message_id.cmp(&a.message_id)));
                     let mut seen = std::collections::HashSet::new();
                     merged.retain(|hit| seen.insert((hit.conversation.clone(), hit.message_id.clone())));
+                    let total = Some(merged.len() as u32);
                     let next_cursor = (offset + PAGE < merged.len()).then(|| (offset + PAGE).to_string());
                     let page: Vec<protocol::MessageHit> = merged.into_iter().skip(offset).take(PAGE).collect();
-                    Response::MessageHits { hits: page, cursor: next_cursor, not_searched }
+                    Response::MessageHits { hits: page, cursor: next_cursor, not_searched, total }
+                }
+            }
+            Request::JumpToDate { conversation, date } => {
+                if let Err(refused) = self.online(&conversation.account()) {
+                    return *refused;
+                }
+                match self.ask(&conversation.account(), |reply| Command::JumpToDate {
+                    conversation_id: conversation.id.clone(),
+                    date,
+                    reply,
+                }) {
+                    Ok(message_id) => Response::Resolved {
+                        conversation: Some(conversation),
+                        message_id,
+                        title: String::new(),
+                    },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SearchCalendar { conversation, kind, offset_date } => {
+                if let Err(refused) = self.online(&conversation.account()) {
+                    return *refused;
+                }
+                match self.ask(&conversation.account(), |reply| Command::SearchCalendar {
+                    conversation_id: conversation.id.clone(),
+                    kind,
+                    offset_date,
+                    reply,
+                }) {
+                    Ok(days) => Response::SearchCalendar { days },
+                    Err(refused) => *refused,
                 }
             }
             Request::SetDraft { conversation, text } => {
@@ -3086,8 +3229,8 @@ impl Chat {
                 }
             }
             Request::ScheduledMessages { conversation } => {
-                if !self.shows(&conversation.account()) {
-                    return error(ErrorCode::NotFound, "signed out");
+                if let Err(refused) = self.online(&conversation.account()) {
+                    return *refused;
                 }
                 match self.ask(&conversation.account(), |reply| Command::ScheduledList {
                     conversation_id: conversation.id.clone(),
@@ -3098,8 +3241,8 @@ impl Chat {
                 }
             }
             Request::CancelScheduled { conversation, scheduled_id } => {
-                if !self.shows(&conversation.account()) {
-                    return error(ErrorCode::NotFound, "signed out");
+                if let Err(refused) = self.online(&conversation.account()) {
+                    return *refused;
                 }
                 match self.ask(&conversation.account(), |reply| Command::CancelScheduled {
                     conversation_id: conversation.id.clone(),
@@ -3110,9 +3253,22 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::SendScheduledNow { conversation, scheduled_id } => {
+                if let Err(refused) = self.online(&conversation.account()) {
+                    return *refused;
+                }
+                match self.ask(&conversation.account(), |reply| Command::SendScheduledNow {
+                    conversation_id: conversation.id.clone(),
+                    scheduled_id,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::RescheduleMessage { conversation, scheduled_id, text, post_at } => {
-                if !self.shows(&conversation.account()) {
-                    return error(ErrorCode::NotFound, "signed out");
+                if let Err(refused) = self.online(&conversation.account()) {
+                    return *refused;
                 }
                 match self.ask(&conversation.account(), |reply| Command::Reschedule {
                     conversation_id: conversation.id.clone(),
@@ -3306,6 +3462,24 @@ impl Chat {
                     self.hub.infos.forget(&conversation);
                 }
                 res
+            }
+            Request::GetDefaultDisappearing { account } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::GetDefaultDisappearing { reply }) {
+                    Ok(seconds) => Response::DefaultDisappearing { seconds },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SetDefaultDisappearing { account, seconds } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::SetDefaultDisappearing { seconds, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
             }
             Request::Leave { conversation } => self.act(&conversation, |conversation_id, reply| Command::Leave { conversation_id, reply }),
             Request::LeaveSpace { space } => self.leave_space(space),
@@ -3558,6 +3732,63 @@ impl Chat {
             }
             Request::Edit { conversation, message_id, text, spans } => self.rewrite(conversation, message_id, Some(text), spans, protocol::DeleteScope::Everyone),
             Request::Delete { conversation, message_id, scope } => self.rewrite(conversation, message_id, None, Vec::new(), scope),
+            Request::DeleteMany { conversation, message_ids, scope } => {
+                if message_ids.is_empty() {
+                    return error(ErrorCode::Refused, "choose at least one message to delete");
+                }
+                if message_ids.iter().collect::<HashSet<_>>().len() != message_ids.len() {
+                    return error(ErrorCode::Refused, "the same message was listed more than once");
+                }
+                if message_ids.len() > 1_000 {
+                    return error(ErrorCode::Refused, "at most 1,000 messages may be deleted in one batch");
+                }
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::DeleteMany {
+                    conversation_id: conversation.id.clone(),
+                    message_ids: message_ids.clone(),
+                    scope,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) if matches!(*refused, Response::Error { code: ErrorCode::Unsupported, .. }) => {
+                        for message_id in message_ids {
+                            let res = self.rewrite(conversation.clone(), message_id, None, Vec::new(), scope);
+                            if !matches!(res, Response::Ok) {
+                                return res;
+                            }
+                        }
+                        Response::Ok
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::DeleteParticipantHistory { conversation, person } => {
+                if person.account() != conversation.account() {
+                    return error(ErrorCode::Refused, "person and conversation must belong to the same account");
+                }
+                self.act(&conversation, |conversation_id, reply| Command::DeleteParticipantHistory {
+                    conversation_id,
+                    person_id: person.id,
+                    reply,
+                })
+            }
+            Request::ReportSpamMessages { conversation, person, message_ids } => {
+                if person.account() != conversation.account() {
+                    return error(ErrorCode::Refused, "person and conversation must belong to the same account");
+                }
+                if message_ids.len() > 1_000 {
+                    return error(ErrorCode::Refused, "at most 1,000 messages may be reported in one batch");
+                }
+                self.act(&conversation, |conversation_id, reply| Command::ReportSpamMessages {
+                    conversation_id,
+                    person_id: person.id,
+                    message_ids,
+                    reply,
+                })
+            }
             Request::Forward { from, message_ids, to, note } => self.forward(from, message_ids, to, note),
 
             Request::Poll { conversation, message_id, votes } => self.poll(conversation, message_id, votes),

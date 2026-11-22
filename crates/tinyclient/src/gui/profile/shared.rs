@@ -45,6 +45,9 @@ fn none_words(network: Network, tab: Tab) -> &'static str {
         Tab::Kind(SharedKind::Media) => "No photos or videos in this chat",
         Tab::Kind(SharedKind::Files) => "No files in this chat",
         Tab::Kind(SharedKind::Links) => "No links in this chat",
+        Tab::Kind(SharedKind::Music) => "No music in this chat",
+        Tab::Kind(SharedKind::Voice) => "No voice messages in this chat",
+        Tab::Kind(SharedKind::Gifs) => "No GIFs in this chat",
         Tab::Pinned if network == Network::Messages => "No starred messages in this chat",
         Tab::Pinned => "Nothing pinned in this chat",
         Tab::Later => "Nothing saved for later",
@@ -102,6 +105,11 @@ pub fn tabs(network: Network) -> Vec<Tab> {
 
 pub fn tabs_for(network: Network, has_pins: bool) -> Vec<Tab> {
     let mut tabs = vec![Tab::Kind(SharedKind::Media), Tab::Kind(SharedKind::Files), Tab::Kind(SharedKind::Links)];
+    if network == Network::Telegram {
+        tabs.push(Tab::Kind(SharedKind::Music));
+        tabs.push(Tab::Kind(SharedKind::Voice));
+        tabs.push(Tab::Kind(SharedKind::Gifs));
+    }
     if !matches!(network, Network::Teams | Network::Tiny)
         || (network == Network::Tiny && has_pins)
     {
@@ -147,7 +155,12 @@ impl Shared {
         self.ask(false, entity, cx, held);
         // Where the network counts it all, every tab's count is asked with the open one.
         if let Some(conversation) = self.conversation.clone().filter(|key| whole_at_open(key.network)) {
-            for kind in [SharedKind::Files, SharedKind::Links] {
+            let kinds: &[SharedKind] = if conversation.network == Network::Telegram {
+                &[SharedKind::Files, SharedKind::Links, SharedKind::Music, SharedKind::Voice, SharedKind::Gifs]
+            } else {
+                &[SharedKind::Files, SharedKind::Links]
+            };
+            for &kind in kinds {
                 self.count(conversation.clone(), kind, entity, cx, held);
             }
         }
@@ -325,6 +338,9 @@ pub fn draw(shared: &Shared, network: Network, has_pins: bool, hub: &Hub, width:
                 Tab::Kind(SharedKind::Media) => "Media",
                 Tab::Kind(SharedKind::Files) => "Files",
                 Tab::Kind(SharedKind::Links) => "Links",
+                Tab::Kind(SharedKind::Music) => "Music",
+                Tab::Kind(SharedKind::Voice) => "Voice",
+                Tab::Kind(SharedKind::Gifs) => "GIFs",
                 Tab::Pinned if network == Network::Messages => "Starred",
                 Tab::Pinned => "Pinned",
                 Tab::Later => "Later",
@@ -385,7 +401,7 @@ fn list(shared: &Shared, hub: &Hub, width: f32, cx: &mut App) -> Div {
     let account = conversation.account();
     let page = &shared.page;
     match shared.tab {
-        Tab::Kind(SharedKind::Media) => {
+        Tab::Kind(SharedKind::Media | SharedKind::Gifs) => {
             // Three to a row, each a third of the row, whatever the pane's width; the height
             // follows the width the pane says it has.
             let tile = ((width - 4.) / 3.).floor().max(40.);
@@ -439,7 +455,7 @@ fn list(shared: &Shared, hub: &Hub, width: f32, cx: &mut App) -> Div {
             }
             grid
         }
-        Tab::Kind(SharedKind::Files) => div().flex().flex_col().children(page.items.iter().enumerate().filter_map(|(ix, item)| {
+        Tab::Kind(SharedKind::Files | SharedKind::Music | SharedKind::Voice) => div().flex().flex_col().children(page.items.iter().enumerate().filter_map(|(ix, item)| {
             if let Some(attachment) = item.attachment.as_ref() {
                 let on_disk = attachment.file.path.clone();
                 let fallback_url = item.url.clone();

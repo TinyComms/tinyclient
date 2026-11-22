@@ -279,6 +279,8 @@ struct Live {
     /// Photo albums still arriving or open, so a later item, edit, reaction or deletion
     /// finds the row they share.
     albums: VecDeque<live::HeldAlbum>,
+    /// Forum topic paging cursors per forum: `(offset_date, offset_id, offset_topic, loaded, total, done)`.
+    topic_pages: HashMap<Who, (i32, i32, i32, u32, u32, bool)>,
 }
 
 /// Telegram's own send options, which Telegram carries out.
@@ -711,12 +713,30 @@ fn offline(ctx: &Context, command: Command) {
         | Command::TogglePaidReactionPrivacy { reply, .. }
         | Command::SetDefaultReaction { reply, .. }
         | Command::Edit { reply, .. }
-        | Command::Delete { reply, .. } => drop(reply.send(Err(down()))),
+        | Command::Delete { reply, .. }
+        | Command::DeleteMany { reply, .. }
+        | Command::DeleteParticipantHistory { reply, .. }
+        | Command::ReportSpamMessages { reply, .. } => drop(reply.send(Err(down()))),
         Command::StarsBalance { reply } => drop(reply.send(Err(down()))),
         Command::Members { reply, .. } => drop(reply.send(Err(down()))),
         Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(down()))),
         Command::ConversationInfo { reply, .. } => drop(reply.send(Err(down()))),
-        Command::SetMute { reply, .. } | Command::Leave { reply, .. } | Command::ClearHistory { reply, .. } => drop(reply.send(Err(down()))),
+        Command::SetMute { reply, .. }
+        | Command::SetDisappearing { reply, .. }
+        | Command::SetDefaultDisappearing { reply, .. }
+        | Command::Leave { reply, .. }
+        | Command::ClearHistory { reply, .. } => drop(reply.send(Err(down()))),
+        Command::GetDefaultDisappearing { reply } => drop(reply.send(Err(down()))),
+        Command::FolderSave { reply, .. } => drop(reply.send(Err(down()))),
+        Command::FolderDelete { reply, .. } | Command::FoldersReorder { reply, .. } => drop(reply.send(Err(down()))),
+        Command::SuggestedFolders { reply } => drop(reply.send(Err(down()))),
+        Command::LoadTopics { reply, .. } => drop(reply.send(Err(down()))),
+        Command::TopicCreate { reply, .. } => drop(reply.send(Err(down()))),
+        Command::TopicUpdate { reply, .. } | Command::TopicDelete { reply, .. } => drop(reply.send(Err(down()))),
+        Command::TopicIcons { reply } => drop(reply.send(Err(down()))),
+        Command::ScheduledList { reply, .. } => drop(reply.send(Err(down()))),
+        Command::CancelScheduled { reply, .. } | Command::SendScheduledNow { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Reschedule { reply, .. } => drop(reply.send(Err(down()))),
         Command::Pinned { reply, .. } => drop(reply.send(Err(down()))),
         Command::Pin { reply, .. } => drop(reply.send(Err(down()))),
         Command::Forward { reply, .. } => drop(reply.send(Err(down()))),
@@ -727,6 +747,8 @@ fn offline(ctx: &Context, command: Command) {
         Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(down()))),
         Command::GetPrivacy { reply, .. } | Command::SetPrivacy { reply, .. } => drop(reply.send(Err(down()))),
         Command::Search { reply, .. } => drop(reply.send(Err(down()))),
+        Command::JumpToDate { reply, .. } => drop(reply.send(Err(down()))),
+        Command::SearchCalendar { reply, .. } => drop(reply.send(Err(down()))),
         Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
         Command::SaveGif { reply, .. } | Command::StickerSet { reply, .. } | Command::FaveSticker { reply, .. } => drop(reply.send(Err(down()))),
         Command::PressButton { reply, .. } => drop(reply.send(Err(down()))),
@@ -769,6 +791,40 @@ fn serve(account: &Arc<Account>, command: Command) {
             sync::backfill(account, &conversation_id);
             let _ = reply.send(Ok(()));
         }
+        Command::LoadTopics { conversation_id, query, offset, limit, reply } => {
+            let _ = reply.send(sync::load_topics(account, &conversation_id, query.as_deref(), offset, limit).map_err(refused));
+        }
+        Command::TopicCreate { conversation_id, title, icon_color, icon_emoji_id, reply } => {
+            let _ = reply.send(
+                sync::create_topic(account, &conversation_id, &title, icon_color, icon_emoji_id.as_deref()).map_err(refused),
+            );
+        }
+        Command::TopicUpdate { conversation_id, title, icon_emoji_id, closed, hidden, pinned, reply } => {
+            let _ = reply.send(
+                sync::update_topic(account, &conversation_id, title.as_deref(), icon_emoji_id.as_deref(), closed, hidden, pinned)
+                    .map_err(refused),
+            );
+        }
+        Command::TopicDelete { conversation_id, reply } => {
+            let _ = reply.send(sync::delete_topic(account, &conversation_id).map_err(refused));
+        }
+        Command::TopicIcons { reply } => {
+            let _ = reply.send(catalog::topic_icons(account).map_err(refused));
+        }
+        Command::ScheduledList { conversation_id, reply } => {
+            let _ = reply.send(info::scheduled_list(account, &conversation_id).map_err(refused));
+        }
+        Command::CancelScheduled { conversation_id, scheduled_id, reply } => {
+            let _ = reply.send(info::cancel_scheduled(account, &conversation_id, &scheduled_id).map_err(refused));
+        }
+        Command::SendScheduledNow { conversation_id, scheduled_id, reply } => {
+            let _ = reply.send(info::send_scheduled_now(account, &conversation_id, &scheduled_id).map_err(refused));
+        }
+        Command::Reschedule { conversation_id, scheduled_id, text, post_at, reply } => {
+            let _ = reply.send(
+                info::reschedule(account, &conversation_id, &scheduled_id, text.as_deref(), post_at).map_err(refused),
+            );
+        }
         Command::Wanted(ids) => drop(account.files.asked(&ids)),
         Command::Previews(ids) => sync::previews(account, &ids),
         Command::MarkRead { conversation_id, message_id } => mark_read(account, &conversation_id, &message_id),
@@ -805,6 +861,15 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::Delete { conversation_id, message_id, scope, reply } => {
             let _ = reply.send(delete(account, &conversation_id, &message_id, scope).map_err(refused));
+        }
+        Command::DeleteMany { conversation_id, message_ids, scope, reply } => {
+            let _ = reply.send(delete_many(account, &conversation_id, &message_ids, scope).map_err(refused));
+        }
+        Command::DeleteParticipantHistory { conversation_id, person_id, reply } => {
+            let _ = reply.send(info::delete_participant_history(account, &conversation_id, &person_id).map_err(refused));
+        }
+        Command::ReportSpamMessages { conversation_id, person_id, message_ids, reply } => {
+            let _ = reply.send(info::report_spam_messages(account, &conversation_id, &person_id, &message_ids).map_err(refused));
         }
         Command::Typing { conversation_id, activity } => typing(account, &conversation_id, activity),
         Command::FollowLink { conversation_id, message_id } => sync::followed(account, &conversation_id, &message_id),
@@ -855,6 +920,12 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::SetDisappearing { conversation_id, seconds, reply } => {
             let _ = reply.send(info::set_disappearing(account, &conversation_id, seconds).map_err(refused));
         }
+        Command::GetDefaultDisappearing { reply } => {
+            let _ = reply.send(info::get_default_disappearing(account).map_err(refused));
+        }
+        Command::SetDefaultDisappearing { seconds, reply } => {
+            let _ = reply.send(info::set_default_disappearing(account, seconds).map_err(refused));
+        }
         Command::Leave { conversation_id, reply } => {
             let _ = reply.send(info::leave(account, &conversation_id).map_err(refused));
         }
@@ -866,6 +937,18 @@ fn serve(account: &Arc<Account>, command: Command) {
                 filing::file(account, &conversation_id, pinned, archived, folder_add.as_deref(), folder_remove.as_deref())
                     .map_err(refused),
             );
+        }
+        Command::FolderSave { folder, reply } => {
+            let _ = reply.send(filing::save_folder(account, &folder).map_err(refused));
+        }
+        Command::FolderDelete { folder_id, reply } => {
+            let _ = reply.send(filing::delete_folder(account, &folder_id).map_err(refused));
+        }
+        Command::FoldersReorder { order, reply } => {
+            let _ = reply.send(filing::reorder_folders(account, &order).map_err(refused));
+        }
+        Command::SuggestedFolders { reply } => {
+            let _ = reply.send(filing::suggested_folders(account).map_err(refused));
         }
         Command::Pinned { conversation_id, reply } => {
             let _ = reply.send(info::pinned(account, &conversation_id).map_err(refused));
@@ -882,13 +965,23 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::ReportReasons { reply, .. } => {
             let _ = reply.send(Ok(protocol::ReportReason::ALL.to_vec()));
         }
-        Command::Search { query, scope, cursor, reply, .. } => {
+        Command::Search { query, scope, filters, cursor, reply, .. } => {
             let result = match scope {
-                super::SearchScope::Conversation(id) => info::search_messages(account, &id, &query).map_err(refused),
-                super::SearchScope::Account => info::search_global(account, &query, cursor.as_deref()).map_err(refused),
+                super::SearchScope::Conversation(id) => {
+                    info::search_messages(account, &id, &query, &filters, cursor.as_deref()).map_err(refused)
+                }
+                super::SearchScope::Account => {
+                    info::search_global(account, &query, &filters, cursor.as_deref()).map_err(refused)
+                }
                 super::SearchScope::Space(_) => Err(Refusal::Unsupported),
             };
             let _ = reply.send(result);
+        }
+        Command::JumpToDate { conversation_id, date, reply } => {
+            let _ = reply.send(info::jump_to_date(account, &conversation_id, date).map_err(refused));
+        }
+        Command::SearchCalendar { conversation_id, kind, offset_date, reply } => {
+            let _ = reply.send(info::search_calendar(account, &conversation_id, kind, offset_date).map_err(refused));
         }
         Command::SearchShared { conversation_id, kind, before, limit, reply } => {
             let _ = reply.send(info::shared(account, &conversation_id, kind, before.as_deref(), limit).map_err(refused));
@@ -1089,9 +1182,28 @@ fn remember_random(account: &Account, random: i64, client_id: &str) {
     live.random.push_back((random, client_id.to_owned()));
 }
 
+fn check_schedule_target(account: &Account, who: Who, opts: Options) -> Result<(), Fault> {
+    if opts.schedule == Some(protocol::SCHEDULE_WHEN_ONLINE as i32) {
+        match who {
+            Who::User(uid) if uid != account.me => {
+                let dir = account.dir();
+                let known = dir.get(who);
+                if known.as_ref().is_some_and(|known| known.bot || !known.seen.is_empty()) {
+                    return Err(Fault::Rpc { code: 400, name: "SCHEDULE_STATUS_PRIVATE".to_owned(), value: None });
+                }
+            }
+            _ => {
+                return Err(Fault::Rpc { code: 400, name: "SCHEDULE_STATUS_PRIVATE".to_owned(), value: None });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn send_text(account: &Account, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, opts: Options, spans: &[protocol::Span]) -> Result<protocol::Message, Fault> {
     let invalid = || Fault::Rpc { code: 400, name: "PEER_ID_INVALID".to_owned(), value: None };
     let (who, topic) = Who::parse(conversation).ok_or_else(invalid)?;
+    check_schedule_target(account, who, opts)?;
     // The comments of a channel post are held in the discussion group behind it: the send
     // names that, under the echo of the post itself, where Telegram's own apps write them.
     let (who, topic) = sync::comment_target(account, conversation)?.map(|(group, echo)| (group, Some(echo))).unwrap_or((who, topic));
@@ -1169,8 +1281,24 @@ fn edit(account: &Account, conversation: &str, message: &str, text: &str, spans:
 }
 
 fn delete(account: &Account, conversation: &str, message: &str, scope: protocol::DeleteScope) -> Result<(), Fault> {
+    delete_many(account, conversation, &[message.to_owned()], scope)
+}
+
+fn delete_many(account: &Account, conversation: &str, message_ids: &[String], scope: protocol::DeleteScope) -> Result<(), Fault> {
     let invalid = || Fault::Rpc { code: 400, name: "MESSAGE_ID_INVALID".to_owned(), value: None };
-    let ((who, _), id) = (Who::parse(conversation).ok_or_else(invalid)?, message.parse::<i32>().map_err(|_| invalid())?);
+    if message_ids.is_empty() {
+        return Err(invalid());
+    }
+    let (who, _) = Who::parse(conversation).ok_or_else(invalid)?;
+    let mut parsed: Vec<(String, i32)> = Vec::with_capacity(message_ids.len());
+    let mut seen = HashSet::new();
+    for raw in message_ids {
+        let id = raw.parse::<i32>().map_err(|_| invalid())?;
+        if !seen.insert(id) {
+            return Err(invalid());
+        }
+        parsed.push((raw.clone(), id));
+    }
     match who {
         Who::Channel(_) => {
             if scope == protocol::DeleteScope::Me {
@@ -1181,19 +1309,27 @@ fn delete(account: &Account, conversation: &str, message: &str, scope: protocol:
                 });
             }
             let channel = account.input_channel(who)?;
-            account.ask(&tl::functions::channels::DeleteMessages { channel, id: vec![id] })?;
+            for chunk in parsed.chunks(100) {
+                let ids: Vec<i32> = chunk.iter().map(|(_, id)| *id).collect();
+                account.ask(&tl::functions::channels::DeleteMessages { channel: channel.clone(), id: ids })?;
+            }
         }
         _ => {
             let revoke = scope == protocol::DeleteScope::Everyone;
-            account.ask(&tl::functions::messages::DeleteMessages { revoke, id: vec![id] })?;
+            for chunk in parsed.chunks(100) {
+                let ids: Vec<i32> = chunk.iter().map(|(_, id)| *id).collect();
+                account.ask(&tl::functions::messages::DeleteMessages { revoke, id: ids })?;
+            }
         }
     }
-    let _ = account.ctx.deleted(conversation, message);
     let noted = match who {
         Who::Channel(_) => Some(who),
         _ => None,
     };
-    account.forget_placed(noted, id);
+    for (raw, id) in parsed {
+        let _ = account.ctx.deleted(conversation, &raw);
+        account.forget_placed(noted, id);
+    }
     Ok(())
 }
 

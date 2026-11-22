@@ -1220,7 +1220,7 @@ impl Shell {
             // same one again), picking a topic, or leaving the drill supersedes its reply.
             let navigation = self.sidebar_state.navigation;
             let requested_forum = forum.clone();
-            let landing = move || ask(&Request::Topics { forum, offset: 0, limit: 1, landing: true });
+            let landing = move || ask(&Request::Topics { forum, offset: 0, limit: 1, landing: true, query: None });
             self.off_thread(cx, landing, move |this, answer, cx| {
                 let Ok(Response::Conversations { conversations, .. }) = answer else {
                     return;

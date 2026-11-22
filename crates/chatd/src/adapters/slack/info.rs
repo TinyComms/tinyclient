@@ -339,6 +339,7 @@ impl Slack {
         let types = match kind {
             SharedKind::Media => "images",
             SharedKind::Files => "all",
+            SharedKind::Music | SharedKind::Voice | SharedKind::Gifs => return None,
             SharedKind::Links => {
                 if before.is_some() {
                     return Some(Ok(SharedPage::default()));

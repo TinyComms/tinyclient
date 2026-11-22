@@ -1048,7 +1048,7 @@ fn a_forum_opens_on_the_newest_activity_post_and_its_posts_are_no_tree_rows() {
     // lands on the post with the newest activity, read or not — here the read "Iterating",
     // though "Sorting" still sits unread. Telegram's own rule (newest unread, else General)
     // would have picked the other post.
-    let landing = || Request::Topics { forum: world.key("4106"), offset: 0, limit: 1, landing: true };
+    let landing = || Request::Topics { forum: world.key("4106"), offset: 0, limit: 1, landing: true, query: None };
     let Response::Conversations { conversations, .. } = world.ask(landing()) else {
         panic!("no landing");
     };
@@ -1062,7 +1062,7 @@ fn a_forum_opens_on_the_newest_activity_post_and_its_posts_are_no_tree_rows() {
     assert!(world.discord.requests_to("GET", "/channels/4106/").is_empty());
 
     // What the topics drill lists: the posts by their activity, a count on the unread one.
-    let drill = Request::Topics { forum: world.key("4106"), offset: 0, limit: 10, landing: false };
+    let drill = Request::Topics { forum: world.key("4106"), offset: 0, limit: 10, landing: false, query: None };
     let Response::Conversations { conversations: posts, total, .. } = world.ask(drill) else {
         panic!("no posts");
     };
@@ -1095,13 +1095,13 @@ fn a_post_arriving_while_connected_is_recorded_under_its_forum_never_as_a_row() 
 
     // It is read under the forum: the topics drill lists it by its activity, and the landing
     // is its own newest activity, though the tree never grows a row for it (`polish/01` §3).
-    let drill = || world.ask(Request::Topics { forum: world.key("4106"), offset: 0, limit: 10, landing: false });
+    let drill = || world.ask(Request::Topics { forum: world.key("4106"), offset: 0, limit: 10, landing: false, query: None });
     let posts = wait("the post recorded under the forum", || match drill() {
         Response::Conversations { conversations, total, .. } if conversations.len() == 3 && total == 3 => Some(conversations),
         _ => None,
     });
     assert_eq!(ids(&posts), ["4603", "4602", "4601"], "{posts:?}");
-    let landing = Request::Topics { forum: world.key("4106"), offset: 0, limit: 1, landing: true };
+    let landing = Request::Topics { forum: world.key("4106"), offset: 0, limit: 1, landing: true, query: None };
     let Response::Conversations { conversations, .. } = world.ask(landing) else {
         panic!("no landing");
     };
