@@ -60,6 +60,8 @@ mod session;
 mod portal;
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 mod x11;
+#[cfg(target_os = "macos")]
+mod mac_screen;
 
 /// The camera the next camera frame comes from, as `settings::CAMERA` stores it (a name, then a
 /// tab and the system's id); `None` is the first one listed. One choice per process.

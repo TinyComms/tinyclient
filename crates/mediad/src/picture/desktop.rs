@@ -517,6 +517,8 @@ impl Outgoing {
         super::portal::stop_screen();
         #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         super::x11::stop();
+        #[cfg(target_os = "macos")]
+        super::mac_screen::stop();
     }
 }
 
@@ -946,8 +948,7 @@ fn grab(id: Option<&str>, allow_portal: bool) -> Result<Rgba, String> {
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = (id, allow_portal);
-        return capture_screen_macos();
+        return super::mac_screen::capture(id, allow_portal);
     }
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     {
@@ -958,30 +959,6 @@ fn grab(id: Option<&str>, allow_portal: bool) -> Result<Rgba, String> {
         let _ = (id, allow_portal);
         Err("Screen sharing isn't available on this system.".to_owned())
     }
-}
-
-#[cfg(target_os = "macos")]
-fn capture_screen_macos() -> Result<Rgba, String> {
-    use core_graphics::display::CGDisplay;
-    // A Core Graphics grab never carries the pointer, and Core Graphics has no mode that draws
-    // it. ScreenCaptureKit's `showsCursor` is the native way, which the capture's move to SCK
-    // brings (#773); until then a macOS share draws no pointer, and `show_cursor` is kept for
-    // that day.
-    let image = CGDisplay::main().image().ok_or_else(|| {
-        "tinyclient can't record the screen. Allow it in System Settings › Privacy & Security › Screen & System Audio Recording.".to_owned()
-    })?;
-    let width = image.width() as u32;
-    let height = image.height() as u32;
-    let stride = image.bytes_per_row();
-    let data = image.data();
-    let bytes = data.bytes();
-    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
-    for row in 0..height as usize {
-        let start = row * stride;
-        let row_bytes = bytes.get(start..start + width as usize * 4).ok_or_else(|| "The screen image was short.".to_owned())?;
-        pixels.extend_from_slice(row_bytes);
-    }
-    Ok(Rgba { width, height, pixels, bgra: true })
 }
 
 /// Wayland shares only through its portal. XWayland's root is not the user's desktop.
