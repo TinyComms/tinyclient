@@ -1804,6 +1804,9 @@ pub enum Command {
         reply: Reply<()>,
     },
     SetVoiceChannelStatus { conversation_id: String, status: Option<String>, reply: Reply<()> },
+    DiscordVoiceSettings { conversation_id: String, reply: Reply<protocol::DiscordVoiceSettings> },
+    EditDiscordVoiceChannel { conversation_id: String, edit: protocol::DiscordChannelVoice, reply: Reply<()> },
+    SetDiscordCallRegion { conversation_id: String, region: String, reply: Reply<()> },
     CallModerate {
         conversation_id: String,
         person_id: String,
@@ -2005,6 +2008,8 @@ impl Command {
             | Command::SetDefaultSendAs { reply, .. }
             | Command::EditChannel { reply, .. }
             | Command::SetVoiceChannelStatus { reply, .. }
+            | Command::EditDiscordVoiceChannel { reply, .. }
+            | Command::SetDiscordCallRegion { reply, .. }
             | Command::CallModerate { reply, .. }
             | Command::CallMove { reply, .. }
             | Command::MoveChannels { reply, .. }
@@ -2013,6 +2018,7 @@ impl Command {
             | Command::DeleteOverwrite { reply, .. }
             | Command::SyncChannelPermissions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ChannelPermissions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DiscordVoiceSettings { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::AuditLog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::AutomodRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SaveAutomodRule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

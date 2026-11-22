@@ -3182,6 +3182,9 @@ pub enum Request {
         conversation: Key,
         status: Option<String>,
     },
+    DiscordVoiceSettings { conversation: Key },
+    EditDiscordVoiceChannel { conversation: Key, edit: DiscordChannelVoice },
+    SetDiscordCallRegion { conversation: Key, region: String },
     /// Changes server mute or deafen for a participant in a server voice channel.
     CallModerate {
         conversation: Key,
@@ -4378,6 +4381,7 @@ pub fn language_name(tag: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Response {
+    DiscordVoiceSettings { settings: DiscordVoiceSettings },
     Pong,
     /// Done, with nothing to say.
     Ok,

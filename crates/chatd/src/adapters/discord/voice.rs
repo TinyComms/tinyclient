@@ -14,6 +14,8 @@ use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+mod settings;
+
 /// Voice states remembered across every server. A person in a voice channel is one entry.
 const HEARD: usize = 2_000;
 
@@ -348,6 +350,8 @@ pub struct Voice {
     call: Option<Joining>,
     /// Direct conversations with a call going on.
     calls: HashSet<String>,
+    call_regions: HashMap<String, String>,
+    regions: Option<(Instant, Vec<protocol::DiscordVoiceRegion>)>,
     /// Direct conversations whose call is ringing us.
     ringing: HashSet<String>,
     /// User ids currently being rung per direct/group call, from `CALL_CREATE` / `CALL_UPDATE`.
@@ -397,6 +401,7 @@ pub struct ServerUpdate {
 #[derive(Deserialize)]
 pub struct CallEvent {
     channel_id: String,
+    region: Option<String>,
     #[serde(default)]
     ringing: Vec<String>,
     #[serde(default)]
@@ -1175,6 +1180,11 @@ impl Discord {
         {
             let mut state = self.state.lock().unwrap();
             state.voice.calls.insert(event.channel_id.clone());
+            if let Some(region) = event.region.as_ref().filter(|region| !region.is_empty() && region.len() <= 64) {
+                if state.voice.call_regions.contains_key(&event.channel_id) || state.voice.call_regions.len() < HEARD {
+                    state.voice.call_regions.insert(event.channel_id.clone(), region.clone());
+                }
+            }
             if event.ringing.is_empty() {
                 state.voice.ringing_out.remove(&event.channel_id);
             } else {
@@ -1249,6 +1259,7 @@ impl Discord {
         {
             let mut state = self.state.lock().unwrap();
             state.voice.calls.remove(&event.channel_id);
+            state.voice.call_regions.remove(&event.channel_id);
             state.voice.ringing.remove(&event.channel_id);
             state.voice.ringing_out.remove(&event.channel_id);
             state.voice.states.retain(|_, heard| heard.channel != event.channel_id);

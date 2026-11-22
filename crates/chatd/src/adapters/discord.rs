@@ -4201,6 +4201,15 @@ impl Discord {
             }
             Command::Download { id, url, reply } => self.download(id, url, reply),
             Command::Handoff { conversation_id, reply } => drop(reply.send(self.handoff(&conversation_id))),
+            Command::DiscordVoiceSettings { conversation_id, reply } => {
+                answer(reply, self.discord_voice_settings(&conversation_id))
+            }
+            Command::EditDiscordVoiceChannel { conversation_id, edit, reply } => {
+                answer(reply, self.edit_discord_voice_channel(&conversation_id, edit))
+            }
+            Command::SetDiscordCallRegion { conversation_id, region, reply } => {
+                answer(reply, self.set_discord_call_region(&conversation_id, &region))
+            }
             Command::SetVoiceChannelStatus { conversation_id, status, reply } => {
                 answer(reply, self.set_voice_status(&conversation_id, status))
             }

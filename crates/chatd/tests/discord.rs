@@ -348,6 +348,22 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             (201, ch)
         }
         // A thread's own edit (ids 45xx here, or thread-only fields) is answered by the thread arm below.
+        ("GET", ["voice", "regions"]) => (200, json!([{"id":"us-east","name":"US East","deprecated":false}])),
+        ("GET", ["channels", "4201"]) => (200, json!({
+            "id":"4201", "type":2, "bitrate":64000, "user_limit":0, "rtc_region":"us-east", "video_quality_mode":1
+        })),
+        ("PATCH", ["channels", channel]) if seen.body.get("bitrate").is_some() => {
+            let mut row = seen.body.clone();
+            row["id"] = json!(channel);
+            row["guild_id"] = json!("4000");
+            row["type"] = json!(2);
+            row["name"] = json!("Lounge");
+            (200, row)
+        }
+        ("PATCH", ["channels", channel, "call"]) => {
+            shared.push("CALL_UPDATE", json!({"channel_id":channel,"region":seen.body["region"],"ringing":[]}));
+            (204, Value::Null)
+        }
         ("PATCH", ["channels", channel])
             if !(channel.starts_with("45") || ["archived", "locked", "auto_archive_duration"].iter().any(|field| seen.body.get(field).is_some())) =>
         {
@@ -3213,6 +3229,48 @@ fn voice_moderation_checks_channel_permissions_and_waits_for_the_gateway() {
     }));
     wait("server mute and deafen", || dev().filter(|dev| dev.server_muted && dev.server_deafened));
     assert_ne!(serde_json::to_value(world.conversation("3001").rights).unwrap()["voice_move"], true);
+}
+
+#[test]
+fn discord_voice_settings_are_loaded_on_demand_and_apply_to_the_right_route() {
+    let world = World::start();
+    let channel = world.key("4201");
+    let dm = world.key("3001");
+    let get = || world.ask(Request::DiscordVoiceSettings { conversation: channel.clone() });
+    assert!(world.discord.requests_to("GET", "/voice/regions").is_empty());
+    let settings = match get() {
+        Response::DiscordVoiceSettings { settings } => settings,
+        other => panic!("{other:?}"),
+    };
+    assert!(settings.channel.is_none());
+    assert!(world.discord.requests_to("GET", "/channels/4201").is_empty());
+    let edit = protocol::DiscordChannelVoice { bitrate: 32000, user_limit: 12, rtc_region: None, video_quality_mode: 2 };
+    let save = || world.ask(Request::EditDiscordVoiceChannel { conversation: channel.clone(), edit: edit.clone() });
+    assert!(matches!(save(), Response::Error { .. }));
+    assert!(world.discord.requests_to("PATCH", "/channels/4201").is_empty());
+    world.discord.push("GUILD_ROLE_UPDATE", json!({
+        "guild_id":"4000", "role":{"id":"4000", "name":"@everyone", "permissions": ((1u64 << 10) | (1 << 20) | (1 << 4)).to_string()}
+    }));
+    wait("manage channel permissions", || world.conversation("4201").rights.rename.then_some(()));
+    match get() {
+        Response::DiscordVoiceSettings { settings } => {
+            assert_eq!(settings.channel.unwrap().rtc_region.as_deref(), Some("us-east"));
+            assert_eq!(settings.regions[0].id, "us-east");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(save(), Response::Ok);
+    assert_eq!(world.conversation("4201").limit, 12);
+    assert_eq!(world.discord.requests_to("PATCH", "/channels/4201")[0].body,
+        json!({"bitrate":32000, "user_limit":12, "rtc_region":null, "video_quality_mode":2}));
+    world.discord.push("CALL_CREATE", json!({"channel_id":"3001", "region":"us-east", "ringing":[]}));
+    wait("the direct call's region", || match world.ask(Request::DiscordVoiceSettings { conversation: dm.clone() }) {
+        Response::DiscordVoiceSettings { settings } => (settings.current_region.as_deref() == Some("us-east")).then_some(()),
+        _ => None,
+    });
+    assert_eq!(world.ask(Request::SetDiscordCallRegion { conversation: dm, region: "us-east".into() }), Response::Ok);
+    assert_eq!(world.discord.requests_to("PATCH", "/channels/3001/call")[0].body, json!({"region":"us-east"}));
+    assert_eq!(world.discord.requests_to("GET", "/voice/regions").len(), 1);
 }
 
 #[test]

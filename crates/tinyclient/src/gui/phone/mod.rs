@@ -240,7 +240,8 @@ impl Shell {
                 .children(self.voice_status_modal(cx))
                 .children(matches!(self.layout_state.menu, Some(crate::gui::layout::Menu::VoiceOccupant(..)))
                     .then(|| self.phone_menu(snapshot, window, cx)).flatten())
-                .children(self.voice_move_modal(cx));
+                .children(self.voice_move_modal(cx))
+                .children(self.voice_settings_modal(cx));
         }
         // Minimised, it is a bar under the status bar, and every screen starts under that bar.
         let bar = self.call_phone_bar(snapshot, cx);
@@ -275,6 +276,7 @@ impl Shell {
             .children(self.edit_channel_modal(cx))
             .children(self.voice_status_modal(cx))
             .children(self.voice_move_modal(cx))
+            .children(self.voice_settings_modal(cx))
             .children(self.move_channels_modal(cx))
             .children(self.delete_channel_modal(cx))
             .children(self.browse_channels_modal(cx))

@@ -6327,6 +6327,36 @@ impl Chat {
                 Err(err) => call_error(err),
             },
 
+            Request::DiscordVoiceSettings { conversation } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::DiscordVoiceSettings { conversation_id: conversation.id, reply }) {
+                    Ok(settings) => Response::DiscordVoiceSettings { settings },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::EditDiscordVoiceChannel { conversation, edit } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::EditDiscordVoiceChannel { conversation_id: conversation.id, edit, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SetDiscordCallRegion { conversation, region } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::SetDiscordCallRegion { conversation_id: conversation.id, region, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::SetVoiceChannelStatus { conversation, status } => {
                 let account = conversation.account();
                 if let Err(refused) = self.online(&account) {

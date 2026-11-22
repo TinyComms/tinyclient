@@ -519,6 +519,16 @@ impl Shell {
         let row = self.snapshot.as_ref().and_then(|snapshot| snapshot.open.as_ref())
             .filter(|row| row.key == call.conversation).cloned()
             .or_else(|| self.sidebar_state.find(&self.trees, &call.conversation));
+        let region = (call.conversation.network == protocol::Network::Discord
+            && call.state == protocol::CallState::Joined
+            && row.as_ref().is_some_and(|row| row.kind.is_direct())).then(|| {
+            let key = call.conversation.clone();
+            menu_item("call-change-region", Some("icons/info.svg"), "Change region…", None)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.call_menu_close(cx);
+                    this.open_discord_voice_settings(key.clone(), true, cx);
+                }))
+        });
         let edit_status = row.filter(|row| {
             super::super::sidebar::can_set_discord_voice_status(row, call.state == protocol::CallState::Joined)
         }).map(|row| {
@@ -566,6 +576,7 @@ impl Shell {
             .child(menu_separator().mx(px(8.)))
             .child(test)
             .children(edit_status)
+            .children(region)
             .child(settings)
     }
 }

@@ -18,6 +18,8 @@ mod shot;
 pub mod switcher;
 pub mod tree;
 pub mod walk;
+mod voice_settings;
+pub(super) use voice_settings::discord_voice_editor;
 
 use super::components::{
     badge_dot, badge_mention, banner, banner_action, button, empty_state, glyph, icon_button, keycap, list_row,
@@ -229,6 +231,7 @@ pub struct State {
     pub edit_channel: Option<EditChannelModal>,
     voice_status: Option<VoiceStatusModal>,
     voice_move: Option<VoiceMove>,
+    voice_settings: Option<voice_settings::Editor>,
     /// Discord bulk channel/category reorder modal.
     pub move_channels: Option<MoveChannelsModal>,
     /// Confirmation modal requiring typing the channel/category name before deleting.
@@ -511,6 +514,7 @@ impl State {
             edit_channel: None,
             voice_status: None,
             voice_move: None,
+            voice_settings: None,
             move_channels: None,
             delete_channel: None,
             discover_input: None,

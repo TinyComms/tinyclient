@@ -145,6 +145,15 @@ impl Shell {
             )
             .children(security)
             .children(status)
+            .children((call.conversation.network == protocol::Network::Discord && call.state == protocol::CallState::Joined).then(|| {
+                let key = call.conversation.clone();
+                let direct = subject.kind.is_direct();
+                row("call-phone-more-region", "icons/info.svg", if direct { "Change region" } else { "Connection details" }, None, Some(chevron()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.call_phone_close_sheet(cx);
+                        this.open_discord_voice_settings(key.clone(), direct, cx);
+                    }))
+            }))
             .child(label("VOICE"))
             .child(
                 row("call-phone-more-ptt", "icons/hand.svg", "Push to talk", Some(if push { "Hold the button to talk".into() } else { "Your microphone opens when you speak".into() }), Some(switch(push)))

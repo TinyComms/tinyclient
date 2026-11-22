@@ -2237,6 +2237,7 @@ impl Render for Shell {
             .children(self.edit_channel_modal(cx))
             .children(self.voice_status_modal(cx))
             .children(self.voice_move_modal(cx))
+            .children(self.voice_settings_modal(cx))
             .children(self.move_channels_modal(cx))
             .children(self.delete_channel_modal(cx))
             .children(self.folder_edit_modal(cx))
