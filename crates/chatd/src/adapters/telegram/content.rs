@@ -1632,6 +1632,7 @@ fn sender(dir: &Directory, who: Who) -> Sender {
         name: dir.name(who),
         avatar: known.and_then(|known| known.avatar()).map(|id| MediaFile::new(id, MediaKind::Avatar)),
         bot: known.is_some_and(|known| known.bot),
+        ..Sender::default()
     }
 }
 
@@ -1946,6 +1947,123 @@ fn action(dir: &Directory, who: &str, action: &MessageAction) -> (String, bool) 
     }
 }
 
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
+pub(super) fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(text.len() / 2);
+    for i in (0..text.len()).step_by(2) {
+        out.push(u8::from_str_radix(&text[i..i + 2], 16).ok()?);
+    }
+    Some(out)
+}
+
+fn inline_buttons(markup: &tl::enums::ReplyMarkup) -> Vec<Vec<protocol::InlineButton>> {
+    let tl::enums::ReplyMarkup::ReplyInlineMarkup(inline) = markup else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    for tl::enums::KeyboardButtonRow::Row(row) in &inline.rows {
+        let mut buttons = Vec::new();
+        for btn in &row.buttons {
+            let mapped = match btn {
+                tl::enums::KeyboardButton::Callback(b) => protocol::InlineButton {
+                    label: b.text.clone(),
+                    kind: protocol::InlineButtonKind::Callback {
+                        data: hex_encode(&b.data),
+                        requires_password: b.requires_password,
+                    },
+                },
+                tl::enums::KeyboardButton::Url(b) => protocol::InlineButton {
+                    label: b.text.clone(),
+                    kind: protocol::InlineButtonKind::Url { url: b.url.clone() },
+                },
+                tl::enums::KeyboardButton::Copy(b) => protocol::InlineButton {
+                    label: b.text.clone(),
+                    kind: protocol::InlineButtonKind::Copy { text: b.copy_text.clone() },
+                },
+                tl::enums::KeyboardButton::SwitchInline(b) => protocol::InlineButton {
+                    label: b.text.clone(),
+                    kind: protocol::InlineButtonKind::SwitchInline {
+                        query: b.query.clone(),
+                        same_peer: b.same_peer,
+                    },
+                },
+                tl::enums::KeyboardButton::WebView(b) => protocol::InlineButton {
+                    label: b.text.clone(),
+                    kind: protocol::InlineButtonKind::Url { url: b.url.clone() },
+                },
+                tl::enums::KeyboardButton::SimpleWebView(b) => protocol::InlineButton {
+                    label: b.text.clone(),
+                    kind: protocol::InlineButtonKind::Url { url: b.url.clone() },
+                },
+                tl::enums::KeyboardButton::UrlAuth(b) => protocol::InlineButton {
+                    label: b.text.clone(),
+                    kind: protocol::InlineButtonKind::Url { url: b.url.clone() },
+                },
+                tl::enums::KeyboardButton::Button(b) => protocol::InlineButton {
+                    label: b.text.clone(),
+                    kind: protocol::InlineButtonKind::Unsupported,
+                },
+                tl::enums::KeyboardButton::Buy(b) => protocol::InlineButton {
+                    label: b.text.clone(),
+                    kind: protocol::InlineButtonKind::Unsupported,
+                },
+                tl::enums::KeyboardButton::Game(b) => protocol::InlineButton {
+                    label: b.text.clone(),
+                    kind: protocol::InlineButtonKind::Unsupported,
+                },
+                tl::enums::KeyboardButton::UserProfile(b) => protocol::InlineButton {
+                    label: b.text.clone(),
+                    kind: protocol::InlineButtonKind::Unsupported,
+                },
+                tl::enums::KeyboardButton::RequestPhone(b) => protocol::InlineButton {
+                    label: b.text.clone(),
+                    kind: protocol::InlineButtonKind::Unsupported,
+                },
+                tl::enums::KeyboardButton::RequestGeoLocation(b) => protocol::InlineButton {
+                    label: b.text.clone(),
+                    kind: protocol::InlineButtonKind::Unsupported,
+                },
+                tl::enums::KeyboardButton::RequestPoll(b) => protocol::InlineButton {
+                    label: b.text.clone(),
+                    kind: protocol::InlineButtonKind::Unsupported,
+                },
+                tl::enums::KeyboardButton::RequestPeer(b) => protocol::InlineButton {
+                    label: b.text.clone(),
+                    kind: protocol::InlineButtonKind::Unsupported,
+                },
+                tl::enums::KeyboardButton::InputKeyboardButtonUrlAuth(b) => protocol::InlineButton {
+                    label: b.text.clone(),
+                    kind: protocol::InlineButtonKind::Url { url: b.url.clone() },
+                },
+                tl::enums::KeyboardButton::InputKeyboardButtonUserProfile(b) => protocol::InlineButton {
+                    label: b.text.clone(),
+                    kind: protocol::InlineButtonKind::Unsupported,
+                },
+                tl::enums::KeyboardButton::InputKeyboardButtonRequestPeer(b) => protocol::InlineButton {
+                    label: b.text.clone(),
+                    kind: protocol::InlineButtonKind::Unsupported,
+                },
+            };
+            buttons.push(mapped);
+        }
+        if !buttons.is_empty() {
+            rows.push(buttons);
+        }
+    }
+    rows
+}
+
 /// One message as the contract has it. `None` for an empty one (a deleted id in a list).
 pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
     match raw {
@@ -2019,6 +2137,7 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
             message.pinned = raw.pinned;
             message.mentions_me = raw.mentioned;
             message.reactions = raw.reactions.as_ref().map(reactions).unwrap_or_default();
+            message.buttons = raw.reply_markup.as_ref().map(inline_buttons).unwrap_or_default();
             // A channel post's comment section rides the post: the count alone comes with it,
             // the linked group named on the wire but not used here. The comments are read
             // under the post's own id (`messages.getReplies`, which takes the channel and

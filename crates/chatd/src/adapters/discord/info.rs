@@ -522,16 +522,10 @@ impl Discord {
     /// Sets a conversation's notifications as Discord's own menu does: one settings change for
     /// its server (`@me` for direct and group conversations). Discord answers with the server's
     /// settings whole, which are applied as if they came from the gateway.
-    pub(super) fn set_mute(&self, channel: &str, notify: Notify) -> Result<(), Refusal> {
+    pub(super) fn set_mute(&self, channel: &str, notify: Notify, until: Option<i64>) -> Result<(), Refusal> {
         let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
         let guild = self.guild_of(&known);
-        let mut setting = match notify {
-            Notify::All => json!({"muted": false, "message_notifications": 0}),
-            Notify::Mentions => json!({"muted": false, "message_notifications": 1}),
-            Notify::Nothing => json!({"muted": true}),
-        };
-        setting["mute_config"] = json!({"end_time": null, "selected_time_window": -1});
-        let body = json!({"channel_overrides": {channel: setting}});
+        let body = mute_override_body(channel, notify, until, now());
         let path = format!("/users/@me/guilds/{}/settings", guild.as_deref().unwrap_or("@me"));
         let answer = self.call("PATCH", &path, Some(body)).map_err(refusal)?;
         match serde_json::from_str::<GuildSettings>(&answer) {
@@ -897,5 +891,240 @@ mod tests {
         let sf = model::snowflake_from_unix(ts);
         assert_eq!(model::seconds(&sf.to_string()), ts);
         assert_eq!(model::snowflake_from_unix(0), 0);
+    }
+
+    /// Kicks, bans, times out, untimes out, or renames a guild member, gated by
+    /// computed guild permissions and role hierarchy.
+    pub(super) fn moderate(
+        &self,
+        guild: &str,
+        target: &str,
+        action: protocol::ModerateAction,
+        reason: &str,
+    ) -> Result<(), Refusal> {
+        let me = self.me();
+        {
+            let state = crate::hub::lock(&self.state);
+            let info = state.guilds.get(guild).ok_or_else(|| refused("This server is gone."))?;
+            info.can_moderate(guild, &me, target, &action).map_err(refused)?;
+        }
+        let (method, path, body) = moderate_request(guild, target, &action);
+        if reason.trim().is_empty() {
+            self.call(method, &path, body).map_err(refusal)?;
+        } else {
+            let encoded = encode_audit_reason(reason.trim());
+            self.rest
+                .call_with(method, &path, body, &[("X-Audit-Log-Reason", &encoded)])
+                .map_err(refusal)?;
+        }
+        Ok(())
+    }
+
+    /// Lifts a ban on `target` in `guild`, gated by `BAN_MEMBERS`.
+    pub(super) fn unban(&self, guild: &str, target: &str, reason: &str) -> Result<(), Refusal> {
+        {
+            let state = crate::hub::lock(&self.state);
+            let info = state.guilds.get(guild).ok_or_else(|| refused("This server is gone."))?;
+            if info.guild_permissions(guild) & model::BAN_MEMBERS == 0 {
+                return Err(refused("You don't have permission to unban members."));
+            }
+        }
+        let path = format!("/guilds/{guild}/bans/{target}");
+        if reason.trim().is_empty() {
+            self.call("DELETE", &path, None).map_err(refusal)?;
+        } else {
+            let encoded = encode_audit_reason(reason.trim());
+            self.rest
+                .call_with("DELETE", &path, None, &[("X-Audit-Log-Reason", &encoded)])
+                .map_err(refusal)?;
+        }
+        Ok(())
+    }
+}
+
+/// Builds the `PATCH /users/@me/guilds/{guild}/settings` body for a timed or endless channel mute.
+pub(super) fn mute_override_body(
+    channel: &str,
+    notify: Notify,
+    until: Option<i64>,
+    now_secs: i64,
+) -> serde_json::Value {
+    let mut setting = match notify {
+        Notify::All => json!({"muted": false, "message_notifications": 0}),
+        Notify::Mentions => json!({"muted": false, "message_notifications": 1}),
+        Notify::Nothing => json!({"muted": true}),
+    };
+    setting["mute_config"] = match (notify, until) {
+        (Notify::Nothing, Some(end)) if end > now_secs => {
+            let window = (end - now_secs).max(1);
+            json!({"end_time": model::iso_timestamp(end), "selected_time_window": window})
+        }
+        _ => json!({"end_time": null, "selected_time_window": -1}),
+    };
+    json!({"channel_overrides": {channel: setting}})
+}
+
+/// Builds the `(method, path, body)` for a Discord member moderation REST request.
+pub(super) fn moderate_request(
+    guild: &str,
+    target: &str,
+    action: &protocol::ModerateAction,
+) -> (&'static str, String, Option<serde_json::Value>) {
+    match action {
+        protocol::ModerateAction::Kick => ("DELETE", format!("/guilds/{guild}/members/{target}"), None),
+        protocol::ModerateAction::Ban { delete_seconds } => (
+            "PUT",
+            format!("/guilds/{guild}/bans/{target}"),
+            Some(json!({"delete_message_seconds": (*delete_seconds).min(604_800)})),
+        ),
+        protocol::ModerateAction::Timeout { until } => (
+            "PATCH",
+            format!("/guilds/{guild}/members/{target}"),
+            Some(json!({"communication_disabled_until": model::iso_timestamp(*until)})),
+        ),
+        protocol::ModerateAction::Untimeout => (
+            "PATCH",
+            format!("/guilds/{guild}/members/{target}"),
+            Some(json!({"communication_disabled_until": serde_json::Value::Null})),
+        ),
+        protocol::ModerateAction::Nick { nick } => (
+            "PATCH",
+            format!("/guilds/{guild}/members/{target}"),
+            Some(json!({"nick": if nick.is_empty() { serde_json::Value::Null } else { json!(nick) }})),
+        ),
+    }
+}
+
+/// Percent-encodes `X-Audit-Log-Reason` as Discord expects.
+pub(super) fn encode_audit_reason(reason: &str) -> String {
+    let mut out = String::with_capacity(reason.len());
+    for byte in reason.bytes().take(512) {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod moderation_tests {
+    use super::*;
+    use crate::adapters::discord::{GuildInfo, RoleInfo};
+    use protocol::ModerateAction;
+
+    #[test]
+    fn moderate_request_builds_expected_routes_and_bodies() {
+        let (m, p, b) = moderate_request("4000", "2001", &ModerateAction::Kick);
+        assert_eq!((m, p.as_str(), b), ("DELETE", "/guilds/4000/members/2001", None));
+
+        let (m, p, b) = moderate_request("4000", "2001", &ModerateAction::Ban { delete_seconds: 86_400 });
+        assert_eq!(m, "PUT");
+        assert_eq!(p, "/guilds/4000/bans/2001");
+        assert_eq!(b.unwrap()["delete_message_seconds"], 86_400);
+
+        let (m, p, b) = moderate_request("4000", "2001", &ModerateAction::Timeout { until: 1_700_000_000 });
+        assert_eq!(m, "PATCH");
+        assert_eq!(p, "/guilds/4000/members/2001");
+        assert_eq!(b.unwrap()["communication_disabled_until"], "2023-11-14T22:13:20Z");
+
+        let (m, p, b) = moderate_request("4000", "2001", &ModerateAction::Untimeout);
+        assert_eq!(m, "PATCH");
+        assert_eq!(p, "/guilds/4000/members/2001");
+        assert!(b.unwrap()["communication_disabled_until"].is_null());
+
+        let (m, p, b) = moderate_request("4000", "2001", &ModerateAction::Nick { nick: "NewName".into() });
+        assert_eq!(m, "PATCH");
+        assert_eq!(p, "/guilds/4000/members/2001");
+        assert_eq!(b.unwrap()["nick"], "NewName");
+
+        assert_eq!(encode_audit_reason("Spam link!"), "Spam%20link%21");
+    }
+
+    #[test]
+    fn can_moderate_enforces_permissions_owner_and_role_hierarchy() {
+        let mut guild = GuildInfo::default();
+        guild.owner_id = "999".into();
+        guild.roles.insert(
+            10,
+            RoleInfo {
+                name: "Mod".into(),
+                permissions: model::KICK_MEMBERS | model::MODERATE_MEMBERS | model::MANAGE_NICKNAMES,
+                position: 5,
+                ..RoleInfo::default()
+            },
+        );
+        guild.roles.insert(
+            20,
+            RoleInfo {
+                name: "Admin".into(),
+                permissions: model::BAN_MEMBERS,
+                position: 10,
+                ..RoleInfo::default()
+            },
+        );
+        guild.roles.insert(
+            5,
+            RoleInfo {
+                name: "Member".into(),
+                permissions: 0,
+                position: 1,
+                ..RoleInfo::default()
+            },
+        );
+        guild.my_roles = vec![10];
+        guild.set_member_roles("low_user", vec![5]);
+        guild.set_member_roles("high_user", vec![20]);
+
+        // Allowed: kick/timeout/nick on lower role
+        assert!(guild.can_moderate("4000", "me", "low_user", &ModerateAction::Kick).is_ok());
+        assert!(guild.can_moderate("4000", "me", "low_user", &ModerateAction::Timeout { until: 100 }).is_ok());
+        assert!(guild.can_moderate("4000", "me", "low_user", &ModerateAction::Nick { nick: "Bob".into() }).is_ok());
+        // Denied: missing BAN_MEMBERS
+        assert!(guild.can_moderate("4000", "me", "low_user", &ModerateAction::Ban { delete_seconds: 0 }).is_err());
+        // Denied: higher role target
+        assert!(guild.can_moderate("4000", "me", "high_user", &ModerateAction::Kick).is_err());
+        // Denied: guild owner
+        assert!(guild.can_moderate("4000", "me", "999", &ModerateAction::Kick).is_err());
+        // Denied: self
+        assert!(guild.can_moderate("4000", "me", "me", &ModerateAction::Kick).is_err());
+    }
+
+    #[test]
+    fn timed_mute_builds_mute_config_and_expires_on_read() {
+        let now_secs = 1_700_000_000_i64;
+        let one_hour = now_secs + 3_600;
+        let body = mute_override_body("4101", Notify::Nothing, Some(one_hour), now_secs);
+        let entry = &body["channel_overrides"]["4101"];
+        assert_eq!(entry["muted"], true);
+        assert_eq!(entry["mute_config"]["selected_time_window"], 3_600);
+        assert_eq!(entry["mute_config"]["end_time"], "2023-11-14T23:13:20Z");
+
+        let endless = mute_override_body("4101", Notify::Nothing, None, now_secs);
+        assert_eq!(endless["channel_overrides"]["4101"]["mute_config"]["selected_time_window"], -1);
+        assert!(endless["channel_overrides"]["4101"]["mute_config"]["end_time"].is_null());
+
+        let unmute = mute_override_body("4101", Notify::All, Some(one_hour), now_secs);
+        assert_eq!(unmute["channel_overrides"]["4101"]["muted"], false);
+        assert_eq!(unmute["channel_overrides"]["4101"]["mute_config"]["selected_time_window"], -1);
+
+        // Reading back a timed mute from GuildSettings unmutes once `end_time` passes.
+        let settings: GuildSettings = serde_json::from_value(json!({
+            "guild_id": "4000",
+            "channel_overrides": [{
+                "channel_id": "4101",
+                "muted": true,
+                "mute_config": {
+                    "end_time": "2023-11-14T23:13:20Z",
+                    "selected_time_window": 3600
+                }
+            }]
+        }))
+        .unwrap();
+        let parsed = super::super::ready::quiet(&settings);
+        assert!(parsed.mutes("4101", None, one_hour - 1), "still muted before end_time");
+        assert!(!parsed.mutes("4101", None, one_hour), "unmuted at end_time");
+        assert!(!parsed.mutes("4101", None, one_hour + 60), "unmuted after end_time");
     }
 }

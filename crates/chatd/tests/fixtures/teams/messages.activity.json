@@ -45,7 +45,55 @@
    "composetime": "2025-10-09T09:05:00.0000000Z",
    "originalarrivaltime": "2025-10-09T09:05:00.0000000Z",
    "properties": {
-    "activity": "{\"activityType\": \"reaction\", \"sourceThreadId\": \"19:grp1@thread.v2\", \"sourceMessageId\": 1759600000001, \"sourceUserId\": \"8:orgid:00000000-0000-4000-8000-0000000000b2\"}"
+    "activity": "{\"activityType\": \"reaction\", \"reactionKey\": \"like\", \"messagePreview\": \"Shipped the fix\", \"sourceThreadId\": \"19:grp1@thread.v2\", \"sourceMessageId\": 1759600000001, \"sourceUserId\": \"8:orgid:00000000-0000-4000-8000-0000000000b2\", \"sourceUserImDisplayName\": \"Ben Okafor\"}"
+   }
+  },
+  {
+   "id": "1760000900004",
+   "type": "Message",
+   "messagetype": "Text",
+   "contenttype": "text",
+   "content": "",
+   "conversationid": "48:notifications",
+   "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/48:notifications",
+   "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000a1",
+   "imdisplayname": "Ana Ruiz",
+   "composetime": "2025-10-09T09:06:00.0000000Z",
+   "originalarrivaltime": "2025-10-09T09:06:00.0000000Z",
+   "properties": {
+    "activity": "{\"activityType\": \"reply\", \"messagePreview\": \"Looks good to me\", \"sourceThreadId\": \"19:platform0general@thread.tacv2\", \"sourceReplyChainId\": \"1760000200200\", \"sourceMessageId\": 1760000210210, \"sourceUserId\": \"8:orgid:00000000-0000-4000-8000-0000000000a1\", \"sourceUserImDisplayName\": \"Ana Ruiz\"}"
+   }
+  },
+  {
+   "id": "1760000900005",
+   "type": "Message",
+   "messagetype": "Text",
+   "contenttype": "text",
+   "content": "",
+   "conversationid": "48:notifications",
+   "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/48:notifications",
+   "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000a1",
+   "imdisplayname": "Ana Ruiz",
+   "composetime": "2025-10-09T09:07:00.0000000Z",
+   "originalarrivaltime": "2025-10-09T09:07:00.0000000Z",
+   "properties": {
+    "activity": "{\"activityType\": \"missedCall\", \"messagePreview\": \"Missed call\", \"sourceThreadId\": \"19:00000000-0000-4000-8000-0000000000a1_00000000-0000-4000-8000-0000000000aa@unq.gbl.spaces\", \"sourceMessageId\": 1760000800001, \"sourceUserId\": \"8:orgid:00000000-0000-4000-8000-0000000000a1\", \"sourceUserImDisplayName\": \"Ana Ruiz\"}"
+   }
+  },
+  {
+   "id": "1760000900006",
+   "type": "Message",
+   "messagetype": "Text",
+   "contenttype": "text",
+   "content": "",
+   "conversationid": "48:notifications",
+   "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/48:notifications",
+   "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000b2",
+   "imdisplayname": "Ben Okafor",
+   "composetime": "2025-10-09T09:08:00.0000000Z",
+   "originalarrivaltime": "2025-10-09T09:08:00.0000000Z",
+   "properties": {
+    "activity": "{\"activityType\": \"addedToTeam\", \"messagePreview\": \"Added you to Design\", \"sourceThreadId\": \"19:design0general@thread.tacv2\", \"sourceMessageId\": 1760000800002, \"sourceUserId\": \"8:orgid:00000000-0000-4000-8000-0000000000b2\", \"sourceUserImDisplayName\": \"Ben Okafor\"}"
    }
   }
  ],

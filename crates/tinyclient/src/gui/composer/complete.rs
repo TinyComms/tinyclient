@@ -193,6 +193,7 @@ mod tests {
             status: String::new(),
             link: String::new(),
             emoji: String::new(), activity: None, title: String::new(), utc_offset: None, mark: None,
+            role_color: None, role_icon: None, role_emoji: None,
         }
     }
 
@@ -237,6 +238,7 @@ mod tests {
             peer: None,
             unread: 0,
             mentions: 0,
+            unread_reactions: 0,
             muted: false,
             starred: false,
             preview: String::new(),
@@ -248,6 +250,7 @@ mod tests {
             limit: 0,
             read_only: false,
             private: false,
+            shared: false,
             encryption: protocol::Encryption::Unknown,
             draft: String::new(),
             folders: Vec::new(), archived: false, pin: None, hidden: false, followed: false, bot: false, meeting: false, special: Default::default(), mark: None, topic_icon: None, opted_out: false, quiet: false, preview_from: String::new(), preview_mine: false, seen: false, delivered: false, sending: false, max_file_bytes: 0, read_only_reason: String::new(), spam: false, rights: Default::default(), disappearing: None, moderate: false, can_pin: false, joined: true, tags: Vec::new(), message_count: 0, total_message_sent: 0, thumbnail: None, reaction: String::new(), owner: String::new(),

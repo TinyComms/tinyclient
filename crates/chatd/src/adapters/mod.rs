@@ -38,6 +38,12 @@ pub fn prove_discord_mark_unread() -> Result<(), String> {
     discord::prove_mark_unread()
 }
 
+/// `TINYCLIENT_PROVE=discord-forward-report`. A forward is a type-1 reference, and a report
+/// uses one captured message-menu path.
+pub fn prove_discord_forward_report() -> Result<(), String> {
+    discord::prove_forward_report()
+}
+
 /// `TINYCLIENT_PROVE=discord-voice-move`. A move to another voice channel in the same server is followed.
 pub fn prove_discord_voice_move() -> Result<(), String> {
     discord::prove_voice_move()
@@ -306,6 +312,8 @@ pub enum Command {
     HistoryAround { conversation_id: String, around: String },
     /// The user opened a Space: bring its tree up to date if the network needs asking.
     OpenSpace(String),
+    /// The user collapsed or expanded a Space group (Discord category sync).
+    Collapse { space_id: String, group_id: String, collapsed: bool },
     /// Tell the network the conversation has been read up to this message.
     MarkRead { conversation_id: String, message_id: String },
     /// Tell the network the marker moved back. `message_id` is the last message that still
@@ -503,6 +511,12 @@ pub enum Command {
         item_id: Option<String>,
         reply: Reply<()>,
     },
+    /// Members who have read a given message (`Request::ReadBy`).
+    ReadBy {
+        conversation_id: String,
+        message_id: String,
+        reply: Reply<Vec<protocol::ReadBy>>,
+    },
     /// Add a bookmark to a channel.
     BookmarkAdd {
         conversation_id: String,
@@ -581,6 +595,21 @@ pub enum Command {
         space_id: String,
         event_id: String,
         interested: bool,
+        reply: Reply<()>,
+    },
+    /// Moderate a member in a Space (kick, ban, timeout, untimeout, nickname).
+    Moderate {
+        space_id: String,
+        person_id: String,
+        action: protocol::ModerateAction,
+        reason: String,
+        reply: Reply<()>,
+    },
+    /// Lift a member ban in a Space.
+    Unban {
+        space_id: String,
+        person_id: String,
+        reason: String,
         reply: Reply<()>,
     },
     /// Set the network's notification setting. `until` is when a mute ends, as Unix seconds.
@@ -688,6 +717,61 @@ pub enum Command {
         element_type: String,
         value: String,
         values: Vec<String>,
+        reply: Reply<()>,
+    },
+    /// Presses an inline callback button under a bot message (Telegram `messages.getBotCallbackAnswer`).
+    PressButton {
+        conversation_id: String,
+        message_id: String,
+        data: String,
+        reply: Reply<protocol::ButtonAnswer>,
+    },
+    /// Reads account-wide notification defaults and per-chat exceptions.
+    GetNotifyDefaults {
+        reply: Reply<protocol::NotifyDefaults>,
+    },
+    /// Updates an account-wide notification default for private chats, groups, or channels.
+    SetNotifyDefault {
+        scope: protocol::NotifyDefaultScope,
+        muted: bool,
+        reply: Reply<protocol::NotifyDefaults>,
+    },
+    /// Resets all account-wide notification defaults and exceptions.
+    ResetNotifyDefaults {
+        reply: Reply<protocol::NotifyDefaults>,
+    },
+    /// Lists Saved Messages grouped by source peer plus reaction tags (Telegram).
+    SavedDialogs {
+        reply: Reply<(Vec<protocol::SavedDialog>, Vec<protocol::SavedTag>)>,
+    },
+    /// Fetches Saved Messages filtered by source peer and/or reaction tag (Telegram).
+    SavedHistory {
+        peer_id: Option<String>,
+        tag: Option<String>,
+        limit: u32,
+        reply: Reply<Vec<protocol::Message>>,
+    },
+    /// Lists active signed-in devices/sessions for this account.
+    ActiveSessions {
+        reply: Reply<Vec<protocol::ActiveSession>>,
+    },
+    /// Terminates another active session by id.
+    EndSession {
+        session_id: String,
+        reply: Reply<()>,
+    },
+    /// Fetches unread mention or reaction message IDs in a conversation.
+    UnreadItems {
+        conversation_id: String,
+        kind: protocol::UnreadItemKind,
+        limit: u32,
+        reply: Reply<Vec<String>>,
+    },
+    /// Marks unread mentions or reactions read in a conversation.
+    MarkUnreadItemsRead {
+        conversation_id: String,
+        kind: protocol::UnreadItemKind,
+        message_ids: Vec<String>,
         reply: Reply<()>,
     },
     /// Forwards one or more messages to target conversations on the same account.
@@ -907,6 +991,8 @@ impl Command {
             Command::EventPreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::EventInterest { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetMute { reply, .. }
+            | Command::Moderate { reply, .. }
+            | Command::Unban { reply, .. }
             | Command::SetDisappearing { reply, .. }
             | Command::Leave { reply, .. }
             | Command::LeaveSpace { reply, .. }
@@ -926,6 +1012,16 @@ impl Command {
             Command::Pinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Pin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MessageAction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::PressButton { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetNotifyDefaults { reply }
+            | Command::SetNotifyDefault { reply, .. }
+            | Command::ResetNotifyDefaults { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SavedDialogs { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SavedHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ActiveSessions { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::EndSession { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::UnreadItems { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MarkUnreadItemsRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Forward { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SaveGif { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -936,6 +1032,7 @@ impl Command {
             Command::Catalog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityFeed { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityMarkRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ReadBy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BookmarkAdd { reply, .. }
             | Command::BookmarkEdit { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BookmarkRemove { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1127,6 +1224,15 @@ impl Context {
         Ok(())
     }
 
+    /// Updates a group's collapsed state from the network (e.g. Discord category settings).
+    pub fn set_collapsed(&self, space_id: &str, group_id: &str, collapsed: bool) -> Stores {
+        let space = self.key(space_id);
+        if self.hub.store().set_collapsed(&space, group_id, collapsed)? {
+            self.hub.changed(Change::Tree { space });
+        }
+        Ok(())
+    }
+
     /// A group was removed. Its conversations stay, under no group, until the network moves them.
     pub fn group_gone(&self, space_id: &str, group_id: &str) -> Stores {
         let space = self.key(space_id);
@@ -1175,6 +1281,23 @@ impl Context {
     ) -> Stores {
         let conversation = self.key(conversation_id);
         if self.hub.store().set_counts(&conversation, unread, mentions, last_read, updated)? {
+            self.hub.changed(Change::Conversation { conversation });
+            self.hub.changed(Change::Status);
+        }
+        Ok(())
+    }
+
+    pub fn unread_reactions(&self, conversation_id: &str, count: u32) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().set_unread_reactions(&conversation, count)? {
+            self.hub.changed(Change::Conversation { conversation });
+        }
+        Ok(())
+    }
+
+    pub fn mentions_count(&self, conversation_id: &str, count: u32) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().set_mentions_count(&conversation, count)? {
             self.hub.changed(Change::Conversation { conversation });
             self.hub.changed(Change::Status);
         }

@@ -760,7 +760,7 @@ impl Shell {
     }
 
     pub(super) fn mark_all_read(&mut self, cx: &mut Context<Self>) {
-        let request = Request::MarkAllRead { network: None, space: None };
+        let request = Request::MarkAllRead { network: None, space: None, folder: None };
         self.off_thread(cx, move || ask(&request), |this, answer, cx| {
             match answer {
                 Ok(Response::Ok) => {
@@ -782,7 +782,26 @@ impl Shell {
     /// Everything with a badge in one Space is read, here and where the network keeps a read
     /// state. Direct messages and other Spaces are left alone.
     pub(super) fn mark_space_read(&mut self, space: Key, cx: &mut Context<Self>) {
-        let request = Request::MarkAllRead { network: Some(space.network), space: Some(space) };
+        let request = Request::MarkAllRead { network: Some(space.network), space: Some(space), folder: None };
+        self.off_thread(cx, move || ask(&request), |this, answer, cx| {
+            match answer {
+                Ok(Response::Ok) => {
+                    this.sidebar_state.muted_news.clear();
+                    this.sidebar_state.muted_open = false;
+                    this.toast(Some(("icons/check.svg", theme::text_soft())), "Marked as read", cx);
+                }
+                Ok(Response::Error { detail, .. }) => this.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx),
+                Err(err) => this.toast(Some(("icons/circle-alert.svg", theme::danger())), crate::client::trouble_words("inbox", &err), cx),
+                _ => {}
+            }
+            let pages = this.sidebar_state.inbox.stale();
+            this.load_inbox(pages, cx);
+        });
+    }
+
+    /// Everything with a badge in one folder (e.g. a Discord server folder) is read.
+    pub(super) fn mark_folder_read(&mut self, folder: Key, cx: &mut Context<Self>) {
+        let request = Request::MarkAllRead { network: Some(folder.network), space: None, folder: Some(folder) };
         self.off_thread(cx, move || ask(&request), |this, answer, cx| {
             match answer {
                 Ok(Response::Ok) => {

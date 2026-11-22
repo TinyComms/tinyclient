@@ -982,6 +982,430 @@ pub(super) fn report(
     }
 }
 
+/// Press an inline callback button under a bot message (`messages.getBotCallbackAnswer`).
+pub(super) fn press_button(
+    account: &Account,
+    conversation_id: &str,
+    message_id: &str,
+    data_hex: &str,
+) -> Result<protocol::ButtonAnswer, Fault> {
+    let (who, _) = Who::parse(conversation_id).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    let msg_id: i32 = message_id.parse().map_err(|_| invalid("MESSAGE_ID_INVALID"))?;
+    let bytes = super::content::hex_decode(data_hex).ok_or_else(|| invalid("DATA_INVALID"))?;
+    let peer = account.input(who)?;
+    let tl::enums::messages::BotCallbackAnswer::Answer(ans) = account.ask(
+        &tl::functions::messages::GetBotCallbackAnswer {
+            game: false,
+            peer,
+            msg_id,
+            data: Some(bytes),
+            password: None,
+        },
+    )?;
+    Ok(protocol::ButtonAnswer {
+        message: ans.message,
+        alert: ans.alert,
+        url: ans.url,
+    })
+}
+
+/// Read account-wide notification defaults (`account.getNotifySettings`) and per-chat exceptions
+/// (`account.getNotifyExceptions`).
+pub(super) fn get_notify_defaults(account: &Account) -> Result<protocol::NotifyDefaults, Fault> {
+    let kinds = [
+        tl::enums::InputNotifyPeer::InputNotifyUsers,
+        tl::enums::InputNotifyPeer::InputNotifyChats,
+        tl::enums::InputNotifyPeer::InputNotifyBroadcasts,
+    ];
+    let mut muted = [false; 3];
+    for (index, peer) in kinds.into_iter().enumerate() {
+        let tl::enums::PeerNotifySettings::Settings(settings) =
+            account.ask(&tl::functions::account::GetNotifySettings { peer })?;
+        muted[index] = settings.mute_until.is_some_and(super::filing::mute_holds);
+        account.live().muted[index] = muted[index];
+    }
+    let mut exceptions = Vec::new();
+    if let Ok(updates) = account.ask(&tl::functions::account::GetNotifyExceptions {
+        compare_sound: false,
+        compare_stories: false,
+        peer: None,
+    }) {
+        let list = match updates {
+            tl::enums::Updates::Updates(u) => {
+                account.learn(&u.users, &u.chats);
+                u.updates
+            }
+            tl::enums::Updates::Combined(u) => {
+                account.learn(&u.users, &u.chats);
+                u.updates
+            }
+            tl::enums::Updates::UpdateShort(u) => vec![u.update],
+            _ => Vec::new(),
+        };
+        let dir = account.dir();
+        let acc_key = protocol::AccountKey {
+            network: protocol::Network::Telegram,
+            account: account.me.to_string(),
+        };
+        for upd in list {
+            if let tl::enums::Update::NotifySettings(ns) = upd {
+                if let tl::enums::NotifyPeer::Peer(p) = ns.peer {
+                    let who = Who::of(&p.peer);
+                    let tl::enums::PeerNotifySettings::Settings(s) = ns.notify_settings;
+                    let is_muted = s.mute_until.is_some_and(super::filing::mute_holds);
+                    exceptions.push(protocol::NotifyException {
+                        conversation: protocol::Key::new(&acc_key, who.text()),
+                        title: dir.name(who),
+                        muted: is_muted,
+                    });
+                }
+            }
+        }
+    }
+    Ok(protocol::NotifyDefaults {
+        users_muted: muted[0],
+        groups_muted: muted[1],
+        channels_muted: muted[2],
+        exceptions,
+    })
+}
+
+/// Update one account-wide notification default scope (`account.updateNotifySettings`) and
+/// refresh unset dialogs so they reflect the new default immediately.
+pub(super) fn set_notify_default(
+    account: &std::sync::Arc<Account>,
+    scope: protocol::NotifyDefaultScope,
+    muted: bool,
+) -> Result<protocol::NotifyDefaults, Fault> {
+    let (index, peer) = match scope {
+        protocol::NotifyDefaultScope::Users => (0, tl::enums::InputNotifyPeer::InputNotifyUsers),
+        protocol::NotifyDefaultScope::Groups => (1, tl::enums::InputNotifyPeer::InputNotifyChats),
+        protocol::NotifyDefaultScope::Channels => (2, tl::enums::InputNotifyPeer::InputNotifyBroadcasts),
+    };
+    let settings = tl::types::InputPeerNotifySettings {
+        show_previews: None,
+        silent: None,
+        mute_until: Some(if muted { i32::MAX } else { 0 }),
+        sound: None,
+        stories_muted: None,
+        stories_hide_sender: None,
+        stories_sound: None,
+    };
+    account.ask(&tl::functions::account::UpdateNotifySettings { peer, settings: settings.into() })?;
+    account.live().muted[index] = muted;
+    let _ = sync::dialogs(account);
+    get_notify_defaults(account)
+}
+
+/// Reset all account-wide notification defaults and exceptions (`account.resetNotifySettings`).
+pub(super) fn reset_notify_defaults(account: &std::sync::Arc<Account>) -> Result<protocol::NotifyDefaults, Fault> {
+    account.ask(&tl::functions::account::ResetNotifySettings {})?;
+    account.live().muted = [false; 3];
+    let _ = sync::dialogs(account);
+    get_notify_defaults(account)
+}
+
+/// List Saved Messages sub-dialogs (`messages.getSavedDialogs`) and reaction tags
+/// (`messages.getSavedReactionTags`).
+pub(super) fn saved_dialogs(account: &Account) -> Result<(Vec<protocol::SavedDialog>, Vec<protocol::SavedTag>), Fault> {
+    let raw = account.ask(&tl::functions::messages::GetSavedDialogs {
+        exclude_pinned: false,
+        parent_peer: None,
+        offset_date: 0,
+        offset_id: 0,
+        offset_peer: tl::enums::InputPeer::Empty,
+        limit: 100,
+        hash: 0,
+    })?;
+    let (dialogs_raw, messages_raw) = match raw {
+        tl::enums::messages::SavedDialogs::Dialogs(d) => {
+            account.learn(&d.users, &d.chats);
+            (d.dialogs, d.messages)
+        }
+        tl::enums::messages::SavedDialogs::Slice(d) => {
+            account.learn(&d.users, &d.chats);
+            (d.dialogs, d.messages)
+        }
+        tl::enums::messages::SavedDialogs::NotModified(_) => (Vec::new(), Vec::new()),
+    };
+    let mut top_by_id: std::collections::HashMap<i32, (String, i64)> = std::collections::HashMap::new();
+    for msg in &messages_raw {
+        if let tl::enums::Message::Message(m) = msg {
+            top_by_id.insert(m.id, (m.message.clone(), i64::from(m.date)));
+        }
+    }
+    let dir = account.dir();
+    let mut dialogs = Vec::new();
+    for item in dialogs_raw {
+        if let tl::enums::SavedDialog::Dialog(d) = item {
+            let who = Who::of(&d.peer);
+            let title = if who == Who::User(account.me) {
+                "My Notes".to_owned()
+            } else {
+                dir.name(who)
+            };
+            let (preview, updated) = top_by_id.get(&d.top_message).cloned().unwrap_or_default();
+            dialogs.push(protocol::SavedDialog {
+                peer_id: who.text(),
+                title,
+                pinned: d.pinned,
+                preview,
+                updated,
+            });
+        }
+    }
+    let mut tags = Vec::new();
+    if let Ok(tl::enums::messages::SavedReactionTags::Tags(found)) = account.ask(
+        &tl::functions::messages::GetSavedReactionTags { peer: None, hash: 0 },
+    ) {
+        for tl::enums::SavedReactionTag::Tag(t) in found.tags {
+            let emoji = match t.reaction {
+                tl::enums::Reaction::Emoji(e) => e.emoticon,
+                tl::enums::Reaction::CustomEmoji(c) => format!("custom:{}", c.document_id),
+                tl::enums::Reaction::Paid => "⭐".to_owned(),
+                tl::enums::Reaction::Empty => continue,
+            };
+            tags.push(protocol::SavedTag {
+                emoji,
+                title: t.title.unwrap_or_default(),
+                count: t.count.max(0) as u32,
+            });
+        }
+    }
+    Ok((dialogs, tags))
+}
+
+/// Fetch Saved Messages filtered by source peer (`messages.getSavedHistory`) and/or reaction tag
+/// (`messages.search` with `saved_reaction`).
+pub(super) fn saved_history(
+    account: &Account,
+    peer_id: Option<&str>,
+    tag: Option<&str>,
+    limit: u32,
+) -> Result<Vec<Message>, Fault> {
+    let limit = (limit.clamp(1, protocol::PAGE_LIMIT)) as i32;
+    let saved_peer = match peer_id.filter(|s| !s.is_empty()) {
+        Some(pid) => {
+            let (who, _) = Who::parse(pid).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+            Some(account.input(who)?)
+        }
+        None => None,
+    };
+    let raw = if let Some(emoji) = tag.filter(|s| !s.is_empty()) {
+        let reaction = if let Some(id_str) = emoji.strip_prefix("custom:") {
+            let doc_id: i64 = id_str.parse().map_err(|_| invalid("REACTION_INVALID"))?;
+            tl::enums::Reaction::CustomEmoji(tl::types::ReactionCustomEmoji { document_id: doc_id })
+        } else {
+            tl::enums::Reaction::Emoji(tl::types::ReactionEmoji { emoticon: emoji.to_owned() })
+        };
+        account.ask(&tl::functions::messages::Search {
+            peer: tl::enums::InputPeer::PeerSelf,
+            q: String::new(),
+            from_id: None,
+            saved_peer_id: saved_peer,
+            saved_reaction: Some(vec![reaction]),
+            top_msg_id: None,
+            filter: tl::enums::MessagesFilter::InputMessagesFilterEmpty,
+            min_date: 0,
+            max_date: 0,
+            offset_id: 0,
+            add_offset: 0,
+            limit,
+            max_id: 0,
+            min_id: 0,
+            hash: 0,
+        })?
+    } else {
+        account.ask(&tl::functions::messages::GetSavedHistory {
+            parent_peer: None,
+            peer: saved_peer.unwrap_or(tl::enums::InputPeer::PeerSelf),
+            offset_id: 0,
+            offset_date: 0,
+            add_offset: 0,
+            limit,
+            max_id: 0,
+            min_id: 0,
+            hash: 0,
+        })?
+    };
+    let messages_raw = match raw {
+        tl::enums::messages::Messages::Messages(m) => {
+            account.learn(&m.users, &m.chats);
+            m.messages
+        }
+        tl::enums::messages::Messages::Slice(m) => {
+            account.learn(&m.users, &m.chats);
+            m.messages
+        }
+        tl::enums::messages::Messages::ChannelMessages(m) => {
+            account.learn(&m.users, &m.chats);
+            m.messages
+        }
+        tl::enums::messages::Messages::NotModified(_) => Vec::new(),
+    };
+    let dir = account.dir();
+    let mut out = Vec::new();
+    for raw_msg in &messages_raw {
+        if let Some(mapped) = super::content::map(&dir, raw_msg) {
+            out.push(mapped.message);
+        }
+    }
+    Ok(out)
+}
+
+/// List active signed-in devices/sessions (`account.getAuthorizations`).
+pub(super) fn active_sessions(account: &Account) -> Result<Vec<protocol::ActiveSession>, Fault> {
+    let tl::enums::account::Authorizations::Authorizations(found) =
+        account.ask(&tl::functions::account::GetAuthorizations {})?;
+    let mut out = Vec::new();
+    for tl::enums::Authorization::Authorization(a) in found.authorizations {
+        let app = format!("{} {}", a.app_name, a.app_version).trim().to_owned();
+        let platform = format!("{} {}", a.platform, a.system_version).trim().to_owned();
+        let location = match (a.region.is_empty(), a.country.is_empty()) {
+            (false, false) => format!("{}, {}", a.region, a.country),
+            (false, true) => a.region,
+            (true, false) => a.country,
+            (true, true) => String::new(),
+        };
+        out.push(protocol::ActiveSession {
+            id: a.hash.to_string(),
+            app,
+            device: a.device_model,
+            platform,
+            location,
+            last_active: i64::from(a.date_active),
+            current: a.current,
+        });
+    }
+    Ok(out)
+}
+
+/// Terminate another active session (`account.resetAuthorization`). Never ends the current session (`hash == 0`).
+pub(super) fn end_session(account: &Account, session_id: &str) -> Result<(), Fault> {
+    let hash: i64 = session_id.trim().parse().map_err(|_| invalid("HASH_INVALID"))?;
+    if hash == 0 {
+        return Err(invalid("CURRENT_SESSION_FORBIDDEN"));
+    }
+    account.ask(&tl::functions::account::ResetAuthorization { hash })?;
+    Ok(())
+}
+
+/// Fetch unread mention or reaction message IDs in a conversation
+/// (`messages.getUnreadMentions` / `messages.getUnreadReactions`).
+pub(super) fn unread_items(
+    account: &Account,
+    conversation_id: &str,
+    kind: protocol::UnreadItemKind,
+    limit: u32,
+) -> Result<Vec<String>, Fault> {
+    let (who, topic) = Who::parse(conversation_id).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    let peer = account.input(who)?;
+    let limit = (limit.clamp(1, protocol::PAGE_LIMIT)) as i32;
+    let raw = match kind {
+        protocol::UnreadItemKind::Mentions => account.ask(&tl::functions::messages::GetUnreadMentions {
+            peer,
+            top_msg_id: topic,
+            offset_id: 0,
+            add_offset: 0,
+            limit,
+            max_id: 0,
+            min_id: 0,
+        })?,
+        protocol::UnreadItemKind::Reactions => account.ask(&tl::functions::messages::GetUnreadReactions {
+            peer,
+            top_msg_id: topic,
+            saved_peer_id: None,
+            offset_id: 0,
+            add_offset: 0,
+            limit,
+            max_id: 0,
+            min_id: 0,
+        })?,
+    };
+    let messages_raw = match raw {
+        tl::enums::messages::Messages::Messages(m) => {
+            account.learn(&m.users, &m.chats);
+            m.messages
+        }
+        tl::enums::messages::Messages::Slice(m) => {
+            account.learn(&m.users, &m.chats);
+            m.messages
+        }
+        tl::enums::messages::Messages::ChannelMessages(m) => {
+            account.learn(&m.users, &m.chats);
+            m.messages
+        }
+        tl::enums::messages::Messages::NotModified(_) => Vec::new(),
+    };
+    let dir = account.dir();
+    let mut ids = Vec::new();
+    let mut mapped_msgs = Vec::new();
+    for raw_msg in &messages_raw {
+        if let Some(mapped) = super::content::map(&dir, raw_msg) {
+            ids.push(mapped.id.to_string());
+            mapped_msgs.push(mapped.message);
+        }
+    }
+    if !mapped_msgs.is_empty() {
+        let _ = account.ctx.history(conversation_id, &mapped_msgs);
+    }
+    Ok(ids)
+}
+
+/// Mark unread mentions or reactions read (`messages.readMessageContents` / `channels.readMessageContents`
+/// / `messages.readMentions` / `messages.readReactions`).
+pub(super) fn mark_unread_items_read(
+    account: &Account,
+    conversation_id: &str,
+    kind: protocol::UnreadItemKind,
+    message_ids: &[String],
+) -> Result<(), Fault> {
+    let (who, topic) = Who::parse(conversation_id).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    match kind {
+        protocol::UnreadItemKind::Mentions => {
+            let parsed_ids: Vec<i32> = message_ids.iter().filter_map(|id| id.parse::<i32>().ok()).collect();
+            if !parsed_ids.is_empty() {
+                let seen = parsed_ids.len() as u32;
+                match who {
+                    Who::Channel(_) => {
+                        let channel = account.input_channel(who)?;
+                        account.ask(&tl::functions::channels::ReadMessageContents { channel, id: parsed_ids })?;
+                    }
+                    _ => {
+                        account.ask(&tl::functions::messages::ReadMessageContents { id: parsed_ids })?;
+                    }
+                }
+                // Seeing one mention tells Telegram about that message. The badge drops by
+                // what was just read; an empty list is the separate "mark all" below.
+                if let Ok(Some(row)) = account.ctx.known(conversation_id) {
+                    let _ = account.ctx.mentions_count(conversation_id, protocol::badge_after_jump(row.mentions, seen));
+                }
+            } else {
+                let peer = account.input(who)?;
+                account.ask(&tl::functions::messages::ReadMentions { peer, top_msg_id: topic })?;
+                let _ = account.ctx.mentions_count(conversation_id, 0);
+            }
+        }
+        protocol::UnreadItemKind::Reactions => {
+            // `messages.readReactions` clears every unread reaction in the chat. A walk
+            // through the list names the one just opened; only an empty list is the clear.
+            if message_ids.is_empty() {
+                let peer = account.input(who)?;
+                account.ask(&tl::functions::messages::ReadReactions {
+                    peer,
+                    top_msg_id: topic,
+                    saved_peer_id: None,
+                })?;
+                let _ = account.ctx.unread_reactions(conversation_id, protocol::badge_after_jump(0, 0));
+            } else if let Ok(Some(row)) = account.ctx.known(conversation_id) {
+                let seen = message_ids.len() as u32;
+                let _ = account.ctx.unread_reactions(conversation_id, protocol::badge_after_jump(row.unread_reactions, seen));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

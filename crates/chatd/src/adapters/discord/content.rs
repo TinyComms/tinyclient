@@ -918,15 +918,21 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
     let kind = posted.kind.unwrap_or(0);
     let link = jump_link(place.guild, &posted.channel_id, &posted.id);
 
-    let forwarded = posted.message_snapshots.first().map(|snapshot| &*snapshot.message);
+    let has_snapshots = !posted.message_snapshots.is_empty();
     let mut message_kind = MessageKind::Normal;
     let mentioned = posted.mentions.first().map_or("", |user| user.name());
     match system_line(kind, &who, content, mentioned) {
         None => {
             markdown(&mut rich, content, place.names);
             // What was forwarded is the message's own text; a forward has none of its own.
-            if let Some(forwarded) = forwarded {
-                markdown(&mut rich, forwarded.content.as_deref().unwrap_or(""), place.names);
+            for snapshot in &posted.message_snapshots {
+                let snap_text = snapshot.message.content.as_deref().unwrap_or("");
+                if !snap_text.is_empty() {
+                    if !rich.text.is_empty() {
+                        rich.text.push('\n');
+                    }
+                    markdown(&mut rich, snap_text, place.names);
+                }
             }
         }
         Some(line) if line.is_empty() => {
@@ -939,16 +945,26 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         }
     }
 
-    let carried = forwarded.unwrap_or(posted);
-    let attached = carried.attachments.as_deref().unwrap_or(&[]);
-    let mut attachments: Vec<Attachment> = attached.iter().map(|attached| attachment(&mut rich, attached)).collect();
-    attachments.extend(carried.sticker_items.iter().map(|item| sticker(&mut rich, item)));
-    let embeds = carried.embeds.as_deref().unwrap_or(&[]);
-    let composed = carried.author.as_ref().is_some_and(|author| author.bot) || carried.webhook_id.is_some();
-    let (card, previews, moving_pictures) = cards(&mut rich, &posted.id, embeds, place.names, composed);
+    let carried: Vec<&Posted> = if has_snapshots {
+        posted.message_snapshots.iter().map(|snapshot| &*snapshot.message).collect()
+    } else {
+        vec![posted]
+    };
+    let mut attachments: Vec<Attachment> = Vec::new();
+    let mut embeds: Vec<model::Embed> = Vec::new();
+    let mut composed = false;
+    for part in &carried {
+        for attached in part.attachments.as_deref().unwrap_or(&[]) {
+            attachments.push(attachment(&mut rich, attached));
+        }
+        attachments.extend(part.sticker_items.iter().map(|item| sticker(&mut rich, item)));
+        embeds.extend(part.embeds.as_deref().unwrap_or(&[]).iter().cloned());
+        composed |= part.author.as_ref().is_some_and(|author| author.bot) || part.webhook_id.is_some();
+    }
+    let (card, previews, moving_pictures) = cards(&mut rich, &posted.id, &embeds, place.names, composed);
     attachments.extend(moving_pictures);
     let reactions = reactions(&mut rich, posted.reactions.as_deref().unwrap_or(&[]));
-    let origin = posted.message_reference.as_ref().filter(|reference| reference.kind == 1 && forwarded.is_some());
+    let origin = posted.message_reference.as_ref().filter(|reference| reference.kind == 1 && has_snapshots);
     let forwarded_from = origin.map(|origin| {
         let channel = origin.channel_id.as_deref().unwrap_or("");
         let elsewhere = origin.guild_id.as_deref().filter(|guild| Some(*guild) != place.guild);
@@ -1044,6 +1060,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
             name: who,
             avatar: Some(avatar),
             bot: author.bot || posted.webhook_id.is_some(),
+            ..Sender::default()
         },
         sent,
         seq: 0,
@@ -1083,6 +1100,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         permalink: String::new(),
         controls: Vec::new(),
         invites,
+        buttons: Vec::new(),
     };
     (message, rich.files)
 }
@@ -1421,5 +1439,64 @@ mod tests {
         assert_eq!(m.call.as_ref().and_then(|c| c.seconds), Some(720));
         assert_eq!(m.call.as_ref().map(|c| c.participants.len()), Some(2));
         assert_eq!(m.text, "Call with Bea · 12 min");
+    }
+
+    #[test]
+    fn multi_snapshot_forward_renders_all_snapshots_and_attachments() {
+        struct Known;
+        impl Names for Known {
+            fn user(&self, _: &str) -> Option<String> { None }
+            fn role(&self, _: &str) -> Option<String> { None }
+            fn channel(&self, id: &str) -> Option<String> { (id == "4101").then(|| "general".into()) }
+            fn space(&self, id: &str) -> Option<String> { (id == "4000").then(|| "Rustaceans".into()) }
+        }
+        let account = AccountKey { network: protocol::Network::Discord, account: "acct".into() };
+        let place = Place { account: &account, me: "me", guild: None, names: &Known, author: None };
+        let snap1 = Posted {
+            content: Some("First snapshot".into()),
+            attachments: Some(vec![Attached {
+                id: "1".into(),
+                filename: "a.txt".into(),
+                size: 12,
+                url: "https://cdn.discordapp.com/attachments/4101/1/a.txt".into(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let snap2 = Posted {
+            content: Some("Second snapshot".into()),
+            attachments: Some(vec![Attached {
+                id: "2".into(),
+                filename: "b.txt".into(),
+                size: 24,
+                url: "https://cdn.discordapp.com/attachments/4101/2/b.txt".into(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let posted = Posted {
+            id: "1300000000000000999".into(),
+            channel_id: "3001".into(),
+            author: Some(model::User { id: "2001".into(), username: "mara".into(), global_name: Some("Mara".into()), ..Default::default() }),
+            message_reference: Some(model::Reference {
+                kind: 1,
+                channel_id: Some("4101".into()),
+                message_id: Some("1300000000000000100".into()),
+                guild_id: Some("4000".into()),
+            }),
+            message_snapshots: vec![
+                model::Snapshot { message: Box::new(snap1) },
+                model::Snapshot { message: Box::new(snap2) },
+            ],
+            ..Default::default()
+        };
+        let (msg, _) = message(&posted, &place);
+        assert!(msg.text.contains("First snapshot"), "missing first snapshot: {}", msg.text);
+        assert!(msg.text.contains("Second snapshot"), "missing second snapshot: {}", msg.text);
+        assert_eq!(msg.attachments.len(), 2);
+        let fwd = msg.forwarded.as_ref().expect("forwarded metadata");
+        assert_eq!(fwd.from_title, "#general");
+        assert_eq!(fwd.from_space, "Rustaceans");
+        assert_eq!(fwd.link, "https://discord.com/channels/4000/4101/1300000000000000100");
     }
 }
