@@ -1344,15 +1344,15 @@ impl ConversationRights {
     const CREATE_INVITE: i64 = 1 << 13;
     /// Bit 14. Bits 8–12 are already conversation rights on other Discord branches.
     const MANAGE_WEBHOOKS: i64 = 1 << 14;
-    const DELETE_CHANNEL: i64 = 1 << 8;
-    const MANAGE_PERMISSIONS: i64 = 1 << 9;
-    const BAN_MEMBERS: i64 = 1 << 8;
-    const PROMOTE_ADMINS: i64 = 1 << 9;
-    const MANAGE_SETTINGS: i64 = 1 << 10;
-    const VIEW_ADMIN_LOG: i64 = 1 << 11;
-    const TRANSFER_OWNER: i64 = 1 << 12;
-    const ANONYMOUS: i64 = 1 << 13;
-    const MANAGE_TOPICS: i64 = 1 << 14;
+    const DELETE_CHANNEL: i64 = 1 << 15;
+    const MANAGE_PERMISSIONS: i64 = 1 << 16;
+    const BAN_MEMBERS: i64 = 1 << 17;
+    const PROMOTE_ADMINS: i64 = 1 << 18;
+    const MANAGE_SETTINGS: i64 = 1 << 19;
+    const VIEW_ADMIN_LOG: i64 = 1 << 20;
+    const TRANSFER_OWNER: i64 = 1 << 21;
+    const ANONYMOUS: i64 = 1 << 22;
+    const MANAGE_TOPICS: i64 = 1 << 23;
 
     pub fn is_none(&self) -> bool {
         *self == ConversationRights::default()

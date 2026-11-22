@@ -4352,7 +4352,7 @@ mod tests {
             vec![MenuAct::Reply, MenuAct::Thread, MenuAct::Forward, MenuAct::SaveAs, MenuAct::Unread, MenuAct::Select],
         );
         assert!(menu_acts(on, false, 0, false, false, false, false, false, false, true, false).contains(&MenuAct::FavouriteGif));
-        let translated = menu_acts(Can { translate: true, ..on }, false, 0, false, true, true, true, false, false, true, false);
+        let translated = menu_acts(Can { translate: true, ..on }, false, 0, false, true, true, true, false, false, false, true);
         let copy = translated.iter().position(|act| *act == MenuAct::Copy).unwrap();
         let link = translated.iter().position(|act| *act == MenuAct::Link).unwrap();
         assert!(copy + 1 < link);
