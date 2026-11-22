@@ -1584,8 +1584,8 @@ impl Chat {
             return *refused;
         }
         let conversation_id = conversation.id.clone();
-        match self.ask(&account, |reply| Command::Translate { conversation_id, message_ids, to, reply }) {
-            Ok(items) => Response::Translated { items },
+        match self.ask(&account, |reply| Command::TranslateMessages { conversation_id, message_ids, to, reply }) {
+            Ok(items) => Response::TranslatedMessages { items },
             Err(refused) => *refused,
         }
     }
@@ -5061,7 +5061,7 @@ impl Chat {
                     reply,
                 })
             }
-            Request::Translate { conversation, message_ids, to } => self.translate(conversation, message_ids, to),
+            Request::TranslateMessages { conversation, message_ids, to } => self.translate(conversation, message_ids, to),
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
                     Some(id) => self.hub.settings().custom_sound(id).is_some(),
@@ -6691,7 +6691,7 @@ mod tests {
         use crate::adapters::Command;
         use crate::hub::lock;
         use crate::store::ConversationRow;
-        use protocol::{ConversationKind, Encryption, ErrorCode, Key, Message, Request, Response, Translation};
+        use protocol::{ConversationKind, Encryption, ErrorCode, Key, Message, Request, Response, TranslatedMessage};
         use std::sync::{Arc, Mutex};
 
         let (chat, account, ctx, rx) = telegram_link_account();
@@ -6708,9 +6708,9 @@ mod tests {
         let worker = std::thread::spawn(move || {
             for cmd in rx {
                 match cmd {
-                    Command::Translate { conversation_id, message_ids, to, reply } => {
+                    Command::TranslateMessages { conversation_id, message_ids, to, reply } => {
                         seen_worker.lock().unwrap().push((conversation_id, message_ids, to));
-                        let _ = reply.send(Ok(vec![Translation {
+                        let _ = reply.send(Ok(vec![TranslatedMessage {
                             message_id: "42".into(),
                             text: "hello".into(),
                             spans: Vec::new(),
@@ -6722,14 +6722,14 @@ mod tests {
             }
         });
 
-        let Response::Translated { items } = chat.handle(Request::Translate {
+        let Response::TranslatedMessages { items } = chat.handle(Request::TranslateMessages {
             conversation: Key::new(&account, "u7"),
             message_ids: vec!["42".into()],
             to: "en".into(),
         }) else {
             panic!("expected Translated");
         };
-        assert_eq!(items, vec![Translation { message_id: "42".into(), text: "hello".into(), spans: Vec::new() }]);
+        assert_eq!(items, vec![TranslatedMessage { message_id: "42".into(), text: "hello".into(), spans: Vec::new() }]);
         assert_eq!(ctx.stored_message("u7", "42").unwrap().unwrap().text, "hola");
         assert_eq!(
             seen.lock().unwrap().clone(),
@@ -6737,7 +6737,7 @@ mod tests {
         );
 
         for id in ["u8", "e9"] {
-            let Response::Error { code, .. } = chat.handle(Request::Translate {
+            let Response::Error { code, .. } = chat.handle(Request::TranslateMessages {
                 conversation: Key::new(&account, id),
                 message_ids: vec!["42".into()],
                 to: "en".into(),
@@ -6746,7 +6746,7 @@ mod tests {
             };
             assert_eq!(code, ErrorCode::Refused, "{id}");
         }
-        let Response::Error { code, .. } = chat.handle(Request::Translate {
+        let Response::Error { code, .. } = chat.handle(Request::TranslateMessages {
             conversation: Key::new(&account, "u7"),
             message_ids: vec!["42".into()],
             to: "  ".into(),

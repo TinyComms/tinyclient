@@ -1305,7 +1305,7 @@ fn default_starred_limit() -> u32 {
 
 /// One message as a network translated it. The stored message is left as it was.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Translation {
+pub struct TranslatedMessage {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub message_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -3064,7 +3064,7 @@ pub enum Request {
     },
     /// Translate these messages into `to` (a language tag such as `en`). On demand: nothing is
     /// stored over the original, and a sealed or secret chat is refused before the network is asked.
-    Translate {
+    TranslateMessages {
         conversation: Key,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         message_ids: Vec<String>,
@@ -3320,9 +3320,9 @@ pub enum Response {
         text: String,
     },
     /// Answers `Translate`. One item per message the network translated, in the order asked.
-    Translated {
+    TranslatedMessages {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        items: Vec<Translation>,
+        items: Vec<TranslatedMessage>,
     },
     /// Answers `Resolve`: the matching cached conversation and optional message id on a signed-in account.
     Resolved {
@@ -4278,23 +4278,23 @@ mod tests {
     fn a_translate_frame_missing_its_new_fields_still_reads() {
         let key = Key::new(&AccountKey { network: Network::Telegram, account: "a".into() }, "u1");
         let bare: Request = serde_json::from_str(&format!(
-            r#"{{"op":"translate","conversation":{}}}"#,
+            r#"{{"op":"translate_messages","conversation":{}}}"#,
             serde_json::to_string(&key).unwrap()
         ))
         .unwrap();
-        assert_eq!(bare, Request::Translate { conversation: key.clone(), message_ids: vec![], to: String::new() });
+        assert_eq!(bare, Request::TranslateMessages { conversation: key.clone(), message_ids: vec![], to: String::new() });
 
-        let full = Request::Translate { conversation: key, message_ids: vec!["9".into()], to: "en".into() };
+        let full = Request::TranslateMessages { conversation: key, message_ids: vec!["9".into()], to: "en".into() };
         assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&full).unwrap()).unwrap(), full);
 
-        let empty: Response = serde_json::from_str(r#"{"op":"translated"}"#).unwrap();
-        assert_eq!(empty, Response::Translated { items: vec![] });
-        let item: Translation = serde_json::from_str("{}").unwrap();
-        assert_eq!(item, Translation { message_id: String::new(), text: String::new(), spans: vec![] });
-        let said = Translation { message_id: "9".into(), text: "hi".into(), spans: vec![] };
-        let wire = serde_json::to_string(&Response::Translated { items: vec![said.clone()] }).unwrap();
+        let empty: Response = serde_json::from_str(r#"{"op":"translated_messages"}"#).unwrap();
+        assert_eq!(empty, Response::TranslatedMessages { items: vec![] });
+        let item: TranslatedMessage = serde_json::from_str("{}").unwrap();
+        assert_eq!(item, TranslatedMessage { message_id: String::new(), text: String::new(), spans: vec![] });
+        let said = TranslatedMessage { message_id: "9".into(), text: "hi".into(), spans: vec![] };
+        let wire = serde_json::to_string(&Response::TranslatedMessages { items: vec![said.clone()] }).unwrap();
         assert!(!wire.contains("spans"), "{wire}");
-        assert_eq!(serde_json::from_str::<Response>(&wire).unwrap(), Response::Translated { items: vec![said] });
+        assert_eq!(serde_json::from_str::<Response>(&wire).unwrap(), Response::TranslatedMessages { items: vec![said] });
     }
 }
 

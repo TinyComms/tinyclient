@@ -17,7 +17,7 @@ pub(super) fn translate(
     conversation_id: &str,
     message_ids: &[String],
     to: &str,
-) -> Result<Vec<protocol::Translation>, Fault> {
+) -> Result<Vec<protocol::TranslatedMessage>, Fault> {
     if secret::is_row(conversation_id) {
         return Err(Fault::Rpc { code: 400, name: "CHAT_SECRET".into(), value: None });
     }
@@ -45,7 +45,7 @@ pub(super) fn translate(
     let mut items = Vec::new();
     for (id, item) in ids.iter().zip(found.result) {
         let tl::enums::TextWithEntities::Entities(body) = item;
-        items.push(protocol::Translation {
+        items.push(protocol::TranslatedMessage {
             message_id: id.to_string(),
             text: body.text.clone(),
             spans: content::spans(&body.text, &body.entities),

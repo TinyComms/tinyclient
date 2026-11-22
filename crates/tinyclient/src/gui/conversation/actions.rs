@@ -1526,7 +1526,7 @@ impl Pane {
         // shortcut: the system language fills `to` until a settings row does.
         let to = time::system_language();
         let watched = conversation.clone();
-        let request = Request::Translate { conversation, message_ids, to };
+        let request = Request::TranslateMessages { conversation, message_ids, to };
         cx.spawn(async move |this, cx| {
             let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
             let _ = this.update(cx, |this, cx| {
@@ -1535,7 +1535,7 @@ impl Pane {
                     return;
                 }
                 match answer {
-                    Ok(Response::Translated { items }) => {
+                    Ok(Response::TranslatedMessages { items }) => {
                         for item in items {
                             if !item.text.is_empty() {
                                 this.translations.insert(item.message_id, item.text);

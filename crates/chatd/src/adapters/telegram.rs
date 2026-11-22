@@ -771,7 +771,7 @@ fn offline(ctx: &Context, command: Command) {
         Command::SearchCalendar { reply, .. } => drop(reply.send(Err(down()))),
         Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
         Command::OpenLink { reply, .. } => drop(reply.send(Err(down()))),
-        Command::Translate { reply, .. } => drop(reply.send(Err(down()))),
+        Command::TranslateMessages { reply, .. } => drop(reply.send(Err(down()))),
         Command::SaveGif { reply, .. } | Command::StickerSet { reply, .. } | Command::FaveSticker { reply, .. } => drop(reply.send(Err(down()))),
         Command::PressButton { reply, .. } => drop(reply.send(Err(down()))),
         Command::GetNotifyDefaults { reply }
@@ -1176,7 +1176,7 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::OpenLink { url, reply } => {
             let _ = reply.send(open_link::open(account, &url).map_err(refused));
         }
-        Command::Translate { conversation_id, message_ids, to, reply } => {
+        Command::TranslateMessages { conversation_id, message_ids, to, reply } => {
             let _ = reply.send(translate::translate(account, &conversation_id, &message_ids, &to).map_err(refused));
         }
         Command::MessageAction { conversation_id, message_id, block_id, action_id, value, reply, .. } => {

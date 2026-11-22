@@ -69,7 +69,7 @@ use protocol::{
     AccountKey, Activity, CallFailure, CallState, Capabilities, CatalogItem, CatalogKind, Change,
     Contact, Group, Key, Link, MediaFile, MemberSection, Message, MessageHit, Network, Notify,
     Occupant, Occupants, Outgoing, Participant, Person, Presence, Reaction, RelateAction, Relation,
-    SendState, SharedItem, SharedKind, Compose, Translation, Typist, VoiceJoin, Warning, Watching,
+    SendState, SharedItem, SharedKind, Compose, TranslatedMessage, Typist, VoiceJoin, Warning, Watching,
 };
 use std::collections::{HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -1242,11 +1242,11 @@ pub enum Command {
     /// public username. Never joins. Other adapters refuse it.
     OpenLink { url: String, reply: Reply<Option<OpenedLink>> },
     /// Translate these messages. The adapter returns the words; it does not replace what is stored.
-    Translate {
+    TranslateMessages {
         conversation_id: String,
         message_ids: Vec<String>,
         to: String,
-        reply: Reply<Vec<Translation>>,
+        reply: Reply<Vec<TranslatedMessage>>,
     },
 }
 
@@ -1397,7 +1397,7 @@ impl Command {
             | Command::OpenForum { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Source { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::OpenLink { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::Translate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::TranslateMessages { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReportReasons { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             // Nothing to end on the network: the session is simply forgotten.
             Command::SignOut(reply) => drop(reply.send(Ok(()))),
