@@ -86,6 +86,13 @@ impl Shell {
             .tooltip(tip("Search in conversation", Some("⌘F")))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|this, _, window, cx| this.toggle_conversation_search(window, cx)));
+        let add_people = self.can_add_people(open).then(|| {
+            let conversation = open.clone();
+            icon_button("add-people", "icons/user-plus.svg", false)
+                .tooltip(tip("Add people", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, window, cx| this.open_add_people(&conversation, window, cx)))
+        });
         let threads_btn = (open.key.network == Network::Discord
             && matches!(open.kind, ConversationKind::Channel | ConversationKind::Announcement))
         .then(|| {
@@ -269,7 +276,7 @@ impl Shell {
             .children(self.follow_button(open, cx).map(|follow| div().flex_none().ml(px(8.)).child(follow)))
             .children(call.map(|call| div().flex_none().ml(px(8.)).child(call)))
             .children(thread_membership.map(|btn| div().flex_none().ml(px(8.)).child(btn)))
-            .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).children(setup).children(thread_settings).children(threads_btn).child(search).children(members).children(details).child(windowed))
+            .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).children(setup).children(thread_settings).children(threads_btn).children(add_people).child(search).children(members).children(details).child(windowed))
     }
 
     /// Follow button in the header strip for Discord announcement channels.
@@ -432,6 +439,11 @@ impl Shell {
                 }
                 return (!line.word.is_empty() || !line.extra.is_empty()).then_some(Beside::Person(line));
             }
+        }
+        // A Tiny group sits with the direct messages, which is no place to name: it says how many
+        // people are in it (its topic, as the adapter writes it).
+        if open.kind == ConversationKind::Group && open.key.network == Network::Tiny && !open.topic.is_empty() {
+            return Some(Beside::Path(open.topic.clone()));
         }
         let path = path_line(&open.subtitle());
         (!path.is_empty()).then(|| Beside::Path(path))

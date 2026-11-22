@@ -5010,7 +5010,10 @@ impl Chat {
                 if title.is_none() && topic.is_none() && description.is_none() {
                     return Response::Ok;
                 }
-                if title.as_deref().is_some_and(|t| t.trim().is_empty()) {
+                // A Tiny group's name may be cleared: it is then called by its people again.
+                let clears = conversation.network == Network::Tiny
+                    && matches!(self.hub.store().conversation(&conversation), Ok(Some(row)) if row.kind == ConversationKind::Group);
+                if title.as_deref().is_some_and(|t| t.trim().is_empty()) && !clears {
                     return error(ErrorCode::Refused, "A conversation name cannot be empty.");
                 }
                 let res = self.act(&conversation, |conversation_id, reply| Command::ConversationUpdate {

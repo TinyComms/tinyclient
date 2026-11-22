@@ -309,7 +309,7 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         note.apply(ctx, saved, names);
     }
     for group in &listed_groups {
-        group_listed(ctx, group);
+        group_listed(ctx, saved, group);
     }
     for direct in &directs {
         if let Some(call) = &direct.last_call {
@@ -3791,7 +3791,8 @@ fn conversation_info(
 ) {
     let mut about = ConversationAbout::default();
     if let Ok(Some(row)) = ctx.known(conversation_id) {
-        about.description = row.topic;
+        // A group's topic is its people count, which the details say themselves.
+        about.description = if row.kind == ConversationKind::Group { String::new() } else { row.topic };
         if row.kind == ConversationKind::Channel {
             about.members = super::members_of(saved).ok().map(|members| members.len() as u32);
         }
@@ -4252,6 +4253,11 @@ fn group_title(saved: &Saved, name: &str, members: &[WireGroupMember]) -> String
     }
 }
 
+/// The line beside a group's title: how many are in it, the viewer included.
+fn people_count(members: usize) -> String {
+    if members == 1 { "1 person".to_owned() } else { format!("{members} people") }
+}
+
 fn group_people(group: &WireGroup) -> Vec<PersonRow> {
     group
         .members
@@ -4268,8 +4274,12 @@ fn group_row(saved: &Saved, group: &WireGroup, position: i32, e2ee: bool, histor
     row.space = Some(SPACE.to_owned());
     row.group = Some("directs".to_owned());
     row.position = position;
+    row.topic = people_count(group.members.len());
     row.call = CallSupport::None;
     row.encryption = encryption_of(saved, &group.id, e2ee, history);
+    // Every member may add people and rename. Nobody removes anyone else.
+    row.rights.add_members = true;
+    row.rights.rename = true;
     row
 }
 
@@ -4278,11 +4288,17 @@ fn group_note(saved: &Saved, group: &WireGroup) -> Note {
     Note::from_last(&group.id, group.unread, group.last_read.as_deref(), None, group.last_message.as_ref(), mine).sealed(group.e2ee)
 }
 
-/// A group nobody has written in still belongs in the list: it is as new as its creation.
-fn group_listed(ctx: &Context, group: &WireGroup) {
+/// A group nobody has written in still belongs in the list: it is as new as its creation. The
+/// person who made it reads that they did, until someone writes.
+fn group_listed(ctx: &Context, saved: &Saved, group: &WireGroup) {
     if group.last_message.is_none() {
         let created = group.created_at.as_deref().and_then(rfc3339).unwrap_or(1);
         let _ = ctx.counts(&group.id, group.unread, 0, group.last_read.as_deref(), created);
+        if group.created_by.as_deref() == Some(saved.user_id.as_str()) {
+            let mut line = Message::plain(format!("created-{}", group.id), saved.display_name.clone(), "You created this group.", created, true);
+            line.kind = MessageKind::System;
+            let _ = ctx.quiet_line(&group.id, &line, false);
+        }
     }
 }
 
@@ -4308,7 +4324,7 @@ fn group_upsert(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, g
     }
     if snapshot {
         group_note(saved, group).apply(ctx, saved, names);
-        group_listed(ctx, group);
+        group_listed(ctx, saved, group);
     } else if known.is_none() {
         let _ = ctx.counts(&group.id, 0, 0, None, group.created_at.as_deref().and_then(rfc3339).unwrap_or(1));
     }
@@ -4334,16 +4350,18 @@ fn group_retitle(ctx: &Context, saved: &Saved, id: &str, kept: &KeptGroup) {
     let Some(known) = ctx.known(id).ok().flatten() else {
         return;
     };
-    let title = group_title(saved, &kept.name, &kept.members);
-    if known.title == title {
+    let (title, count) = (group_title(saved, &kept.name, &kept.members), people_count(kept.members.len()));
+    if known.title == title && known.topic == count {
         return;
     }
     let mut row = ConversationRow::new(id, ConversationKind::Group, title);
     row.space = Some(SPACE.to_owned());
     row.group = Some("directs".to_owned());
+    row.topic = count;
     row.position = known.position;
     row.call = known.call;
     row.encryption = known.encryption;
+    row.rights = known.rights;
     let _ = ctx.conversation(&row);
 }
 
@@ -4527,6 +4545,11 @@ fn add_group_members(ctx: &Context, saved: &Saved, id: &str, people: &[String], 
 
 /// An empty name clears it: the group is called by its people again.
 fn rename_group(ctx: &Context, saved: &Saved, id: &str, name: &str, reply: crate::adapters::Reply<()>) {
+    // The server's own rule, said in words instead of its bare 400.
+    if name.trim().chars().count() > 80 {
+        let _ = reply.send(Err(Refusal::Refused("A group name is at most 80 characters.".to_owned())));
+        return;
+    }
     let answer = match super::asked("PATCH", saved, &format!("/v1/groups/{id}"), Some(json!({ "name": name.trim() }))) {
         Ok((200, body)) => {
             let name = body.get("group").unwrap_or(&body).get("name").and_then(Value::as_str).unwrap_or(name.trim()).to_owned();
@@ -4570,7 +4593,7 @@ fn group_members(ctx: &Context, saved: &Saved, id: &str, offset: u32, limit: u32
         .map(|member| {
             let mut person = protocol::Person::new(ctx.key(&member.user_id), member_name(member));
             if !member.reachable {
-                person.status = "Hasn't updated Tiny yet".to_owned();
+                person.status = protocol::TINY_NOT_UPDATED.to_owned();
             }
             person
         })
@@ -5143,6 +5166,114 @@ fn answer_refused_list(listener: std::net::TcpListener) {
                     ("200 OK", "[]")
                 } else {
                     ("404 Not Found", "{}")
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(std::time::Duration::from_millis(5)),
+            Err(_) => break,
+        }
+    }
+}
+
+/// Proves group conversations end to end against a scripted server: a listed group is a row
+/// beside the directs under its computed title, a failed groups call keeps it and its messages,
+/// the same people twice are one group, and leaving removes the row.
+/// The lab sets `TINYCLIENT_PROVE=tiny-groups`. A build from before groups ignores that and keeps
+/// serving, so the same driver fails there.
+pub(super) fn prove_tiny_groups() -> Result<(), String> {
+    const ME: &str = "11111111-1111-1111-1111-111111111111";
+    const BEA: &str = "22222222-2222-2222-2222-222222222222";
+    const CY: &str = "33333333-3333-3333-3333-333333333333";
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|err| err.to_string())?;
+    let base = format!("http://{}", listener.local_addr().map_err(|err| err.to_string())?);
+    std::thread::spawn(move || answer_tiny_groups(listener));
+    let saved = Saved {
+        base_url: base,
+        token: "t".to_owned(),
+        user_id: ME.to_owned(),
+        email: None,
+        display_name: "Ada".to_owned(),
+        role: "member".to_owned(),
+        plain_http_ok: false,
+        e2ee: None,
+    };
+    let hub = std::sync::Arc::new(crate::hub::Hub::new(
+        crate::store::Store::open(std::path::Path::new(":memory:")).map_err(|err| err.to_string())?,
+    ));
+    let account = protocol::AccountKey { network: protocol::Network::Tiny, account: saved.user_id.clone() };
+    let (_adapter, ctx, _inbox) = crate::adapters::local(account, hub);
+    let known = |id: &str| ctx.known(id).map_err(|err| err.to_string());
+    refresh(&ctx, &saved);
+    match known("group-1")? {
+        Some(row) if row.kind == ConversationKind::Group && row.title == "Bea, Cy" && row.group_title == "Direct messages" => {}
+        Some(row) => return Err(format!("the group was listed as {:?} {:?} under {:?}", row.kind, row.title, row.group_title)),
+        None => return Err("the listed group is not a row".to_owned()),
+    }
+    let kept = Message::plain("g-kept", "Bea", "kept", 1_700_000_000, false);
+    ctx.hub.store().ingest(&ctx.key("group-1"), &kept, false).map_err(|err| err.to_string())?;
+    refresh(&ctx, &saved);
+    if ctx.stored_message("group-1", "g-kept").map_err(|err| err.to_string())?.is_none() {
+        return Err("a failed groups call deleted the stored group".to_owned());
+    }
+    let start = || {
+        let (reply, result) = std::sync::mpsc::channel();
+        start_group(&ctx, &saved, &[BEA.to_owned(), CY.to_owned()], None, reply);
+        result.recv().map_err(|err| err.to_string())?.map_err(|refusal| format!("{refusal:?}"))
+    };
+    let (first, again) = (start()?, start()?);
+    if first != "group-2" || again != first {
+        return Err(format!("the same people made {first:?} and then {again:?}"));
+    }
+    let (reply, left) = std::sync::mpsc::channel();
+    leave_group(&ctx, &saved, "group-2", reply);
+    left.recv().map_err(|err| err.to_string())?.map_err(|refusal| format!("{refusal:?}"))?;
+    match known("group-2")? {
+        None => Ok(()),
+        Some(_) => Err("the group was still listed after leaving it".to_owned()),
+    }
+}
+
+fn answer_tiny_groups(listener: std::net::TcpListener) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (lists, starts) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let _ = listener.set_nonblocking(true);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let group = |id: &str| {
+        format!(
+            r#"{{"id":"{id}","name":"","created_by":"22222222-2222-2222-2222-222222222222","created_at":"2024-01-02T03:04:05Z","members":[{{"user_id":"22222222-2222-2222-2222-222222222222","display_name":"Bea"}},{{"user_id":"11111111-1111-1111-1111-111111111111","display_name":"Ada"}},{{"user_id":"33333333-3333-3333-3333-333333333333","display_name":"Cy"}}]}}"#
+        )
+    };
+    while std::time::Instant::now() < deadline {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                let mut got = [0u8; 2048];
+                let read = std::io::Read::read(&mut stream, &mut got).unwrap_or(0);
+                let request = String::from_utf8_lossy(&got[..read]);
+                let (status, payload) = if request.contains("GET /v1/capabilities") {
+                    ("200 OK", r#"{"features":["groups"]}"#.to_owned())
+                } else if request.contains("GET /v1/groups ") {
+                    if lists.fetch_add(1, Ordering::Relaxed) == 0 {
+                        ("200 OK", format!(r#"{{"groups":[{}]}}"#, group("group-1")))
+                    } else {
+                        ("500 Internal Server Error", "{}".to_owned())
+                    }
+                } else if request.contains("POST /v1/groups ") {
+                    (if starts.fetch_add(1, Ordering::Relaxed) == 0 { "201 Created" } else { "200 OK" }, group("group-2"))
+                } else if request.contains("DELETE /v1/groups/group-2/members/me") {
+                    ("204 No Content", String::new())
+                } else if request.contains("GET /v1/channels") {
+                    ("200 OK", r#"{"channels":[{"id":"channel-1","name":"general"}]}"#.to_owned())
+                } else if request.contains("GET /v1/directs") {
+                    ("200 OK", r#"{"directs":[]}"#.to_owned())
+                } else if request.contains("GET /v1/rooms") || request.contains("GET /v1/members") {
+                    ("200 OK", "[]".to_owned())
+                } else {
+                    ("404 Not Found", "{}".to_owned())
                 };
                 let response = format!(
                     "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
@@ -7012,6 +7143,11 @@ mod tests {
     }
 
     #[test]
+    fn the_tiny_groups_proof_passes() {
+        prove_tiny_groups().unwrap();
+    }
+
+    #[test]
     fn a_server_without_groups_is_never_asked_for_them() {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let log = seen.clone();
@@ -7036,7 +7172,7 @@ mod tests {
         assert!(account_caps(&saved).groups > 0);
         let row = ctx.known("group-1").unwrap().expect("the group is a row");
         assert_eq!((row.kind, row.title.as_str(), row.group_title.as_str()), (ConversationKind::Group, "Bea, Cy +1", "Direct messages"));
-        assert_eq!((row.peer, row.call, row.encryption), (None, CallSupport::None, Encryption::Plain));
+        assert_eq!((row.peer, row.call, row.encryption, row.topic.as_str()), (None, CallSupport::None, Encryption::Plain, "4 people"));
         assert_eq!((row.unread, row.preview.as_str(), row.last_read.as_deref()), (2, "lunch?", Some("g-m1")));
         assert!(row.position > ctx.known("direct-1").unwrap().unwrap().position, "groups come after the directs");
         assert_eq!(ctx.hub.store().person(&ctx.key(DEE)).unwrap().unwrap().name, "Dee", "each member is a known person");
@@ -7143,7 +7279,8 @@ mod tests {
         let paged = paged.recv().unwrap().unwrap();
         assert_eq!((paged.members.len(), paged.members[0].status.as_str(), paged.sections[0].count), (1, "", 4));
         heard("group.member_left", json!({"group_id": "group-live", "user_id": PEER}));
-        assert_eq!(ctx.known("group-live").unwrap().unwrap().title, "Cy, Dee");
+        let fewer = ctx.known("group-live").unwrap().unwrap();
+        assert_eq!((fewer.title.as_str(), fewer.topic.as_str()), ("Cy, Dee", "3 people"));
 
         // A rename of a member reaches the unnamed group they are in.
         member_renamed(&ctx, &saved, CY, "Cyrus");
@@ -7151,12 +7288,13 @@ mod tests {
 
         // I am added to a group this device has not seen: it is read whole, with no badge.
         heard("group.member_added", json!({"group_id": "group-new", "user_id": ME, "members": [member(PEER, "Bea"), member(ME, "Ada")]}));
+        assert!(ctx.stored_message("group-new", "created-group-new").unwrap().is_none());
         let added = ctx.known("group-new").unwrap().expect("the group I was added to");
         assert_eq!((added.title.as_str(), added.unread), ("Climbing", 0));
         let (reply, about) = std::sync::mpsc::channel();
         serve(&ctx, &saved, &Live::new().unwrap(), Command::ConversationInfo { conversation_id: "group-new".into(), reply });
         let about = about.recv().unwrap().unwrap();
-        assert_eq!((about.members, about.created, about.creator.as_str()), (Some(4), rfc3339(WHEN), "Bea"));
+        assert_eq!((about.members, about.created, about.creator.as_str(), about.description.as_str()), (Some(4), rfc3339(WHEN), "Bea", ""));
 
         // I leave on another device; a group is deleted.
         heard("group.member_left", json!({"group_id": "group-new", "user_id": ME}));
@@ -7218,6 +7356,7 @@ mod tests {
         let (_adapter, ctx, saved) = group_fixture(move |request| {
             log.lock().unwrap().push(request.to_owned());
             let mut made = group_json("group-made");
+            made["created_by"] = json!(ME);
             made["unread"] = json!(0);
             made["last_message"] = Value::Null;
             if request.starts_with("POST /v1/groups ") {
@@ -7247,6 +7386,8 @@ mod tests {
         assert_eq!(body, json!({"user_ids": [PEER, CY, DEE], "e2ee": false}), "plaintext, as a direct made on this device would be");
         let row = ctx.known("group-made").unwrap().expect("the new group is a row before any message");
         assert_eq!((row.kind, row.title.as_str(), row.unread), (ConversationKind::Group, "Bea, Cy +1", 0));
+        assert!(row.rights.add_members && row.rights.rename && !row.rights.remove_members, "anyone adds and renames; nobody removes");
+        assert_eq!(ctx.stored_message("group-made", "created-group-made").unwrap().unwrap().text, "You created this group.");
         // The same people again: the same group, already a row (which is how the shell knows it existed).
         assert_eq!(start().unwrap(), "group-made");
         assert_eq!(asks_for(&seen, "POST /v1/groups "), 2);
@@ -7264,7 +7405,8 @@ mod tests {
         let (reply, renamed) = std::sync::mpsc::channel();
         serve(&ctx, &saved, &live, Command::ConversationUpdate { conversation_id: "group-made".into(), title: Some("Lunch".into()), topic: None, description: None, reply });
         assert_eq!(renamed.recv().unwrap(), Ok(()));
-        assert_eq!(ctx.known("group-made").unwrap().unwrap().title, "Lunch");
+        let renamed = ctx.known("group-made").unwrap().unwrap();
+        assert!(renamed.title == "Lunch" && renamed.rights.rename, "a retitle keeps the row's rights");
 
         let (reply, left) = std::sync::mpsc::channel();
         serve(&ctx, &saved, &live, Command::Leave { conversation_id: "group-made".into(), silent: false, reply });

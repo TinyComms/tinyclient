@@ -455,6 +455,12 @@ impl Shell {
     }
 
     /// The rows the shell holds now, wherever they are drawn.
+    /// "Add people" belongs on this conversation's strip (`facts::can_add_people`).
+    pub(in crate::gui) fn can_add_people(&self, open: &Conversation) -> bool {
+        let account = open.key.account();
+        self.snapshot.as_ref().and_then(|snapshot| snapshot.account(&account)).is_some_and(|status| info::profile::facts::can_add_people(open, &status.can))
+    }
+
     pub(in crate::gui) fn held_rows(&self) -> impl Iterator<Item = &Conversation> {
         let open = self.snapshot.as_ref().and_then(|snapshot| snapshot.open.as_ref());
         let lists = self.sidebar_state.held();

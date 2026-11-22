@@ -70,6 +70,22 @@ Discord member lists subscribe to the visible range of the open channel and drop
 
 Accept, ignore, cancel, and block go through `Relate`. People search still needs a query. The directory is not browsed A to Z.
 
+## Group conversations on a Tiny server
+
+When a Tiny server advertises `groups`, a direct message can grow into a group of three or more people, and a group can take more.
+
+- **Starting one.** A direct message's header has **Add people** (the person-plus glyph, left of search; on a phone it sits with Members and Details). It opens a picker titled "Add people to this conversation": the server's members, searchable by name, without you and without bots. The person you are talking to is already in, as a chip that cannot be taken off. Return picks or unpicks the selected row, a click does the same, Command-Return (Ctrl-Return on Windows and Linux) or **Create group** confirms, Escape closes. **Create group** stays off until one other person is picked. The picker has no maximum of its own; the server says when a group is too large for it.
+- **The same people again.** The server finds the group that already has exactly those people instead of making a second. It opens with the toast "You already have a group with these people." The direct message stays where it was with its history; nothing is copied.
+- **From a group.** The same button, and **Add people…** at the top of the member list and in Details. People already in read "Already in" and cannot be picked. Each pick is one request; a refusal is a toast naming that person with the server's reason.
+- **Where it sits.** With the direct messages, in the Inbox, in People and in the server's own column, ordered by the same recency. Never under the text channels.
+- **Name.** Unnamed, it is called by the other members in join order: the first two, then "+N". Never your own name. **Edit name** in Details names it (80 characters at most); saving the field empty clears the name. The header says how many people are in it.
+- **Members.** The member list is in join order, you included. Someone whose app is too old to see groups reads "Hasn't updated Tiny yet" under their name. Nobody can remove anyone else.
+- **Leaving.** "Leave group" in the row's menu, with the same confirmation every network's group gets. The row goes; the others keep the group.
+- **The group you made** reads "You created this group." until someone writes.
+- **Encryption, typing and notifications** follow a direct message: the same chip, typing is shown, every message notifies unless muted (under the group-messages switch), and being added is silent.
+
+A server without `groups` shows none of this: no button, no rows, no request.
+
 ## Avatars
 
 Where: conversation row, message header, conversation header, People row, member row (all one

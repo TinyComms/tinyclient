@@ -115,6 +115,11 @@ pub fn prove_keep_opened_sealed() -> Result<(), String> {
     messages::prove_keep_opened_sealed()
 }
 
+/// The lab's tiny-groups proof. See `messages::prove_tiny_groups`.
+pub fn prove_tiny_groups() -> Result<(), String> {
+    messages::prove_tiny_groups()
+}
+
 /// The lab's refused-list proof. See `messages::prove_refused_list`.
 pub fn prove_refused_list() -> Result<(), String> {
     messages::prove_refused_list()

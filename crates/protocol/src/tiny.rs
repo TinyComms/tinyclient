@@ -428,6 +428,8 @@ pub const TINY_FEATURE_E2EE_CALLS: &str = "e2ee_calls";
 pub const TINY_FEATURE_DIRECT_CALLS: &str = "direct_calls";
 /// Group conversations: three or more people a member picked (`/v1/groups`). An older server has none.
 pub const TINY_FEATURE_GROUPS: &str = "groups";
+/// Under a group member whose app is too old to see groups (`Person::status` in its member list).
+pub const TINY_NOT_UPDATED: &str = "Hasn't updated Tiny yet";
 /// Text, direct messages and files can be end-to-end encrypted: MLS groups per conversation.
 pub const TINY_FEATURE_E2EE_TEXT: &str = "e2ee_text";
 /// The domain Incognito hosts communities under. A community there promises calls that are end
