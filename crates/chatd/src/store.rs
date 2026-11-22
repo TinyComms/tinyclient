@@ -2268,7 +2268,7 @@ impl Store {
                         slowmode_seconds: row.get(31)?,
                         locked: row.get(32)?,
                         age_restricted: row.get(33)?,
-                        voice_notes_forbidden: row.get(31)?,
+                        voice_notes_forbidden: row.get(34)?,
                     },
                 ))
             })?

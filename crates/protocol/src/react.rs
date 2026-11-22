@@ -197,7 +197,8 @@ impl ReactionRules {
         if self.set == ReactionSet::Off {
             return Err(if self.why.is_empty() { "Reactions are turned off here.".to_owned() } else { self.why.clone() });
         }
-        if burst && !self.burst {
+        // Telegram's big reaction travels as `burst` too, under its own rule.
+        if burst && !self.burst && !self.big {
             return Err("Super reactions aren't allowed here.".to_owned());
         }
         let on_it = reactions.iter().find(|have| same(have, emoji));
