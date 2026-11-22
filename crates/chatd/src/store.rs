@@ -85,6 +85,9 @@ const TABLES: &str = "
         can_create_invites INTEGER NOT NULL DEFAULT 0,
         rights   INTEGER NOT NULL DEFAULT 0,
         opt_in_channels INTEGER NOT NULL DEFAULT 0,
+        can_manage_webhooks INTEGER NOT NULL DEFAULT 0,
+        can_manage_guild INTEGER NOT NULL DEFAULT 0,
+        can_manage_expressions INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (network, account, id)
     ) WITHOUT ROWID;
     -- A folder: of chats (Telegram, membership on the conversation) or of Spaces (Discord,
@@ -1284,6 +1287,15 @@ impl Store {
         if !column(&store.db, "space", "rights")? {
             store.db.execute_batch("ALTER TABLE space ADD COLUMN rights INTEGER NOT NULL DEFAULT 0")?;
         }
+        if !column(&store.db, "space", "can_manage_webhooks")? {
+            store.db.execute_batch("ALTER TABLE space ADD COLUMN can_manage_webhooks INTEGER NOT NULL DEFAULT 0")?;
+        }
+        if !column(&store.db, "space", "can_manage_guild")? {
+            store.db.execute_batch("ALTER TABLE space ADD COLUMN can_manage_guild INTEGER NOT NULL DEFAULT 0")?;
+        }
+        if !column(&store.db, "space", "can_manage_expressions")? {
+            store.db.execute_batch("ALTER TABLE space ADD COLUMN can_manage_expressions INTEGER NOT NULL DEFAULT 0")?;
+        }
         Ok(store)
     }
 
@@ -1494,7 +1506,8 @@ impl Store {
                     (SELECT f.id FROM folder f
                       WHERE f.network = s.network AND f.account = s.account
                         AND instr(f.spaces, ',' || s.id || ',') > 0 LIMIT 1),
-                    s.muted, s.hide_muted, s.can_create_channels, s.can_create_invites, s.opt_in_channels, s.rights
+                    s.muted, s.hide_muted, s.can_create_channels, s.can_create_invites, s.opt_in_channels, s.rights,
+                    s.can_manage_webhooks, s.can_manage_guild, s.can_manage_expressions
              FROM space s
              LEFT JOIN media m ON m.network = s.network AND m.account = s.account AND m.id = s.icon
              WHERE ?1 IS NULL OR s.network = ?1
@@ -1516,6 +1529,9 @@ impl Store {
                 can_create_invites: row.get(18)?,
                 opt_in_channels: row.get(19)?,
                 rights: protocol::SpaceRights::from_bits(rights_bits),
+                can_manage_webhooks: row.get(21)?,
+                can_manage_guild: row.get(22)?,
+                can_manage_expressions: row.get(23)?,
             })
         })?;
         rows.collect()
@@ -2260,6 +2276,33 @@ impl Store {
         Ok((rows, total))
     }
 
+    /// The composer lock on threads and forum posts already stored under this server.
+    /// A tree replacement leaves a row that names its parent, so the gate has to be written
+    /// onto those rows itself. Each pair is the conversation and the space it sits in, empty
+    /// when a post has no place in the tree. Only rows whose lock changed are returned.
+    pub fn restamp_threads(&mut self, space: &Key, read_only: bool, reason: &str) -> rusqlite::Result<Vec<(String, String)>> {
+        let belongs = "network = ?1 AND account = ?2 AND kind = 'thread' AND parent != ''
+            AND (space = ?3 OR parent IN (
+                SELECT parent_row.id FROM conversation AS parent_row
+                 WHERE parent_row.network = ?1 AND parent_row.account = ?2 AND parent_row.space = ?3
+            ))
+            AND (read_only != ?4 OR read_only_reason != ?5)";
+        let network = word(&space.network);
+        let changed: Vec<(String, String)> = self
+            .db
+            .prepare(&format!("SELECT id, space FROM conversation WHERE {belongs}"))?
+            .query_map(params![network, space.account, space.id, read_only, reason], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        if changed.is_empty() {
+            return Ok(changed);
+        }
+        self.db.execute(
+            &format!("UPDATE conversation SET read_only = ?4, read_only_reason = ?5 WHERE {belongs}"),
+            params![network, space.account, space.id, read_only, reason],
+        )?;
+        Ok(changed)
+    }
+
     /// Where the network files a conversation. True if anything changed.
     pub fn set_filing(&mut self, conversation: &Key, filing: &Filing) -> rusqlite::Result<bool> {
         let changed = self.db.execute(
@@ -2430,6 +2473,16 @@ impl Store {
             "UPDATE space SET rights = ?4
               WHERE network = ?1 AND account = ?2 AND id = ?3 AND rights != ?4",
             params![word(&space.network), space.account, space.id, bits],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn set_space_manage(&mut self, space: &Key, webhooks: bool, guild: bool, expressions: bool) -> rusqlite::Result<bool> {
+        let changed = self.db.execute(
+            "UPDATE space SET can_manage_webhooks = ?4, can_manage_guild = ?5, can_manage_expressions = ?6
+              WHERE network = ?1 AND account = ?2 AND id = ?3
+                AND (can_manage_webhooks != ?4 OR can_manage_guild != ?5 OR can_manage_expressions != ?6)",
+            params![word(&space.network), space.account, space.id, webhooks, guild, expressions],
         )?;
         Ok(changed == 1)
     }

@@ -34,6 +34,8 @@ pub enum Drill {
     Requests,
     /// A forum's topics.
     Topics(Rc<Conversation>),
+    /// Discord's public servers.
+    Discover,
 }
 
 /// What an action row does.
@@ -51,6 +53,10 @@ pub enum Act {
     MoreChats,
     /// Show or hide a team's opted-out channels. The id is the team's.
     Hidden(String),
+    /// Discord's public-server list.
+    Discover,
+    /// Join one server from that list. The id is a snowflake, never a URL.
+    JoinFound(String),
 }
 
 /// Consecutive calls with the same person collapsed into one row with a count.
@@ -165,6 +171,11 @@ pub struct Home {
     pub opened: HashSet<String>,
     /// Teams whose hidden channels are listed, by team id.
     pub hidden_shown: HashSet<String>,
+    /// Public servers from the Discover list, and the search that asked for them.
+    pub discover: Vec<protocol::DiscoveredGuild>,
+    pub discover_query: String,
+    pub discover_total: u32,
+    pub discover_error: String,
 }
 
 impl Home {
@@ -211,6 +222,9 @@ pub fn discord(home: &Home, spaces: &[Space], open_space: Option<&str>, unread: 
     if !unread || home.friend_requests > 0 {
         let after = if home.online > 0 { format!("{} online", home.online) } else { String::new() };
         out.push(Item::Action { act: Act::Friends, icon: "icons/users.svg", words: "Friends".into(), after, dot: None });
+    }
+    if !unread {
+        out.push(Item::Action { act: Act::Discover, icon: "icons/search.svg", words: "Discover".into(), after: String::new(), dot: None });
     }
     if home.requests > 0 && !unread {
         out.push(Item::Action { act: Act::Requests, icon: "icons/mail.svg", words: "Message requests".into(), after: home.requests.to_string(), dot: None });
@@ -440,7 +454,7 @@ mod tests {
     }
 
     fn space(id: &str, folder: Option<&str>, attention: u32, unread: bool) -> Space {
-        Space { key: key(id), name: id.into(), icon: None, position: 0, attention, unread, folder: folder.map(Into::into), muted: false, hide_muted: false, can_create_channels: false, can_create_invites: false, opt_in_channels: false, rights: protocol::SpaceRights::default() }
+        Space { key: key(id), name: id.into(), icon: None, position: 0, attention, unread, folder: folder.map(Into::into), muted: false, hide_muted: false, can_create_channels: false, can_create_invites: false, opt_in_channels: false, rights: protocol::SpaceRights::default(), can_manage_webhooks: false, can_manage_guild: false, can_manage_expressions: false }
     }
 
     fn folder(id: &str, spaces: &[&str]) -> Folder {
@@ -546,7 +560,7 @@ mod tests {
             ..Home::for_network(Network::Discord)
         };
         let got = shape(&discord(&home, &spaces, None, false), &spaces);
-        assert_eq!(got, ["<Friends>", "<Message requests>", "[In voice]", "v0", "v1", "v2", "<2 more>", "[Direct messages]", "ines", "kofi", "[Servers]", "moss"]);
+        assert_eq!(got, ["<Friends>", "<Discover>", "<Message requests>", "[In voice]", "v0", "v1", "v2", "<2 more>", "[Direct messages]", "ines", "kofi", "[Servers]", "moss"]);
         assert_eq!(shape(&discord(&home, &spaces, None, true), &spaces), ["[Direct messages]", "ines"]);
     }
 
@@ -561,7 +575,7 @@ mod tests {
         home.loaded = true;
         home.loaded_once = true;
         let ready = shape(&discord(&home, &spaces, None, false), &spaces);
-        assert_eq!(ready, ["<Friends>", "[Direct messages]", "ines", "[Servers]", "moss"]);
+        assert_eq!(ready, ["<Friends>", "<Discover>", "[Direct messages]", "ines", "[Servers]", "moss"]);
         // Refreshes and sublist loading keep the cached home ready.
         home.epoch += 1;
         home.loaded = false;
@@ -572,7 +586,7 @@ mod tests {
     fn discord_shows_servers_after_a_completed_empty_chat_read() {
         let spaces = [space("moss", None, 0, false)];
         let home = Home { loaded: true, loaded_once: true, ..Home::for_network(Network::Discord) };
-        assert_eq!(shape(&discord(&home, &spaces, None, false), &spaces), ["<Friends>", "[Servers]", "moss"]);
+        assert_eq!(shape(&discord(&home, &spaces, None, false), &spaces), ["<Friends>", "<Discover>", "[Servers]", "moss"]);
     }
 
     #[test]

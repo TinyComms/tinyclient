@@ -253,6 +253,8 @@ pub struct Shell {
     pub(super) discord_settings: super::discord_settings::State,
     /// Discord admin modals (permissions, audit log, AutoMod & safety).
     pub(super) discord_admin_state: super::discord_admin::State,
+    /// Discord server management modal (webhooks, integrations, emoji & stickers).
+    pub(super) discord_admin: super::discord_manage::State,
 
     /// chatd as the shell sees it: starting, live, reconnecting, given up; the keychain.
     pub(super) service: Service,
@@ -342,6 +344,7 @@ impl Shell {
             tiny_state: super::tiny::State::new(cx),
             discord_settings: super::discord_settings::State::default(),
             discord_admin_state: super::discord_admin::State::default(),
+            discord_admin: super::discord_manage::State::default(),
             service: Service::new(!cfg!(feature = "gui-shot") || std::env::args().any(|arg| arg == "--start-chatd")),
             crashed: app::crash::relaunched_after(),
             restore: Some((prefs.open.clone(), prefs.mode.clone())),

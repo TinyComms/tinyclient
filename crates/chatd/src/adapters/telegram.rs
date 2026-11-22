@@ -886,7 +886,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             let result = match scope {
                 super::SearchScope::Conversation(id) => info::search_messages(account, &id, &query).map_err(refused),
                 super::SearchScope::Account => info::search_global(account, &query, cursor.as_deref()).map_err(refused),
-                super::SearchScope::Space(_) => Err(Refusal::Unsupported),
+                super::SearchScope::Space(_) | super::SearchScope::Home => Err(Refusal::Unsupported),
             };
             let _ = reply.send(result.map(super::SearchPage::from));
         }

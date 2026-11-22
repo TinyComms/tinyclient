@@ -2962,7 +2962,7 @@ fn a_search_asks_slacks_own_search_once_and_maps_hits_to_their_conversations() {
 
     // One conversation: Slack's own search, narrowed to it, and the hit mapped like the
     // cache's. A channel the sidebar does not know is not a hit we can open.
-    let asked = world.ask(Request::SearchNetwork { conversation: Some(alpha("C0GEN")), space: None, query: "deploy".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
+    let asked = world.ask(Request::SearchNetwork { conversation: Some(alpha("C0GEN")), space: None, query: "deploy".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None, home: false  });
     let Response::MessageHits { hits, .. } = asked else { panic!("{asked:?}") };
     assert_eq!(hits.len(), 1, "{hits:?}");
     let hit = &hits[0];
@@ -2979,7 +2979,7 @@ fn a_search_asks_slacks_own_search_once_and_maps_hits_to_their_conversations() {
 
     // The workspace's own search: no channel filter, and every hit in a conversation the
     // sidebar knows, newest first.
-    let asked = world.ask(Request::SearchNetwork { conversation: None, space: Some(alpha("T01ALPHA")), query: "deploy".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
+    let asked = world.ask(Request::SearchNetwork { conversation: None, space: Some(alpha("T01ALPHA")), query: "deploy".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None, home: false  });
     let Response::MessageHits { hits, .. } = asked else { panic!("{asked:?}") };
     let mapped: Vec<(&str, &str)> = hits.iter().map(|hit| (hit.conversation.id.as_str(), hit.title.as_str())).collect();
     assert_eq!(mapped, [("C0GEN", "#general"), ("C0DEP", "#deploys")]);
@@ -2994,7 +2994,7 @@ fn a_search_slack_will_not_do_is_refused_in_words_rather_than_faked() {
     });
     world.ready();
     // The web session cannot reach Slack's search: the user is told, and no hit is invented.
-    let refused = world.ask(Request::SearchNetwork { conversation: Some(alpha("C0GEN")), space: None, query: "deploy".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
+    let refused = world.ask(Request::SearchNetwork { conversation: Some(alpha("C0GEN")), space: None, query: "deploy".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None, home: false  });
     assert!(matches!(&refused, Response::Error { detail, .. } if detail == "Slack's own search isn't reachable with this session."), "{refused:?}");
 }
 
@@ -5615,6 +5615,7 @@ fn slack_search_filters_and_no_duplicate_in_modifier() {
         query: "deploy".into(),
         filters: filters.clone(),
         cursor: None,
+        home: false,
     }) else {
         panic!("expected Response::MessageHits");
     };
@@ -5636,6 +5637,7 @@ fn slack_search_filters_and_no_duplicate_in_modifier() {
         query: "in:#deployments during:2026-11 release".into(),
         filters: protocol::SearchFilters::default(),
         cursor: None,
+        home: false,
     }) else {
         panic!("expected Response::MessageHits");
     };

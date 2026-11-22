@@ -1454,6 +1454,80 @@ pub fn badge_after_jump(count: u32, marked: u32) -> u32 {
     if marked == 0 { 0 } else { count.saturating_sub(marked) }
 }
 
+/// One public server from Discord Discovery (`Request::Discover`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveredGuild {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Discord's icon hash. Never a URL.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub icon: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub members: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub online: u32,
+}
+
+/// One question on a server's rules form (`Request::SpaceGate`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateField {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    /// Discord's `field_type`: TERMS, TEXT_INPUT, PARAGRAPH, MULTIPLE_CHOICE, VERIFICATION.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<String>,
+}
+
+/// One answer a server's onboarding offers. The id is a snowflake, never a URL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateOption {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+}
+
+/// One onboarding question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GatePrompt {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<GateOption>,
+}
+
+/// What a server asks before a member can talk (`Request::SpaceGate`).
+/// `external` is only ever `https://discord.com/app`, and only when phone or email
+/// verification has to be finished in Discord. Rules text is not a link.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SpaceGate {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pending: bool,
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub verification: u8,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manual: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub onboarding: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<GateField>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prompts: Vec<GatePrompt>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub external: String,
+}
+
 /// Preview of a Space invite (`Request::InvitePreview`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InvitePreview {
@@ -2119,6 +2193,162 @@ pub struct AutomodRule {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub raw: String,
 }
+/// Kind of webhook in a Space (e.g. Discord incoming, channel follower, or application webhook).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookKind {
+    #[default]
+    Incoming,
+    ChannelFollower,
+    Application,
+}
+
+/// One webhook in a Space (incoming webhook, followed announcement channel, or app webhook).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceWebhook {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub channel_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub channel_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<MediaFile>,
+    #[serde(default)]
+    pub kind: WebhookKind,
+    /// Full webhook URL (including secret token for incoming webhooks). Never logged; only shown
+    /// or copied on explicit user action.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub creator: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_guild: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_channel: String,
+}
+
+/// One installed bot, app, or third-party integration in a Space.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceIntegration {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Integration type (e.g. `"discord"`, `"twitch"`, `"youtube"`, `"guild_subscription"`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+    #[serde(default = "is_true_val", skip_serializing_if = "is_true")]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub application_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bot_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bot_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub account_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<MediaFile>,
+}
+
+fn is_true_val() -> bool {
+    true
+}
+
+/// A Space's webhooks, followed channels, and installed bots/integrations.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceIntegrations {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub webhooks: Vec<SpaceWebhook>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub followers: Vec<SpaceWebhook>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub integrations: Vec<SpaceIntegration>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_manage_webhooks: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_manage_guild: bool,
+    /// External URL to add a bot/app in Discord's App Directory.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub add_bot_url: String,
+    /// External URL to edit per-command integration permissions in Discord.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub permissions_url: String,
+}
+
+/// One custom emoji in a Space (e.g. Discord guild emoji).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceEmoji {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub animated: bool,
+    #[serde(default = "is_true_val", skip_serializing_if = "is_true")]
+    pub available: bool,
+    /// Role IDs allowed to use this emoji; empty means everyone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<MediaFile>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub creator: String,
+}
+
+/// One custom sticker in a Space (e.g. Discord guild sticker).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceSticker {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Related Unicode emoji or autocomplete tag.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tags: String,
+    /// Discord sticker format: 1 PNG, 2 APNG, 3 Lottie, 4 GIF.
+    #[serde(default)]
+    pub format: u8,
+    #[serde(default = "is_true_val", skip_serializing_if = "is_true")]
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<MediaFile>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub creator: String,
+}
+
+/// A role that can be selected when restricting custom emoji access.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceRoleChoice {
+    pub id: String,
+    pub name: String,
+}
+
+/// A Space's custom emoji, stickers, slot limits (from boost tier), and available roles.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceExpressions {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emojis: Vec<SpaceEmoji>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stickers: Vec<SpaceSticker>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<SpaceRoleChoice>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub static_emoji_limit: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub animated_emoji_limit: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub sticker_limit: u32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_manage: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_create: bool,
+    #[serde(default)]
+    pub premium_tier: u8,
+}
 
 #[cfg(test)]
 mod tests {
@@ -2259,6 +2489,9 @@ mod tests {
             folder: None,
             muted: false,
             hide_muted: false,
+            can_manage_webhooks: false,
+            can_manage_guild: false,
+            can_manage_expressions: false,
             can_create_channels: false,
             can_create_invites: false,
             opt_in_channels: false,
@@ -2387,8 +2620,8 @@ mod tests {
             image: None,
         };
         let reqs = [
-            Request::EditSpace { space: space.clone(), edit },
-            Request::DeleteSpace { space: space.clone(), mfa_code: Some("123456".into()) },
+            Request::EditSpace { space: space.clone(), edit},
+            Request::DeleteSpace { space: space.clone(), mfa_code: Some("123456".into())},
             Request::TransferSpace {
                 space: space.clone(),
                 new_owner: Key::new(&account, "2001"),
@@ -2511,5 +2744,202 @@ mod tests {
         let one = Response::Role { role };
         let back: Response = serde_json::from_str(&serde_json::to_string(&one).unwrap()).unwrap();
         assert_eq!(back, one);
+    }
+
+    #[test]
+    fn space_integrations_and_webhook_requests_round_trip() {
+        use crate::{AccountKey, Request, Response};
+        let account = AccountKey { network: Network::Discord, account: "1".into() };
+        let space = Key::new(&account, "4000");
+        let conv = Key::new(&account, "4101");
+        let reqs = [
+            Request::SpaceIntegrations { space: space.clone() },
+            Request::CreateWebhook { conversation: conv.clone(), name: "Deployments".into() },
+            Request::EditWebhook {
+                space: space.clone(),
+                webhook_id: "9001".into(),
+                name: Some("CI".into()),
+                channel_id: Some("4102".into()),
+            },
+            Request::DeleteWebhook { space: space.clone(), webhook_id: "9001".into() },
+            Request::RemoveIntegration { space: space.clone(), integration_id: "8001".into() },
+        ];
+        for req in reqs {
+            let wire = serde_json::to_string(&req).unwrap();
+            let back: Request = serde_json::from_str(&wire).unwrap();
+            assert_eq!(back, req);
+        }
+        let hook = SpaceWebhook {
+            id: "9001".into(),
+            name: "CI".into(),
+            channel_id: "4101".into(),
+            channel_name: "general".into(),
+            kind: WebhookKind::Incoming,
+            url: "https://discord.com/api/webhooks/9001/secret".into(),
+            creator: "Justin".into(),
+            ..SpaceWebhook::default()
+        };
+        let page = SpaceIntegrations {
+            webhooks: vec![hook.clone()],
+            followers: vec![SpaceWebhook {
+                id: "9002".into(),
+                name: "Rust News".into(),
+                channel_id: "4101".into(),
+                kind: WebhookKind::ChannelFollower,
+                source_guild: "Rust".into(),
+                source_channel: "announcements".into(),
+                ..SpaceWebhook::default()
+            }],
+            integrations: vec![SpaceIntegration {
+                id: "8001".into(),
+                name: "HelperBot".into(),
+                kind: "discord".into(),
+                enabled: true,
+                application_id: "7001".into(),
+                bot_id: "7002".into(),
+                bot_name: "HelperBot".into(),
+                ..SpaceIntegration::default()
+            }],
+            can_manage_webhooks: true,
+            can_manage_guild: true,
+            add_bot_url: "https://discord.com/discovery/applications".into(),
+            permissions_url: "https://discord.com/channels/4000".into(),
+        };
+        let resp = Response::SpaceIntegrations { space, integrations: Box::new(page) };
+        let back: Response = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(back, resp);
+        let hook_resp = Response::SpaceWebhook { webhook: Box::new(hook) };
+        let back_hook: Response = serde_json::from_str(&serde_json::to_string(&hook_resp).unwrap()).unwrap();
+        assert_eq!(back_hook, hook_resp);
+    }
+
+    #[test]
+    fn space_expressions_requests_and_responses_round_trip() {
+        use crate::{AccountKey, Request, Response};
+        let account = AccountKey { network: Network::Discord, account: "1".into() };
+        let space = Key::new(&account, "4000");
+        let reqs = [
+            Request::SpaceExpressions { space: space.clone() },
+            Request::CreateEmoji { space: space.clone(), name: "ferris".into(), path: "/tmp/ferris.png".into() },
+            Request::EditEmoji {
+                space: space.clone(),
+                emoji_id: "7001".into(),
+                name: Some("ferris_happy".into()),
+                roles: Some(vec!["4010".into()]),
+            },
+            Request::DeleteEmoji { space: space.clone(), emoji_id: "7001".into() },
+            Request::CreateSticker {
+                space: space.clone(),
+                name: "Wave".into(),
+                tags: "wave".into(),
+                description: "Waving mascot".into(),
+                path: "/tmp/wave.png".into(),
+            },
+            Request::EditSticker {
+                space: space.clone(),
+                sticker_id: "8001".into(),
+                name: Some("Big Wave".into()),
+                tags: Some("hand".into()),
+                description: Some("Updated".into()),
+            },
+            Request::DeleteSticker { space: space.clone(), sticker_id: "8001".into() },
+        ];
+        for req in reqs {
+            let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+            assert_eq!(back, req);
+        }
+        let emoji = SpaceEmoji {
+            id: "7001".into(),
+            name: "ferris".into(),
+            roles: vec!["4010".into()],
+            ..SpaceEmoji::default()
+        };
+        let sticker = SpaceSticker {
+            id: "8001".into(),
+            name: "Wave".into(),
+            tags: "wave".into(),
+            format: 1,
+            ..SpaceSticker::default()
+        };
+        let expr = SpaceExpressions {
+            emojis: vec![emoji.clone()],
+            stickers: vec![sticker.clone()],
+            roles: vec![SpaceRoleChoice { id: "4010".into(), name: "mods".into() }],
+            static_emoji_limit: 50,
+            animated_emoji_limit: 50,
+            sticker_limit: 5,
+            can_manage: true,
+            can_create: true,
+            premium_tier: 0,
+        };
+        let resp = Response::SpaceExpressions { space, expressions: Box::new(expr) };
+        let back: Response = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(back, resp);
+        let e_resp = Response::SpaceEmoji { emoji: Box::new(emoji) };
+        assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&e_resp).unwrap()).unwrap(), e_resp);
+        let s_resp = Response::SpaceSticker { sticker: Box::new(sticker) };
+        assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&s_resp).unwrap()).unwrap(), s_resp);
+    }
+
+    #[test]
+    fn discover_requests_round_trip_and_default_the_new_fields() {
+        use crate::Response;
+        let account = AccountKey { network: Network::Discord, account: "1".into() };
+        let listed = Request::Discover { account: account.clone(), query: String::new(), category: 0, offset: 0, limit: 0 };
+        let wire = serde_json::to_string(&listed).unwrap();
+        assert!(!wire.contains("\"query\"") && !wire.contains("category"), "{wire}");
+        assert_eq!(serde_json::from_str::<Request>(&wire).unwrap(), listed);
+        let account_json = serde_json::to_string(&account).unwrap();
+        let bare = format!(r#"{{"op":"discover","account":{account_json}}}"#);
+        assert_eq!(serde_json::from_str::<Request>(&bare).unwrap(), listed);
+        let searched = Request::Discover { account: account.clone(), query: "lichen".into(), category: 1, offset: 24, limit: 24 };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&searched).unwrap()).unwrap(), searched);
+        let join = Request::JoinDiscovered { account, guild_id: "5000".into() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&join).unwrap()).unwrap(), join);
+        let guild = DiscoveredGuild { id: "5000".into(), name: "Lichen".into(), description: String::new(), icon: String::new(), members: 12, online: 3 };
+        let resp = Response::Discovered { guilds: vec![guild], total: 1 };
+        assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&resp).unwrap()).unwrap(), resp);
+    }
+
+    #[test]
+    fn space_gate_requests_round_trip_and_default_the_new_fields() {
+        use crate::Response;
+        let space = Key { network: Network::Discord, account: "1".into(), id: "4000".into() };
+        let bare = Request::SpaceGate { space: space.clone() };
+        let wire = serde_json::to_string(&bare).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&wire).unwrap(), bare);
+        let accept = Request::AcceptRules { space: space.clone(), answers: vec!["true".into()] };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&accept).unwrap()).unwrap(), accept);
+        let empty = format!(r#"{{"op":"accept_rules","space":{}}}"#, serde_json::to_string(&space).unwrap());
+        assert!(matches!(serde_json::from_str::<Request>(&empty).unwrap(), Request::AcceptRules { answers, .. } if answers.is_empty()));
+        let submit = Request::SubmitOnboarding { space: space.clone(), options: vec!["6101".into()] };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&submit).unwrap()).unwrap(), submit);
+        let gate = SpaceGate {
+            pending: true,
+            description: "Be kind".into(),
+            reason: "Accept the rules to talk here".into(),
+            external: "https://discord.com/app".into(),
+            fields: vec![GateField { label: "Rules".into(), kind: "TERMS".into(), values: vec!["Be kind".into()], required: true, choices: Vec::new() }],
+            ..SpaceGate::default()
+        };
+        let resp = Response::SpaceGate { space, gate };
+        assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&resp).unwrap()).unwrap(), resp);
+        let omitted = r#"{"op":"space_gate","space":{"network":"discord","account":"1","id":"4000"},"gate":{}}"#;
+        let back: Response = serde_json::from_str(omitted).unwrap();
+        match back {
+            Response::SpaceGate { gate, .. } => {
+                assert!(!gate.pending && gate.fields.is_empty() && gate.external.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_activity_round_trips_and_an_omitted_name_is_empty() {
+        let account = AccountKey { network: Network::Discord, account: "1".into() };
+        let set = Request::SetActivity { account: account.clone(), name: "Celeste".into() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&set).unwrap()).unwrap(), set);
+        let bare = format!(r#"{{"op":"set_activity","account":{}}}"#, serde_json::to_string(&account).unwrap());
+        assert!(matches!(serde_json::from_str::<Request>(&bare).unwrap(), Request::SetActivity { name, .. } if name.is_empty()));
     }
 }

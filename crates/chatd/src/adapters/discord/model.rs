@@ -70,6 +70,8 @@ pub const SEND_MESSAGES_IN_THREADS: u64 = 1 << 38;
 pub const MANAGE_WEBHOOKS: u64 = 1 << 29;
 pub const MANAGE_EVENTS: u64 = 1 << 33;
 pub const SEND_VOICE_MESSAGES: u64 = 1 << 46;
+pub const MANAGE_GUILD_EXPRESSIONS: u64 = 1 << 30;
+pub const CREATE_GUILD_EXPRESSIONS: u64 = 1 << 43;
 pub const PIN_MESSAGES: u64 = 1 << 51;
 
 /// Formats Unix seconds as UTC ISO 8601 (`YYYY-MM-DDTHH:MM:SSZ`) for Discord REST bodies.
@@ -96,6 +98,10 @@ pub fn iso_timestamp(unix_secs: i64) -> String {
 pub const CROSSPOSTED: u64 = 1 << 0;
 pub const IS_CROSSPOST: u64 = 1 << 1;
 pub const SUPPRESS_EMBEDS: u64 = 1 << 2;
+/// Validates a Discord snowflake id before interpolating it into an API path.
+pub fn safe_discord_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 32 && id.bytes().all(|b| b.is_ascii_digit())
+}
 
 /// Where Discord's own app, or its site when the app is not installed, shows a person.
 pub fn user_link(id: &str) -> String {
@@ -157,6 +163,23 @@ fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de> + Default>(de: D) -> 
     Ok(Option::<T>::deserialize(de)?.unwrap_or_default())
 }
 
+/// A phone number is a secret. Missing stays unknown (`None`, and this is not called).
+/// Null or an empty string is "no phone". Anything else is "a phone is set", and the digits are dropped.
+fn phone_known<'de, D: Deserializer<'de>>(de: D) -> Result<Option<bool>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Phone {
+        Text(String),
+        Other(IgnoredAny),
+    }
+    let known = match Option::<Phone>::deserialize(de)? {
+        None => false,
+        Some(Phone::Text(text)) => !text.trim().is_empty(),
+        Some(Phone::Other(_)) => true,
+    };
+    Ok(Some(known))
+}
+
 #[derive(Deserialize, Default, Clone, Debug)]
 pub struct PrimaryGuild {
     #[serde(default)]
@@ -193,6 +216,12 @@ pub struct User {
     /// On READY's user: `Some(false)` when the account is underage / not permitted in age-restricted channels.
     #[serde(default)]
     pub nsfw_allowed: Option<bool>,
+    /// Verified email, when Discord says. Missing and null are unknown, not a failure.
+    #[serde(default)]
+    pub verified: Option<bool>,
+    /// Whether a phone is on the account. The number is never stored.
+    #[serde(default, deserialize_with = "phone_known")]
+    pub phone: Option<bool>,
     /// Present on the users of a message's `mentions`.
     #[serde(default)]
     pub member: Option<Box<Member>>,
@@ -527,6 +556,12 @@ pub struct Member {
     pub presence: Option<PresenceUpdate>,
     #[serde(default)]
     pub communication_disabled_until: Option<String>,
+    /// Rules not accepted yet. Not a permission.
+    #[serde(default, deserialize_with = "nullable")]
+    pub pending: bool,
+    /// Membership flags. Not a permission grant.
+    #[serde(default, deserialize_with = "lenient_u64")]
+    pub flags: u64,
 }
 
 impl Member {
@@ -939,6 +974,7 @@ pub struct GuildProperties {
     pub afk_timeout: Option<u32>,
     #[serde(default)]
     pub default_message_notifications: Option<u8>,
+    pub verification_level: Option<u8>,
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]
@@ -972,6 +1008,7 @@ pub struct Guild {
     pub afk_timeout: Option<u32>,
     #[serde(default)]
     pub default_message_notifications: Option<u8>,
+    pub verification_level: Option<u8>,
     #[serde(default)]
     pub channels: Vec<Channel>,
     #[serde(default)]
@@ -1166,6 +1203,19 @@ impl Guild {
     pub fn default_message_notifications(&self) -> Option<u8> {
         let wrapped = self.properties.as_ref().and_then(|properties| properties.default_message_notifications);
         wrapped.or(self.default_message_notifications)
+    }
+    /// Missing on a partial guild update, so a caller does not treat that as level 0.
+    pub fn verification_level(&self) -> Option<u8> {
+        let wrapped = self.properties.as_ref().and_then(|properties| properties.verification_level);
+        wrapped.or(self.verification_level)
+    }
+
+    /// The feature list when this payload carries one. An omitted list is not an empty one.
+    pub fn listed_features(&self) -> Option<&[String]> {
+        if let Some(features) = self.properties.as_ref().and_then(|properties| properties.features.as_deref()) {
+            return Some(features);
+        }
+        self.features.as_deref().filter(|features| !features.is_empty())
     }
 }
 

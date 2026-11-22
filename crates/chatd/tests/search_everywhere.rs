@@ -70,6 +70,7 @@ fn everywhere_search_merges_two_networks_and_reports_unsearched() {
         query: "the".into(),
         filters: SearchFilters::default(),
         cursor: None,
+        home: false,
     }) else {
         panic!("expected MessageHits");
     };
@@ -92,6 +93,7 @@ fn everywhere_search_merges_two_networks_and_reports_unsearched() {
             query: "the".into(),
             filters: SearchFilters::default(),
             cursor: Some(cur),
+            home: false,
         }) else {
             panic!("expected MessageHits on next page");
         };
@@ -127,6 +129,7 @@ fn everywhere_search_merges_two_networks_and_reports_unsearched() {
         query: "the".into(),
         filters: SearchFilters::default(),
         cursor: None,
+        home: false,
     }) else {
         panic!("expected MessageHits");
     };
@@ -145,6 +148,7 @@ fn everywhere_search_merges_two_networks_and_reports_unsearched() {
             ..SearchFilters::default()
         },
         cursor: None,
+        home: false,
     });
     assert!(matches!(filtered, Response::MessageHits { .. }), "got {filtered:?}");
 }

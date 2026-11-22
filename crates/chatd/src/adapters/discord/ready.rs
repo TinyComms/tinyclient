@@ -5,9 +5,9 @@ use super::super::{Command, Failure};
 use super::model::{
     self, number, seconds, Channel, Guild, GuildSettings, Kept, Member, MuteConfig, PresenceUpdate,
     ReadState, Relationship, Role, User, Versioned, VoiceState, ADMINISTRATOR, BAN_MEMBERS, CONNECT,
-    CREATE_INSTANT_INVITE, CREATE_PRIVATE_THREADS, CREATE_PUBLIC_THREADS, KICK_MEMBERS, MANAGE_CHANNELS, MANAGE_EVENTS, MANAGE_GUILD,
-    MANAGE_MESSAGES, MANAGE_ROLES, MANAGE_THREADS, MANAGE_WEBHOOKS, PIN_MESSAGES, SEND_MESSAGES, SEND_MESSAGES_IN_THREADS, VIEW_AUDIT_LOG,
-    VIEW_CHANNEL,
+    CREATE_GUILD_EXPRESSIONS, CREATE_INSTANT_INVITE, CREATE_PRIVATE_THREADS, CREATE_PUBLIC_THREADS, KICK_MEMBERS, MANAGE_CHANNELS,
+    MANAGE_EVENTS, MANAGE_GUILD, MANAGE_GUILD_EXPRESSIONS, MANAGE_MESSAGES, MANAGE_ROLES, MANAGE_THREADS, MANAGE_WEBHOOKS,
+    PIN_MESSAGES, SEND_MESSAGES, SEND_MESSAGES_IN_THREADS, VIEW_AUDIT_LOG, VIEW_CHANNEL,
 };
 use super::{proto, Discord, GuildInfo, Quiet, Resumable, RoleInfo, WARM};
 use crate::hub::now;
@@ -244,6 +244,9 @@ pub(super) fn thread_read_only(timed_out: Option<i64>, now: i64, locked: bool, r
         (false, String::new())
     }
 }
+/// Membership flags. Neither one grants a permission bit.
+const BYPASSES_VERIFICATION: u64 = 1 << 2;
+const COMPLETED_ONBOARDING: u64 = 1 << 1;
 
 impl GuildInfo {
     /// Unix seconds when our server timeout ends, if still active.
@@ -264,6 +267,50 @@ impl GuildInfo {
             view_audit_log: perms & VIEW_AUDIT_LOG != 0,
             manage_server: not_timed_out && (perms & MANAGE_GUILD != 0),
         }
+    }
+
+    /// Why this member cannot talk yet. Empty when the only block is a missing send permission.
+    /// Timeout wins. A verification we cannot prove does not lock. Onboarding alone does not lock.
+    pub(super) fn lock_reason(&self, now: i64, me: &str) -> (bool, String) {
+        if let Some(until) = self.timed_out(now) {
+            let reason = timeout_reason(until, now);
+            if !reason.is_empty() {
+                return (true, reason);
+            }
+        }
+        let reason = self.gate_reason(now, me);
+        if reason.is_empty() {
+            (false, String::new())
+        } else {
+            (true, reason)
+        }
+    }
+
+    pub(super) fn gate_reason(&self, now: i64, me: &str) -> String {
+        if self.pending {
+            return "Accept the rules to talk here".to_owned();
+        }
+        if self.bypass_verification {
+            return String::new();
+        }
+        let level = self.verification.unwrap_or(0);
+        if level >= 4 && self.phone == Some(false) {
+            return "This server needs a verified phone".to_owned();
+        }
+        if level >= 1 && self.verified == Some(false) {
+            return "This server needs a verified email".to_owned();
+        }
+        if level >= 2 {
+            let born_ms = (number(me) >> 22) + 1_420_070_400_000;
+            let now_ms = (now.max(0) as u64).saturating_mul(1000);
+            if now_ms.saturating_sub(born_ms) < 5 * 60 * 1000 {
+                return "This server needs an account older than 5 minutes".to_owned();
+            }
+        }
+        if level >= 3 && self.joined > 0 && now.saturating_sub(self.joined) < 10 * 60 {
+            return "This server needs you to be a member for 10 minutes".to_owned();
+        }
+        String::new()
     }
 
     /// Base server-wide permissions from `@everyone` and our roles (without channel overwrites).
@@ -328,8 +375,8 @@ impl GuildInfo {
         let timed_out = self.timed_out(clock);
         let perms = self.permissions(guild, me, channel);
         let can_connect = perms & CONNECT != 0;
-        let read_only_reason = timed_out.map(|until| timeout_reason(until, clock)).unwrap_or_default();
-        let read_only = timed_out.is_some() || (written && perms & SEND_MESSAGES == 0);
+        let (locked, read_only_reason) = self.lock_reason(clock, me);
+        let read_only = locked || (written && perms & SEND_MESSAGES == 0);
         let rights = protocol::ConversationRights {
             pin: timed_out.is_none() && (perms & (MANAGE_MESSAGES | PIN_MESSAGES) != 0),
             delete_others: timed_out.is_none() && (perms & MANAGE_MESSAGES != 0),
@@ -402,6 +449,12 @@ impl Discord {
         }
         let categories = guild.channels.iter().filter(|channel| channel.kind == model::CATEGORY);
         let categories = categories.map(|category| (category.id.clone(), (category.position, category.name.clone().unwrap_or_default())));
+        let features = guild.listed_features().unwrap_or(&[]);
+        let member_flags = member.map(|member| member.flags).unwrap_or(0);
+        let (verified, phone) = {
+            let state = self.state.lock().unwrap();
+            (state.verified, state.phone)
+        };
         GuildInfo {
             name: guild.name().to_owned(),
             icon: guild.icon().map(str::to_owned),
@@ -429,6 +482,15 @@ impl Discord {
             timeout_until: member.and_then(|member| member.communication_disabled_until.as_deref()).and_then(model::iso_seconds),
             onboarding_defaults: HashSet::new(),
             onboarding_fetched: false,
+            pending: member.is_some_and(|member| member.pending),
+            bypass_verification: member_flags & BYPASSES_VERIFICATION != 0,
+            verification: guild.verification_level(),
+            onboarding: features.iter().any(|feature| feature == "GUILD_ONBOARDING"),
+            onboarding_done: member_flags & COMPLETED_ONBOARDING != 0,
+            manual: features.iter().any(|feature| feature == "MEMBER_VERIFICATION_MANUAL_APPROVAL"),
+            rules: features.iter().any(|feature| feature == "MEMBER_VERIFICATION_GATE_ENABLED"),
+            verified,
+            phone,
             emojis: guild.emojis.iter().filter(|emoji| emoji.available).filter_map(|emoji| {
                 Some(super::Pickable {
                     id: emoji.id.clone()?,
@@ -537,6 +599,9 @@ impl Discord {
             thread_rights.slowmode_exempt = slowmode_exempt(*parent_perms, true);
             let locked = thread.thread_metadata.as_ref().is_some_and(|m| m.locked);
             let (read_only, read_only_reason) = thread_read_only(timed_out, clock, locked, &thread_rights);
+            // The server's gate (rules not accepted, verification) locks a thread no lock or timeout already closed.
+            let (gated, gate_reason) = info.lock_reason(clock, me);
+            let (read_only, read_only_reason) = if !read_only && gated { (true, gate_reason) } else { (read_only, read_only_reason) };
             let row = ConversationRow {
                 parent: thread.parent_id.clone(),
                 // A thread started from a message has that message's id.
@@ -694,7 +759,7 @@ impl Discord {
             ..Guild::default()
         };
         let me = self.me();
-        let (tree, muted) = {
+        let (tree, muted, locked, reason) = {
             let mut state = self.state.lock().unwrap();
             let Some(info) = state.guilds.get_mut(guild_id) else {
                 return Ok(());
@@ -706,8 +771,9 @@ impl Discord {
             let threads = threads.into_iter().filter(|(id, parent)| !visible.contains(id) && visible.contains(parent));
             info.channels.extend(threads);
             let now = now();
+            let (locked, reason) = info.lock_reason(now, &me);
             let muted: Vec<bool> = tree.rows.iter().map(|row| info.quiet.mutes(&row.id, row.group.as_deref(), now)).collect();
-            (tree, muted)
+            (tree, muted, locked, reason)
         };
         self.ctx.tree(guild_id, &tree.groups, &tree.rows)?;
         self.release_idle_slowmode(&tree.rows);
@@ -720,6 +786,9 @@ impl Discord {
         for (row, muted) in tree.rows.iter().zip(muted) {
             self.ctx.muted(&row.id, muted)?;
         }
+        // Forum posts never take a tree place, and a channel's threads name their parent, so
+        // the replacement above leaves both. The gate they were planted with is written again.
+        self.ctx.restamp_threads(guild_id, locked, &reason)?;
         let clock = now();
         let flags = self.state.lock().unwrap().guilds.get(guild_id).map(|info| {
             (info.quiet.server_muted(clock), info.quiet.hide_muted, info.quiet.opt_in, info.can_invite, info.space_rights(guild_id, clock))
@@ -757,6 +826,7 @@ impl Discord {
             // What the server's info says we may do (our nickname) follows our permissions.
             self.ctx.space_info_stale(guild);
             self.replant(guild)?;
+            self.spaces()?;
         }
         Ok(())
     }
@@ -769,7 +839,10 @@ impl Discord {
         roles.sort_unstable();
         let is_me = uid == self.me();
         let timeout_until = member.communication_disabled_until.as_deref().and_then(model::iso_seconds);
-        let (moved, timeout_changed, roster_refresh, icon_file) = {
+        let pending = member.pending;
+        let bypass = member.flags & BYPASSES_VERIFICATION != 0;
+        let onboarding_done = member.flags & COMPLETED_ONBOARDING != 0;
+        let (moved, timeout_changed, roster_refresh, icon_file, gate_changed) = {
             let mut state = self.state.lock().unwrap();
             let state = &mut *state;
             let Some(info) = state.guilds.get_mut(guild) else {
@@ -801,13 +874,17 @@ impl Discord {
                 }
             }
             if !is_me {
-                (false, false, roster_refresh, icon_file)
+                (false, false, roster_refresh, icon_file, false)
             } else {
                 let mut before = std::mem::replace(&mut info.my_roles, roles.clone());
                 before.sort_unstable();
                 info.nick = member.nick.clone().unwrap_or_default();
                 let prev_timeout = std::mem::replace(&mut info.timeout_until, timeout_until);
-                (before != roles, prev_timeout != timeout_until, roster_refresh, icon_file)
+                let gate_changed = info.pending != pending || info.bypass_verification != bypass || info.onboarding_done != onboarding_done;
+                info.pending = pending;
+                info.bypass_verification = bypass;
+                info.onboarding_done = onboarding_done;
+                (before != roles, prev_timeout != timeout_until, roster_refresh, icon_file, gate_changed)
             }
         };
         if let Some(file) = icon_file {
@@ -816,8 +893,11 @@ impl Discord {
         if let Some(channel) = roster_refresh {
             self.ctx.members_changed(&channel);
         }
-        if moved || timeout_changed {
+        if moved || timeout_changed || gate_changed {
             self.replant(guild)?;
+        }
+        if moved {
+            self.spaces()?;
         }
         if timeout_changed {
             self.reschedule_unmute();
@@ -829,11 +909,21 @@ impl Discord {
     pub(super) fn spaces(&self) -> rusqlite::Result<()> {
         let now = now();
         let mut flags = Vec::new();
+        let mut manage = Vec::new();
         let (rows, files): (Vec<SpaceRow>, Vec<(MediaFile, String)>) = {
             let state = self.state.lock().unwrap();
             flags.extend(state.guilds.iter().map(|(id, info)| {
                 (id.clone(), info.quiet.server_muted(now), info.quiet.hide_muted, info.quiet.opt_in, info.can_invite, info.space_rights(id, now))
             }));
+            for (id, info) in &state.guilds {
+                let perms = info.base_permissions(id);
+                manage.push((
+                    id.clone(),
+                    perms & MANAGE_WEBHOOKS != 0,
+                    perms & MANAGE_GUILD != 0,
+                    perms & (MANAGE_GUILD_EXPRESSIONS | CREATE_GUILD_EXPRESSIONS) != 0,
+                ));
+            }
             let mut rows = Vec::with_capacity(state.guilds.len());
             let mut files = Vec::new();
             for (id, info) in &state.guilds {
@@ -867,6 +957,9 @@ impl Discord {
             self.ctx.space_rights(&id, rights)?;
             self.ctx.set_space_opt_in(&id, opt_in)?;
             self.ctx.set_space_can_create_channels(&id, rights.manage_channels)?;
+        }
+        for (id, webhooks, guild, expressions) in manage {
+            self.ctx.set_space_manage(&id, webhooks, guild, expressions)?;
         }
         Ok(())
     }
@@ -989,6 +1082,47 @@ impl Discord {
         self.ctx.media(&[user.avatar()])?;
         self.ctx.people(&[user.person(None)])?;
         self.ctx.describe(user.name(), &user.id)
+    }
+
+    /// A phone or email Discord has just said is verified. The account snapshot is what a server
+    /// joined later copies. Every server already joined keeps its own copy, which is what the
+    /// composer lock reads, and one that was blocking is replanted so the lock lifts without a
+    /// reconnect, on its channels and on the threads and forum posts already planted.
+    pub(super) fn note_verified(&self, user: &User) -> Result<(), Failure> {
+        let email = user.verified == Some(true);
+        let phone = user.phone == Some(true);
+        if !email && !phone {
+            return Ok(());
+        }
+        let guilds = {
+            let mut state = self.state.lock().unwrap();
+            if email {
+                state.verified = Some(true);
+            }
+            if phone {
+                state.phone = Some(true);
+            }
+            let mut lift = Vec::new();
+            for (id, info) in state.guilds.iter_mut() {
+                let mut blocking = false;
+                if email && info.verified != Some(true) {
+                    blocking |= info.verified == Some(false);
+                    info.verified = Some(true);
+                }
+                if phone && info.phone != Some(true) {
+                    blocking |= info.phone == Some(false);
+                    info.phone = Some(true);
+                }
+                if blocking {
+                    lift.push(id.clone());
+                }
+            }
+            lift
+        };
+        for guild in guilds {
+            self.replant(&guild)?;
+        }
+        Ok(())
     }
 
     /// The user's server folders as JSON settings or protobuf ones carry them. Only a folder with
@@ -1166,6 +1300,8 @@ impl Discord {
                 url,
             });
             state.me = me.clone();
+            state.verified = ready.user.verified;
+            state.phone = ready.user.phone;
             state.users = names;
             state.users.insert(me.clone(), ready.user.name().to_owned());
             state.rows = kept;
@@ -1383,6 +1519,11 @@ impl Discord {
             }
         }
         self.ctx.presence(id, update.presence(), update.status(), owned);
+        // This session's playing line is only what the local user set. A presence that names
+        // us does not replace it, and is not shown as our activity.
+        if id == self.me() {
+            return;
+        }
         let mut files = Vec::new();
         if let Some(emoji_file) = update.emoji_file() {
             files.push(emoji_file);
@@ -1529,7 +1670,26 @@ impl Discord {
                 _ => false,
             }
         };
-        if tier_changed {
+        let verification_changed = {
+            let mut state = self.state.lock().unwrap();
+            let Some(info) = state.guilds.get_mut(&guild.id) else {
+                return Ok(());
+            };
+            let mut changed = false;
+            if let Some(level) = guild.verification_level() {
+                if info.verification != Some(level) {
+                    info.verification = Some(level);
+                    changed = true;
+                }
+            }
+            if let Some(features) = guild.listed_features() {
+                info.onboarding = features.iter().any(|feature| feature == "GUILD_ONBOARDING");
+                info.manual = features.iter().any(|feature| feature == "MEMBER_VERIFICATION_MANUAL_APPROVAL");
+                info.rules = features.iter().any(|feature| feature == "MEMBER_VERIFICATION_GATE_ENABLED");
+            }
+            changed
+        };
+        if tier_changed || verification_changed {
             self.replant(&guild.id)?;
         }
         self.ctx.space_info_stale(&guild.id);

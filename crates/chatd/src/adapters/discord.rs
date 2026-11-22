@@ -12,8 +12,10 @@
 
 mod audit;
 mod automod;
+mod admin;
 mod content;
 mod events;
+mod expressions;
 
 pub(super) fn prove_code_colors() -> Result<(), String> {
     protocol::highlight::prove_code_colors()
@@ -367,6 +369,24 @@ struct GuildInfo {
     onboarding_defaults: HashSet<String>,
     /// Whether `GET /guilds/{id}/onboarding` has already been fetched in this session.
     onboarding_fetched: bool,
+    /// Rules not accepted yet. Not a permission.
+    pending: bool,
+    /// Membership flag BYPASSES_VERIFICATION. It skips the verification lock only.
+    bypass_verification: bool,
+    /// Guild verification level when Discord sent one.
+    verification: Option<u8>,
+    /// The server has onboarding questions. That alone does not lock the composer.
+    onboarding: bool,
+    /// COMPLETED_ONBOARDING. Not a permission grant.
+    onboarding_done: bool,
+    /// A moderator still has to approve the join.
+    manual: bool,
+    /// MEMBER_VERIFICATION_GATE_ENABLED. The rules form is fetched when this or `pending` is set.
+    rules: bool,
+    /// Our verified email, copied off the session so a row can be built without locking state.
+    verified: Option<bool>,
+    /// Whether we have a phone, copied the same way. The number is never stored.
+    phone: Option<bool>,
     emojis: Vec<Pickable>,
     stickers: Vec<Pickable>,
     events: HashMap<String, StoredEvent>,
@@ -596,6 +616,12 @@ pub(super) fn kept_filing(known: Option<&protocol::Conversation>, archived: bool
 #[derive(Default)]
 struct State {
     me: String,
+    /// Verified email. READY writes it, and so does a later event once Discord says it is verified.
+    /// Missing is unknown.
+    verified: Option<bool>,
+    /// Whether this account has a phone. The number is never stored. Written the same way.
+    /// Missing is unknown.
+    phone: Option<bool>,
     session: Option<Resumable>,
     guilds: HashMap<String, GuildInfo>,
     /// Friends, pending requests and direct partners by id: the name shown for them.
@@ -634,6 +660,8 @@ struct State {
     own_emoji: String,
     own_emoji_id: Option<u64>,
     own_status_until: Option<i64>,
+    /// The "Playing" name this session publishes. Only `SetActivity` writes it.
+    own_activity: String,
     status_settings: Vec<u8>,
     /// Our guild folders protobuf block (field 14) and parsed folder list, kept so reordering
     /// or folder edits preserve unknown fields byte-for-byte.
@@ -673,6 +701,8 @@ struct State {
     doing: HashMap<String, (String, Option<protocol::Activity>)>,
     /// Cached private notes on people (`user_id -> note`), updated on fetch, write, and `USER_NOTE_UPDATE`.
     notes: HashMap<String, String>,
+    /// Vanity codes from Discovery, by server id. A code only, never a URL.
+    discovered_vanity: HashMap<String, String>,
     /// When the last profile was asked for: the route is watched, so one per 3 s at most.
     profiled: Option<Instant>,
     /// How many profiles have been asked for: one still waiting its turn that is not the newest
@@ -2277,6 +2307,249 @@ impl Discord {
         Ok(())
     }
 
+    /// Public servers (`GET /discoverable-guilds`, or `/search` when there is a query).
+    /// A URL in the listing is never requested and never stored as a join target.
+    fn discover(&self, query: &str, category: u32, offset: u32, limit: u32) -> Result<(Vec<protocol::DiscoveredGuild>, u32), Refusal> {
+        let query: String = query.trim().chars().take(100).collect();
+        let limit = if limit == 0 { 24 } else { limit.min(48) };
+        let path = if query.is_empty() {
+            let mut path = format!("/discoverable-guilds?limit={limit}&offset={offset}");
+            if category != 0 {
+                path.push_str(&format!("&categories={category}"));
+            }
+            path
+        } else {
+            let mut path = format!("/discoverable-guilds/search?query={}&limit={limit}&offset={offset}", escaped(&query));
+            if category != 0 {
+                path.push_str(&format!("&category_id={category}"));
+            }
+            path
+        };
+        let body = self.call("GET", &path, None).map_err(refusal)?;
+        let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        let total = parsed.get("total").and_then(Value::as_u64).unwrap_or(0).min(u64::from(u32::MAX)) as u32;
+        let mut guilds = Vec::new();
+        let mut vanity = Vec::new();
+        for row in parsed.get("guilds").and_then(Value::as_array).into_iter().flatten() {
+            let Some(id) = row.get("id").and_then(Value::as_str).filter(|id| discovery_snowflake(id)) else {
+                continue;
+            };
+            let Some(name) = row.get("name").and_then(Value::as_str).map(str::trim).filter(|name| !name.is_empty()) else {
+                continue;
+            };
+            // The route is already the public list. A features list that names something else is not.
+            let listed = row.get("features").and_then(Value::as_array);
+            if listed.is_some_and(|list| !list.is_empty() && !list.iter().any(|flag| flag.as_str() == Some("DISCOVERABLE"))) {
+                continue;
+            }
+            let icon = row.get("icon").and_then(Value::as_str).filter(|hash| icon_hash(hash)).unwrap_or("").to_owned();
+            let description: String = row.get("description").and_then(Value::as_str).unwrap_or("").chars().take(300).collect();
+            if let Some(code) = row.get("vanity_url_code").and_then(Value::as_str).filter(|code| discovery_code(code)) {
+                vanity.push((id.to_owned(), code.to_owned()));
+            }
+            let count = |key: &str| row.get(key).and_then(Value::as_u64).unwrap_or(0).min(u64::from(u32::MAX)) as u32;
+            guilds.push(protocol::DiscoveredGuild {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                description,
+                icon,
+                members: count("approximate_member_count"),
+                online: count("approximate_presence_count"),
+            });
+        }
+        if !vanity.is_empty() {
+            let mut state = crate::hub::lock(&self.state);
+            if state.discovered_vanity.len() > 128 {
+                state.discovered_vanity.clear();
+            }
+            for (id, code) in vanity {
+                state.discovered_vanity.insert(id, code);
+            }
+        }
+        Ok((guilds, total))
+    }
+
+    /// Joins a public server by its id (`PUT /guilds/{id}/members/@me`). A vanity code stored
+    /// from that listing is the only fallback, and only when it is a code.
+    fn join_discovered(&self, guild_id: &str) -> Result<(Option<String>, Option<String>), Refusal> {
+        if !discovery_snowflake(guild_id) {
+            return Err(Refusal::Refused("That is not a server you can join from Discovery.".to_owned()));
+        }
+        let vanity = crate::hub::lock(&self.state).discovered_vanity.get(guild_id).cloned().filter(|code| discovery_code(code));
+        let path = format!("/guilds/{guild_id}/members/@me");
+        match self.rest.call_once_with("PUT", &path, Some(json!({})), &[]) {
+            Ok(_) => Ok((Some(guild_id.to_owned()), None)),
+            Err(err) => match vanity {
+                Some(code) => self.invite_join(&code),
+                None => Err(refusal(err)),
+            },
+        }
+    }
+
+    /// The rules form and onboarding questions for one server. Phone and email, when we know
+    /// they are missing, point at Discord's own app. Nothing in the JSON is opened or fetched.
+    fn space_gate(&self, guild_id: &str) -> Result<protocol::SpaceGate, Refusal> {
+        if !discovery_snowflake(guild_id) {
+            return Err(Refusal::Refused("That is not a server.".to_owned()));
+        }
+        let (mut gate, rules, onboarding) = self.gate_snapshot(guild_id)?;
+        if rules {
+            if let Ok(form) = self.get_json(&format!("/guilds/{guild_id}/member-verification")) {
+                fill_form(&mut gate, &form);
+            }
+        }
+        if onboarding {
+            if let Ok(board) = self.get_json(&format!("/guilds/{guild_id}/onboarding")) {
+                fill_prompts(&mut gate, &board);
+            }
+        }
+        Ok(gate)
+    }
+
+    /// Accepts the rules. The form is read again and sent back whole, with this member's answers
+    /// filled in. A required check Discord has to do itself is not submitted.
+    fn accept_rules(&self, guild_id: &str, answers: &[String]) -> Result<protocol::SpaceGate, Refusal> {
+        if !discovery_snowflake(guild_id) {
+            return Err(Refusal::Refused("That is not a server.".to_owned()));
+        }
+        let form = self.get_json(&format!("/guilds/{guild_id}/member-verification"))?;
+        let fields = form.get("form_fields").and_then(Value::as_array).cloned().unwrap_or_default();
+        if fields.is_empty() {
+            return Err(Refusal::Refused("This server has no rules to accept.".to_owned()));
+        }
+        let mut filled = Vec::with_capacity(fields.len());
+        for (index, mut field) in fields.into_iter().enumerate() {
+            if !field.is_object() {
+                filled.push(field);
+                continue;
+            }
+            let kind = field.get("field_type").and_then(Value::as_str).unwrap_or("").to_owned();
+            let required = field.get("required").and_then(Value::as_bool).unwrap_or(false);
+            let answer = answers.get(index).map(String::as_str).unwrap_or("");
+            match kind.as_str() {
+                "TERMS" => {
+                    let yes = matches!(answer.to_ascii_lowercase().as_str(), "true" | "yes" | "1");
+                    if required && !yes {
+                        return Err(Refusal::Refused("Accept the rules to continue.".to_owned()));
+                    }
+                    field["response"] = json!(yes);
+                }
+                "MULTIPLE_CHOICE" => {
+                    if answer.is_empty() {
+                        if required {
+                            return Err(Refusal::Refused("Pick one of the choices.".to_owned()));
+                        }
+                    } else {
+                        let choice: u64 = answer.parse().map_err(|_| Refusal::Refused("Pick one of the choices.".to_owned()))?;
+                        field["response"] = json!(choice);
+                    }
+                }
+                "TEXT_INPUT" | "PARAGRAPH" => {
+                    let text: String = answer.chars().take(1000).collect();
+                    if required && text.trim().is_empty() {
+                        return Err(Refusal::Refused("Fill in every required answer.".to_owned()));
+                    }
+                    if !text.is_empty() {
+                        field["response"] = json!(text);
+                    }
+                }
+                "VERIFICATION" if required => {
+                    return Err(Refusal::Refused("That check can only be done in Discord.".to_owned()));
+                }
+                _ if required => {
+                    return Err(Refusal::Refused("This server asks for something that can only be finished in Discord.".to_owned()));
+                }
+                _ => {}
+            }
+            filled.push(field);
+        }
+        let version = form.get("version").cloned().unwrap_or(Value::Null);
+        let body = json!({"form_fields": filled, "version": version});
+        let text = self
+            .rest
+            .call_once_with("PUT", &format!("/guilds/{guild_id}/requests/@me"), Some(body), &[])
+            .map_err(refusal)?;
+        let parsed = parse_body(&text);
+        if accept_cleared(&parsed) {
+            {
+                let mut state = crate::hub::lock(&self.state);
+                if let Some(info) = state.guilds.get_mut(guild_id) {
+                    info.pending = false;
+                }
+            }
+            let _ = self.replant(guild_id);
+        }
+        let (mut gate, _, _) = self.gate_snapshot(guild_id)?;
+        fill_form(&mut gate, &form);
+        Ok(gate)
+    }
+
+    /// Sends onboarding answers. Option ids that were not in the questions are dropped.
+    /// Discord assigns any roles itself; this does not.
+    fn submit_onboarding(&self, guild_id: &str, options: &[String]) -> Result<(), Refusal> {
+        if !discovery_snowflake(guild_id) {
+            return Err(Refusal::Refused("That is not a server.".to_owned()));
+        }
+        let onboarding = crate::hub::lock(&self.state).guilds.get(guild_id).is_some_and(|info| info.onboarding);
+        if !onboarding {
+            return Err(Refusal::Refused("This server has no setup questions.".to_owned()));
+        }
+        let board = self.get_json(&format!("/guilds/{guild_id}/onboarding"))?;
+        let allowed = prompt_option_ids(&board);
+        let mut picked = Vec::new();
+        for id in options {
+            if discovery_snowflake(id) && allowed.contains(id) && !picked.iter().any(|kept: &String| kept == id) {
+                picked.push(id.to_owned());
+            }
+            if picked.len() == 750 {
+                break;
+            }
+        }
+        if !options.is_empty() && picked.is_empty() {
+            return Err(Refusal::Refused("Those answers are not part of this server's questions.".to_owned()));
+        }
+        let (prompts_seen, responses_seen) = if options.is_empty() {
+            (serde_json::Map::new(), serde_json::Map::new())
+        } else {
+            seen_maps(&board, &picked)
+        };
+        let body = json!({
+            "onboarding_responses": picked,
+            "onboarding_prompts_seen": prompts_seen,
+            "onboarding_responses_seen": responses_seen,
+        });
+        self.rest
+            .call_once_with("POST", &format!("/guilds/{guild_id}/onboarding-responses"), Some(body), &[])
+            .map_err(refusal)?;
+        Ok(())
+    }
+
+    fn gate_snapshot(&self, guild_id: &str) -> Result<(protocol::SpaceGate, bool, bool), Refusal> {
+        let state = crate::hub::lock(&self.state);
+        let me = state.me.clone();
+        let Some(info) = state.guilds.get(guild_id) else {
+            return Err(Refusal::Refused("You are not in that server.".to_owned()));
+        };
+        let reason = info.gate_reason(crate::hub::now(), &me);
+        let mut gate = protocol::SpaceGate {
+            pending: info.pending,
+            verification: info.verification.unwrap_or(0),
+            manual: info.manual,
+            onboarding: info.onboarding,
+            reason: reason.clone(),
+            ..protocol::SpaceGate::default()
+        };
+        if reason.contains("verified phone") || reason.contains("verified email") {
+            gate.external = "https://discord.com/app".to_owned();
+        }
+        Ok((gate, info.pending || info.rules, info.onboarding))
+    }
+
+    fn get_json(&self, path: &str) -> Result<Value, Refusal> {
+        let text = self.call("GET", path, None).map_err(refusal)?;
+        Ok(parse_body(&text))
+    }
+
     /// Our own presence, and custom status (text, emoji, clear-after) unless all three are `None`.
     /// Both are settings: the web client saves them (protobuf, `settings-proto/1`) and tells the
     /// gateway (op 3), and so does this.
@@ -2363,18 +2636,22 @@ impl Discord {
         let settings = proto::with_custom_status(&kept, word, changing_custom.then_some(&custom));
         let body = json!({"settings": proto::settings(&settings)});
         self.call("PATCH", "/users/@me/settings-proto/1", Some(body)).map_err(refusal)?;
-        let activities = if custom.is_empty() {
-            json!([])
-        } else {
-            let emoji_json = if let Some(id) = custom.emoji_id {
-                json!({"id": id.to_string(), "name": custom.emoji_name, "animated": animated})
-            } else if !custom.emoji_name.is_empty() {
-                json!({"id": null, "name": custom.emoji_name, "animated": false})
-            } else {
-                Value::Null
-            };
-            json!([{"name": "Custom Status", "type": 4, "state": custom.text, "emoji": emoji_json}])
-        };
+        let playing = crate::hub::lock(&self.state).own_activity.clone();
+        let mut activities = Vec::new();
+        if !custom.is_empty() {
+                let emoji_json = if let Some(id) = custom.emoji_id {
+                    json!({"id": id.to_string(), "name": custom.emoji_name, "animated": animated})
+                } else if !custom.emoji_name.is_empty() {
+                    json!({"id": null, "name": custom.emoji_name, "animated": false})
+                } else {
+                    Value::Null
+                };
+            activities.push(json!({"name": "Custom Status", "type": 4, "state": custom.text, "emoji": emoji_json}));
+        }
+        // The local "Playing" name goes out with the status, as `set_activity` sends it.
+        if !playing.is_empty() {
+            activities.push(json!({"name": playing, "type": 0}));
+        }
         self.tell(3, json!({"status": word, "since": 0, "activities": activities, "afk": false}));
         let until = custom.expires_at_ms.map(|ms| (ms / 1000) as i64);
         {
@@ -2465,6 +2742,20 @@ impl Discord {
         }
         self.record_folders(&next).map_err(|err| Refusal::Refused(err.to_string()))?;
         self.spaces().map_err(|err| Refusal::Refused(err.to_string()))
+    }
+    /// Publishes the local user's "Playing" name on this session. Empty clears it.
+    /// A later status change sends it again, and a presence that names us does not replace it.
+    fn set_activity(&self, mut name: String) -> Result<(), Refusal> {
+        protocol::clip(&mut name, 128);
+        let (presence, text, playing) = {
+            let mut state = crate::hub::lock(&self.state);
+            state.own_activity = name;
+            let (presence, text) = state.own.clone();
+            (presence, text, state.own_activity.clone())
+        };
+        let word = presence_word(presence);
+        self.tell(3, json!({"status": word, "since": 0, "activities": session_activities(&text, &playing), "afk": false}));
+        Ok(())
     }
 
     /// Acknowledges reading up to `message`. At most one per channel per [`ACK_EVERY`]: a read
@@ -3578,6 +3869,7 @@ impl Discord {
             }
             Command::SetAvatar { path, reply } => answer(reply, self.set_avatar(&path)),
             Command::SetNickname { space_id, nickname, reply } => answer(reply, self.set_nickname(&space_id, nickname)),
+            Command::SetActivity { name, reply } => answer(reply, self.set_activity(name)),
             Command::Profile { person_id, reply } => answer(reply, self.profile(&person_id, None)),
             Command::ProfileIn { person_id, space_id, reply } => answer(reply, self.profile(&person_id, Some(&space_id))),
             Command::ConversationInfo { conversation_id, reply } => answer(reply, self.conversation_info(&conversation_id)),
@@ -3724,7 +4016,46 @@ impl Discord {
             Command::SaveAutomodRule { space_id, rule, reply } => answer(reply, self.save_automod_rule(&space_id, &rule)),
             Command::DeleteAutomodRule { space_id, rule_id, reply } => answer(reply, self.delete_automod_rule(&space_id, &rule_id)),
             Command::SaveSpaceSafety { space_id, safety, reply } => answer(reply, self.save_space_safety(&space_id, &safety)),
+            Command::Discover { query, category, offset, limit, reply } => {
+                answer(reply, self.discover(&query, category, offset, limit))
+            }
+            Command::JoinDiscovered { guild_id, reply } => answer(reply, self.join_discovered(&guild_id)),
+            Command::SpaceGate { space_id, reply } => answer(reply, self.space_gate(&space_id)),
+            Command::AcceptRules { space_id, answers, reply } => answer(reply, self.accept_rules(&space_id, &answers)),
+            Command::SubmitOnboarding { space_id, options, reply } => answer(reply, self.submit_onboarding(&space_id, &options)),
             Command::LeaveSpace { space_id, reply } => answer(reply, self.leave_space(&space_id)),
+            Command::SpaceIntegrations { space_id, reply } => answer(reply, self.space_integrations(&space_id)),
+            Command::CreateWebhook { conversation_id, name, reply } => {
+                answer(reply, self.create_webhook(&conversation_id, &name))
+            }
+            Command::EditWebhook { space_id, webhook_id, name, channel_id, reply } => {
+                answer(reply, self.edit_webhook(&space_id, &webhook_id, name, channel_id))
+            }
+            Command::DeleteWebhook { space_id, webhook_id, reply } => {
+                answer(reply, self.delete_webhook(&space_id, &webhook_id))
+            }
+            Command::RemoveIntegration { space_id, integration_id, reply } => {
+                answer(reply, self.remove_integration(&space_id, &integration_id))
+            }
+            Command::SpaceExpressions { space_id, reply } => answer(reply, self.space_expressions(&space_id)),
+            Command::CreateEmoji { space_id, name, path, reply } => {
+                answer(reply, self.create_emoji(&space_id, &name, &path))
+            }
+            Command::EditEmoji { space_id, emoji_id, name, roles, reply } => {
+                answer(reply, self.edit_emoji(&space_id, &emoji_id, name, roles))
+            }
+            Command::DeleteEmoji { space_id, emoji_id, reply } => {
+                answer(reply, self.delete_emoji(&space_id, &emoji_id))
+            }
+            Command::CreateSticker { space_id, name, tags, description, path, reply } => {
+                answer(reply, self.create_sticker(&space_id, &name, &tags, &description, &path))
+            }
+            Command::EditSticker { space_id, sticker_id, name, tags, description, reply } => {
+                answer(reply, self.edit_sticker(&space_id, &sticker_id, name, tags, description))
+            }
+            Command::DeleteSticker { space_id, sticker_id, reply } => {
+                answer(reply, self.delete_sticker(&space_id, &sticker_id))
+            }
             Command::CloseDirect { conversation_id, reply } => answer(reply, self.leave(&conversation_id, true, false)),
             Command::AnswerMessageRequest { conversation_id, accept, reply } => {
                 answer(reply, self.answer_message_request(&conversation_id, accept))
@@ -4294,6 +4625,177 @@ fn add_friend_refusal(err: Refused) -> Refusal {
     }
 }
 
+fn presence_word(presence: Presence) -> &'static str {
+    match presence {
+        Presence::Idle => "idle",
+        Presence::Dnd => "dnd",
+        Presence::Offline => "invisible",
+        Presence::Online | Presence::Unknown | Presence::Busy => "online",
+    }
+}
+
+/// This session's gateway activities: the custom status, then the local "Playing" name.
+/// Empty is an empty list, which clears only this session. No application id is invented.
+fn session_activities(status: &str, playing: &str) -> Value {
+    let mut activities = Vec::new();
+    if !status.is_empty() {
+        activities.push(json!({"name": "Custom Status", "type": 4, "state": status, "emoji": null}));
+    }
+    if !playing.is_empty() {
+        activities.push(json!({"name": playing, "type": 0}));
+    }
+    Value::Array(activities)
+}
+
+fn parse_body(text: &str) -> Value {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed == "null" {
+        return Value::Null;
+    }
+    serde_json::from_str(trimmed).unwrap_or(Value::Null)
+}
+
+fn clip_chars(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
+}
+
+fn text_at(value: &Value, key: &str, max: usize) -> String {
+    value.get(key).and_then(Value::as_str).map(|text| clip_chars(text, max)).unwrap_or_default()
+}
+
+fn string_list(value: Option<&Value>, max_items: usize, max_chars: usize) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items.iter().filter_map(Value::as_str).take(max_items).map(|text| clip_chars(text, max_chars)).collect()
+        })
+        .unwrap_or_default()
+}
+
+fn choice_list(value: Option<&Value>) -> Vec<String> {
+    let Some(items) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .take(12)
+        .filter_map(|item| {
+            item.as_str()
+                .or_else(|| item.get("label").and_then(Value::as_str))
+                .or_else(|| item.get("value").and_then(Value::as_str))
+                .map(|text| clip_chars(text, 200))
+        })
+        .collect()
+}
+
+/// Copies the form's words. It does not request anything those words mention.
+fn fill_form(gate: &mut protocol::SpaceGate, form: &Value) {
+    if let Some(description) = form.get("description").and_then(Value::as_str) {
+        gate.description = clip_chars(description, 2000);
+    }
+    let Some(fields) = form.get("form_fields").and_then(Value::as_array) else {
+        return;
+    };
+    gate.fields.clear();
+    for field in fields.iter().take(5) {
+        gate.fields.push(protocol::GateField {
+            label: text_at(field, "label", 200),
+            kind: text_at(field, "field_type", 40),
+            values: string_list(field.get("values"), 8, 2000),
+            required: field.get("required").and_then(Value::as_bool).unwrap_or(false),
+            choices: choice_list(field.get("choices")),
+        });
+    }
+}
+
+fn fill_prompts(gate: &mut protocol::SpaceGate, board: &Value) {
+    let Some(prompts) = board.get("prompts").and_then(Value::as_array) else {
+        return;
+    };
+    gate.prompts.clear();
+    for prompt in prompts.iter().take(12) {
+        let mut options = Vec::new();
+        if let Some(list) = prompt.get("options").and_then(Value::as_array) {
+            for option in list.iter().take(25) {
+                let Some(id) = option.get("id").and_then(Value::as_str).filter(|id| discovery_snowflake(id)) else {
+                    continue;
+                };
+                let label = option.get("title").or_else(|| option.get("label")).and_then(Value::as_str).unwrap_or("");
+                options.push(protocol::GateOption { id: id.to_owned(), label: clip_chars(label, 200) });
+            }
+        }
+        let label = prompt.get("title").or_else(|| prompt.get("label")).and_then(Value::as_str).unwrap_or("");
+        gate.prompts.push(protocol::GatePrompt { label: clip_chars(label, 200), options });
+    }
+}
+
+fn prompt_option_ids(board: &Value) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    let Some(prompts) = board.get("prompts").and_then(Value::as_array) else {
+        return ids;
+    };
+    for prompt in prompts {
+        let Some(list) = prompt.get("options").and_then(Value::as_array) else {
+            continue;
+        };
+        for option in list {
+            if let Some(id) = option.get("id").and_then(Value::as_str).filter(|id| discovery_snowflake(id)) {
+                ids.insert(id.to_owned());
+            }
+        }
+    }
+    ids
+}
+
+fn seen_maps(board: &Value, picked: &[String]) -> (serde_json::Map<String, Value>, serde_json::Map<String, Value>) {
+    let mut prompts_seen = serde_json::Map::new();
+    let mut responses_seen = serde_json::Map::new();
+    let Some(prompts) = board.get("prompts").and_then(Value::as_array) else {
+        return (prompts_seen, responses_seen);
+    };
+    for prompt in prompts {
+        if let Some(id) = prompt.get("id").and_then(Value::as_str).filter(|id| discovery_snowflake(id)) {
+            prompts_seen.insert(id.to_owned(), Value::Bool(true));
+        }
+        let Some(list) = prompt.get("options").and_then(Value::as_array) else {
+            continue;
+        };
+        for option in list {
+            let Some(id) = option.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            if picked.iter().any(|picked| picked == id) {
+                responses_seen.insert(id.to_owned(), Value::Bool(true));
+            }
+        }
+    }
+    (prompts_seen, responses_seen)
+}
+
+/// Pending is cleared only when Discord says the join is through.
+fn accept_cleared(body: &Value) -> bool {
+    let approved = |value: &Value| {
+        value.get("pending") == Some(&Value::Bool(false))
+            || value.get("application_status").and_then(Value::as_str) == Some("APPROVED")
+    };
+    approved(body) || body.get("member").is_some_and(approved) || body.get("guild_member").is_some_and(approved)
+}
+
+/// Digits only. A URL is not a server id.
+fn discovery_snowflake(id: &str) -> bool {
+    (1..=20).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// A vanity code from a listing: letters, digits, and hyphens. Never a URL.
+fn discovery_code(code: &str) -> bool {
+    (2..=32).contains(&code.len()) && code.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+/// Discord's icon hash. A slash or a colon means it is a URL, which is dropped.
+fn icon_hash(hash: &str) -> bool {
+    (1..=64).contains(&hash.len()) && hash.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
 /// Extracts a Discord invite code from `discord.gg/<code>`, `discord.com/invite/<code>`,
 /// `discordapp.com/invite/<code>`, or a bare invite code.
 fn parse_discord_invite_code(raw: &str) -> Result<String, String> {
@@ -4418,6 +4920,22 @@ pub(super) fn ack_bulk_payloads(reads: &[(String, String)]) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_phone_number_is_not_kept_and_a_missing_one_is_unknown() {
+        let missing: User = serde_json::from_str(r#"{"id":"1","username":"a"}"#).unwrap();
+        assert_eq!(missing.phone, None);
+        assert_eq!(missing.verified, None);
+        let empty: User = serde_json::from_str(r#"{"id":"1","username":"a","phone":null,"verified":null}"#).unwrap();
+        assert_eq!(empty.phone, Some(false));
+        assert_eq!(empty.verified, None);
+        let blank: User = serde_json::from_str(r#"{"id":"1","username":"a","phone":"","verified":false}"#).unwrap();
+        assert_eq!(blank.phone, Some(false));
+        assert_eq!(blank.verified, Some(false));
+        let set: User = serde_json::from_str(r#"{"id":"1","username":"a","phone":"+15555550100","verified":true}"#).unwrap();
+        assert_eq!(set.phone, Some(true));
+        assert!(!format!("{set:?}").contains("555"));
+    }
 
     #[test]
     fn the_account_is_named_by_the_user_id_in_the_token() {

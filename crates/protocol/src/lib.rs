@@ -363,6 +363,15 @@ pub struct Space {
     /// Server-level management permissions for this account inside this Space.
     #[serde(default, skip_serializing_if = "SpaceRights::is_empty")]
     pub rights: SpaceRights,
+    /// The user has permission to manage webhooks in this Space (`MANAGE_WEBHOOKS`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_manage_webhooks: bool,
+    /// The user has permission to manage server integrations in this Space (`MANAGE_GUILD`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_manage_guild: bool,
+    /// The user has permission to manage or create emoji/stickers in this Space (`MANAGE_GUILD_EXPRESSIONS` / `CREATE_GUILD_EXPRESSIONS`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_manage_expressions: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1601,8 +1610,10 @@ pub enum Request {
         limit: u32,
     },
     /// Ask the network itself for messages, as the pane's Enter does: a server's own search
-    /// when a Space is the scope, the channel's when one conversation is, one account/network, or
-    /// everywhere across every connected account that supports global search.
+    /// when a Space is the scope, the channel's when one conversation is, one account's direct
+    /// messages when `home` is set, one account/network, or everywhere across every connected
+    /// account that supports global search. `home` is one Discord account's direct messages,
+    /// not a search of every server.
     SearchNetwork {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conversation: Option<Key>,
@@ -1617,6 +1628,9 @@ pub enum Request {
         filters: SearchFilters,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor: Option<String>,
+        /// All direct messages on `account`. Discord only; ignored for an everywhere search.
+        #[serde(default, skip_serializing_if = "is_false")]
+        home: bool,
     },
     /// Keeps what the user typed and did not send. Empty text forgets it. Local: no network
     /// hears of it and no change is announced.
@@ -2175,6 +2189,13 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         clear_at: Option<i64>,
     },
+    /// What this session says it is playing. Empty clears it. The name is the local user's;
+    /// another member cannot set it.
+    SetActivity {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        name: String,
+    },
     /// Our own profile on one account. `None` leaves that part. An empty about or emoji clears
     /// it. A username, or `photo`, is refused: those are still changed on the phone. Signal is
     /// the account that accepts a name, about, and about emoji.
@@ -2373,6 +2394,116 @@ pub enum Request {
         space: Key,
         event_id: String,
         interested: bool,
+    },
+    /// Browse or search Discord's public servers. `query` empty is the listing.
+    Discover {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        query: String,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        category: u32,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        offset: u32,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        limit: u32,
+    },
+    /// Join a server from Discovery by its id. Not a URL and not an invite link.
+    JoinDiscovered {
+        account: AccountKey,
+        guild_id: String,
+    },
+    /// A server's rules and onboarding, for the member who is looking at it.
+    SpaceGate {
+        space: Key,
+    },
+    /// Accept that server's rules. `answers` follow the form fields, in order.
+    AcceptRules {
+        space: Key,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        answers: Vec<String>,
+    },
+    /// Finish that server's onboarding. `options` are snowflake ids from its questions.
+    SubmitOnboarding {
+        space: Key,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        options: Vec<String>,
+    },
+    /// Read a Space's webhooks, followed channels, and installed bots/integrations.
+    SpaceIntegrations {
+        space: Key,
+    },
+    /// Create an incoming webhook in a channel.
+    CreateWebhook {
+        conversation: Key,
+        name: String,
+    },
+    /// Rename or move an existing webhook in a Space.
+    EditWebhook {
+        space: Key,
+        webhook_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel_id: Option<String>,
+    },
+    /// Delete a webhook (or unfollow a followed announcement channel) in a Space.
+    DeleteWebhook {
+        space: Key,
+        webhook_id: String,
+    },
+    /// Remove an installed bot or integration from a Space.
+    RemoveIntegration {
+        space: Key,
+        integration_id: String,
+    },
+    /// Read a Space's custom emoji, stickers, slot counts, and available roles.
+    SpaceExpressions {
+        space: Key,
+    },
+    /// Upload a new custom emoji to a Space from a local image file.
+    CreateEmoji {
+        space: Key,
+        name: String,
+        path: String,
+    },
+    /// Rename or change role restrictions on an existing custom emoji in a Space.
+    EditEmoji {
+        space: Key,
+        emoji_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        roles: Option<Vec<String>>,
+    },
+    /// Delete a custom emoji from a Space.
+    DeleteEmoji {
+        space: Key,
+        emoji_id: String,
+    },
+    /// Upload a new custom sticker (PNG, APNG, or Lottie JSON) to a Space.
+    CreateSticker {
+        space: Key,
+        name: String,
+        tags: String,
+        #[serde(default)]
+        description: String,
+        path: String,
+    },
+    /// Rename or edit tags/description on an existing custom sticker in a Space.
+    EditSticker {
+        space: Key,
+        sticker_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tags: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+    },
+    /// Delete a custom sticker from a Space.
+    DeleteSticker {
+        space: Key,
+        sticker_id: String,
     },
     Watch(Watching),
 
@@ -3954,6 +4085,18 @@ pub enum Response {
     EventPreview {
         event: ScheduledEvent,
     },
+    /// Answers `Discover`: public servers, and how many the listing says there are.
+    Discovered {
+        guilds: Vec<DiscoveredGuild>,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        total: u32,
+    },
+    /// Answers `SpaceGate` and `AcceptRules`.
+    SpaceGate {
+        space: Key,
+        #[serde(default)]
+        gate: SpaceGate,
+    },
     Pinned {
         conversation: Key,
         messages: Vec<Message>,
@@ -4210,6 +4353,28 @@ pub enum Response {
     /// Autocomplete choices for one slash-command option (`Request::CommandAutocomplete`).
     CommandChoices {
         choices: Vec<CommandChoice>,
+    },
+    /// A Space's webhooks, followed channels, and bots/integrations (`Request::SpaceIntegrations`).
+    SpaceIntegrations {
+        space: Key,
+        integrations: Box<SpaceIntegrations>,
+    },
+    /// A created or edited webhook (`Request::CreateWebhook` / `Request::EditWebhook`).
+    SpaceWebhook {
+        webhook: Box<SpaceWebhook>,
+    },
+    /// A Space's custom emoji, stickers, and slot limits (`Request::SpaceExpressions`).
+    SpaceExpressions {
+        space: Key,
+        expressions: Box<SpaceExpressions>,
+    },
+    /// A created or edited custom emoji (`Request::CreateEmoji` / `Request::EditEmoji`).
+    SpaceEmoji {
+        emoji: Box<SpaceEmoji>,
+    },
+    /// A created or edited custom sticker (`Request::CreateSticker` / `Request::EditSticker`).
+    SpaceSticker {
+        sticker: Box<SpaceSticker>,
     },
 }
 
@@ -4505,6 +4670,7 @@ mod tests {
                 offset: 25,
             },
             cursor: Some("25".into()),
+            home: false,
         };
         let encoded = serde_json::to_string(&filtered).unwrap();
         let decoded: Request = serde_json::from_str(&encoded).unwrap();
@@ -4528,11 +4694,14 @@ mod tests {
             query: "lichen".into(),
             filters: SearchFilters::default(),
             cursor: None,
+            home: false,
         };
         assert_eq!(
             serde_json::to_string(&asked).unwrap(),
             r#"{"op":"search_network","conversation":{"network":"discord","account":"1","id":"C2"},"query":"lichen"}"#
         );
+        let home: Request = serde_json::from_str(r#"{"op":"search_network","query":"lichen","home":true}"#).unwrap();
+        assert!(matches!(home, Request::SearchNetwork { home: true, .. }));
     }
 
     #[test]

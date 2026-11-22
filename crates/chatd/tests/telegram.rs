@@ -2921,7 +2921,7 @@ fn conversation_search_asks_telegram_with_the_query_and_maps_its_hits() {
     let world = World::signed_in();
     world.connected();
     let search = |query: &str| match world.ask(Request::SearchNetwork {
-        conversation: Some(key("g8001")), space: None, query: query.into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None 
+        conversation: Some(key("g8001")), space: None, query: query.into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None, home: false 
     }) {
         Response::MessageHits { hits, .. } => hits,
         other => panic!("{other:?}"),
@@ -2943,7 +2943,7 @@ fn conversation_search_keeps_the_telegram_forum_topic_scope() {
     let world = World::signed_in();
     world.connected();
     let Response::MessageHits { hits, .. } = world.ask(Request::SearchNetwork {
-        conversation: Some(key("c9002_31")), space: None, query: "wrench".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None 
+        conversation: Some(key("c9002_31")), space: None, query: "wrench".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None, home: false 
     }) else { panic!("no search hits") };
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].conversation, key("c9002_31"));
@@ -3881,6 +3881,7 @@ fn global_search_across_chats_with_pagination() {
         query: "trail".into(),
         filters: protocol::SearchFilters::default(),
         cursor: None,
+        home: false,
     });
     let (hits, not_searched) = match resp {
         Response::MessageHits { hits, not_searched, .. } => (hits, not_searched),

@@ -733,6 +733,7 @@ impl Demo {
                 demo.ctx.presence(&demo.me.id, presence, status.as_deref().unwrap_or(&old), true);
                 let _ = reply.send(Ok(()));
             }
+            Command::SetActivity { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetProfile { about, reply, .. } => {
                 if let Some(about) = about {
                     let (presence, _) = demo.hub.shown(&demo.key(&demo.me.id));
@@ -833,13 +834,19 @@ impl Demo {
                 let (conv, space) = match &scope {
                     crate::adapters::SearchScope::Conversation(id) => (Some(id.as_str()), None),
                     crate::adapters::SearchScope::Space(id) => (None, Some(id.as_str())),
-                    crate::adapters::SearchScope::Account => (None, None),
+                    crate::adapters::SearchScope::Account | crate::adapters::SearchScope::Home => (None, None),
                 };
                 let found = demo
                     .hub
                     .store()
                     .search_account_filtered(&demo.ctx.account, conv, space, &query, &filters, 100)
                     .map(crate::adapters::SearchPage::from)
+                    .map(|mut hits| {
+                        if matches!(scope, crate::adapters::SearchScope::Home) {
+                            hits.hits.retain(|hit| hit.space_title.is_empty());
+                        }
+                        hits
+                    })
                     .map_err(|err| Refusal::Refused(err.to_string()));
                 let _ = reply.send(found);
             }
@@ -1273,8 +1280,30 @@ impl Demo {
             }
             Command::EventPreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::EventLinkInterest { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Discover { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::JoinDiscovered { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SpaceGate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AcceptRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SubmitOnboarding { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::LeaveSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetSpaceNotify { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SpaceIntegrations { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateWebhook { reply, .. } | Command::EditWebhook { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::DeleteWebhook { reply, .. } | Command::RemoveIntegration { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::SpaceExpressions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateEmoji { reply, .. } | Command::EditEmoji { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::CreateSticker { reply, .. } | Command::EditSticker { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::DeleteEmoji { reply, .. } | Command::DeleteSticker { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CancelScheduled { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

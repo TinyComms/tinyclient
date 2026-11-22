@@ -2230,6 +2230,86 @@ impl Chat {
         }
     }
 
+    fn discover(&self, account: AccountKey, query: String, category: u32, offset: u32, limit: u32) -> Response {
+        if account.network != Network::Discord {
+            return error(ErrorCode::Refused, "Discovery is a Discord list.");
+        }
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::Discover { query, category, offset, limit, reply }) {
+            Ok((guilds, total)) => Response::Discovered { guilds, total },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn join_discovered(&self, account: AccountKey, guild_id: String) -> Response {
+        if account.network != Network::Discord || !discovery_snowflake(&guild_id) {
+            return error(ErrorCode::Refused, "That is not a server you can join from Discovery.");
+        }
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::JoinDiscovered { guild_id, reply }) {
+            Ok((space_id, channel_id)) => Response::InviteJoined {
+                space: space_id.filter(|id| discovery_snowflake(id)).map(|id| Key::new(&account, id)),
+                conversation: channel_id.filter(|id| discovery_snowflake(id)).map(|id| Key::new(&account, id)),
+            },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn space_gate(&self, space: Key) -> Response {
+        if space.network != Network::Discord || !discovery_snowflake(&space.id) {
+            return error(ErrorCode::Refused, "That is not a server.");
+        }
+        if let Err(refused) = self.online(&space.account()) {
+            return *refused;
+        }
+        match self.ask(&space.account(), |reply| Command::SpaceGate { space_id: space.id.clone(), reply }) {
+            Ok(mut gate) => {
+                scrub_gate(&mut gate);
+                Response::SpaceGate { space, gate }
+            }
+            Err(refused) => *refused,
+        }
+    }
+
+    fn accept_rules(&self, space: Key, mut answers: Vec<String>) -> Response {
+        if space.network != Network::Discord || !discovery_snowflake(&space.id) {
+            return error(ErrorCode::Refused, "That is not a server.");
+        }
+        if let Err(refused) = self.online(&space.account()) {
+            return *refused;
+        }
+        answers.truncate(8);
+        for answer in &mut answers {
+            clip(answer, 1000);
+        }
+        match self.ask(&space.account(), |reply| Command::AcceptRules { space_id: space.id.clone(), answers, reply }) {
+            Ok(mut gate) => {
+                scrub_gate(&mut gate);
+                Response::SpaceGate { space, gate }
+            }
+            Err(refused) => *refused,
+        }
+    }
+
+    fn submit_onboarding(&self, space: Key, mut options: Vec<String>) -> Response {
+        if space.network != Network::Discord || !discovery_snowflake(&space.id) {
+            return error(ErrorCode::Refused, "That is not a server.");
+        }
+        if let Err(refused) = self.online(&space.account()) {
+            return *refused;
+        }
+        options.truncate(750);
+        options.retain(|id| discovery_snowflake(id));
+        match self.ask(&space.account(), |reply| Command::SubmitOnboarding { space_id: space.id.clone(), options, reply }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
     fn leave_space(&self, space: Key) -> Response {
         let account = space.account();
         if let Err(refused) = self.online(&account) {
@@ -2375,6 +2455,22 @@ impl Chat {
                 }
                 *refused
             }
+        }
+    }
+
+    /// This session's "Playing" line. Empty clears it. The name is text, never a page to open,
+    /// and it is only the account the local user named.
+    fn set_activity(&self, account: AccountKey, mut name: String) -> Response {
+        if account.network != Network::Discord {
+            return error(ErrorCode::Refused, "Sharing an activity is a Discord status.");
+        }
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        clip(&mut name, 128);
+        match self.ask(&account, |reply| Command::SetActivity { name, reply }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
         }
     }
 
@@ -3654,7 +3750,7 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
-            Request::SearchNetwork { conversation, space, account, network, query, filters, cursor } => {
+            Request::SearchNetwork { conversation, space, account, network, query, filters, cursor, home } => {
                 let query = query.trim().to_owned();
                 if query.is_empty() && filters.is_empty() {
                     Response::MessageHits { hits: Vec::new(), cursor: None, not_searched: Vec::new(), total: None }
@@ -3681,6 +3777,22 @@ impl Chat {
                             not_searched: Vec::new(),
                             total: page.total,
                         },
+                        Err(refused) => *refused,
+                    }
+                } else if home {
+                    // One Discord account's direct messages. Not a fan-out across its servers.
+                    let Some(target) = account.filter(|key| key.network == Network::Discord && self.shows(key)) else {
+                        return Response::MessageHits { hits: Vec::new(), cursor: None, not_searched: Vec::new(), total: None };
+                    };
+                    match self.ask(&target, |reply| Command::Search {
+                        query,
+                        scope: SearchScope::Home,
+                        filters,
+                        cursor,
+                        at: std::time::Instant::now(),
+                        reply,
+                    }) {
+                        Ok(page) => Response::MessageHits { hits: page.hits, cursor: page.cursor, not_searched: Vec::new(), total: page.total },
                         Err(refused) => *refused,
                     }
                 } else {
@@ -4400,6 +4512,172 @@ impl Chat {
                 res
             }
             Request::LeaveSpace { space } => self.leave_space(space),
+            Request::SpaceIntegrations { space } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::SpaceIntegrations { space_id: space.id.clone(), reply }) {
+                    Ok(integrations) => Response::SpaceIntegrations { space, integrations: Box::new(integrations) },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::CreateWebhook { conversation, name } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::CreateWebhook {
+                    conversation_id: conversation.id.clone(),
+                    name,
+                    reply,
+                }) {
+                    Ok(webhook) => Response::SpaceWebhook { webhook: Box::new(webhook) },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::EditWebhook { space, webhook_id, name, channel_id } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::EditWebhook {
+                    space_id: space.id.clone(),
+                    webhook_id,
+                    name,
+                    channel_id,
+                    reply,
+                }) {
+                    Ok(webhook) => Response::SpaceWebhook { webhook: Box::new(webhook) },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::DeleteWebhook { space, webhook_id } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::DeleteWebhook {
+                    space_id: space.id.clone(),
+                    webhook_id,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::RemoveIntegration { space, integration_id } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::RemoveIntegration {
+                    space_id: space.id.clone(),
+                    integration_id,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SpaceExpressions { space } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::SpaceExpressions { space_id: space.id.clone(), reply }) {
+                    Ok(expressions) => Response::SpaceExpressions { space, expressions: Box::new(expressions) },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::CreateEmoji { space, name, path } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::CreateEmoji { space_id: space.id.clone(), name, path, reply }) {
+                    Ok(emoji) => Response::SpaceEmoji { emoji: Box::new(emoji) },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::EditEmoji { space, emoji_id, name, roles } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::EditEmoji {
+                    space_id: space.id.clone(),
+                    emoji_id,
+                    name,
+                    roles,
+                    reply,
+                }) {
+                    Ok(emoji) => Response::SpaceEmoji { emoji: Box::new(emoji) },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::DeleteEmoji { space, emoji_id } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::DeleteEmoji {
+                    space_id: space.id.clone(),
+                    emoji_id,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::CreateSticker { space, name, tags, description, path } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::CreateSticker {
+                    space_id: space.id.clone(),
+                    name,
+                    tags,
+                    description,
+                    path,
+                    reply,
+                }) {
+                    Ok(sticker) => Response::SpaceSticker { sticker: Box::new(sticker) },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::EditSticker { space, sticker_id, name, tags, description } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::EditSticker {
+                    space_id: space.id.clone(),
+                    sticker_id,
+                    name,
+                    tags,
+                    description,
+                    reply,
+                }) {
+                    Ok(sticker) => Response::SpaceSticker { sticker: Box::new(sticker) },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::DeleteSticker { space, sticker_id } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::DeleteSticker {
+                    space_id: space.id.clone(),
+                    sticker_id,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::CloseDirect { conversation } => {
                 self.act(&conversation, |conversation_id, reply| Command::CloseDirect { conversation_id, reply })
             }
@@ -4509,6 +4787,7 @@ impl Chat {
             Request::Report { target, reason, note, block } => self.report(target, reason, note, block),
             Request::ReportReasons { target } => self.report_reasons(target),
             Request::SetPresence { account, presence, status, status_emoji, clear_at } => self.set_presence(account, presence, status, status_emoji, clear_at),
+            Request::SetActivity { account, name } => self.set_activity(account, name),
             Request::SetProfile { account, name, about, pronouns, emoji, username, photo, accent, banner, space } => {
                 self.set_profile(account, name, about, pronouns, emoji, username, photo, accent, banner, space)
             }
@@ -4541,6 +4820,11 @@ impl Chat {
             Request::SetMemberRoles { space, person, roles } => self.set_member_roles(space, person, roles),
             Request::EventPreview { space, event_id } => self.event_preview(space, event_id),
             Request::EventLinkInterest { space, event_id, interested } => self.event_link_interest(space, event_id, interested),
+            Request::Discover { account, query, category, offset, limit } => self.discover(account, query, category, offset, limit),
+            Request::JoinDiscovered { account, guild_id } => self.join_discovered(account, guild_id),
+            Request::SpaceGate { space } => self.space_gate(space),
+            Request::AcceptRules { space, answers } => self.accept_rules(space, answers),
+            Request::SubmitOnboarding { space, options } => self.submit_onboarding(space, options),
             Request::Watch(watching) => self.watch(watching),
 
             Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),
@@ -5509,6 +5793,47 @@ impl Chat {
             }
         }
     }
+}
+
+/// A Discord snowflake: digits only, short enough to be an id and not a URL.
+/// Phone and email leave Discord only through this address, which we write ourselves.
+const DISCORD_APP: &str = "https://discord.com/app";
+
+fn scrub_gate(gate: &mut protocol::SpaceGate) {
+    if gate.external != DISCORD_APP {
+        gate.external.clear();
+    }
+    clip(&mut gate.description, 2_000);
+    clip(&mut gate.reason, 300);
+    gate.fields.truncate(5);
+    for field in &mut gate.fields {
+        clip(&mut field.label, 200);
+        clip(&mut field.kind, 40);
+        field.values.truncate(8);
+        for value in &mut field.values {
+            clip(value, 2_000);
+        }
+        field.choices.truncate(12);
+        for choice in &mut field.choices {
+            clip(choice, 200);
+        }
+    }
+    gate.prompts.truncate(12);
+    for prompt in &mut gate.prompts {
+        clip(&mut prompt.label, 200);
+        prompt.options.truncate(25);
+        for option in &mut prompt.options {
+            if !discovery_snowflake(&option.id) {
+                option.id.clear();
+            }
+            clip(&mut option.label, 200);
+        }
+        prompt.options.retain(|option| !option.id.is_empty());
+    }
+}
+
+fn discovery_snowflake(id: &str) -> bool {
+    (1..=20).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Tiny keeps every server in the one item. A second sign-in is folded in before anything is

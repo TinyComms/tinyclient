@@ -3539,6 +3539,101 @@ fn friendships_presence_and_profiles_are_asked_of_discord_only_when_the_user_doe
 }
 
 #[test]
+fn playing_is_this_sessions_name_and_not_one_someone_else_sends() {
+    let world = World::start();
+    settled(&world);
+    let present = |status: &str| {
+        world.ask(Request::SetPresence {
+            account: world.account(),
+            presence: Presence::Online,
+            status: Some(status.to_owned()),
+            status_emoji: None,
+            clear_at: None,
+        })
+    };
+    let play = |name: &str| world.ask(Request::SetActivity { account: world.account(), name: name.to_owned() });
+    let playing = |name: &str| {
+        world.discord.frames_of(3).into_iter().rev().find(|frame| {
+            frame["d"]["activities"].as_array().is_some_and(|items| {
+                items.iter().any(|item| item["type"] == json!(0) && item["name"] == name)
+            })
+        })
+    };
+    assert_eq!(present("heads down"), Response::Ok);
+    let patches = world.discord.requests_to("PATCH", "/users/@me/settings-proto/1").len();
+    assert_eq!(play("Celeste"), Response::Ok);
+    assert_eq!(world.discord.requests_to("PATCH", "/users/@me/settings-proto/1").len(), patches, "playing is not a settings write");
+    let told = wait("playing beside the status", || playing("Celeste"));
+    let items = told["d"]["activities"].as_array().unwrap();
+    assert!(items.iter().any(|item| item["type"] == json!(4) && item["state"] == "heads down"));
+    let game = items.iter().find(|item| item["type"] == json!(0)).unwrap();
+    assert_eq!(game["name"], "Celeste");
+    assert!(game.get("application_id").is_none(), "no invented application id");
+    assert!(world.discord.asked().iter().all(|line| !line.contains("Celeste")), "{:?}", world.discord.asked());
+
+    assert_eq!(present("back"), Response::Ok);
+    let told = wait("a status change to keep the game", || {
+        playing("Celeste").filter(|frame| frame["d"]["activities"].as_array().is_some_and(|items| items.iter().any(|item| item["state"] == "back")))
+    });
+    assert_eq!(told["d"]["status"], "online");
+
+    world.discord.push("PRESENCE_UPDATE", json!({
+        "user": {"id": "1000"},
+        "status": "online",
+        "activities": [
+            {"name": "Custom Status", "type": 4, "state": "stolen"},
+            {"name": "https://evil.example/play", "type": 0}
+        ]
+    }));
+    world.discord.push("PRESENCE_UPDATE", json!({
+        "user": {"id": "2001"},
+        "status": "online",
+        "activities": [
+            {"name": "Custom Status", "type": 4, "state": "from-them"},
+            {"name": "https://evil.example/theirs", "type": 0}
+        ]
+    }));
+    wait("a friend's own status to arrive", || {
+        world.people(Some(Relation::Friend), None).iter().any(|person| person.key.id == "2001" && person.status == "from-them").then_some(())
+    });
+    assert_eq!(present("still"), Response::Ok);
+    let told = wait("our game to stay ours", || {
+        playing("Celeste").filter(|frame| frame["d"]["activities"].as_array().is_some_and(|items| items.iter().any(|item| item["state"] == "still")))
+    });
+    let items = told["d"]["activities"].as_array().unwrap();
+    assert!(items.iter().all(|item| item["name"] != "https://evil.example/play"));
+    assert!(world.discord.frames_of(3).iter().all(|frame| !frame.to_string().contains("evil.example")));
+    assert!(world.discord.asked().iter().all(|line| !line.contains("evil.example")), "{:?}", world.discord.asked());
+
+    let long = "a".repeat(200);
+    assert_eq!(play(&long), Response::Ok);
+    let told = wait("a long name to be cut", || playing(&"a".repeat(128)));
+    let game = told["d"]["activities"].as_array().unwrap().iter().find(|item| item["type"] == json!(0)).unwrap();
+    assert_eq!(game["name"].as_str().unwrap().chars().count(), 128);
+    assert!(told["d"]["activities"].as_array().unwrap().iter().any(|item| item["state"] == "still"));
+
+    assert_eq!(play(""), Response::Ok);
+    wait("clearing the game to leave the status", || {
+        world.discord.frames_of(3).pop().filter(|frame| {
+            let Some(items) = frame["d"]["activities"].as_array() else {
+                return false;
+            };
+            items.iter().all(|item| item["type"] != json!(0)) && items.iter().any(|item| item["state"] == "still")
+        })
+    });
+
+    match world.ask(Request::SetActivity {
+        account: AccountKey { network: Network::Slack, account: "T0".into() },
+        name: "https://evil.example/join".into(),
+    }) {
+        Response::Error { .. } => {}
+        other => panic!("another network cannot set it, got {other:?}"),
+    }
+    assert!(world.discord.frames_of(3).iter().all(|frame| !frame.to_string().contains("evil.example")));
+    assert!(world.discord.asked().iter().all(|line| !line.contains("evil.example")));
+}
+
+#[test]
 fn reading_forward_and_jumping_ask_discord_once_and_what_was_deleted_meanwhile_goes() {
     let world = World::start();
     let dm = "3001";
@@ -4526,7 +4621,7 @@ fn info_mute_leave_pins_and_the_shared_search_ask_discord_once_each_and_only_whe
 fn search_asks_discord_itself_for_a_space_and_a_conversation_and_tells_of_an_index_still_building() {
     let world = polished();
     // A Space's own search: the server's, one request, the hits mapped like the cache's.
-    let hits = match world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "rules".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  }) {
+    let hits = match world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "rules".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None, home: false  }) {
         Response::MessageHits { hits, .. } => hits,
         other => panic!("{other:?}"),
     };
@@ -4545,7 +4640,7 @@ fn search_asks_discord_itself_for_a_space_and_a_conversation_and_tells_of_an_ind
 
     // A server channel as the conversation: the server's search narrowed to the channel.
     let before = world.discord.requests_to("GET", "/guilds/4000/messages/search").len();
-    let answer = world.ask(Request::SearchNetwork { conversation: Some(world.key("4101")), space: None, query: "hello".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
+    let answer = world.ask(Request::SearchNetwork { conversation: Some(world.key("4101")), space: None, query: "hello".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None, home: false  });
     assert!(matches!(answer, Response::MessageHits { .. }), "{answer:?}");
     let asked = world.discord.requests_to("GET", "/guilds/4000/messages/search");
     assert_eq!(asked.len(), before + 1, "the channel search is asked");
@@ -4554,7 +4649,7 @@ fn search_asks_discord_itself_for_a_space_and_a_conversation_and_tells_of_an_ind
     // One conversation: the DM's own channel search.
     sleep(Duration::from_millis(400));
     let before = world.discord.requests_to("GET", "/channels/3001/messages/search").len();
-    let answer = world.ask(Request::SearchNetwork { conversation: Some(world.key("3001")), space: None, query: "hello".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
+    let answer = world.ask(Request::SearchNetwork { conversation: Some(world.key("3001")), space: None, query: "hello".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None, home: false  });
     assert!(matches!(answer, Response::MessageHits { .. }), "{answer:?}");
     let asked = world.discord.requests_to("GET", "/channels/3001/messages/search");
     assert_eq!(asked.len(), before + 1, "the DM's channel search is asked");
@@ -4562,12 +4657,12 @@ fn search_asks_discord_itself_for_a_space_and_a_conversation_and_tells_of_an_ind
 
     // A 202: the index is still building, and the words say so.
     sleep(Duration::from_millis(400));
-    let not_ready = world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "index".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
+    let not_ready = world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "index".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None, home: false  });
     assert!(matches!(&not_ready, Response::Error { detail, .. } if detail.contains("isn't ready")), "{not_ready:?}");
 
     // Paced: Enter again at once queues and waits out the gap instead of refusing.
     let started = Instant::now();
-    let queued = world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "again".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None });
+    let queued = world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "again".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None, home: false });
     assert!(matches!(&queued, Response::MessageHits { hits, total: Some(1), .. } if hits.len() == 1), "{queued:?}");
     assert!(started.elapsed() >= Duration::from_millis(350), "rapid search must wait its pacing gap");
 }
@@ -4596,6 +4691,7 @@ fn search_maps_all_filters_sort_paging_and_all_dms_route() {
         query: "paged".into(),
         filters: filters.clone(),
         cursor: None,
+        home: false,
     });
     let Response::MessageHits { hits, cursor, total, .. } = page1 else {
         panic!("expected MessageHits, got {page1:?}");
@@ -4628,6 +4724,7 @@ fn search_maps_all_filters_sort_paging_and_all_dms_route() {
         query: "paged".into(),
         filters,
         cursor,
+        home: false,
     });
     let Response::MessageHits { hits: hits2, cursor: cursor2, total: total2, .. } = page2 else {
         panic!("expected MessageHits page 2, got {page2:?}");
@@ -4651,6 +4748,7 @@ fn search_maps_all_filters_sort_paging_and_all_dms_route() {
             ..Default::default()
         },
         cursor: None,
+        home: false,
     });
     let Response::MessageHits { hits: dm_hits, .. } = all_dms else {
         panic!("expected MessageHits for all-DMs, got {all_dms:?}");
@@ -4660,6 +4758,151 @@ fn search_maps_all_filters_sort_paging_and_all_dms_route() {
     let req3 = world.discord.requests_to("GET", "/users/@me/messages/search").pop().unwrap();
     assert!(req3.path.contains("mentions=1000"), "{}", req3.path);
     assert!(req3.path.contains("sort_by=relevance&sort_order=desc"), "{}", req3.path);
+}
+
+#[test]
+fn home_search_asks_every_direct_message_and_drops_text_the_user_cannot_read() {
+    let world = polished();
+    let secret = "secret-from-a-channel-you-cannot-read";
+    let guild_words = "server-channel-words-stay-out";
+    let dm = "the lichen note in a direct message";
+    let hit = |channel: &str, id: &str, content: &str| {
+        json!({
+            "id": id, "channel_id": channel, "type": 0,
+            "author": {"id": "200000000000000001", "username": "Ines Marchetti", "global_name": "Ines Marchetti", "discriminator": "0", "avatar": null},
+            "content": content,
+            "timestamp": "2026-10-13T08:15:00.000000+00:00", "edited_timestamp": null, "mentions": [], "mention_roles": [],
+            "mention_everyone": false, "embeds": [], "pinned": false, "attachments": [],
+        })
+    };
+    let page = |rows: Vec<Value>| {
+        let messages: Vec<Value> = rows.into_iter().map(|row| json!([row])).collect();
+        json!({"analytics_id": "a", "doing_deep_historical_index": false, "total_results": messages.len(), "messages": messages})
+    };
+
+    // No Discord account named: not a fan-out across servers, and Discord is not asked.
+    let skipped = world.ask(Request::SearchNetwork {
+        conversation: None, space: None, account: None, network: None, query: "lichen".into(),
+        filters: protocol::SearchFilters::default(), cursor: None, home: true,
+    });
+    assert!(matches!(&skipped, Response::MessageHits { hits, .. } if hits.is_empty()), "{skipped:?}");
+    assert!(world.discord.requests_to("GET", "/users/@me/messages/search").is_empty());
+
+    world.discord.script("/users/@me/messages/search", 200, page(vec![
+        hit("3001", "1300000000000000610", dm),
+        hit("9999", "1300000000000000611", secret),
+        hit("4101", "1300000000000000612", guild_words),
+    ]));
+    let hits = match world.ask(Request::SearchNetwork {
+        conversation: None, space: None, account: Some(world.account()), network: None, query: "lichen".into(),
+        filters: protocol::SearchFilters::default(), cursor: None, home: true,
+    }) {
+        Response::MessageHits { hits, .. } => hits,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].conversation, world.key("3001"));
+    assert!(hits[0].snippet.contains("lichen"), "{}", hits[0].snippet);
+    let shown = format!("{hits:?}");
+    assert!(!shown.contains(secret) && !shown.contains(guild_words), "{shown}");
+    let asked = world.discord.requests_to("GET", "/users/@me/messages/search");
+    assert_eq!(asked.len(), 1);
+    assert!(asked[0].path.contains("content=lichen") && !asked[0].path.contains("guilds"), "{}", asked[0].path);
+
+    sleep(Duration::from_millis(450));
+    world.discord.script("/users/@me/messages/search", 403, json!({"message": "Missing Access", "code": 50001}));
+    let refused = world.ask(Request::SearchNetwork {
+        conversation: None, space: None, account: Some(world.account()), network: None, query: "nope".into(),
+        filters: protocol::SearchFilters::default(), cursor: None, home: true,
+    });
+    assert!(matches!(refused, Response::Error { .. }), "{refused:?}");
+}
+
+#[test]
+fn discovery_lists_public_servers_and_refuses_a_url_join() {
+    let world = polished();
+    let account = world.account();
+    world.discord.script("/discoverable-guilds", 200, json!({
+        "guilds": [
+            {"id": "5001", "name": "Hidden", "description": "hidden-blurb", "features": ["COMMUNITY"]},
+            {"id": "https://evil.example/join", "name": "Do not open", "features": ["DISCOVERABLE"], "vanity_url_code": "https://evil.example/join"},
+            {
+                "id": "5000", "name": "Lichen", "description": "Crabs", "features": ["DISCOVERABLE"],
+                "approximate_member_count": 12, "approximate_presence_count": 3,
+                "icon": "https://evil.example/icon.png", "vanity_url_code": "https://evil.example/join",
+            },
+            {"id": "5002", "name": "Moss", "features": ["DISCOVERABLE"], "vanity_url_code": "moss-hang", "approximate_member_count": 4},
+        ],
+        "total": 2,
+    }));
+    let found = match world.ask(Request::Discover { account: account.clone(), query: String::new(), category: 0, offset: 0, limit: 0 }) {
+        Response::Discovered { guilds, total } => {
+            assert_eq!(total, 2);
+            guilds
+        }
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert_eq!(found[0].id, "5000");
+    assert_eq!(found[0].name, "Lichen");
+    assert_eq!(found[0].members, 12);
+    assert_eq!(found[0].online, 3);
+    assert!(found[0].icon.is_empty(), "a URL is not an icon hash");
+    let shown = format!("{found:?}");
+    assert!(!shown.contains("hidden-blurb") && !shown.contains("Do not open") && !shown.contains("evil.example"), "{shown}");
+    let listed = world.discord.requests_to("GET", "/discoverable-guilds");
+    assert_eq!(listed.len(), 1);
+    assert!(listed[0].path.starts_with("/discoverable-guilds?") && !listed[0].path.contains("evil.example"), "{}", listed[0].path);
+
+    world.discord.script("/discoverable-guilds/search", 200, json!({
+        "guilds": [{"id": "5000", "name": "Lichen", "features": ["DISCOVERABLE"], "approximate_member_count": 12}],
+        "total": 1,
+    }));
+    let searched = world.ask(Request::Discover { account: account.clone(), query: "lichen".into(), category: 0, offset: 0, limit: 0 });
+    assert!(matches!(&searched, Response::Discovered { guilds, .. } if guilds.len() == 1), "{searched:?}");
+    let search = world.discord.requests_to("GET", "/discoverable-guilds/search");
+    assert_eq!(search.len(), 1);
+    assert!(search[0].path.contains("query=lichen") && !search[0].path.contains("guild_ids"), "{}", search[0].path);
+
+    // The listing's vanity was a URL, so a refused join does not follow it.
+    world.discord.script("/guilds/5000/members/@me", 403, json!({"message": "Missing Access", "code": 50001}));
+    let blocked = world.ask(Request::JoinDiscovered { account: account.clone(), guild_id: "5000".into() });
+    assert!(matches!(blocked, Response::Error { .. }), "{blocked:?}");
+    assert!(world.discord.requests_to("POST", "/invites/").is_empty());
+    assert!(world.discord.asked().iter().all(|path| !path.contains("evil.example")), "{:?}", world.discord.asked());
+
+    world.discord.script("/guilds/5000/members/@me", 200, json!({"user": {"id": "1000"}, "roles": []}));
+    match world.ask(Request::JoinDiscovered { account: account.clone(), guild_id: "5000".into() }) {
+        Response::InviteJoined { space, .. } => assert_eq!(space, Some(world.key("5000"))),
+        other => panic!("{other:?}"),
+    }
+    let joined = world.discord.requests_to("PUT", "/guilds/5000/members/@me");
+    assert_eq!(joined.len(), 2);
+    assert!(world.discord.requests_to("POST", "/invites/").is_empty());
+
+    let puts = world.discord.requests_to("PUT", "/guilds/").len();
+    let url = world.ask(Request::JoinDiscovered { account: account.clone(), guild_id: "https://evil.example/join".into() });
+    assert!(matches!(url, Response::Error { .. }), "{url:?}");
+    assert_eq!(world.discord.requests_to("PUT", "/guilds/").len(), puts, "a URL is refused before any request");
+    assert!(world.discord.asked().iter().all(|path| !path.contains("evil.example")));
+
+    // A refused join falls back only to a vanity code stored from the listing.
+    world.discord.script("/guilds/5002/members/@me", 403, json!({"message": "Missing Access", "code": 50001}));
+    world.discord.script("/invites/moss-hang", 200, json!({"guild": {"id": "5002"}, "channel": {"id": "5102"}}));
+    match world.ask(Request::JoinDiscovered { account: account.clone(), guild_id: "5002".into() }) {
+        Response::InviteJoined { space, conversation } => {
+            assert_eq!(space, Some(world.key("5002")));
+            assert_eq!(conversation, Some(world.key("5102")));
+        }
+        other => panic!("{other:?}"),
+    }
+    let fallback = world.discord.requests_to("POST", "/invites/moss-hang");
+    assert_eq!(fallback.len(), 1, "{:?}", world.discord.asked());
+    assert_eq!(fallback[0].path, "/invites/moss-hang");
+
+    world.discord.script("/discoverable-guilds", 403, json!({"message": "Missing Access", "code": 50001}));
+    let refused = world.ask(Request::Discover { account, query: String::new(), category: 0, offset: 0, limit: 0 });
+    assert!(matches!(refused, Response::Error { .. }), "{refused:?}");
 }
 
 /// A file of `size` bytes beside the world's directory: chatd never sends from its own.
@@ -5038,6 +5281,221 @@ fn server_timeout_marks_rows_read_only_and_lifts_when_cleared() {
     assert!(!lifted.read_only, "clearing timeout must lift read-only");
     assert!(lifted.read_only_reason.is_empty(), "clearing timeout must clear read_only_reason");
     assert_eq!(world.conversation("4201").call, CallSupport::Native, "voice join returns when timeout lifts");
+}
+
+#[test]
+fn rules_and_onboarding_lock_until_discord_says_so_and_do_not_grant_a_channel() {
+    let world = polished();
+    assert!(!world.conversation("4101").read_only);
+    let hidden = |world: &World| world.tree("4000").1.iter().any(|row| row.key.id == "4103");
+    assert!(!hidden(&world), "staff stays hidden without that role");
+
+    world.discord.push("GUILD_UPDATE", json!({
+        "id": "4000",
+        "properties": {
+            "features": ["COMMUNITY", "GUILD_ONBOARDING", "MEMBER_VERIFICATION_GATE_ENABLED", "MEMBER_VERIFICATION_MANUAL_APPROVAL"],
+            "verification_level": 4
+        }
+    }));
+    world.discord.push("GUILD_MEMBER_UPDATE", json!({
+        "guild_id": "4000",
+        "user": {"id": "1000", "username": "justin"},
+        "roles": ["4010"],
+        "pending": true,
+        "flags": 0
+    }));
+    wait("pending rules to lock the channel", || {
+        let row = world.conversation("4101");
+        (row.read_only && row.read_only_reason == "Accept the rules to talk here").then_some(())
+    });
+    assert!(!hidden(&world), "pending does not grant the staff channel");
+
+    let form = json!({
+        "version": "2024-01-01",
+        "description": "Read this first. https://evil.example/join",
+        "form_fields": [
+            {
+                "field_type": "TERMS",
+                "label": "Rules",
+                "required": true,
+                "values": ["Be kind.", "https://evil.example/phish"]
+            },
+            {"field_type": "TEXT_INPUT", "label": "Name", "required": false}
+        ]
+    });
+    let board = json!({
+        "prompts": [{
+            "id": "6100",
+            "title": "What brings you here?",
+            "options": [
+                {"id": "6101", "title": "Art", "role_ids": ["4011"], "channel_ids": ["4103"]},
+                {"id": "https://evil.example/opt", "title": "Do not keep"}
+            ]
+        }]
+    });
+    world.discord.script("/guilds/4000/member-verification", 200, form.clone());
+    world.discord.script("/guilds/4000/onboarding", 200, board.clone());
+    world.discord.script("/guilds/4000/member-verification", 200, form);
+    world.discord.script("/guilds/4000/requests/@me", 200, json!({"application_status": "PENDING"}));
+    world.discord.script("/guilds/4000/onboarding", 200, board);
+    world.discord.script("/guilds/4000/onboarding-responses", 204, Value::Null);
+
+    let gate = match world.ask(Request::SpaceGate { space: world.key("4000") }) {
+        Response::SpaceGate { gate, .. } => gate,
+        other => panic!("{other:?}"),
+    };
+    assert!(gate.pending && gate.manual && gate.onboarding, "{gate:?}");
+    assert!(gate.description.contains("https://evil.example/join"));
+    assert_eq!(gate.fields.len(), 2);
+    assert_eq!(gate.fields[0].kind, "TERMS");
+    assert!(gate.fields[0].values.iter().any(|value| value.contains("https://evil.example/phish")));
+    assert_eq!(gate.prompts.len(), 1);
+    assert_eq!(gate.prompts[0].options.len(), 1);
+    assert_eq!(gate.prompts[0].options[0].id, "6101");
+    assert!(gate.external.is_empty(), "rules text is not a link");
+    let asked = world.discord.asked();
+    assert!(asked.iter().all(|line| !line.contains("evil.example")), "{asked:?}");
+
+    match world.ask(Request::AcceptRules { space: world.key("4000"), answers: vec!["true".into(), "Ada".into()] }) {
+        Response::SpaceGate { gate, .. } => assert!(gate.pending, "a pending review stays pending"),
+        other => panic!("{other:?}"),
+    }
+    let puts = world.discord.requests_to("PUT", "/guilds/4000/requests/@me");
+    assert_eq!(puts.len(), 1);
+    assert_eq!(puts[0].body["version"], "2024-01-01");
+    let fields = puts[0].body["form_fields"].as_array().unwrap();
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[0]["field_type"], "TERMS");
+    assert_eq!(fields[0]["response"], true);
+    assert_eq!(fields[1]["response"], "Ada");
+    assert!(fields[0]["values"].to_string().contains("evil.example"));
+    assert!(world.conversation("4101").read_only, "pending review does not unlock");
+    assert!(!hidden(&world));
+
+    assert_eq!(
+        world.ask(Request::SubmitOnboarding {
+            space: world.key("4000"),
+            options: vec!["6101".into(), "https://evil.example/opt".into(), "9999".into()],
+        }),
+        Response::Ok
+    );
+    let posts = world.discord.requests_to("POST", "/guilds/4000/onboarding-responses");
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].body["onboarding_responses"], json!(["6101"]));
+    assert_eq!(posts[0].body["onboarding_prompts_seen"]["6100"], true);
+    assert_eq!(posts[0].body["onboarding_responses_seen"]["6101"], true);
+    assert!(!hidden(&world), "onboarding does not grant the role's channel");
+
+    world.discord.push("GUILD_MEMBER_UPDATE", json!({
+        "guild_id": "4000",
+        "user": {"id": "1000", "username": "justin"},
+        "roles": ["4010"],
+        "pending": false,
+        "flags": 2
+    }));
+    wait("discord clearing pending to unlock", || (!world.conversation("4101").read_only).then_some(()));
+    assert!(world.conversation("4101").read_only_reason.is_empty());
+    assert!(!hidden(&world), "finishing onboarding does not grant a channel");
+
+    let puts_before = world.discord.requests_to("PUT", "/guilds/4000/requests/").len();
+    match world.ask(Request::AcceptRules { space: world.key("https://evil.example/join"), answers: vec!["true".into()] }) {
+        Response::Error { .. } => {}
+        other => panic!("a URL is not a server, got {other:?}"),
+    }
+    match world.ask(Request::SubmitOnboarding { space: world.key("4000/../1"), options: vec!["6101".into()] }) {
+        Response::Error { .. } => {}
+        other => panic!("a path is not a server, got {other:?}"),
+    }
+    assert_eq!(world.discord.requests_to("PUT", "/guilds/4000/requests/").len(), puts_before);
+
+    world.discord.script("/guilds/4000/member-verification", 200, json!({
+        "version": "2024-01-01",
+        "form_fields": [{"field_type": "TERMS", "label": "Rules", "required": true, "values": ["Be kind."]}]
+    }));
+    world.discord.script("/guilds/4000/requests/@me", 403, json!({"message": "Missing Access", "code": 50001}));
+    match world.ask(Request::AcceptRules { space: world.key("4000"), answers: vec!["true".into()] }) {
+        Response::Error { .. } => {}
+        other => panic!("a refused submit stays an error, got {other:?}"),
+    }
+}
+
+#[test]
+fn verifying_phone_or_email_unlocks_the_composer_without_a_new_ready() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    ready["user"]["verified"] = json!(false);
+    ready["user"]["phone"] = Value::Null;
+    // Level 4 asks for a phone. Level 1 asks for an email. The phone check runs first, so only
+    // the level-4 server says phone while the email is still unverified.
+    ready["guilds"][0]["properties"]["verification_level"] = json!(4);
+    ready["guilds"][1]["verification_level"] = json!(1);
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+    assert_eq!(world.conversation("4101").read_only_reason, "This server needs a verified phone");
+    assert_eq!(world.conversation("5001").read_only_reason, "This server needs a verified email");
+    // A thread under general, and a forum post, were planted with the same phone gate.
+    assert!(world.conversation("4500").read_only);
+    assert_eq!(world.conversation("4500").read_only_reason, "This server needs a verified phone");
+    assert!(world.conversation("4601").read_only);
+    assert_eq!(world.conversation("4601").read_only_reason, "This server needs a verified phone");
+
+    // Clearing the challenge, with no user on it, does not refresh the snapshot READY stored.
+    world.discord.push("USER_REQUIRED_ACTION_UPDATE", json!({"required_action": null}));
+    world.incoming("3002", None, "still locked", json!({}));
+    wait("the challenge clear to be handled", || {
+        world.messages("3002").into_iter().rev().find(|message| message.text == "still locked").map(|_| ())
+    });
+    assert_eq!(world.conversation("4101").read_only_reason, "This server needs a verified phone");
+    assert_eq!(world.conversation("5001").read_only_reason, "This server needs a verified email");
+    assert_eq!(world.conversation("4500").read_only_reason, "This server needs a verified phone");
+    assert_eq!(world.conversation("4601").read_only_reason, "This server needs a verified phone");
+
+    world.discord.push("USER_UPDATE", json!({
+        "id": "1000", "username": "justin", "global_name": "Justin", "discriminator": "0", "verified": true
+    }));
+    wait("the email lock to lift", || world.conversation("5001").read_only_reason.is_empty().then_some(()));
+    assert!(!world.conversation("5001").read_only);
+    assert_eq!(world.conversation("4101").read_only_reason, "This server needs a verified phone");
+    // This server still wants a phone, so its thread and forum post stay locked.
+    assert!(world.conversation("4500").read_only);
+    assert_eq!(world.conversation("4500").read_only_reason, "This server needs a verified phone");
+    assert!(world.conversation("4601").read_only);
+    assert_eq!(world.conversation("4601").read_only_reason, "This server needs a verified phone");
+
+    world.discord.push("USER_REQUIRED_ACTION_UPDATE", json!({
+        "required_action": null,
+        "user": {"id": "1000", "username": "justin", "global_name": "Justin", "discriminator": "0", "phone": "+15555550100"}
+    }));
+    wait("the phone lock to lift", || {
+        let open = |id| {
+            let row = world.conversation(id);
+            row.read_only_reason.is_empty() && !row.read_only
+        };
+        (open("4101") && open("4500") && open("4601")).then_some(())
+    });
+    assert!(!world.conversation("4101").read_only);
+    assert!(!world.conversation("4500").read_only);
+    assert!(world.conversation("4500").read_only_reason.is_empty());
+    assert!(!world.conversation("4601").read_only);
+    assert!(world.conversation("4601").read_only_reason.is_empty());
+
+    // A server joined after that copies the new snapshot, not the one from READY.
+    world.discord.push("GUILD_CREATE", json!({
+        "id": "6000", "name": "New Place", "icon": null, "owner_id": "2001", "joined_at": "2026-10-13T08:00:00+00:00",
+        "verification_level": 4,
+        "roles": [{"id": "6000", "name": "@everyone", "permissions": "3072", "position": 0}],
+        "channels": [{"id": "6001", "type": 0, "name": "lobby", "position": 0, "permission_overwrites": []}],
+        "threads": [],
+        "members": [{"user": {"id": "1000", "username": "justin"}, "roles": [], "joined_at": "2026-10-13T08:00:00+00:00"}]
+    }));
+    // `World::tree` panics on an error, and the Space is not there until the event is handled.
+    wait("the new server", || match world.ask(Request::Tree { space: world.key("6000"), offset: 0, limit: 500, peek: false }) {
+        Response::Tree { conversations, .. } => conversations.iter().any(|row| row.key.id == "6001").then_some(()),
+        _ => None,
+    });
+    let joined = world.conversation("6001");
+    assert!(!joined.read_only, "a server joined after verification stays locked: {}", joined.read_only_reason);
 }
 
 #[test]
@@ -5944,6 +6402,364 @@ fn leave_space_sends_delete_refuses_owner_and_cleans_tree() {
         }
         other => panic!("expected Response::Spaces, got {other:?}"),
     }
+}
+
+#[test]
+fn server_webhooks_and_integrations_list_create_edit_delete_and_remove() {
+    let ready: Value = serde_json::from_str(READY).unwrap();
+    // Guild 5000 is owned by user 1000 (full permissions), while guild 4000 has no webhook/guild manage perms.
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    // Verify Space management flags: owned guild 5000 can manage webhooks & guild; guild 4000 cannot.
+    match world.ask(Request::Spaces { network: Some(Network::Discord) }) {
+        Response::Spaces { spaces } => {
+            let g4000 = spaces.iter().find(|s| s.key.id == "4000").expect("guild 4000");
+            let g5000 = spaces.iter().find(|s| s.key.id == "5000").expect("guild 5000");
+            assert!(!g4000.can_manage_webhooks && !g4000.can_manage_guild);
+            assert!(g5000.can_manage_webhooks && g5000.can_manage_guild);
+        }
+        other => panic!("expected Response::Spaces, got {other:?}"),
+    }
+
+    // Guild 4000 is refused locally without hitting Discord.
+    match world.ask(Request::SpaceIntegrations { space: world.key("4000") }) {
+        Response::Error { detail, .. } => assert!(detail.contains("permission"), "got: {detail}"),
+        other => panic!("expected permission error, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("GET", "/guilds/4000/webhooks").is_empty());
+
+    // Script webhooks (1 incoming + 1 channel follower) and integrations for owned guild 5000.
+    world.discord.script(
+        "/guilds/5000/webhooks",
+        200,
+        json!([
+            {
+                "id": "9101",
+                "type": 1,
+                "channel_id": "5001",
+                "name": "Build Alerts",
+                "avatar": null,
+                "token": "secret_tok_123",
+                "user": {"username": "justin", "global_name": "Justin"}
+            },
+            {
+                "id": "9102",
+                "type": 2,
+                "channel_id": "5001",
+                "name": "Rust #announcements",
+                "source_guild": {"name": "Rust"},
+                "source_channel": {"name": "announcements"}
+            }
+        ]),
+    );
+    world.discord.script(
+        "/guilds/5000/integrations",
+        200,
+        json!([
+            {
+                "id": "8101",
+                "name": "DeployBot",
+                "type": "discord",
+                "enabled": true,
+                "account": {"name": "DeployBot"},
+                "application": {
+                    "id": "7101",
+                    "name": "DeployBot",
+                    "description": "Ships releases",
+                    "bot": {"id": "7102", "username": "deploybot", "global_name": "DeployBot", "avatar": null, "discriminator": "0"}
+                }
+            }
+        ]),
+    );
+
+    match world.ask(Request::SpaceIntegrations { space: world.key("5000") }) {
+        Response::SpaceIntegrations { integrations, .. } => {
+            assert!(integrations.can_manage_webhooks && integrations.can_manage_guild);
+            assert_eq!(integrations.webhooks.len(), 1);
+            assert_eq!(integrations.webhooks[0].name, "Build Alerts");
+            assert_eq!(integrations.webhooks[0].url, "https://discord.com/api/webhooks/9101/secret_tok_123");
+            assert_eq!(integrations.followers.len(), 1);
+            assert_eq!(integrations.followers[0].source_guild, "Rust");
+            assert!(integrations.followers[0].url.is_empty());
+            assert_eq!(integrations.integrations.len(), 1);
+            assert_eq!(integrations.integrations[0].bot_name, "DeployBot");
+        }
+        other => panic!("expected Response::SpaceIntegrations, got {other:?}"),
+    }
+
+    // Create webhook
+    world.discord.script(
+        "/channels/5001/webhooks",
+        200,
+        json!({
+            "id": "9103",
+            "type": 1,
+            "channel_id": "5001",
+            "name": "CI Hook",
+            "token": "new_secret_tok"
+        }),
+    );
+    match world.ask(Request::CreateWebhook { conversation: world.key("5001"), name: "CI Hook".into() }) {
+        Response::SpaceWebhook { webhook } => {
+            assert_eq!(webhook.id, "9103");
+            assert_eq!(webhook.url, "https://discord.com/api/webhooks/9103/new_secret_tok");
+        }
+        other => panic!("expected Response::SpaceWebhook, got {other:?}"),
+    }
+    let creates = world.discord.requests_to("POST", "/channels/5001/webhooks");
+    assert_eq!(creates.len(), 1);
+    assert_eq!(creates[0].body, json!({"name": "CI Hook"}));
+
+    // Edit webhook
+    world.discord.script(
+        "/webhooks/9103",
+        200,
+        json!({
+            "id": "9103",
+            "type": 1,
+            "channel_id": "5001",
+            "name": "Renamed Hook",
+            "token": "new_secret_tok"
+        }),
+    );
+    match world.ask(Request::EditWebhook {
+        space: world.key("5000"),
+        webhook_id: "9103".into(),
+        name: Some("Renamed Hook".into()),
+        channel_id: None,
+    }) {
+        Response::SpaceWebhook { webhook } => assert_eq!(webhook.name, "Renamed Hook"),
+        other => panic!("expected Response::SpaceWebhook, got {other:?}"),
+    }
+    assert_eq!(world.discord.requests_to("PATCH", "/webhooks/9103").len(), 1);
+
+    // Delete webhook
+    world.discord.script("/webhooks/9103", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::DeleteWebhook { space: world.key("5000"), webhook_id: "9103".into() }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("DELETE", "/webhooks/9103").len(), 1);
+
+    // Remove integration
+    world.discord.script("/guilds/5000/integrations/8101", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::RemoveIntegration { space: world.key("5000"), integration_id: "8101".into() }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("DELETE", "/guilds/5000/integrations/8101").len(), 1);
+}
+
+/// A 1×1 PNG. Small enough to pass the emoji size check and fail the sticker's 320×320 rule.
+const TINY_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01,
+    0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41,
+    0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+    0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+];
+
+#[test]
+fn server_emoji_and_stickers_list_upload_edit_roles_and_delete() {
+    let ready: Value = serde_json::from_str(READY).unwrap();
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    match world.ask(Request::Spaces { network: Some(Network::Discord) }) {
+        Response::Spaces { spaces } => {
+            let g4000 = spaces.iter().find(|s| s.key.id == "4000").expect("guild 4000");
+            let g5000 = spaces.iter().find(|s| s.key.id == "5000").expect("guild 5000");
+            assert!(!g4000.can_manage_expressions);
+            assert!(g5000.can_manage_expressions);
+        }
+        other => panic!("expected Response::Spaces, got {other:?}"),
+    }
+
+    match world.ask(Request::SpaceExpressions { space: world.key("4000") }) {
+        Response::Error { detail, .. } => assert!(detail.contains("permission"), "got: {detail}"),
+        other => panic!("expected permission error, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("GET", "/guilds/4000/emojis").is_empty());
+
+    match world.ask(Request::CreateEmoji {
+        space: world.key("4000"),
+        name: "nope".into(),
+        path: "not-a-file".into(),
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("permission"), "got: {detail}"),
+        other => panic!("expected permission error, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("POST", "/guilds/4000/emojis").is_empty());
+
+    world.discord.script(
+        "/guilds/5000/emojis",
+        200,
+        json!([{
+            "id": "7201",
+            "name": "ferris",
+            "animated": false,
+            "available": true,
+            "roles": ["4010"],
+            "user": {"username": "justin", "global_name": "Justin"}
+        }]),
+    );
+    world.discord.script(
+        "/guilds/5000/stickers",
+        200,
+        json!([{
+            "id": "8201",
+            "name": "Wave",
+            "description": "Waving",
+            "tags": "wave",
+            "format_type": 1,
+            "available": true,
+            "user": {"username": "justin", "global_name": "Justin"}
+        }]),
+    );
+    match world.ask(Request::SpaceExpressions { space: world.key("5000") }) {
+        Response::SpaceExpressions { expressions, .. } => {
+            assert!(expressions.can_manage && expressions.can_create);
+            assert_eq!(expressions.premium_tier, 0);
+            assert_eq!((expressions.static_emoji_limit, expressions.animated_emoji_limit, expressions.sticker_limit), (50, 50, 5));
+            assert_eq!(expressions.emojis.len(), 1);
+            assert_eq!(expressions.emojis[0].name, "ferris");
+            assert_eq!(expressions.emojis[0].roles, ["4010"]);
+            assert_eq!(expressions.emojis[0].creator, "Justin");
+            assert_eq!(expressions.stickers.len(), 1);
+            assert_eq!(expressions.stickers[0].name, "Wave");
+            assert_eq!(expressions.stickers[0].format, 1);
+            assert!(expressions.roles.is_empty(), "@everyone is not a restrictable role");
+        }
+        other => panic!("expected Response::SpaceExpressions, got {other:?}"),
+    }
+
+    match world.ask(Request::CreateEmoji {
+        space: world.key("5000"),
+        name: "bad-name".into(),
+        path: "not-a-file".into(),
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("2 to 32"), "got: {detail}"),
+        other => panic!("expected name refusal, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("POST", "/guilds/5000/emojis").is_empty());
+
+    let png_path = std::env::temp_dir().join(format!("tinyclient-emoji-{}.png", std::process::id()));
+    std::fs::write(&png_path, TINY_PNG).unwrap();
+    let png = png_path.to_string_lossy().into_owned();
+    world.discord.script(
+        "/guilds/5000/emojis",
+        200,
+        json!({
+            "id": "7202",
+            "name": "ferris",
+            "animated": false,
+            "available": true,
+            "roles": [],
+            "user": {"username": "justin", "global_name": "Justin"}
+        }),
+    );
+    match world.ask(Request::CreateEmoji { space: world.key("5000"), name: "ferris".into(), path: png.clone() }) {
+        Response::SpaceEmoji { emoji } => {
+            assert_eq!(emoji.id, "7202");
+            assert_eq!(emoji.name, "ferris");
+        }
+        other => panic!("expected Response::SpaceEmoji, got {other:?}"),
+    }
+    let creates = world.discord.requests_to("POST", "/guilds/5000/emojis");
+    assert_eq!(creates.len(), 1);
+    assert_eq!(creates[0].body["name"], "ferris");
+    assert_eq!(creates[0].body["roles"], json!([]));
+    let image = creates[0].body["image"].as_str().unwrap_or("");
+    assert!(image.starts_with("data:image/png;base64,"), "got: {image}");
+
+    world.discord.script(
+        "/guilds/5000/emojis/7202",
+        200,
+        json!({
+            "id": "7202",
+            "name": "ferris_happy",
+            "animated": false,
+            "available": true,
+            "roles": ["4010"]
+        }),
+    );
+    match world.ask(Request::EditEmoji {
+        space: world.key("5000"),
+        emoji_id: "7202".into(),
+        name: Some("ferris_happy".into()),
+        roles: Some(vec!["4010".into()]),
+    }) {
+        Response::SpaceEmoji { emoji } => {
+            assert_eq!(emoji.name, "ferris_happy");
+            assert_eq!(emoji.roles, ["4010"]);
+        }
+        other => panic!("expected Response::SpaceEmoji, got {other:?}"),
+    }
+    let edits = world.discord.requests_to("PATCH", "/guilds/5000/emojis/7202");
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].body["name"], "ferris_happy");
+    assert_eq!(edits[0].body["roles"], json!(["4010"]));
+
+    world.discord.script("/guilds/5000/emojis/7202", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::DeleteEmoji { space: world.key("5000"), emoji_id: "7202".into() }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("DELETE", "/guilds/5000/emojis/7202").len(), 1);
+
+    match world.ask(Request::CreateSticker {
+        space: world.key("5000"),
+        name: "Wave".into(),
+        tags: "wave".into(),
+        description: "Hi".into(),
+        path: png,
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("320x320"), "got: {detail}"),
+        other => panic!("expected dimension refusal, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("POST", "/guilds/5000/stickers").is_empty());
+    let _ = std::fs::remove_file(&png_path);
+
+    world.discord.script(
+        "/guilds/5000/stickers/8201",
+        200,
+        json!({
+            "id": "8201",
+            "name": "Big Wave",
+            "description": "Updated",
+            "tags": "ocean",
+            "format_type": 1,
+            "available": true
+        }),
+    );
+    match world.ask(Request::EditSticker {
+        space: world.key("5000"),
+        sticker_id: "8201".into(),
+        name: Some("Big Wave".into()),
+        tags: Some("ocean".into()),
+        description: Some("Updated".into()),
+    }) {
+        Response::SpaceSticker { sticker } => {
+            assert_eq!(sticker.name, "Big Wave");
+            assert_eq!(sticker.tags, "ocean");
+        }
+        other => panic!("expected Response::SpaceSticker, got {other:?}"),
+    }
+    let sticker_edits = world.discord.requests_to("PATCH", "/guilds/5000/stickers/8201");
+    assert_eq!(sticker_edits.len(), 1);
+    assert_eq!(sticker_edits[0].body["name"], "Big Wave");
+    assert_eq!(sticker_edits[0].body["tags"], "ocean");
+
+    world.discord.script("/guilds/5000/stickers/8201", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::DeleteSticker { space: world.key("5000"), sticker_id: "8201".into() }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("DELETE", "/guilds/5000/stickers/8201").len(), 1);
 }
 
 #[test]

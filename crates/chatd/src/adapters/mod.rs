@@ -122,12 +122,15 @@ impl std::fmt::Debug for SealedFile {
     }
 }
 
-/// What the search's ask names: a Space's own search, one conversation's, or the whole account.
+/// What the search's ask names: a Space's own search, one conversation's, the whole account,
+/// or one account's direct messages (`Home`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchScope {
     Space(String),
     Conversation(String),
     Account,
+    /// Every direct message on this account. Not a search of every server.
+    Home,
 }
 
 /// One page of recent calls across all chats on an account (`Command::CallHistory`).
@@ -977,6 +980,36 @@ pub enum Command {
         roles: Vec<String>,
         reply: Reply<()>,
     },
+    /// Discord's public-server listing or search.
+    Discover {
+        query: String,
+        category: u32,
+        offset: u32,
+        limit: u32,
+        reply: Reply<(Vec<protocol::DiscoveredGuild>, u32)>,
+    },
+    /// Join one server from that listing by its id. Returns `(space_id, channel_id)`.
+    JoinDiscovered {
+        guild_id: String,
+        reply: Reply<(Option<String>, Option<String>)>,
+    },
+    /// A server's rules form and onboarding questions.
+    SpaceGate {
+        space_id: String,
+        reply: Reply<protocol::SpaceGate>,
+    },
+    /// Accept that server's rules. Answers follow the form fields, in order.
+    AcceptRules {
+        space_id: String,
+        answers: Vec<String>,
+        reply: Reply<protocol::SpaceGate>,
+    },
+    /// Finish that server's onboarding with option ids from its questions.
+    SubmitOnboarding {
+        space_id: String,
+        options: Vec<String>,
+        reply: Reply<()>,
+    },
     /// Set the network's notification setting. `until` is when a mute ends, as Unix seconds.
     /// Absent means muted until it is turned off, or not muted. An adapter with no timed mute
     /// ignores it. Report the new mute through [`Context::muted`] before answering.
@@ -1104,6 +1137,56 @@ pub enum Command {
     TransferOwner { conversation_id: String, person: String, reply: Reply<()> },
     /// Leave a Space (e.g. Discord server `DELETE /users/@me/guilds/{id}`).
     LeaveSpace { space_id: String, reply: Reply<()> },
+    /// Read a Space's webhooks, followed channels, and installed bots/integrations.
+    SpaceIntegrations { space_id: String, reply: Reply<protocol::SpaceIntegrations> },
+    /// Create an incoming webhook in a channel.
+    CreateWebhook { conversation_id: String, name: String, reply: Reply<protocol::SpaceWebhook> },
+    /// Rename or move an existing webhook in a Space.
+    EditWebhook {
+        space_id: String,
+        webhook_id: String,
+        name: Option<String>,
+        channel_id: Option<String>,
+        reply: Reply<protocol::SpaceWebhook>,
+    },
+    /// Delete a webhook or unfollow a followed channel in a Space.
+    DeleteWebhook { space_id: String, webhook_id: String, reply: Reply<()> },
+    /// Remove an installed bot or integration from a Space.
+    RemoveIntegration { space_id: String, integration_id: String, reply: Reply<()> },
+    /// Read a Space's custom emoji, stickers, slot limits, and roles.
+    SpaceExpressions { space_id: String, reply: Reply<protocol::SpaceExpressions> },
+    /// Upload a new custom emoji to a Space.
+    CreateEmoji { space_id: String, name: String, path: String, reply: Reply<protocol::SpaceEmoji> },
+    /// Rename or edit role restrictions on an existing custom emoji.
+    EditEmoji {
+        space_id: String,
+        emoji_id: String,
+        name: Option<String>,
+        roles: Option<Vec<String>>,
+        reply: Reply<protocol::SpaceEmoji>,
+    },
+    /// Delete a custom emoji from a Space.
+    DeleteEmoji { space_id: String, emoji_id: String, reply: Reply<()> },
+    /// Upload a new custom sticker to a Space.
+    CreateSticker {
+        space_id: String,
+        name: String,
+        tags: String,
+        description: String,
+        path: String,
+        reply: Reply<protocol::SpaceSticker>,
+    },
+    /// Rename or edit tags/description on an existing custom sticker.
+    EditSticker {
+        space_id: String,
+        sticker_id: String,
+        name: Option<String>,
+        tags: Option<String>,
+        description: Option<String>,
+        reply: Reply<protocol::SpaceSticker>,
+    },
+    /// Delete a custom sticker from a Space.
+    DeleteSticker { space_id: String, sticker_id: String, reply: Reply<()> },
     /// Close a direct conversation as the network's own × does. Report it through
     /// [`Context::filing`] (hidden) or [`Context::conversation_gone`].
     CloseDirect { conversation_id: String, reply: Reply<()> },
@@ -1359,6 +1442,11 @@ pub enum Command {
         clear_at: Option<i64>,
         reply: Reply<()>,
     },
+    /// This session's "Playing" name. Empty clears it. Not another member's text.
+    SetActivity {
+        name: String,
+        reply: Reply<()>,
+    },
     /// Edit our own profile fields on the network. `None` leaves a field unchanged.
     SetProfile {
         name: Option<String>,
@@ -1531,6 +1619,17 @@ impl Command {
             Command::SpaceInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ForumInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetSpaceOptions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SpaceIntegrations { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateWebhook { reply, .. } | Command::EditWebhook { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::SpaceExpressions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateEmoji { reply, .. } | Command::EditEmoji { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::CreateSticker { reply, .. } | Command::EditSticker { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CreateInvite { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1554,6 +1653,11 @@ impl Command {
             }
             Command::EventPreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::EventLinkInterest { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Discover { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::JoinDiscovered { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SpaceGate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AcceptRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SubmitOnboarding { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetMute { reply, .. }
             | Command::Moderate { reply, .. }
             | Command::Unban { reply, .. }
@@ -1562,6 +1666,10 @@ impl Command {
             | Command::Leave { reply, .. }
             | Command::TransferOwner { reply, .. }
             | Command::LeaveSpace { reply, .. }
+            | Command::DeleteWebhook { reply, .. }
+            | Command::RemoveIntegration { reply, .. }
+            | Command::DeleteEmoji { reply, .. }
+            | Command::DeleteSticker { reply, .. }
             | Command::CloseDirect { reply, .. }
             | Command::ClearHistory { reply, .. }
             | Command::Star { reply, .. }
@@ -1649,6 +1757,7 @@ impl Command {
             | Command::AddFriend { reply, .. }
             | Command::Report { reply, .. }
             | Command::SetPresence { reply, .. }
+            | Command::SetActivity { reply, .. }
             | Command::SetProfile { reply, .. }
             | Command::SetAvatar { reply, .. }
             | Command::SetNickname { reply, .. }
@@ -1827,6 +1936,14 @@ impl Context {
         }
         Ok(())
     }
+    /// Sets whether the user can manage webhooks, guild integrations, or expressions in `space_id`.
+    pub fn set_space_manage(&self, space_id: &str, webhooks: bool, guild: bool, expressions: bool) -> Stores {
+        let space = self.key(space_id);
+        if self.hub.store().set_space_manage(&space, webhooks, guild, expressions)? {
+            self.hub.changed(Change::Spaces { account: self.account.clone() });
+        }
+        Ok(())
+    }
 
     /// One Space's whole tree: only what the user may see, in the network's order. Rows go
     /// straight to the store; keep none of them.
@@ -1834,6 +1951,18 @@ impl Context {
         let space = self.key(space_id);
         self.hub.store().replace_tree(&space, groups, conversations)?;
         self.hub.changed(Change::Tree { space });
+        Ok(())
+    }
+
+    /// Writes this server's composer lock onto threads and forum posts already stored.
+    /// A tree replacement does not touch a row that names its parent.
+    pub fn restamp_threads(&self, space_id: &str, read_only: bool, reason: &str) -> Stores {
+        let space = self.key(space_id);
+        let changed = self.hub.store().restamp_threads(&space, read_only, reason)?;
+        for (id, stored_space) in &changed {
+            let place = (!stored_space.is_empty()).then_some(stored_space.as_str());
+            self.row_changed(id, place);
+        }
         Ok(())
     }
 

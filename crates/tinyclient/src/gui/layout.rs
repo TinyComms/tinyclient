@@ -935,6 +935,35 @@ impl Shell {
                             .into_any_element(),
                     );
                 }
+                let space_entry = self.spaces.iter().find(|s| &s.key == space);
+                if space.network == Network::Discord
+                    && space_entry.is_some_and(|s| s.can_manage_webhooks || s.can_manage_guild)
+                {
+                    let int_space = space.clone();
+                    let int_name = space_entry.map(|s| s.name.clone()).unwrap_or_else(|| "Server".to_owned());
+                    items.push(
+                        menu_item("space-integrations", Some("icons/settings.svg"), "Integrations…", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.open_discord_integrations(int_space.clone(), int_name.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
+                if space.network == Network::Discord
+                    && space_entry.is_some_and(|s| s.can_manage_expressions)
+                {
+                    let expr_space = space.clone();
+                    let expr_name = space_entry.map(|s| s.name.clone()).unwrap_or_else(|| "Server".to_owned());
+                    items.push(
+                        menu_item("space-expressions", Some("icons/smile.svg"), "Emoji & Stickers…", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.open_discord_expressions(expr_space.clone(), expr_name.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
                 items.push(
                     menu_item("details", Some("icons/info.svg"), "Details", None)
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -2090,10 +2119,12 @@ impl Render for Shell {
             .children(self.join_server_modal(cx))
             .children(self.create_server_modal(cx))
             .children(self.events_modal(cx))
+            .children(self.server_gate_modal(cx))
             .children(self.leave_space_modal(cx))
             .children(self.discord_settings_layer(window, cx))
             .children(self.browse_channels_modal(cx))
             .children(self.discord_admin_layer(cx))
+            .children(self.discord_admin_modal(window, cx))
             .children(self.tiny_layer(window, cx))
             .children(self.menu_layer(snapshot, plan.sidebar.unwrap_or(state.sidebar_width), overview, window, cx))
             .children(self.toast_layer(width, cx))

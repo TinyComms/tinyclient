@@ -3134,7 +3134,8 @@ impl Discord {
                 }
                 (format!("/guilds/{space}/messages/search"), None, state.me.clone())
             }
-            SearchScope::Account => {
+            // Home (the pane's "all direct messages") and the account scope are the same route.
+            SearchScope::Account | SearchScope::Home => {
                 let me = crate::hub::lock(&self.state).me.clone();
                 ("/users/@me/messages/search".to_owned(), None, me)
             }
@@ -3190,6 +3191,30 @@ impl Discord {
         outcome
     }
 
+    /// A hit we may quote: the conversation is listed, we know it, and a server channel is one
+    /// this account can see. Home is direct messages only. Unknown channels are dropped before
+    /// their text is read.
+    fn quotable(&self, scope: &SearchScope, channel_id: &str) -> Option<protocol::Conversation> {
+        if !self.ctx.listable(channel_id) {
+            return None;
+        }
+        let known = self.ctx.known(channel_id).ok().flatten()?;
+        let guild = self.guild_of(&known);
+        if matches!(scope, SearchScope::Home) && guild.is_some() {
+            return None;
+        }
+        if let Some(guild) = guild.as_deref() {
+            let id = number(channel_id);
+            let seen = crate::hub::lock(&self.state).guilds.get(guild).is_some_and(|info| {
+                id != 0 && info.channels.iter().any(|(channel, _)| *channel == id)
+            });
+            if !seen {
+                return None;
+            }
+        }
+        Some(known)
+    }
+
     fn run_message_search(&self, path: &str, query: &str, scope: &SearchScope, offset: u32) -> Result<SearchPage, Refusal> {
         let answer = self.call("GET", path, None).map_err(refusal)?;
         let found: Found = serde_json::from_str(&answer).map_err(refused)?;
@@ -3202,21 +3227,20 @@ impl Discord {
             SearchScope::Conversation(channel) => {
                 self.ctx.known(channel).ok().flatten().and_then(|known| self.guild_of(&known))
             }
-            SearchScope::Account => None,
+            SearchScope::Account | SearchScope::Home => None,
         };
         let raw_count = hits.len();
         let mut found_hits = Vec::new();
         for posted in hits.iter().filter_map(|hit| hit.first()) {
-            // Hidden conversations and message requests stay out of it, as they stay out of
-            // the cache's own search.
-            if !self.ctx.listable(&posted.channel_id) {
+            // Hidden rows, message requests, and anything we cannot confirm the user can read
+            // stay out. The message text is not used until that check passes.
+            let Some(known) = self.quotable(scope, &posted.channel_id) else {
                 continue;
-            }
-            let known = self.ctx.known(&posted.channel_id).ok().flatten();
-            let age_restricted = known.as_ref().is_some_and(|row| row.age_restricted);
-            let kind = known.as_ref().map_or(ConversationKind::Channel, |row| row.kind);
-            let title = known.as_ref().map_or_else(String::new, |row| row.title.clone());
-            let space_title = known.as_ref().map_or_else(String::new, |row| row.space_title.clone());
+            };
+            let age_restricted = known.age_restricted;
+            let kind = known.kind;
+            let title = known.title.clone();
+            let space_title = known.space_title.clone();
             let (message, _) = self.convert(posted, space_id.as_deref(), kind);
             let text = if !message.text.is_empty() {
                 message.text
@@ -3871,4 +3895,5 @@ mod view_tests {
         assert_eq!(cat_unmute["channel_overrides"]["4050"]["muted"], false);
         assert_eq!(cat_unmute["channel_overrides"]["4050"]["message_notifications"], 0);
     }
+
 }

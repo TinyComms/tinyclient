@@ -124,6 +124,13 @@ impl Shell {
                 .on_click(cx.listener(move |this, _, _, cx| this.toggle_follow_thread(key.clone(), !joined, cx)))
                 .child(label)
         });
+        let setup = (open.key.network == Network::Discord && open.space.is_some()).then(|| {
+            let space = Key { id: open.space.clone().unwrap_or_default(), ..open.key.clone() };
+            icon_button("server-setup", "icons/list.svg", false)
+                .tooltip(tip("Server setup", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| this.open_server_gate(space.clone(), cx)))
+        });
         let live_hint = self.snapshot.as_ref().and_then(|snapshot| self.call_live_hint(snapshot, cx));
         let call = self.snapshot.as_ref().and_then(|snapshot| self.call_pill(snapshot, cx)).map(|call| {
             let call = call.h(px(28.)).rounded(px(theme::R_CONTROL)).whitespace_nowrap();
@@ -248,7 +255,7 @@ impl Shell {
             .children(self.follow_button(open, cx).map(|follow| div().flex_none().ml(px(8.)).child(follow)))
             .children(call.map(|call| div().flex_none().ml(px(8.)).child(call)))
             .children(thread_membership.map(|btn| div().flex_none().ml(px(8.)).child(btn)))
-            .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).children(thread_settings).children(threads_btn).child(search).children(members).children(details))
+            .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).children(setup).children(thread_settings).children(threads_btn).child(search).children(members).children(details))
     }
 
     /// Follow button in the header strip for Discord announcement channels.
