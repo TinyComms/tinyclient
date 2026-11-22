@@ -411,7 +411,8 @@ impl Player {
         };
         write_frame(&mut stdin, &open)?;
         let hub = hub.clone();
-        std::thread::Builder::new().name("player".into()).stack_size(128 * 1024).spawn(move || {
+        // Auto-advance reads the next message from the store on this thread, which needs more than the 128 KiB it had.
+        std::thread::Builder::new().name("player".into()).stack_size(1024 * 1024).spawn(move || {
             // Ends when mediad exits, which it does when the file ends or its stdin closes.
             while let Ok(event) = read_frame::<PlayerEvent>(&mut stdout) {
                 hub.player.heard(&hub, generation, event);
