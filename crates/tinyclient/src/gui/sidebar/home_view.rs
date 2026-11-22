@@ -441,7 +441,7 @@ impl Shell {
                     let network = space.as_ref().map(|s| s.network).or(self.sidebar_state.home.network);
                     self.sidebar_state.home.unreads.clear();
                     self.rebuild_home(cx);
-                    self.off_thread(cx, move || ask(&Request::MarkAllRead { network, space }), |_, _, _| {});
+                    self.off_thread(cx, move || ask(&Request::MarkAllRead { network, space, folder: None }), |_, _, _| {});
                     return;
                 }
                 Act::Hidden(id) => {

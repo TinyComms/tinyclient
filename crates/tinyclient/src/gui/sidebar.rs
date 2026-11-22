@@ -2026,8 +2026,8 @@ impl Shell {
             );
             menu = menu.child(super::components::menu_separator());
             menu = menu.child(super::components::menu_label("Workspace settings · Opens in your browser"));
-            for (ix, &(label, rel)) in super::profile::facts::SLACK_WORKSPACE_LINKS.iter().enumerate() {
-                let url = super::profile::facts::slack_workspace_url("", &team_id, rel);
+            for (ix, &(label, rel)) in super::people::SLACK_WORKSPACE_LINKS.iter().enumerate() {
+                let url = super::people::slack_workspace_url("", &team_id, rel);
                 menu = menu.child(
                     super::components::menu_item(("slack-admin-link", ix), Some("icons/external-link.svg"), label, None)
                         .tooltip(tip(format!("{label} · Opens in your browser"), None))

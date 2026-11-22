@@ -1028,7 +1028,7 @@ impl Picker {
                     .then(|| self.setup.account.as_ref().map(|a| a.account.clone()))
                     .flatten()
                     .map(|team| {
-                        let url = crate::gui::profile::facts::slack_workspace_url("", &team, "customize/emoji");
+                        let url = crate::gui::people::slack_workspace_url("", &team, "customize/emoji");
                         div()
                             .id("picker-add-emoji")
                             .flex_none()

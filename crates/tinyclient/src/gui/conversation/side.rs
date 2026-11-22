@@ -881,7 +881,7 @@ impl Shell {
                     return;
                 }
                 SearchTab::People => {
-                    self.ask_people(cx);
+                    self.ask_side_people(cx);
                     return;
                 }
                 SearchTab::Messages => {}
@@ -964,7 +964,7 @@ impl Shell {
         match tab {
             SearchTab::Files => self.ask_files(None, cx),
             SearchTab::Channels => self.ask_channels(cx),
-            SearchTab::People => self.ask_people(cx),
+            SearchTab::People => self.ask_side_people(cx),
             SearchTab::Messages => {}
         }
         cx.notify();
@@ -1123,7 +1123,7 @@ impl Shell {
         }
     }
 
-    fn ask_people(&mut self, cx: &mut Context<Self>) {
+    fn ask_side_people(&mut self, cx: &mut Context<Self>) {
         let Some(page) = self.conversation_state.side.search.as_ref() else {
             return;
         };
