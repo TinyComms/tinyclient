@@ -1452,6 +1452,10 @@ fn people_are_searched_watched_and_called_through_the_official_app() {
     assert!(matches!(world.ask(Request::StartDirect { person: key(DEE) }), Response::Conversation { conversation } if conversation.key.id == CHAT_DEE));
     assert_eq!(world.fake.calls("POST", "/chat/v1/threads").len(), 1);
 
+    // Opening the card asks for her presence, so the change is in the log from here.
+    let Response::Status { seq, .. } = world.ask(Request::Status) else {
+        panic!("no status");
+    };
     // A person's card says what their organization says of them.
     let Response::Profile { profile } = world.ask(Request::Profile { person: key(ANA), space: None }) else {
         panic!("no profile");
@@ -1465,9 +1469,6 @@ fn people_are_searched_watched_and_called_through_the_official_app() {
     );
 
     // Presence is asked for exactly who is on screen, together.
-    let Response::Status { seq, .. } = world.ask(Request::Status) else {
-        panic!("no status");
-    };
     let watch = || Request::Watch(Watching { people: vec![key(ANA)], ..Watching::default() });
     let seen = world.until("Ana's presence", || match world.ask(watch()) {
         Response::Watching { people, .. } => people.into_iter().find(|person| person.presence != Presence::Unknown),
@@ -1487,11 +1488,15 @@ fn people_are_searched_watched_and_called_through_the_official_app() {
     // What she is doing comes before her note.
     assert_eq!(told, Some((Presence::Busy, "In a meeting".to_owned())));
     let presence = world.fake.calls("POST", "/presence/v1/presence/getpresence/");
-    assert_eq!(presence[0].json(), json!([{"mri": ANA}, {"mri": ME}]), "who is on screen, and me");
+    assert!(
+        presence.iter().any(|call| call.json() == json!([{"mri": ANA}, {"mri": ME}])),
+        "who is on screen, and me"
+    );
     // Asked again at once for the same people, Teams is not asked again.
+    let asked = presence.len();
     world.ask(watch());
     sleep(Duration::from_millis(400));
-    assert_eq!(world.fake.calls("POST", "/presence/v1/presence/getpresence/").len(), 1);
+    assert_eq!(world.fake.calls("POST", "/presence/v1/presence/getpresence/").len(), asked);
 
     // My own presence is set only when I ask.
     assert!(world.fake.calls("PUT", "/presence/v1/me/forceavailability/").is_empty());
