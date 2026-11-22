@@ -74,9 +74,22 @@ pub(super) fn canned() -> Option<Canned> {
             canned.network = Network::Tiny;
             SignInStep::Invite { server: String::new(), problem: Some(SignInProblem::Other { reason: "That code isn't one this server gave out. Ask for a new one.".to_owned() }) }
         }
-        "messages-browser" => SignInStep::Browser { server: "https://messages.google.com".into(), provider: "Google".into(), waiting: false, problem: None },
-        "messages-waiting" => SignInStep::Browser { server: "https://messages.google.com".into(), provider: "Google".into(), waiting: true, problem: None },
-        "messages-emoji" => SignInStep::Emoji { emoji: "🐢".into() },
+        "messages-browser" => {
+            canned.network = Network::Messages;
+            SignInStep::Browser { server: "https://messages.google.com".into(), provider: "Google".into(), waiting: false, problem: None }
+        }
+        "messages-waiting" => {
+            canned.network = Network::Messages;
+            SignInStep::Browser { server: "https://messages.google.com".into(), provider: "Google".into(), waiting: true, problem: None }
+        }
+        "messages-qr" => {
+            canned.network = Network::Messages;
+            qr("https://support.google.com/messages/?p=web_computer#?c=Cj0AfykVEmKirgiiArHB50PkhjgeYDOpTt3b6WA6sMcvlBjKSqO01t0U9seRD9JEr/guOhSjXdDmBdNdjjQgEiB6eK1NUJBpBl8gdj5IKoYsNDZXZWn013SzCK4ATZgSHRogkLrgDh0lXYS9fgIdnhMyVLbHGS7DSb6qTdQnjF2cVt4=", None)
+        }
+        "messages-emoji" => {
+            canned.network = Network::Messages;
+            SignInStep::Emoji { emoji: "🐢".into() }
+        }
         "qr-waiting" => qr("", None),
         "qr" => qr(LINK, None),
         "qr-offline" => qr("", Some(SignInProblem::Unreachable)),

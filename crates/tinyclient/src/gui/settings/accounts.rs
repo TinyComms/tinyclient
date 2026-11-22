@@ -109,17 +109,17 @@ impl SettingsWindow {
         let mut pane = div().flex().flex_col().gap(px(20.));
         for network in NETWORK_ORDER {
             let mine: Vec<&AccountStatus> = accounts.iter().filter(|a| a.key.network == network && a.link != Link::SignedOut).collect();
-            // A phone offers only networks supported on phone (`signin::welcome::on_phone`): any
-            // other group shows only for an account that came from elsewhere.
+            // A phone offers every network supported on phone (`signin::welcome::on_phone`).
             if phone::active() && mine.is_empty() && !crate::gui::signin::welcome::on_phone(network) {
                 continue;
             }
             let mut group = card();
             if mine.is_empty() {
                 let waiting = signing_in == Some(network);
-                let line = match (waiting, phone::active()) {
-                    (true, true) => "Finish signing in on its page.",
-                    (true, false) => "Finish signing in in the other window.",
+                let line = match (waiting, phone::active(), network) {
+                    (true, true, _) => "Finish signing in on its page.",
+                    (true, false, _) => "Finish signing in in the other window.",
+                    (false, true, Network::Messages) => "Pair by QR from an Android phone; arrives while open",
                     _ => "Not signed in",
                 };
                 let action = if waiting {
@@ -170,13 +170,16 @@ impl SettingsWindow {
                     group = group.child(self.telegram_call_privacy_rows(account, ix, cx));
                     group = group.child(self.telegram_download_rows(account, ix, cx));
                 }
-                if network == Network::Discord && account.link == Link::Connected {
-                    group = group.child(self.discord_privacy_rows(account, ix, cx));
+                if network == Network::Discord {
+                    group = group.child(self.discord_account_rows(account, ix, cx));
+                    if account.link == Link::Connected {
+                        group = group.child(self.discord_privacy_rows(account, ix, cx));
+                    }
                 }
                 if account.can.notify_defaults && account.link == Link::Connected {
                     group = group.child(self.notify_defaults_rows(account, ix, cx));
                 }
-                if account.can.active_sessions && account.link == Link::Connected {
+                if network == Network::Telegram && account.can.active_sessions && account.link == Link::Connected {
                     group = group.child(self.active_sessions_rows(account, ix, cx));
                 }
             }

@@ -396,6 +396,24 @@ pub struct Call {
     /// direct calls and Discord). Defaults to `true` when omitted by older builds.
     #[serde(default = "video_allowed_default", skip_serializing_if = "is_true")]
     pub video_allowed: bool,
+    /// People rung for this call who are not in it yet. Empty on a call that rings no one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ringing: Vec<CallRing>,
+    /// The direct conversation this call moved out of. Set while the move is still settling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moved_from: Option<Key>,
+    /// One sentence about that move, or why it came back. The shell shows it once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub move_notice: Option<String>,
+}
+
+/// Someone rung into a group call, and what the server last said of that ring.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallRing {
+    pub id: String,
+    pub name: String,
+    /// `ringing`, `declined`, `missed`, `busy`, or `unreachable`.
+    pub state: String,
 }
 
 fn video_allowed_default() -> bool {

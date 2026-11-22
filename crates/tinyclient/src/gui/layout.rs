@@ -1982,7 +1982,12 @@ impl Shell {
         let offered = |network: &Network| !phone || super::signin::welcome::on_phone(*network);
         for network in AVAILABLE.into_iter().filter(offered) {
             if snapshot.link(network) == Link::SignedOut {
-                add(network, network.label(), "Sign in", true);
+                let caption = if phone && network == Network::Messages {
+                    "Pair by QR; arrives while open"
+                } else {
+                    "Sign in"
+                };
+                add(network, network.label(), caption, true);
             } else if network == Network::Slack {
                 add(network, "Add a Slack workspace", "Sign in to another workspace", true);
             } else if network == Network::Telegram {

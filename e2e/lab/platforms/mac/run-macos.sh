@@ -6,10 +6,21 @@ set -u
 . "$HOME/tiny-lab/lib.sh"
 R=$RUNS/$RUN
 OUT=$R/out
-HELPER=$(helper_app)
 rm -rf "$OUT"; mkdir -p "$OUT"
 rm -f "$OUT/app.pid" "$OUT/t0" "$OUT/rec.done"
 
+# The probe records its actual received JPEGs. Its test must compile against exactly the same
+# source as the bundle, so keep the source lock during the probe on the shared Mac checkout.
+if [ "${SCENARIO:-}" = tiny-video-received ]; then
+    lock
+    sync_src "$SRC_TAR"
+    export E2E_OUT=$OUT E2E_APP_DIR=$R/tinyclient.app E2E_SRC_DIR=$LAB/src
+    bash "$R/scenario/drive.macos.sh" >"$OUT/driver.log" 2>&1
+    echo "DRIVER_RC=$?"
+    exit 0
+fi
+
+HELPER=$(helper_app)
 # No grant, no recording: say so before anything is started on the Mac.
 open -W -n --stdout "$OUT/status.txt" --stderr "$OUT/status.txt" -a "$HELPER" --args status >/dev/null 2>&1
 STATUS=$(cat "$OUT/status.txt" 2>/dev/null)

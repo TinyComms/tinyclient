@@ -273,10 +273,12 @@ impl Shell {
         let place_chip = subject.space.as_ref().map(|space| {
             chip(space.clone(), theme::text_soft(), theme::hover())
         });
-        let can_add_people = call.conversation.network == Network::Discord
-            && subject.kind.is_direct()
-            && call.state == CallState::Joined
-            && (call.participants.len() + 1) < 10;
+        let picker = self.call_add_picker(&call, subject.kind);
+        let can_add_people = picker
+            || (call.conversation.network == Network::Discord
+                && subject.kind.is_direct()
+                && call.state == CallState::Joined
+                && (call.participants.len() + 1) < 10);
 
         let back = icon_button("call-view-back", "icons/arrow-left.svg", false)
             .tooltip(tip("Back to conversation (Esc)", None))
@@ -327,7 +329,16 @@ impl Shell {
             )
             .h(px(28.))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .on_click(cx.listener(|this, _, _, cx| this.call_menu_toggle(Menu::AddPeople, cx)))
+            .on_click(cx.listener({
+                let picker = picker;
+                move |this, _, window, cx| {
+                    if picker {
+                        this.open_call_people(window, cx);
+                    } else {
+                        this.call_menu_toggle(Menu::AddPeople, cx);
+                    }
+                }
+            }))
         });
         let bar = drags_window(div())
             .h(px(TOP_BAR))

@@ -515,6 +515,10 @@ impl Outgoing {
         self.screen_selfie.forget();
         #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         super::portal::stop_screen();
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        super::x11::stop();
+        #[cfg(target_os = "macos")]
+        super::mac_screen::stop();
     }
 }
 
@@ -699,6 +703,9 @@ struct Camera {
 
 impl Camera {
     fn frame(&mut self) -> Result<Rgba, String> {
+        if let Some(pattern) = test_pattern() {
+            return Ok(pattern);
+        }
         let chosen = super::camera_chosen();
         #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if self.portal {
@@ -924,13 +931,15 @@ pub fn capture_screen() -> Result<Rgba, String> {
 }
 
 /// One screen or window by its `--screens` id, for a thumbnail. This does not open a portal
-/// dialog. Only Windows tells the ids apart; elsewhere a thumbnail is the primary screen, or the
-/// frame a share that is already recording last produced.
+/// dialog. On Wayland a thumbnail is the last frame of an active share.
 pub(super) fn capture_source(id: Option<&str>) -> Result<Rgba, String> {
     grab(id, false)
 }
 
 fn grab(id: Option<&str>, allow_portal: bool) -> Result<Rgba, String> {
+    if let Some(pattern) = test_pattern() {
+        return Ok(pattern);
+    }
     // A headless test run can supply a blank screen when running inside a scratch `TINYCLIENT_DIR`,
     // just like `TINYCLIENT_MEDIAD_AUDIO=null` replaces audio devices.
     if crate::out::var_os("TINYCLIENT_DIR").is_some()
@@ -943,102 +952,67 @@ fn grab(id: Option<&str>, allow_portal: bool) -> Result<Rgba, String> {
         let _ = allow_portal;
         return super::screens::capture(id);
     }
-    #[cfg(not(windows))]
-    let _ = id;
     #[cfg(target_os = "macos")]
     {
-        let _ = allow_portal;
-        return capture_screen_macos();
+        return super::mac_screen::capture(id, allow_portal);
     }
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     {
-        return capture_screen_linux(allow_portal);
+        return capture_screen_linux(id, allow_portal);
     }
     #[cfg(not(any(windows, target_os = "macos", all(target_os = "linux", not(target_env = "ohos")))))]
     {
-        let _ = allow_portal;
+        let _ = (id, allow_portal);
         Err("Screen sharing isn't available on this system.".to_owned())
     }
 }
 
-#[cfg(target_os = "macos")]
-fn capture_screen_macos() -> Result<Rgba, String> {
-    use core_graphics::display::CGDisplay;
-    // A Core Graphics grab never carries the pointer, and Core Graphics has no mode that draws
-    // it. ScreenCaptureKit's `showsCursor` is the native way, which the capture's move to SCK
-    // brings (#773); until then a macOS share draws no pointer, and `show_cursor` is kept for
-    // that day.
-    let image = CGDisplay::main().image().ok_or_else(|| {
-        "tinyclient can't record the screen. Allow it in System Settings › Privacy & Security › Screen & System Audio Recording.".to_owned()
-    })?;
-    let width = image.width() as u32;
-    let height = image.height() as u32;
-    let stride = image.bytes_per_row();
-    let data = image.data();
-    let bytes = data.bytes();
-    let mut pixels = Vec::with_capacity((width * height * 4) as usize);
-    for row in 0..height as usize {
-        let start = row * stride;
-        let row_bytes = bytes.get(start..start + width as usize * 4).ok_or_else(|| "The screen image was short.".to_owned())?;
-        pixels.extend_from_slice(row_bytes);
+/// A scratch probe supplies a picture before opening any screen or camera. The wide blocks
+/// survive the regular low camera layer, H.264 compression, and the viewer's JPEG paint.
+fn test_pattern() -> Option<Rgba> {
+    use std::sync::{atomic::AtomicU16, OnceLock};
+    if crate::out::var_os("TINYCLIENT_DIR").is_none()
+        || crate::out::var_os("TINYCLIENT_MEDIAD_AUDIO").is_none()
+        || crate::out::var("TINYCLIENT_MEDIAD_PICTURE").as_deref() != Some("pattern")
+    {
+        return None;
     }
-    Ok(Rgba { width, height, pixels, bgra: true })
+    static STARTED: OnceLock<Instant> = OnceLock::new();
+    static FRAME: AtomicU16 = AtomicU16::new(0);
+    let (counter, seconds) = if crate::out::var_os("TINY_VIDEO_FREEZE_PATTERN").is_some() {
+        (0, 0)
+    } else {
+        (FRAME.fetch_add(1, Ordering::Relaxed), STARTED.get_or_init(Instant::now).elapsed().as_secs())
+    };
+    let color = [[224, 48, 48, 255], [48, 80, 224, 255], [48, 192, 64, 255]][(seconds % 3) as usize];
+    const WIDTH: usize = 320;
+    const HEIGHT: usize = 192;
+    let mut pixels = Vec::with_capacity(WIDTH * HEIGHT * 4);
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let pixel = if y < HEIGHT / 4 {
+                let level = if counter & (1 << (x * 16 / WIDTH)) == 0 { 0 } else { 255 };
+                [level, level, level, 255]
+            } else {
+                color
+            };
+            pixels.extend_from_slice(&pixel);
+        }
+    }
+    Some(Rgba { width: WIDTH as u32, height: HEIGHT as u32, pixels, bgra: false })
 }
 
-/// Wayland goes to the portal first, on every compositor that implements it. A cancel stays a
-/// cancel. The portal being absent may fall through to X11, which is XWayland on a Wayland
-/// session and the real root on an X11 session. An X11 session never opens the portal, so XFCE
-/// and the others do not get a dialog on top of a grab that already works. A thumbnail never
-/// opens the portal either.
+/// Wayland shares only through its portal. XWayland's root is not the user's desktop.
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-fn capture_screen_linux(allow_portal: bool) -> Result<Rgba, String> {
-    use super::session::Kind;
-    if allow_portal && super::session::current() == Kind::Wayland {
-        match super::portal::capture_screen() {
-            Ok(frame) => return Ok(frame),
-            Err(err) if err.refused => return Err(err.words),
-            Err(err) => return x11_or(err.words),
-        }
+fn capture_screen_linux(id: Option<&str>, live: bool) -> Result<Rgba, String> {
+    if super::session::current() == super::session::Kind::Wayland {
+        return if live {
+            super::portal::capture_screen().map_err(|err| err.words)
+        } else {
+            super::portal::latest_screen().ok_or_else(|| "The screen list does not open the share dialog.".to_owned())
+        };
     }
-    if !allow_portal {
-        if let Some(frame) = super::portal::latest_screen() {
-            return Ok(frame);
-        }
-        if super::session::current() == Kind::Wayland {
-            return Err("The screen list does not open the share dialog.".to_owned());
-        }
-    }
-    capture_x11()
-}
-
-/// The portal could not start. Use the X11 root when this session has a display.
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-fn x11_or(portal_words: String) -> Result<Rgba, String> {
-    let display = std::env::var("DISPLAY").ok();
-    if display.is_some_and(|value| !value.is_empty()) {
-        if let Ok(frame) = capture_x11() {
-            return Ok(frame);
-        }
-    }
-    Err(portal_words)
-}
-
-#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-fn capture_x11() -> Result<Rgba, String> {
-    use x11rb::connection::Connection;
-    use x11rb::protocol::xproto::{ConnectionExt, ImageFormat};
-    let (conn, screen_num) = x11rb::connect(None).map_err(|_| "This session has no X11 display, so the screen can't be shared.".to_owned())?;
-    let screen = &conn.setup().roots[screen_num];
-    let (width, height) = (screen.width_in_pixels, screen.height_in_pixels);
-    let reply = conn
-        .get_image(ImageFormat::Z_PIXMAP, screen.root, 0, 0, width, height, !0)
-        .map_err(|err| err.to_string())?
-        .reply()
-        .map_err(|_| "The screen could not be read.".to_owned())?;
-    if reply.depth < 24 {
-        return Err("This screen's picture is in a form tinyclient can't share.".to_owned());
-    }
-    Ok(Rgba { width: width as u32, height: height as u32, pixels: reply.data, bgra: true })
+    super::x11::capture(id, live)
 }
 
 /// What the call is told when Cisco's host could not be reached. A VPN or a firewall that

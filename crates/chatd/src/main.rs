@@ -195,6 +195,14 @@ fn main() -> io::Result<()> {
         eprintln!("prove-exit:0");
         return Ok(());
     }
+    // The lab's tiny-groups driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("tiny-groups") {
+        if let Err(err) = chatd::adapters::tiny::prove_tiny_groups() {
+            eprintln!("tiny-groups: {err}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     // The lab's refused-list driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("refused-list") {
         if let Err(err) = chatd::adapters::tiny::prove_refused_list() {
@@ -1093,6 +1101,15 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
         eprintln!("prove-messages-sign-out:0");
+        return Ok(());
+    }
+    // The lab's messages-wave12 driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("messages-wave12") {
+        if let Err(err) = chatd::adapters::messages::prove_messages_wave12() {
+            eprintln!("messages-wave12: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-messages-wave12:0");
         return Ok(());
     }
     let _log = protocol::log_policy::install("chatd", protocol::log_policy::LogPolicy::from_env());

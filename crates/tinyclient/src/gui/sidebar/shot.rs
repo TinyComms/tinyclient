@@ -31,6 +31,13 @@ pub fn schedule(cx: &mut Context<Shell>) {
         let _ = this.update(cx, |shell, cx| shell.shot_mode(cx));
         cx.background_executor().timer(Duration::from_millis(500)).await;
         let _ = this.update(cx, |shell, cx| shell.shot_inside(cx));
+        if std::env::var("TINYCLIENT_SHOT_CALL").ok().as_deref() == Some("add_call") {
+            for handle in cx.update(|cx| cx.windows()) {
+                let _ = gpui::AppContext::update_window(cx, handle, |_, window, cx| {
+                    let _ = this.update(cx, |shell, cx| shell.open_call_people(window, cx));
+                });
+            }
+        }
     })
     .detach();
 }

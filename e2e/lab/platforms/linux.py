@@ -29,7 +29,8 @@ KEEP_SOURCES = 4
 
 # Runs on the VM. `session` is the whole recorded run; `cleanup` kills by marker only.
 SESSION_SH = r'''#!/bin/bash
-# lab-run.sh session <run-dir> <app-dir> <driver-timeout>   |   lab-run.sh cleanup <run-id>
+# lab-run.sh session <run-dir> <app-dir> <driver-timeout> <source-dir> <scenario-id>
+# lab-run.sh cleanup <run-id>
 # Nothing here is killed by name: only processes whose environment carries this run's E2E_RUN_ID.
 marked() {  # pids whose environment holds E2E_RUN_ID=$1, never this shell
     local d p
@@ -51,12 +52,20 @@ sweep() {
 }
 if [ "$1" = cleanup ]; then sweep "$2"; exit 0; fi
 
-RUN=$2; APP=$3; LIMIT=${4:-300}
+RUN=$2; APP=$3; LIMIT=${4:-300}; SOURCE=$5
 ID=$(basename "$RUN")
 OUT=$RUN/out
 mkdir -p "$OUT"
 export DISPLAY=:0 XAUTHORITY=/run/user/1000/gdm/Xauthority
-export E2E_RUN_ID=$ID E2E_OUT=$OUT E2E_APP_DIR=$APP
+export E2E_RUN_ID=$ID E2E_OUT=$OUT E2E_APP_DIR=$APP E2E_SRC_DIR=$SOURCE
+if [ "${6:-}" = tiny-video-received ]; then
+    export CARGO_TARGET_DIR
+    CARGO_TARGET_DIR=$(dirname "$APP")
+    timeout -k 5 "$LIMIT" bash "$RUN/scenario/drive.linux.sh" > "$OUT/driver.log" 2>&1
+    echo "$?" > "$OUT/driver.rc"
+    sweep "$ID"
+    exit 0
+fi
 FF=
 stop_recorder() {
     [ -n "$FF" ] || return 0
@@ -198,10 +207,13 @@ def run(ctx):
             return outcome(False, "could not copy the scenario to the host: " + r.stderr[-300:], binary_sha256=digest)
 
         # 4. the recorded run
-        limit = int(host.get("driver_timeout", 300))
+        headless = ctx.scenario["id"] == "tiny-video-received"
+        limit = int(host.get("build_timeout", 3600) if headless else host.get("driver_timeout", 300))
         env = "E2E_SABOTAGE=%s" % shlex.quote(os.environ.get("E2E_SABOTAGE", ""))
         log("recording and driving")
-        r = ssh(target, "%s bash %s/bin/lab-run.sh session %s %s %d" % (env, shlex.quote(work), shlex.quote(run_dir), shlex.quote(bin_dir), limit),
+        r = ssh(target, "%s bash %s/bin/lab-run.sh session %s %s %d %s %s" % (
+                env, shlex.quote(work), shlex.quote(run_dir), shlex.quote(bin_dir), limit,
+                shlex.quote(src), shlex.quote(ctx.scenario["id"])),
                 timeout=limit + 120)
         if r.stderr.strip():
             log("session: " + r.stderr.strip()[-300:])
@@ -225,9 +237,10 @@ def run(ctx):
         steps = local("steps.jsonl")
         failed = [s["step"] for s in common.read_steps(steps) if not s.get("ok", True)]
         note = "driver exit %s%s; build %.0fs" % (rc_text or "?", ("; failed: " + ", ".join(failed)) if failed else "", built)
-        if not local("raw.mp4"):
+        recording = local("recording.mp4" if headless else "raw.mp4")
+        if not recording:
             note += "; no recording"
-        return outcome(rc_text == "0", note, recording=local("raw.mp4"), steps=steps, seconds=seconds, binary_sha256=digest)
+        return outcome(rc_text == "0", note, recording=recording, steps=steps, seconds=seconds, binary_sha256=digest)
     finally:
         # Kill by marker, then drop the run folder. Never by name.
         if started:

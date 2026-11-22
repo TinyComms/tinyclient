@@ -1,0 +1,15 @@
+{
+  "id": "call-video-seen",
+  "title": "One person shares their screen in a call and the other person's window shows it",
+  "platforms": [
+    "windows",
+    "macos",
+    "linux"
+  ],
+  "needs": [
+    "server",
+    "two-people"
+  ],
+  "release": false,
+  "max_still_seconds": 30
+}

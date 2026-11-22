@@ -183,6 +183,11 @@ impl Discord {
     pub(super) fn dispatch(&self, event: &str, data: &str) -> Result<(), Failure> {
         match event {
             "READY_SUPPLEMENTAL" => self.supplemental(from_str(data)?),
+            "AUTH_SESSION_CHANGE" => {
+                let change: serde_json::Value = from_str(data)?;
+                self.state.lock().unwrap().auth_session_id_hash =
+                    change["auth_session_id_hash"].as_str().map(str::to_owned);
+            }
             "MESSAGE_CREATE" => self.created(from_str(data)?)?,
             "MESSAGE_UPDATE" => self.updated(from_str(data)?)?,
             "MESSAGE_POLL_VOTE_ADD" | "MESSAGE_POLL_VOTE_REMOVE" => {

@@ -459,7 +459,15 @@ impl MemberList {
         let in_call = !person.bot && (talking || in_call(&self.hub, &self.scene, &person.key));
         let live_status = self.hub.status_of(&person.key);
         let status = if live_status.is_empty() { person.status.as_str() } else { live_status.as_str() };
-        let (second, is_custom_status) = if away { (String::new(), false) } else { member_line(person, status, in_call) };
+        // A Tiny group member whose app cannot see groups yet says so, online or not.
+        let outdated = person.status == protocol::TINY_NOT_UPDATED;
+        let (second, is_custom_status) = if outdated {
+            (person.status.clone(), false)
+        } else if away {
+            (String::new(), false)
+        } else {
+            member_line(person, status, in_call)
+        };
         let custom_emoji_path = if is_custom_status {
             person
                 .emoji_file
@@ -665,9 +673,17 @@ impl Render for MemberList {
                             .h(px(26.))
                             .px(px(10.))
                             .type_small()
-                            .on_click(move |_, _, cx| {
+                            .on_click(move |_, window, cx| {
                                 let key = key.clone();
                                 let _ = add_shell.update(cx, |shell, cx| {
+                                    // A Tiny group picks people by name, not by id.
+                                    if key.network == protocol::Network::Tiny {
+                                        let row = shell.held_rows().find(|row| row.key == key).cloned();
+                                        if let Some(row) = row {
+                                            shell.open_add_people(&row, window, cx);
+                                        }
+                                        return;
+                                    }
                                     shell.details_conversation(key.clone(), cx);
                                     let info = shell.details_entity(cx);
                                     info.update(cx, |info, cx| {

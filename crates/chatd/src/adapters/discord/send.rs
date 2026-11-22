@@ -9,9 +9,9 @@
 use super::model::{self, Posted};
 use super::Discord;
 use crate::adapters::Refusal;
-use crate::blobs::upload::{Target, Upload};
+use crate::blobs::upload::{size_refusal, Target, Upload};
 use base64::Engine;
-use protocol::{CatalogKind, ConversationKind, Message, Outgoing, VoiceNote};
+use protocol::{CatalogKind, ConversationKind, Message, Network, Outgoing, VoiceNote};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -245,7 +245,7 @@ impl Discord {
             return Err(format!("Discord takes {FILES} files in one message."));
         }
         if let Some(big) = up.files().iter().find(|file| file.bytes > most) {
-            return Err(format!("{} is too big for Discord (limit {} MB).", big.name, most >> 20));
+            return Err(size_refusal(Network::Discord, &big.name, most));
         }
 
         if with.voice.is_some() {
@@ -449,7 +449,7 @@ impl Discord {
                 return Err(refuse(format!("Discord takes {FILES} files in one message.")));
             }
             if let Some(big) = up.files().iter().find(|file| file.bytes > most) {
-                return Err(refuse(format!("{} is too big for Discord (limit {} MB).", big.name, most >> 20)));
+                return Err(refuse(size_refusal(Network::Discord, &big.name, most)));
             }
             Some(up)
         };

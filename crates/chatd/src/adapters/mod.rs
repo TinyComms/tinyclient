@@ -1480,6 +1480,9 @@ pub enum Command {
         session_id: String,
         reply: Reply<()>,
     },
+    EndOtherDiscordSessions { reply: Reply<()> },
+    DiscordAccountEntries { list: protocol::DiscordAccountList, reply: Reply<Vec<protocol::DiscordAccountEntry>> },
+    RemoveDiscordAccountEntry { target: protocol::DiscordAccountEntryId, reply: Reply<()> },
     /// Fetches unread mention or reaction message IDs in a conversation.
     UnreadItems {
         conversation_id: String,
@@ -2168,7 +2171,10 @@ impl Command {
             Command::SavedDialogs { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SavedHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActiveSessions { reply } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::EndSession { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::EndSession { reply, .. }
+            | Command::EndOtherDiscordSessions { reply }
+            | Command::RemoveDiscordAccountEntry { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DiscordAccountEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::UnreadItems { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MarkUnreadItemsRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Commands { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -3456,6 +3462,21 @@ impl Context {
     /// Everyone in the call but us, with their mute and deafen as the network shows them.
     pub fn participants(&self, conversation_id: &str, participants: Vec<Participant>) {
         self.hub.calls.set_participants(&self.hub, &self.key(conversation_id), participants);
+    }
+
+    /// People rung into this call who have not joined.
+    pub fn set_ringing(&self, conversation_id: &str, ringing: Vec<protocol::CallRing>) {
+        self.hub.calls.set_ringing(&self.hub, &self.key(conversation_id), ringing);
+    }
+
+    /// The direct conversation a group call is moving out of.
+    pub fn set_moved_from(&self, conversation_id: &str, moved_from: Option<protocol::Key>) {
+        self.hub.calls.set_moved_from(&self.hub, &self.key(conversation_id), moved_from);
+    }
+
+    /// One sentence about a move into a group call, or why that move came back.
+    pub fn set_move_notice(&self, conversation_id: &str, notice: Option<String>) {
+        self.hub.calls.set_move_notice(&self.hub, &self.key(conversation_id), notice);
     }
 
     /// Server-side moderation on our own voice state (server mute, server deafen, suppressed).

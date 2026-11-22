@@ -23,7 +23,8 @@ case "${RUNNER_OS:-}" in
         # lld-link.exe is the same binary but ignores -flavor and then tries to open
         # a file called "link".
         sysroot=$(rustc --print sysroot)
-        lld="$sysroot/lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe"
+        host=$(rustc -vV | sed -n 's/^host: //p' | tr -d '\r')
+        lld="$sysroot/lib/rustlib/$host/bin/rust-lld.exe"
         if [ -x "$lld" ]; then
             echo "$(cygpath -w "$(dirname "$lld")")" >> "$GITHUB_PATH"
             echo 'RUSTFLAGS=-C linker=rust-lld.exe' >> "$GITHUB_ENV"

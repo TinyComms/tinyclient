@@ -51,7 +51,7 @@ futures-lite = "2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 
 [features]
-gui = ["dep:notifier", "dep:tlottie", "dep:ureq", "dep:url", "dep:gpui", "dep:gpui_platform", "dep:unicode-segmentation", "dep:libc", "dep:image", "dep:smallvec", "dep:serde_json", "dep:palette", "dep:windows-sys"]
+gui = ["dep:notifier", "dep:tlottie", "dep:ureq", "dep:url", "dep:gpui", "dep:gpui_platform", "dep:unicode-segmentation", "dep:libc", "dep:image", "dep:smallvec", "dep:serde_json", "dep:palette", "dep:windows-sys", "dep:zbus", "dep:async-io", "dep:futures-lite", "dep:serde"]
 # Adds `--shot out.png`: render the window to a file and quit, for design review without
 # Screen Recording permission. Pulls GPUI's test support, so it is not part of `gui`.
 gui-shot = ["gui", "gpui/test-support", "gpui_platform/test-support"]
@@ -115,6 +115,13 @@ embed-resource = "3"
 # Android and iOS are unix too; they use gpui-ce's mobile backends, not a display server.
 [target.'cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))'.dependencies]
 gpui_platform = { package = "gpui_ce_platform", version = "0.3.0", optional = true, default-features = false, features = ["font-kit", "wayland", "x11"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Wayland Global Shortcuts uses the same pure-Rust session bus as notifier.
+zbus = { version = "5", optional = true }
+async-io = { version = "2", optional = true }
+futures-lite = { version = "2", optional = true }
+serde = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 gpui_platform = { package = "gpui_ce_platform", version = "0.3.0", optional = true, default-features = false, features = ["runtime_shaders"] }

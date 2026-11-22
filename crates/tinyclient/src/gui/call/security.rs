@@ -650,6 +650,9 @@ mod tests {
             share_view: None,
             picture_source: None,
             video_allowed: true,
+        ringing: Vec::new(),
+        moved_from: None,
+        move_notice: None,
         }
     }
 

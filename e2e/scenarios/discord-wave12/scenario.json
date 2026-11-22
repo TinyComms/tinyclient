@@ -1,0 +1,12 @@
+{
+  "id": "discord-wave12",
+  "title": "Discord account settings manage devices, authorized apps and connections, with Discord handoffs",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "This driver uses desktop Settings shortcuts and browser handoffs. A touch driver with a Discord fixture is needed.",
+    "ios": "This driver uses desktop Settings shortcuts and browser handoffs. A touch driver with a Discord fixture is needed."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

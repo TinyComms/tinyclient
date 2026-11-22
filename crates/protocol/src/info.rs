@@ -1603,11 +1603,35 @@ pub struct AdminLogEntry {
     pub summary: String,
 }
 
+/// The subscription plan Discord reports for the signed-in account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscordPlan {
+    Free,
+    Classic,
+    Nitro,
+    Basic,
+}
+
+impl DiscordPlan {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Free => "No Nitro",
+            Self::Classic => "Nitro Classic",
+            Self::Nitro => "Nitro",
+            Self::Basic => "Nitro Basic",
+        }
+    }
+}
+
 /// What an account may send and do on messages, as the session says (the plan, the workspace's
 /// settings). A control the account lacks is absent in the shell, never disabled. Nothing is
 /// allowed until the adapter reports it (`Context::capabilities`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
+    /// Absent for other networks and before Discord reports its plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discord_plan: Option<DiscordPlan>,
     /// This Tiny account can ring a member before a direct conversation exists.
     #[serde(default, skip_serializing_if = "is_false")]
     pub direct_calls: bool,
@@ -1775,6 +1799,9 @@ pub struct Capabilities {
     /// Maximum members in a group chat this account can create (`Request::StartGroup`). 0: unsupported.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub groups: u32,
+    /// This Tiny account can ring and join a call in a group conversation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub group_calls: bool,
     /// This account supports marking messages as Important or Urgent (`Outgoing::importance`, Teams).
     #[serde(default, skip_serializing_if = "is_false")]
     pub importance: bool,
@@ -1884,7 +1911,7 @@ pub struct Capabilities {
     /// This account supports browsing Saved Messages grouped by source chat and reaction tags (Telegram).
     #[serde(default, skip_serializing_if = "is_false")]
     pub saved_subdialogs: bool,
-    /// This account supports listing active signed-in devices/sessions and ending another session (Telegram).
+    /// This account supports listing active signed-in devices and ending another session.
     #[serde(default, skip_serializing_if = "is_false")]
     pub active_sessions: bool,
     /// This account supports jumping to unread mentions and reactions per conversation (Telegram).
@@ -1972,7 +1999,7 @@ pub struct SavedTag {
     pub count: u32,
 }
 
-/// One active signed-in device/session on an account (`account.getAuthorizations`).
+/// One active signed-in device/session on an account.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveSession {
     /// Opaque session identifier (`"0"` for the current session on Telegram).
@@ -1989,6 +2016,27 @@ pub struct ActiveSession {
     pub last_active: i64,
     #[serde(default, skip_serializing_if = "is_false")]
     pub current: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscordAccountList {
+    AuthorizedApps,
+    Connections,
+}
+
+/// The identity of a revocable Discord authorization or connection, never its credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DiscordAccountEntryId {
+    AuthorizedApp { id: String },
+    Connection { provider: String, id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscordAccountEntry {
+    pub target: DiscordAccountEntryId,
+    pub name: String,
 }
 
 /// Which unread markers to list or clear in a conversation (`UnreadItems` / `MarkUnreadItemsRead`).

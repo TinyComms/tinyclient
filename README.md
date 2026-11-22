@@ -47,7 +47,7 @@ The official apps are several copies of a browser. tinyclient is one small daemo
 - **No telemetry.** No analytics, no usage pings, no crash upload. A panic is written, with credentials redacted, to a `crash.log` on your disk and nowhere else. About once an hour the window asks GitHub whether a newer release exists. That request sends only `User-Agent: tinyclient/<version>`. With automatic install on, the new copy is checked against the release's `SHA256SUMS` and replaces this one when you quit.
 - **Small, with budgets.** Every feature has a memory, speed, and idle-CPU budget it must pass, measured from outside the process ([`docs/product/07-budgets-and-risk.md`](docs/product/07-budgets-and-risk.md)). The target for the whole product, idle and signed in to four networks, is **150 MB**. The budget for idle `chatd` is about one wakeup a second.
 - **Calls cost nothing until you make one.** Voice runs in its own process, `mediad`, for the length of a call, and again as `mediad --play` while a voice message plays. No audio process is running the rest of the time.
-- **Native, not Electron.** The window is [GPUI](https://github.com/zed-industries/zed), Zed's UI framework. Slack, Discord, and Teams sign in inside `tinyclient-login`, a separate process that exits when you are in. Signal, Telegram, and Messages sign in in the main window. Messages also opens Chrome, Edge, or Chromium for the Google account. A Tiny server's sign-in opens in your own browser.
+- **Native, not Electron.** The window is [GPUI](https://github.com/zed-industries/zed), Zed's UI framework. Slack, Discord, and Teams sign in inside `tinyclient-login`, a separate process that exits when you are in. Signal, Telegram, and Messages sign in in the main window — Messages pairs by scanning a QR code in the window, or by opening Chrome, Edge, or Chromium for a Google account. A Tiny server's sign-in opens in your own browser.
 - **Never acts for you.** No adapter sends a reaction, edit, friend request, or presence change you did not ask for. A conversation is marked read only when the window is active, the conversation is open, and the message is on screen. Telegram's own rules still send a read receipt and a typing indicator when you read and when you type. Signal sends those only as your Signal settings allow.
 
 Sizes of a macOS arm64 release build, measured 2026-10-14. Later releases have not been measured again.
@@ -99,6 +99,7 @@ Download from [tinyclient.io](https://tinyclient.io), or from the [latest releas
 | OS | Download | What it is |
 | --- | --- | --- |
 | macOS 13 or later, Apple silicon | [`tinyclient-macos.dmg`](https://tinyclient.io/download/macos) ([`.zip`](https://tinyclient.io/download/macos-zip)) | `tinyclient.app`, to drag to Applications |
+| macOS 13 or later, Intel | [`tinyclient-macos-x86_64.dmg`](https://tinyclient.io/download/macos-intel) ([`.zip`](https://tinyclient.io/download/macos-intel-zip)) | `tinyclient.app`, to drag to Applications |
 | Debian, Ubuntu, x86_64 | [`tinyclient-linux-x86_64.deb`](https://tinyclient.io/download/deb) | `sudo apt install ./tinyclient-linux-x86_64.deb` |
 | Debian, Ubuntu, arm64 | [`tinyclient-linux-aarch64.deb`](https://tinyclient.io/download/deb-arm64) | `sudo apt install ./tinyclient-linux-aarch64.deb` |
 | Fedora, openSUSE, x86_64 | [`tinyclient-linux-x86_64.rpm`](https://tinyclient.io/download/rpm) | `sudo dnf install ./tinyclient-linux-x86_64.rpm` |
@@ -109,9 +110,10 @@ Download from [tinyclient.io](https://tinyclient.io), or from the [latest releas
 | Any Linux, arm64 | [`tinyclient-linux-aarch64.tar.gz`](https://tinyclient.io/download/linux-tar-arm64) | The four programs and `install.sh` |
 | NixOS, Nix on Linux | [`flake.nix`](flake.nix) | Built from source. See [Nix](#nix). |
 | Windows 10 or later, x86_64 | [`tinyclient-windows-x86_64-setup.exe`](https://tinyclient.io/download/windows) | Installer for the current user. Settings, Apps uninstalls it. |
-| Windows, portable | [`tinyclient-windows-x86_64.zip`](https://tinyclient.io/download/windows-portable) | The four `.exe` files, run in place |
+| Windows 11 on Arm | [`tinyclient-windows-aarch64-setup.exe`](https://tinyclient.io/download/windows-arm64) | Native Arm64 installer for the current user |
+| Windows, portable | [x86_64 `.zip`](https://tinyclient.io/download/windows-portable) or [Arm64 `.zip`](https://tinyclient.io/download/windows-arm64-portable) | The four `.exe` files, run in place |
 
-There is no macOS Intel build and no Windows arm64 build. Linux arm64 files use `aarch64` in the name. The `.deb` and `.rpm` package name is `tinyclient` on both architectures.
+Linux and Windows Arm64 files use `aarch64` in the name. The Linux `.deb` and `.rpm` package name is `tinyclient` on both architectures.
 
 Tiny device linking verifies the owner through the operating system before approving another
 device. Windows desktop verification is documented for Windows 11 (build 22000) and later.
@@ -171,15 +173,18 @@ While the window is open it asks GitHub whether a newer release exists, shortly 
 
 The address compiled into this copy is the old repository feed in `crates/tinyclient/src/update.rs`. GitHub currently redirects that request to [TinyComms/tinyclient](https://github.com/TinyComms/tinyclient), and the release it returns is the one the site serves.
 
-The in-app download exists for three builds:
+The in-app updater chooses the archive for the running build.
 
 | This copy | Archive it downloads |
 | --- | --- |
 | macOS, Apple silicon | `tinyclient-macos.zip` |
+| macOS, Intel | `tinyclient-macos-x86_64.zip` |
 | Linux x86_64 | `tinyclient-linux-x86_64.tar.gz` |
+| Linux arm64 | `tinyclient-linux-aarch64.tar.gz` |
 | Windows x86_64 | `tinyclient-windows-x86_64.zip` |
+| Windows Arm64 | `tinyclient-windows-aarch64.zip` |
 
-Linux arm64 does not ask GitHub. A development build under `target/`, and any copy in the Nix store, is never replaced. A directory this user cannot write, including `/usr/lib/tinyclient` from the `.deb` and `.rpm`, is not replaced either. The window can still say a release is available. Install the newer package, or the newer archive, yourself.
+A development build under `target/`, and any copy in the Nix store, is never replaced. A directory this user cannot write, including `/usr/lib/tinyclient` from the `.deb` and `.rpm`, is not replaced either. The window can still say a release is available. Install the newer package, or the newer archive, yourself.
 
 When a download is allowed, it is checked against that release's `SHA256SUMS`. On macOS the new app is checked with `codesign --verify --deep --strict` before it is kept. It replaces this copy when you quit. The menu then says Restart to Update. On Windows the swap waits until the programs from that folder have stopped, puts the old programs back if a step fails, and opens tinyclient again either way.
 
@@ -341,7 +346,7 @@ That leaves Signal out. Sign-in then says this build was made without Signal. Th
 
 ## Try it without an account
 
-`TINYCLIENT_DIR` moves the socket, database, media cache, and logs to a directory you choose. chatd does not read or write the system credential store while it is set. Discord, Slack, Teams, and Messages sign-in is refused unless `TINYCLIENT_LOGIN` names a helper. A session cannot be saved. Use a scratch directory for development.
+`TINYCLIENT_DIR` moves the socket, database, media cache, and logs to a directory you choose. chatd does not read or write the system credential store while it is set. Discord, Slack, Teams, and the Messages Google-account browser sign-in are refused unless `TINYCLIENT_LOGIN` names a helper (Messages QR pairing does not use the helper). A session cannot be saved. Use a scratch directory for development.
 
 `--seed-demo` fills that directory with invented data and serves it: Discord, two Slack workspaces (Harbor Labs and Fernhill Collective), Telegram, Teams, Signal, and a Tiny server named Night Shift. `#showcase`, in Moss & Lichen, holds one of every kind of message. There is no network behind it (`crates/chatd/src/demo/adapter.rs`). The Tiny server's own requests are answered in-process.
 
@@ -378,7 +383,9 @@ With `TINYCLIENT_DIR` set, browser sign-in runs only a helper named by `TINYCLIE
 
 Shortcuts use Command on macOS and Ctrl on Linux and Windows. Menus, tooltips, and Settings → Shortcuts show the keys for this computer. Help → Keyboard Shortcuts (Command-/ , Ctrl-/ elsewhere) opens that page. Super is left to the Linux desktop.
 
-Settings → Shortcuts lists the keys and changes them. Click a row, then press the new keys. Reset restores the defaults, and Backspace on a row restores that one. A key another command uses is refused. Undo, Redo, Cut, Copy, Paste and Select All stay the platform's own keys. Voice keys are separate: Settings → Voice records push-to-talk, priority push-to-talk, toggle mute, and toggle deafen. On Wayland those mute and deafen keys work while the window is in front, and push-to-talk does not.
+Settings → Shortcuts lists the keys and changes them. Click a row, then press the new keys. Reset restores the defaults, and Backspace on a row restores that one. A key another command uses is refused. Undo, Redo, Cut, Copy, Paste and Select All stay the platform's own keys. Voice keys are separate: Settings → Voice records push-to-talk, priority push-to-talk, toggle mute, and toggle deafen. On Wayland, approve the voice shortcuts in your desktop’s Global Shortcuts portal. Settings → Voice shows the desktop’s active bindings. Without portal support or approval, mute and deafen work in the tinyclient window. The portal has no standard mouse-button shortcut, so use keyboard keys.
+
+In a call on Windows, macOS or X11 Linux, choose an individual display or window in the share picker. On Wayland the desktop portal shows its own list. On macOS, grant Screen & System Audio Recording access in Privacy & Security, then restart tinyclient. Without an X11 compositor, a window share shows anything that overlaps the selected window.
 
 Type `>` in the Quick Switcher for commands: menu actions, set status, pause notifications, toggle mute, sign in, and open a settings section. Commands with nothing behind them are not listed.
 
@@ -451,7 +458,7 @@ A [Tiny server](https://github.com/TinyComms/tinyserver) is one you already run.
 | [`protocol`](crates/protocol) | | The contract: every request, answer, and change, as serde types. Frames are a 4-byte length, then JSON, at most 1 MiB, over a Unix socket (a named pipe on Windows). Also the panic hook, credential redaction, and how the shell starts chatd. |
 | [`chatd`](crates/chatd) | `chatd` | Always on, one per data directory (`chatd.lock`). One adapter per account speaks that network's protocol. Everything lands in SQLite and the media cache. Spawns `tinyclient-login` for Slack, Discord, and Teams, and for the Messages browser step. Spawns `mediad` for a call, a voice message, or a notification sound. Never decodes media and never fetches a link from a message. |
 | [`mediad`](crates/mediad) | `mediad` | Voice: Discord's voice gateway, RTP over UDP, Opus, DAVE, and a Tiny server's room calls through str0m — UDP, or ICE-TCP where UDP is blocked — audio devices through cpal. `mediad --play` plays one voice message or audio file. `mediad --sound` plays one notification sound. Speaks only to chatd over stdin and stdout, and exits when its job ends or chatd closes its stdin. |
-| [`login`](crates/login) | `tinyclient-login` | The sign-in page for Slack, Discord, and Teams in a native web view (WKWebView on macOS, wry elsewhere). Prints the session on stdout and exits. The same binary opens Chrome, Edge, or Chromium for Messages. Signal and Telegram sign in in the main window. A Tiny server collects the invite or address in that window, then opens the server's sign-in provider in the system browser, driven by chatd. |
+| [`login`](crates/login) | `tinyclient-login` | The sign-in page for Slack, Discord, and Teams in a native web view (WKWebView on macOS, wry elsewhere). Prints the session on stdout and exits. The same binary opens Chrome, Edge, or Chromium for the optional Messages Google-account path. Signal, Telegram, and Messages QR pairing sign in in the main window. A Tiny server collects the invite or address in that window, then opens the server's sign-in provider in the system browser, driven by chatd. |
 | [`notifier`](crates/notifier) | | Library, not a process. System notifications for chatd, and the taskbar button or Dock icon for the window. |
 | [`tinyclient`](crates/tinyclient) | `tinyclient` | The shell. Draws what chatd reports and decodes images for rows on screen. GPUI is behind the `gui` feature so tests and the daemons never build a GPU stack. Does not read the database. While the window is open it asks GitHub whether a newer release exists, about once an hour, with user agent `tinyclient/<version>`. |
 
@@ -513,7 +520,7 @@ tinyclient is an independent project. It is not made or endorsed by Slack, Disco
 - **Teams.** Signs in as Microsoft's own Teams client. Your organization's policy applies, and an organization can turn third-party sign-ins off. Work and school accounts only.
 - **Telegram.** Telegram welcomes third-party clients. Its rules mean read receipts and typing indicators are always sent. Secret chats are not supported. A build carries the Telegram app id of whoever built it.
 - **Signal.** Links as one more device, like Signal Desktop, using Signal's own libsignal through presage. It never registers a phone number. It receives what arrives after it is linked, and signing out removes the device.
-- **Messages.** Pairs this computer to Google Messages on an Android phone, the same kind of pairing messages.google.com uses. Google does not publish this protocol and can change it. The phone is the account: it has to stay online, and a text is sent through it. This is not iMessage, and it is not a second phone number.
+- **Messages.** Pairs this device to Google Messages on an Android phone by scanning a QR code (no Google account in a browser needed) or signing in with your Google account and confirming an emoji on the phone, the same pairing messages.google.com uses. Google does not publish this protocol and can change it. The phone is the account: it has to stay online, and a text is sent through it. This is not iMessage, and it is not a second phone number.
 - **A Tiny server.** Optional. Someone runs it for their own community. tinyclient is its app. tinyclient.io does not run it, does not take its credentials, and does not proxy its messages. There is no official app and no third-party terms of the kind above.
 
 ## Contributing

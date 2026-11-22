@@ -28,9 +28,15 @@ e2e/scenarios/<id>/
   listed here. A platform the scenario does not list is a gap the reviewer asks about.
 - `needs`: what the lab stands up first. `server` is a `tinyserver` built from `origin/main`
   with a fresh database and the seed (`scripts/e2e/local-tiny-call.ps1 -Phase server`).
-  `two-people` is a second signed-in person on another host.
+  `two-people` is a second signed-in person on another host. For `call-video-seen`, A opens
+  the synthetic direct with B and rings. B accepts from the dock and checks the received pixels.
+  A shares the first display and puts a full-screen test card on it, with four colored
+  quadrants and a new number each second. The two join the seeded Proof room and repeat the
+  checks after B clicks Watch. The [scenario setup](scenarios/call-video-seen/README.md)
+  describes the private profiles and desktop controls.
 - `release`: `true` puts it in the release suite (gate 3). Keep that suite small. Every scenario
-  in it runs on five platforms before every cut.
+  in it runs on the five-platform plan before every cut. A native-only probe lists explicit
+  `not_applicable` reasons for phones.
 
 A driver talks to the app the way a person does and nothing else. Desktop: window input and
 pixels (`scripts/e2e/win-window.ps1`, `TINYCLIENT_DEBUG_JOIN`). Phones: the debug launch extras
@@ -40,8 +46,8 @@ and the platform's own input. It writes `steps.jsonl` beside it, one line per st
 {"t": 12.4, "step": "open the room menu", "ok": true, "shot": "03-menu.png"}
 ```
 
-Test data is invented. Drivers run with an isolated `TINYCLIENT_DIR` and made-up people, so a
-recording never shows a real account, and the recordings are public.
+Test data is invented. Drivers use an isolated `TINYCLIENT_DIR` or a dedicated lab OS user
+signed in with made-up people. The recordings are public.
 
 ## A lab run
 
@@ -99,6 +105,10 @@ The lab checks these with `ffprobe` and `ffmpeg`, and fails the platform if any 
 - The SHA and the step name are burned into the picture (`drawtext` from `steps.jsonl`), so a
   clip cannot be moved to another pull request.
 - Audio scenarios also keep the received audio and run `scripts/e2e/tone-check.py` on it.
+- The windowed video scenario also samples the receiver's recording for its test-card colors
+  and number at the recorded steps.
+- The headless video probe produces a playback from the receiver's JPEG samples. Its recorded
+  steps identify each room or direct share and camera leg in playback time.
 
 ### `proof.json`
 
