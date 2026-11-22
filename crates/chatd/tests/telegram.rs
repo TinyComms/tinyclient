@@ -4793,6 +4793,25 @@ fn a_chat_is_pinned_unpinned_archived_and_unarchived_on_telegram() {
 }
 
 #[test]
+fn copy_link_is_filled_for_channels_and_forum_topics_and_not_for_private_chats() {
+    let world = World::signed_in();
+    world.connected();
+    // A public channel's post is addressed by the channel's name.
+    world.watch(Watching { conversation: Some(key("c9001")), ..Watching::default() });
+    world.messages("c9001");
+    assert_eq!(world.arrived("c9001", "5").permalink, "https://t.me/fieldnotes/5");
+    // A private forum's message carries its topic, and only members can open it.
+    world.watch(Watching { conversation: Some(key("c9002")), ..Watching::default() });
+    world.messages("c9002");
+    world.until("the topic row", || world.conversation("c9002_31"));
+    world.watch(Watching { conversation: Some(key("c9002_31")), ..Watching::default() });
+    assert_eq!(world.arrived("c9002_31", "41").permalink, "https://t.me/c/9002/31/41");
+    // A private chat and a basic group have no address anyone else could open.
+    assert_eq!(world.arrived("u7002", "12").permalink, "");
+    assert_eq!(world.arrived("g8001", "20").permalink, "");
+}
+
+#[test]
 fn a_message_is_pinned_unpinned_and_follows_the_pins_made_elsewhere() {
     let world = World::signed_in();
     world.connected();

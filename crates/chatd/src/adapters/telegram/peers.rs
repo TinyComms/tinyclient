@@ -912,10 +912,40 @@ pub fn message_link(who: Who, known: Option<&Known>, message: i32) -> String {
     }
 }
 
+/// The address "Copy link" gives for a message of a channel or a supergroup: by its public
+/// name, or `t.me/c/<id>` which only members can open. A forum topic's messages carry the
+/// topic. A private chat and a basic group have no address anyone else could open: empty.
+pub fn permalink(who: Who, known: Option<&Known>, topic: Option<i32>, message: i32) -> String {
+    let Who::Channel(id) = who else {
+        return String::new();
+    };
+    let place = match known.map(|known| known.handle.as_str()).filter(|handle| !handle.is_empty()) {
+        Some(handle) => handle.to_owned(),
+        None => format!("c/{id}"),
+    };
+    match topic.filter(|topic| *topic != message) {
+        Some(topic) => format!("https://t.me/{place}/{topic}/{message}"),
+        None => format!("https://t.me/{place}/{message}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use grammers_tl_types::{Deserializable, Serializable};
+
+    #[test]
+    fn copy_link_has_a_public_a_private_and_a_topic_form_and_none_outside_channels() {
+        let public = Known { handle: "trailcrew".to_owned(), ..Known::default() };
+        assert_eq!(permalink(Who::Channel(9), Some(&public), None, 4), "https://t.me/trailcrew/4");
+        assert_eq!(permalink(Who::Channel(9), Some(&public), Some(31), 41), "https://t.me/trailcrew/31/41");
+        assert_eq!(permalink(Who::Channel(9), None, None, 4), "https://t.me/c/9/4");
+        assert_eq!(permalink(Who::Channel(9), None, Some(31), 41), "https://t.me/c/9/31/41");
+        // The message that opens a topic is addressed like any other.
+        assert_eq!(permalink(Who::Channel(9), None, Some(31), 31), "https://t.me/c/9/31");
+        assert_eq!(permalink(Who::User(3), None, None, 4), "");
+        assert_eq!(permalink(Who::Group(7), None, None, 4), "");
+    }
 
     type Field<'a> = &'a dyn Fn(&mut Vec<u8>);
 
