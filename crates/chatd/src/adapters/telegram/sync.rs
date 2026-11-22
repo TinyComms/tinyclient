@@ -1147,6 +1147,8 @@ pub(super) fn avatar(account: &Account, who: Who) -> Option<Want> {
         row: Some(who.text()),
         watched: false,
         original: false,
+        supports_streaming: false,
+        source: None,
     })
 }
 
@@ -1515,6 +1517,8 @@ fn emoji_want(document: &tl::types::Document, row: Option<String>) -> Want {
         row,
         watched: false,
         original: false,
+        supports_streaming: false,
+        source: None,
     }
 }
 

@@ -177,6 +177,7 @@ impl Dirty {
             Change::Messages { .. }
             | Change::People { .. }
             | Change::Media { .. }
+            | Change::MediaProgress { .. }
             | Change::Typing { .. }
             | Change::Ephemeral { .. }
             | Change::Presence { .. }

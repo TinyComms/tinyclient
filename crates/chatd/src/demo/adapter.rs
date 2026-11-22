@@ -1473,6 +1473,7 @@ impl Demo {
             | Command::Draft { .. }
             | Command::Watch(_)
             | Command::Wanted(_)
+            | Command::WantedSpan { .. }
             | Command::Played { .. }
             | Command::Stop => {}
         }

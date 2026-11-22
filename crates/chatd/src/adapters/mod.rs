@@ -1806,6 +1806,12 @@ pub enum Command {
     /// also takes it as what is on screen: a picture a message shows goes ahead of those that
     /// are not, even one no page has named yet. Others ignore it.
     Wanted(Vec<String>),
+    /// A byte range `[start, end)` of files the player asked for (`Fetch { span }`), for
+    /// progressive/ranged playback without downloading the entire file first.
+    WantedSpan {
+        ids: Vec<String>,
+        span: (u64, u64),
+    },
     /// The link that opens this conversation's call in the official app.
     Handoff { conversation_id: String, reply: Reply<String> },
     /// Today's meetings, soonest first. A calendar the account cannot read answers with what

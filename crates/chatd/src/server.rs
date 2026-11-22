@@ -6167,7 +6167,11 @@ impl Chat {
                         // What the cache has never heard of may be the adapter's to fetch itself.
                         let unknown: Vec<String> = ids.iter().filter(|id| !files.iter().any(|file| file.id == **id)).cloned().collect();
                         if let (false, Some(adapter)) = (unknown.is_empty(), adapter) {
-                            let _ = adapter.send(Command::Wanted(unknown));
+                            let command = match span {
+                                Some(span) => Command::WantedSpan { ids: unknown, span },
+                                None => Command::Wanted(unknown),
+                            };
+                            let _ = adapter.send(command);
                         }
                         Response::Media { files }
                     }

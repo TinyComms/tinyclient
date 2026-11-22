@@ -28,6 +28,12 @@ pub struct Want {
     /// A picture itself, for the viewer: kept until the shell asks for it, never fetched for a
     /// row.
     pub original: bool,
+    /// True when a video carries `supports_streaming` (`moov` atom at the start); false means
+    /// a ranged reader must fetch the tail first to find the `moov` atom.
+    pub supports_streaming: bool,
+    /// The peer and message id this file came from, so an expired `file_reference` can be
+    /// refreshed mid-stream.
+    pub source: Option<(Who, i32)>,
 }
 
 /// What a reply header says besides the id of the message it answers.
@@ -977,12 +983,12 @@ fn photo(photo: &tl::types::Photo, spoiler: bool, wants: &mut Vec<Want>, peer: W
         let mut preview = MediaFile::new(format!("p{}{}", photo.id, stripped.r#type), MediaKind::Image);
         (preview.width, preview.height, preview.bytes) = (width, height, jpeg.len() as u64);
         let location = location(&stripped.r#type);
-        wants.push(Want { file: preview.clone(), dc: photo.dc_id, location, inline: Some(jpeg), row: None, watched: false, original: false });
+        wants.push(Want { file: preview.clone(), dc: photo.dc_id, location, inline: Some(jpeg), row: None, watched: false, original: false, supports_streaming: false, source: None });
         Some(preview)
     });
     let mut thumb = MediaFile::new(format!("p{}{kind}", photo.id), MediaKind::Image);
     (thumb.width, thumb.height, thumb.bytes) = (width, height, bytes);
-    wants.push(Want { file: thumb.clone(), dc: photo.dc_id, location: location(kind), inline: inline.map(<[u8]>::to_vec), row: None, watched: false, original: false });
+    wants.push(Want { file: thumb.clone(), dc: photo.dc_id, location: location(kind), inline: inline.map(<[u8]>::to_vec), row: None, watched: false, original: false, supports_streaming: false, source: None });
     // The picture itself is the largest size Telegram keeps: the viewer fills a screen with
     // it, at the screen's own pixels.
     let mut file = thumb.clone();
@@ -990,7 +996,7 @@ fn photo(photo: &tl::types::Photo, spoiler: bool, wants: &mut Vec<Want>, peer: W
         file.id = format!("p{}{kind}", photo.id);
         (file.width, file.height, file.bytes) = (width, height, bytes);
         let fetch = rules.fetch_full(peer, megagroup, DownloadClass::Photo, bytes);
-        wants.push(Want { file: file.clone(), dc: photo.dc_id, location: location(kind), inline: inline.map(<[u8]>::to_vec), row: None, watched: false, original: !fetch });
+        wants.push(Want { file: file.clone(), dc: photo.dc_id, location: location(kind), inline: inline.map(<[u8]>::to_vec), row: None, watched: false, original: !fetch, supports_streaming: false, source: None });
     }
     let mut attachment = Attachment::new("Photo", file);
     attachment.thumb = Some(thumb);
@@ -1021,6 +1027,8 @@ fn preview_image(page: &tl::types::WebPage, wants: &mut Vec<Want>) -> Option<Med
             row: None,
             watched: false,
             original: false,
+            supports_streaming: false,
+            source: None,
         });
         return Some(image);
     }
@@ -1042,13 +1050,15 @@ fn preview_image(page: &tl::types::WebPage, wants: &mut Vec<Want>) -> Option<Med
         row: None,
         watched: false,
         original: false,
+        supports_streaming: false,
+        source: None,
     });
     Some(image)
 }
 
 pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::types::Document, wants: &mut Vec<Want>, peer: Who, megagroup: bool, rules: DownloadRules) -> Attachment {
     let (mut name, mut size, mut duration, mut wave) = (String::new(), (0u32, 0u32), 0u32, Vec::new());
-    let (mut sticker, mut animated, mut video, mut round, mut voice, mut audio) = (false, false, false, false, false, false);
+    let (mut sticker, mut animated, mut video, mut round, mut voice, mut audio, mut supports_streaming) = (false, false, false, false, false, false, false);
     for attribute in &document.attributes {
         match attribute {
             DocumentAttribute::Filename(file) => name = file.file_name.clone(),
@@ -1058,6 +1068,7 @@ pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::t
             DocumentAttribute::Video(attribute) => {
                 video = true;
                 round = attribute.round_message;
+                supports_streaming = attribute.supports_streaming;
                 size = (attribute.w as u32, attribute.h as u32);
                 duration = attribute.duration.max(0.) as u32;
             }
@@ -1091,6 +1102,8 @@ pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::t
             row: None,
             watched: false,
             original: false,
+            supports_streaming: false,
+            source: None,
         });
         thumb
     });
@@ -1128,13 +1141,13 @@ pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::t
     if moving {
         // `.tgs` arrives gzipped, like a custom emoji, so the fetch unpacks it for the Lottie player.
         file.kind = if mime == "application/x-tgsticker" { MediaKind::Emoji } else { MediaKind::Video };
-        wants.push(Want { file: file.clone(), dc: document.dc_id, location: location.into(), inline: None, row: None, watched: false, original: false });
+        wants.push(Want { file: file.clone(), dc: document.dc_id, location: location.into(), inline: None, row: None, watched: false, original: false, supports_streaming: false, source: None });
     } else if let (true, Some(still)) = (sticker, &still) {
         file = still.clone();
     } else if kind != MediaKind::Image || still.is_some() {
         // A picture sent as a file opens in the viewer like a photo, so it is kept the same way
         // unless this chat's auto-download rule says the full file is small enough to fetch now.
-        // GIFs are not autoplayed; a GIF under the video cap is only fetched ahead.
+        // GIFs under the video cap are fetched ahead; larger videos stream on demand via ranged reads.
         let class = match kind {
             MediaKind::Video => DownloadClass::Video,
             MediaKind::Gif => DownloadClass::Gif,
@@ -1142,7 +1155,50 @@ pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::t
             _ => DownloadClass::File,
         };
         let fetch = rules.fetch_full(peer, megagroup, class, file.bytes);
-        wants.push(Want { file: file.clone(), dc: document.dc_id, location: location.into(), inline: None, row: None, watched: false, original: !fetch });
+        wants.push(Want { file: file.clone(), dc: document.dc_id, location: location.into(), inline: None, row: None, watched: false, original: !fetch, supports_streaming, source: None });
+    }
+    // Alternative video qualities (`alt_documents`): expose each variant for the viewer's quality
+    // selector and register its location for on-demand ranged streaming.
+    let mut variants = Vec::new();
+    if let Some(alts) = media.alt_documents.as_deref() {
+        for alt in alts {
+            let tl::enums::Document::Document(alt) = alt else { continue };
+            if alt.id == document.id {
+                continue;
+            }
+            let (mut alt_size, mut alt_streaming) = ((0u32, 0u32), false);
+            for attr in &alt.attributes {
+                if let DocumentAttribute::Video(v) = attr {
+                    alt_size = (v.w as u32, v.h as u32);
+                    alt_streaming = v.supports_streaming;
+                }
+            }
+            let mut variant = MediaFile::new(format!("d{}", alt.id), MediaKind::Video);
+            (variant.width, variant.height) = alt_size;
+            variant.bytes = alt.size.max(0) as u64;
+            if variants.iter().any(|seen: &MediaFile| seen.id == variant.id) {
+                continue;
+            }
+            wants.push(Want {
+                file: variant.clone(),
+                dc: alt.dc_id,
+                location: tl::types::InputDocumentFileLocation {
+                    id: alt.id,
+                    access_hash: alt.access_hash,
+                    file_reference: alt.file_reference.clone(),
+                    thumb_size: String::new(),
+                }
+                .into(),
+                inline: None,
+                row: None,
+                watched: false,
+                original: true,
+                supports_streaming: alt_streaming,
+                source: None,
+            });
+            variants.push(variant);
+        }
+        variants.sort_by(|a, b| b.height.cmp(&a.height).then_with(|| b.bytes.cmp(&a.bytes)));
     }
     let mut attachment = Attachment::new(if name.is_empty() { label.to_owned() } else { name }, file);
     attachment.thumb = still;
@@ -1153,6 +1209,7 @@ pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::t
     attachment.waveform = wave;
     attachment.round = round || media.round;
     attachment.sticker_set = sticker_set_key(&document.attributes);
+    attachment.variants = variants;
     attachment
 }
 
@@ -2883,6 +2940,11 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                 Some(MessageMedia::Document(media)) if media.document.is_some() && media.ttl_seconds.is_none() => {
                     if let Some(tl::enums::Document::Document(file)) = &media.document {
                         let attachment = document(media, file, &mut wants, peer, megagroup, rules);
+                        for want in &mut wants {
+                            if want.source.is_none() {
+                                want.source = Some((peer, raw.id));
+                            }
+                        }
                         let playable = !attachment.view_once && (attachment.round || attachment.file.kind == MediaKind::Audio);
                         if raw.media_unread && playable {
                             message.media_unread = true;

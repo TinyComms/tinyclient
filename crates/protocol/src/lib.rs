@@ -4172,6 +4172,18 @@ pub enum Change {
     Members { conversation: Key },
     /// A requested file is on disk (`path`), or could not be fetched (`failed` says why).
     Media { account: AccountKey, file: MediaFile },
+    /// Ephemeral. A streaming file is landing in a sparse cache file at `path`, with `loaded`
+    /// unique bytes written so far out of `total` (0 if unknown). `complete` is true once every
+    /// byte has landed.
+    MediaProgress {
+        account: AccountKey,
+        id: String,
+        path: String,
+        loaded: u64,
+        total: u64,
+        #[serde(default, skip_serializing_if = "is_false")]
+        complete: bool,
+    },
     /// Ephemeral. Who is in a voice channel now; no people and a total of 0 when it emptied.
     Occupants { conversation: Key, occupants: Occupants },
     /// Ephemeral. A network finished the search for `query`, whether or not it found anyone.
@@ -4275,6 +4287,9 @@ impl Change {
             (Change::Media { account: a, file: x }, Change::Media { account: b, file: y }) => {
                 a == b && x.id == y.id
             }
+            (Change::MediaProgress { account: a, id: x, .. }, Change::MediaProgress { account: b, id: y, .. }) => {
+                a == b && x == y
+            }
             (Change::InteractionModal { conversation: a, modal: x }, Change::InteractionModal { conversation: b, modal: y }) => {
                 a == b && x.id == y.id
             }
@@ -4300,6 +4315,7 @@ impl Change {
                 | Change::Searched { .. }
                 | Change::SignIn { .. }
                 | Change::Upload { .. }
+                | Change::MediaProgress { .. }
                 | Change::Playback { .. }
                 | Change::Recording { .. }
                 | Change::Meter { .. }
@@ -6041,5 +6057,17 @@ mod sock_path_tests {
         assert!(rate_change.is_ephemeral());
         assert!(rate_change.same_scope(&rate_change));
         assert_eq!(serde_json::from_str::<Change>(&serde_json::to_string(&rate_change).unwrap()).unwrap(), rate_change);
+
+        let progress = Change::MediaProgress {
+            account: AccountKey { network: Network::Telegram, account: "7001".into() },
+            id: "d9500".into(),
+            path: "/tmp/d9500.stream".into(),
+            loaded: 262_144,
+            total: 52_428_800,
+            complete: false,
+        };
+        assert!(progress.is_ephemeral());
+        assert!(progress.same_scope(&progress));
+        assert_eq!(serde_json::from_str::<Change>(&serde_json::to_string(&progress).unwrap()).unwrap(), progress);
     }
 }

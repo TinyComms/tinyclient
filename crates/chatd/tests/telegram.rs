@@ -4981,6 +4981,126 @@ fn a_call_discard_with_need_rating_prompts_and_sends_set_call_rating() {
 }
 
 #[test]
+fn a_fifty_megabyte_video_streams_first_bytes_moov_and_alt_quality_without_downloading_the_whole_file() {
+    let world = World::signed_in();
+    world.connected();
+    world.watch(Watching { conversation: Some(key("u7002")), ..Watching::default() });
+    world.arrived("u7002", "12");
+
+    world.steer("video-stream");
+    let fast = world.arrived("u7002", "73");
+    let slow = world.arrived("u7002", "74");
+    let fast_att = &fast.attachments[0];
+    assert_eq!(fast_att.file.id, "d9500");
+    assert_eq!(fast_att.file.bytes, 50 * 1024 * 1024);
+    assert_eq!(fast_att.variants.len(), 1);
+    assert_eq!(fast_att.variants[0].id, "d9501");
+    assert_eq!(fast_att.variants[0].height, 480);
+    assert_eq!(slow.attachments[0].file.id, "d9502");
+
+    // Nothing has been downloaded yet for any of the 50 MB videos.
+    assert_eq!(world.called("GetFile document 9500"), 0);
+    assert_eq!(world.called("GetFile document 9501"), 0);
+    assert_eq!(world.called("GetFile document 9502"), 0);
+
+    let mut cursor = world.status().1;
+    let mut wait_progress = |wanted_id: &str, min_loaded: u64| -> (String, u64, u64, bool) {
+        world.until(&format!("MediaProgress for {wanted_id} >= {min_loaded}"), || {
+            match world.ask(Request::Wait { since: cursor }) {
+                Response::Changes { seq, changes, .. } => {
+                    cursor = seq;
+                    changes.into_iter().find_map(|change| match change {
+                        protocol::Change::MediaProgress { id, path, loaded, total, complete, .. }
+                            if id == wanted_id && loaded >= min_loaded =>
+                        {
+                            Some((path, loaded, total, complete))
+                        }
+                        _ => None,
+                    })
+                }
+                other => panic!("unexpected Wait response: {other:?}"),
+            }
+        })
+    };
+
+    // 1. Ask for the first 256 KB window of the 50 MB fast-start video: player gets its first
+    //    bytes after ONE piece (not after all 50 MB!).
+    let _ = world.ask(Request::Fetch {
+        account: account(),
+        ids: vec!["d9500".into()],
+        size: None,
+        retry: false,
+        span: Some((0, 256 * 1024)),
+    });
+    let (path, loaded, total, complete) = wait_progress("d9500", 256 * 1024);
+    assert!(!complete);
+    assert_eq!(loaded, 256 * 1024);
+    assert_eq!(total, 50 * 1024 * 1024);
+    assert_eq!(world.called("GetFile document 9500"), 1, "only the first piece should be fetched: {:?}", world.calls());
+    let head = std::fs::read(&path).expect("sparse stream file exists");
+    assert_eq!(&head[..4], b"FTYP");
+
+    // 2. Scrub to 25 MB: fetches only that 4 KB-aligned piece into the same sparse cache file.
+    let scrub_off = 25 * 1024 * 1024u64;
+    let _ = world.ask(Request::Fetch {
+        account: account(),
+        ids: vec!["d9500".into()],
+        size: None,
+        retry: false,
+        span: Some((scrub_off, scrub_off + 256 * 1024)),
+    });
+    let (path2, loaded2, _, complete2) = wait_progress("d9500", 512 * 1024);
+    assert!(!complete2);
+    assert_eq!(path2, path);
+    assert_eq!(loaded2, 512 * 1024);
+    assert_eq!(world.called("GetFile document 9500 at 26214400"), 1);
+    assert_eq!(world.called("GetFile document 9500"), 2);
+    let mut f = std::fs::File::open(&path2).unwrap();
+    use std::io::{Read, Seek, SeekFrom};
+    f.seek(SeekFrom::Start(scrub_off)).unwrap();
+    let mut mark = [0u8; 4];
+    f.read_exact(&mut mark).unwrap();
+    assert_eq!(&mark, b"SCRB");
+
+    // 3. Non-fast-start 50 MB video (`supports_streaming = false`): fetches the tail (`moov`) + head
+    //    in just 2 pieces, writing `MOOV` at the end and `FTYP` at offset 0.
+    let _ = world.ask(Request::Fetch {
+        account: account(),
+        ids: vec!["d9502".into()],
+        size: None,
+        retry: false,
+        span: Some((0, 256 * 1024)),
+    });
+    let (slow_path, slow_loaded, slow_total, slow_complete) = wait_progress("d9502", 512 * 1024);
+    assert!(!slow_complete);
+    assert_eq!(slow_loaded, 512 * 1024);
+    assert_eq!(slow_total, 50 * 1024 * 1024);
+    assert_eq!(world.called("GetFile document 9502"), 2, "only moov tail + head: {:?}", world.calls());
+    let mut sf = std::fs::File::open(&slow_path).unwrap();
+    let mut head_mark = [0u8; 4];
+    sf.read_exact(&mut head_mark).unwrap();
+    assert_eq!(&head_mark, b"FTYP");
+    sf.seek(SeekFrom::Start(slow_total - 4)).unwrap();
+    let mut tail_mark = [0u8; 4];
+    sf.read_exact(&mut tail_mark).unwrap();
+    assert_eq!(&tail_mark, b"MOOV");
+
+    // 4. Alternative quality (`alt_documents` 480p variant `d9501`) streams independently on demand.
+    let _ = world.ask(Request::Fetch {
+        account: account(),
+        ids: vec!["d9501".into()],
+        size: None,
+        retry: false,
+        span: Some((0, 256 * 1024)),
+    });
+    let (_, alt_loaded, alt_total, alt_complete) = wait_progress("d9501", 256 * 1024);
+    assert!(!alt_complete);
+    assert_eq!(alt_loaded, 256 * 1024);
+    assert_eq!(alt_total, 12 * 1024 * 1024);
+    assert_eq!(world.called("GetFile document 9501 at 0"), 1);
+}
+
+#[test]
 fn who_reacted_and_who_read_a_message_are_asked_of_telegram_only_on_demand() {
     let world = World::signed_in();
     world.connected();

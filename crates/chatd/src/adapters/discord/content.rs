@@ -612,6 +612,7 @@ fn attachment(rich: &mut Rich, attached: &Attached, blur_explicit: bool) -> Atta
         page: String::new(),
         transcription: None,
         transcript: None,
+        variants: Vec::new(),
     }
 }
 
@@ -650,6 +651,7 @@ fn sticker(rich: &mut Rich, sticker: &model::Sticker) -> Attachment {
         page: String::new(),
         transcription: None,
         transcript: None,
+        variants: Vec::new(),
     }
 }
 
@@ -1708,6 +1710,7 @@ fn component_media_attachment(
         page: String::new(),
         transcript: None,
         transcription: None,
+        variants: Vec::new(),
     })
 }
 

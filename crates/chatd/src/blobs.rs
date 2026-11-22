@@ -621,7 +621,11 @@ impl Cache {
             self.picks.notify_all();
         }
         if let (false, Some(adapter)) = (theirs.is_empty(), &adapter) {
-            let _ = adapter.send(Command::Wanted(theirs));
+            let command = match span {
+                Some(span) => Command::WantedSpan { ids: theirs, span },
+                None => Command::Wanted(theirs),
+            };
+            let _ = adapter.send(command);
         }
         // Whoever asked for what gave way is told it did not arrive, so nothing waits on it.
         for (account, id) in dropped {

@@ -901,6 +901,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             );
         }
         Command::Wanted(ids) => drop(account.files.asked(&ids)),
+        Command::WantedSpan { ids, span } => drop(account.files.asked_span(&ids, span)),
         Command::Previews(ids) => sync::previews(account, &ids),
         Command::MarkRead { conversation_id, message_id } => mark_read(account, &conversation_id, &message_id),
         Command::MarkUnread { conversation_id, .. } => mark_dialog_unread(account, &conversation_id, true),

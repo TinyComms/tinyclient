@@ -436,6 +436,8 @@ pub struct Pane {
     viewer: Option<viewer::Viewer>,
     /// Expanded full-screen text/code attachment viewer (#385).
     text_viewer: Option<viewer::TextViewer>,
+    /// Progressive/ranged media streaming progress by file id: `(path, loaded, total, complete)`.
+    pub(super) stream_progress: HashMap<String, (String, u64, u64, bool)>,
     /// Decoded inline text/code attachment previews by `file.id` (`None` = binary/unpreviewable).
     text_previews: HashMap<String, Option<Rc<text_preview::TextPreview>>>,
     /// Text attachment files currently being read/decoded off the UI thread.
@@ -691,6 +693,7 @@ impl Pane {
             gated_open: None,
             wants_focus: false,
             uploads: HashMap::new(),
+            stream_progress: HashMap::new(),
             pending_at: HashMap::new(),
             scrub: None,
             scrub_bounds: Rc::default(),
@@ -1657,6 +1660,10 @@ impl Pane {
                 cx.notify();
             }
             Change::Media { account, file } if *account == key.account() => self.landed(file, true, cx),
+            Change::MediaProgress { account, id, path, loaded, total, complete } if *account == key.account() => {
+                self.stream_progress.insert(id.clone(), (path.clone(), *loaded, *total, *complete));
+                cx.notify();
+            }
             Change::InteractionModal { conversation, modal } if conversation == key => {
                 let inputs = modal
                     .fields

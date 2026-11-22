@@ -106,6 +106,8 @@ pub struct Viewer {
     reel: Option<Reel>,
     /// The byte window already asked for this picture. Cleared when the play head is scrubbed.
     spanned: Option<(u64, u64)>,
+    /// Selected alternative quality file id (`Attachment::variants`), or `None` for the original.
+    quality: Option<String>,
 }
 
 /// Full-screen text/code viewer opened from "Expand" on an inline text attachment preview (#385).
@@ -205,6 +207,7 @@ impl Pane {
             decoded: Vec::new(),
             reel: None,
             spanned: None,
+            quality: None,
         });
         self.hover = None;
         window.focus(&self.focus, cx);
@@ -251,6 +254,7 @@ impl Pane {
         viewer.saved = None;
         viewer.reel = None;
         viewer.spanned = None;
+        viewer.quality = None;
         cx.notify();
     }
 
@@ -489,6 +493,83 @@ impl Pane {
             cx.stop_propagation();
             cx.notify();
         }));
+        let active_file = self.viewed().map(|(_, att)| {
+            let chosen = self.viewer.as_ref().and_then(|v| v.quality.as_deref());
+            att.variants
+                .iter()
+                .find(|v| Some(v.id.as_str()) == chosen)
+                .cloned()
+                .unwrap_or(att.file)
+        });
+        let progress = active_file.as_ref().and_then(|f| self.stream_progress.get(&f.id).cloned());
+        let buffered_fraction = progress
+            .as_ref()
+            .and_then(|(_, loaded, total, _)| (*total > 0).then(|| (*loaded as f32 / *total as f32).clamp(0., 1.)))
+            .unwrap_or(0.);
+        let variants = self
+            .viewed()
+            .map(|(_, att)| (att.file, att.variants))
+            .unwrap_or_else(|| (protocol::MediaFile::new("", protocol::MediaKind::Video), Vec::new()));
+        let chosen_quality = self.viewer.as_ref().and_then(|v| v.quality.clone());
+        let quality_row = (!variants.1.is_empty()).then(|| {
+            let mut row = div().flex().items_center().gap(px(4.));
+            let orig_label = if variants.0.height > 0 { format!("{}p", variants.0.height) } else { "Original".to_owned() };
+            let orig_active = chosen_quality.is_none();
+            row = row.child(
+                div()
+                    .id("viewer-quality-orig")
+                    .px(px(6.))
+                    .py(px(1.))
+                    .rounded(px(4.))
+                    .bg(if orig_active { theme::accent_soft() } else { theme::hover() })
+                    .type_micro()
+                    .text_color(if orig_active { theme::accent_text() } else { theme::text_soft() })
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(viewer) = this.viewer.as_mut() {
+                            viewer.quality = None;
+                            viewer.spanned = None;
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                    }))
+                    .child(orig_label),
+            );
+            for variant in &variants.1 {
+                let vid = variant.id.clone();
+                let label = if variant.height > 0 { format!("{}p", variant.height) } else { media::size_label(variant.bytes) };
+                let active = chosen_quality.as_deref() == Some(vid.as_str());
+                row = row.child(
+                    div()
+                        .id(gpui::SharedString::from(format!("viewer-quality-{vid}")))
+                        .px(px(6.))
+                        .py(px(1.))
+                        .rounded(px(4.))
+                        .bg(if active { theme::accent_soft() } else { theme::hover() })
+                        .type_micro()
+                        .text_color(if active { theme::accent_text() } else { theme::text_soft() })
+                        .cursor_pointer()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(viewer) = this.viewer.as_mut() {
+                                viewer.quality = Some(vid.clone());
+                                viewer.spanned = None;
+                            }
+                            cx.stop_propagation();
+                            cx.notify();
+                        }))
+                        .child(label),
+                );
+            }
+            row
+        });
+        let status_line = match progress {
+            Some((_, loaded, total, false)) if loaded > 0 && total > 0 => {
+                format!("Buffered {} of {} · The picture stays this still.", media::size_label(loaded), media::size_label(total))
+            }
+            _ => "The picture stays this still.".to_owned(),
+        };
         let scrub = div()
             .id("viewer-scrub")
             .w(px(160.))
@@ -517,6 +598,18 @@ impl Pane {
                     .h(px(4.))
                     .rounded_full()
                     .bg(theme::hover())
+                    .when(buffered_fraction > 0., |bar| {
+                        bar.child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .h(px(4.))
+                                .w(px((160. * buffered_fraction).clamp(0., 160.)))
+                                .rounded_full()
+                                .bg(theme::accent_soft()),
+                        )
+                    })
                     .child(div().absolute().left_0().top_0().h(px(4.)).w(px((160. * fraction).clamp(0., 160.))).rounded_full().bg(theme::accent()))
                     .child(canvas(
                         move |bounds, _, _| remembered.set((f32::from(bounds.origin.x), f32::from(bounds.size.width).max(1.))),
@@ -544,9 +637,10 @@ impl Pane {
                     .child(div().type_micro().text_color(theme::text()).child(format!("{at} / {length}")))
                     .child(scrub)
                     .child(sound)
-                    .child(div().type_micro().text_color(theme::text_soft()).child(volume)),
+                    .child(div().type_micro().text_color(theme::text_soft()).child(volume))
+                    .children(quality_row),
             )
-            .child(div().type_micro().text_color(theme::text_faint()).child("The picture stays this still."))
+            .child(div().type_micro().text_color(theme::text_faint()).child(status_line))
             .into_any_element()
     }
 
@@ -567,8 +661,14 @@ impl Pane {
         if moving {
             let gif = media::shape(&attachment) == Shape::Gif;
             let duration_ms = u64::from(attachment.duration).saturating_mul(1_000);
-            let bytes = attachment.file.bytes;
-            let id = attachment.file.id.clone();
+            let chosen_id = self.viewer.as_ref().and_then(|v| v.quality.as_deref());
+            let active = attachment
+                .variants
+                .iter()
+                .find(|v| Some(v.id.as_str()) == chosen_id)
+                .unwrap_or(&attachment.file);
+            let bytes = active.bytes;
+            let id = active.id.clone();
             let mut span_ask = None;
             if let Some(viewer) = self.viewer.as_mut() {
                 if viewer.reel.is_none() {

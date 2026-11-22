@@ -444,6 +444,9 @@ pub struct Attachment {
     /// Optional clip transcript preview and lazy caption track (Slack clips).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript: Option<Transcript>,
+    /// Alternative video quality variants offered by the network (Telegram `alt_documents`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variants: Vec<MediaFile>,
 }
 
 impl Attachment {
@@ -465,6 +468,7 @@ impl Attachment {
             page: String::new(),
             transcription: None,
             transcript: None,
+            variants: Vec::new(),
         }
     }
 }

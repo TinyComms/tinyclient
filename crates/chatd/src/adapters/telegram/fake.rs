@@ -571,6 +571,31 @@ fn big_piece(offset: i64, limit: i32) -> Vec<u8> {
     (from..to).map(|at| (at % 251) as u8).collect()
 }
 
+/// Deterministic synthetic bytes for 50 MB / 12 MB streaming videos (`9500`, `9501`, `9502`):
+/// starts with `"FTYP"`, marks the 25 MB scrub point with `"SCRB"`, and ends `9502` with `"MOOV"`.
+fn stream_piece(doc_id: i64, offset: i64, limit: i32) -> Vec<u8> {
+    let total: usize = if doc_id == 9_501 { 12 * 1024 * 1024 } else { 50 * 1024 * 1024 };
+    let at = offset.max(0) as usize;
+    let end = (at + limit.max(0) as usize).min(total);
+    if at >= end {
+        return Vec::new();
+    }
+    let mut out = vec![(doc_id & 0xff) as u8; end - at];
+    if at == 0 && out.len() >= 4 {
+        out[..4].copy_from_slice(b"FTYP");
+    }
+    let scrub_off = 25 * 1024 * 1024;
+    if at <= scrub_off && scrub_off + 4 <= end {
+        let rel = scrub_off - at;
+        out[rel..rel + 4].copy_from_slice(b"SCRB");
+    }
+    if doc_id == 9_502 && end == total && out.len() >= 4 {
+        let n = out.len();
+        out[n - 4..].copy_from_slice(b"MOOV");
+    }
+    out
+}
+
 fn cdn_digest() -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(CDN_PLAIN);
@@ -3024,6 +3049,76 @@ impl World {
                 };
                 vec![update(waiting.into()), update(discarded.into())]
             }
+            // Two 50 MB videos in Odalys's chat:
+            // - msg 73 (doc 9500): fast-start 1080p with an `alt_documents` 480p variant (doc 9501)
+            // - msg 74 (doc 9502): non-fast-start 720p (`supports_streaming = false`, `moov` at tail)
+            "video-stream" => {
+                let make_doc = |id: i64, size: i64, w: i32, h: i32, streaming: bool, name: &str| {
+                    tl::enums::Document::Document(tl::types::Document {
+                        id,
+                        access_hash: id * 10,
+                        file_reference: vec![1, 2, 3],
+                        date: t0() + 92,
+                        mime_type: "video/mp4".to_owned(),
+                        size,
+                        thumbs: None,
+                        video_thumbs: None,
+                        dc_id: 2,
+                        attributes: vec![
+                            tl::types::DocumentAttributeVideo {
+                                round_message: false,
+                                supports_streaming: streaming,
+                                nosound: false,
+                                duration: 120.0,
+                                w,
+                                h,
+                                preload_prefix_size: None,
+                                video_start_ts: None,
+                                video_codec: None,
+                            }
+                            .into(),
+                            tl::types::DocumentAttributeFilename { file_name: name.to_owned() }.into(),
+                        ],
+                    })
+                };
+                let fifty_mb: i64 = 50 * 1024 * 1024;
+                let twelve_mb: i64 = 12 * 1024 * 1024;
+                let mut fast = message(odalys, 73, ODALYS, t0() + 93, "");
+                fast.media = Some(
+                    tl::types::MessageMediaDocument {
+                        nopremium: false,
+                        spoiler: false,
+                        video: true,
+                        round: false,
+                        voice: false,
+                        document: Some(make_doc(9_500, fifty_mb, 1920, 1080, true, "ridge-1080p.mp4")),
+                        alt_documents: Some(vec![make_doc(9_501, twelve_mb, 854, 480, true, "ridge-480p.mp4")]),
+                        video_cover: None,
+                        video_timestamp: None,
+                        ttl_seconds: None,
+                    }
+                    .into(),
+                );
+                let mut slow = message(odalys, 74, ODALYS, t0() + 94, "");
+                slow.media = Some(
+                    tl::types::MessageMediaDocument {
+                        nopremium: false,
+                        spoiler: false,
+                        video: true,
+                        round: false,
+                        voice: false,
+                        document: Some(make_doc(9_502, fifty_mb, 1280, 720, false, "ridge-moov-end.mp4")),
+                        alt_documents: None,
+                        video_cover: None,
+                        video_timestamp: None,
+                        ttl_seconds: None,
+                    }
+                    .into(),
+                );
+                self.store(None, fast.clone());
+                self.store(None, slow.clone());
+                vec![new(fast), new(slow)]
+            }
             "pins-full" => {
                 self.pins_full = true;
                 Vec::new()
@@ -4697,6 +4792,9 @@ impl World {
                 location if is_ridge_thumb(location) => piece_of(RIDGE_M, request.offset, request.limit),
                 location if is_crew_thumb(location) => piece_of(CREW_PHOTO_M, request.offset, request.limit),
                 tl::enums::InputFileLocation::InputDocumentFileLocation(document) if document.id == 9_400 => big_piece(request.offset, request.limit),
+                tl::enums::InputFileLocation::InputDocumentFileLocation(document) if matches!(document.id, 9_500 | 9_501 | 9_502) => {
+                    stream_piece(document.id, request.offset, request.limit)
+                }
                 _ => file_piece(request.offset, request.limit),
             };
             let piece = tl::types::upload::File { r#type: tl::enums::storage::FileType::FileJpeg, mtime: t0(), bytes: held };

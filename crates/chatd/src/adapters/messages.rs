@@ -1493,6 +1493,7 @@ fn message(account: &Account, note: &bugle::Note, page: &[bugle::Note]) -> Messa
             page: String::new(),
             transcription: None,
             transcript: None,
+            variants: Vec::new(),
         });
     }
     message.attachments = shown;
@@ -2766,6 +2767,7 @@ fn deliver_files(
             page: String::new(),
             transcription: None,
             transcript: None,
+            variants: Vec::new(),
         });
     }
     message.attachments = attachments;
