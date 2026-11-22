@@ -5969,7 +5969,7 @@ fn slack_clip_transcript_vtt_and_transcoded_video() {
     let world = World::start();
     world.ready();
     let general = alpha("C0GEN");
-    world.open(&general);
+    let _ = world.messages(&general);
 
     let ts = "1760000950.000950";
     let event = json!({
