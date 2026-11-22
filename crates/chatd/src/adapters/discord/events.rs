@@ -293,9 +293,125 @@ impl Discord {
             "STREAM_DELETE" => self.stream_deleted(data)?,
             "CALL_CREATE" | "CALL_UPDATE" => self.call_changed(from_str(data)?),
             "CALL_DELETE" => self.call_deleted(from_str(data)?),
+            "GUILD_SCHEDULED_EVENT_CREATE" | "GUILD_SCHEDULED_EVENT_UPDATE" => {
+                self.scheduled_event_changed(from_str(data)?)?;
+            }
+            "GUILD_SCHEDULED_EVENT_DELETE" => self.scheduled_event_deleted(from_str(data)?),
+            "GUILD_SCHEDULED_EVENT_USER_ADD" => self.scheduled_event_user(from_str(data)?, true),
+            "GUILD_SCHEDULED_EVENT_USER_REMOVE" => self.scheduled_event_user(from_str(data)?, false),
             _ => {}
         }
         Ok(())
+    }
+
+    fn scheduled_event_changed(&self, ev: model::ScheduledEvent) -> Result<(), Failure> {
+        let guild = ev.guild_id.clone();
+        if guild.is_empty() || ev.id.is_empty() {
+            return Ok(());
+        }
+        let cover = ev
+            .image
+            .as_deref()
+            .filter(|h| !h.is_empty())
+            .map(|h| model::event_cover(&ev.id, h));
+        let mut notify_info: Option<(String, String, String, String)> = None;
+        {
+            let mut state = self.state.lock().unwrap();
+            let Some(info) = state.guilds.get_mut(&guild) else {
+                return Ok(());
+            };
+            let prev = info.events.get(&ev.id);
+            let was_status = prev.map_or(0, |s| s.event.status);
+            let interested = prev.is_some_and(|s| s.interested);
+            if matches!(ev.status, 3 | 4) {
+                info.events.remove(&ev.id);
+            } else {
+                if super::should_notify_scheduled_event(
+                    was_status,
+                    ev.status,
+                    interested,
+                    info.quiet.mute_scheduled_events,
+                    info.quiet.server_muted(crate::hub::now()),
+                ) {
+                    let place = ev
+                        .entity_metadata
+                        .as_ref()
+                        .and_then(|m| m.location.clone())
+                        .unwrap_or_default();
+                    notify_info = Some((info.name.clone(), ev.id.clone(), ev.name.clone(), place));
+                }
+                info.events.insert(
+                    ev.id.clone(),
+                    super::StoredEvent {
+                        event: ev,
+                        interested,
+                    },
+                );
+            }
+        }
+        if let Some((file, url)) = cover {
+            let _ = self.ctx.media(&[(file, url)]);
+        }
+        if let Some((space_name, event_id, name, mut place)) = notify_info {
+            if place.is_empty() {
+                if let Some(ch) = self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .guilds
+                    .get(&guild)
+                    .and_then(|g| g.events.get(&event_id))
+                    .and_then(|s| s.event.channel_id.clone())
+                {
+                    if let Ok(Some(row)) = self.ctx.known(&ch) {
+                        place = row.title;
+                    }
+                }
+            }
+            self.ctx.scheduled_event_started(&guild, &space_name, &event_id, &name, &place);
+        }
+        self.ctx.events_changed(&guild);
+        Ok(())
+    }
+
+    fn scheduled_event_deleted(&self, ev: model::ScheduledEvent) {
+        if ev.guild_id.is_empty() || ev.id.is_empty() {
+            return;
+        }
+        let removed = {
+            let mut state = self.state.lock().unwrap();
+            state
+                .guilds
+                .get_mut(&ev.guild_id)
+                .is_some_and(|info| info.events.remove(&ev.id).is_some())
+        };
+        if removed {
+            self.ctx.events_changed(&ev.guild_id);
+        }
+    }
+
+    fn scheduled_event_user(&self, change: model::ScheduledEventUser, added: bool) {
+        let changed = {
+            let mut state = self.state.lock().unwrap();
+            let me = state.me.clone();
+            if let Some(stored) = state
+                .guilds
+                .get_mut(&change.guild_id)
+                .and_then(|info| info.events.get_mut(&change.guild_scheduled_event_id))
+            {
+                if change.user_id == me {
+                    stored.interested = added;
+                }
+                let count = stored.event.user_count.unwrap_or(0);
+                stored.event.user_count = Some(if added { count.saturating_add(1) } else { count.saturating_sub(1) });
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            self.ctx.events_changed(&change.guild_id);
+        }
     }
 
     /// Someone joined or left a group DM. The list and an unnamed title follow. A named group keeps its name.

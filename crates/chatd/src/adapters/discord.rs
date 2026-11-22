@@ -164,6 +164,8 @@ struct Quiet {
     channels: HashMap<String, i64>,
     /// "Hide muted channels", as the user set it for the server.
     hide_muted: bool,
+    /// "Mute new events" (`mute_scheduled_events`) in Discord's server notification settings.
+    mute_scheduled_events: bool,
     /// "Show all channels" is off: only what is opted in shows.
     opt_in: bool,
     /// Channels and categories opted in.
@@ -234,8 +236,45 @@ pub(super) struct RoleInfo {
     pub permissions: u64,
     pub position: i32,
     pub color: u32,
+    pub hoist: bool,
+    pub mentionable: bool,
+    pub managed: bool,
+    /// Discord's icon hash, never a URL.
     pub icon: Option<String>,
     pub unicode_emoji: Option<String>,
+}
+
+impl RoleInfo {
+    fn remember(role: &model::Role) -> Self {
+        Self {
+            name: role.name.clone(),
+            permissions: role.permissions,
+            color: role.color & 0x00FF_FFFF,
+            hoist: role.hoist,
+            position: role.position,
+            mentionable: role.mentionable,
+            managed: role.managed,
+            icon: model::role_icon_hash(role.icon.as_deref()),
+            unicode_emoji: model::role_emoji(role.unicode_emoji.as_deref()),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct StoredEvent {
+    pub event: model::ScheduledEvent,
+    pub interested: bool,
+}
+
+/// Whether a live transition of a scheduled event should post a local notification.
+pub(super) fn should_notify_scheduled_event(
+    was_status: u8,
+    now_status: u8,
+    interested: bool,
+    mute_scheduled_events: bool,
+    server_muted: bool,
+) -> bool {
+    was_status != 2 && now_status == 2 && interested && !mute_scheduled_events && !server_muted
 }
 
 /// What is kept of a server once its tree is in the store.
@@ -264,10 +303,29 @@ struct GuildInfo {
     nick: String,
     /// Server boost tier (0..=3), which can raise the file upload limit for everyone in it.
     premium_tier: u8,
+    /// Number of active server boosts.
+    premium_subscription_count: u32,
+    /// Banner hash from Discord (`banners/{guild}/{hash}.webp`).
+    banner: Option<String>,
+    /// Server description shown in Details.
+    description: String,
+    /// Discord feature flags (e.g. `VERIFIED`, `PARTNERED`, `INVITES_DISABLED`).
+    features: Vec<String>,
+    /// Server vanity invite code, if any.
+    vanity_url_code: Option<String>,
+    /// System messages channel id.
+    system_channel_id: Option<String>,
+    /// AFK voice channel id.
+    afk_channel_id: Option<String>,
+    /// AFK timeout in seconds.
+    afk_timeout: u32,
+    /// Default server notification level (0 all, 1 mentions).
+    default_message_notifications: u8,
     /// Unix seconds until our own server timeout ends, if timed out.
     timeout_until: Option<i64>,
     emojis: Vec<Pickable>,
     stickers: Vec<Pickable>,
+    events: HashMap<String, StoredEvent>,
     /// True when at least one visible channel in this guild permits `CREATE_INSTANT_INVITE`.
     can_invite: bool,
 }
@@ -3097,6 +3155,40 @@ impl Discord {
             Command::TransferOwner { conversation_id, person, reply } => {
                 answer(reply, self.transfer_group_owner(&conversation_id, &person))
             }
+            Command::CreateSpace { name, icon, template, reply } => {
+                answer(reply, self.create_space(&name, icon.as_deref(), template.as_deref()))
+            }
+            Command::Events { space_id, reply } => answer(reply, self.events(&space_id)),
+            Command::EventInterest { space_id, event_id, on, reply } => {
+                answer(reply, self.event_interest(&space_id, &event_id, on))
+            }
+            Command::EditSpace { space_id, edit, reply } => answer(reply, self.edit_space(&space_id, &edit)),
+            Command::DeleteSpace { space_id, mfa_code, reply } => {
+                answer(reply, self.delete_space(&space_id, mfa_code.as_deref()))
+            }
+            Command::TransferSpace { space_id, new_owner_id, mfa_code, reply } => {
+                answer(reply, self.transfer_space(&space_id, &new_owner_id, mfa_code.as_deref()))
+            }
+            Command::CreateEvent { space_id, event, reply } => answer(reply, self.create_event(&space_id, &event)),
+            Command::EditEvent { space_id, event_id, event, reply } => {
+                answer(reply, self.edit_event(&space_id, &event_id, &event))
+            }
+            Command::DeleteEvent { space_id, event_id, reply } => {
+                answer(reply, self.delete_event(&space_id, &event_id))
+            }
+            Command::SpaceInvites { space_id, reply } => answer(reply, self.space_invites(&space_id)),
+            Command::RevokeInvite { space_id, code, reply } => answer(reply, self.revoke_invite(&space_id, &code)),
+            Command::SetInvitesPaused { space_id, paused, reply } => {
+                answer(reply, self.set_invites_paused(&space_id, paused))
+            }
+            Command::Roles { space_id, reply } => answer(reply, self.roles(&space_id)),
+            Command::CreateRole { space_id, edit, reply } => answer(reply, self.create_role(&space_id, &edit)),
+            Command::EditRole { space_id, role_id, edit, reply } => answer(reply, self.edit_role(&space_id, &role_id, &edit)),
+            Command::MoveRoles { space_id, roles, reply } => answer(reply, self.move_roles(&space_id, &roles)),
+            Command::DeleteRole { space_id, role_id, reply } => answer(reply, self.delete_role(&space_id, &role_id)),
+            Command::SetMemberRoles { space_id, person_id, roles, reply } => {
+                answer(reply, self.set_member_roles(&space_id, &person_id, &roles))
+            }
             Command::LeaveSpace { space_id, reply } => answer(reply, self.leave_space(&space_id)),
             Command::CloseDirect { conversation_id, reply } => answer(reply, self.leave(&conversation_id, true, false)),
             Command::AnswerMessageRequest { conversation_id, accept, reply } => {
@@ -3220,6 +3312,164 @@ impl Discord {
             }
             command => command.unsupported(&self.ctx),
         }
+    }
+
+    /// Creates a new Discord server (`POST /guilds`). Uses `call_once_with` so a 429 or captcha
+    /// challenge fails cleanly without retrying or locking the whole session.
+    fn create_space(
+        &self,
+        name: &str,
+        icon_path: Option<&str>,
+        template: Option<&str>,
+    ) -> Result<(String, Option<String>), Refusal> {
+        let icon_uri = match icon_path.map(str::trim).filter(|p| !p.is_empty()) {
+            Some(path) => Some(read_image_data_uri(path, DISCORD_IMAGE_MAX)?),
+            None => None,
+        };
+        let body = build_create_guild_body(name, icon_uri.as_deref(), template)?;
+        let raw = self
+            .rest
+            .call_once_with("POST", "/guilds", Some(body), &[])
+            .map_err(create_space_refusal)?;
+        let parsed: Value = serde_json::from_str(&raw).map_err(|err| Refusal::Refused(err.to_string()))?;
+        let id = parsed
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Refusal::Refused("Discord did not return the new server id.".to_owned()))?
+            .to_owned();
+        let system_channel = parsed
+            .get("system_channel_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        Ok((id, system_channel))
+    }
+}
+
+/// Maximum size for Discord guild icons and banners (8 MiB).
+pub(super) const DISCORD_IMAGE_MAX: usize = 8 * 1024 * 1024;
+
+/// Identifies PNG, JPEG, GIF, or WebP from file magic bytes.
+pub(super) fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// Safely reads an allowed local image file and encodes it as a `data:<mime>;base64,...` URI
+/// suitable for Discord's guild/role image fields.
+pub(super) fn read_image_data_uri(path: &str, max_bytes: usize) -> Result<String, Refusal> {
+    use std::io::Read;
+    let (real, _) = upload::allowed(path).map_err(|why| Refusal::Refused(format!("That picture {why}")))?;
+    let mut bytes = Vec::new();
+    std::fs::File::open(&real)
+        .and_then(|file| file.take(max_bytes as u64 + 1).read_to_end(&mut bytes))
+        .map_err(|_| Refusal::Refused("That picture could not be read.".to_owned()))?;
+    if bytes.len() > max_bytes {
+        let mb = (max_bytes / (1024 * 1024)).max(1);
+        return Err(Refusal::Refused(format!("That picture is too big (limit {mb} MiB).")));
+    }
+    let Some(mime) = detect_image_mime(&bytes) else {
+        return Err(Refusal::Refused("That picture isn't a PNG, JPEG, GIF, or WebP.".to_owned()));
+    };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:{mime};base64,{encoded}"))
+}
+
+/// Builds the JSON payload for `POST /guilds`, including optional starter channels for templates.
+fn build_create_guild_body(name: &str, icon_uri: Option<&str>, template: Option<&str>) -> Result<Value, Refusal> {
+    let name = name.trim();
+    let chars = name.chars().count();
+    if !(2..=100).contains(&chars) {
+        return Err(Refusal::Refused("Server name must be between 2 and 100 characters.".to_owned()));
+    }
+    let (channels, system_channel_id): (Vec<Value>, Option<&str>) = match template.map(str::trim).unwrap_or("") {
+        "gaming" => (
+            vec![
+                json!({"id": "1", "type": 4, "name": "Text Channels"}),
+                json!({"id": "2", "type": 0, "name": "general", "parent_id": "1"}),
+                json!({"id": "3", "type": 0, "name": "clips-and-highlights", "parent_id": "1"}),
+                json!({"id": "4", "type": 4, "name": "Voice Channels"}),
+                json!({"id": "5", "type": 2, "name": "Lobby", "parent_id": "4"}),
+                json!({"id": "6", "type": 2, "name": "Gaming", "parent_id": "4"}),
+            ],
+            Some("2"),
+        ),
+        "study" => (
+            vec![
+                json!({"id": "1", "type": 4, "name": "Information"}),
+                json!({"id": "2", "type": 0, "name": "general", "parent_id": "1"}),
+                json!({"id": "3", "type": 0, "name": "homework-help", "parent_id": "1"}),
+                json!({"id": "4", "type": 0, "name": "resources", "parent_id": "1"}),
+                json!({"id": "5", "type": 4, "name": "Study Rooms"}),
+                json!({"id": "6", "type": 2, "name": "Study Room", "parent_id": "5"}),
+            ],
+            Some("2"),
+        ),
+        "friends" => (
+            vec![
+                json!({"id": "1", "type": 4, "name": "Text Channels"}),
+                json!({"id": "2", "type": 0, "name": "general", "parent_id": "1"}),
+                json!({"id": "3", "type": 0, "name": "memes", "parent_id": "1"}),
+                json!({"id": "4", "type": 4, "name": "Voice Channels"}),
+                json!({"id": "5", "type": 2, "name": "Lounge", "parent_id": "4"}),
+            ],
+            Some("2"),
+        ),
+        "community" => (
+            vec![
+                json!({"id": "1", "type": 4, "name": "Welcome"}),
+                json!({"id": "2", "type": 0, "name": "welcome", "parent_id": "1"}),
+                json!({"id": "3", "type": 0, "name": "announcements", "parent_id": "1"}),
+                json!({"id": "4", "type": 0, "name": "general", "parent_id": "1"}),
+                json!({"id": "5", "type": 4, "name": "Voice"}),
+                json!({"id": "6", "type": 2, "name": "Town Hall", "parent_id": "5"}),
+            ],
+            Some("2"),
+        ),
+        _ => (Vec::new(), None),
+    };
+    Ok(json!({
+        "name": name,
+        "icon": icon_uri,
+        "channels": channels,
+        "system_channel_id": system_channel_id,
+    }))
+}
+
+/// Translates Discord's refusal codes on `POST /guilds` into clear words.
+fn create_space_refusal(err: Refused) -> Refusal {
+    match err {
+        Refused::Challenge => Refusal::Refused(
+            "Discord asked for a captcha check tinyclient cannot complete. Create this server in Discord.".to_owned(),
+        ),
+        Refused::Limited(_) | Refused::Paused(_) | Refused::Status { status: 429, .. } => {
+            Refusal::Refused("Too many server creation requests. Wait a moment and try again.".to_owned())
+        }
+        Refused::Status { code: 30001, .. } => {
+            Refusal::Refused("You have reached Discord's server limit (100 servers, or 200 with Nitro).".to_owned())
+        }
+        Refused::Status { code: 40002, .. } => {
+            Refusal::Refused("Verify your Discord email address before creating a server.".to_owned())
+        }
+        Refused::Status { code: 50035, .. } => {
+            Refusal::Refused("Check the server name (2 to 100 characters) and picture, then try again.".to_owned())
+        }
+        Refused::Status { status: 400, ref message, .. } if message.to_ascii_lowercase().contains("captcha") => {
+            Refusal::Refused(
+                "Discord asked for a captcha check tinyclient cannot complete. Create this server in Discord.".to_owned(),
+            )
+        }
+        other => refusal(other),
     }
 }
 
@@ -3567,5 +3817,56 @@ mod tests {
     #[test]
     fn forward_report_prove_passes() {
         prove_forward_report().expect("forward and report");
+    }
+
+    #[test]
+    fn create_space_payload_templates_image_detection_and_refusals() {
+        let blank = build_create_guild_body("  My Club  ", None, None).unwrap();
+        assert_eq!(blank["name"], "My Club");
+        assert!(blank["icon"].is_null());
+        assert_eq!(blank["channels"].as_array().unwrap().len(), 0);
+        assert!(blank["system_channel_id"].is_null());
+
+        let gaming = build_create_guild_body("Raid Night", Some("data:image/png;base64,AA=="), Some("gaming")).unwrap();
+        assert_eq!(gaming["name"], "Raid Night");
+        assert_eq!(gaming["icon"], "data:image/png;base64,AA==");
+        assert!(gaming["channels"].as_array().unwrap().len() >= 4);
+        assert_eq!(gaming["system_channel_id"], "2");
+
+        assert!(build_create_guild_body("a", None, None).is_err());
+        assert!(build_create_guild_body(&"x".repeat(101), None, None).is_err());
+
+        assert_eq!(detect_image_mime(b"\x89PNG\r\n\x1a\nrest"), Some("image/png"));
+        assert_eq!(detect_image_mime(&[0xff, 0xd8, 0xff, 0xe0]), Some("image/jpeg"));
+        assert_eq!(detect_image_mime(b"GIF89a..."), Some("image/gif"));
+        assert_eq!(detect_image_mime(b"RIFF1234WEBP"), Some("image/webp"));
+        assert_eq!(detect_image_mime(b"not-an-image"), None);
+        assert!(read_image_data_uri("relative/path.png", DISCORD_IMAGE_MAX).is_err());
+
+        let msg = |r: Refused| match create_space_refusal(r) {
+            Refusal::Refused(m) => m,
+            Refusal::Unsupported => panic!("unexpected unsupported"),
+        };
+        assert!(msg(Refused::Status { status: 400, code: 30001, message: String::new(), retry_after: None }).contains("server limit"));
+        assert!(msg(Refused::Status { status: 403, code: 40002, message: String::new(), retry_after: None }).contains("Verify your Discord email"));
+        assert!(msg(Refused::Limited(10.0)).contains("Too many server creation requests"));
+        assert!(msg(Refused::Challenge).contains("captcha"));
+    }
+
+    #[test]
+    fn scheduled_event_notification_respects_interest_and_mute_flags() {
+        // Transitions from scheduled (1) to active (2) while interested and unmuted -> notify.
+        assert!(should_notify_scheduled_event(1, 2, true, false, false));
+        // Already active (2 -> 2) -> do not notify twice.
+        assert!(!should_notify_scheduled_event(2, 2, true, false, false));
+        // Not interested -> do not notify.
+        assert!(!should_notify_scheduled_event(1, 2, false, false, false));
+        // mute_scheduled_events set -> do not notify.
+        assert!(!should_notify_scheduled_event(1, 2, true, true, false));
+        // Whole server muted -> do not notify.
+        assert!(!should_notify_scheduled_event(1, 2, true, false, true));
+        // Completed (3) or canceled (4) -> do not notify.
+        assert!(!should_notify_scheduled_event(2, 3, true, false, false));
+        assert!(!should_notify_scheduled_event(1, 4, true, false, false));
     }
 }

@@ -41,6 +41,7 @@ pub const KICK_MEMBERS: u64 = 1 << 1;
 pub const BAN_MEMBERS: u64 = 1 << 2;
 pub const ADMINISTRATOR: u64 = 1 << 3;
 pub const MANAGE_CHANNELS: u64 = 1 << 4;
+pub const MANAGE_GUILD: u64 = 1 << 5;
 pub const ADD_REACTIONS: u64 = 1 << 6;
 #[allow(dead_code)]
 pub const STREAM: u64 = 1 << 9;
@@ -61,6 +62,7 @@ pub const CREATE_PUBLIC_THREADS: u64 = 1 << 35;
 pub const CREATE_PRIVATE_THREADS: u64 = 1 << 36;
 pub const SEND_MESSAGES_IN_THREADS: u64 = 1 << 38;
 pub const MANAGE_WEBHOOKS: u64 = 1 << 29;
+pub const MANAGE_EVENTS: u64 = 1 << 33;
 pub const PIN_MESSAGES: u64 = 1 << 51;
 
 /// Formats Unix seconds as UTC ISO 8601 (`YYYY-MM-DDTHH:MM:SSZ`) for Discord REST bodies.
@@ -431,6 +433,26 @@ pub fn role_icon(role: &str, hash: &str) -> (MediaFile, String) {
     )
 }
 
+/// A server's banner image, served from Discord's CDN at 512px wide.
+pub fn guild_banner(guild: &str, hash: &str) -> (MediaFile, String) {
+    (
+        MediaFile {
+            width: 512,
+            height: 288,
+            ..MediaFile::new(format!("banner:{guild}:{hash}"), MediaKind::Image)
+        },
+        format!("{}/banners/{guild}/{hash}.webp?size=512{}", cdn(), moving(hash)),
+    )
+}
+
+/// Whether a server's `features` list marks it as verified or partnered.
+pub fn guild_mark(features: &[String]) -> Option<protocol::Mark> {
+    features
+        .iter()
+        .any(|f| f == "VERIFIED" || f == "PARTNERED")
+        .then_some(protocol::Mark::Verified)
+}
+
 /// A group direct message's own picture. The address is from the community documentation and
 /// unconfirmed against a real account.
 pub fn group_icon(channel: &str, hash: &str) -> Option<(MediaFile, String)> {
@@ -680,14 +702,108 @@ pub struct Role {
     #[serde(default, deserialize_with = "nullable")]
     pub position: i32,
     #[serde(default, deserialize_with = "nullable")]
+    pub hoist: bool,
+    /// `0xRRGGBB`. Missing and null are no colour.
+    #[serde(default, deserialize_with = "color_u32")]
     pub color: u32,
+    #[serde(default)]
+    pub mentionable: bool,
+    #[serde(default)]
+    pub managed: bool,
     #[serde(default)]
     pub icon: Option<String>,
     #[serde(default)]
     pub unicode_emoji: Option<String>,
-    #[allow(dead_code)]
-    #[serde(default, deserialize_with = "nullable")]
-    pub hoist: bool,
+}
+
+fn color_u32<'de, D: Deserializer<'de>>(de: D) -> Result<u32, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Number(u64),
+        Text(String),
+    }
+    let value = match Option::<Either>::deserialize(de)? {
+        Some(Either::Number(number)) => number,
+        Some(Either::Text(text)) => text.parse().unwrap_or(0),
+        None => 0,
+    };
+    Ok((value & 0x00FF_FFFF) as u32)
+}
+
+/// A role-icon hash Discord would store. A URL, a slash, or anything outside the hash alphabet is dropped.
+pub fn role_icon_hash(raw: Option<&str>) -> Option<String> {
+    let hash = raw?.trim();
+    if hash.is_empty()
+        || hash.contains("://")
+        || hash.contains('/')
+        || hash.contains('\\')
+        || hash.contains('?')
+        || hash.contains('#')
+        || hash.contains('@')
+        || hash.contains('%')
+        || hash.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    let body = hash.strip_prefix("a_").unwrap_or(hash);
+    if body.is_empty() || body.len() > 64 || !body.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(hash.to_owned())
+}
+
+/// A unicode emoji for a role. A URL, a slash, or a sentence is dropped.
+pub fn role_emoji(raw: Option<&str>) -> Option<String> {
+    let emoji = raw?.trim();
+    if emoji.is_empty()
+        || emoji.contains("://")
+        || emoji.contains('/')
+        || emoji.contains('\\')
+        || emoji.chars().any(|c| c.is_whitespace() || c.is_control())
+        || emoji.chars().count() > 32
+    {
+        return None;
+    }
+    Some(emoji.to_owned())
+}
+
+/// `https` anywhere, or `http` only for a loopback host (the test CDN). Userinfo and junk are refused.
+pub fn cdn_base_ok(base: &str) -> bool {
+    if base.is_empty() || base.contains('@') || base.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    if let Some(rest) = base.strip_prefix("https://") {
+        let host = rest.split('/').next().unwrap_or("");
+        return !host.is_empty();
+    }
+    if let Some(rest) = base.strip_prefix("http://") {
+        let authority = rest.split('/').next().unwrap_or("");
+        let host = if let Some(inner) = authority.strip_prefix('[') {
+            inner.split(']').next().unwrap_or("")
+        } else {
+            authority.split(':').next().unwrap_or("")
+        };
+        return matches!(host, "127.0.0.1" | "localhost" | "::1");
+    }
+    false
+}
+
+/// The picture URL for a role icon. Built only from a numeric role id, a hash, and the configured CDN.
+pub fn role_icon_url(role_id: &str, hash: &str) -> Option<String> {
+    let hash = role_icon_hash(Some(hash))?;
+    if role_id.is_empty()
+        || role_id.len() > 20
+        || !role_id.bytes().all(|byte| byte.is_ascii_digit())
+        || number(role_id) == 0
+    {
+        return None;
+    }
+    let base = cdn().trim_end_matches('/');
+    if !cdn_base_ok(base) {
+        return None;
+    }
+    Some(format!("{base}/role-icons/{role_id}/{hash}.png"))
 }
 
 /// What newer sessions wrap a guild's own fields in.
@@ -698,9 +814,27 @@ pub struct GuildProperties {
     #[serde(default)]
     pub icon: Option<String>,
     #[serde(default)]
+    pub banner: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
     pub owner_id: Option<String>,
     #[serde(default)]
     pub premium_tier: Option<u8>,
+    #[serde(default)]
+    pub premium_subscription_count: Option<u32>,
+    #[serde(default)]
+    pub features: Option<Vec<String>>,
+    #[serde(default)]
+    pub vanity_url_code: Option<String>,
+    #[serde(default)]
+    pub system_channel_id: Option<String>,
+    #[serde(default)]
+    pub afk_channel_id: Option<String>,
+    #[serde(default)]
+    pub afk_timeout: Option<u32>,
+    #[serde(default)]
+    pub default_message_notifications: Option<u8>,
 }
 
 #[derive(Deserialize, Clone, Debug, Default)]
@@ -713,9 +847,27 @@ pub struct Guild {
     #[serde(default)]
     pub icon: Option<String>,
     #[serde(default)]
+    pub banner: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
     pub owner_id: Option<String>,
     #[serde(default)]
     pub premium_tier: Option<u8>,
+    #[serde(default)]
+    pub premium_subscription_count: Option<u32>,
+    #[serde(default)]
+    pub features: Option<Vec<String>>,
+    #[serde(default)]
+    pub vanity_url_code: Option<String>,
+    #[serde(default)]
+    pub system_channel_id: Option<String>,
+    #[serde(default)]
+    pub afk_channel_id: Option<String>,
+    #[serde(default)]
+    pub afk_timeout: Option<u32>,
+    #[serde(default)]
+    pub default_message_notifications: Option<u8>,
     #[serde(default)]
     pub channels: Vec<Channel>,
     #[serde(default)]
@@ -735,6 +887,59 @@ pub struct Guild {
     pub emojis: Vec<GuildEmoji>,
     #[serde(default, deserialize_with = "nullable")]
     pub stickers: Vec<GuildSticker>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub guild_scheduled_events: Vec<ScheduledEvent>,
+}
+
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct EventEntityMetadata {
+    #[serde(default)]
+    pub location: Option<String>,
+}
+
+/// One scheduled event in a Discord server (`guild_scheduled_events` in READY, gateway events,
+/// and `GET /guilds/{id}/scheduled-events`).
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct ScheduledEvent {
+    pub id: String,
+    #[serde(default)]
+    pub guild_id: String,
+    #[serde(default)]
+    pub channel_id: Option<String>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub scheduled_start_time: Option<String>,
+    #[serde(default)]
+    pub scheduled_end_time: Option<String>,
+    /// 1 = scheduled, 2 = active, 3 = completed, 4 = canceled.
+    #[serde(default, deserialize_with = "nullable")]
+    pub status: u8,
+    /// 1 = stage, 2 = voice, 3 = external.
+    #[serde(default, deserialize_with = "nullable")]
+    pub entity_type: u8,
+    #[serde(default)]
+    pub entity_metadata: Option<EventEntityMetadata>,
+    #[serde(default)]
+    pub user_count: Option<u32>,
+    #[serde(default)]
+    pub image: Option<String>,
+}
+
+/// Payload for `GUILD_SCHEDULED_EVENT_USER_ADD` and `GUILD_SCHEDULED_EVENT_USER_REMOVE`.
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct ScheduledEventUser {
+    pub guild_scheduled_event_id: String,
+    pub user_id: String,
+    pub guild_id: String,
+}
+
+/// Cover image for a Discord scheduled event (`guild-events/{id}/{hash}.webp?size=512`).
+pub fn event_cover(event_id: &str, hash: &str) -> (MediaFile, String) {
+    let url = format!("{}/guild-events/{event_id}/{hash}.webp?size=512", cdn());
+    (MediaFile::new(format!("event_cover:{event_id}:{hash}"), MediaKind::Image), url)
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -812,6 +1017,51 @@ impl Guild {
     pub fn premium_tier(&self) -> Option<u8> {
         let wrapped = self.properties.as_ref().and_then(|properties| properties.premium_tier);
         wrapped.or(self.premium_tier)
+    }
+
+    pub fn banner(&self) -> Option<&str> {
+        let wrapped = self.properties.as_ref().and_then(|properties| properties.banner.as_deref());
+        wrapped.or(self.banner.as_deref()).filter(|h| !h.is_empty())
+    }
+
+    pub fn description(&self) -> Option<&str> {
+        let wrapped = self.properties.as_ref().and_then(|properties| properties.description.as_deref());
+        wrapped.or(self.description.as_deref())
+    }
+
+    pub fn premium_subscription_count(&self) -> Option<u32> {
+        let wrapped = self.properties.as_ref().and_then(|properties| properties.premium_subscription_count);
+        wrapped.or(self.premium_subscription_count)
+    }
+
+    pub fn features(&self) -> &[String] {
+        let wrapped = self.properties.as_ref().and_then(|properties| properties.features.as_deref());
+        wrapped.or(self.features.as_deref()).unwrap_or(&[])
+    }
+
+    pub fn vanity_url_code(&self) -> Option<&str> {
+        let wrapped = self.properties.as_ref().and_then(|properties| properties.vanity_url_code.as_deref());
+        wrapped.or(self.vanity_url_code.as_deref()).filter(|c| !c.is_empty())
+    }
+
+    pub fn system_channel_id(&self) -> Option<&str> {
+        let wrapped = self.properties.as_ref().and_then(|properties| properties.system_channel_id.as_deref());
+        wrapped.or(self.system_channel_id.as_deref()).filter(|id| !id.is_empty())
+    }
+
+    pub fn afk_channel_id(&self) -> Option<&str> {
+        let wrapped = self.properties.as_ref().and_then(|properties| properties.afk_channel_id.as_deref());
+        wrapped.or(self.afk_channel_id.as_deref()).filter(|id| !id.is_empty())
+    }
+
+    pub fn afk_timeout(&self) -> Option<u32> {
+        let wrapped = self.properties.as_ref().and_then(|properties| properties.afk_timeout);
+        wrapped.or(self.afk_timeout)
+    }
+
+    pub fn default_message_notifications(&self) -> Option<u8> {
+        let wrapped = self.properties.as_ref().and_then(|properties| properties.default_message_notifications);
+        wrapped.or(self.default_message_notifications)
     }
 }
 
@@ -936,6 +1186,8 @@ pub struct GuildSettings {
     pub channel_overrides: Vec<ChannelOverride>,
     #[serde(default, deserialize_with = "nullable")]
     pub hide_muted_channels: bool,
+    #[serde(default, deserialize_with = "nullable")]
+    pub mute_scheduled_events: bool,
     #[serde(default, deserialize_with = "nullable")]
     pub flags: u32,
     /// 0 all, 1 mentions, 2 nothing.
@@ -1451,6 +1703,29 @@ pub fn iso_seconds(text: &str) -> Option<i64> {
     Some(days * 86_400 + hour * 3600 + minute * 60 + second)
 }
 
+/// Formats Unix seconds as an ISO-8601 UTC timestamp (`2026-10-13T08:15:00Z`), the exact inverse
+/// of [`iso_seconds`].
+pub fn format_iso_utc(unix: i64) -> String {
+    let days = unix.div_euclid(86_400);
+    let secs = unix.rem_euclid(86_400);
+    let hour = secs / 3600;
+    let minute = (secs % 3600) / 60;
+    let second = secs % 60;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    if month <= 2 {
+        year += 1;
+    }
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1520,5 +1795,130 @@ mod tests {
         assert!(guild_icon("4000", "iconhash").is_some());
         assert!(group_icon("3001", "..").is_none());
         assert!(group_icon("3001", "ghash").is_some());
+    }
+
+    #[test]
+    fn guild_banner_boosts_description_and_verified_mark_parse() {
+        let guild: Guild = serde_json::from_str(
+            r#"{
+                "id": "4000",
+                "properties": {
+                    "name": "Rustaceans",
+                    "banner": "a_banhash",
+                    "description": "Friendly crabs",
+                    "premium_tier": 2,
+                    "premium_subscription_count": 9,
+                    "features": ["COMMUNITY", "VERIFIED"],
+                    "vanity_url_code": "rust"
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(guild.banner(), Some("a_banhash"));
+        assert_eq!(guild.description(), Some("Friendly crabs"));
+        assert_eq!(guild.premium_tier(), Some(2));
+        assert_eq!(guild.premium_subscription_count(), Some(9));
+        assert_eq!(guild.vanity_url_code(), Some("rust"));
+        assert_eq!(guild_mark(guild.features()), Some(protocol::Mark::Verified));
+
+        let (file, url) = guild_banner("4000", "a_banhash");
+        assert_eq!(file.id, "banner:4000:a_banhash");
+        assert_eq!(url, format!("{}/banners/4000/a_banhash.webp?size=600", cdn()));
+        assert_eq!(guild_mark(&["PARTNERED".to_owned()]), Some(protocol::Mark::Verified));
+        assert_eq!(guild_mark(&["COMMUNITY".to_owned()]), None);
+    }
+
+    #[test]
+    fn scheduled_event_and_cover_parse_cleanly() {
+        let ev: ScheduledEvent = serde_json::from_str(
+            r#"{
+                "id": "9001",
+                "guild_id": "4000",
+                "channel_id": "4201",
+                "name": "Game Night",
+                "description": "Bring snacks",
+                "scheduled_start_time": "2026-10-15T19:00:00+00:00",
+                "scheduled_end_time": "2026-10-15T21:00:00+00:00",
+                "status": 1,
+                "entity_type": 2,
+                "user_count": 12,
+                "image": "covhash"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(ev.id, "9001");
+        assert_eq!(ev.status, 1);
+        assert_eq!(ev.entity_type, 2);
+        assert_eq!(ev.user_count, Some(12));
+        let (file, url) = event_cover(&ev.id, ev.image.as_deref().unwrap());
+        assert_eq!(file.id, "event_cover:9001:covhash");
+        assert_eq!(url, format!("{}/guild-events/9001/covhash.webp?size=512", cdn()));
+
+        let settings: GuildSettings = serde_json::from_str(r#"{"guild_id":"4000","mute_scheduled_events":true}"#).unwrap();
+        assert!(settings.mute_scheduled_events);
+    }
+
+    #[test]
+    fn format_iso_utc_inverts_iso_seconds_and_guild_overview_fields_parse() {
+        for ts in [1_462_015_105, 1_700_000_000, 1_760_356_800, 1_800_000_000] {
+            let formatted = format_iso_utc(ts);
+            assert_eq!(iso_seconds(&formatted), Some(ts), "round-trip failed for {ts} ({formatted})");
+        }
+        let guild: Guild = serde_json::from_str(
+            r#"{
+                "id": "4000",
+                "properties": {
+                    "name": "Rustaceans",
+                    "system_channel_id": "4101",
+                    "afk_channel_id": "4201",
+                    "afk_timeout": 900,
+                    "default_message_notifications": 1
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(guild.system_channel_id(), Some("4101"));
+        assert_eq!(guild.afk_channel_id(), Some("4201"));
+        assert_eq!(guild.afk_timeout(), Some(900));
+        assert_eq!(guild.default_message_notifications(), Some(1));
+    }
+
+    #[test]
+    fn role_fields_default_and_icon_urls_stay_on_the_cdn() {
+        let role: Role = serde_json::from_str(
+            r#"{"id":"4701","name":"Newbie","permissions":"2048","color":16711680,"hoist":true,"position":1,"mentionable":true,"managed":false,"icon":"a1b2c3d4","unicode_emoji":null}"#,
+        )
+        .unwrap();
+        assert_eq!((role.color, role.position, role.permissions), (16_711_680, 1, 2048));
+        assert!(role.hoist && role.mentionable && !role.managed);
+        assert_eq!(role.icon.as_deref(), Some("a1b2c3d4"));
+        assert!(role.unicode_emoji.is_none());
+        let bare: Role = serde_json::from_str(r#"{"id":"1","name":"x","permissions":0,"color":null,"icon":null}"#).unwrap();
+        assert_eq!(bare.color, 0);
+        assert!(!bare.hoist && !bare.mentionable && !bare.managed);
+        assert_eq!(bare.position, 0);
+        assert!(bare.icon.is_none() && bare.unicode_emoji.is_none());
+
+        let url = role_icon_url("4701", "a1b2c3d4").unwrap();
+        assert_eq!(url, format!("{}/role-icons/4701/a1b2c3d4.png", cdn().trim_end_matches('/')));
+        assert!(url.starts_with("https://") || url.starts_with("http://127.0.0.1") || url.starts_with("http://localhost") || url.starts_with("http://[::1]"));
+        assert!(!url.contains('@'));
+        assert!(url.contains("/role-icons/4701/a1b2c3d4.png"));
+        assert!(role_icon_url("4701", "a1b2/../../evil").is_none());
+        assert!(role_icon_url("4701", "https://evil.example/x").is_none());
+        assert!(role_icon_url("4701", "a1b2c3d4?x=1").is_none());
+        assert!(role_icon_url("nope", "a1b2c3d4").is_none());
+        assert!(role_icon_hash(Some("a_ab12")).as_deref() == Some("a_ab12"));
+        assert!(role_icon_hash(Some("not a hash")).is_none());
+        assert!(role_emoji(Some("🌿")).as_deref() == Some("🌿"));
+        assert!(role_emoji(Some("https://evil.example")).is_none());
+        assert!(cdn_base_ok("https://cdn.discordapp.com"));
+        assert!(cdn_base_ok("http://127.0.0.1:9/media"));
+        assert!(cdn_base_ok("http://localhost:9/media"));
+        assert!(cdn_base_ok("http://[::1]:9/media"));
+        assert!(!cdn_base_ok("http://evil.example/media"));
+        assert!(!cdn_base_ok("https://user:pass@cdn.discordapp.com"));
+        assert!(!cdn_base_ok("http://127.0.0.1:9/media user"));
+        assert!(cdn_base_ok(cdn().trim_end_matches('/')));
     }
 }

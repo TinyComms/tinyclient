@@ -5,7 +5,7 @@
 //! Every field here is optional on the wire and every list has a cap, as in the rest of the
 //! contract.
 
-use crate::{is_false, is_zero, Conversation, Key, MediaFile, Network, Space};
+use crate::{is_false, is_zero, is_zero64, Conversation, Key, MediaFile, Network, Space};
 use serde::{Deserialize, Serialize};
 
 /// Most folders an account lists. Telegram allows 30 with Premium; Discord's server folders are
@@ -19,6 +19,36 @@ pub const FOLDER_MEMBERS: usize = 200;
 pub const ROWS_WATCHED: usize = 100;
 /// Most roles, or contact lines, a profile carries.
 pub const PROFILE_ROLES: usize = 12;
+/// Discord permission bits the Roles page labels. Values are Discord's; keep this table when
+/// Discord adds a bit the page should name. Bits absent here still round-trip as a number.
+pub const DISCORD_PERMISSIONS: &[(u64, &str)] = &[
+    (1 << 0, "Create invite"),
+    (1 << 1, "Kick members"),
+    (1 << 2, "Ban members"),
+    (1 << 3, "Administrator"),
+    (1 << 4, "Manage channels"),
+    (1 << 5, "Manage server"),
+    (1 << 6, "Add reactions"),
+    (1 << 10, "View channels"),
+    (1 << 11, "Send messages"),
+    (1 << 13, "Manage messages"),
+    (1 << 14, "Embed links"),
+    (1 << 15, "Attach files"),
+    (1 << 16, "Read message history"),
+    (1 << 17, "Mention @everyone"),
+    (1 << 20, "Connect"),
+    (1 << 21, "Speak"),
+    (1 << 24, "Move members"),
+    (1 << 26, "Change nickname"),
+    (1 << 27, "Manage nicknames"),
+    (1 << 28, "Manage roles"),
+    (1 << 29, "Manage webhooks"),
+    (1 << 31, "Use application commands"),
+    (1 << 33, "Manage events"),
+    (1 << 34, "Manage threads"),
+    (1 << 40, "Timeout members"),
+    (1 << 51, "Pin messages"),
+];
 pub const PROFILE_CONTACTS: usize = 6;
 /// Most badges or connected accounts a profile carries.
 pub const PROFILE_BADGES: usize = 24;
@@ -406,6 +436,230 @@ pub struct SpaceInfo {
     /// Mentionable team tags in this Space (Teams).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<TeamTag>,
+    /// Server banner image, where the Space has one (e.g. boosted Discord server).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banner: Option<MediaFile>,
+    /// Boost level / tier (0..=3 on Discord).
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub boost_level: u8,
+    /// Number of active server boosts.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub boosts: u32,
+    /// Verified or partnered server mark.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mark: Option<Mark>,
+    /// System messages channel id, when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_channel_id: Option<String>,
+    /// AFK voice channel id, when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub afk_channel_id: Option<String>,
+    /// AFK timeout in seconds (0 when unknown).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub afk_timeout: u32,
+    /// Server-wide default notification level (`All` or `Mentions`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_notify: Option<Notify>,
+    /// Vanity invite code, if the server has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vanity_url: Option<String>,
+    /// Whether invites are currently paused (`INVITES_DISABLED` feature).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub invites_disabled: bool,
+}
+
+/// Fields to update on a Space's overview (`Request::EditSpace`).
+/// `icon` / `banner`: `None` = unchanged, `Some("")` = clear, `Some(path)` = upload image.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceEdit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banner: Option<String>,
+    /// `Some("")` clears the system channel; `Some(id)` sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_channel_id: Option<String>,
+    /// `Some("")` clears the AFK channel; `Some(id)` sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub afk_channel_id: Option<String>,
+    /// AFK timeout in seconds (Discord accepts 60, 300, 900, 1800, 3600).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub afk_timeout: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_notify: Option<Notify>,
+}
+
+/// Fields to create or edit a Space's scheduled event (`Request::CreateEvent` / `EditEvent`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceEventEdit {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Start time in Unix seconds.
+    pub start: i64,
+    /// End time in Unix seconds (required by Discord for external events).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<i64>,
+    #[serde(default)]
+    pub place_kind: EventPlaceKind,
+    /// Voice or stage channel id (for Voice/Stage events).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    /// External location string (for External events).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    /// Local path to cover image (`Some("")` removes cover on edit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+}
+
+/// One active invite link in a Space (`Request::SpaceInvites`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceInvite {
+    pub code: String,
+    /// Full shareable invite URL (e.g. `https://discord.gg/<code>`).
+    pub url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub inviter: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub channel_name: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub uses: u32,
+    /// 0 means unlimited uses.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_uses: u32,
+    /// Unix seconds when this invite expires (`None` = never expires).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+    /// True for the server's read-only vanity URL row.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub vanity: bool,
+}
+
+/// One role in a Space (`Request::Roles`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceRole {
+    pub id: String,
+    pub name: String,
+    /// `0xRRGGBB`. Zero means the role has no colour.
+    #[serde(default)]
+    pub color: u32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hoist: bool,
+    /// Discord's order. Zero is the everyone role, so it is kept on the wire.
+    #[serde(default)]
+    pub position: i32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mentionable: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub managed: bool,
+    /// A validated picture URL on Discord's CDN, or a unicode emoji. Empty when the role has neither.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub icon: String,
+    #[serde(default, skip_serializing_if = "is_zero64")]
+    pub permissions: u64,
+    /// The signed-in user may edit this role (below their highest role, and not managed).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub editable: bool,
+    /// The signed-in user may give or take this role. The everyone role is never assignable.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub assignable: bool,
+}
+
+/// Fields to create or edit a role (`Request::CreateRole` / `EditRole`).
+/// `icon`: `None` unchanged, `Some("")` clear, `Some(path)` a picture on this computer.
+/// `unicode_emoji`: `None` unchanged, `Some("")` clear.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleEdit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hoist: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mentionable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unicode_emoji: Option<String>,
+    /// Required when this edit newly grants Administrator.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub confirm_admin: bool,
+}
+
+/// One role's new place in the list (`Request::MoveRoles`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleMove {
+    pub id: String,
+    #[serde(default)]
+    pub position: i32,
+}
+
+/// Lifecycle status of a Space's scheduled event (Discord `guild_scheduled_events`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventStatus {
+    #[default]
+    Scheduled,
+    Active,
+    Completed,
+    Canceled,
+}
+
+/// Where a Space's scheduled event takes place.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventPlaceKind {
+    #[default]
+    Voice,
+    Stage,
+    External,
+}
+
+/// One scheduled event in a Space (`Request::Events`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceEvent {
+    /// Event key (account + event id).
+    pub key: Key,
+    /// The Space hosting this event.
+    pub space: Key,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Scheduled start time, Unix seconds.
+    pub start: i64,
+    /// Scheduled end time, Unix seconds, when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<i64>,
+    /// Voice channel, stage channel, or external location.
+    #[serde(default)]
+    pub place_kind: EventPlaceKind,
+    /// Channel name or external location string.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub place: String,
+    /// Voice or stage conversation key, when held inside a channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<Key>,
+    #[serde(default)]
+    pub status: EventStatus,
+    /// Whether the signed-in user marked themselves interested.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub interested: bool,
+    /// Number of interested users reported by the network.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub count: u32,
+    /// Event cover image, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover: Option<MediaFile>,
 }
 
 /// Which of a custom emoji set this account may send.
@@ -807,6 +1061,9 @@ pub struct Capabilities {
     /// This account supports leaving a Space (`Request::LeaveSpace`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub leave_space: bool,
+    /// This account supports creating a new Space (`Request::CreateSpace`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub create_space: bool,
     /// This account supports sharing contact cards (`Outgoing::contact`, Telegram/Signal).
     #[serde(default, skip_serializing_if = "is_false")]
     pub share_contact: bool,
@@ -1504,5 +1761,270 @@ mod tests {
         };
         let back_opt: SendAs = serde_json::from_str(&serde_json::to_string(&opt).unwrap()).unwrap();
         assert_eq!(back_opt, opt);
+    }
+
+    #[test]
+    fn space_info_banner_boosts_and_mark_round_trip_and_default_cleanly() {
+        let account = AccountKey { network: Network::Discord, account: "1".into() };
+        let space = Space {
+            key: Key::new(&account, "4000"),
+            name: "Rustaceans".into(),
+            icon: None,
+            position: 0,
+            attention: 0,
+            unread: false,
+            folder: None,
+            muted: false,
+            hide_muted: false,
+            can_create_channels: false,
+            can_create_invites: false,
+            rights: crate::SpaceRights::default(),
+        };
+        let legacy = serde_json::json!({
+            "space": space,
+            "description": "Crabs",
+            "members": 42,
+            "online": 7
+        });
+        let parsed: SpaceInfo = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.banner, None);
+        assert_eq!(parsed.boost_level, 0);
+        assert_eq!(parsed.boosts, 0);
+        assert_eq!(parsed.mark, None);
+
+        let full = SpaceInfo {
+            banner: Some(MediaFile::new("banner:4000:abc", crate::MediaKind::Image)),
+            boost_level: 2,
+            boosts: 14,
+            mark: Some(Mark::Verified),
+            ..parsed
+        };
+        let wire = serde_json::to_string(&full).unwrap();
+        let back: SpaceInfo = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, full);
+    }
+
+    #[test]
+    fn create_space_request_response_and_capability_round_trip() {
+        use crate::Response;
+        let mut can = Capabilities::default();
+        assert!(!can.create_space);
+        can.create_space = true;
+        let back_can: Capabilities = serde_json::from_str(&serde_json::to_string(&can).unwrap()).unwrap();
+        assert!(back_can.create_space);
+
+        let account = AccountKey { network: Network::Discord, account: "1000".into() };
+        let req = Request::CreateSpace {
+            account: account.clone(),
+            name: "Book Club".into(),
+            icon: Some("/tmp/icon.png".into()),
+            template: Some("friends".into()),
+        };
+        let back_req: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(back_req, req);
+
+        let resp = Response::SpaceCreated {
+            space: Key::new(&account, "8800"),
+            conversation: Some(Key::new(&account, "8801")),
+        };
+        let back_resp: Response = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(back_resp, resp);
+    }
+
+    #[test]
+    fn space_events_requests_responses_and_change_round_trip() {
+        use crate::{Change, Response};
+        let account = AccountKey { network: Network::Discord, account: "1000".into() };
+        let space = Key::new(&account, "4000");
+        let ev_key = Key::new(&account, "9001");
+        let ev = SpaceEvent {
+            key: ev_key.clone(),
+            space: space.clone(),
+            name: "Community Q&A".into(),
+            description: "Ask anything".into(),
+            start: 1_760_000_000,
+            end: Some(1_760_003_600),
+            place_kind: EventPlaceKind::Voice,
+            place: "General Voice".into(),
+            conversation: Some(Key::new(&account, "4201")),
+            status: EventStatus::Active,
+            interested: true,
+            count: 17,
+            cover: Some(MediaFile::new("event_cover:9001:abc", crate::MediaKind::Image)),
+        };
+        let reqs = [
+            Request::Events { space: space.clone() },
+            Request::EventInterest { space: space.clone(), event: ev_key, on: true },
+        ];
+        for req in reqs {
+            let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+            assert_eq!(back, req);
+        }
+        let resp = Response::Events { space: space.clone(), events: vec![ev] };
+        let back_resp: Response = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(back_resp, resp);
+
+        let change = Change::Events { space: space.clone() };
+        assert!(change.same_scope(&Change::Events { space }));
+        assert!(!change.is_ephemeral());
+    }
+
+    #[test]
+    fn space_edit_rights_and_event_admin_round_trip() {
+        use crate::SpaceRights;
+        let rights = SpaceRights {
+            manage_space: true,
+            manage_roles: false,
+            manage_events: true,
+            owner: true,
+        };
+        assert_eq!(SpaceRights::from_bits(rights.to_bits()), rights);
+        assert!(rights.any_settings());
+        assert!(SpaceRights::default().is_empty());
+
+        let account = AccountKey { network: Network::Discord, account: "1000".into() };
+        let space = Key::new(&account, "4000");
+        let edit = SpaceEdit {
+            name: Some("New Name".into()),
+            description: Some("Fresh description".into()),
+            afk_timeout: Some(900),
+            default_notify: Some(Notify::Mentions),
+            ..SpaceEdit::default()
+        };
+        let ev_edit = SpaceEventEdit {
+            name: "Town Hall".into(),
+            description: "Monthly sync".into(),
+            start: 1_760_000_000,
+            end: Some(1_760_003_600),
+            place_kind: EventPlaceKind::External,
+            channel_id: None,
+            location: Some("https://example.com/hall".into()),
+            image: None,
+        };
+        let reqs = [
+            Request::EditSpace { space: space.clone(), edit },
+            Request::DeleteSpace { space: space.clone(), mfa_code: Some("123456".into()) },
+            Request::TransferSpace {
+                space: space.clone(),
+                new_owner: Key::new(&account, "2001"),
+                mfa_code: None,
+            },
+            Request::CreateEvent { space: space.clone(), event: ev_edit.clone() },
+            Request::EditEvent { space: space.clone(), event_id: "9001".into(), event: ev_edit },
+            Request::DeleteEvent { space, event_id: "9001".into() },
+        ];
+        for req in reqs {
+            let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+            assert_eq!(back, req);
+        }
+    }
+
+    #[test]
+    fn space_invites_requests_and_response_round_trip() {
+        use crate::Response;
+        let account = AccountKey { network: Network::Discord, account: "1000".into() };
+        let space = Key::new(&account, "4000");
+        let reqs = [
+            Request::SpaceInvites { space: space.clone() },
+            Request::RevokeInvite { space: space.clone(), code: "abc123".into() },
+            Request::SetInvitesPaused { space: space.clone(), paused: true },
+        ];
+        for req in reqs {
+            let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+            assert_eq!(back, req);
+        }
+        let resp = Response::SpaceInvites {
+            space,
+            paused: true,
+            invites: vec![
+                SpaceInvite {
+                    code: "rust".into(),
+                    url: "https://discord.gg/rust".into(),
+                    inviter: String::new(),
+                    channel_id: None,
+                    channel_name: String::new(),
+                    uses: 0,
+                    max_uses: 0,
+                    expires_at: None,
+                    vanity: true,
+                },
+                SpaceInvite {
+                    code: "abc123".into(),
+                    url: "https://discord.gg/abc123".into(),
+                    inviter: "Justin".into(),
+                    channel_id: Some("4101".into()),
+                    channel_name: "general".into(),
+                    uses: 4,
+                    max_uses: 10,
+                    expires_at: Some(1_760_100_000),
+                    vanity: false,
+                },
+            ],
+        };
+        let back: Response = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn role_requests_round_trip_and_omit_defaults() {
+        use crate::Response;
+        let account = AccountKey { network: Network::Discord, account: "1000".into() };
+        let space = Key::new(&account, "4777");
+        let person = Key::new(&account, "2006");
+        let edit = RoleEdit {
+            name: Some("Helper".into()),
+            color: Some(0xFF_00_00),
+            hoist: Some(true),
+            mentionable: Some(false),
+            permissions: Some(1 << 28),
+            confirm_admin: true,
+            ..RoleEdit::default()
+        };
+        let role = SpaceRole {
+            id: "4701".into(),
+            name: "Newbie".into(),
+            color: 0xFF_00_00,
+            hoist: true,
+            position: 1,
+            mentionable: true,
+            managed: false,
+            icon: "https://cdn.discordapp.com/role-icons/4701/a1b2c3d4.png".into(),
+            permissions: 0,
+            editable: true,
+            assignable: true,
+        };
+        let reqs = [
+            Request::Roles { space: space.clone() },
+            Request::CreateRole { space: space.clone(), edit: edit.clone() },
+            Request::EditRole { space: space.clone(), role_id: "4701".into(), edit: edit.clone() },
+            Request::MoveRoles {
+                space: space.clone(),
+                roles: vec![RoleMove { id: "4701".into(), position: 2 }],
+            },
+            Request::DeleteRole { space: space.clone(), role_id: "4701".into() },
+            Request::SetMemberRoles { space: space.clone(), person, roles: vec!["4701".into()] },
+        ];
+        for req in reqs {
+            let back: Request = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+            assert_eq!(back, req);
+        }
+        let bare = Request::CreateRole { space: space.clone(), edit: RoleEdit::default() };
+        let mut value = serde_json::to_value(&bare).unwrap();
+        value.as_object_mut().unwrap().remove("edit");
+        let back: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(back, bare);
+        let omitted: SpaceRole = serde_json::from_value(serde_json::json!({"id": "1", "name": "Helper"})).unwrap();
+        assert_eq!(omitted.color, 0);
+        assert!(!omitted.hoist && !omitted.mentionable && !omitted.managed);
+        assert_eq!(omitted.position, 0);
+        assert!(omitted.icon.is_empty());
+        assert_eq!(omitted.permissions, 0);
+        assert!(!omitted.editable && !omitted.assignable);
+        let resp = Response::Roles { space, roles: vec![role.clone()] };
+        let back: Response = serde_json::from_str(&serde_json::to_string(&resp).unwrap()).unwrap();
+        assert_eq!(back, resp);
+        let one = Response::Role { role };
+        let back: Response = serde_json::from_str(&serde_json::to_string(&one).unwrap()).unwrap();
+        assert_eq!(back, one);
     }
 }

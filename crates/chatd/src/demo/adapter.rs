@@ -1050,6 +1050,24 @@ impl Demo {
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CreateInvite { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::TransferOwner { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Events { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::EventInterest { reply, .. }
+            | Command::EditSpace { reply, .. }
+            | Command::DeleteSpace { reply, .. }
+            | Command::TransferSpace { reply, .. }
+            | Command::DeleteEvent { reply, .. }
+            | Command::RevokeInvite { reply, .. }
+            | Command::SetInvitesPaused { reply, .. }
+            | Command::MoveRoles { reply, .. }
+            | Command::DeleteRole { reply, .. }
+            | Command::SetMemberRoles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SpaceInvites { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Roles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateRole { reply, .. } | Command::EditRole { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateEvent { reply, .. } | Command::EditEvent { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
             Command::LeaveSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CancelScheduled { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

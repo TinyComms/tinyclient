@@ -7750,3 +7750,797 @@ fn text_attachment_head_preview_uses_range_request_and_keeps_full_download_separ
     assert_eq!(full_bytes.len(), payload_len);
     assert_eq!(rx.try_recv().unwrap(), None);
 }
+
+#[test]
+fn space_info_shows_banner_boosts_verified_mark_description_and_updates_on_guild_update() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    ready["guilds"][0]["properties"]["banner"] = json!("ban123");
+    ready["guilds"][0]["properties"]["description"] = json!("Crabs from READY");
+    ready["guilds"][0]["properties"]["premium_tier"] = json!(2);
+    ready["guilds"][0]["properties"]["premium_subscription_count"] = json!(11);
+    ready["guilds"][0]["properties"]["features"] = json!(["COMMUNITY", "VERIFIED"]);
+
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    // Per-server upload limit on channels reflects boost tier 2 (50 MiB).
+    let rows = world.tree("4000").1;
+    let general = rows.iter().find(|c| c.key.id == "4101").expect("general channel");
+    assert_eq!(general.max_file_bytes, 50 << 20);
+
+    // SpaceInfo merges READY banner, boost tier/count, verified mark, and REST description/counts.
+    match world.ask(Request::SpaceInfo { space: world.key("4000") }) {
+        Response::SpaceInfo { info } => {
+            assert_eq!(info.description, "Crabs and their friends");
+            assert_eq!(info.members, Some(1204));
+            assert_eq!(info.online, Some(230));
+            assert_eq!(info.boost_level, 2);
+            assert_eq!(info.boosts, 11);
+            assert_eq!(info.mark, Some(protocol::Mark::Verified));
+            assert_eq!(info.banner.as_ref().map(|b| b.id.as_str()), Some("banner:4000:ban123"));
+        }
+        other => panic!("expected Response::SpaceInfo, got {other:?}"),
+    }
+
+    // GUILD_UPDATE with a new banner and tier 3 invalidates cached SpaceInfo and lifts channel upload limit to 100 MiB.
+    world.discord.push(
+        "GUILD_UPDATE",
+        json!({
+            "id": "4000",
+            "name": "Rustaceans",
+            "banner": "ban456",
+            "description": "Updated description",
+            "premium_tier": 3,
+            "premium_subscription_count": 20,
+            "features": ["COMMUNITY", "PARTNERED"]
+        }),
+    );
+    wait("channel upload limit to reflect tier 3", || {
+        world.tree("4000").1.into_iter().find(|c| c.key.id == "4101" && c.max_file_bytes == 100 << 20)
+    });
+    world.discord.script(
+        "/guilds/4000",
+        200,
+        json!({
+            "id": "4000",
+            "name": "Rustaceans",
+            "banner": "ban456",
+            "description": "Updated description",
+            "premium_tier": 3,
+            "premium_subscription_count": 20,
+            "features": ["COMMUNITY", "PARTNERED"],
+            "approximate_member_count": 1250,
+            "approximate_presence_count": 260
+        }),
+    );
+    match world.ask(Request::SpaceInfo { space: world.key("4000") }) {
+        Response::SpaceInfo { info } => {
+            assert_eq!(info.description, "Updated description");
+            assert_eq!(info.boost_level, 3);
+            assert_eq!(info.boosts, 20);
+            assert_eq!(info.mark, Some(protocol::Mark::Verified));
+            assert_eq!(info.banner.as_ref().map(|b| b.id.as_str()), Some("banner:4000:ban456"));
+        }
+        other => panic!("expected updated Response::SpaceInfo, got {other:?}"),
+    }
+}
+
+#[test]
+fn create_space_posts_guild_handles_templates_icon_and_refusals() {
+    let world = World::start();
+    let account = AccountKey { network: Network::Discord, account: "1000".into() };
+
+    // Capability is advertised for Discord accounts.
+    match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => {
+            let discord = accounts.iter().find(|a| a.key == account).expect("discord account");
+            assert!(discord.can.create_space);
+        }
+        other => panic!("expected Response::Status, got {other:?}"),
+    }
+
+    // 1. Short name (1 char) is refused locally before hitting Discord.
+    match world.ask(Request::CreateSpace {
+        account: account.clone(),
+        name: "x".into(),
+        icon: None,
+        template: None,
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("2 and 100"), "got: {detail}"),
+        other => panic!("expected local refusal for short name, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("POST", "/guilds").is_empty());
+
+    // 2. Create a server with a template and a staged PNG icon inside outbox.
+    let outbox = world.dir.join("outbox");
+    std::fs::create_dir_all(&outbox).unwrap();
+    let icon_path = outbox.join("server-icon.png");
+    std::fs::write(&icon_path, b"\x89PNG\r\n\x1a\nfake-png-bytes").unwrap();
+    world.discord.script(
+        "/guilds",
+        201,
+        json!({"id": "7700", "name": "Game Night", "system_channel_id": "7701"}),
+    );
+    match world.ask(Request::CreateSpace {
+        account: account.clone(),
+        name: "Game Night".into(),
+        icon: Some(icon_path.to_string_lossy().into_owned()),
+        template: Some("gaming".into()),
+    }) {
+        Response::SpaceCreated { space, conversation } => {
+            assert_eq!(space.id, "7700");
+            assert_eq!(conversation.map(|k| k.id), Some("7701".into()));
+        }
+        other => panic!("expected Response::SpaceCreated, got {other:?}"),
+    }
+    let posts = world.discord.requests_to("POST", "/guilds");
+    assert_eq!(posts.len(), 1);
+    assert_eq!(posts[0].body["name"], "Game Night");
+    assert!(posts[0].body["icon"].as_str().unwrap().starts_with("data:image/png;base64,"));
+    assert!(posts[0].body["channels"].as_array().unwrap().len() >= 4);
+    assert_eq!(posts[0].body["system_channel_id"], "2");
+
+    // 3. Error translations: server limit (30001), unverified email (40002), rate limit (429).
+    for (status, code, expected) in [
+        (400, 30001, "server limit"),
+        (403, 40002, "Verify your Discord email"),
+        (429, 0, "Too many server creation requests"),
+    ] {
+        world.discord.script("/guilds", status, json!({"code": code, "message": "err", "retry_after": 5.0}));
+        match world.ask(Request::CreateSpace {
+            account: account.clone(),
+            name: "Another Club".into(),
+            icon: None,
+            template: None,
+        }) {
+            Response::Error { detail, .. } => {
+                assert!(detail.contains(expected), "code {code} expected '{expected}', got '{detail}'");
+            }
+            other => panic!("expected error for code {code}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn scheduled_events_list_interest_and_gateway_updates() {
+    let world = World::start();
+    let space = world.key("4000");
+
+    // 1. Listing events calls GET /guilds/4000/scheduled-events?with_user_count=true and sorts Active first.
+    world.discord.script(
+        "/guilds/4000/scheduled-events",
+        200,
+        json!([
+            {
+                "id": "9001",
+                "guild_id": "4000",
+                "channel_id": "4201",
+                "name": "Weekly Standup",
+                "description": "Quick sync",
+                "scheduled_start_time": "2026-10-20T18:00:00+00:00",
+                "status": 1,
+                "entity_type": 2,
+                "user_count": 5,
+                "image": "evhash1"
+            },
+            {
+                "id": "9002",
+                "guild_id": "4000",
+                "name": "Live AMA",
+                "description": "Ask us anything",
+                "scheduled_start_time": "2026-10-21T18:00:00+00:00",
+                "status": 2,
+                "entity_type": 3,
+                "entity_metadata": {"location": "https://example.com/ama"},
+                "user_count": 42
+            }
+        ]),
+    );
+    match world.ask(Request::Events { space: space.clone() }) {
+        Response::Events { space: got_space, events } => {
+            assert_eq!(got_space, space);
+            assert_eq!(events.len(), 2);
+            // Active event sorts first even though its start time is later.
+            assert_eq!(events[0].key.id, "9002");
+            assert_eq!(events[0].status, protocol::EventStatus::Active);
+            assert_eq!(events[0].place_kind, protocol::EventPlaceKind::External);
+            assert_eq!(events[0].place, "https://example.com/ama");
+            assert_eq!(events[0].count, 42);
+
+            assert_eq!(events[1].key.id, "9001");
+            assert_eq!(events[1].status, protocol::EventStatus::Scheduled);
+            assert_eq!(events[1].place_kind, protocol::EventPlaceKind::Voice);
+            assert_eq!(events[1].conversation.as_ref().map(|k| k.id.as_str()), Some("4201"));
+            assert_eq!(events[1].cover.as_ref().map(|c| c.id.as_str()), Some("event_cover:9001:evhash1"));
+        }
+        other => panic!("expected Response::Events, got {other:?}"),
+    }
+    let list_reqs = world.discord.requests_to("GET", "/guilds/4000/scheduled-events");
+    assert_eq!(list_reqs.len(), 1);
+    assert!(list_reqs[0].path.contains("with_user_count=true"));
+
+    // 2. Marking interested sends PUT, unmarking sends DELETE.
+    world.discord.script("/guilds/4000/scheduled-events/9001/users/@me", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::EventInterest {
+            space: space.clone(),
+            event: world.key("9001"),
+            on: true,
+        }),
+        Response::Ok
+    );
+    assert_eq!(
+        world.discord.requests_to("PUT", "/guilds/4000/scheduled-events/9001/users/@me").len(),
+        1
+    );
+
+    // Re-listing preserves our interested flag for event 9001.
+    world.discord.script(
+        "/guilds/4000/scheduled-events",
+        200,
+        json!([
+            {
+                "id": "9001",
+                "guild_id": "4000",
+                "channel_id": "4201",
+                "name": "Weekly Standup",
+                "scheduled_start_time": "2026-10-20T18:00:00+00:00",
+                "status": 1,
+                "entity_type": 2,
+                "user_count": 6
+            }
+        ]),
+    );
+    match world.ask(Request::Events { space: space.clone() }) {
+        Response::Events { events, .. } => {
+            assert_eq!(events.len(), 1);
+            assert!(events[0].interested);
+            assert_eq!(events[0].count, 6);
+        }
+        other => panic!("expected Response::Events, got {other:?}"),
+    }
+
+    world.discord.script("/guilds/4000/scheduled-events/9001/users/@me", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::EventInterest {
+            space: space.clone(),
+            event: world.key("9001"),
+            on: false,
+        }),
+        Response::Ok
+    );
+    assert_eq!(
+        world.discord.requests_to("DELETE", "/guilds/4000/scheduled-events/9001/users/@me").len(),
+        1
+    );
+
+    // 3. Gateway event create/update/delete emit Change::Events for the guild.
+    let seq = match world.ask(Request::Status) {
+        Response::Status { seq, .. } => seq,
+        other => panic!("expected Status, got {other:?}"),
+    };
+    world.discord.push(
+        "GUILD_SCHEDULED_EVENT_CREATE",
+        json!({
+            "id": "9099",
+            "guild_id": "4000",
+            "name": "Pop-up Jam",
+            "scheduled_start_time": "2026-10-22T20:00:00+00:00",
+            "status": 1,
+            "entity_type": 2,
+            "channel_id": "4201"
+        }),
+    );
+    match world.ask(Request::Wait { since: seq }) {
+        Response::Changes { changes, .. } => {
+            assert!(
+                changes.iter().any(|c| c == &Change::Events { space: space.clone() }),
+                "expected Change::Events, got {changes:?}"
+            );
+        }
+        other => panic!("expected Response::Changes, got {other:?}"),
+    }
+}
+
+#[test]
+fn server_overview_edit_delete_transfer_and_event_admin_enforce_permissions() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    // Guild 4000: user 1000 is not owner and lacks MANAGE_GUILD/MANAGE_EVENTS.
+    // Add guild 4999: user 1000 is owner (full management rights).
+    ready["guilds"].as_array_mut().unwrap().push(json!({
+        "id": "4999",
+        "properties": {
+            "id": "4999",
+            "name": "Owned Guild",
+            "owner_id": "1000",
+            "icon": null,
+            "description": "Original bio",
+            "afk_timeout": 300,
+            "default_message_notifications": 0
+        },
+        "roles": [{"id": "4999", "name": "@everyone", "permissions": "1071698529857"}],
+        "channels": [
+            {"id": "4991", "type": 0, "name": "general", "position": 0, "permission_overwrites": []},
+            {"id": "4992", "type": 2, "name": "Lounge", "position": 1, "permission_overwrites": []}
+        ],
+        "members": [{"user": me(), "roles": []}],
+        "voice_states": []
+    }));
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    // Spaces advertise rights accurately: 4000 has none, 4999 has owner + manage flags.
+    match world.ask(Request::Spaces { network: Some(Network::Discord) }) {
+        Response::Spaces { spaces } => {
+            let s4000 = spaces.iter().find(|s| s.key.id == "4000").expect("4000");
+            assert!(!s4000.rights.manage_space && !s4000.rights.owner);
+            let s4999 = spaces.iter().find(|s| s.key.id == "4999").expect("4999");
+            assert!(s4999.rights.owner && s4999.rights.manage_space && s4999.rights.manage_events && s4999.rights.manage_roles);
+        }
+        other => panic!("expected Spaces, got {other:?}"),
+    }
+
+    // 1. Non-manager on guild 4000 is refused locally before hitting Discord.
+    match world.ask(Request::EditSpace {
+        space: world.key("4000"),
+        edit: protocol::SpaceEdit { name: Some("Hijack".into()), ..Default::default() },
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("Manage Server"), "got: {detail}"),
+        other => panic!("expected permission refusal, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("PATCH", "/guilds/4000").is_empty());
+
+    // 2. Owner edits guild 4999 name, description, AFK timeout, default notifications, and icon.
+    let outbox = world.dir.join("outbox");
+    std::fs::create_dir_all(&outbox).unwrap();
+    let icon_path = outbox.join("guild-icon.png");
+    std::fs::write(&icon_path, b"\x89PNG\r\n\x1a\npixeldata").unwrap();
+    world.discord.script(
+        "/guilds/4999",
+        200,
+        json!({
+            "id": "4999",
+            "name": "Renamed Guild",
+            "description": "Updated bio",
+            "afk_channel_id": "4992",
+            "afk_timeout": 900,
+            "default_message_notifications": 1
+        }),
+    );
+    assert_eq!(
+        world.ask(Request::EditSpace {
+            space: world.key("4999"),
+            edit: protocol::SpaceEdit {
+                name: Some("Renamed Guild".into()),
+                description: Some("Updated bio".into()),
+                icon: Some(icon_path.to_string_lossy().into_owned()),
+                afk_channel_id: Some("4992".into()),
+                afk_timeout: Some(900),
+                default_notify: Some(protocol::Notify::Mentions),
+                ..Default::default()
+            },
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/guilds/4999");
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0].body["name"], "Renamed Guild");
+    assert_eq!(patches[0].body["description"], "Updated bio");
+    assert_eq!(patches[0].body["afk_channel_id"], "4992");
+    assert_eq!(patches[0].body["afk_timeout"], 900);
+    assert_eq!(patches[0].body["default_message_notifications"], 1);
+    assert!(patches[0].body["icon"].as_str().unwrap().starts_with("data:image/png;base64,"));
+
+    // 3. Create, edit, and delete a scheduled event on owned guild 4999.
+    world.discord.script(
+        "/guilds/4999/scheduled-events",
+        200,
+        json!({
+            "id": "9500",
+            "guild_id": "4999",
+            "channel_id": "4992",
+            "name": "Launch Party",
+            "description": "Come hang out",
+            "scheduled_start_time": "2026-11-01T18:00:00Z",
+            "status": 1,
+            "entity_type": 2,
+            "user_count": 1
+        }),
+    );
+    let created = world.ask(Request::CreateEvent {
+        space: world.key("4999"),
+        event: protocol::SpaceEventEdit {
+            name: "Launch Party".into(),
+            description: "Come hang out".into(),
+            start: 1_793_556_000,
+            end: None,
+            place_kind: protocol::EventPlaceKind::Voice,
+            channel_id: Some("4992".into()),
+            location: None,
+            image: None,
+        },
+    });
+    assert!(matches!(created, Response::Event { ref event } if event.key.id == "9500"), "{created:?}");
+
+    world.discord.script("/guilds/4999/scheduled-events/9500", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::DeleteEvent { space: world.key("4999"), event_id: "9500".into() }),
+        Response::Ok
+    );
+
+    // 4. Delete requires owner; non-owner on 4000 is refused locally; 60003 surfaces 2FA prompt; success removes Space.
+    match world.ask(Request::DeleteSpace { space: world.key("4000"), mfa_code: None }) {
+        Response::Error { detail, .. } => assert!(detail.contains("Only the server owner"), "got: {detail}"),
+        other => panic!("expected owner refusal, got {other:?}"),
+    }
+    world.discord.script("/guilds/4999/delete", 401, json!({"code": 60003, "message": "Two factor is required"}));
+    match world.ask(Request::DeleteSpace { space: world.key("4999"), mfa_code: None }) {
+        Response::Error { detail, .. } => assert!(detail.contains("2FA code"), "got: {detail}"),
+        other => panic!("expected 2FA refusal, got {other:?}"),
+    }
+    world.discord.script("/guilds/4999/delete", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::DeleteSpace { space: world.key("4999"), mfa_code: Some("123456".into()) }),
+        Response::Ok
+    );
+    let dels = world.discord.requests_to("POST", "/guilds/4999/delete");
+    assert_eq!(dels.last().unwrap().body["code"], "123456");
+}
+
+#[test]
+fn space_invites_list_vanity_revoke_pause_and_permission_guards() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    ready["guilds"].as_array_mut().unwrap().push(json!({
+        "id": "4888",
+        "properties": {
+            "id": "4888",
+            "name": "Managed Guild",
+            "owner_id": "1000",
+            "icon": null,
+            "vanity_url_code": "rustclub",
+            "features": ["COMMUNITY", "VANITY_URL"]
+        },
+        "roles": [{"id": "4888", "name": "@everyone", "permissions": "1071698529857"}],
+        "channels": [{"id": "4881", "type": 0, "name": "welcome", "position": 0, "permission_overwrites": []}],
+        "members": [{"user": me(), "roles": []}],
+        "voice_states": []
+    }));
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    // 1. Non-manager on guild 4000 is refused locally without hitting Discord.
+    match world.ask(Request::SpaceInvites { space: world.key("4000") }) {
+        Response::Error { detail, .. } => assert!(detail.contains("Manage Server"), "got: {detail}"),
+        other => panic!("expected Manage Server refusal, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("GET", "/guilds/4000/invites").is_empty());
+
+    // 2. Listing invites on managed guild 4888 prepends read-only vanity URL first.
+    world.discord.script(
+        "/guilds/4888/invites",
+        200,
+        json!([
+            {
+                "code": "k9x2ab",
+                "inviter": {"id": "1000", "username": "justin", "global_name": "Justin", "discriminator": "0"},
+                "channel": {"id": "4881", "name": "welcome"},
+                "uses": 3,
+                "max_uses": 10,
+                "expires_at": "2026-11-10T12:00:00+00:00"
+            }
+        ]),
+    );
+    match world.ask(Request::SpaceInvites { space: world.key("4888") }) {
+        Response::SpaceInvites { invites, paused, .. } => {
+            assert!(!paused);
+            assert_eq!(invites.len(), 2);
+            assert!(invites[0].vanity);
+            assert_eq!(invites[0].code, "rustclub");
+            assert_eq!(invites[0].url, "https://discord.gg/rustclub");
+            assert!(!invites[1].vanity);
+            assert_eq!(invites[1].code, "k9x2ab");
+            assert_eq!(invites[1].inviter, "Justin");
+            assert_eq!(invites[1].channel_name, "welcome");
+            assert_eq!((invites[1].uses, invites[1].max_uses), (3, 10));
+        }
+        other => panic!("expected Response::SpaceInvites, got {other:?}"),
+    }
+
+    // 3. Revoking vanity code is refused locally; revoking normal invite sends DELETE /invites/k9x2ab.
+    match world.ask(Request::RevokeInvite { space: world.key("4888"), code: "rustclub".into() }) {
+        Response::Error { detail, .. } => assert!(detail.contains("vanity URL"), "got: {detail}"),
+        other => panic!("expected vanity refusal, got {other:?}"),
+    }
+    world.discord.script("/invites/k9x2ab", 200, json!({"code": "k9x2ab"}));
+    assert_eq!(
+        world.ask(Request::RevokeInvite { space: world.key("4888"), code: "k9x2ab".into() }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("DELETE", "/invites/k9x2ab").len(), 1);
+
+    // 4. Pausing invites toggles INVITES_DISABLED feature via PATCH /guilds/4888.
+    world.discord.script(
+        "/guilds/4888",
+        200,
+        json!({"id": "4888", "name": "Managed Guild", "features": ["COMMUNITY", "VANITY_URL", "INVITES_DISABLED"]}),
+    );
+    assert_eq!(
+        world.ask(Request::SetInvitesPaused { space: world.key("4888"), paused: true }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/guilds/4888");
+    assert_eq!(patches.len(), 1);
+    assert!(
+        patches[0].body["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "INVITES_DISABLED")
+    );
+}
+
+/// Create, edit, and assign Discord roles. Missing Manage Roles, hierarchy, managed roles, and
+/// an unconfirmed Administrator grant are refused before any mutating HTTP.
+#[test]
+fn roles_create_edit_assign_and_permission_guards() {
+    fn refusal(answer: Response, needle: &str) {
+        match answer {
+            Response::Error { detail, .. } => assert!(detail.contains(needle), "got: {detail}"),
+            other => panic!("expected a refusal containing {needle}, got {other:?}"),
+        }
+    }
+
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    // 4777: we hold Mod (Manage Roles and Administrator) at position 5. Owner is someone else,
+    // so Administrator does not bypass the hierarchy. 4000 still has neither right.
+    ready["guilds"].as_array_mut().unwrap().push(json!({
+        "id": "4777",
+        "properties": {"id": "4777", "name": "Role Guild", "owner_id": "9999", "icon": null},
+        "roles": [
+            {"id": "4777", "name": "@everyone", "permissions": "0", "position": 0},
+            {"id": "4701", "name": "Newbie", "permissions": "0", "color": 16711680, "hoist": true, "mentionable": true, "position": 1, "icon": "a1b2c3d4"},
+            {"id": "4704", "name": "Bot", "permissions": "0", "position": 2, "managed": true},
+            {"id": "4705", "name": "Fun", "permissions": "0", "position": 3, "unicode_emoji": "🌿"},
+            {"id": "4702", "name": "Mod", "permissions": "268435464", "position": 5},
+            {"id": "4703", "name": "Admin", "permissions": "8", "position": 10}
+        ],
+        "channels": [{"id": "4771", "type": 0, "name": "general", "position": 0, "permission_overwrites": []}],
+        "members": [{"user": me(), "roles": ["4702"]}],
+        "voice_states": []
+    }));
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+    let space = world.key("4777");
+    let rename = protocol::RoleEdit { name: Some("Nope".into()), ..Default::default() };
+
+    // 1. Guild 4000 has no Manage Roles. Each refusal stays on this machine.
+    refusal(world.ask(Request::Roles { space: world.key("4000") }), "to view roles");
+    refusal(
+        world.ask(Request::CreateRole {
+            space: world.key("4000"),
+            edit: protocol::RoleEdit { name: Some("Nope".into()), ..Default::default() },
+        }),
+        "to create a role",
+    );
+    refusal(
+        world.ask(Request::EditRole { space: world.key("4000"), role_id: "4010".into(), edit: rename.clone() }),
+        "to edit roles",
+    );
+    refusal(
+        world.ask(Request::SetMemberRoles {
+            space: world.key("4000"),
+            person: world.key("2006"),
+            roles: vec!["4010".into()],
+        }),
+        "to change a member's roles",
+    );
+    assert!(world.discord.requests_to("GET", "/guilds/4000/roles").is_empty());
+    assert!(world.discord.requests_to("POST", "/guilds/4000/roles").is_empty());
+    assert!(world.discord.requests_to("PATCH", "/guilds/4000/roles").is_empty());
+    assert!(world.discord.requests_to("PUT", "/guilds/4000/members").is_empty());
+    assert!(world.discord.requests_to("DELETE", "/guilds/4000/members").is_empty());
+
+    // 2. The list is the gateway cache. Colour, hoist, and the icon stay on the configured CDN.
+    match world.ask(Request::Roles { space: space.clone() }) {
+        Response::Roles { roles, .. } => {
+            let ids: Vec<&str> = roles.iter().map(|role| role.id.as_str()).collect();
+            assert_eq!(ids, ["4703", "4702", "4705", "4704", "4701", "4777"]);
+            let newbie = roles.iter().find(|role| role.id == "4701").unwrap();
+            assert_eq!(newbie.color, 16_711_680);
+            assert!(newbie.hoist && newbie.mentionable && newbie.editable && newbie.assignable);
+            assert!(!newbie.managed);
+            assert!(newbie.icon.contains("/role-icons/4701/a1b2c3d4.png"), "{}", newbie.icon);
+            assert!(newbie.icon.starts_with("http://") || newbie.icon.starts_with("https://"), "{}", newbie.icon);
+            assert!(!newbie.icon.contains('@'), "{}", newbie.icon);
+            let fun = roles.iter().find(|role| role.id == "4705").unwrap();
+            assert_eq!(fun.icon, "🌿");
+            assert!(fun.assignable && fun.editable);
+            let everyone = roles.iter().find(|role| role.id == "4777").unwrap();
+            assert!(everyone.editable && !everyone.assignable);
+            let admin = roles.iter().find(|role| role.id == "4703").unwrap();
+            assert!(!admin.editable && !admin.assignable);
+            let bot = roles.iter().find(|role| role.id == "4704").unwrap();
+            assert!(bot.managed && !bot.editable && !bot.assignable);
+            let mods = roles.iter().find(|role| role.id == "4702").unwrap();
+            assert!(!mods.editable && !mods.assignable);
+        }
+        other => panic!("expected Response::Roles, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("GET", "/guilds/4777/roles").is_empty());
+    assert!(world.discord.requests_to("POST", "/guilds/4777/roles").is_empty());
+    assert!(world.discord.requests_to("PATCH", "/guilds/4777/roles").is_empty());
+
+    // 3. A role above us, a managed role, and our own highest role are not edited.
+    refusal(world.ask(Request::EditRole { space: space.clone(), role_id: "4703".into(), edit: rename.clone() }), "at or above your highest role");
+    refusal(world.ask(Request::EditRole { space: space.clone(), role_id: "4704".into(), edit: rename.clone() }), "Managed roles cannot be edited");
+    refusal(world.ask(Request::EditRole { space: space.clone(), role_id: "4702".into(), edit: rename }), "at or above your highest role");
+    assert!(world.discord.requests_to("PATCH", "/guilds/4777/roles").is_empty());
+
+    // 4. Administrator is a second confirmation, even when we already hold the bit.
+    refusal(
+        world.ask(Request::CreateRole {
+            space: space.clone(),
+            edit: protocol::RoleEdit {
+                name: Some("Boss".into()),
+                permissions: Some(8),
+                confirm_admin: false,
+                ..Default::default()
+            },
+        }),
+        "Confirm before granting the Administrator permission",
+    );
+    assert!(world.discord.requests_to("POST", "/guilds/4777/roles").is_empty());
+
+    // 5. An edit that names nothing is the role we already have, and Discord is not asked.
+    match world.ask(Request::EditRole { space: space.clone(), role_id: "4701".into(), edit: protocol::RoleEdit::default() }) {
+        Response::Role { role } => {
+            assert_eq!(role.id, "4701");
+            assert_eq!(role.name, "Newbie");
+            assert_eq!(role.color, 16_711_680);
+            assert!(role.hoist && role.mentionable && role.assignable);
+        }
+        other => panic!("expected the cached role, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("PATCH", "/guilds/4777/roles").is_empty());
+
+    // 6. Creating a role posts once. Permissions travel as a decimal string.
+    world.discord.script(
+        "/guilds/4777/roles",
+        200,
+        json!({"id": "4706", "name": "Helpers", "permissions": "0", "color": 255, "position": 2}),
+    );
+    match world.ask(Request::CreateRole {
+        space: space.clone(),
+        edit: protocol::RoleEdit {
+            name: Some("Helpers".into()),
+            color: Some(255),
+            permissions: Some(0),
+            ..Default::default()
+        },
+    }) {
+        Response::Role { role } => {
+            assert_eq!((role.id.as_str(), role.name.as_str(), role.color), ("4706", "Helpers", 255));
+            assert!(role.assignable && role.editable);
+        }
+        other => panic!("expected Response::Role, got {other:?}"),
+    }
+
+    // 7. Editing Newbie patches that role and keeps its icon on the CDN.
+    world.discord.script(
+        "/guilds/4777/roles/4701",
+        200,
+        json!({
+            "id": "4701",
+            "name": "Newcomers",
+            "permissions": "0",
+            "color": 255,
+            "hoist": true,
+            "mentionable": true,
+            "position": 1,
+            "icon": "a1b2c3d4"
+        }),
+    );
+    match world.ask(Request::EditRole {
+        space: space.clone(),
+        role_id: "4701".into(),
+        edit: protocol::RoleEdit {
+            name: Some("Newcomers".into()),
+            color: Some(255),
+            hoist: Some(true),
+            ..Default::default()
+        },
+    }) {
+        Response::Role { role } => {
+            assert_eq!(role.name, "Newcomers");
+            assert!(role.hoist);
+            assert_eq!(role.color, 255);
+            assert!(role.icon.contains("/role-icons/4701/a1b2c3d4.png"), "{}", role.icon);
+            assert!(!role.icon.contains('@'), "{}", role.icon);
+        }
+        other => panic!("expected the edited role, got {other:?}"),
+    }
+    let patches = world.discord.requests_to("PATCH", "/guilds/4777/roles");
+    assert!(patches.iter().all(|seen| seen.path == "/guilds/4777/roles/4701"), "{patches:?}");
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0].body["name"], "Newcomers");
+    assert_eq!(patches[0].body["color"], json!(255));
+    assert_eq!(patches[0].body["hoist"], json!(true));
+
+    // 8. The same Administrator grant, confirmed, is the second post.
+    world.discord.script(
+        "/guilds/4777/roles",
+        200,
+        json!({"id": "4707", "name": "Boss", "permissions": "8", "color": 0, "position": 4}),
+    );
+    match world.ask(Request::CreateRole {
+        space: space.clone(),
+        edit: protocol::RoleEdit {
+            name: Some("Boss".into()),
+            permissions: Some(8),
+            confirm_admin: true,
+            ..Default::default()
+        },
+    }) {
+        Response::Role { role } => {
+            assert_eq!(role.id, "4707");
+            assert_eq!(role.permissions, 8);
+            assert!(role.assignable);
+        }
+        other => panic!("expected the confirmed role, got {other:?}"),
+    }
+    let posts = world.discord.requests_to("POST", "/guilds/4777/roles");
+    assert_eq!(posts.len(), 2);
+    assert_eq!(posts[0].path, "/guilds/4777/roles");
+    assert_eq!(posts[0].body["name"], "Helpers");
+    assert_eq!(posts[0].body["color"], json!(255));
+    assert_eq!(posts[0].body["permissions"], json!("0"));
+    assert_eq!(posts[1].body["name"], "Boss");
+    assert_eq!(posts[1].body["permissions"], json!("8"));
+
+    // 9. An unknown role and @everyone never ask Discord who the member is.
+    let member = world.key("2006");
+    refusal(
+        world.ask(Request::SetMemberRoles { space: space.clone(), person: member.clone(), roles: vec!["4999".into()] }),
+        "not on this server",
+    );
+    refusal(
+        world.ask(Request::SetMemberRoles { space: space.clone(), person: member.clone(), roles: vec!["4777".into()] }),
+        "assigned to every member",
+    );
+    assert!(world.discord.requests_to("GET", "/guilds/4777/members/2006").is_empty());
+
+    // 10. Taking away a managed role reads the member, then stops before any write.
+    world.discord.script("/guilds/4777/members/2006", 200, json!({"user": {"id": "2006"}, "roles": ["4704"]}));
+    refusal(
+        world.ask(Request::SetMemberRoles { space: space.clone(), person: member.clone(), roles: vec!["4701".into()] }),
+        "so it stays",
+    );
+    assert_eq!(world.discord.requests_to("GET", "/guilds/4777/members/2006").len(), 1);
+    assert!(world.discord.requests_to("PUT", "/guilds/4777/members/2006/roles").is_empty());
+    assert!(world.discord.requests_to("DELETE", "/guilds/4777/members/2006/roles").is_empty());
+
+    // 11. Keeping the managed role and adding Newbie is one PUT.
+    world.discord.script("/guilds/4777/members/2006", 200, json!({"user": {"id": "2006"}, "roles": ["4704"]}));
+    world.discord.script("/guilds/4777/members/2006/roles/4701", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::SetMemberRoles {
+            space,
+            person: member,
+            roles: vec!["4704".into(), "4701".into()],
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("GET", "/guilds/4777/members/2006").len(), 2);
+    let puts = world.discord.requests_to("PUT", "/guilds/4777/members/2006/roles");
+    assert_eq!(puts.len(), 1);
+    assert_eq!(puts[0].path, "/guilds/4777/members/2006/roles/4701");
+    assert!(world.discord.requests_to("DELETE", "/guilds/4777/members/2006/roles").is_empty());
+}

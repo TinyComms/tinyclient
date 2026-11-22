@@ -69,6 +69,22 @@ pub struct State {
     passed_age_gate: HashSet<Key>,
 }
 
+impl Shell {
+    /// Opens an external `http://` or `https://` URL through the conversation pane's link
+    /// confirmation flow (falling back to validated `cx.open_url` if the pane isn't mounted).
+    pub(in crate::gui) fn open_external_url(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dest) = protocol::link::Destination::parse(url) else {
+            return;
+        };
+        if let Some(pane) = self.conversation_state.pane.get().cloned() {
+            pane.update(cx, |pane, cx| pane.open_external_link(url, window, cx));
+        } else {
+            let strip = super::app::prefs::choices().strip_tracking;
+            cx.open_url(&dest.target(strip));
+        }
+    }
+}
+
 /// How often the network is told how far the user has read, at most.
 const READ_EVERY: Duration = Duration::from_secs(1);
 /// How far from the bottom the jump button appears.

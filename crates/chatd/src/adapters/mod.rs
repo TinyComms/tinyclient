@@ -177,6 +177,8 @@ pub struct About {
     pub reports: Vec<protocol::ProfilePerson>,
     /// Role names in that Space, colours left out.
     pub roles: Vec<String>,
+    /// Role ids in that Space. The card uses these to give or take roles; names stay in `roles`.
+    pub role_ids: Vec<String>,
     /// Email and phone; chatd masks phone numbers.
     pub contacts: Vec<Contact>,
     /// Mutual Spaces in all, when more than `mutual_spaces` lists.
@@ -222,6 +224,16 @@ pub struct SpaceAbout {
     pub roles: Vec<String>,
     pub notify: Notify,
     pub tags: Vec<protocol::TeamTag>,
+    pub banner: Option<MediaFile>,
+    pub boost_level: u8,
+    pub boosts: u32,
+    pub mark: Option<protocol::Mark>,
+    pub system_channel_id: Option<String>,
+    pub afk_channel_id: Option<String>,
+    pub afk_timeout: u32,
+    pub default_notify: Option<Notify>,
+    pub vanity_url: Option<String>,
+    pub invites_disabled: bool,
 }
 
 /// A page of what was shared, from the network's own search.
@@ -617,6 +629,117 @@ pub enum Command {
         max_uses: u32,
         temporary: bool,
         reply: Reply<String>,
+    },
+    /// Create a new Space; returns `(space_id, landing_channel_id)`.
+    CreateSpace {
+        name: String,
+        icon: Option<String>,
+        template: Option<String>,
+        reply: Reply<(String, Option<String>)>,
+    },
+    /// Lists scheduled and active events for a Space.
+    Events {
+        space_id: String,
+        reply: Reply<Vec<protocol::SpaceEvent>>,
+    },
+    /// Marks or unmarks the signed-in user as interested in a scheduled event.
+    EventInterest {
+        space_id: String,
+        event_id: String,
+        on: bool,
+        reply: Reply<()>,
+    },
+    /// Edit a Space's overview settings (`PATCH /guilds/{id}`).
+    EditSpace {
+        space_id: String,
+        edit: protocol::SpaceEdit,
+        reply: Reply<()>,
+    },
+    /// Delete an owned Space (`POST /guilds/{id}/delete`).
+    DeleteSpace {
+        space_id: String,
+        mfa_code: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Transfer ownership of an owned Space (`PATCH /guilds/{id}`).
+    TransferSpace {
+        space_id: String,
+        new_owner_id: String,
+        mfa_code: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Create a scheduled event in a Space.
+    CreateEvent {
+        space_id: String,
+        event: protocol::SpaceEventEdit,
+        reply: Reply<protocol::SpaceEvent>,
+    },
+    /// Edit a scheduled event in a Space.
+    EditEvent {
+        space_id: String,
+        event_id: String,
+        event: protocol::SpaceEventEdit,
+        reply: Reply<protocol::SpaceEvent>,
+    },
+    /// Delete / cancel a scheduled event in a Space.
+    DeleteEvent {
+        space_id: String,
+        event_id: String,
+        reply: Reply<()>,
+    },
+    /// List active invite links for a Space; returns `(invites, paused)`.
+    SpaceInvites {
+        space_id: String,
+        reply: Reply<(Vec<protocol::SpaceInvite>, bool)>,
+    },
+    /// Revoke one invite link in a Space.
+    RevokeInvite {
+        space_id: String,
+        code: String,
+        reply: Reply<()>,
+    },
+    /// Pause or resume invites for a Space (`INVITES_DISABLED`).
+    SetInvitesPaused {
+        space_id: String,
+        paused: bool,
+        reply: Reply<()>,
+    },
+    /// A Space's roles, from what the adapter already knows.
+    Roles {
+        space_id: String,
+        reply: Reply<Vec<protocol::SpaceRole>>,
+    },
+    /// Create a role.
+    CreateRole {
+        space_id: String,
+        edit: protocol::RoleEdit,
+        reply: Reply<protocol::SpaceRole>,
+    },
+    /// Edit a role.
+    EditRole {
+        space_id: String,
+        role_id: String,
+        edit: protocol::RoleEdit,
+        reply: Reply<protocol::SpaceRole>,
+    },
+    /// Reorder roles.
+    MoveRoles {
+        space_id: String,
+        roles: Vec<protocol::RoleMove>,
+        reply: Reply<()>,
+    },
+    /// Delete a role.
+    DeleteRole {
+        space_id: String,
+        role_id: String,
+        reply: Reply<()>,
+    },
+    /// Give or take a member's roles.
+    SetMemberRoles {
+        space_id: String,
+        person_id: String,
+        roles: Vec<String>,
+        reply: Reply<()>,
     },
     /// Set the network's notification setting. `until` is when a mute ends, as Unix seconds.
     /// Absent means muted until it is turned off, or not muted. An adapter with no timed mute
@@ -1064,6 +1187,24 @@ impl Command {
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CreateInvite { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Events { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::EventInterest { reply, .. }
+            | Command::EditSpace { reply, .. }
+            | Command::DeleteSpace { reply, .. }
+            | Command::TransferSpace { reply, .. }
+            | Command::DeleteEvent { reply, .. }
+            | Command::RevokeInvite { reply, .. }
+            | Command::SetInvitesPaused { reply, .. }
+            | Command::MoveRoles { reply, .. }
+            | Command::DeleteRole { reply, .. }
+            | Command::SetMemberRoles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SpaceInvites { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Roles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateRole { reply, .. } | Command::EditRole { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateEvent { reply, .. } | Command::EditEvent { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
             Command::SetMute { reply, .. }
             | Command::Moderate { reply, .. }
             | Command::Unban { reply, .. }
@@ -1520,6 +1661,15 @@ impl Context {
         Ok(())
     }
 
+    /// Management permissions held by the signed-in user in a Space.
+    pub fn space_rights(&self, space_id: &str, rights: protocol::SpaceRights) -> Stores {
+        let space = self.key(space_id);
+        if self.hub.store().set_space_rights(&space, rights)? {
+            self.hub.changed(Change::Spaces { account: self.account.clone() });
+        }
+        Ok(())
+    }
+
     /// The newest message as a line, where the network's list gives only that (Teams'
     /// `lastMessage`). Where a whole message is at hand, record it with [`Context::history`].
     pub fn preview(&self, conversation_id: &str, line: &PreviewLine) -> Stores {
@@ -1921,6 +2071,26 @@ impl Context {
         let person = self.key(person_id);
         let note = note.to_owned();
         self.hub.profiles.update_where(|(key, _)| *key == person, |profile| profile.note = note.clone());
+    }
+    /// A Space's cached info is no longer current (e.g. `GUILD_UPDATE` or overview edit).
+    pub fn space_info_stale(&self, space_id: &str) {
+        self.hub.space_infos.forget(&self.key(space_id));
+    }
+
+    /// A Space's scheduled events changed: tells open shells to refresh them.
+    pub fn events_changed(&self, space_id: &str) {
+        self.hub.changed(Change::Events { space: self.key(space_id) });
+    }
+
+    /// A scheduled event the user is interested in just went live.
+    pub fn scheduled_event_started(&self, space_id: &str, space_name: &str, event_id: &str, name: &str, place: &str) {
+        self.hub.notify(crate::notify::Event::ScheduledEvent {
+            space: self.key(space_id),
+            space_name: space_name.to_owned(),
+            event_id: event_id.to_owned(),
+            name: name.to_owned(),
+            place: place.to_owned(),
+        });
     }
 
     /// What is held about a person's presence now, for a member row built here.

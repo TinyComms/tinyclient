@@ -1,0 +1,1830 @@
+//! Discord server settings overlay: Overview (name, description, icon, banner, system/AFK
+//! channels, default notifications, Danger Zone delete & transfer), Invites, Events, and Roles.
+
+use super::components::{button, glyph, icon_button, segment, segmented, ButtonKind};
+use super::input::TextInput;
+use super::state::Shell;
+use super::theme::{self, Type};
+use crate::client::ask;
+use gpui::{
+    div, prelude::*, px, AnyElement, ClipboardItem, Context, Div, Entity, MouseButton,
+    PathPromptOptions, Stateful, Window,
+};
+use protocol::{
+    ConversationKind, EventPlaceKind, Key, Network, Notify, Request, Response, RoleEdit, RoleMove,
+    SpaceEdit, SpaceEvent, SpaceEventEdit, SpaceInfo, SpaceInvite, SpaceRights, SpaceRole,
+};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(in crate::gui) enum Tab {
+    Overview,
+    Invites,
+    Events,
+    Roles,
+}
+
+enum PictureTarget {
+    Icon,
+    Banner,
+    Event,
+    Role,
+}
+
+fn parse_role_color(text: &str) -> Result<u32, ()> {
+    let text = text.trim().trim_start_matches('#');
+    if text.is_empty() {
+        return Ok(0);
+    }
+    if text.len() != 6 || !text.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(());
+    }
+    u32::from_str_radix(text, 16).map_err(|_| ())
+}
+
+#[derive(Default)]
+pub(in crate::gui) struct State {
+    pub open: Option<Open>,
+}
+
+pub(in crate::gui) struct Open {
+    pub space: Key,
+    pub space_name: String,
+    pub rights: SpaceRights,
+    pub tab: Tab,
+    pub loading: bool,
+    pub busy: bool,
+    pub notice: Option<String>,
+    pub error: Option<String>,
+    pub info: Option<SpaceInfo>,
+
+    // Overview form fields
+    pub name: Entity<TextInput>,
+    pub description: Entity<TextInput>,
+    pub icon_edit: Option<String>,
+    pub banner_edit: Option<String>,
+    pub system_channel_id: String,
+    pub afk_channel_id: String,
+    pub afk_timeout: u32,
+    pub default_notify: Notify,
+
+    // Danger zone (owner only)
+    pub confirm_name: Entity<TextInput>,
+    pub transfer_owner_id: Entity<TextInput>,
+    pub mfa_code: Entity<TextInput>,
+
+    // Events admin form
+    pub editing_event_id: Option<String>,
+    pub event_name: Entity<TextInput>,
+    pub event_desc: Entity<TextInput>,
+    pub event_location: Entity<TextInput>,
+    pub event_place_kind: EventPlaceKind,
+    pub event_channel_id: String,
+    pub event_hours_ahead: i64,
+    pub event_duration_hours: i64,
+    pub event_image: Option<String>,
+
+    // Invites tab
+    pub invites: Vec<SpaceInvite>,
+    pub invites_paused: bool,
+    pub invites_loaded: bool,
+
+    // Roles tab
+    pub roles: Vec<SpaceRole>,
+    pub roles_loaded: bool,
+    pub editing_role: Option<String>,
+    pub role_form: bool,
+    pub role_name: Entity<TextInput>,
+    pub role_color: Entity<TextInput>,
+    pub role_emoji: Entity<TextInput>,
+    pub role_hoist: bool,
+    pub role_mentionable: bool,
+    pub role_permissions: u64,
+    /// `None` leaves the picture alone, `Some("")` clears it, `Some(path)` uploads that file.
+    pub role_icon: Option<String>,
+    pub role_clear_emoji: bool,
+    pub role_confirm_admin: bool,
+}
+
+fn field_box(input: Entity<TextInput>) -> Div {
+    div()
+        .px(px(8.))
+        .py(px(6.))
+        .rounded(px(theme::R_CONTROL))
+        .bg(theme::canvas())
+        .border_1()
+        .border_color(theme::border())
+        .type_ui()
+        .child(input)
+}
+
+impl Shell {
+    pub(in crate::gui) fn open_discord_settings(&mut self, space: Key, cx: &mut Context<Self>) {
+        let found = self.spaces.iter().find(|s| s.key == space).cloned();
+        let space_name = found.as_ref().map(|s| s.name.clone()).unwrap_or_else(|| "Server".to_owned());
+        let rights = found.map(|s| s.rights).unwrap_or_default();
+        if !rights.any_settings() {
+            return;
+        }
+        let tab = if rights.manage_space || rights.owner {
+            Tab::Overview
+        } else if rights.manage_roles {
+            Tab::Roles
+        } else {
+            Tab::Events
+        };
+        let initial_name = space_name.clone();
+        let name = cx.new(|cx| {
+            let mut input = TextInput::new("Server name", cx);
+            input.set_text(&initial_name, cx);
+            input
+        });
+        let description = cx.new(|cx| TextInput::new("Short server description", cx));
+        let confirm_name = cx.new(|cx| TextInput::new("Type server name to confirm", cx));
+        let transfer_owner_id = cx.new(|cx| TextInput::new("Member user ID", cx));
+        let mfa_code = cx.new(|cx| TextInput::new("6-digit 2FA code (if required)", cx));
+        let event_name = cx.new(|cx| TextInput::new("Event title", cx));
+        let event_desc = cx.new(|cx| TextInput::new("What is this event about?", cx));
+        let event_location = cx.new(|cx| TextInput::new("Location or https:// link", cx));
+        let role_name = cx.new(|cx| TextInput::new("Role name", cx));
+        let role_color = cx.new(|cx| TextInput::new("#RRGGBB", cx));
+        let role_emoji = cx.new(|cx| TextInput::new("Emoji", cx));
+        self.discord_settings.open = Some(Open {
+            space: space.clone(),
+            space_name,
+            rights,
+            tab,
+            loading: true,
+            busy: false,
+            notice: None,
+            error: None,
+            info: None,
+            name,
+            description,
+            icon_edit: None,
+            banner_edit: None,
+            system_channel_id: String::new(),
+            afk_channel_id: String::new(),
+            afk_timeout: 300,
+            default_notify: Notify::All,
+            confirm_name,
+            transfer_owner_id,
+            mfa_code,
+            editing_event_id: None,
+            event_name,
+            event_desc,
+            event_location,
+            event_place_kind: EventPlaceKind::Voice,
+            event_channel_id: String::new(),
+            event_hours_ahead: 1,
+            event_duration_hours: 1,
+            event_image: None,
+            invites: Vec::new(),
+            invites_paused: false,
+            invites_loaded: false,
+            roles: Vec::new(),
+            roles_loaded: false,
+            editing_role: None,
+            role_form: false,
+            role_name,
+            role_color,
+            role_emoji,
+            role_hoist: false,
+            role_mentionable: false,
+            role_permissions: 0,
+            role_icon: None,
+            role_clear_emoji: false,
+            role_confirm_admin: false,
+        });
+        self.load_discord_settings_info(space.clone(), cx);
+        if rights.manage_space {
+            self.load_discord_invites(space.clone(), cx);
+        }
+        if rights.manage_roles {
+            self.load_discord_roles(space.clone(), cx);
+        }
+        if rights.manage_events {
+            self.load_space_events(space, cx);
+        }
+        cx.notify();
+    }
+
+    fn load_discord_invites(&mut self, space: Key, cx: &mut Context<Self>) {
+        let req = Request::SpaceInvites { space: space.clone() };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                let Some(open) = this.discord_settings.open.as_mut() else {
+                    return;
+                };
+                if open.space != space {
+                    return;
+                }
+                open.invites_loaded = true;
+                match answer {
+                    Ok(Response::SpaceInvites { invites, paused, .. }) => {
+                        open.invites = invites;
+                        open.invites_paused = paused;
+                    }
+                    Ok(Response::Error { detail, .. }) => open.error = Some(detail),
+                    Err(err) => open.error = Some(err.to_string()),
+                    _ => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn revoke_discord_invite(&mut self, space: Key, code: String, cx: &mut Context<Self>) {
+        let Some(open) = self.discord_settings.open.as_mut() else {
+            return;
+        };
+        if open.busy {
+            return;
+        }
+        open.busy = true;
+        open.error = None;
+        open.notice = None;
+        cx.notify();
+        let req = Request::RevokeInvite {
+            space: space.clone(),
+            code: code.clone(),
+        };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                if let Some(open) = this.discord_settings.open.as_mut() {
+                    open.busy = false;
+                    match answer {
+                        Ok(Response::Ok) => {
+                            open.invites.retain(|inv| inv.vanity || inv.code != code);
+                            open.notice = Some(format!("Revoked invite {code}."));
+                        }
+                        Ok(Response::Error { detail, .. }) => open.error = Some(detail),
+                        Err(err) => open.error = Some(err.to_string()),
+                        _ => {}
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn toggle_discord_invites_paused(&mut self, space: Key, paused: bool, cx: &mut Context<Self>) {
+        let Some(open) = self.discord_settings.open.as_mut() else {
+            return;
+        };
+        if open.busy {
+            return;
+        }
+        open.busy = true;
+        open.error = None;
+        open.notice = None;
+        cx.notify();
+        let req = Request::SetInvitesPaused { space, paused };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                if let Some(open) = this.discord_settings.open.as_mut() {
+                    open.busy = false;
+                    match answer {
+                        Ok(Response::Ok) => {
+                            open.invites_paused = paused;
+                            open.notice = Some(if paused {
+                                "Invites paused.".to_owned()
+                            } else {
+                                "Invites resumed.".to_owned()
+                            });
+                        }
+                        Ok(Response::Error { detail, .. }) => open.error = Some(detail),
+                        Err(err) => open.error = Some(err.to_string()),
+                        _ => {}
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(in crate::gui) fn close_discord_settings(&mut self, cx: &mut Context<Self>) {
+        if self.discord_settings.open.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn load_discord_settings_info(&mut self, space: Key, cx: &mut Context<Self>) {
+        let req = Request::SpaceInfo { space: space.clone() };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                let Some(open) = this.discord_settings.open.as_mut() else {
+                    return;
+                };
+                if open.space != space {
+                    return;
+                }
+                open.loading = false;
+                match answer {
+                    Ok(Response::SpaceInfo { info }) => {
+                        let name_text = info.space.name.clone();
+                        let desc_text = info.description.clone();
+                        open.space_name = name_text.clone();
+                        open.system_channel_id = info.system_channel_id.clone().unwrap_or_default();
+                        open.afk_channel_id = info.afk_channel_id.clone().unwrap_or_default();
+                        open.afk_timeout = if info.afk_timeout > 0 { info.afk_timeout } else { 300 };
+                        open.default_notify = info.default_notify.unwrap_or(Notify::All);
+                        let name_entity = open.name.clone();
+                        let desc_entity = open.description.clone();
+                        open.info = Some(*info);
+                        name_entity.update(cx, |i, cx| i.set_text(&name_text, cx));
+                        desc_entity.update(cx, |i, cx| i.set_text(&desc_text, cx));
+                    }
+                    Ok(Response::Error { detail, .. }) => open.error = Some(detail),
+                    Err(err) => open.error = Some(err.to_string()),
+                    _ => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn pick_discord_settings_image(&mut self, target: PictureTarget, cx: &mut Context<Self>) {
+        let prompt = match target {
+            PictureTarget::Event => "Choose event cover image",
+            PictureTarget::Banner => "Choose server banner",
+            PictureTarget::Role => "Choose role icon",
+            PictureTarget::Icon => "Choose server icon",
+        };
+        let asked = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(prompt.into()),
+        });
+        cx.spawn(async move |shell, cx| {
+            if let Ok(Ok(Some(paths))) = asked.await {
+                if let Some(path) = paths.into_iter().next() {
+                    let chosen = path.to_string_lossy().into_owned();
+                    let _ = shell.update(cx, |this, cx| {
+                        if let Some(open) = this.discord_settings.open.as_mut() {
+                            match target {
+                                PictureTarget::Event => open.event_image = Some(chosen),
+                                PictureTarget::Banner => open.banner_edit = Some(chosen),
+                                PictureTarget::Icon => open.icon_edit = Some(chosen),
+                                PictureTarget::Role => {
+                                    open.role_icon = Some(chosen);
+                                    open.role_clear_emoji = false;
+                                    let emoji = open.role_emoji.clone();
+                                    emoji.update(cx, |input, cx| input.set_text("", cx));
+                                }
+                            }
+                            open.error = None;
+                            cx.notify();
+                        }
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn save_discord_overview(&mut self, cx: &mut Context<Self>) {
+        let Some(open) = self.discord_settings.open.as_mut() else {
+            return;
+        };
+        if open.busy {
+            return;
+        }
+        let name = open.name.read(cx).text().trim().to_owned();
+        if !(2..=100).contains(&name.chars().count()) {
+            open.error = Some("Server name must be between 2 and 100 characters.".to_owned());
+            cx.notify();
+            return;
+        }
+        let description = open.description.read(cx).text().trim().to_owned();
+        let edit = SpaceEdit {
+            name: Some(name),
+            description: Some(description),
+            icon: open.icon_edit.clone(),
+            banner: open.banner_edit.clone(),
+            system_channel_id: Some(open.system_channel_id.clone()),
+            afk_channel_id: Some(open.afk_channel_id.clone()),
+            afk_timeout: Some(open.afk_timeout),
+            default_notify: Some(open.default_notify),
+        };
+        let space = open.space.clone();
+        open.busy = true;
+        open.error = None;
+        open.notice = None;
+        cx.notify();
+        let req = Request::EditSpace { space: space.clone(), edit };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                if let Some(open) = this.discord_settings.open.as_mut() {
+                    open.busy = false;
+                    match answer {
+                        Ok(Response::Ok) => {
+                            open.icon_edit = None;
+                            open.banner_edit = None;
+                            open.notice = Some("Server settings saved.".to_owned());
+                            open.error = None;
+                            this.load_discord_settings_info(space, cx);
+                        }
+                        Ok(Response::Error { detail, .. }) => open.error = Some(detail),
+                        Err(err) => open.error = Some(err.to_string()),
+                        _ => open.error = Some("Could not save settings.".to_owned()),
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn submit_discord_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(open) = self.discord_settings.open.as_mut() else {
+            return;
+        };
+        if open.busy {
+            return;
+        }
+        let typed = open.confirm_name.read(cx).text().trim().to_owned();
+        if typed != open.space_name {
+            open.error = Some(format!("Type \"{}\" exactly to confirm deletion.", open.space_name));
+            cx.notify();
+            return;
+        }
+        let mfa = open.mfa_code.read(cx).text().trim().to_owned();
+        let mfa_code = (!mfa.is_empty()).then_some(mfa);
+        let space = open.space.clone();
+        open.busy = true;
+        open.error = None;
+        open.notice = None;
+        cx.notify();
+        let req = Request::DeleteSpace { space, mfa_code };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| match answer {
+                Ok(Response::Ok) => {
+                    this.discord_settings.open = None;
+                    this.go(super::sidebar::Mode::Network(Network::Discord), cx);
+                    this.toast(Some(("icons/trash-2.svg", theme::text_soft())), "Server deleted", cx);
+                    cx.notify();
+                }
+                Ok(Response::Error { detail, .. }) => {
+                    if let Some(open) = this.discord_settings.open.as_mut() {
+                        open.busy = false;
+                        open.error = Some(detail);
+                    }
+                    cx.notify();
+                }
+                Err(err) => {
+                    if let Some(open) = this.discord_settings.open.as_mut() {
+                        open.busy = false;
+                        open.error = Some(err.to_string());
+                    }
+                    cx.notify();
+                }
+                _ => {
+                    if let Some(open) = this.discord_settings.open.as_mut() {
+                        open.busy = false;
+                        open.error = Some("Could not delete server.".to_owned());
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn submit_discord_transfer(&mut self, cx: &mut Context<Self>) {
+        let Some(open) = self.discord_settings.open.as_mut() else {
+            return;
+        };
+        if open.busy {
+            return;
+        }
+        let typed = open.confirm_name.read(cx).text().trim().to_owned();
+        if typed != open.space_name {
+            open.error = Some(format!("Type \"{}\" exactly to confirm ownership transfer.", open.space_name));
+            cx.notify();
+            return;
+        }
+        let new_id = open.transfer_owner_id.read(cx).text().trim().to_owned();
+        if new_id.is_empty() {
+            open.error = Some("Enter the member's user ID to transfer ownership.".to_owned());
+            cx.notify();
+            return;
+        }
+        let mfa = open.mfa_code.read(cx).text().trim().to_owned();
+        let mfa_code = (!mfa.is_empty()).then_some(mfa);
+        let space = open.space.clone();
+        let new_owner = Key::new(&space.account(), new_id);
+        open.busy = true;
+        open.error = None;
+        open.notice = None;
+        cx.notify();
+        let req = Request::TransferSpace { space, new_owner, mfa_code };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                if let Some(open) = this.discord_settings.open.as_mut() {
+                    open.busy = false;
+                    match answer {
+                        Ok(Response::Ok) => {
+                            open.rights.owner = false;
+                            open.notice = Some("Ownership transferred.".to_owned());
+                            open.error = None;
+                        }
+                        Ok(Response::Error { detail, .. }) => open.error = Some(detail),
+                        Err(err) => open.error = Some(err.to_string()),
+                        _ => open.error = Some("Could not transfer ownership.".to_owned()),
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn save_discord_event(&mut self, cx: &mut Context<Self>) {
+        let Some(open) = self.discord_settings.open.as_mut() else {
+            return;
+        };
+        if open.busy {
+            return;
+        }
+        let name = open.event_name.read(cx).text().trim().to_owned();
+        if name.is_empty() {
+            open.error = Some("Enter an event title.".to_owned());
+            cx.notify();
+            return;
+        }
+        let description = open.event_desc.read(cx).text().trim().to_owned();
+        let location = open.event_location.read(cx).text().trim().to_owned();
+        let start = crate::view::now() + open.event_hours_ahead.max(1) * 3600;
+        let end = Some(start + open.event_duration_hours.max(1) * 3600);
+        let edit = SpaceEventEdit {
+            name,
+            description,
+            start,
+            end,
+            place_kind: open.event_place_kind,
+            channel_id: (!open.event_channel_id.is_empty()).then(|| open.event_channel_id.clone()),
+            location: (!location.is_empty()).then_some(location),
+            image: open.event_image.clone(),
+        };
+        let space = open.space.clone();
+        let editing_id = open.editing_event_id.clone();
+        open.busy = true;
+        open.error = None;
+        open.notice = None;
+        cx.notify();
+        let req = match editing_id {
+            Some(event_id) => Request::EditEvent { space: space.clone(), event_id, event: edit },
+            None => Request::CreateEvent { space: space.clone(), event: edit },
+        };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                if let Some(open) = this.discord_settings.open.as_mut() {
+                    open.busy = false;
+                    match answer {
+                        Ok(Response::Event { .. }) => {
+                            open.editing_event_id = None;
+                            open.event_image = None;
+                            let n = open.event_name.clone();
+                            let d = open.event_desc.clone();
+                            let l = open.event_location.clone();
+                            open.notice = Some("Event saved.".to_owned());
+                            open.error = None;
+                            n.update(cx, |i, cx| i.clear(cx));
+                            d.update(cx, |i, cx| i.clear(cx));
+                            l.update(cx, |i, cx| i.clear(cx));
+                            this.load_space_events(space, cx);
+                        }
+                        Ok(Response::Error { detail, .. }) => open.error = Some(detail),
+                        Err(err) => open.error = Some(err.to_string()),
+                        _ => open.error = Some("Could not save event.".to_owned()),
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn delete_discord_event(&mut self, space: Key, event_id: String, cx: &mut Context<Self>) {
+        let Some(open) = self.discord_settings.open.as_mut() else {
+            return;
+        };
+        if open.busy {
+            return;
+        }
+        open.busy = true;
+        open.error = None;
+        cx.notify();
+        let req = Request::DeleteEvent { space: space.clone(), event_id };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                if let Some(open) = this.discord_settings.open.as_mut() {
+                    open.busy = false;
+                    match answer {
+                        Ok(Response::Ok) => {
+                            open.notice = Some("Event canceled.".to_owned());
+                            this.load_space_events(space, cx);
+                        }
+                        Ok(Response::Error { detail, .. }) => open.error = Some(detail),
+                        Err(err) => open.error = Some(err.to_string()),
+                        _ => {}
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn start_edit_discord_event(&mut self, ev: &SpaceEvent, cx: &mut Context<Self>) {
+        let Some(open) = self.discord_settings.open.as_mut() else {
+            return;
+        };
+        open.editing_event_id = Some(ev.key.id.clone());
+        open.event_place_kind = ev.place_kind;
+        open.event_channel_id = ev.conversation.as_ref().map(|c| c.id.clone()).unwrap_or_default();
+        let n = open.event_name.clone();
+        let d = open.event_desc.clone();
+        let l = open.event_location.clone();
+        let name = ev.name.clone();
+        let desc = ev.description.clone();
+        let place = if ev.place_kind == EventPlaceKind::External { ev.place.clone() } else { String::new() };
+        n.update(cx, |i, cx| i.set_text(&name, cx));
+        d.update(cx, |i, cx| i.set_text(&desc, cx));
+        l.update(cx, |i, cx| i.set_text(&place, cx));
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn discord_settings_layer(&self, _window: &mut Window, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let open = self.discord_settings.open.as_ref()?;
+        let mut tabs = div().w(px(176.)).flex_none().border_r_1().border_color(theme::border()).p(px(12.)).flex().flex_col().gap(px(4.));
+        tabs = tabs.child(
+            div()
+                .px(px(8.))
+                .pb(px(8.))
+                .min_w_0()
+                .truncate()
+                .type_ui()
+                .font_weight(theme::SEMIBOLD)
+                .text_color(theme::text())
+                .child(open.space_name.clone()),
+        );
+        let tab_btn = |id: &'static str, icon: &'static str, label: &'static str, target: Tab, active: bool, cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .h(px(30.))
+                .px(px(8.))
+                .rounded(px(theme::R_CONTROL))
+                .cursor_pointer()
+                .when(active, |d| d.bg(theme::selected()))
+                .hover(|s| s.bg(theme::hover()))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(open) = this.discord_settings.open.as_mut() {
+                        open.tab = target;
+                        open.error = None;
+                        open.notice = None;
+                        cx.notify();
+                    }
+                }))
+                .child(glyph(icon, 15., if active { theme::text() } else { theme::text_soft() }))
+                .child(div().type_ui().text_color(if active { theme::text() } else { theme::text_soft() }).child(label))
+        };
+        if open.rights.manage_space || open.rights.owner {
+            tabs = tabs.child(tab_btn("ds-tab-overview", "icons/settings.svg", "Overview", Tab::Overview, open.tab == Tab::Overview, cx));
+        }
+        if open.rights.manage_space {
+            tabs = tabs.child(tab_btn("ds-tab-invites", "icons/link.svg", "Invites", Tab::Invites, open.tab == Tab::Invites, cx));
+        }
+        if open.rights.manage_events {
+            tabs = tabs.child(tab_btn("ds-tab-events", "icons/calendar.svg", "Events", Tab::Events, open.tab == Tab::Events, cx));
+        }
+        if open.rights.manage_roles {
+            tabs = tabs.child(tab_btn("ds-tab-roles", "icons/shield.svg", "Roles", Tab::Roles, open.tab == Tab::Roles, cx));
+        }
+
+        let content: AnyElement = match open.tab {
+            Tab::Overview => self.discord_overview_tab(open, cx).into_any_element(),
+            Tab::Invites => self.discord_invites_tab(open, cx).into_any_element(),
+            Tab::Events => self.discord_events_tab(open, cx).into_any_element(),
+            Tab::Roles => self.discord_roles_tab(open, cx).into_any_element(),
+        };
+
+        let panel = div()
+            .id("discord-settings-panel")
+            .w(px(740.))
+            .max_w_full()
+            .h(px(580.))
+            .max_h_full()
+            .rounded(px(theme::R_FLOAT))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .overflow_hidden()
+            .flex()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(tabs)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .h(px(44.))
+                            .px(px(16.))
+                            .border_b_1()
+                            .border_color(theme::border())
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(div().type_title().text_color(theme::text()).child(match open.tab {
+                                Tab::Overview => "Server overview",
+                                Tab::Invites => "Invite links",
+                                Tab::Events => "Scheduled events",
+                                Tab::Roles => "Roles",
+                            }))
+                            .child(icon_button("ds-close", "icons/x.svg", false).on_click(cx.listener(|this, _, _, cx| {
+                                this.close_discord_settings(cx);
+                            }))),
+                    )
+                    .child(
+                        div()
+                            .id("discord-settings-scroll")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .p(px(16.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(12.))
+                            .children(open.error.as_ref().map(|e| div().type_small().text_color(theme::danger()).child(e.clone())))
+                            .children(open.notice.as_ref().map(|n| div().type_small().text_color(theme::online()).child(n.clone())))
+                            .child(content),
+                    ),
+            );
+
+        Some(
+            div()
+                .id("discord-settings-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(gpui::rgba(0x0000_0066))
+                .p(px(24.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.close_discord_settings(cx);
+                }))
+                .child(panel),
+        )
+    }
+
+    fn discord_overview_tab(&self, open: &Open, cx: &mut Context<Self>) -> Div {
+        let tree = self.trees.get(&open.space);
+        let text_channels: Vec<(String, String)> = tree
+            .map(|t| {
+                t.conversations
+                    .iter()
+                    .filter(|c| matches!(c.kind, ConversationKind::Channel | ConversationKind::Announcement))
+                    .map(|c| (c.key.id.clone(), c.title.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let voice_channels: Vec<(String, String)> = tree
+            .map(|t| {
+                t.conversations
+                    .iter()
+                    .filter(|c| c.kind == ConversationKind::Voice)
+                    .map(|c| (c.key.id.clone(), c.title.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut sys_bar = div().flex().flex_wrap().gap(px(6.));
+        sys_bar = sys_bar.child(
+            segment("ds-sys-none", "None", open.system_channel_id.is_empty())
+                .px(px(8.))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(o) = this.discord_settings.open.as_mut() {
+                        o.system_channel_id.clear();
+                        cx.notify();
+                    }
+                })),
+        );
+        for (ix, (id, title)) in text_channels.iter().take(12).enumerate() {
+            let selected = open.system_channel_id == *id;
+            let chosen = id.clone();
+            sys_bar = sys_bar.child(
+                segment(("ds-sys-ch", ix), format!("#{}", title.trim_start_matches('#')), selected)
+                    .px(px(8.))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(o) = this.discord_settings.open.as_mut() {
+                            o.system_channel_id = chosen.clone();
+                            cx.notify();
+                        }
+                    })),
+            );
+        }
+
+        let mut afk_bar = div().flex().flex_wrap().gap(px(6.));
+        afk_bar = afk_bar.child(
+            segment("ds-afk-none", "None", open.afk_channel_id.is_empty())
+                .px(px(8.))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(o) = this.discord_settings.open.as_mut() {
+                        o.afk_channel_id.clear();
+                        cx.notify();
+                    }
+                })),
+        );
+        for (ix, (id, title)) in voice_channels.iter().take(12).enumerate() {
+            let selected = open.afk_channel_id == *id;
+            let chosen = id.clone();
+            afk_bar = afk_bar.child(
+                segment(("ds-afk-ch", ix), title.clone(), selected)
+                    .px(px(8.))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(o) = this.discord_settings.open.as_mut() {
+                            o.afk_channel_id = chosen.clone();
+                            cx.notify();
+                        }
+                    })),
+            );
+        }
+
+        let timeouts: [(u32, &str); 5] = [(60, "1 min"), (300, "5 min"), (900, "15 min"), (1800, "30 min"), (3600, "1 hour")];
+        let mut timeout_bar = segmented();
+        for (ix, (secs, label)) in timeouts.into_iter().enumerate() {
+            timeout_bar = timeout_bar.child(
+                segment(("ds-afk-t", ix), label, open.afk_timeout == secs)
+                    .px(px(8.))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(o) = this.discord_settings.open.as_mut() {
+                            o.afk_timeout = secs;
+                            cx.notify();
+                        }
+                    })),
+            );
+        }
+
+        let notify_bar = segmented()
+            .child(
+                segment("ds-notify-all", "All messages", open.default_notify == Notify::All)
+                    .px(px(8.))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(o) = this.discord_settings.open.as_mut() {
+                            o.default_notify = Notify::All;
+                            cx.notify();
+                        }
+                    })),
+            )
+            .child(
+                segment("ds-notify-mentions", "Only @mentions", open.default_notify != Notify::All)
+                    .px(px(8.))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(o) = this.discord_settings.open.as_mut() {
+                            o.default_notify = Notify::Mentions;
+                            cx.notify();
+                        }
+                    })),
+            );
+
+        let icon_note = match open.icon_edit.as_deref() {
+            Some("") => "Will remove icon".to_owned(),
+            Some(path) => std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Selected".to_owned()),
+            None => "Unchanged".to_owned(),
+        };
+        let banner_note = match open.banner_edit.as_deref() {
+            Some("") => "Will remove banner".to_owned(),
+            Some(path) => std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Selected".to_owned()),
+            None => "Unchanged".to_owned(),
+        };
+
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .child(div().type_small().text_color(theme::text_soft()).child("Server name"))
+            .child(field_box(open.name.clone()))
+            .child(div().type_small().text_color(theme::text_soft()).child("Description"))
+            .child(field_box(open.description.clone()))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(button("ds-pick-icon", ButtonKind::Secondary, "Choose icon…").on_click(cx.listener(|this, _, _, cx| {
+                        this.pick_discord_settings_image(PictureTarget::Icon, cx);
+                    })))
+                    .child(button("ds-clear-icon", ButtonKind::Ghost, "Remove icon").on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(o) = this.discord_settings.open.as_mut() {
+                            o.icon_edit = Some(String::new());
+                            cx.notify();
+                        }
+                    })))
+                    .child(div().type_small().text_color(theme::text_faint()).child(icon_note)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(button("ds-pick-banner", ButtonKind::Secondary, "Choose banner…").on_click(cx.listener(|this, _, _, cx| {
+                        this.pick_discord_settings_image(PictureTarget::Banner, cx);
+                    })))
+                    .child(button("ds-clear-banner", ButtonKind::Ghost, "Remove banner").on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(o) = this.discord_settings.open.as_mut() {
+                            o.banner_edit = Some(String::new());
+                            cx.notify();
+                        }
+                    })))
+                    .child(div().type_small().text_color(theme::text_faint()).child(banner_note)),
+            )
+            .child(div().type_small().text_color(theme::text_soft()).child("System messages channel"))
+            .child(sys_bar)
+            .child(div().type_small().text_color(theme::text_soft()).child("Inactive (AFK) voice channel"))
+            .child(afk_bar)
+            .child(div().type_small().text_color(theme::text_soft()).child("Inactive timeout"))
+            .child(timeout_bar)
+            .child(div().type_small().text_color(theme::text_soft()).child("Default notification settings"))
+            .child(notify_bar)
+            .child(
+                div()
+                    .mt(px(4.))
+                    .flex()
+                    .justify_end()
+                    .child(
+                        button("ds-save-overview", ButtonKind::Primary, if open.busy { "Saving…" } else { "Save changes" })
+                            .when(!open.busy, |b| b.on_click(cx.listener(|this, _, _, cx| this.save_discord_overview(cx)))),
+                    ),
+            );
+
+        if open.rights.owner {
+            let discord_url = format!("https://discord.com/channels/{}", open.space.id);
+            col = col.child(
+                div()
+                    .mt(px(12.))
+                    .pt(px(12.))
+                    .border_t_1()
+                    .border_color(theme::border())
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::danger()).child("Danger zone (owner only)"))
+                    .child(div().type_small().text_color(theme::text_soft()).child(format!("Type \"{}\" below to confirm deleting or transferring this server.", open.space_name)))
+                    .child(field_box(open.confirm_name.clone()))
+                    .child(field_box(open.mfa_code.clone()))
+                    .child(div().type_small().text_color(theme::text_soft()).child("Transfer ownership to member user ID"))
+                    .child(field_box(open.transfer_owner_id.clone()))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                button("ds-transfer", ButtonKind::Secondary, "Transfer ownership")
+                                    .when(!open.busy, |b| b.on_click(cx.listener(|this, _, _, cx| this.submit_discord_transfer(cx)))),
+                            )
+                            .child(
+                                button("ds-delete", ButtonKind::Danger, "Delete server")
+                                    .when(!open.busy, |b| b.on_click(cx.listener(|this, _, _, cx| this.submit_discord_delete(cx)))),
+                            )
+                            .child(button("ds-open-discord", ButtonKind::Ghost, "Open in Discord").on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_external_url(&discord_url, window, cx);
+                            }))),
+                    ),
+            );
+        }
+        col
+    }
+
+    fn discord_invites_tab(&self, open: &Open, cx: &mut Context<Self>) -> Div {
+        let pause_space = open.space.clone();
+        let next_paused = !open.invites_paused;
+        let refresh_space = open.space.clone();
+        let now = crate::view::now();
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .child(
+                div()
+                    .p(px(10.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::canvas())
+                    .border_1()
+                    .border_color(theme::border())
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child("Pause invites"))
+                            .child(div().type_small().text_color(theme::text_soft()).child(if open.invites_paused {
+                                "New members cannot join via invite links while paused."
+                            } else {
+                                "Temporarily stop anyone from joining through invite links."
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                button(
+                                    "ds-invites-pause",
+                                    if open.invites_paused { ButtonKind::Primary } else { ButtonKind::Secondary },
+                                    if open.invites_paused { "Resume invites" } else { "Pause invites" },
+                                )
+                                .when(!open.busy, |b| {
+                                    b.on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_discord_invites_paused(pause_space.clone(), next_paused, cx);
+                                    }))
+                                }),
+                            )
+                            .child(icon_button("ds-invites-refresh", "icons/refresh-cw.svg", false).on_click(cx.listener(move |this, _, _, cx| {
+                                this.load_discord_invites(refresh_space.clone(), cx);
+                            }))),
+                    ),
+            );
+
+        if !open.invites_loaded {
+            col = col.child(div().type_small().text_color(theme::text_soft()).child("Loading invites…"));
+            return col;
+        }
+        if open.invites.is_empty() {
+            col = col.child(div().type_ui().text_color(theme::text_soft()).child("No active invite links."));
+            return col;
+        }
+        for (ix, inv) in open.invites.iter().enumerate() {
+            let copy_url = inv.url.clone();
+            let revoke_space = open.space.clone();
+            let revoke_code = inv.code.clone();
+            let uses_text = if inv.max_uses > 0 {
+                format!("{}/{} uses", inv.uses, inv.max_uses)
+            } else if inv.uses > 0 {
+                format!("{} uses", inv.uses)
+            } else {
+                "0 uses".to_owned()
+            };
+            let expiry_text = match inv.expires_at {
+                Some(ts) => format!("Expires {} {}", super::time::day(now, ts), super::time::clock(ts)),
+                None => "Never expires".to_owned(),
+            };
+            let meta = if inv.vanity {
+                "Custom vanity URL (read-only)".to_owned()
+            } else {
+                let mut parts = Vec::new();
+                if !inv.channel_name.is_empty() {
+                    parts.push(format!("#{}", inv.channel_name.trim_start_matches('#')));
+                }
+                if !inv.inviter.is_empty() {
+                    parts.push(format!("by {}", inv.inviter));
+                }
+                parts.push(uses_text);
+                parts.push(expiry_text);
+                parts.join(" · ")
+            };
+            col = col.child(
+                div()
+                    .p(px(10.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::canvas())
+                    .border_1()
+                    .border_color(theme::border())
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(div().truncate().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(inv.url.clone()))
+                            .child(div().truncate().type_small().text_color(theme::text_soft()).child(meta)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                button(("ds-inv-copy", ix), ButtonKind::Secondary, "Copy")
+                                    .h(px(26.))
+                                    .px(px(8.))
+                                    .type_small()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(copy_url.clone()));
+                                        this.toast(Some(("icons/copy.svg", theme::text_soft())), "Invite link copied", cx);
+                                    })),
+                            )
+                            .when(!inv.vanity, |bar| {
+                                bar.child(
+                                    button(("ds-inv-revoke", ix), ButtonKind::Danger, "Revoke")
+                                        .h(px(26.))
+                                        .px(px(8.))
+                                        .type_small()
+                                        .when(!open.busy, |b| {
+                                            b.on_click(cx.listener(move |this, _, _, cx| {
+                                                this.revoke_discord_invite(revoke_space.clone(), revoke_code.clone(), cx);
+                                            }))
+                                        }),
+                                )
+                            }),
+                    ),
+            );
+        }
+        col
+    }
+
+    fn load_discord_roles(&mut self, space: Key, cx: &mut Context<Self>) {
+        let req = Request::Roles { space: space.clone() };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                let Some(open) = this.discord_settings.open.as_mut() else {
+                    return;
+                };
+                if open.space != space {
+                    return;
+                }
+                open.roles_loaded = true;
+                match answer {
+                    Ok(Response::Roles { roles, .. }) => open.roles = roles,
+                    Ok(Response::Error { detail, .. }) => open.error = Some(detail),
+                    Err(err) => open.error = Some(err.to_string()),
+                    _ => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn begin_discord_role(&mut self, role_id: Option<String>, cx: &mut Context<Self>) {
+        let Some(open) = self.discord_settings.open.as_mut() else {
+            return;
+        };
+        let found = role_id.as_ref().and_then(|id| open.roles.iter().find(|role| &role.id == id).cloned());
+        open.editing_role = role_id;
+        open.role_form = true;
+        open.role_confirm_admin = false;
+        open.role_clear_emoji = false;
+        open.role_icon = None;
+        open.error = None;
+        let (name, color, emoji, hoist, mentionable, perms) = match found {
+            Some(role) => {
+                let color = if role.color == 0 { String::new() } else { format!("#{:06X}", role.color & 0x00FF_FFFF) };
+                let emoji = if role.icon.contains("://") { String::new() } else { role.icon };
+                (role.name, color, emoji, role.hoist, role.mentionable, role.permissions)
+            }
+            None => (String::new(), String::new(), String::new(), false, false, 0),
+        };
+        open.role_hoist = hoist;
+        open.role_mentionable = mentionable;
+        open.role_permissions = perms;
+        let name_in = open.role_name.clone();
+        let color_in = open.role_color.clone();
+        let emoji_in = open.role_emoji.clone();
+        name_in.update(cx, |input, cx| input.set_text(&name, cx));
+        color_in.update(cx, |input, cx| input.set_text(&color, cx));
+        emoji_in.update(cx, |input, cx| input.set_text(&emoji, cx));
+        cx.notify();
+    }
+
+    fn save_discord_role(&mut self, cx: &mut Context<Self>) {
+        let Some(open) = self.discord_settings.open.as_mut() else {
+            return;
+        };
+        if open.busy {
+            return;
+        }
+        let name = open.role_name.read(cx).text().trim().to_owned();
+        if name.is_empty() {
+            open.error = Some("Enter a role name.".to_owned());
+            cx.notify();
+            return;
+        }
+        if name.chars().count() > 100 {
+            open.error = Some("Role name must be between 1 and 100 characters.".to_owned());
+            cx.notify();
+            return;
+        }
+        let color = match parse_role_color(&open.role_color.read(cx).text()) {
+            Ok(color) => color,
+            Err(()) => {
+                open.error = Some("Role color must be between #000000 and #FFFFFF.".to_owned());
+                cx.notify();
+                return;
+            }
+        };
+        let emoji_text = open.role_emoji.read(cx).text().trim().to_owned();
+        // A typed emoji replaces Clear. The flag only applies while the field stays empty.
+        if !emoji_text.is_empty() {
+            open.role_clear_emoji = false;
+        }
+        let unicode_emoji = if !emoji_text.is_empty() {
+            Some(emoji_text)
+        } else if open.role_clear_emoji {
+            Some(String::new())
+        } else {
+            None
+        };
+        if unicode_emoji.as_ref().is_some_and(|emoji| !emoji.is_empty()) && open.role_icon.as_ref().is_some_and(|path| !path.is_empty()) {
+            open.error = Some("A role can have a picture or an emoji, not both.".to_owned());
+            cx.notify();
+            return;
+        }
+        let before = open
+            .editing_role
+            .as_ref()
+            .and_then(|id| open.roles.iter().find(|role| &role.id == id).map(|role| role.permissions))
+            .unwrap_or(0);
+        let admin = 1u64 << 3;
+        let newly = open.role_permissions & admin != 0 && before & admin == 0;
+        if newly && !open.role_confirm_admin {
+            open.role_confirm_admin = true;
+            open.error = Some("This role would gain Administrator. Save again to confirm.".to_owned());
+            cx.notify();
+            return;
+        }
+        let edit = RoleEdit {
+            name: Some(name),
+            color: Some(color),
+            hoist: Some(open.role_hoist),
+            mentionable: Some(open.role_mentionable),
+            permissions: Some(open.role_permissions),
+            icon: open.role_icon.clone(),
+            unicode_emoji,
+            confirm_admin: newly,
+        };
+        let space = open.space.clone();
+        let editing = open.editing_role.clone();
+        open.busy = true;
+        open.error = None;
+        open.notice = None;
+        cx.notify();
+        let req = match editing {
+            Some(role_id) => Request::EditRole { space: space.clone(), role_id, edit },
+            None => Request::CreateRole { space: space.clone(), edit },
+        };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                let mut reload = false;
+                if let Some(open) = this.discord_settings.open.as_mut() {
+                    if open.space == space {
+                        open.busy = false;
+                        match answer {
+                            Ok(Response::Role { .. }) => {
+                                open.role_form = false;
+                                open.editing_role = None;
+                                open.role_icon = None;
+                                open.role_clear_emoji = false;
+                                open.role_confirm_admin = false;
+                                open.notice = Some("Role saved.".to_owned());
+                                open.error = None;
+                                reload = true;
+                            }
+                            Ok(Response::Error { detail, .. }) => open.error = Some(detail),
+                            Err(err) => open.error = Some(err.to_string()),
+                            _ => open.error = Some("Could not save the role.".to_owned()),
+                        }
+                    }
+                }
+                if reload {
+                    this.load_discord_roles(space, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn move_discord_role(&mut self, index: usize, up: bool, cx: &mut Context<Self>) {
+        let planned = {
+            let Some(open) = self.discord_settings.open.as_ref() else {
+                return;
+            };
+            if open.busy {
+                return;
+            }
+            let space_id = open.space.id.clone();
+            let listed = open.roles.clone();
+            let Some(role) = listed.get(index) else {
+                return;
+            };
+            if !role.editable || role.managed || role.id == space_id {
+                return;
+            }
+            let Some(other_index) = (if up { index.checked_sub(1) } else { index.checked_add(1) }) else {
+                return;
+            };
+            let Some(other) = listed.get(other_index) else {
+                return;
+            };
+            if !other.editable || other.position <= 0 || other.id == space_id {
+                return;
+            }
+            (
+                open.space.clone(),
+                vec![
+                    RoleMove { id: role.id.clone(), position: other.position },
+                    RoleMove { id: other.id.clone(), position: role.position },
+                ],
+            )
+        };
+        let (space, roles) = planned;
+        let Some(open) = self.discord_settings.open.as_mut() else {
+            return;
+        };
+        open.busy = true;
+        open.error = None;
+        open.notice = None;
+        cx.notify();
+        let req = Request::MoveRoles { space: space.clone(), roles };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                let mut reload = false;
+                if let Some(open) = this.discord_settings.open.as_mut() {
+                    if open.space == space {
+                        open.busy = false;
+                        match answer {
+                            Ok(Response::Ok) => {
+                                open.notice = Some("Role order saved.".to_owned());
+                                open.error = None;
+                                reload = true;
+                            }
+                            Ok(Response::Error { detail, .. }) => open.error = Some(detail),
+                            Err(err) => open.error = Some(err.to_string()),
+                            _ => open.error = Some("Could not reorder roles.".to_owned()),
+                        }
+                    }
+                }
+                if reload {
+                    this.load_discord_roles(space, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn delete_discord_role(&mut self, role_id: String, cx: &mut Context<Self>) {
+        let Some(open) = self.discord_settings.open.as_mut() else {
+            return;
+        };
+        if open.busy {
+            return;
+        }
+        let space = open.space.clone();
+        open.busy = true;
+        open.error = None;
+        open.notice = None;
+        cx.notify();
+        let req = Request::DeleteRole { space: space.clone(), role_id };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                let mut reload = false;
+                if let Some(open) = this.discord_settings.open.as_mut() {
+                    if open.space == space {
+                        open.busy = false;
+                        match answer {
+                            Ok(Response::Ok) => {
+                                open.role_form = false;
+                                open.editing_role = None;
+                                open.notice = Some("Role deleted.".to_owned());
+                                open.error = None;
+                                reload = true;
+                            }
+                            Ok(Response::Error { detail, .. }) => open.error = Some(detail),
+                            Err(err) => open.error = Some(err.to_string()),
+                            _ => open.error = Some("Could not delete the role.".to_owned()),
+                        }
+                    }
+                }
+                if reload {
+                    this.load_discord_roles(space, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn discord_roles_tab(&self, open: &Open, cx: &mut Context<Self>) -> Div {
+        if !open.roles_loaded {
+            return div().type_small().text_color(theme::text_soft()).child("Loading roles…");
+        }
+        let space_id = open.space.id.clone();
+        let busy = open.busy;
+        let mut col = div().flex().flex_col().gap(px(10.)).child(
+            div().flex().items_center().gap(px(8.)).child(
+                button("ds-role-new", ButtonKind::Primary, "New role").when(!busy, |b| {
+                    b.on_click(cx.listener(|this, _, _, cx| this.begin_discord_role(None, cx)))
+                }),
+            ),
+        );
+        if open.role_form {
+            let icon_note = match open.role_icon.as_deref() {
+                Some("") => "Will remove icon".to_owned(),
+                Some(path) => std::path::Path::new(path).file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_else(|| "Selected".to_owned()),
+                None => "Unchanged".to_owned(),
+            };
+            let title = if open.editing_role.is_some() { "Edit role" } else { "New role" };
+            col = col.child(
+                div()
+                    .p(px(10.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::canvas())
+                    .border_1()
+                    .border_color(theme::border())
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(title))
+                    .child(div().type_small().text_color(theme::text_soft()).child("Name"))
+                    .child(field_box(open.role_name.clone()))
+                    .child(div().type_small().text_color(theme::text_soft()).child("Color"))
+                    .child(field_box(open.role_color.clone()))
+                    .child(div().type_small().text_color(theme::text_soft()).child("Emoji"))
+                    .child(field_box(open.role_emoji.clone()))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(button("ds-role-pick-icon", ButtonKind::Secondary, "Choose icon…").on_click(cx.listener(|this, _, _, cx| {
+                                this.pick_discord_settings_image(PictureTarget::Role, cx);
+                            })))
+                            .child(button("ds-role-clear-icon", ButtonKind::Ghost, "Remove icon").on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(open) = this.discord_settings.open.as_mut() {
+                                    open.role_icon = Some(String::new());
+                                    cx.notify();
+                                }
+                            })))
+                            .child(button("ds-role-clear-emoji", ButtonKind::Ghost, "Clear emoji").on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(open) = this.discord_settings.open.as_mut() {
+                                    open.role_clear_emoji = true;
+                                    let emoji = open.role_emoji.clone();
+                                    emoji.update(cx, |input, cx| input.set_text("", cx));
+                                    cx.notify();
+                                }
+                            })))
+                            .child(div().type_small().text_color(theme::text_faint()).child(icon_note)),
+                    ),
+            );
+            let hoist = open.role_hoist;
+            let mentionable = open.role_mentionable;
+            col = col.child(
+                div()
+                    .flex()
+                    .gap(px(8.))
+                    .child(self.discord_role_flag("ds-role-hoist", "Display separately", hoist, cx, |open| {
+                        open.role_hoist = !open.role_hoist;
+                    }))
+                    .child(self.discord_role_flag("ds-role-mention", "Allow mentions", mentionable, cx, |open| {
+                        open.role_mentionable = !open.role_mentionable;
+                    })),
+            );
+            let mut perms = div().flex().flex_wrap().gap(px(6.));
+            for (ix, (bit, label)) in protocol::DISCORD_PERMISSIONS.iter().copied().enumerate() {
+                let on = open.role_permissions & bit != 0;
+                perms = perms.child(
+                    div()
+                        .id(("ds-role-perm", ix))
+                        .h(px(28.))
+                        .px(px(8.))
+                        .rounded(px(theme::R_CONTROL))
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .bg(theme::canvas())
+                        .border_1()
+                        .border_color(theme::border())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let Some(open) = this.discord_settings.open.as_mut() else {
+                                return;
+                            };
+                            if on {
+                                open.role_permissions &= !bit;
+                                if bit == 1 << 3 {
+                                    open.role_confirm_admin = false;
+                                }
+                            } else {
+                                open.role_permissions |= bit;
+                            }
+                            cx.notify();
+                        }))
+                        .child(glyph(if on { "icons/square-check.svg" } else { "icons/square.svg" }, 14., if on { theme::accent() } else { theme::text_soft() }))
+                        .child(div().type_small().text_color(theme::text()).child(label)),
+                );
+            }
+            col = col
+                .child(div().type_small().text_color(theme::text_soft()).child("Permissions"))
+                .child(perms)
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(8.))
+                        .child(button("ds-role-save", ButtonKind::Primary, "Save").when(!busy, |b| {
+                            b.on_click(cx.listener(|this, _, _, cx| this.save_discord_role(cx)))
+                        }))
+                        .child(button("ds-role-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(open) = this.discord_settings.open.as_mut() {
+                                open.role_form = false;
+                                open.editing_role = None;
+                                open.role_icon = None;
+                                open.role_clear_emoji = false;
+                                open.role_confirm_admin = false;
+                                cx.notify();
+                            }
+                        }))),
+                );
+        }
+        for (ix, role) in open.roles.iter().enumerate() {
+            let can_change = role.editable && !role.managed && role.id != space_id;
+            let previous = ix.checked_sub(1).and_then(|i| open.roles.get(i));
+            let next = open.roles.get(ix + 1);
+            let can_up = can_change && previous.is_some_and(|other| other.editable && other.position > 0 && other.id != space_id);
+            let can_down = can_change && next.is_some_and(|other| other.editable && other.position > 0 && other.id != space_id);
+            let role_id = role.id.clone();
+            let edit_id = role.id.clone();
+            let mut row = div()
+                .p(px(10.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(theme::canvas())
+                .border_1()
+                .border_color(theme::border())
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(if role.color == 0 {
+                    div().w(px(12.)).h(px(12.))
+                } else {
+                    div().w(px(12.)).h(px(12.)).rounded(px(4.)).bg(gpui::rgb(role.color))
+                });
+            if !role.icon.is_empty() && !role.icon.contains("://") {
+                row = row.child(div().type_ui().child(role.icon.clone()));
+            }
+            let mut meta = Vec::new();
+            if role.managed {
+                meta.push("Managed");
+            }
+            if role.hoist {
+                meta.push("Hoisted");
+            }
+            if role.mentionable {
+                meta.push("Mentionable");
+            }
+            row = row.child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(div().truncate().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(role.name.clone()))
+                    .when(!meta.is_empty(), |line| line.child(div().type_small().text_color(theme::text_soft()).child(meta.join(" · ")))),
+            );
+            row = row.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .when(can_up, |bar| {
+                        bar.child(button(("ds-role-up", ix), ButtonKind::Ghost, "Up").h(px(26.)).px(px(8.)).type_small().when(!busy, |b| {
+                            b.on_click(cx.listener(move |this, _, _, cx| this.move_discord_role(ix, true, cx)))
+                        }))
+                    })
+                    .when(can_down, |bar| {
+                        bar.child(button(("ds-role-down", ix), ButtonKind::Ghost, "Down").h(px(26.)).px(px(8.)).type_small().when(!busy, |b| {
+                            b.on_click(cx.listener(move |this, _, _, cx| this.move_discord_role(ix, false, cx)))
+                        }))
+                    })
+                    .when(role.editable, |bar| {
+                        bar.child(button(("ds-role-edit", ix), ButtonKind::Secondary, "Edit").h(px(26.)).px(px(8.)).type_small().when(!busy, |b| {
+                            b.on_click(cx.listener(move |this, _, _, cx| this.begin_discord_role(Some(edit_id.clone()), cx)))
+                        }))
+                    })
+                    .when(can_change, |bar| {
+                        bar.child(button(("ds-role-delete", ix), ButtonKind::Danger, "Delete").h(px(26.)).px(px(8.)).type_small().when(!busy, |b| {
+                            b.on_click(cx.listener(move |this, _, _, cx| this.delete_discord_role(role_id.clone(), cx)))
+                        }))
+                    }),
+            );
+            col = col.child(row);
+        }
+        col
+    }
+
+    fn discord_role_flag(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        on: bool,
+        cx: &mut Context<Self>,
+        toggle: impl Fn(&mut Open) + 'static,
+    ) -> Div {
+        div()
+            .id(id)
+            .h(px(28.))
+            .px(px(8.))
+            .rounded(px(theme::R_CONTROL))
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(open) = this.discord_settings.open.as_mut() {
+                    toggle(open);
+                    cx.notify();
+                }
+            }))
+            .child(glyph(if on { "icons/square-check.svg" } else { "icons/square.svg" }, 14., if on { theme::accent() } else { theme::text_soft() }))
+            .child(div().type_small().text_color(theme::text()).child(label))
+    }
+
+    fn discord_events_tab(&self, open: &Open, cx: &mut Context<Self>) -> Div {
+        let events = self.sidebar_state.space_events.get(&open.space).cloned().unwrap_or_default();
+        let voice_channels: Vec<(String, String)> = self
+            .trees
+            .get(&open.space)
+            .map(|t| {
+                t.conversations
+                    .iter()
+                    .filter(|c| c.kind == ConversationKind::Voice)
+                    .map(|c| (c.key.id.clone(), c.title.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let place_bar = segmented()
+            .child(segment("ds-ev-voice", "Voice", open.event_place_kind == EventPlaceKind::Voice).px(px(8.)).on_click(cx.listener(|this, _, _, cx| {
+                if let Some(o) = this.discord_settings.open.as_mut() {
+                    o.event_place_kind = EventPlaceKind::Voice;
+                    cx.notify();
+                }
+            })))
+            .child(segment("ds-ev-stage", "Stage", open.event_place_kind == EventPlaceKind::Stage).px(px(8.)).on_click(cx.listener(|this, _, _, cx| {
+                if let Some(o) = this.discord_settings.open.as_mut() {
+                    o.event_place_kind = EventPlaceKind::Stage;
+                    cx.notify();
+                }
+            })))
+            .child(segment("ds-ev-ext", "Somewhere else", open.event_place_kind == EventPlaceKind::External).px(px(8.)).on_click(cx.listener(|this, _, _, cx| {
+                if let Some(o) = this.discord_settings.open.as_mut() {
+                    o.event_place_kind = EventPlaceKind::External;
+                    cx.notify();
+                }
+            })));
+
+        let mut ch_bar = div().flex().flex_wrap().gap(px(6.));
+        for (ix, (id, title)) in voice_channels.iter().take(10).enumerate() {
+            let selected = open.event_channel_id == *id;
+            let chosen = id.clone();
+            ch_bar = ch_bar.child(
+                segment(("ds-ev-ch", ix), title.clone(), selected)
+                    .px(px(8.))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(o) = this.discord_settings.open.as_mut() {
+                            o.event_channel_id = chosen.clone();
+                            cx.notify();
+                        }
+                    })),
+            );
+        }
+
+        let start_choices: [(i64, &str); 4] = [(1, "In 1 hour"), (3, "In 3 hours"), (24, "Tomorrow"), (168, "Next week")];
+        let mut start_bar = segmented();
+        for (ix, (hrs, label)) in start_choices.into_iter().enumerate() {
+            start_bar = start_bar.child(
+                segment(("ds-ev-start", ix), label, open.event_hours_ahead == hrs)
+                    .px(px(8.))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(o) = this.discord_settings.open.as_mut() {
+                            o.event_hours_ahead = hrs;
+                            cx.notify();
+                        }
+                    })),
+            );
+        }
+
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(
+                if open.editing_event_id.is_some() { "Edit event" } else { "Create event" },
+            ))
+            .child(field_box(open.event_name.clone()))
+            .child(field_box(open.event_desc.clone()))
+            .child(place_bar)
+            .when(open.event_place_kind == EventPlaceKind::External, |c| c.child(field_box(open.event_location.clone())))
+            .when(open.event_place_kind != EventPlaceKind::External, |c| c.child(ch_bar))
+            .child(start_bar)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
+                    .child(button("ds-ev-cover", ButtonKind::Secondary, "Cover image…").on_click(cx.listener(|this, _, _, cx| {
+                        this.pick_discord_settings_image(PictureTarget::Event, cx);
+                    })))
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(6.))
+                            .when(open.editing_event_id.is_some(), |b| {
+                                b.child(button("ds-ev-cancel-edit", ButtonKind::Ghost, "Cancel edit").on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(o) = this.discord_settings.open.as_mut() {
+                                        o.editing_event_id = None;
+                                        cx.notify();
+                                    }
+                                })))
+                            })
+                            .child(
+                                button(
+                                    "ds-ev-save",
+                                    ButtonKind::Primary,
+                                    if open.editing_event_id.is_some() { "Update event" } else { "Create event" },
+                                )
+                                .when(!open.busy, |b| b.on_click(cx.listener(|this, _, _, cx| this.save_discord_event(cx)))),
+                            ),
+                    ),
+            );
+
+        if !events.is_empty() {
+            col = col.child(div().mt(px(8.)).type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child("Existing events"));
+            for (ix, ev) in events.into_iter().enumerate() {
+                let edit_ev = ev.clone();
+                let del_space = open.space.clone();
+                let del_id = ev.key.id.clone();
+                col = col.child(
+                    div()
+                        .p(px(10.))
+                        .rounded(px(theme::R_CONTROL))
+                        .bg(theme::canvas())
+                        .border_1()
+                        .border_color(theme::border())
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .child(div().truncate().type_ui().text_color(theme::text()).child(ev.name))
+                                .child(div().truncate().type_small().text_color(theme::text_soft()).child(ev.place)),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(6.))
+                                .child(button(("ds-ev-edit", ix), ButtonKind::Secondary, "Edit").h(px(26.)).px(px(8.)).type_small().on_click(cx.listener(move |this, _, _, cx| {
+                                    this.start_edit_discord_event(&edit_ev, cx);
+                                })))
+                                .child(button(("ds-ev-del", ix), ButtonKind::Danger, "Cancel").h(px(26.)).px(px(8.)).type_small().on_click(cx.listener(move |this, _, _, cx| {
+                                    this.delete_discord_event(del_space.clone(), del_id.clone(), cx);
+                                }))),
+                        ),
+                );
+            }
+        }
+        col
+    }
+}

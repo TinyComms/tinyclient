@@ -5,8 +5,8 @@ use super::super::{Command, Failure};
 use super::model::{
     self, number, seconds, Channel, Guild, GuildSettings, Kept, Member, MuteConfig, PresenceUpdate,
     ReadState, Relationship, Role, User, Versioned, VoiceState, ADMINISTRATOR, BAN_MEMBERS, CONNECT,
-    CREATE_INSTANT_INVITE, CREATE_PRIVATE_THREADS, CREATE_PUBLIC_THREADS, KICK_MEMBERS, MANAGE_CHANNELS, MANAGE_MESSAGES,
-    MANAGE_ROLES, MANAGE_THREADS, MANAGE_WEBHOOKS, PIN_MESSAGES, SEND_MESSAGES, SEND_MESSAGES_IN_THREADS, VIEW_CHANNEL,
+    CREATE_INSTANT_INVITE, CREATE_PRIVATE_THREADS, CREATE_PUBLIC_THREADS, KICK_MEMBERS, MANAGE_CHANNELS, MANAGE_EVENTS, MANAGE_GUILD,
+    MANAGE_MESSAGES, MANAGE_ROLES, MANAGE_THREADS, MANAGE_WEBHOOKS, PIN_MESSAGES, SEND_MESSAGES, SEND_MESSAGES_IN_THREADS, VIEW_CHANNEL,
 };
 use super::{proto, Discord, GuildInfo, Quiet, Resumable, RoleInfo, WARM};
 use crate::hub::now;
@@ -111,6 +111,7 @@ pub(super) fn quiet(settings: &GuildSettings) -> Quiet {
         suppress_roles: settings.suppress_roles,
         channels: muted.map(|channel| (channel.channel_id.clone(), until(channel.mute_config.as_ref()))).collect(),
         hide_muted: settings.hide_muted_channels,
+        mute_scheduled_events: settings.mute_scheduled_events,
         opt_in: settings.flags & model::OPT_IN_CHANNELS_ON != 0,
         opted_in: opted.map(|channel| channel.channel_id.clone()).collect(),
         level: settings.message_notifications,
@@ -240,6 +241,31 @@ impl GuildInfo {
         self.timeout_until.filter(|until| *until > now)
     }
 
+    /// Guild-level base permissions across `@everyone` and our assigned roles (without channel overwrites).
+    pub(super) fn base_permissions(&self, guild: &str) -> u64 {
+        if self.owner {
+            return u64::MAX;
+        }
+        let everyone = number(guild);
+        let of = |role: &u64| self.roles.get(role).map_or(0, |role| role.permissions);
+        let allowed = self.my_roles.iter().fold(of(&everyone), |all, role| all | of(role));
+        if allowed & ADMINISTRATOR != 0 {
+            return u64::MAX;
+        }
+        allowed
+    }
+
+    /// Management rights advertised to the shell on `protocol::Space`.
+    pub(super) fn space_rights(&self, guild: &str) -> protocol::SpaceRights {
+        let perms = self.base_permissions(guild);
+        protocol::SpaceRights {
+            manage_space: self.owner || perms & MANAGE_GUILD != 0,
+            manage_roles: self.owner || perms & MANAGE_ROLES != 0,
+            manage_events: self.owner || perms & MANAGE_EVENTS != 0,
+            owner: self.owner,
+        }
+    }
+
     /// Discord's permission rule for a channel: the roles' own permissions, then the channel's
     /// overwrites for everyone, for our roles, and for us.
     pub(super) fn permissions(&self, guild: &str, me: &str, channel: &Channel) -> u64 {
@@ -351,17 +377,7 @@ struct Tree {
 
 impl Discord {
     fn guild_info(&self, guild: &Guild, member: Option<&Member>, me: &str, position: i32, quiet: Quiet) -> GuildInfo {
-        let roles = guild.roles.iter().map(|role| {
-            let info = RoleInfo {
-                name: role.name.clone(),
-                permissions: role.permissions,
-                position: role.position,
-                color: role.color,
-                icon: role.icon.clone(),
-                unicode_emoji: role.unicode_emoji.clone(),
-            };
-            (number(&role.id), info)
-        });
+        let roles = guild.roles.iter().map(|role| (number(&role.id), RoleInfo::remember(role)));
         let mut member_roles = HashMap::new();
         for m in &guild.members {
             let uid = m.id();
@@ -386,6 +402,15 @@ impl Discord {
             quiet,
             nick: member.and_then(|member| member.nick.clone()).unwrap_or_default(),
             premium_tier: guild.premium_tier().unwrap_or(0),
+            premium_subscription_count: guild.premium_subscription_count().unwrap_or(0),
+            banner: guild.banner().map(str::to_owned),
+            description: guild.description().unwrap_or_default().to_owned(),
+            features: guild.features().to_vec(),
+            vanity_url_code: guild.vanity_url_code().map(str::to_owned),
+            system_channel_id: guild.system_channel_id().map(str::to_owned),
+            afk_channel_id: guild.afk_channel_id().map(str::to_owned),
+            afk_timeout: guild.afk_timeout().unwrap_or(300),
+            default_message_notifications: guild.default_message_notifications().unwrap_or(0),
             timeout_until: member.and_then(|member| member.communication_disabled_until.as_deref()).and_then(model::iso_seconds),
             emojis: guild.emojis.iter().filter(|emoji| emoji.available).filter_map(|emoji| {
                 Some(super::Pickable {
@@ -404,6 +429,20 @@ impl Discord {
                 roles: Box::default(),
             }).collect(),
             can_invite: false,
+            events: guild
+                .guild_scheduled_events
+                .iter()
+                .filter(|ev| matches!(ev.status, 1 | 2))
+                .map(|ev| {
+                    (
+                        ev.id.clone(),
+                        super::StoredEvent {
+                            event: ev.clone(),
+                            interested: false,
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -661,11 +700,12 @@ impl Discord {
             self.ctx.muted(&row.id, muted)?;
         }
         let flags = self.state.lock().unwrap().guilds.get(guild_id).map(|info| {
-            (info.quiet.server_muted(now()), info.quiet.hide_muted, info.can_invite)
+            (info.quiet.server_muted(now()), info.quiet.hide_muted, info.can_invite, info.space_rights(guild_id))
         });
-        if let Some((muted, hide, can_invite)) = flags {
+        if let Some((muted, hide, can_invite, rights)) = flags {
             self.ctx.space_flags(guild_id, muted, hide)?;
             self.ctx.set_space_can_create_invites(guild_id, can_invite)?;
+            self.ctx.space_rights(guild_id, rights)?;
         }
         Ok(())
     }
@@ -679,14 +719,7 @@ impl Discord {
             };
             match (role, deleted) {
                 (Some(role), _) => {
-                    let fresh = RoleInfo {
-                        name: role.name.clone(),
-                        permissions: role.permissions,
-                        position: role.position,
-                        color: role.color,
-                        icon: role.icon.clone(),
-                        unicode_emoji: role.unicode_emoji.clone(),
-                    };
+                    let fresh = RoleInfo::remember(&role);
                     let before = info.roles.insert(number(&role.id), fresh);
                     // Everyone holds the server's own role; any other counts only if we do.
                     let ours = role.id == guild || info.my_roles.contains(&number(&role.id));
@@ -774,27 +807,39 @@ impl Discord {
         let (rows, files): (Vec<SpaceRow>, Vec<(MediaFile, String)>) = {
             let state = self.state.lock().unwrap();
             flags.extend(state.guilds.iter().map(|(id, info)| {
-                (id.clone(), info.quiet.server_muted(now), info.quiet.hide_muted, info.can_invite)
+                (id.clone(), info.quiet.server_muted(now), info.quiet.hide_muted, info.can_invite, info.space_rights(id))
             }));
-            let listed = state.guilds.iter().map(|(id, info)| {
+            let mut rows = Vec::with_capacity(state.guilds.len());
+            let mut files = Vec::new();
+            for (id, info) in &state.guilds {
                 let icon = info.icon.as_deref().and_then(|hash| model::guild_icon(id, hash));
-                let row = SpaceRow {
+                rows.push(SpaceRow {
                     id: id.clone(),
                     name: info.name.clone(),
                     icon: icon.as_ref().map(|(file, _)| file.id.clone()),
                     position: info.position,
-                };
-                (row, icon)
-            });
-            let (rows, icons): (Vec<_>, Vec<_>) = listed.unzip();
-            (rows, icons.into_iter().flatten().collect())
+                });
+                if let Some(icon) = icon {
+                    files.push(icon);
+                }
+                if let Some(hash) = info.banner.as_deref() {
+                    files.push(model::guild_banner(id, hash));
+                }
+                for stored in info.events.values() {
+                    if let Some(hash) = stored.event.image.as_deref().filter(|h| !h.is_empty()) {
+                        files.push(model::event_cover(&stored.event.id, hash));
+                    }
+                }
+            }
+            (rows, files)
         };
         self.ctx.media(&files)?;
         self.ctx.spaces(&rows)?;
-        // A server's own mute, "hide muted channels", and invite permission, once its Space exists.
-        for (id, muted, hide, can_invite) in flags {
+        // A server's own mute, "hide muted channels", invite permission, and management rights once its Space exists.
+        for (id, muted, hide, can_invite, rights) in flags {
             self.ctx.space_flags(&id, muted, hide)?;
             self.ctx.set_space_can_create_invites(&id, can_invite)?;
+            self.ctx.space_rights(&id, rights)?;
         }
         Ok(())
     }
@@ -1013,6 +1058,7 @@ impl Discord {
             person_notes: true,
             age_restricted_blocked,
             announcement_follow: true,
+            create_space: true,
             ..Default::default()
         });
         self.state.lock().unwrap().premium = premium;
@@ -1335,6 +1381,7 @@ impl Discord {
 
     /// A server renamed or given a new icon. The payload names only what it wants shown.
     pub(super) fn guild_updated(&self, guild: Guild) -> Result<(), Failure> {
+        let me = self.me();
         let tier_changed = {
             let mut state = self.state.lock().unwrap();
             let Some(info) = state.guilds.get_mut(&guild.id) else {
@@ -1344,6 +1391,34 @@ impl Discord {
                 info.name = guild.name().to_owned();
             }
             info.icon = guild.icon().map(str::to_owned);
+            info.banner = guild.banner().map(str::to_owned);
+            if let Some(description) = guild.description() {
+                info.description = description.to_owned();
+            }
+            if let Some(count) = guild.premium_subscription_count() {
+                info.premium_subscription_count = count;
+            }
+            if !guild.features().is_empty() {
+                info.features = guild.features().to_vec();
+            }
+            if let Some(code) = guild.vanity_url_code() {
+                info.vanity_url_code = Some(code.to_owned());
+            }
+            if let Some(ch) = guild.system_channel_id() {
+                info.system_channel_id = Some(ch.to_owned());
+            }
+            if let Some(ch) = guild.afk_channel_id() {
+                info.afk_channel_id = Some(ch.to_owned());
+            }
+            if let Some(timeout) = guild.afk_timeout() {
+                info.afk_timeout = timeout;
+            }
+            if let Some(level) = guild.default_message_notifications() {
+                info.default_message_notifications = level;
+            }
+            if !guild.owner().is_empty() {
+                info.owner = guild.owner() == me;
+            }
             match guild.premium_tier() {
                 Some(tier) if tier != info.premium_tier => {
                     info.premium_tier = tier;
@@ -1355,6 +1430,7 @@ impl Discord {
         if tier_changed {
             self.replant(&guild.id)?;
         }
+        self.ctx.space_info_stale(&guild.id);
         Ok(self.spaces()?)
     }
 
@@ -1896,6 +1972,7 @@ mod tests {
                 color: 0x112233,
                 icon: None,
                 unicode_emoji: Some("⭐".into()),
+                ..Default::default()
             },
         );
         // High role with color == 0 (transparent) and icon hash
@@ -1908,6 +1985,7 @@ mod tests {
                 color: 0,
                 icon: Some("hash_abc".into()),
                 unicode_emoji: None,
+                ..Default::default()
             },
         );
         // Mid role with non-zero color
@@ -1920,6 +1998,7 @@ mod tests {
                 color: 0xe74c3c,
                 icon: None,
                 unicode_emoji: None,
+                ..Default::default()
             },
         );
 

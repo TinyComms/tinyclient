@@ -1355,7 +1355,7 @@ mod tests {
         let mut desmond = (*row("Desmond", Direct, 10)).clone();
         desmond.peer = Some("desmond".into());
         let rows = vec![row("design", Channel, 10), row("redesign", Channel, 10), Rc::new(desmond), row("general", Channel, 99)];
-        let space = Space { key: key("s"), name: "Design Guild".into(), icon: None, position: 0, attention: 0, unread: false, folder: None, muted: false, hide_muted: false, can_create_channels: false, can_create_invites: false };
+        let space = Space { key: key("s"), name: "Design Guild".into(), icon: None, position: 0, attention: 0, unread: false, folder: None, muted: false, hide_muted: false, can_create_channels: false, can_create_invites: false, rights: protocol::SpaceRights::default() };
         let people = vec![person("desmond"), person("Desiree")];
         // Long after anything was said, so recency lifts nothing.
         let found = hits("des", &rows, std::slice::from_ref(&space), &people, &[], true, 10_000_000);

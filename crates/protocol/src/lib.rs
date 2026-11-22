@@ -246,6 +246,49 @@ pub enum Media {
     Running,
 }
 
+/// Server management permissions the signed-in user holds in a Space.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceRights {
+    /// Manage Server (`MANAGE_GUILD` on Discord): overview settings and invites.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_space: bool,
+    /// Manage Roles (`MANAGE_ROLES` on Discord).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_roles: bool,
+    /// Manage Events (`MANAGE_EVENTS` on Discord).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_events: bool,
+    /// Server owner (transfer ownership / delete server).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub owner: bool,
+}
+
+impl SpaceRights {
+    pub fn is_empty(&self) -> bool {
+        !self.manage_space && !self.manage_roles && !self.manage_events && !self.owner
+    }
+
+    pub fn any_settings(&self) -> bool {
+        self.manage_space || self.manage_roles || self.manage_events || self.owner
+    }
+
+    pub fn to_bits(self) -> u32 {
+        u32::from(self.manage_space)
+            | (u32::from(self.manage_roles) << 1)
+            | (u32::from(self.manage_events) << 2)
+            | (u32::from(self.owner) << 3)
+    }
+
+    pub fn from_bits(bits: u32) -> Self {
+        Self {
+            manage_space: bits & 1 != 0,
+            manage_roles: bits & 2 != 0,
+            manage_events: bits & 4 != 0,
+            owner: bits & 8 != 0,
+        }
+    }
+}
+
 /// A server, workspace or team. Every account also has its direct conversations, which belong to
 /// no Space.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,6 +317,9 @@ pub struct Space {
     /// The user has permission to create invite links in at least one channel of this Space (`Request::CreateInvite`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub can_create_invites: bool,
+    /// Management permissions held by the signed-in user in this Space.
+    #[serde(default, skip_serializing_if = "SpaceRights::is_empty")]
+    pub rights: SpaceRights,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -902,6 +948,9 @@ pub struct Profile {
     /// Their roles in that Space, names only (colours are left out), at most [`PROFILE_ROLES`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<String>,
+    /// Role ids in that Space, so a card can give or take them. Not capped at [`PROFILE_ROLES`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub role_ids: Vec<String>,
     /// Email and phone, each copied on click; phone numbers masked until clicked. At most
     /// [`PROFILE_CONTACTS`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -962,6 +1011,7 @@ impl Profile {
             manager: None,
             reports: Vec::new(),
             roles: Vec::new(),
+            role_ids: Vec::new(),
             contacts: Vec::new(),
             mutual_total: 0,
             joined: None,
@@ -1934,6 +1984,108 @@ pub enum Request {
         /// Grant temporary membership.
         #[serde(default, skip_serializing_if = "is_false")]
         temporary: bool,
+    },
+    /// Create a new Space on this account (e.g. Discord `POST /guilds`).
+    CreateSpace {
+        account: AccountKey,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        template: Option<String>,
+    },
+    /// Lists scheduled and active events for a Space (e.g. Discord `GET /guilds/{id}/scheduled-events`).
+    Events {
+        space: Key,
+    },
+    /// Marks (`on: true`) or unmarks (`on: false`) the signed-in user as interested in an event.
+    EventInterest {
+        space: Key,
+        event: Key,
+        on: bool,
+    },
+    /// Edit a Space's overview settings (e.g. Discord `PATCH /guilds/{id}`).
+    EditSpace {
+        space: Key,
+        edit: SpaceEdit,
+    },
+    /// Permanently delete a Space you own (e.g. Discord `POST /guilds/{id}/delete`).
+    DeleteSpace {
+        space: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mfa_code: Option<String>,
+    },
+    /// Transfer ownership of a Space you own to another member (e.g. Discord `PATCH /guilds/{id}`).
+    TransferSpace {
+        space: Key,
+        new_owner: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mfa_code: Option<String>,
+    },
+    /// Create a scheduled event in a Space (e.g. Discord `POST /guilds/{id}/scheduled-events`).
+    CreateEvent {
+        space: Key,
+        event: SpaceEventEdit,
+    },
+    /// Edit an existing scheduled event in a Space (e.g. Discord `PATCH /guilds/{id}/scheduled-events/{event_id}`).
+    EditEvent {
+        space: Key,
+        event_id: String,
+        event: SpaceEventEdit,
+    },
+    /// Cancel / delete a scheduled event in a Space (e.g. Discord `DELETE /guilds/{id}/scheduled-events/{event_id}`).
+    DeleteEvent {
+        space: Key,
+        event_id: String,
+    },
+    /// List active invite links for a Space (e.g. Discord `GET /guilds/{id}/invites`).
+    SpaceInvites {
+        space: Key,
+    },
+    /// Revoke one invite link (e.g. Discord `DELETE /invites/{code}`).
+    RevokeInvite {
+        space: Key,
+        code: String,
+    },
+    /// Pause or resume invites on a Space (e.g. Discord `INVITES_DISABLED` feature).
+    SetInvitesPaused {
+        space: Key,
+        paused: bool,
+    },
+    /// List a Space's roles (Discord roles already known from the gateway).
+    Roles {
+        space: Key,
+    },
+    /// Create a role (Discord `POST /guilds/{id}/roles`).
+    CreateRole {
+        space: Key,
+        #[serde(default)]
+        edit: RoleEdit,
+    },
+    /// Edit a role (Discord `PATCH /guilds/{id}/roles/{role}`).
+    EditRole {
+        space: Key,
+        role_id: String,
+        #[serde(default)]
+        edit: RoleEdit,
+    },
+    /// Reorder roles (Discord `PATCH /guilds/{id}/roles`).
+    MoveRoles {
+        space: Key,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        roles: Vec<RoleMove>,
+    },
+    /// Delete a role (Discord `DELETE /guilds/{id}/roles/{role}`).
+    DeleteRole {
+        space: Key,
+        role_id: String,
+    },
+    /// Give or take a member's roles (Discord `PUT` / `DELETE /guilds/{id}/members/{user}/roles/{role}`).
+    SetMemberRoles {
+        space: Key,
+        person: Key,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        roles: Vec<String>,
     },
     Watch(Watching),
 
@@ -3038,6 +3190,8 @@ pub enum Change {
     /// A Tiny server's people, roles, invites or rooms changed: ask `TinyCommunity`. Who is in
     /// a room's call is `Occupants`, and who is online `Presence`.
     Tiny { account: AccountKey },
+    /// A Space's scheduled events changed: ask `Events`.
+    Events { space: Key },
 }
 
 impl Change {
@@ -3058,6 +3212,7 @@ impl Change {
             | (Change::Members { conversation: a }, Change::Members { conversation: b })
             | (Change::Occupants { conversation: a, .. }, Change::Occupants { conversation: b, .. })
             | (Change::Tree { space: a }, Change::Tree { space: b })
+            | (Change::Events { space: a }, Change::Events { space: b })
             | (Change::Presence { person: a, .. }, Change::Presence { person: b, .. }) => a == b,
             (Change::Upload { conversation: a, client_id: x, .. }, Change::Upload { conversation: b, client_id: y, .. }) => {
                 a == b && x == y
@@ -3334,6 +3489,37 @@ pub enum Response {
         space: Option<Key>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conversation: Option<Key>,
+    },
+    /// Answers `CreateSpace`: the created Space and landing conversation, when reported.
+    SpaceCreated {
+        space: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation: Option<Key>,
+    },
+    /// Answers `Events`: scheduled and active events for `space`.
+    Events {
+        space: Key,
+        events: Vec<SpaceEvent>,
+    },
+    /// Answers `CreateEvent` / `EditEvent`: the created or updated event.
+    Event {
+        event: SpaceEvent,
+    },
+    /// Answers `SpaceInvites`: active invite links (with optional vanity URL first) and pause state.
+    SpaceInvites {
+        space: Key,
+        invites: Vec<SpaceInvite>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        paused: bool,
+    },
+    /// Answers `Roles`: the Space's roles, highest first.
+    Roles {
+        space: Key,
+        roles: Vec<SpaceRole>,
+    },
+    /// Answers `CreateRole` / `EditRole`.
+    Role {
+        role: SpaceRole,
     },
     Pinned {
         conversation: Key,
