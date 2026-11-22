@@ -356,12 +356,26 @@ fn qr_steps(network: Network) -> [&'static str; 3] {
     }
 }
 
+/// Whether Google Messages should skip the desktop browser choice and start directly on QR.
+fn messages_starts_on_qr(phone_mode: bool) -> bool {
+    phone_mode
+}
+
+/// Shown under the Messages QR instructions on a phone or tablet where background long-polls pause.
+fn messages_phone_note() -> &'static str {
+    "Texts arrive only while tinyclient is open. Your Android phone has to stay online."
+}
+
 /// What the sheet draws before chatd has answered. Tiny starts on the code.
 fn waiting_for(network: Network) -> SignInStep {
+    waiting_for_mode(network, phone::active())
+}
+
+fn waiting_for_mode(network: Network, phone_mode: bool) -> SignInStep {
     if network == Network::Tiny {
         SignInStep::Invite { server: String::new(), problem: None }
     } else if network == Network::Messages {
-        if phone::active() {
+        if messages_starts_on_qr(phone_mode) {
             waiting()
         } else {
             SignInStep::Browser { server: "https://messages.google.com".into(), provider: "Google".into(), waiting: false, problem: None }
@@ -1093,7 +1107,7 @@ impl Sheet {
                 .phone_preview()
                 .whitespace_normal()
                 .text_color(theme::text_soft())
-                .child("Texts arrive only while tinyclient is open. Your Android phone has to stay online.")
+                .child(messages_phone_note())
         });
         div()
             .flex()
@@ -2022,7 +2036,10 @@ mod tests {
         let steps = qr_steps(Network::Messages);
         assert!(steps.iter().any(|s| s.contains("Android phone")));
         assert!(steps.iter().any(|s| s.contains("QR code scanner")));
-        assert!(matches!(waiting_for(Network::Messages), SignInStep::Browser { waiting: false, .. }));
+        assert!(matches!(waiting_for_mode(Network::Messages, false), SignInStep::Browser { waiting: false, .. }));
+        assert!(matches!(waiting_for_mode(Network::Messages, true), SignInStep::Qr { .. }));
+        assert!(messages_starts_on_qr(true) && !messages_starts_on_qr(false));
+        assert!(messages_phone_note().contains("while tinyclient is open"));
     }
 
     #[test]
