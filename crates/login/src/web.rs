@@ -9,7 +9,7 @@
 //! `USAGE` for a network with no web sign-in).
 
 use crate::teams::{self, Flow};
-use crate::{blocked, hands_off, route, session, web_client, Route, Site, BLOCKED, CLOSED, DISCORD, LOAD_FAILED, NO_TOKEN, NO_TOKEN_AFTER, PAGE, SLACK, USAGE};
+use crate::{blocked, hands_off, route, session, slack_page, web_client, Route, Site, BLOCKED, CLOSED, DISCORD, LOAD_FAILED, NO_TOKEN, NO_TOKEN_AFTER, PAGE, SLACK, USAGE};
 use protocol::web_sign_in::{Navigation, WebPage, WebPageHandle, WebSignIn};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -54,7 +54,13 @@ fn navigate(seen: &Mutex<Seen>, url: &str, teams: bool) -> Navigation {
 }
 
 /// Signs in to `network` (`discord`, `slack`, `teams`) in the platform's web view.
-pub fn sign_in(provider: &dyn WebSignIn, network: &str) -> Result<String, i32> {
+/// `open` is a Slack workspace address to show instead of the usual sign-in page.
+pub fn sign_in(provider: &dyn WebSignIn, network: &str, open: Option<&str>) -> Result<String, i32> {
+    if let Some(url) = open {
+        if network != "slack" || !slack_page(url) {
+            return Err(USAGE);
+        }
+    }
     let flow = match network {
         "teams" => Some(Flow::new()?),
         "discord" | "slack" => None,
@@ -65,7 +71,7 @@ pub fn sign_in(provider: &dyn WebSignIn, network: &str) -> Result<String, i32> {
         "discord" => DISCORD,
         _ => Site { title: teams::TITLE, start: "", probe: teams::PROBE, read: |_| None, cookie: None, detour: None },
     };
-    let start = flow.as_ref().map_or_else(|| site.start.to_owned(), Flow::start);
+    let start = open.map(str::to_owned).unwrap_or_else(|| flow.as_ref().map_or_else(|| site.start.to_owned(), Flow::start));
     let agent = crate::user_agent();
     let seen = Arc::new(Mutex::new(Seen::default()));
     let teams = flow.is_some();
@@ -140,6 +146,10 @@ fn drive(page: &mut dyn WebPageHandle, site: &Site, flow: Option<&Flow>, seen: &
                 }
             }
         }
+        // localConfig_v2 is only on slack.com. An identity-provider page is shown, not read.
+        if site.probe == SLACK.probe && !slack_page(at) {
+            continue;
+        }
         let Some(found) = page.evaluate(site.probe).as_deref().and_then(js_return) else {
             continue;
         };
@@ -170,17 +180,24 @@ mod tests {
         probe: Option<String>,
         cookie: Option<String>,
         closed: bool,
+        /// Close after two idle looks when the session probe must not run.
+        close_unprobed: bool,
+        ticks: u32,
         log: Arc<Mutex<Vec<String>>>,
     }
 
     impl WebPageHandle for Scripted {
         fn state(&mut self) -> PageState {
-            PageState { url: self.url.clone(), closed: self.closed, load_failed: false }
+            self.ticks += 1;
+            let probed = self.log.lock().unwrap().iter().any(|line| line == "probe");
+            let closed = self.closed || (self.close_unprobed && self.ticks >= 3 && !probed);
+            PageState { url: self.url.clone(), closed, load_failed: false }
         }
         fn evaluate(&mut self, script: &str) -> Option<String> {
             if script == PAGE {
                 return Some(serde_json::to_string(&serde_json::json!({"url": self.url, "text": ""}).to_string()).unwrap());
             }
+            self.log.lock().unwrap().push("probe".to_owned());
             self.probe.clone()
         }
         fn cookie(&mut self, domain: &str, name: &str) -> Option<String> {
@@ -219,9 +236,9 @@ mod tests {
     #[test]
     fn discord_is_read_from_its_probe_and_the_page_is_closed() {
         let log = Arc::default();
-        let page = Scripted { url: "https://discord.com/channels/@me".into(), probe: Some(r#""{\"token\":\"abc\"}""#.into()), cookie: None, closed: false, log: Arc::clone(&log) };
+        let page = Scripted { url: "https://discord.com/channels/@me".into(), probe: Some(r#""{\"token\":\"abc\"}""#.into()), cookie: None, closed: false, close_unprobed: false, ticks: 0, log: Arc::clone(&log) };
         let provider = provider(page);
-        let line = sign_in(&provider, "discord").unwrap();
+        let line = sign_in(&provider, "discord", None).unwrap();
         let session: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(session["token"], "abc");
         assert_eq!(session["user_agent"], crate::user_agent());
@@ -233,9 +250,9 @@ mod tests {
     fn slack_waits_for_its_cookie_and_its_links_are_routed() {
         let config = r#"{"teams":{"T1":{"name":"Acme","url":"https://acme.slack.com/","token":"xoxc-1"}},"lastActiveTeamId":"T1"}"#;
         let log = Arc::default();
-        let page = Scripted { url: "https://app.slack.com/client/T1".into(), probe: Some(serde_json::to_string(config).unwrap()), cookie: Some("xoxd-9".into()), closed: false, log: Arc::clone(&log) };
+        let page = Scripted { url: "https://app.slack.com/client/T1".into(), probe: Some(serde_json::to_string(config).unwrap()), cookie: Some("xoxd-9".into()), closed: false, close_unprobed: false, ticks: 0, log: Arc::clone(&log) };
         let provider = provider(page);
-        let line = sign_in(&provider, "slack").unwrap();
+        let line = sign_in(&provider, "slack", None).unwrap();
         let session: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!((session["cookie"].as_str(), session["teams"][0]["token"].as_str()), (Some("xoxd-9"), Some("xoxc-1")));
         assert!(log.lock().unwrap().contains(&"cookie slack.com d".to_owned()));
@@ -246,19 +263,64 @@ mod tests {
     }
 
     #[test]
+    fn a_slack_workspace_opens_on_its_own_address() {
+        let config = r#"{"teams":{"T1":{"name":"Acme","url":"https://acme.slack.com/","token":"xoxc-1"}},"lastActiveTeamId":"T1"}"#;
+        let page = Scripted {
+            url: "https://acme.slack.com/".into(),
+            probe: Some(serde_json::to_string(config).unwrap()),
+            cookie: Some("xoxd-9".into()),
+            closed: false,
+            close_unprobed: false,
+            ticks: 0,
+            log: Arc::default(),
+        };
+        let workspace = provider(page);
+        sign_in(&workspace, "slack", Some("https://acme.slack.com/")).unwrap();
+        assert_eq!(workspace.opened.lock().unwrap()[0].1, "https://acme.slack.com/");
+        let blocked = provider(Scripted { url: String::new(), probe: None, cookie: None, closed: false, close_unprobed: false, ticks: 0, log: Arc::default() });
+        assert_eq!(sign_in(&blocked, "slack", Some("https://evil.example/")), Err(USAGE));
+        assert_eq!(sign_in(&blocked, "discord", Some("https://acme.slack.com/")), Err(USAGE));
+    }
+
+    #[test]
+    fn slack_does_not_probe_an_identity_provider_page() {
+        let config = r#"{"teams":{"T1":{"name":"Acme","url":"https://acme.slack.com/","token":"xoxc-1"}},"lastActiveTeamId":"T1"}"#;
+        let log = Arc::default();
+        let page = Scripted {
+            url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
+            probe: Some(serde_json::to_string(config).unwrap()),
+            cookie: Some("xoxd-stolen".into()),
+            closed: false,
+            close_unprobed: true,
+            ticks: 0,
+            log: Arc::clone(&log),
+        };
+        let provider = provider(page);
+        assert_eq!(sign_in(&provider, "slack", None), Err(CLOSED));
+        let lines = log.lock().unwrap();
+        assert!(lines.iter().all(|line| line != "probe"), "{lines:?}");
+        assert!(lines.iter().all(|line| !line.starts_with("cookie")), "{lines:?}");
+        drop(lines);
+        let navigate = provider.navigate.lock().unwrap().clone().unwrap();
+        assert_eq!(navigate("https://accounts.google.com/o/oauth2/v2/auth"), Navigation::Allow);
+        assert_eq!(navigate("https://acme.okta.com/login"), Navigation::Allow);
+        assert_eq!(navigate("https://app.slack.com/client/T1"), Navigation::Allow);
+    }
+
+    #[test]
     fn closing_the_page_is_the_helpers_closed_and_unknown_networks_are_refused() {
-        let page = Scripted { url: "https://discord.com/login".into(), probe: None, cookie: None, closed: true, log: Arc::default() };
-        assert_eq!(sign_in(&provider(page), "discord"), Err(CLOSED));
-        let page = Scripted { url: String::new(), probe: None, cookie: None, closed: false, log: Arc::default() };
-        assert_eq!(sign_in(&provider(page), "messages"), Err(USAGE));
+        let page = Scripted { url: "https://discord.com/login".into(), probe: None, cookie: None, closed: true, close_unprobed: false, ticks: 0, log: Arc::default() };
+        assert_eq!(sign_in(&provider(page), "discord", None), Err(CLOSED));
+        let page = Scripted { url: String::new(), probe: None, cookie: None, closed: false, close_unprobed: false, ticks: 0, log: Arc::default() };
+        assert_eq!(sign_in(&provider(page), "messages", None), Err(USAGE));
     }
 
     #[test]
     fn teams_catches_microsofts_redirect_and_a_refusal_ends_it() {
-        let page = Scripted { url: "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize".into(), probe: None, cookie: None, closed: false, log: Arc::default() };
+        let page = Scripted { url: "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize".into(), probe: None, cookie: None, closed: false, close_unprobed: false, ticks: 0, log: Arc::default() };
         let provider = provider(page);
         let worker = std::thread::scope(|scope| {
-            let running = scope.spawn(|| sign_in(&provider, "teams"));
+            let running = scope.spawn(|| sign_in(&provider, "teams", None));
             let deadline = Instant::now() + Duration::from_secs(5);
             let navigate = loop {
                 if let Some(navigate) = provider.navigate.lock().unwrap().clone() {

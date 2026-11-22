@@ -36,6 +36,11 @@ pub(super) fn under(host: &str, name: &str) -> bool {
     host == name || host.strip_suffix(name).is_some_and(|rest| rest.ends_with('.'))
 }
 
+/// A Slack workspace file (`/files-pri/`, `/files-tmb/`), not a public avatar or emoji.
+fn slack_workspace_file(url: &str) -> bool {
+    url.contains("/files-pri/") || url.contains("/files-tmb/")
+}
+
 impl Hosts {
     pub(super) fn trust(&self, network: Network, url: &str) -> Option<Trust> {
         self.trust_for(None, network, url)
@@ -50,6 +55,11 @@ impl Hosts {
             return Some(Trust::Session);
         }
         if let Some((_, trust)) = self.local.iter().find(|(local, _)| *local == host) {
+            // A workspace file on the test server needs the session, the same as files.slack.com.
+            // Avatars and emoji on that server stay open.
+            if network == Network::Slack && *trust == Trust::Open && slack_workspace_file(url) {
+                return Some(Trust::Session);
+            }
             return Some(*trust);
         }
         if !secure {
@@ -674,6 +684,12 @@ mod tests {
         // A test's own server, and nothing else on plain HTTP.
         assert_eq!(trust(Discord, "http://127.0.0.1:4000/a.png"), Some(Trust::Open));
         assert_eq!(trust(Discord, "http://localhost:4000/a.png"), None);
+        // A clip transcript on the test server is a workspace file, so it asks Download.
+        // A public avatar on that same server does not.
+        assert_eq!(trust(Slack, "http://127.0.0.1:4000/files-pri/T1-F1/a.vtt"), Some(Trust::Session));
+        assert_eq!(trust(Slack, "http://127.0.0.1:4000/files-tmb/T1-F1/a_480.png"), Some(Trust::Session));
+        assert_eq!(trust(Slack, "http://127.0.0.1:4000/img/avatars/a.png"), Some(Trust::Open));
+        assert_eq!(trust(Discord, "http://127.0.0.1:4000/files-pri/T1-F1/a.vtt"), Some(Trust::Open));
         // A Tiny file asks Download even on a local test server. A user part is not a host.
         assert_eq!(trust(Network::Tiny, "https://chat.example/v1/media/a"), Some(Trust::Session));
         assert_eq!(trust(Network::Tiny, "http://127.0.0.1:9/v1/media/a"), Some(Trust::Session));

@@ -238,7 +238,8 @@ impl Slack {
     fn edge(&self, path: &str, mut body: Value) -> Result<Value, Fault> {
         let method = format!("edge:{path}");
         self.halted(&method)?;
-        body["token"] = self.session.token.as_str().into();
+        let token = self.token();
+        body["token"] = token.as_str().into();
         let url = format!("{}{}/{path}", self.edge, self.ctx.account.account);
         if self.pace(&method) {
             return Err(Fault::Net(format!("{path}: stopped")));
@@ -252,6 +253,7 @@ impl Slack {
             return Err(Fault::Limited(wait.unwrap_or(5)));
         }
         let body: Value = response.body_mut().read_json().map_err(|err| Fault::Net(err.to_string()))?;
+        self.note_token(&body);
         self.checked(path, body)
     }
 

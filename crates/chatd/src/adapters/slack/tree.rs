@@ -74,6 +74,29 @@ pub(super) fn starred_from(kinds: &[(&str, &[&str])]) -> Vec<String> {
     starred_channels(&sections)
 }
 
+/// The workspace id a channel names, when it is one of `known`. Otherwise `primary`, so an
+/// org-wide channel is filed once.
+pub(super) fn workspace_of(channel: &Value, known: &[&str], primary: &str) -> String {
+    let owns = |id: &str| known.iter().any(|held| *held == id);
+    for key in ["context_team_id", "team"] {
+        if let Some(id) = channel[key].as_str().filter(|id| !id.is_empty() && owns(id)) {
+            return id.to_owned();
+        }
+    }
+    for key in ["shared_team_ids", "internal_team_ids"] {
+        if let Some(id) = channel[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .find(|id| !id.is_empty() && owns(id))
+        {
+            return id.to_owned();
+        }
+    }
+    primary.to_owned()
+}
+
 fn section(id: &str, name: &str) -> Section {
     Section {
         id: id.to_owned(),
@@ -86,15 +109,66 @@ fn section(id: &str, name: &str) -> Section {
 }
 
 impl Slack {
-    /// A conversation's row in this workspace's Space. Every Slack conversation can hold a
+    /// The primary Space id for this account: for Enterprise Grid, the first workspace Space;
+    /// for a standalone workspace, the workspace account id itself.
+    pub(super) fn primary_space(&self) -> String {
+        if self.is_enterprise() {
+            if let Some(first) = self.session.workspaces.first().filter(|w| !w.id.is_empty()) {
+                return first.id.clone();
+            }
+        }
+        self.ctx.account.account.clone()
+    }
+
+    /// The Spaces belonging to this account: all Grid workspaces for an org, or the single
+    /// workspace for a standalone account.
+    pub(super) fn grid_spaces(&self) -> Vec<(String, String)> {
+        if self.is_enterprise() && !self.session.workspaces.is_empty() {
+            return self
+                .session
+                .workspaces
+                .iter()
+                .filter(|w| !w.id.is_empty())
+                .map(|w| {
+                    let label = if w.name.is_empty() { w.id.clone() } else { w.name.clone() };
+                    (w.id.clone(), label)
+                })
+                .collect();
+        }
+        let name = if !self.session.enterprise_name.is_empty() {
+            self.session.enterprise_name.clone()
+        } else {
+            self.ctx.account.account.clone()
+        };
+        vec![(self.ctx.account.account.clone(), name)]
+    }
+
+    /// Which workspace Space a channel belongs to. On Enterprise Grid, uses Slack's
+    /// `context_team_id` / `shared_team_ids` / `internal_team_ids` / `team` when it names one of
+    /// our org's workspaces, falling back to [`Self::primary_space`] so org-wide channels appear once.
+    pub(super) fn workspace_for_channel(&self, channel: &Value) -> String {
+        let primary = self.primary_space();
+        if !self.is_enterprise() {
+            return primary;
+        }
+        let known: Vec<&str> = self.session.workspaces.iter().map(|workspace| workspace.id.as_str()).collect();
+        workspace_of(channel, &known, &primary)
+    }
+
+    /// A conversation's row in a specific workspace Space. Every Slack conversation can hold a
     /// huddle, which the official app carries.
-    pub(super) fn placed(&self, id: &str, kind: ConversationKind, title: &str) -> ConversationRow {
+    pub(super) fn placed_in(&self, space_id: &str, id: &str, kind: ConversationKind, title: &str) -> ConversationRow {
         ConversationRow {
-            space: Some(self.ctx.account.account.clone()),
+            space: Some(space_id.to_owned()),
             position: LAST,
             call: CallSupport::Handoff,
             ..ConversationRow::new(id, kind, title)
         }
+    }
+
+    /// A conversation's row in this account's primary Space.
+    pub(super) fn placed(&self, id: &str, kind: ConversationKind, title: &str) -> ConversationRow {
+        self.placed_in(&self.primary_space(), id, kind, title)
     }
 
     /// The row for one of Slack's conversation objects. Looks up the partner of a direct one.
@@ -116,7 +190,8 @@ impl Slack {
             row.private = true;
             return Some(row);
         }
-        let mut row = self.placed(id, ConversationKind::Channel, &format!("#{name}"));
+        let space_id = self.workspace_for_channel(channel);
+        let mut row = self.placed_in(&space_id, id, ConversationKind::Channel, &format!("#{name}"));
         row.group = self.ctx.note("group:channel");
         // The topic is what Slack shows in the header; the purpose stands in when there is none.
         row.topic = said("topic").or(said("purpose")).unwrap_or("").to_owned();
@@ -415,8 +490,27 @@ impl Slack {
         Ok(())
     }
 
-    /// The workspace as the account's one Space, with its icon.
+    /// The workspace as the account's one Space, with its icon. An Enterprise Grid org lists
+    /// each of its workspaces as a Space under the one account.
     pub(super) fn space(&self, name: &str) -> Result<(), Failure> {
+        if self.is_enterprise() {
+            let listed = self.grid_spaces();
+            let rows: Vec<SpaceRow> = listed
+                .iter()
+                .enumerate()
+                .map(|(position, (id, label))| SpaceRow {
+                    id: id.clone(),
+                    name: label.clone(),
+                    icon: None,
+                    position: position as i32,
+                })
+                .collect();
+            self.ctx.spaces(&rows)?;
+            for (id, _) in &listed {
+                self.ctx.set_space_can_create_channels(id, true)?;
+            }
+            return Ok(());
+        }
         // Looked up once: `-` when the workspace has only Slack's default picture.
         let icon = self.ctx.note("icon").or_else(|| {
             let info = self.api("team.info", &[]).ok()?;
@@ -718,7 +812,7 @@ impl Slack {
         let created = match self.api("conversations.create", &[("name", clean), ("is_private", is_private)]) {
             Ok(created) => created,
             Err(Fault::Slack(ref err)) if err == "restricted_action" => {
-                let _ = self.ctx.set_space_can_create_channels(&self.ctx.account.account, false);
+                let _ = self.ctx.set_space_can_create_channels(&self.primary_space(), false);
                 return Err(Fault::Slack("restricted_action".to_owned()));
             }
             Err(fault) => return Err(fault),
@@ -889,7 +983,7 @@ impl Slack {
         self.ctx.set_note("group:channel", &default("channels").unwrap_or_default());
         self.ctx.set_note("group:directs", DIRECTS);
 
-        let (mut channels, mut cursor) = (Vec::<Value>::new(), String::new());
+        let (mut channels, mut cursor, mut seen) = (Vec::<Value>::new(), String::new(), HashSet::new());
         loop {
             let mut page = self.api(
                 "users.conversations",
@@ -910,7 +1004,10 @@ impl Slack {
                             .as_str()
                             .is_some_and(|id| open.contains(id) || recent_app_channels.contains(id))
                 };
-                channels.extend(found.into_iter().filter(shown));
+                channels.extend(found.into_iter().filter(shown).filter(|channel| match channel["id"].as_str() {
+                    Some(id) => seen.insert(id.to_owned()),
+                    None => true,
+                }));
             }
             if cursor.is_empty() {
                 break;
@@ -977,27 +1074,9 @@ impl Slack {
                 ..row
             })
             .collect();
-        let used = |id: &str| rows.iter().any(|row| row.group.as_deref() == Some(id));
-        let mut groups: Vec<Group> = sections
-            .iter()
-            .enumerate()
-            .filter(|(_, section)| used(&section.id))
-            .map(|(position, section)| Group {
-                unread_only,
-                emoji: section.emoji.clone(),
-                sort: section.sort.clone(),
-                ..Group::new(&section.id, &section.name, position as i32)
-            })
-            .collect();
-        if used(DIRECTS) {
-            groups.push(Group {
-                kind: GroupKind::Directs,
-                ..Group::new(DIRECTS, "Direct messages", sections.len() as i32)
-            });
-        }
         let have: HashSet<&str> = rows.iter().map(|row| row.id.as_str()).collect();
         let starred: Vec<String> = starred_channels(&sections).into_iter().filter(|id| have.contains(id.as_str())).collect();
-        self.ctx.tree(&self.ctx.account.account, &groups, &rows)?;
+        self.publish_trees(&sections, &rows, unread_only)?;
         drop(rows);
         for id in starred {
             self.ctx.starred(&id, true)?;
@@ -1017,6 +1096,43 @@ impl Slack {
         self.ctx.set_note("tree", "1");
         self.apply_mutes(&prefs)?;
         self.apply_counts(&counts)
+    }
+
+    /// One Space's groups and the rows filed under it. A Grid org writes one tree per workspace,
+    /// so a channel Slack shares across workspaces is stored once.
+    fn publish_trees(&self, sections: &[Section], rows: &[ConversationRow], unread_only: bool) -> Result<(), Failure> {
+        let spaces: Vec<String> = if self.is_enterprise() {
+            self.grid_spaces().into_iter().map(|(id, _)| id).collect()
+        } else {
+            vec![self.ctx.account.account.clone()]
+        };
+        for space in spaces {
+            let mut mine: Vec<ConversationRow> = rows.iter().filter(|row| row.space.as_deref() == Some(space.as_str())).cloned().collect();
+            mine.sort_by_key(|row| row.position);
+            for (position, row) in mine.iter_mut().enumerate() {
+                row.position = position as i32;
+            }
+            let used = |id: &str| mine.iter().any(|row| row.group.as_deref() == Some(id));
+            let mut groups: Vec<Group> = sections
+                .iter()
+                .enumerate()
+                .filter(|(_, section)| used(&section.id))
+                .map(|(position, section)| Group {
+                    unread_only,
+                    emoji: section.emoji.clone(),
+                    sort: section.sort.clone(),
+                    ..Group::new(&section.id, &section.name, position as i32)
+                })
+                .collect();
+            if used(DIRECTS) {
+                groups.push(Group {
+                    kind: GroupKind::Directs,
+                    ..Group::new(DIRECTS, "Direct messages", sections.len() as i32)
+                });
+            }
+            self.ctx.tree(&space, &groups, &mine)?;
+        }
+        Ok(())
     }
 
     /// At a connection: what was read or arrived while there was no socket.

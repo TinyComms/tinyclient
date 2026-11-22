@@ -23,6 +23,89 @@ pub(super) const FILES: usize = 10;
 const SHOWN_WITHIN: Duration = Duration::from_secs(20);
 /// Slack schedules no further ahead than this.
 const SCHEDULE_AHEAD: i64 = 120 * 86_400;
+/// Slack clips (audio or video) are capped at five minutes.
+pub(super) const MAX_CLIP_MS: u32 = 5 * 60 * 1_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipKind {
+    Audio,
+    Video,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClipSpec {
+    kind: ClipKind,
+    duration_ms: u32,
+    waveform: Vec<u8>,
+}
+
+impl ClipSpec {
+    fn subtype(&self) -> &'static str {
+        match self.kind {
+            ClipKind::Audio => "slack_audio",
+            ClipKind::Video => "slack_video",
+        }
+    }
+}
+
+/// Resolves whether a single-file send is a Slack audio or video clip and checks the 5-minute cap.
+/// A voice note is a clip only for `audio/*` or `video/*`. Anything else is refused and not uploaded.
+fn clip_spec(with: &Outgoing, up: &Upload) -> Result<Option<ClipSpec>, String> {
+    if up.files().len() != 1 || with.snippet_type.is_some() {
+        return Ok(None);
+    }
+    let file = &up.files()[0];
+    if let Some(voice) = &with.voice {
+        if voice.duration > MAX_CLIP_MS {
+            return Err("Slack clips can be at most 5 minutes long.".to_owned());
+        }
+        let kind = if file.mime.starts_with("video/") {
+            ClipKind::Video
+        } else if file.mime.starts_with("audio/") {
+            ClipKind::Audio
+        } else {
+            return Err("Slack refused this clip. Only audio and video can be clips.".to_owned());
+        };
+        return Ok(Some(ClipSpec {
+            kind,
+            duration_ms: voice.duration,
+            waveform: voice.waveform.clone(),
+        }));
+    }
+    if !file.as_file && file.mime.starts_with("video/") {
+        if let Some(duration_ms) = file.media.as_ref().and_then(|m| m.duration_ms).filter(|&d| d > 0) {
+            if duration_ms <= MAX_CLIP_MS {
+                return Ok(Some(ClipSpec {
+                    kind: ClipKind::Video,
+                    duration_ms,
+                    waveform: Vec::new(),
+                }));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Maps `.opus` Ogg Opus voice recordings to `.ogg` so Slack recognizes `audio/ogg` for clips.
+fn clip_filename(name: &str, kind: ClipKind) -> String {
+    if kind == ClipKind::Audio {
+        if let Some((stem, ext)) = name.rsplit_once('.') {
+            if ext.eq_ignore_ascii_case("opus") && !stem.is_empty() {
+                return format!("{stem}.ogg");
+            }
+        }
+    }
+    name.to_owned()
+}
+
+/// Rescales tinyclient's 0..=255 waveform bars into Slack's 0..=100 `audio_wave_samples` scale.
+fn slack_wave_samples(waveform: &[u8]) -> Vec<u8> {
+    waveform
+        .iter()
+        .take(protocol::WAVEFORM_LIMIT)
+        .map(|&bar| ((u16::from(bar) * 100 + 127) / 255).min(100) as u8)
+        .collect()
+}
 
 impl Slack {
     /// The work of one `SendWith`, run by the upload helper on a thread of its own, which reads
@@ -64,14 +147,36 @@ impl Slack {
             None => (conversation, reply_to),
         };
         let broadcast_thread = with.broadcast && thread_of(conversation).is_some();
-        let ids = self.upload(up, with.snippet_type.as_deref())?;
+        let clip = clip_spec(with, up)?;
+        let ids = self.upload(up, with.snippet_type.as_deref(), clip.as_ref())?;
         up.check()?;
 
         // The socket names the message that holds the files: it is watched for before Slack is
         // told to share them, so it cannot pass unseen.
         let (shown, seen) = std::sync::mpsc::channel();
         self.state().shares.insert(ids[0].clone(), shown);
-        let files: Vec<Value> = ids.iter().zip(up.files()).map(|(id, file)| json!({"id": id, "title": file.name})).collect();
+        let files: Vec<Value> = ids
+            .iter()
+            .zip(up.files())
+            .enumerate()
+            .map(|(at, (id, file))| match clip.as_ref().filter(|_| at == 0) {
+                Some(spec) => {
+                    let mut entry = json!({
+                        "id": id,
+                        "title": clip_filename(&file.name, spec.kind),
+                        "subtype": spec.subtype(),
+                    });
+                    if spec.duration_ms > 0 {
+                        entry["duration_ms"] = spec.duration_ms.into();
+                    }
+                    if spec.kind == ClipKind::Audio && !spec.waveform.is_empty() {
+                        entry["audio_wave_samples"] = json!(slack_wave_samples(&spec.waveform));
+                    }
+                    entry
+                }
+                None => json!({"id": id, "title": file.name}),
+            })
+            .collect();
         let files = json!(files).to_string();
         let comment = escape(text);
         let blocks = super::Slack::blocks_json(text, &with.spans);
@@ -112,8 +217,30 @@ impl Slack {
             let ts = ["public", "private"].iter().find_map(|access| shares[*access][channel][0]["ts"].as_str());
             let ts = ts.map(str::to_owned).unwrap_or_else(|| format!("{}.000000", crate::hub::now()));
             let me = self.me.get().cloned().unwrap_or_default();
+            let mut completed_files = completed["files"].clone();
+            if let (Some(spec), Some(first)) = (&clip, completed_files.get_mut(0)) {
+                if first["subtype"].is_null() {
+                    first["subtype"] = spec.subtype().into();
+                }
+                if first["mimetype"].is_null() {
+                    first["mimetype"] = match spec.kind {
+                        ClipKind::Audio => "audio/ogg",
+                        ClipKind::Video => "video/mp4",
+                    }
+                    .into();
+                }
+                if first["duration_ms"].is_null() && spec.duration_ms > 0 {
+                    first["duration_ms"] = spec.duration_ms.into();
+                }
+                if first["audio_wave_samples"].is_null()
+                    && spec.kind == ClipKind::Audio
+                    && !spec.waveform.is_empty()
+                {
+                    first["audio_wave_samples"] = json!(slack_wave_samples(&spec.waveform));
+                }
+            }
             let event = super::Slack::with_blocks(
-                json!({"type": "message", "ts": ts, "user": me, "text": comment, "files": completed["files"]}),
+                json!({"type": "message", "ts": ts, "user": me, "text": comment, "files": completed_files}),
                 text,
                 &with.spans,
             );
@@ -137,15 +264,31 @@ impl Slack {
 
     /// Asks for an address per file and posts each file's bytes there from its path. Answers
     /// the file ids, in order. When `snippet_type` is given, asks Slack to create a code/text snippet.
-    fn upload(&self, up: &mut Upload, snippet_type: Option<&str>) -> Result<Vec<String>, String> {
+    /// When `clip` is given, marks the uploaded file with Slack's clip `subtype` (`slack_audio` / `slack_video`).
+    fn upload(&self, up: &mut Upload, snippet_type: Option<&str>, clip: Option<&ClipSpec>) -> Result<Vec<String>, String> {
         let mut ids = Vec::with_capacity(up.files().len());
         let snippet = snippet_type.map(str::trim).filter(|s| !s.is_empty());
         for at in 0..up.files().len() {
             up.check()?;
-            let (name, length) = (up.files()[at].name.clone(), up.files()[at].bytes.to_string());
+            let clip_here = clip.filter(|_| at == 0);
+            let (name, length, content_type) = match clip_here {
+                Some(spec) => (
+                    clip_filename(&up.files()[at].name, spec.kind),
+                    up.files()[at].bytes.to_string(),
+                    up.files()[at].mime,
+                ),
+                None => (
+                    up.files()[at].name.clone(),
+                    up.files()[at].bytes.to_string(),
+                    "application/octet-stream",
+                ),
+            };
             let mut params = vec![("filename", name.as_str()), ("length", length.as_str())];
             if let Some(lang) = snippet {
                 params.push(("snippet_type", lang));
+            }
+            if let Some(spec) = clip_here {
+                params.push(("subtype", spec.subtype()));
             }
             let address = self.api("files.getUploadURLExternal", &params);
             let address = address.map_err(|fault| format!("{name} could not be sent: {}", super::reason(fault)))?;
@@ -154,7 +297,7 @@ impl Slack {
             };
             // As the session's own browser, with its cookie: the address is on Slack's host.
             let target = Target::post(url)
-                .header("Content-Type", "application/octet-stream")
+                .header("Content-Type", content_type)
                 .header("User-Agent", &self.session.user_agent)
                 .header("Cookie", &self.cookie());
             up.send(at, &target)?;
@@ -321,5 +464,28 @@ impl Slack {
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clip_filename_maps_opus_to_ogg_for_audio_only() {
+        assert_eq!(clip_filename("voice-123.opus", ClipKind::Audio), "voice-123.ogg");
+        assert_eq!(clip_filename("VOICE.OPUS", ClipKind::Audio), "VOICE.ogg");
+        assert_eq!(clip_filename("memo.m4a", ClipKind::Audio), "memo.m4a");
+        assert_eq!(clip_filename("demo.mp4", ClipKind::Video), "demo.mp4");
+        assert_eq!(clip_filename(".opus", ClipKind::Audio), ".opus");
+    }
+
+    #[test]
+    fn slack_wave_samples_scales_to_hundred_and_caps_length() {
+        assert_eq!(slack_wave_samples(&[0, 128, 255]), vec![0, 50, 100]);
+        let long = vec![255u8; protocol::WAVEFORM_LIMIT + 32];
+        let scaled = slack_wave_samples(&long);
+        assert_eq!(scaled.len(), protocol::WAVEFORM_LIMIT);
+        assert!(scaled.iter().all(|&s| s == 100));
     }
 }

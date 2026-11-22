@@ -2111,6 +2111,10 @@ pub enum Request {
         /// over it and not on another display.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         at: Option<(i32, i32)>,
+        /// A Slack workspace or org to continue (SSO or two-factor). The helper opens that
+        /// workspace's address, and only that account's token is replaced.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume: Option<String>,
     },
     /// Reads again the sessions the keychain refused (`Keychain::denied`): the user's "Try
     /// again". Answers `Status` at once; the read goes on behind it.
@@ -3866,7 +3870,7 @@ mod tests {
         let request: Request = serde_json::from_str(r#"{"op":"fetch","account":{"network":"slack","account":"T1"},"ids":["a"]}"#).unwrap();
         assert!(matches!(request, Request::Fetch { size: None, retry: false, .. }));
         let request: Request = serde_json::from_str(r#"{"op":"sign_in","network":"slack"}"#).unwrap();
-        assert!(matches!(request, Request::SignIn { at: None, .. }));
+        assert!(matches!(request, Request::SignIn { at: None, resume: None, .. }));
         let thread: ThreadSummary = serde_json::from_str(r#"{"id":"t","replies":2,"last":5}"#).unwrap();
         assert_eq!((thread.participants.len(), thread.unread), (0, 0));
         let call = r#"{"conversation":{"network":"discord","account":"1","id":"c"},"state":"joined",

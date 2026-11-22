@@ -1718,6 +1718,15 @@ impl Shell {
                 Tone::Danger => banner(tone, words).child(
                     banner_action("sign-in-again", "Sign in").on_click(cx.listener(move |this, _, _, cx| this.sign_in(network, cx))),
                 ),
+                Tone::Attention if slack_can_continue(network, &words) => {
+                    let id = account.account.clone();
+                    banner(tone, words).child(
+                        banner_action("continue-slack", "Continue in tinyclient").on_click(cx.listener(move |this, _, _, cx| {
+                            this.continue_slack(id.clone(), cx);
+                        })),
+                    )
+                }
+                Tone::Attention if network == Network::Slack => banner(tone, words),
                 Tone::Attention => banner(tone, words).child(
                     banner_action("open-network", format!("Open {}", network.label())).on_click(cx.listener(move |this, _, _, cx| {
                         if network == Network::Tiny { this.tiny_reconnect(account.clone(), cx); }
@@ -2012,7 +2021,34 @@ impl Shell {
             menu = menu.child(super::components::menu_separator());
         }
         let account = current.as_ref().map(Key::account);
-        let name = current.as_ref().and_then(|key| self.spaces.iter().find(|s| &s.key == key)).map_or_else(String::new, |s| s.name.clone());
+        let is_grid = account.as_ref().is_some_and(|a| a.account.starts_with('E'));
+        if is_grid {
+            if let Some(org_id) = account.as_ref().map(|a| a.account.clone()) {
+                let browse_url = format!("https://app.slack.com/client/{org_id}");
+                menu = menu.child(
+                    super::components::menu_item("slack-browse-workspaces", None, "Browse workspaces", None).on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.sidebar_state.slack_menu = false;
+                            cx.open_url(&browse_url);
+                            cx.notify();
+                        }),
+                    ),
+                );
+            }
+        }
+        let name = if is_grid {
+            account
+                .as_ref()
+                .and_then(|acc| snapshot.accounts.iter().find(|a| a.key == *acc))
+                .map(|a| a.name.clone())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| "Slack".to_owned())
+        } else {
+            current
+                .as_ref()
+                .and_then(|key| self.spaces.iter().find(|s| &s.key == key))
+                .map_or_else(String::new, |s| s.name.clone())
+        };
         if let Some(space_key) = current.clone() {
             let team_id = space_key.id.clone();
             let info_key = space_key.clone();
@@ -2789,6 +2825,11 @@ fn urgency(tone: Tone) -> u8 {
     }
 }
 
+/// A Slack demand can be finished here. A workspace that blocks this browser is words only.
+fn slack_can_continue(network: Network, words: &str) -> bool {
+    network == Network::Slack && !words.contains("from this browser")
+}
+
 /// Where the network's own app is, for what only it can do (verify an account, solve a captcha).
 fn network_app(network: Network) -> &'static str {
     match network {
@@ -2867,6 +2908,14 @@ fn inbox_strip_fit(width: f32, phone: bool, text_scale: f32, has_unread: bool) -
 pub(crate) mod tests {
     use super::*;
     use protocol::{AccountKey, AccountStatus, Presence};
+
+    #[test]
+    fn a_slack_demand_can_continue_and_a_blocked_browser_cannot() {
+        let demand = "Slack wants two-factor authentication set up. Continue in tinyclient for this workspace.";
+        assert!(slack_can_continue(Network::Slack, demand));
+        assert!(!slack_can_continue(Network::Slack, "This workspace does not allow signing in from this browser."));
+        assert!(!slack_can_continue(Network::Discord, demand));
+    }
 
     #[cfg(feature = "gui-shot")]
     #[gpui::test]

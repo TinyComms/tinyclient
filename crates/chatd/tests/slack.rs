@@ -378,10 +378,20 @@ impl Fake {
             assert_eq!(space, team(&call.token), "the edge cache is asked under the workspace's own id");
             return self.edge(&call.token, method, &asked);
         }
-        // A file: an upload, a thumbnail, a picture.
+        // A file: an upload, a thumbnail, a picture, or a clip WebVTT track.
         call.method = format!("file:{path}");
         call.token = header("authorization").trim_start_matches("Bearer ").to_owned();
         self.calls.lock().unwrap().push(call);
+        if path.ends_with(".vtt") {
+            let vtt = "WEBVTT\n\n00:00:00.500 --> 00:00:03.200\n<v Ana>Quick deploy update for everyone.</v>\n\n00:00:03.500 --> 00:00:07.000\nCanary is green and traffic is at 50%.\n";
+            return Reply {
+                status: "200 OK",
+                retry_after: None,
+                kind: "text/vtt",
+                cookie: None,
+                body: vtt.as_bytes().to_vec(),
+            };
+        }
         Reply {
             status: "200 OK",
             retry_after: None,
@@ -477,8 +487,32 @@ impl Fake {
                     .as_array()
                     .unwrap()
                     .iter()
-                    .map(|file| json!({"id": file["id"], "name": file["title"], "title": file["title"], "mimetype": "text/plain", "size": 3,
-                                        "url_private": format!("https://files.slack.com/files-pri/{}-{}/f", team(token), file["id"].as_str().unwrap())}))
+                    .map(|file| {
+                        let subtype = file["subtype"].as_str().unwrap_or("");
+                        let mime = match subtype {
+                            "slack_audio" => "audio/ogg",
+                            "slack_video" => "video/mp4",
+                            _ => "text/plain",
+                        };
+                        let mut out = json!({
+                            "id": file["id"],
+                            "name": file["title"],
+                            "title": file["title"],
+                            "mimetype": mime,
+                            "size": 3,
+                            "url_private": format!("https://files.slack.com/files-pri/{}-{}/f", team(token), file["id"].as_str().unwrap()),
+                        });
+                        if !subtype.is_empty() {
+                            out["subtype"] = subtype.into();
+                        }
+                        if let Some(ms) = file["duration_ms"].as_u64() {
+                            out["duration_ms"] = ms.into();
+                        }
+                        if let Some(wave) = file["audio_wave_samples"].as_array() {
+                            out["audio_wave_samples"] = Value::Array(wave.clone());
+                        }
+                        out
+                    })
                     .collect();
                 let number = self.posted.fetch_add(1, Ordering::Relaxed) + 1;
                 let ts = format!("17600020{number:02}.{number:06}");
@@ -3180,12 +3214,12 @@ fn a_reissued_cookie_is_used_and_saved_and_a_demand_only_slacks_app_can_meet_sto
     assert_eq!((saved["user_agent"].as_str(), saved["teams"].as_array().map(Vec::len)), (Some(agent()), Some(2)));
     assert_eq!((saved["teams"][0]["token"].as_str(), saved["teams"][1]["token"].as_str()), (Some(ALPHA), Some(BETA)));
 
-    // Slack wants a second factor set up: only its own app can do that. The account says so,
-    // and nothing more is asked of Slack for this workspace.
+    // Slack wants a second factor set up. The account says so, and nothing more is asked of
+    // Slack for this workspace until the user continues that sign-in.
     world.fake.refusing.lock().unwrap().insert("conversations.replies".to_owned(), "two_factor_setup_required".to_owned());
     world.messages(&alpha("C0GEN:1760000200.000200"));
     let required = world.until("the account to say what Slack wants", || Some(world.account("T01ALPHA").required).filter(|required| !required.is_empty()));
-    assert_eq!(required, "Slack wants two-factor authentication set up. Finish that in the Slack app.");
+    assert_eq!(required, "Slack wants two-factor authentication set up. Continue in tinyclient for this workspace.");
     world.fake.refusing.lock().unwrap().clear();
     let asked = world.fake.calls.lock().unwrap().iter().filter(|call| call.token == ALPHA).count();
     let members = world.ask(Request::Members { conversation: general.clone(), offset: 0, limit: 10 });
@@ -7142,4 +7176,295 @@ fn slack_all_unreads_fetches_paced_history_on_open_and_marks_read() {
     };
     assert_eq!(remaining.len(), 2);
     assert!(!remaining.iter().any(|g| g.conversation.key == deploy));
+}
+
+#[test]
+fn slack_records_and_sends_audio_and_video_clips() {
+    let world = World::start();
+    world.ready();
+
+    assert!(world.account("T01ALPHA").can.voice_notes, "Slack must advertise voice_notes for clip recording");
+
+    let dir = world.dir.with_extension("clips");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // 1. Audio clip recorded as Ogg Opus (.opus) uploads as `slack_audio` (.ogg) with duration & waveform.
+    let audio_path = dir.join("voice-42.opus");
+    std::fs::write(&audio_path, b"OggS-fake-audio").unwrap();
+    let with_audio = protocol::Outgoing {
+        files: vec![protocol::OutgoingFile {
+            path: audio_path.to_string_lossy().into_owned(),
+            name: String::new(),
+            spoiler: false,
+            as_file: false,
+            original: false,
+            view_once: false,
+            media: None,
+        }],
+        voice: Some(protocol::VoiceNote {
+            duration: 12_400,
+            waveform: vec![0, 128, 255],
+        }),
+        ..Default::default()
+    };
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: alpha("C0GEN"),
+            client_id: "56101".into(),
+            text: "Quick update".into(),
+            reply_to: None,
+            with: with_audio,
+        }),
+        Response::Sent { .. }
+    ));
+    let sent = world.until("audio clip settles", || {
+        world
+            .messages(&alpha("C0GEN"))
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("56101") && m.state != SendState::Pending)
+    });
+    assert_eq!(sent.state, SendState::Sent);
+    assert_eq!(sent.attachments.len(), 1);
+    assert_eq!(sent.attachments[0].file.kind, MediaKind::Audio);
+    assert_eq!(sent.attachments[0].duration, 12);
+    assert!(!sent.attachments[0].waveform.is_empty());
+
+    let get_url = world.fake.calls(ALPHA, "files.getUploadURLExternal").pop().unwrap();
+    assert_eq!(get_url.params["filename"], "voice-42.ogg");
+    assert_eq!(get_url.params.get("subtype").map(String::as_str), Some("slack_audio"));
+
+    let completed = world.fake.calls(ALPHA, "files.completeUploadExternal").pop().unwrap();
+    let files: Value = serde_json::from_str(&completed.params["files"]).unwrap();
+    assert_eq!(files[0]["subtype"], "slack_audio");
+    assert_eq!(files[0]["duration_ms"], 12_400);
+    assert_eq!(files[0]["audio_wave_samples"], json!([0, 50, 100]));
+
+    // 2. Voice clip exceeding Slack's 5-minute cap is refused cleanly.
+    let too_long = protocol::Outgoing {
+        files: vec![protocol::OutgoingFile {
+            path: audio_path.to_string_lossy().into_owned(),
+            ..Default::default()
+        }],
+        voice: Some(protocol::VoiceNote {
+            duration: 300_001,
+            waveform: vec![64],
+        }),
+        ..Default::default()
+    };
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: alpha("C0GEN"),
+            client_id: "56102".into(),
+            text: String::new(),
+            reply_to: None,
+            with: too_long,
+        }),
+        Response::Sent { .. }
+    ));
+    let refused = world.until("overlong clip fails", || {
+        world
+            .messages(&alpha("C0GEN"))
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("56102") && m.state != SendState::Pending)
+    });
+    assert!(
+        matches!(&refused.state, SendState::Failed { reason } if reason.contains("5 minutes")),
+        "{:?}",
+        refused.state
+    );
+
+    // 3. Video clip with duration metadata uploads as `slack_video`.
+    let video_path = dir.join("demo-clip.mp4");
+    std::fs::write(&video_path, b"ftypmp42-fake-video").unwrap();
+    let with_video = protocol::Outgoing {
+        files: vec![protocol::OutgoingFile {
+            path: video_path.to_string_lossy().into_owned(),
+            media: Some(protocol::OutgoingMedia {
+                duration_ms: Some(45_000),
+                width: Some(1280),
+                height: Some(720),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: alpha("C0GEN"),
+            client_id: "56103".into(),
+            text: "Walkthrough".into(),
+            reply_to: None,
+            with: with_video,
+        }),
+        Response::Sent { .. }
+    ));
+    let video_sent = world.until("video clip settles", || {
+        world
+            .messages(&alpha("C0GEN"))
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("56103") && m.state != SendState::Pending)
+    });
+    assert_eq!(video_sent.state, SendState::Sent);
+    assert_eq!(video_sent.attachments.len(), 1);
+    assert_eq!(video_sent.attachments[0].file.kind, MediaKind::Video);
+    assert_eq!(video_sent.attachments[0].duration, 45);
+    let vid_url = world.fake.calls(ALPHA, "files.getUploadURLExternal").pop().unwrap();
+    assert_eq!(vid_url.params.get("subtype").map(String::as_str), Some("slack_video"));
+}
+
+#[test]
+fn slack_refuses_a_pdf_voice_note_instead_of_uploading_it_as_audio() {
+    let world = World::start();
+    world.ready();
+
+    let dir = world.dir.with_extension("pdf-clip");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pdf_path = dir.join("report.pdf");
+    std::fs::write(&pdf_path, b"%PDF-1.4 not a clip").unwrap();
+    let with_pdf = protocol::Outgoing {
+        files: vec![protocol::OutgoingFile {
+            path: pdf_path.to_string_lossy().into_owned(),
+            name: "report.pdf".into(),
+            ..Default::default()
+        }],
+        voice: Some(protocol::VoiceNote {
+            duration: 1_000,
+            waveform: vec![10, 20],
+        }),
+        ..Default::default()
+    };
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: alpha("C0GEN"),
+            client_id: "56104".into(),
+            text: String::new(),
+            reply_to: None,
+            with: with_pdf,
+        }),
+        Response::Sent { .. }
+    ));
+    let refused = world.until("pdf voice note fails", || {
+        world
+            .messages(&alpha("C0GEN"))
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("56104") && m.state != SendState::Pending)
+    });
+    assert!(
+        matches!(&refused.state, SendState::Failed { reason } if reason == "Slack refused this clip. Only audio and video can be clips."),
+        "{:?}",
+        refused.state
+    );
+    let uploads = world.fake.calls(ALPHA, "files.getUploadURLExternal");
+    assert!(
+        uploads.iter().all(|call| call.params.get("subtype").map(String::as_str) != Some("slack_audio")),
+        "files.getUploadURLExternal must not be called with subtype=slack_audio: {uploads:?}"
+    );
+    assert!(
+        uploads.iter().all(|call| call.params.get("filename").map(String::as_str) != Some("report.pdf")),
+        "report.pdf must not be uploaded as a file: {uploads:?}"
+    );
+}
+
+#[test]
+fn slack_clip_transcript_vtt_and_transcoded_video() {
+    let world = World::start();
+    world.ready();
+    let general = alpha("C0GEN");
+    let _ = world.messages(&general);
+
+    let ts = "1760000950.000950";
+    let event = json!({
+        "type": "message",
+        "channel": "C0GEN",
+        "user": "U0ANA",
+        "text": "",
+        "ts": ts,
+        "event_ts": ts,
+        "files": [
+            {
+                "id": "F0CLIP1",
+                "name": "standup.ogg",
+                "title": "Standup update",
+                "mimetype": "audio/ogg",
+                "subtype": "slack_audio",
+                "size": 42_000,
+                "duration_ms": 7_500,
+                "audio_wave_samples": [10, 50, 90, 40],
+                "url_private": format!("{}/files-pri/T01ALPHA-F0CLIP1/standup.ogg", world.fake.base),
+                "vtt": format!("{}/files-pri/T01ALPHA-F0CLIP1/transcript.vtt", world.fake.base),
+                "transcription": {
+                    "status": "complete",
+                    "preview": { "content": "Quick deploy update for everyone." }
+                }
+            },
+            {
+                "id": "F0VID1",
+                "name": "walkthrough.mov",
+                "title": "Walkthrough",
+                "mimetype": "video/quicktime",
+                "subtype": "slack_video",
+                "size": 25_000_000,
+                "duration_ms": 30_000,
+                "url_private": format!("{}/files-pri/T01ALPHA-F0VID1/original.mov", world.fake.base),
+                "mp4": format!("{}/files-pri/T01ALPHA-F0VID1/transcoded.mp4", world.fake.base),
+                "thumb_video": format!("{}/files-tmb/T01ALPHA-F0VID1/thumb.jpg", world.fake.base),
+                "vtt": format!("{}/files-pri/T01ALPHA-F0VID1/captions.vtt", world.fake.base),
+                "transcription": {
+                    "status": "complete",
+                    "preview": "Demo preview"
+                }
+            }
+        ]
+    });
+    world.fake.push(ALPHA, event);
+
+    let msg = world.until("clip message stored", || world.message(&general, ts));
+    assert_eq!(msg.attachments.len(), 2);
+
+    // 1. Audio clip carries transcript preview/status and lazy VTT MediaFile, never eagerly fetched.
+    let audio = &msg.attachments[0];
+    assert_eq!(audio.file.kind, MediaKind::Audio);
+    assert_eq!(audio.duration, 7);
+    let tr = audio.transcript.as_ref().expect("audio clip transcript");
+    assert_eq!(tr.status, "complete");
+    assert_eq!(tr.preview, "Quick deploy update for everyone.");
+    assert!(tr.lines.is_empty(), "full lines must be fetched lazily, not stored eagerly");
+    let vtt_file = tr.file.as_ref().expect("vtt MediaFile registered");
+    assert_eq!(vtt_file.id, "F0CLIP1:vtt");
+    assert!(
+        world.fake.file("/files-pri/T01ALPHA-F0CLIP1/transcript.vtt").is_none(),
+        "VTT must not be fetched until the user opens the transcript"
+    );
+
+    // 2. On-demand Request::Fetch downloads the VTT with session headers and parses into timed cues.
+    let landed = world.fetched(&general, &vtt_file.id, None);
+    let path = landed.path.as_deref().expect("vtt landed on disk");
+    let vtt_call = world
+        .fake
+        .file("/files-pri/T01ALPHA-F0CLIP1/transcript.vtt")
+        .expect("vtt fetched on demand");
+    assert_eq!(vtt_call.token, ALPHA);
+    assert!(vtt_call.cookie.contains(COOKIE));
+    let raw = std::fs::read_to_string(path).unwrap();
+    let lines = protocol::parse_webvtt(&raw);
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0].start_ms, 500);
+    assert_eq!(lines[0].text, "Ana: Quick deploy update for everyone.");
+    assert_eq!(lines[1].start_ms, 3_500);
+    assert_eq!(protocol::active_caption(&lines, 4_000).map(|l| l.text.as_str()), Some("Canary is green and traffic is at 50%."));
+
+    // 3. Video clip prefers the smaller transcoded `mp4` copy over the raw `url_private` upload.
+    let video = &msg.attachments[1];
+    assert_eq!(video.file.kind, MediaKind::Video);
+    assert_eq!(video.transcript.as_ref().unwrap().preview, "Demo preview");
+    let _landed_vid = world.fetched(&general, &video.file.id, None);
+    assert!(
+        world.fake.file("/files-pri/T01ALPHA-F0VID1/transcoded.mp4").is_some(),
+        "must prefer transcoded mp4 copy over original mov"
+    );
+    assert!(
+        world.fake.file("/files-pri/T01ALPHA-F0VID1/original.mov").is_none(),
+        "must not fetch original mov when transcoded mp4 exists"
+    );
 }

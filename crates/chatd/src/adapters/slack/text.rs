@@ -140,7 +140,14 @@ impl<'a> Rich<'a> {
 
     pub fn link(&mut self, url: &str, label: Option<&str>) {
         let start = self.at();
-        self.text.push_str(label.filter(|label| !label.is_empty()).unwrap_or(url));
+        // A shortcut is a workflow. The catalog that would name it is not documented, so the
+        // link says what it is and that it opens in Slack. The address itself is unchanged.
+        let shown = if shortcut_link(url) {
+            "Workflow · Open in Slack"
+        } else {
+            label.filter(|label| !label.is_empty()).unwrap_or(url)
+        };
+        self.text.push_str(shown);
         self.span(start, Style::Link { url: url.to_owned() });
     }
 
@@ -445,6 +452,27 @@ impl<'a> Rich<'a> {
             }
         }
     }
+}
+
+/// A Slack shortcut page: `https://slack.com/shortcuts` or a workspace's `/shortcuts/…`.
+/// Not a channel, a file, or another host.
+fn shortcut_link(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    if rest.is_empty() || rest.contains('@') {
+        return false;
+    }
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    if authority.is_empty() || authority.contains(':') || authority.starts_with('.') || authority.contains("..") {
+        return false;
+    }
+    let slack = authority == "slack.com" || authority.strip_suffix("slack.com").is_some_and(|prefix| prefix.ends_with('.'));
+    if !slack {
+        return false;
+    }
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    path == "shortcuts" || path.starts_with("shortcuts/")
 }
 
 /// Where the style opened at `open` closes, if this really is a pair: it opens at the start of
@@ -943,6 +971,23 @@ mod tests {
         rich.finish();
         assert_eq!(rich.text, "hello ¯\\_(ツ)_/¯");
         assert!(rich.spans.iter().all(|span| !matches!(span.style, Style::Italic)));
+    }
+
+    #[test]
+    fn a_shortcut_link_is_named_a_workflow() {
+        let mut rich = Rich::new(&Book);
+        rich.mrkdwn("run <https://acme.slack.com/shortcuts/Ft1|Deploy> or <https://slack.com/shortcuts> and <https://acme.slack.com/archives/C9>");
+        rich.finish();
+        let found = ranges(&rich);
+        let linked = |url: &str| found.iter().any(|(text, style)| text == "Workflow · Open in Slack" && matches!(style, Style::Link { url: got } if got == url));
+        assert!(linked("https://acme.slack.com/shortcuts/Ft1"));
+        assert!(linked("https://slack.com/shortcuts"));
+        assert!(found.iter().any(|(text, style)| text == "https://acme.slack.com/archives/C9" && matches!(style, Style::Link { .. })));
+        assert!(!super::shortcut_link("https://evil.example/shortcuts"));
+        assert!(!super::shortcut_link("https://notslack.com/shortcuts"));
+        assert!(!super::shortcut_link("http://slack.com/shortcuts"));
+        assert!(!super::shortcut_link("https://acme.slack.com/shortcuts-other"));
+        assert!(super::shortcut_link("https://app.slack.com/shortcuts/Ft9?focus=1"));
     }
 
     #[test]

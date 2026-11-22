@@ -821,8 +821,10 @@ impl Slack {
             if self.ctx.pause(wait) {
                 return;
             }
-            self.state().previewed = Some(Instant::now());
+            // The gap runs from one answer to the next request. A stamp taken before the
+            // call lets a slow answer and a fast follow-up arrive less than a second apart.
             self.report(self.newest_of(&id));
+            self.state().previewed = Some(Instant::now());
         }
     }
 

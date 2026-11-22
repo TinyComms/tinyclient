@@ -24,6 +24,8 @@ pub const DELIVERIES_LIMIT: usize = 256;
 pub const MESSAGE_CONTROLS_LIMIT: usize = 32;
 /// Most selectable options on a single menu, radio group, or checkbox group.
 pub const CONTROL_OPTIONS_LIMIT: usize = 100;
+/// Most timed cues kept from a clip transcript (WebVTT).
+pub const TRANSCRIPT_LINES_LIMIT: usize = 2_000;
 
 /// Cuts text from a network to at most `chars` characters, so no frame grows with what a
 /// stranger typed.
@@ -145,6 +147,195 @@ pub struct Span {
     pub style: Style,
 }
 
+/// One timed cue in a clip's transcript or caption track (parsed from WebVTT).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptLine {
+    /// Milliseconds from the start of the clip.
+    pub start_ms: u32,
+    /// Milliseconds at the end of the cue (0 when unknown).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub end_ms: u32,
+    pub text: String,
+}
+
+/// Optional transcript and captions metadata carried on an audio or video clip [`Attachment`].
+/// The full WebVTT track (`file`) is fetched lazily via `Request::Fetch` only when opened, never
+/// downloaded or stored for unopened clips.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Transcript {
+    /// Short preview snippet supplied inline by the network (e.g. Slack `transcription.preview`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub preview: String,
+    /// Network transcription state (`"complete"`, `"processing"`, `"failed"`, etc.) when reported.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
+    /// Registered caption track file (WebVTT), fetched on demand with the session's headers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<MediaFile>,
+    /// Timed lines when supplied inline or populated on demand.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lines: Vec<TranscriptLine>,
+}
+
+impl Transcript {
+    pub fn is_empty(&self) -> bool {
+        self.preview.is_empty() && self.status.is_empty() && self.file.is_none() && self.lines.is_empty()
+    }
+
+    /// Returns the cue active at playback position `at_ms`.
+    pub fn active_caption(&self, at_ms: u32) -> Option<&TranscriptLine> {
+        active_caption(&self.lines, at_ms)
+    }
+
+    pub fn bound(&mut self) {
+        clip(&mut self.preview, 1_000);
+        clip(&mut self.status, 64);
+        self.lines.truncate(TRANSCRIPT_LINES_LIMIT);
+        for line in &mut self.lines {
+            clip(&mut line.text, 500);
+        }
+    }
+}
+
+/// Returns the caption cue active at `at_ms`, preferring cues with an explicit `[start_ms, end_ms)`
+/// range and falling back to the latest open-ended cue (`end_ms == 0`) at or before `at_ms`.
+pub fn active_caption(lines: &[TranscriptLine], at_ms: u32) -> Option<&TranscriptLine> {
+    if let Some(hit) = lines
+        .iter()
+        .find(|line| line.end_ms > line.start_ms && at_ms >= line.start_ms && at_ms < line.end_ms)
+    {
+        return Some(hit);
+    }
+    lines
+        .iter()
+        .rev()
+        .find(|line| line.end_ms == 0 && at_ms >= line.start_ms)
+}
+
+/// Parses a WebVTT (or SRT-formatted) caption track into bounded timed [`TranscriptLine`]s.
+pub fn parse_webvtt(vtt: &str) -> Vec<TranscriptLine> {
+    let normalized = vtt.trim_start_matches('\u{feff}').replace("\r\n", "\n").replace('\r', "\n");
+    let mut out = Vec::new();
+    let mut block: Vec<&str> = Vec::new();
+    for line in normalized.split('\n').chain(std::iter::once("")) {
+        if line.trim().is_empty() {
+            if !block.is_empty() {
+                parse_vtt_block(&block, &mut out);
+                block.clear();
+                if out.len() >= TRANSCRIPT_LINES_LIMIT {
+                    break;
+                }
+            }
+        } else {
+            block.push(line);
+        }
+    }
+    out
+}
+
+fn parse_vtt_block(block: &[&str], out: &mut Vec<TranscriptLine>) {
+    let first = block[0].trim();
+    if first.starts_with("WEBVTT")
+        || first.starts_with("NOTE")
+        || first.starts_with("STYLE")
+        || first.starts_with("REGION")
+    {
+        return;
+    }
+    let Some(timing_idx) = block.iter().position(|line| line.contains("-->")) else {
+        return;
+    };
+    let Some((left, right)) = block[timing_idx].split_once("-->") else {
+        return;
+    };
+    let Some(start_ms) = parse_vtt_timestamp(left.trim()) else {
+        return;
+    };
+    let end_ms = right
+        .split_whitespace()
+        .next()
+        .and_then(parse_vtt_timestamp)
+        .unwrap_or(0);
+    let mut text = String::new();
+    for payload in &block[timing_idx + 1..] {
+        let cleaned = clean_vtt_text(payload);
+        let trimmed = cleaned.trim();
+        if !trimmed.is_empty() {
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            text.push_str(trimmed);
+        }
+    }
+    if !text.is_empty() {
+        clip(&mut text, 500);
+        out.push(TranscriptLine { start_ms, end_ms, text });
+    }
+}
+
+fn parse_vtt_timestamp(raw: &str) -> Option<u32> {
+    let parts: Vec<&str> = raw.split(':').collect();
+    let (hours, mins, sec_str) = match parts.as_slice() {
+        [h, m, s] => (h.parse::<u64>().ok()?, m.parse::<u64>().ok()?, *s),
+        [m, s] => (0u64, m.parse::<u64>().ok()?, *s),
+        _ => return None,
+    };
+    let (secs, ms) = match sec_str.split_once(['.', ',']) {
+        Some((s, frac)) => {
+            let secs = s.parse::<u64>().ok()?;
+            let digits: String = frac.chars().take_while(char::is_ascii_digit).take(3).collect();
+            let ms = match digits.len() {
+                0 => 0,
+                1 => digits.parse::<u64>().ok()? * 100,
+                2 => digits.parse::<u64>().ok()? * 10,
+                _ => digits.parse::<u64>().ok()?,
+            };
+            (secs, ms)
+        }
+        None => (sec_str.parse::<u64>().ok()?, 0),
+    };
+    let total = hours
+        .saturating_mul(3_600_000)
+        .saturating_add(mins.saturating_mul(60_000))
+        .saturating_add(secs.saturating_mul(1_000))
+        .saturating_add(ms);
+    Some(total.min(u64::from(u32::MAX)) as u32)
+}
+
+fn clean_vtt_text(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(lt) = rest.find('<') {
+        out.push_str(&rest[..lt]);
+        let after = &rest[lt + 1..];
+        let Some(gt) = after.find('>') else {
+            out.push('<');
+            rest = after;
+            break;
+        };
+        let tag = &after[..gt];
+        if let Some(tail) = tag.strip_prefix('v') {
+            if tail.starts_with([' ', '.']) {
+                if let Some((_, speaker)) = tail.split_once(' ') {
+                    let speaker = speaker.trim();
+                    if !speaker.is_empty() && out.is_empty() {
+                        out.push_str(speaker);
+                        out.push_str(": ");
+                    }
+                }
+            }
+        }
+        rest = &after[gt + 1..];
+    }
+    out.push_str(rest);
+    out.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&nbsp;", " ")
+        .replace("&apos;", "'")
+        .replace("&quot;", "\"")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     pub name: String,
@@ -184,6 +375,9 @@ pub struct Attachment {
     /// Telegram sticker pack as `id:access_hash` or a short name. Empty on every other attachment.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub sticker_set: String,
+    /// Optional clip transcript preview and lazy caption track (Slack clips).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<Transcript>,
 }
 
 impl Attachment {
@@ -202,6 +396,7 @@ impl Attachment {
             round: false,
             view_once: false,
             sticker_set: String::new(),
+            transcript: None,
         }
     }
 }
@@ -1035,6 +1230,11 @@ impl Message {
         for attachment in &mut self.attachments {
             attachment.waveform.truncate(WAVEFORM_LIMIT);
         }
+        for attachment in &mut self.attachments {
+            if let Some(transcript) = &mut attachment.transcript {
+                transcript.bound();
+            }
+        }
         if let Some(thread) = &mut self.thread {
             thread.participants.truncate(THREAD_FACES);
         }
@@ -1192,10 +1392,12 @@ impl Message {
 
     /// Every file the message refers to, for registering and for fetching what is on screen.
     pub fn files(&self) -> impl Iterator<Item = &MediaFile> {
-        let attached = self
-            .attachments
-            .iter()
-            .flat_map(|attachment| std::iter::once(&attachment.file).chain(&attachment.thumb).chain(&attachment.preview));
+        let attached = self.attachments.iter().flat_map(|attachment| {
+            std::iter::once(&attachment.file)
+                .chain(&attachment.thumb)
+                .chain(&attachment.preview)
+                .chain(attachment.transcript.as_ref().and_then(|t| t.file.as_ref()))
+        });
         let emoji = self.spans.iter().filter_map(|span| match &span.style {
             Style::Emoji { file } => Some(file),
             _ => None,
@@ -1214,10 +1416,12 @@ impl Message {
 
     /// The same, to fill in paths.
     pub fn files_mut(&mut self) -> impl Iterator<Item = &mut MediaFile> {
-        let attached = self
-            .attachments
-            .iter_mut()
-            .flat_map(|attachment| std::iter::once(&mut attachment.file).chain(&mut attachment.thumb).chain(&mut attachment.preview));
+        let attached = self.attachments.iter_mut().flat_map(|attachment| {
+            std::iter::once(&mut attachment.file)
+                .chain(&mut attachment.thumb)
+                .chain(&mut attachment.preview)
+                .chain(attachment.transcript.as_mut().and_then(|t| t.file.as_mut()))
+        });
         let emoji = self.spans.iter_mut().filter_map(|span| match &mut span.style {
             Style::Emoji { file } => Some(file),
             _ => None,
@@ -1427,6 +1631,35 @@ mod tests {
         let story_wire = serde_json::to_string(&story_reply).unwrap();
         assert!(story_wire.contains(r#""story":true"#));
         assert!(serde_json::from_str::<ReplyTo>(&story_wire).unwrap().story);
+    }
+
+    #[test]
+    fn webvtt_parses_timed_lines_active_caption_and_transcript_round_trips() {
+        let vtt = "\u{feff}WEBVTT\r\n\r\nNOTE generated by Slack\r\n\r\n1\r\n00:00:00.500 --> 00:00:03.200 align:start\r\n<v Ana>Hello &amp; welcome!</v>\r\n\r\n00:03.500 --> 00:07.000\r\n<i>Canary</i> is green.\r\nSecond line.\r\n\r\n01:02:03,45 --> 01:02:05,000\r\nLate cue\r\n";
+        let lines = parse_webvtt(vtt);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], TranscriptLine { start_ms: 500, end_ms: 3_200, text: "Ana: Hello & welcome!".into() });
+        assert_eq!(lines[1], TranscriptLine { start_ms: 3_500, end_ms: 7_000, text: "Canary is green. Second line.".into() });
+        assert_eq!(lines[2], TranscriptLine { start_ms: 3_723_450, end_ms: 3_725_000, text: "Late cue".into() });
+
+        assert_eq!(active_caption(&lines, 400), None);
+        assert_eq!(active_caption(&lines, 1_000), Some(&lines[0]));
+        assert_eq!(active_caption(&lines, 3_300), None);
+        assert_eq!(active_caption(&lines, 3_500), Some(&lines[1]));
+
+        let mut att = Attachment::new("clip.ogg", MediaFile::new("F0CLIP", MediaKind::Audio));
+        let plain_wire = serde_json::to_string(&att).unwrap();
+        assert!(!plain_wire.contains("transcript"), "empty transcript stays off wire");
+        assert_eq!(serde_json::from_str::<Attachment>(&plain_wire).unwrap().transcript, None);
+
+        att.transcript = Some(Transcript {
+            preview: "Hello & welcome!".into(),
+            status: "complete".into(),
+            file: Some(MediaFile::new("F0CLIP:vtt", MediaKind::File)),
+            lines: lines.clone(),
+        });
+        let rich_wire = serde_json::to_string(&att).unwrap();
+        assert_eq!(serde_json::from_str::<Attachment>(&rich_wire).unwrap(), att);
     }
 
     #[test]
