@@ -3182,6 +3182,19 @@ pub enum Request {
         conversation: Key,
         status: Option<String>,
     },
+    /// Changes server mute or deafen for a participant in a server voice channel.
+    CallModerate {
+        conversation: Key,
+        person: Key,
+        server_muted: Option<bool>,
+        server_deafened: Option<bool>,
+    },
+    /// Moves a participant from their voice channel, or disconnects them when `to` is absent.
+    CallMove {
+        conversation: Key,
+        person: Key,
+        to: Option<Key>,
+    },
     /// Joins or rings. Starts mediad. One call at a time. Refused with `Unsupported`, and no
     /// mediad, unless the conversation's `call` is `Native`.
     CallStart {
@@ -5647,6 +5660,10 @@ mod tests {
         assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&set_as).unwrap()).unwrap(), set_as);
 
         let all = ConversationRights {
+            set_voice_status: true,
+            voice_mute: true,
+            voice_deafen: true,
+            voice_move: true,
             pin: true,
             delete_others: true,
             manage_members: true,

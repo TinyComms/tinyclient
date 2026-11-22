@@ -56,6 +56,8 @@ pub const MANAGE_MESSAGES: u64 = 1 << 13;
 pub const READ_MESSAGE_HISTORY: u64 = 1 << 16;
 pub const CONNECT: u64 = 1 << 20;
 pub const SPEAK: u64 = 1 << 21;
+pub const MUTE_MEMBERS: u64 = 1 << 22;
+pub const DEAFEN_MEMBERS: u64 = 1 << 23;
 pub const MOVE_MEMBERS: u64 = 1 << 24;
 #[allow(dead_code)]
 pub const USE_VAD: u64 = 1 << 25;

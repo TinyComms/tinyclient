@@ -367,6 +367,8 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             (200, ch)
         }
         ("PATCH", ["guilds", _guild, "channels"]) => (204, Value::Null),
+        ("PATCH", ["guilds", _guild, "members", _member])
+            if ["mute", "deaf", "channel_id"].iter().any(|field| seen.body.get(field).is_some()) => (204, Value::Null),
         ("PUT", ["channels", _channel, "permissions", _target]) => (204, Value::Null),
         ("PUT", ["channels", channel, "voice-status"]) => {
             shared.push("VOICE_CHANNEL_STATUS_UPDATE", json!({"id": channel, "guild_id": "4000", "status": seen.body["status"]}));
@@ -3162,6 +3164,55 @@ fn voice_channel_status_loads_on_open_and_clears_when_the_last_person_leaves() {
     wait("the status from the gateway", || (world.conversation("4201").topic == "é".repeat(500)).then_some(()));
     world.discord.push("VOICE_STATE_UPDATE", json!({"guild_id": "4000", "channel_id": null, "user_id": "2002", "session_id": "voice-dev"}));
     wait("the empty channel to clear its status", || world.conversation("4201").topic.is_empty().then_some(()));
+}
+
+#[test]
+fn voice_moderation_checks_channel_permissions_and_waits_for_the_gateway() {
+    let world = World::start();
+    let lounge = world.key("4201");
+    let person = world.key("2002");
+    let modify = |server_muted: Option<bool>, server_deafened: Option<bool>| {
+        world.ask(serde_json::from_value(json!({
+            "op": "call_moderate", "conversation": lounge, "person": person, "server_muted": server_muted, "server_deafened": server_deafened
+        })).unwrap())
+    };
+    let move_to = |to: Option<Key>| world.ask(serde_json::from_value(json!({
+        "op": "call_move", "conversation": lounge, "person": person, "to": to
+    })).unwrap());
+    let route = "/guilds/4000/members/2002";
+    assert!(matches!(modify(Some(true), None), Response::Error { .. }));
+    assert!(matches!(modify(None, Some(true)), Response::Error { .. }));
+    assert!(matches!(move_to(None), Response::Error { .. }));
+    assert!(world.discord.requests_to("PATCH", route).is_empty());
+    world.discord.push("GUILD_ROLE_UPDATE", json!({
+        "guild_id": "4000",
+        "role": {"id": "4000", "name": "@everyone", "permissions": ((1u64 << 10) | (1 << 20) | (1 << 22) | (1 << 23) | (1 << 24)).to_string()}
+    }));
+    wait("the moderation permissions", || {
+        let rights = serde_json::to_value(world.conversation("4201").rights).unwrap();
+        (rights["voice_mute"] == true && rights["voice_deafen"] == true && rights["voice_move"] == true).then_some(())
+    });
+    world.discord.push("CHANNEL_CREATE", json!({
+        "id":"4203", "guild_id":"4000", "type":2, "name":"Studio", "parent_id":"4200", "permission_overwrites":[]
+    }));
+    wait("a joinable destination", || {
+        matches!(world.ask(Request::Conversation { conversation: world.key("4203") }),
+            Response::Conversation { conversation } if conversation.call == CallSupport::Native).then_some(())
+    });
+    assert_eq!(modify(Some(true), None), Response::Ok);
+    assert_eq!(modify(None, Some(true)), Response::Ok);
+    assert_eq!(move_to(Some(world.key("4203"))), Response::Ok);
+    assert_eq!(move_to(None), Response::Ok);
+    let sent: Vec<_> = world.discord.requests_to("PATCH", route).into_iter().map(|seen| seen.body).collect();
+    assert_eq!(sent, [json!({"mute": true}), json!({"deaf": true}), json!({"channel_id": "4203"}), json!({"channel_id": null})]);
+    let dev = || world.conversation("4201").occupants.and_then(|inside| inside.people.into_iter().find(|who| who.person == person));
+    assert!(!dev().unwrap().server_muted);
+    assert!(!dev().unwrap().server_deafened);
+    world.discord.push("VOICE_STATE_UPDATE", json!({
+        "guild_id": "4000", "channel_id": "4201", "user_id": "2002", "session_id": "voice-dev", "mute": true, "deaf": true
+    }));
+    wait("server mute and deafen", || dev().filter(|dev| dev.server_muted && dev.server_deafened));
+    assert_ne!(serde_json::to_value(world.conversation("3001").rights).unwrap()["voice_move"], true);
 }
 
 #[test]

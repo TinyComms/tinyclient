@@ -6337,6 +6337,36 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::CallModerate { conversation, person, server_muted, server_deafened } => {
+                let account = conversation.account();
+                if person.account() != account {
+                    return error(ErrorCode::Refused, "That participant belongs to a different account.");
+                }
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::CallModerate {
+                    conversation_id: conversation.id, person_id: person.id, server_muted, server_deafened, reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::CallMove { conversation, person, to } => {
+                let account = conversation.account();
+                if person.account() != account || to.as_ref().is_some_and(|channel| channel.account() != account) {
+                    return error(ErrorCode::Refused, "The participant and channels must belong to the same account.");
+                }
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::CallMove {
+                    conversation_id: conversation.id, person_id: person.id, to: to.map(|channel| channel.id), reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::CallStart { conversation } => self.call_start(conversation),
             Request::CallAccept => self.call_accept(),
             // A ring waiting beside a call is declined on its own. Ending the call does not

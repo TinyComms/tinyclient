@@ -4204,6 +4204,12 @@ impl Discord {
             Command::SetVoiceChannelStatus { conversation_id, status, reply } => {
                 answer(reply, self.set_voice_status(&conversation_id, status))
             }
+            Command::CallModerate { conversation_id, person_id, server_muted, server_deafened, reply } => {
+                answer(reply, self.moderate_voice(&conversation_id, &person_id, server_muted, server_deafened))
+            }
+            Command::CallMove { conversation_id, person_id, to, reply } => {
+                answer(reply, self.move_in_voice(&conversation_id, &person_id, to.as_deref()))
+            }
             Command::CallJoin(conversation_id) => self.call_join(&conversation_id),
             Command::CallLeave(conversation_id) => self.call_leave(&conversation_id),
             Command::CallAudio { muted, deafened } => self.call_audio(muted, deafened),

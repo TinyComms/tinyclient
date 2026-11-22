@@ -1804,6 +1804,14 @@ pub enum Command {
         reply: Reply<()>,
     },
     SetVoiceChannelStatus { conversation_id: String, status: Option<String>, reply: Reply<()> },
+    CallModerate {
+        conversation_id: String,
+        person_id: String,
+        server_muted: Option<bool>,
+        server_deafened: Option<bool>,
+        reply: Reply<()>,
+    },
+    CallMove { conversation_id: String, person_id: String, to: Option<String>, reply: Reply<()> },
     /// mediad is up: join or ring on the network, then report through [`Context::voice`].
     CallJoin(String),
     /// Leave, cancel or decline on the network. Also sent when the call failed here (mediad
@@ -1997,6 +2005,8 @@ impl Command {
             | Command::SetDefaultSendAs { reply, .. }
             | Command::EditChannel { reply, .. }
             | Command::SetVoiceChannelStatus { reply, .. }
+            | Command::CallModerate { reply, .. }
+            | Command::CallMove { reply, .. }
             | Command::MoveChannels { reply, .. }
             | Command::DeleteChannel { reply, .. }
             | Command::SetOverwrite { reply, .. }

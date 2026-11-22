@@ -70,6 +70,48 @@ impl Discord {
         self.call("PUT", &format!("/channels/{channel}/voice-status"), Some(json!({"status": status})))
             .map(|_| ()).map_err(super::refusal)
     }
+
+    /// The current channel and guild are checked against the latest gateway state.
+    fn voice_target(&self, channel: &str, person: &str) -> Result<String, Refusal> {
+        let state = self.state.lock().unwrap();
+        state.voice.states.get(person).filter(|heard| heard.channel == channel && person != state.me)
+            .and_then(|heard| heard.guild.clone())
+            .ok_or_else(|| Refusal::Refused("That participant is no longer in this server voice channel.".into()))
+    }
+
+    pub(super) fn moderate_voice(&self, channel: &str, person: &str, mute: Option<bool>, deaf: Option<bool>) -> Result<(), Refusal> {
+        let guild = self.voice_target(channel, person)?;
+        let mut body = serde_json::Map::new();
+        if let Some(mute) = mute {
+            self.require_channel_perm(&guild, channel, model::MUTE_MEMBERS, "server mute this participant")?;
+            body.insert("mute".into(), json!(mute));
+        }
+        if let Some(deaf) = deaf {
+            self.require_channel_perm(&guild, channel, model::DEAFEN_MEMBERS, "server deafen this participant")?;
+            body.insert("deaf".into(), json!(deaf));
+        }
+        if body.is_empty() {
+            return Ok(());
+        }
+        self.call("PATCH", &format!("/guilds/{guild}/members/{person}"), Some(Value::Object(body)))
+            .map(|_| ()).map_err(super::refusal)
+    }
+
+    pub(super) fn move_in_voice(&self, channel: &str, person: &str, to: Option<&str>) -> Result<(), Refusal> {
+        let guild = self.voice_target(channel, person)?;
+        self.require_channel_perm(&guild, channel, model::MOVE_MEMBERS, "move or disconnect this participant")?;
+        if let Some(to) = to {
+            let valid = self.ctx.known(to).ok().flatten().is_some_and(|row| {
+                row.kind == ConversationKind::Voice && row.space.as_deref() == Some(guild.as_str())
+                    && self.channel_permission_bits(&guild, to).is_some_and(|bits| bits & model::CONNECT != 0)
+            });
+            if !valid {
+                return Err(Refusal::Refused("Choose a voice channel you can join on this server.".into()));
+            }
+        }
+        self.call("PATCH", &format!("/guilds/{guild}/members/{person}"), Some(json!({"channel_id": to})))
+            .map(|_| ()).map_err(super::refusal)
+    }
 }
 /// How long Discord has to hand out a voice session.
 const PATIENCE: Duration = Duration::from_secs(15);

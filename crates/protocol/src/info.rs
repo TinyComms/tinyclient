@@ -1254,6 +1254,12 @@ pub struct ConversationRights {
     /// May set the status of a voice channel while connected to it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub set_voice_status: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub voice_mute: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub voice_deafen: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub voice_move: bool,
     /// May pin or unpin messages in this conversation.
     #[serde(default, skip_serializing_if = "is_false")]
     pub pin: bool,
@@ -1360,6 +1366,9 @@ impl ConversationRights {
     const ANONYMOUS: i64 = 1 << 22;
     const MANAGE_TOPICS: i64 = 1 << 23;
     const SET_VOICE_STATUS: i64 = 1 << 24;
+    const VOICE_MUTE: i64 = 1 << 25;
+    const VOICE_DEAFEN: i64 = 1 << 26;
+    const VOICE_MOVE: i64 = 1 << 27;
 
     pub fn is_none(&self) -> bool {
         *self == ConversationRights::default()
@@ -1373,6 +1382,15 @@ impl ConversationRights {
         let mut bits = 0i64;
         if self.set_voice_status {
             bits |= Self::SET_VOICE_STATUS;
+        }
+        if self.voice_mute {
+            bits |= Self::VOICE_MUTE;
+        }
+        if self.voice_deafen {
+            bits |= Self::VOICE_DEAFEN;
+        }
+        if self.voice_move {
+            bits |= Self::VOICE_MOVE;
         }
         if self.pin {
             bits |= Self::PIN;
@@ -1452,6 +1470,9 @@ impl ConversationRights {
     pub fn from_bits(bits: i64) -> Self {
         Self {
             set_voice_status: bits & Self::SET_VOICE_STATUS != 0,
+            voice_mute: bits & Self::VOICE_MUTE != 0,
+            voice_deafen: bits & Self::VOICE_DEAFEN != 0,
+            voice_move: bits & Self::VOICE_MOVE != 0,
             pin: (bits & Self::PIN) != 0,
             delete_others: (bits & Self::DELETE_OTHERS) != 0,
             manage_members: (bits & Self::MANAGE_MEMBERS) != 0,

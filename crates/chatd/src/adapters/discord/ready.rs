@@ -390,6 +390,9 @@ impl GuildInfo {
         let read_only = locked || (written && perms & SEND_MESSAGES == 0);
         let rights = protocol::ConversationRights {
             set_voice_status: channel.kind == model::VOICE && timed_out.is_none() && perms & model::SET_VOICE_CHANNEL_STATUS != 0,
+            voice_mute: channel.is_voice() && timed_out.is_none() && perms & model::MUTE_MEMBERS != 0,
+            voice_deafen: channel.is_voice() && timed_out.is_none() && perms & model::DEAFEN_MEMBERS != 0,
+            voice_move: channel.is_voice() && timed_out.is_none() && perms & model::MOVE_MEMBERS != 0,
             pin: timed_out.is_none() && (perms & (MANAGE_MESSAGES | PIN_MESSAGES) != 0),
             delete_others: timed_out.is_none() && (perms & MANAGE_MESSAGES != 0),
             manage_members: timed_out.is_none() && (perms & (KICK_MEMBERS | BAN_MEMBERS | MANAGE_ROLES) != 0),

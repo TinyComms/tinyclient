@@ -287,6 +287,7 @@ impl Shell {
         others.sort_by_key(|who| who.name.to_lowercase());
         people.extend(others);
         let count = people.len();
+        let channel = self.discord_voice_row(&call.conversation).map(std::rc::Rc::new);
         let rows = people.into_iter().map(|who| {
             let state = if who.sharing {
                 ("Sharing their screen", theme::accent_text())
@@ -302,6 +303,16 @@ impl Shell {
                 ("In the call", theme::text_faint())
             };
             let name = if who.me { format!("{} (you)", who.name) } else { who.name.clone() };
+            let moderate = channel.as_ref().filter(|channel| !who.me && self.discord_voice_target(channel, &who.key))
+                .and_then(|channel| {
+                    let occupant = channel.occupants.as_ref()?.people.iter().find(|occupant| occupant.person == who.key)?.clone();
+                    let channel = channel.clone();
+                    let id = gpui::SharedString::from(format!("call-phone-moderate-{}", who.key.id));
+                    Some(strip_button(id, "icons/ellipsis.svg")
+                        .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                            this.open_menu(crate::gui::layout::Menu::VoiceOccupant(channel.clone(), occupant.clone(), event.position()), cx);
+                        })))
+                });
             div()
                 .min_h(px(64.))
                 .px(px(tokens::GUTTER))
@@ -328,6 +339,7 @@ impl Shell {
                         .children(who.deafened.then(|| glyph("icons/headphone-off.svg", 18., theme::text_faint())))
                         .children(who.muted.then(|| glyph("icons/mic-off.svg", 18., theme::danger()))),
                 )
+                .children(moderate)
         });
         let place = subject.space.clone().map(|space| format!("{} · {space}", subject.title)).unwrap_or_else(|| subject.title.clone());
         div()

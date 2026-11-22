@@ -70,7 +70,7 @@ pub enum Row {
     Drafts { space: Key, count: u32 },
     Group { space: Key, id: String, name: String, collapsed: bool, muted: bool, rollup: Rollup, depth: u8 },
     Conversation { conversation: Rc<Conversation>, depth: u8 },
-    Occupant { occupant: Occupant, depth: u8 },
+    Occupant { channel: Rc<Conversation>, occupant: Occupant, depth: u8 },
     /// `+4` under a voice channel.
     More { words: String, depth: u8 },
     Fold { words: String, reveal: Reveal, depth: u8 },
@@ -186,7 +186,9 @@ pub fn flatten(space: &Key, groups: &[Group], conversations: &[Rc<Conversation>]
                 rows.push(Row::Fold { words, reveal: Reveal::Threads(conversation.key.clone()), depth: depth + 1 });
             }
             if let Some(inside) = conversation.occupants.as_ref().filter(|_| occupied(conversation)) {
-                rows.extend(inside.people.iter().take(OCCUPANTS_SHOWN).map(|occupant| Row::Occupant { occupant: occupant.clone(), depth: depth + 1 }));
+                rows.extend(inside.people.iter().take(OCCUPANTS_SHOWN).map(|occupant| Row::Occupant {
+                    channel: Rc::clone(conversation), occupant: occupant.clone(), depth: depth + 1,
+                }));
                 let more = (inside.total as usize).saturating_sub(OCCUPANTS_SHOWN.min(inside.people.len()));
                 if more > 0 {
                     rows.push(Row::More { words: format!("+{more}"), depth: depth + 1 });
@@ -332,7 +334,7 @@ mod tests {
                     }
                 }
                 Row::Conversation { conversation, depth } => format!("{}{}", ".".repeat(*depth as usize), conversation.key.id),
-                Row::Occupant { occupant, depth } => format!("{}@{}", ".".repeat(*depth as usize), occupant.name),
+                Row::Occupant { occupant, depth, .. } => format!("{}@{}", ".".repeat(*depth as usize), occupant.name),
                 Row::More { words, .. } | Row::Fold { words, .. } => words.clone(),
                 other => format!("{other:?}"),
             })

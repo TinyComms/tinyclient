@@ -1411,6 +1411,8 @@ impl Demo {
             Command::GetNetworkPrivacy { reply } | Command::SetNetworkPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CreateCategory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetVoiceChannelStatus { reply, .. }
+            | Command::CallModerate { reply, .. }
+            | Command::CallMove { reply, .. }
             | Command::EditChannel { reply, .. }
             | Command::MoveChannels { reply, .. }
             | Command::DeleteChannel { reply, .. }

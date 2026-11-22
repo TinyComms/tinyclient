@@ -212,7 +212,7 @@ impl Shell {
         cx.notify();
     }
 
-    pub(super) fn call_menu_close(&mut self, cx: &mut Context<Self>) {
+    pub(in crate::gui) fn call_menu_close(&mut self, cx: &mut Context<Self>) {
         if self.call_state.menu.is_some() {
             self.call_state.menu_closed = Some(Instant::now());
             self.call_menu_set(None, cx);
