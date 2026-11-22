@@ -1479,6 +1479,7 @@ fn message(account: &Account, note: &bugle::Note, page: &[bugle::Note]) -> Messa
             round: false,
             view_once: false,
             sticker_set: String::new(),
+            transcript: None,
         });
     }
     message.attachments = shown;
@@ -2746,6 +2747,7 @@ fn deliver_files(
             round: false,
             view_once: false,
             sticker_set: String::new(),
+            transcript: None,
         });
     }
     message.attachments = attachments;

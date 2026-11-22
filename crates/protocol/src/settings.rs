@@ -97,6 +97,11 @@ pub const GAIN_PREFIX: &str = "gain:";
 /// Local switch: always relay Telegram calls through Telegram servers, never offering a direct
 /// peer-to-peer path regardless of the account's peer-to-peer setting.
 pub const TELEGRAM_ALWAYS_RELAY: &str = "telegram_always_relay";
+/// Local gates beside Telegram's auto-download presets. Off until the account turns them on.
+pub const TELEGRAM_DOWNLOAD_PHOTOS: &str = "telegram_download_photos";
+pub const TELEGRAM_DOWNLOAD_PRIVATE: &str = "telegram_download_private";
+pub const TELEGRAM_DOWNLOAD_GROUPS: &str = "telegram_download_groups";
+pub const TELEGRAM_DOWNLOAD_CHANNELS: &str = "telegram_download_channels";
 
 /// Whether a Telegram call's media must run relay-only (no host or reflexive ICE candidates).
 /// Obeys both the per-call server promise (`p2p_allowed == false`) and the local always-relay
@@ -289,7 +294,11 @@ fn kind(key: &str) -> Option<Kind> {
         CACHE_MB => Kind::Choice(&CACHE_MB_CHOICES, 500),
         // Per account; the default is the network's (`typing_default`).
         TYPING | RECEIPTS | PRESENCE_ACTIVITY => Kind::Switch(true),
-        TELEGRAM_ALWAYS_RELAY => Kind::Switch(false),
+        TELEGRAM_ALWAYS_RELAY
+        | TELEGRAM_DOWNLOAD_PHOTOS
+        | TELEGRAM_DOWNLOAD_PRIVATE
+        | TELEGRAM_DOWNLOAD_GROUPS
+        | TELEGRAM_DOWNLOAD_CHANNELS => Kind::Switch(false),
         LOG_LEVEL => Kind::Word(&LOG_LEVEL_CHOICES, "info"),
         LOG_RING | LOG_EXPORT => Kind::Switch(true),
         CUSTOM_SOUND => Kind::CustomSound,
@@ -318,7 +327,11 @@ fn scoped(key: &str, scope: &str) -> bool {
         TYPING => account_of(scope).is_some_and(|account| typing_choice(account.network)),
         RECEIPTS => account_of(scope).is_some_and(|account| matches!(account.network, Network::Teams | Network::Signal | Network::Tiny)),
         PRESENCE_ACTIVITY => account_of(scope).is_some_and(|account| account.network == Network::Teams),
-        TELEGRAM_ALWAYS_RELAY => account_of(scope).is_some_and(|account| account.network == Network::Telegram),
+        TELEGRAM_ALWAYS_RELAY
+        | TELEGRAM_DOWNLOAD_PHOTOS
+        | TELEGRAM_DOWNLOAD_PRIVATE
+        | TELEGRAM_DOWNLOAD_GROUPS
+        | TELEGRAM_DOWNLOAD_CHANNELS => account_of(scope).is_some_and(|account| account.network == Network::Telegram),
         _ if gain_user(key).is_some() => account_of(scope).is_some(),
         NOTIFY_ABOUT => scope == GLOBAL || account_of(scope).is_some() || conversation_of(scope).is_some(),
         SOUND => account_of(scope).is_some() || conversation_of(scope).is_some(),

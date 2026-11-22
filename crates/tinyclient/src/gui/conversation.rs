@@ -452,6 +452,10 @@ pub struct Pane {
     scrub_bounds: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
     /// A file the user pressed play on before it was on disk: file, message, attachment, from.
     play_after: Option<(String, String, usize, Option<u32>)>,
+    /// Transcripts currently collapsed by the user, keyed by `(message_id, attachment_index)`.
+    transcript_collapsed: HashSet<(String, usize)>,
+    /// Transcriptions currently awaiting the initial RPC reply, keyed by `(message_id, attachment_index)`.
+    transcribing: HashSet<(String, usize)>,
 
     /// How wide the list was when last drawn; 0 before the first draw.
     width: f32,
@@ -545,6 +549,8 @@ impl Pane {
             scrub: None,
             scrub_bounds: Rc::default(),
             play_after: None,
+            transcript_collapsed: HashSet::new(),
+            transcribing: HashSet::new(),
             width: 0.,
             opening: false,
             seen: Rc::default(),
@@ -577,6 +583,80 @@ impl Pane {
             self.revealed_contacts.insert(key);
         }
         cx.notify();
+    }
+
+    pub(super) fn toggle_transcript(&mut self, message_id: String, index: usize, cx: &mut Context<Self>) {
+        let key = (message_id, index);
+        if !self.transcript_collapsed.remove(&key) {
+            self.transcript_collapsed.insert(key);
+        }
+        cx.notify();
+    }
+
+    /// Requests server-side transcription for one voice or round video message (explicit user action only).
+    pub(super) fn transcribe(&mut self, message_id: String, index: usize, cx: &mut Context<Self>) {
+        if SCREENSHOTS {
+            return;
+        }
+        let Some(conversation) = self.open.as_ref().map(|open| open.key.clone()) else {
+            return;
+        };
+        let slot = (message_id.clone(), index);
+        self.transcript_collapsed.remove(&slot);
+        if !self.transcribing.insert(slot.clone()) {
+            return;
+        }
+        cx.notify();
+        cx.spawn(async move |pane, cx| {
+            let answer = cx
+                .background_executor()
+                .spawn(async move { ask(&Request::Transcribe { conversation, message_id }) })
+                .await;
+            let _ = pane.update(cx, |this, cx| {
+                this.transcribing.remove(&slot);
+                if let Ok(Response::Error { detail, .. }) = answer {
+                    let shell = this.shell.clone();
+                    cx.defer(move |cx| {
+                        let _ = shell.update(cx, |shell, cx| shell.toast(None, detail, cx));
+                    });
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Sends thumbs-up / thumbs-down feedback for a completed transcription.
+    pub(super) fn rate_transcript(&mut self, message_id: String, transcription_id: i64, good: bool, cx: &mut Context<Self>) {
+        if SCREENSHOTS || transcription_id == 0 {
+            return;
+        }
+        let Some(conversation) = self.open.as_ref().map(|open| open.key.clone()) else {
+            return;
+        };
+        cx.spawn(async move |pane, cx| {
+            let answer = cx
+                .background_executor()
+                .spawn(async move {
+                    ask(&Request::RateTranscript {
+                        conversation,
+                        message_id,
+                        transcription_id,
+                        good,
+                    })
+                })
+                .await;
+            let _ = pane.update(cx, |this, cx| {
+                if let Ok(Response::Error { detail, .. }) = answer {
+                    let shell = this.shell.clone();
+                    cx.defer(move |cx| {
+                        let _ = shell.update(cx, |shell, cx| shell.toast(None, detail, cx));
+                    });
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(super) fn vote_poll(&mut self, message_id: String, votes: Option<Vec<u32>>, cx: &mut Context<Self>) {
@@ -2347,6 +2427,44 @@ impl Render for Pane {
             .children(self.action_layers(window, cx))
             .children(self.viewer_layer(window, cx))
     }
+
+    /// The latest reply keyboard while `key` is the open conversation.
+    /// A selective one stays hidden unless it mentions the reader or answers one of theirs,
+    /// and an older keyboard is not used in its place.
+    /// An empty keyboard is a hide: it clears what is showing. A message with no reply
+    /// markup is skipped, so the keyboard before it stays. A selective hide that is not
+    /// for the reader is skipped the same way.
+    pub(super) fn reply_keyboard(&self, key: &Key) -> Option<(String, protocol::ReplyKeyboard)> {
+        let open = self.open.as_ref()?;
+        if &open.key != key {
+            return None;
+        }
+        for message in self.window.messages.iter().rev() {
+            let Some(board) = message.keyboard.as_ref() else {
+                continue;
+            };
+            let answers_me = message.reply_to.as_ref().is_some_and(|reply| {
+                self.window.messages.iter().any(|held| held.id == reply.id && held.outgoing)
+            });
+            let for_me = message.mentions_me || answers_me;
+            if board.rows.is_empty() {
+                if board.selective && !for_me {
+                    continue;
+                }
+                return None;
+            }
+            if board.selective && !for_me {
+                return None;
+            }
+            return Some((message.id.clone(), board.clone()));
+        }
+        None
+    }
+
+    /// Start belongs on an empty bot chat. A thread, or a window that still has older history, has none.
+    pub(super) fn bot_can_start(&self, key: &Key) -> bool {
+        self.open.as_ref().is_some_and(|open| &open.key == key) && self.window.messages.is_empty() && !self.window.older && !self.thread
+    }
 }
 
 impl Shell {
@@ -2363,6 +2481,30 @@ impl Shell {
         self.subscribe_pane(&pane, cx);
         self.follow_changes(cx);
         pane
+    }
+
+    /// The reply keyboard under the composer, from the open pane.
+    pub(in crate::gui) fn bot_reply_keyboard(&self, key: &Key, cx: &gpui::App) -> Option<(String, protocol::ReplyKeyboard)> {
+        self.conversation_state.pane.get()?.read(cx).reply_keyboard(key)
+    }
+
+    /// Whether the open pane should offer Start for this bot chat.
+    pub(in crate::gui) fn bot_can_start(&self, key: &Key, cx: &gpui::App) -> bool {
+        self.conversation_state.pane.get().is_some_and(|pane| pane.read(cx).bot_can_start(key))
+    }
+
+    /// `messages.startBot`. An empty `start_param` is the Start button; a deep link passes its payload.
+    pub(in crate::gui) fn start_bot(&mut self, conversation: Key, start_param: String, cx: &mut Context<Self>) {
+        super::people::ask_later(cx, Request::StartBot { conversation, start_param }, |_, _| {});
+    }
+
+    /// A bot menu or keyboard URL, through the pane's link confirm.
+    pub(in crate::gui) fn open_pane_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pane) = self.conversation_state.pane.get().cloned() else {
+            return;
+        };
+        let url = url.to_owned();
+        pane.update(cx, |pane, cx| pane.open_external_link(&url, window, cx));
     }
 
     /// My own id on the account a conversation belongs to.

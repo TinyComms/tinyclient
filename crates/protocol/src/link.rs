@@ -614,6 +614,11 @@ pub fn telegram_invite_hash(raw: &str) -> Option<String> {
     valid(hash).then(|| hash.to_owned())
 }
 
+/// A `t.me` or `tg://` `start` payload: 1 to 64 letters, digits, `_`, or `-`.
+fn telegram_start_param(raw: &str) -> bool {
+    (1..=64).contains(&raw.len()) && raw.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
 /// Parses a message or conversation link for any supported network (the inverse of `message_link`).
 /// Invite links (`discord.gg`, `t.me/+...`, `t.me/joinchat/...`, Slack invites) return `None`.
 pub fn parse_network_link(raw: &str) -> Option<NetworkLink> {
@@ -721,21 +726,37 @@ pub fn parse_network_link(raw: &str) -> Option<NetworkLink> {
     if scheme == "tg" && host == "resolve" {
         let domain = query("domain")?;
         let message_id = query("post").filter(|m| m.bytes().all(|b| b.is_ascii_digit()));
+        // `tg://resolve?domain=&start=` reuses `space` and `thread_id`. No new field.
+        let start = message_id.is_none().then(|| query("start")).flatten().filter(|raw| telegram_start_param(raw));
         return Some(NetworkLink {
             network: crate::Network::Telegram,
-            space: None,
+            space: start.as_ref().map(|_| "start".to_owned()),
             channel: domain,
             message_id,
-            thread_id: None,
+            thread_id: start,
         });
     }
     if matches!(scheme, "http" | "https") && matches!(host.as_str(), "t.me" | "telegram.me" | "telegram.dog") {
         let first = *segments.first()?;
+        // t.me/boost/{username} opens that channel. `space` marks it as a boost link; no new field.
+        if first.eq_ignore_ascii_case("boost") {
+            let name = *segments.get(1)?;
+            if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                return None;
+            }
+            return Some(NetworkLink {
+                network: crate::Network::Telegram,
+                space: Some("boost".to_owned()),
+                channel: name.to_owned(),
+                message_id: None,
+                thread_id: None,
+            });
+        }
         // Invite links and Telegram utility routes stay external.
         if first.starts_with('+')
             || matches!(
                 first.to_ascii_lowercase().as_str(),
-                "joinchat" | "addstickers" | "addemoji" | "addlist" | "addtheme" | "proxy" | "socks" | "share" | "login" | "iv" | "bg" | "setlanguage" | "boost" | "giftcode"
+                "joinchat" | "addstickers" | "addemoji" | "addlist" | "addtheme" | "proxy" | "socks" | "share" | "login" | "iv" | "bg" | "setlanguage" | "giftcode"
             )
         {
             return None;
@@ -764,12 +785,14 @@ pub fn parse_network_link(raw: &str) -> Option<NetworkLink> {
             return None;
         }
         let message_id = msg_seg.filter(|s| s.bytes().all(|b| b.is_ascii_digit())).map(str::to_owned);
+        // `t.me/{bot}?start={payload}` reuses `space` and `thread_id`. A bad payload is just the username.
+        let start = message_id.is_none().then(|| query("start")).flatten().filter(|raw| telegram_start_param(raw));
         return Some(NetworkLink {
             network: crate::Network::Telegram,
-            space: None,
+            space: start.as_ref().map(|_| "start".to_owned()),
             channel: name.to_owned(),
             message_id,
-            thread_id: None,
+            thread_id: start,
         });
     }
 
@@ -1315,6 +1338,57 @@ mod tests {
                 space: None,
                 channel: "rustlang".into(),
                 message_id: Some("99".into()),
+                thread_id: None,
+            })
+        );
+        assert_eq!(
+            parse_network_link("https://t.me/boost/fieldnotes"),
+            Some(NetworkLink {
+                network: Network::Telegram,
+                space: Some("boost".into()),
+                channel: "fieldnotes".into(),
+                message_id: None,
+                thread_id: None,
+            })
+        );
+        assert_eq!(parse_network_link("https://t.me/boost"), None);
+        assert_eq!(
+            parse_network_link("https://t.me/trail_bot?start=trail"),
+            Some(NetworkLink {
+                network: Network::Telegram,
+                space: Some("start".into()),
+                channel: "trail_bot".into(),
+                message_id: None,
+                thread_id: Some("trail".into()),
+            })
+        );
+        assert_eq!(
+            parse_network_link("tg://resolve?domain=trail_bot&start=trail"),
+            Some(NetworkLink {
+                network: Network::Telegram,
+                space: Some("start".into()),
+                channel: "trail_bot".into(),
+                message_id: None,
+                thread_id: Some("trail".into()),
+            })
+        );
+        assert_eq!(
+            parse_network_link("https://t.me/trail_bot?start="),
+            Some(NetworkLink {
+                network: Network::Telegram,
+                space: None,
+                channel: "trail_bot".into(),
+                message_id: None,
+                thread_id: None,
+            })
+        );
+        assert_eq!(
+            parse_network_link("https://t.me/trail_bot?start=!!!"),
+            Some(NetworkLink {
+                network: Network::Telegram,
+                space: None,
+                channel: "trail_bot".into(),
+                message_id: None,
                 thread_id: None,
             })
         );

@@ -92,6 +92,14 @@ pub enum PrivacyKey {
     PhoneCall,
     PhoneP2p,
     VoiceMessages,
+    /// Who can see when this account was last online (`inputPrivacyKeyStatusTimestamp`).
+    LastSeen,
+    /// Who can see this account's phone number (`inputPrivacyKeyPhoneNumber`).
+    PhoneNumber,
+    /// Who can see this account's profile photo (`inputPrivacyKeyProfilePhoto`).
+    ProfilePhoto,
+    /// Who can add this account to groups and channels (`inputPrivacyKeyChatInvite`).
+    ChatInvite,
 }
 
 /// Base audience for a network privacy rule.
@@ -128,6 +136,121 @@ pub struct PrivacyPolicy {
     /// True when changing this key requires a paid tier (e.g. Telegram Premium for VoiceMessages).
     #[serde(default, skip_serializing_if = "is_false")]
     pub premium_only: bool,
+}
+
+fn disabled_preset() -> bool {
+    true
+}
+
+/// One connection class of Telegram's `autoDownloadSettings` (roaming, mobile, or Wi-Fi).
+/// A missing preset is off, so an older frame never starts fetching full files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoDownloadPreset {
+    #[serde(default = "disabled_preset")]
+    pub disabled: bool,
+    #[serde(default)]
+    pub photo_size_max: i64,
+    #[serde(default)]
+    pub video_size_max: i64,
+    #[serde(default)]
+    pub file_size_max: i64,
+}
+
+impl Default for AutoDownloadPreset {
+    fn default() -> Self {
+        Self { disabled: true, photo_size_max: 0, video_size_max: 0, file_size_max: 0 }
+    }
+}
+
+/// Telegram's three auto-download presets, plus the local chat-kind gates this app keeps.
+/// Size limits are Telegram's (`account.getAutoDownloadSettings`). Which chats may use them
+/// is local and stays off until the account turns a kind on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoDownload {
+    #[serde(default)]
+    pub roaming: AutoDownloadPreset,
+    #[serde(default)]
+    pub mobile: AutoDownloadPreset,
+    #[serde(default)]
+    pub wifi: AutoDownloadPreset,
+    /// Fetch a photo's full size when the active preset's photo cap allows it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fetch_full_photos: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub private_chats: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub groups: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub channels: bool,
+}
+
+impl Default for AutoDownload {
+    fn default() -> Self {
+        Self {
+            roaming: AutoDownloadPreset::default(),
+            mobile: AutoDownloadPreset::default(),
+            wifi: AutoDownloadPreset::default(),
+            fetch_full_photos: false,
+            private_chats: false,
+            groups: false,
+            channels: false,
+        }
+    }
+}
+
+/// A channel's boost level, from `premium.getBoostsStatus`.
+/// `slots` are the free boosts this Premium account can still give.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelBoosts {
+    #[serde(default)]
+    pub level: i32,
+    #[serde(default)]
+    pub boosts: i32,
+    #[serde(default)]
+    pub current_level_boosts: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_level_boosts: Option<i32>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub my_boost: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slots: Vec<i32>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub boost_url: String,
+    /// The signed-in account is Telegram Premium, so it may give a boost.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_boost: bool,
+}
+
+/// One command a bot lists for `/` completion.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotCommand {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub command: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
+/// A bot's description, commands, and menu button, from `users.getFullUser`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotMenu {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<BotCommand>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub menu_label: String,
+    /// An `http` or `https` menu button. Anything else is left empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub menu_url: String,
+}
+
+/// Cached files one conversation is using, when those files can be attributed to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatCache {
+    pub conversation: Key,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    pub bytes: u64,
 }
 
 /// Which list of a network's home `Home` reads.
@@ -941,6 +1064,9 @@ pub struct Capabilities {
     /// This account supports following and unfollowing threads (`Request::FollowThread`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub follow_threads: bool,
+    /// This account supports on-demand server transcription of voice and round video messages (`Request::Transcribe`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub transcribe: bool,
     /// This account supports reading and setting out-of-office / automatic replies (`Request::GetOutOfOffice`, `Request::SetOutOfOffice`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub out_of_office: bool,

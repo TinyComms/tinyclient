@@ -762,6 +762,10 @@ fn offline(ctx: &Context, command: Command) {
         Command::CallHistory { reply, .. } => drop(reply.send(Err(down()))),
         Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(down()))),
         Command::GetPrivacy { reply, .. } | Command::SetPrivacy { reply, .. } => drop(reply.send(Err(down()))),
+        Command::GetAutoDownload { reply } | Command::SetAutoDownload { reply, .. } => drop(reply.send(Err(down()))),
+        Command::GetBoosts { reply, .. } | Command::ApplyBoost { reply, .. } => drop(reply.send(Err(down()))),
+        Command::GetBotMenu { reply, .. } => drop(reply.send(Err(down()))),
+        Command::StartBot { reply, .. } | Command::SharePhone { reply, .. } => drop(reply.send(Err(down()))),
         Command::Search { reply, .. } => drop(reply.send(Err(down()))),
         Command::JumpToDate { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchCalendar { reply, .. } => drop(reply.send(Err(down()))),
@@ -779,6 +783,8 @@ fn offline(ctx: &Context, command: Command) {
         Command::EndSession { reply, .. } => drop(reply.send(Err(down()))),
         Command::UnreadItems { reply, .. } => drop(reply.send(Err(down()))),
         Command::MarkUnreadItemsRead { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Transcribe { reply, .. } => drop(reply.send(Err(down()))),
+        Command::RateTranscript { reply, .. } => drop(reply.send(Err(down()))),
         Command::SendWith { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
         Command::StartDirect { reply, .. }
         | Command::StartGroup { reply, .. }
@@ -1143,6 +1149,27 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::SetPrivacy { key, policy, reply } => {
             let _ = reply.send(info::set_privacy(account, key, &policy).map_err(refused));
         }
+        Command::GetAutoDownload { reply } => {
+            let _ = reply.send(info::get_auto_download(account).map_err(refused));
+        }
+        Command::SetAutoDownload { settings, reply } => {
+            let _ = reply.send(info::set_auto_download(account, &settings).map_err(refused));
+        }
+        Command::GetBoosts { conversation_id, reply } => {
+            let _ = reply.send(info::get_boosts(account, &conversation_id).map_err(refused));
+        }
+        Command::ApplyBoost { conversation_id, reply } => {
+            let _ = reply.send(info::apply_boost(account, &conversation_id).map_err(refused));
+        }
+        Command::GetBotMenu { conversation_id, reply } => {
+            let _ = reply.send(info::bot_menu(account, &conversation_id).map_err(refused));
+        }
+        Command::StartBot { conversation_id, start_param, reply } => {
+            let _ = reply.send(info::start_bot(account, &conversation_id, &start_param).map_err(refused));
+        }
+        Command::SharePhone { conversation_id, reply } => {
+            let _ = reply.send(info::share_phone(account, &conversation_id).map_err(refused));
+        }
         Command::Catalog { kind, space_id, query, cursor, reply } => {
             let _ = reply.send(catalog::catalog(account, kind, space_id.as_deref(), &query, cursor.as_deref()).map_err(refused));
         }
@@ -1199,6 +1226,12 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::MarkUnreadItemsRead { conversation_id, kind, message_ids, reply } => {
             let _ = reply.send(info::mark_unread_items_read(account, &conversation_id, kind, &message_ids).map_err(refused));
+        }
+        Command::Transcribe { conversation_id, message_id, reply } => {
+            let _ = reply.send(info::transcribe(account, &conversation_id, &message_id).map_err(refused));
+        }
+        Command::RateTranscript { conversation_id, message_id, transcription_id, good, reply } => {
+            let _ = reply.send(info::rate_transcript(account, &conversation_id, &message_id, transcription_id, good).map_err(refused));
         }
         Command::Handoff { conversation_id, reply } => {
             let link = Who::parse(&conversation_id).map(|(who, _)| {

@@ -186,6 +186,7 @@ const TABLES: &str = "
         call_video INTEGER NOT NULL DEFAULT 0,
         shared INTEGER NOT NULL DEFAULT 0,
         unread_reactions INTEGER NOT NULL DEFAULT 0,
+        voice_notes_forbidden TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (network, account, id)
     ) WITHOUT ROWID;
     CREATE INDEX conversation_threads ON conversation (network, account, parent) WHERE parent != '';
@@ -305,7 +306,7 @@ const CONVERSATION: &str = "
            (c.preview_mine AND c.delivered_to != '' AND (length(c.delivered_to), c.delivered_to) >= (length(c.preview_id), c.preview_id)),
            (c.preview_mine AND EXISTS (SELECT 1 FROM message f WHERE f.network = c.network AND f.account = c.account
                                          AND f.conversation = c.id AND f.id = c.preview_id AND f.pending = 1)),
-           c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason, c.spam, c.rights, c.disappearing, c.moderate, c.can_pin, c.joined, c.call_video, c.shared, c.unread_reactions
+           c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason, c.spam, c.rights, c.disappearing, c.moderate, c.can_pin, c.joined, c.call_video, c.shared, c.unread_reactions, c.voice_notes_forbidden
     FROM conversation c
     LEFT JOIN media m ON m.network = c.network AND m.account = c.account AND m.id = c.avatar
     LEFT JOIN space s ON s.network = c.network AND s.account = c.account AND s.id = c.space
@@ -414,6 +415,8 @@ pub struct ConversationRow {
     pub can_pin: bool,
     /// Whether this account has joined the conversation (`false` for an unjoined channel preview).
     pub joined: bool,
+    /// Why voice and round video messages are not allowed here (empty when allowed).
+    pub voice_notes_forbidden: String,
     /// How the network files it. `None` leaves what is stored, so a tree that does not know
     /// (a Slack tree reload) never undoes a pin or a follow; `Some` replaces it.
     pub filing: Option<Filing>,
@@ -517,6 +520,7 @@ impl ConversationRow {
             moderate: false,
             can_pin: false,
             joined: true,
+            voice_notes_forbidden: String::new(),
         }
     }
 }
@@ -761,6 +765,7 @@ fn conversation_from(row: &Row) -> rusqlite::Result<Conversation> {
         call_video: row.get(59)?,
         shared: row.get(60)?,
         unread_reactions: row.get(61)?,
+        voice_notes_forbidden: row.get(62)?,
     })
 }
 
@@ -928,9 +933,9 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
         "INSERT INTO conversation
              (network, account, id, kind, title, space, section, position, avatar, peer, call, listed,
               topic, parent, root, read_only, private, bot, meeting, special, mark, opted_out,
-              folders, archived, pin, hidden, followed, voice_limit, encryption, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin, joined, call_video, shared)
+              folders, archived, pin, hidden, followed, voice_limit, encryption, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin, joined, call_video, shared, voice_notes_forbidden)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41)
+                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42)
          ON CONFLICT (network, account, id) DO UPDATE SET
              kind = excluded.kind, title = excluded.title, space = excluded.space,
              section = excluded.section, position = excluded.position, avatar = excluded.avatar,
@@ -951,6 +956,7 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
              joined = excluded.joined,
              call_video = excluded.call_video,
              shared = excluded.shared,
+             voice_notes_forbidden = excluded.voice_notes_forbidden,
              folders = CASE WHEN ?23 THEN excluded.folders ELSE folders END,
              archived = CASE WHEN ?23 THEN excluded.archived ELSE archived END,
              pin = CASE WHEN ?23 THEN excluded.pin ELSE pin END,
@@ -998,6 +1004,7 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
             row.joined,
             row.call_video,
             row.shared,
+            row.voice_notes_forbidden,
         ],
     )?;
     Ok(())
@@ -1091,6 +1098,9 @@ fn keep_added_columns(db: &Connection, version: i32) -> rusqlite::Result<bool> {
     if !column(db, "conversation", "unread_reactions")? {
         db.execute_batch("ALTER TABLE conversation ADD COLUMN unread_reactions INTEGER NOT NULL DEFAULT 0")?;
     }
+    if !column(db, "conversation", "voice_notes_forbidden")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN voice_notes_forbidden TEXT NOT NULL DEFAULT ''")?;
+    }
     Ok(true)
 }
 
@@ -1171,6 +1181,9 @@ impl Store {
         if !column(&store.db, "conversation", "unread_reactions")? {
             store.db.execute_batch("ALTER TABLE conversation ADD COLUMN unread_reactions INTEGER NOT NULL DEFAULT 0")?;
         }
+        if !column(&store.db, "conversation", "voice_notes_forbidden")? {
+            store.db.execute_batch("ALTER TABLE conversation ADD COLUMN voice_notes_forbidden TEXT NOT NULL DEFAULT ''")?;
+        }
         if !column(&store.db, "space", "can_create_channels")? {
             store.db.execute_batch("ALTER TABLE space ADD COLUMN can_create_channels INTEGER NOT NULL DEFAULT 0")?;
         }
@@ -1210,6 +1223,46 @@ impl Store {
     /// convert: the table is new.
     fn migrate_reminders(&mut self) -> rusqlite::Result<()> {
         self.db.execute_batch(REMINDERS_TABLE)
+    }
+
+    /// On-disk media attributed to a conversation through its cached messages.
+    /// A chat with nothing on disk is omitted. The same file in one chat counts once.
+    pub fn chat_cache(&self, limit: u32) -> rusqlite::Result<Vec<protocol::ChatCache>> {
+        let mut query = self.db.prepare(
+            "SELECT network, account, conversation, MAX(title), SUM(bytes) FROM (
+                SELECT DISTINCT r.network AS network, r.account AS account, r.conversation AS conversation,
+                       c.title AS title, r.fid AS fid, media.bytes AS bytes
+                  FROM (
+                    SELECT network, account, conversation, json_extract(j.value, '$.file.id') AS fid
+                      FROM message, json_each(message.body, '$.attachments') j
+                     WHERE json_extract(j.value, '$.file.id') IS NOT NULL
+                    UNION
+                    SELECT network, account, conversation, json_extract(j.value, '$.thumb.id')
+                      FROM message, json_each(message.body, '$.attachments') j
+                     WHERE json_extract(j.value, '$.thumb.id') IS NOT NULL
+                    UNION
+                    SELECT network, account, conversation, json_extract(j.value, '$.preview.id')
+                      FROM message, json_each(message.body, '$.attachments') j
+                     WHERE json_extract(j.value, '$.preview.id') IS NOT NULL
+                  ) r
+                  JOIN media ON media.network = r.network AND media.account = r.account AND media.id = r.fid
+                   AND media.path IS NOT NULL
+                  JOIN conversation c ON c.network = r.network AND c.account = r.account AND c.id = r.conversation
+             )
+             GROUP BY network, account, conversation
+             HAVING SUM(bytes) > 0
+             ORDER BY SUM(bytes) DESC
+             LIMIT ?1",
+        )?;
+        let rows = query.query_map(params![limit], |row| {
+            let bytes: i64 = row.get(4)?;
+            Ok(protocol::ChatCache {
+                conversation: Key { network: from_word(row.get(0)?)?, account: row.get(1)?, id: row.get(2)? },
+                title: row.get(3)?,
+                bytes: bytes.max(0) as u64,
+            })
+        })?;
+        rows.collect()
     }
 
     /// Every stored setting, the version row included.
@@ -1890,7 +1943,7 @@ impl Store {
         let mut stmt = self.db.prepare(
             "SELECT id, kind, title, space, section, position, avatar, peer, call, voice_limit,
                     listed, topic, read_only, private, encryption, bot, meeting, special, mark,
-                    opted_out, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin, joined, call_video, shared
+                    opted_out, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin, joined, call_video, shared, voice_notes_forbidden
                FROM conversation
               WHERE network = ?1 AND account = ?2 AND space = ?3 AND parent = ''
               ORDER BY position, id",
@@ -1944,6 +1997,7 @@ impl Store {
                         joined: row.get(28)?,
                         call_video: row.get(29)?,
                         shared: row.get(30)?,
+                        voice_notes_forbidden: row.get(31)?,
                     },
                 ))
             })?
@@ -4790,6 +4844,32 @@ mod tests {
         let page = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
         assert!(page.messages[0].deleted);
         assert!(page.messages[0].attachments.is_empty());
+    }
+
+    #[test]
+    fn chat_cache_counts_only_files_on_disk_and_only_the_chat_that_shows_them() {
+        let (mut store, key) = store();
+        let mut message = said("1", "ridge", NOW);
+        let mut file = MediaFile::new("ridge-full", protocol::MediaKind::Image);
+        file.bytes = 9_000;
+        message.attachments.push(protocol::Attachment::new("ridge.jpg", file));
+        store.ingest(&key, &message, false).unwrap();
+        store.db.execute(
+            "INSERT INTO media (network, account, id, kind, bytes, path, used) VALUES ('discord', 'me', 'ridge-full', 'image', 4096, 'ridge.jpg', 1)",
+            [],
+        ).unwrap();
+        store.db.execute(
+            "INSERT INTO media (network, account, id, kind, bytes, used) VALUES ('discord', 'me', 'missing', 'image', 100, 1)",
+            [],
+        ).unwrap();
+        let mut other = said("2", "not on disk", NOW + 1);
+        other.attachments.push(protocol::Attachment::new("gone.jpg", MediaFile::new("missing", protocol::MediaKind::Image)));
+        store.ingest(&key, &other, false).unwrap();
+        let rows = store.chat_cache(40).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].conversation, key);
+        assert_eq!(rows[0].title, "#general");
+        assert_eq!(rows[0].bytes, 4096);
     }
 
     #[test]

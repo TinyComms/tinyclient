@@ -134,6 +134,18 @@ fn row(account: &Account, who: Who, known: &Known) -> ConversationRow {
                     }
                 }
             }
+            if known.voice_forbidden == Some(true) {
+                row.voice_notes_forbidden = if known.name.is_empty() {
+                    "This person doesn't accept voice and video messages.".to_owned()
+                } else {
+                    format!("{} doesn't accept voice and video messages.", known.name)
+                };
+            }
+        }
+        Who::Group(_) | Who::Channel(_) if !known.broadcast => {
+            if known.voice_banned {
+                row.voice_notes_forbidden = "Voice and video messages aren't allowed in this group.".to_owned();
+            }
         }
         _ => {}
     }
@@ -450,6 +462,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         saved_subdialogs: true,
         active_sessions: true,
         unread_jumps: true,
+        transcribe: true,
         ..Capabilities::default()
     }
 }
@@ -479,6 +492,9 @@ pub(super) fn sign_on(account: &Arc<Account>) -> Result<(), Fault> {
         let tl::enums::PeerNotifySettings::Settings(settings) = account.ask(&tl::functions::account::GetNotifySettings { peer })?;
         account.live().muted[index] = settings.mute_until.is_some_and(filing::mute_holds);
     }
+    // Before the dialog list maps its newest messages. The stored gates apply without
+    // the Accounts page, and the Wi-Fi caps come with them when Telegram answers.
+    super::info::load_remembered_download(account);
     dialogs(account)?;
     // An earlier build kept every chat in one invented Space. The rows read just now have left
     // it; what is left (chats past the newest 500) goes with it, and comes back on scroll.
@@ -1631,6 +1647,18 @@ pub(super) fn finish(account: &Account, conversation: &str, mapped: &mut Mapped,
     }
     // A pin names the message it points at. The words are filled once that message is known.
     content::quote_pin(&mut mapped.message);
+    // Preserve any previously saved speech-to-text transcripts across history refreshes.
+    if !mapped.message.attachments.is_empty() {
+        if let Ok(Some(stored)) = account.ctx.stored_message(conversation, &mapped.message.id) {
+            for att in &mut mapped.message.attachments {
+                if att.transcript.is_none() {
+                    if let Some(prev) = stored.attachments.iter().find(|old| old.file.id == att.file.id) {
+                        att.transcript = prev.transcript.clone();
+                    }
+                }
+            }
+        }
+    }
     account.place(mapped.peer, mapped.id, conversation);
     comment_thread(account, conversation, mapped);
     for want in &mapped.wants {

@@ -1039,6 +1039,8 @@ impl Demo {
             Command::SendPaidReaction { reply, .. }
             | Command::TogglePaidReactionPrivacy { reply, .. }
             | Command::SetDefaultReaction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Transcribe { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::RateTranscript { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::PreviewChannel { reply, .. }
             | Command::Join { reply, .. }
             | Command::DeleteFile { reply, .. }
@@ -1104,6 +1106,13 @@ impl Demo {
             Command::EndSession { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::UnreadItems { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MarkUnreadItemsRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetAutoDownload { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetAutoDownload { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetBoosts { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ApplyBoost { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetBotMenu { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::StartBot { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SharePhone { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Backfill(_)
             | Command::Warm(_)
             | Command::History { .. }

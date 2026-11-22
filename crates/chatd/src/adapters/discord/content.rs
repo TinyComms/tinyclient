@@ -519,6 +519,7 @@ fn attachment(rich: &mut Rich, attached: &Attached) -> Attachment {
         round: false,
         view_once: false,
         sticker_set: String::new(),
+        transcript: None,
     }
 }
 
@@ -554,6 +555,7 @@ fn sticker(rich: &mut Rich, sticker: &model::Sticker) -> Attachment {
         round: false,
         view_once: false,
         sticker_set: String::new(),
+        transcript: None,
     }
 }
 
@@ -969,6 +971,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         controls: Vec::new(),
         buttons: Vec::new(),
         media_unread: false,
+        keyboard: None,
     };
     (message, rich.files)
 }

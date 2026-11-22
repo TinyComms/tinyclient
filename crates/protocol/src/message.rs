@@ -155,6 +155,33 @@ pub struct Span {
     pub style: Style,
 }
 
+/// Server-side transcription of a voice or round video message (Telegram).
+/// Stored inside [`Attachment::transcript`] so it survives restarts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Transcript {
+    /// Network transcription id (used for rating feedback).
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub id: i64,
+    /// Transcribed text so far (may stream in chunks while `pending` is true).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    /// True while the network is still generating the transcript.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pending: bool,
+    /// Plain-words failure or quota message (e.g. Premium required when trial is used up).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed: Option<String>,
+    /// Free trial transcriptions remaining this period (non-Premium), when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_remains: Option<u32>,
+    /// Unix seconds when the free trial resets, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_resets_at: Option<i64>,
+    /// User's rating (`Some(true)` = good, `Some(false)` = bad).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rated: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     pub name: String,
@@ -194,6 +221,9 @@ pub struct Attachment {
     /// Telegram sticker pack as `id:access_hash` or a short name. Empty on every other attachment.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub sticker_set: String,
+    /// Server-side speech-to-text transcript for a voice or round video message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<Transcript>,
 }
 
 impl Attachment {
@@ -212,6 +242,7 @@ impl Attachment {
             round: false,
             view_once: false,
             sticker_set: String::new(),
+            transcript: None,
         }
     }
 }
@@ -700,6 +731,51 @@ pub enum ControlKind {
     },
 }
 
+/// What a Telegram reply-keyboard button does. Text is the default and stays off the wire.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BotKeyKind {
+    #[default]
+    Text,
+    Url,
+    Phone,
+    Location,
+    Peer,
+}
+
+fn is_text_key(kind: &BotKeyKind) -> bool {
+    matches!(kind, BotKeyKind::Text)
+}
+
+/// One button on a Telegram reply keyboard. Inline callback buttons stay unmapped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotKey {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "is_text_key")]
+    pub kind: BotKeyKind,
+}
+
+/// A bot's reply keyboard, drawn under the composer. `selective` hides it unless the
+/// message mentions the reader or answers one of theirs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyKeyboard {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rows: Vec<Vec<BotKey>>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub resize: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub single_use: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub selective: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub persistent: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+}
+
 /// One interactive Block Kit control attached to a bot/app message (button, menu, picker, etc.).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageControl {
@@ -917,6 +993,9 @@ pub struct Message {
     /// stays set until the recipient plays it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub media_unread: bool,
+    /// Telegram reply keyboard for this message. Inline keyboards are not carried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyboard: Option<ReplyKeyboard>,
 }
 
 /// How a direct or group call ended, or that it is live.
@@ -1028,6 +1107,7 @@ impl Message {
             controls: Vec::new(),
             buttons: Vec::new(),
             media_unread: false,
+            keyboard: None,
         }
     }
 
@@ -1105,6 +1185,21 @@ impl Message {
             clip(via, 64);
         }
         self.controls.truncate(MESSAGE_CONTROLS_LIMIT);
+        if let Some(keyboard) = &mut self.keyboard {
+            keyboard.rows.truncate(8);
+            for row in &mut keyboard.rows {
+                row.truncate(8);
+                for key in row.iter_mut() {
+                    clip(&mut key.text, 64);
+                    if let Some(url) = &mut key.url {
+                        clip(url, 2_000);
+                    }
+                }
+            }
+            if let Some(hint) = &mut keyboard.placeholder {
+                clip(hint, 64);
+            }
+        }
         for control in &mut self.controls {
             clip(&mut control.block_id, 255);
             clip(&mut control.action_id, 255);
@@ -1193,6 +1288,7 @@ impl Message {
         self.cards.clear();
         self.controls.clear();
         self.buttons.clear();
+        self.keyboard = None;
         self.poll = None;
         self.deliveries.clear();
         self.receipt_note.clear();

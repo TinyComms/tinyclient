@@ -228,7 +228,7 @@ fn send_dice(account: &Account, conversation: &str, client_id: &str, text: &str,
 }
 
 /// Shares a contact card via `messages.sendMedia` (`InputMediaContact`).
-fn send_contact(
+pub(super) fn send_contact(
     account: &Account,
     conversation: &str,
     client_id: &str,
@@ -337,7 +337,21 @@ fn files(account: &Account, conversation: &str, client_id: &str, text: &str, rep
         let Some(one) = uploaded.pop() else {
             return Err("Nothing was sent.".to_owned());
         };
-        let answer = account.ask(&send_media(&target, one.media, caption, entities.clone(), random, opts)).map_err(words)?;
+        let answer = match account.ask(&send_media(&target, one.media, caption, entities.clone(), random, opts)) {
+            Ok(answer) => answer,
+            Err(fault) => {
+                if fault.is("VOICE_MESSAGES_FORBIDDEN") {
+                    if account.dir().set_voice_forbidden(target.who, true) {
+                        super::sync::refresh_row(account, target.who);
+                    }
+                } else if fault.is("CHAT_SEND_VOICES_FORBIDDEN") || fault.is("CHAT_SEND_ROUNDVIDEOS_FORBIDDEN") {
+                    if account.dir().set_voice_banned(target.who, true) {
+                        super::sync::refresh_row(account, target.who);
+                    }
+                }
+                return Err(fault.words());
+            }
+        };
         return made(account, conversation, &target, caption, opts, &answer).map_err(words);
     }
     // Albums: pictures and videos together, documents together, ten at most each. The caption

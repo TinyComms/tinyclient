@@ -345,6 +345,46 @@ fn crew_poll(counts: &[(u8, i32)], total: i32) -> (tl::enums::Poll, tl::enums::P
     (poll.into(), results.into())
 }
 
+fn trail_keyboard() -> tl::enums::ReplyMarkup {
+    tl::types::ReplyKeyboardMarkup {
+        resize: true,
+        single_use: false,
+        selective: false,
+        persistent: false,
+        rows: vec![tl::types::KeyboardButtonRow {
+            buttons: vec![tl::types::KeyboardButton { style: None, text: "Ridge".to_owned() }.into()],
+        }
+        .into()],
+        placeholder: Some("Ask the trail".to_owned()),
+    }
+    .into()
+}
+
+fn trail_bot_info() -> tl::enums::BotInfo {
+    let command = |name: &str, description: &str| {
+        tl::enums::BotCommand::Command(tl::types::BotCommand { command: name.to_owned(), description: description.to_owned() })
+    };
+    tl::enums::BotInfo::Info(tl::types::BotInfo {
+        has_preview_medias: false,
+        user_id: Some(BOT),
+        description: Some("Trail reports.".to_owned()),
+        description_photo: None,
+        description_document: None,
+        commands: Some(vec![
+            command("start", "Open the trail"),
+            command("report", "Today's report"),
+            command("closures", "Weekend closures"),
+        ]),
+        menu_button: Some(tl::enums::BotMenuButton::Button(tl::types::BotMenuButton {
+            text: "Map".to_owned(),
+            url: "https://t.me/trail_bot".to_owned(),
+        })),
+        privacy_policy_url: None,
+        app_settings: None,
+        verifier_settings: None,
+    })
+}
+
 fn message(peer: Who, id: i32, from: i64, date: i32, text: &str) -> tl::types::Message {
     let mut message: tl::types::Message = blank(&[&put(0u32), &put(0u32), &put(id), &put(peer.peer()), &put(date), &put(text.to_owned())]);
     message.out = from == ME;
@@ -624,8 +664,28 @@ struct World {
     blocked: HashSet<i64>,
     /// Per-user `(phone_calls_available, phone_calls_private, video_calls_available)` for `GetFullUser`.
     call_flags: HashMap<i64, (bool, bool, bool)>,
-    /// Stored privacy rules by key name (`phone_call`, `phone_p2p`, `voice_messages`).
+    /// Users whose `UserFull::voice_messages_forbidden` is true and whose `SendMedia` refuses voice notes.
+    voice_forbidden: HashSet<i64>,
+    /// Groups/supergroups where `send_voices` is forbidden (`CHAT_SEND_VOICES_FORBIDDEN`).
+    voice_banned: HashSet<Who>,
+    /// Stored privacy rules by key name (`phone_call`, `status_timestamp`, …).
     privacy: HashMap<&'static str, Vec<tl::enums::PrivacyRule>>,
+    /// The next `account.setPrivacy` returns `PREMIUM_ACCOUNT_REQUIRED` (`privacy-refuse`).
+    privacy_refuse: bool,
+    /// `account.getAutoDownloadSettings` presets: roaming, mobile, Wi-Fi.
+    download: [tl::types::AutoDownloadSettings; 3],
+    /// The next `account.saveAutoDownloadSettings` returns `PREMIUM_ACCOUNT_REQUIRED`.
+    download_refuse: bool,
+    /// `account.getAutoDownloadSettings` fails, so a save must not write a preset.
+    download_unread: bool,
+    /// Channel id this account's one boost slot is applied to.
+    boost_peer: Option<i64>,
+    boost_level: i32,
+    boost_count: i32,
+    /// The next `premium.applyBoost` returns `PREMIUM_ACCOUNT_REQUIRED`.
+    boost_refuse: bool,
+    /// The next `messages.startBot` returns `BOT_INVALID`.
+    start_refuse: bool,
     calls: PathBuf,
     /// The test let the held pages of the chats through (`dialogs-go`, `peer-go`).
     dialogs_go: bool,
@@ -710,6 +770,10 @@ struct World {
     media_banned: HashSet<i64>,
     /// Per-peer (`user_id` or `channel_id`) paid-message price in Stars (`send_paid_messages_stars`).
     paid_stars: HashMap<i64, i64>,
+    /// Next `messages.transcribeAudio` response mode: `"pending"`, `"exhausted"`, or immediate.
+    transcribe_mode: String,
+    /// Remaining free trial transcriptions reported by `messages.transcribeAudio`.
+    transcribe_trial: Option<i32>,
 }
 
 fn key(peer: Who, topic: Option<i32>) -> String {
@@ -764,11 +828,35 @@ impl World {
             topic_reads: HashMap::new(),
             blocked: HashSet::new(),
             call_flags: HashMap::new(),
+            voice_forbidden: HashSet::new(),
+            voice_banned: HashSet::new(),
             privacy: HashMap::from([
                 ("phone_call", vec![tl::enums::PrivacyRule::PrivacyValueAllowAll]),
                 ("phone_p2p", vec![tl::enums::PrivacyRule::PrivacyValueAllowContacts]),
                 ("voice_messages", vec![tl::enums::PrivacyRule::PrivacyValueAllowAll]),
+                ("status_timestamp", vec![tl::enums::PrivacyRule::PrivacyValueAllowAll]),
+                ("phone_number", vec![tl::enums::PrivacyRule::PrivacyValueAllowContacts]),
+                ("profile_photo", vec![tl::enums::PrivacyRule::PrivacyValueAllowAll]),
+                ("chat_invite", vec![tl::enums::PrivacyRule::PrivacyValueAllowAll]),
             ]),
+            privacy_refuse: false,
+            download: [
+                download_preset(true, 0, 0, 0),
+                download_preset(false, 102_400, 512_000, 0),
+                {
+                    let mut high = download_preset(false, 1_048_576, 10_485_760, 1_048_576);
+                    high.video_preload_large = true;
+                    high.video_upload_maxbitrate = 64;
+                    high
+                },
+            ],
+            download_refuse: false,
+            download_unread: false,
+            boost_peer: None,
+            boost_level: 3,
+            boost_count: 12,
+            boost_refuse: false,
+            start_refuse: false,
             calls: protocol::support_dir().join("telegram.calls"),
             dialogs_go: false,
             peer_go: false,
@@ -851,6 +939,8 @@ impl World {
             slowmode_seconds: HashMap::new(),
             media_banned: HashSet::new(),
             paid_stars: HashMap::new(),
+            transcribe_mode: String::new(),
+            transcribe_trial: Some(2),
         };
         let odalys = Who::User(ODALYS);
         world.store(None, message(odalys, 10, ODALYS, t0() - 300, "Are you coming to the ridge on Saturday?"));
@@ -875,7 +965,9 @@ impl World {
         world.store(None, message(Who::User(TOBIN), 31, ME, t0() - 80_000, "Trailhead at seven, then."));
         world.store(None, message(Who::User(ME), 2, ME, t0() - 100_000, "Packing list: stove, map, headlamp."));
         world.store(None, message(Who::User(SERVICE), 3, SERVICE, t0() - 110_000, "Login code: 24680. Do not give this code to anyone."));
-        world.store(None, message(Who::User(BOT), 4, BOT, t0() - 120_000, "Trail report: all clear."));
+        let mut trail = message(Who::User(BOT), 4, BOT, t0() - 120_000, "Trail report: all clear.");
+        trail.reply_markup = Some(trail_keyboard());
+        world.store(None, trail);
         // My newest word to the bot, which its dialog's read-outbox stops below: ✓ without ✓✓.
         world.store(None, message(Who::User(BOT), 5, ME, t0() - 115_000, "Any closures this weekend?"));
         world.store(None, message(Who::User(SCAM), 6, SCAM, t0() - 130_000, "You won a prize!"));
@@ -1166,6 +1258,62 @@ fn rpc(code: i32, name: &str, value: Option<u32>) -> Fault {
 fn limited(ids: &[i32], limit: i32) -> Vec<i32> {
     let n = usize::try_from(limit).unwrap_or(0);
     ids.iter().copied().take(n).collect()
+}
+
+fn boost_status(level: i32, boosts: i32, mine: bool, url: &str) -> tl::types::premium::BoostsStatus {
+    tl::types::premium::BoostsStatus {
+        my_boost: mine,
+        level,
+        current_level_boosts: 10,
+        boosts,
+        gift_boosts: None,
+        next_level_boosts: Some(20),
+        premium_audience: None,
+        boost_url: url.to_owned(),
+        prepaid_giveaways: None,
+        my_boost_slots: mine.then_some(vec![1]),
+    }
+}
+
+fn one_boost(slot: i32, channel: Option<i64>) -> tl::enums::MyBoost {
+    tl::types::MyBoost {
+        slot,
+        peer: channel.map(|id| Who::Channel(id).peer()),
+        date: t0(),
+        expires: t0() + 30 * 86_400,
+        cooldown_until_date: None,
+    }
+    .into()
+}
+
+fn download_preset(disabled: bool, photo: i32, video: i64, file: i64) -> tl::types::AutoDownloadSettings {
+    tl::types::AutoDownloadSettings {
+        disabled,
+        video_preload_large: false,
+        audio_preload_next: false,
+        phonecalls_less_data: false,
+        stories_preload: false,
+        photo_size_max: photo,
+        video_size_max: video,
+        file_size_max: file,
+        video_upload_maxbitrate: 0,
+        small_queue_active_operations_max: 0,
+        large_queue_active_operations_max: 0,
+    }
+}
+
+/// Wire log name for an `account.getPrivacy` / `account.setPrivacy` key.
+fn privacy_key_name(key: &tl::enums::InputPrivacyKey) -> &'static str {
+    match key {
+        tl::enums::InputPrivacyKey::PhoneCall => "phone_call",
+        tl::enums::InputPrivacyKey::PhoneP2P => "phone_p2p",
+        tl::enums::InputPrivacyKey::VoiceMessages => "voice_messages",
+        tl::enums::InputPrivacyKey::StatusTimestamp => "status_timestamp",
+        tl::enums::InputPrivacyKey::PhoneNumber => "phone_number",
+        tl::enums::InputPrivacyKey::ProfilePhoto => "profile_photo",
+        tl::enums::InputPrivacyKey::ChatInvite => "chat_invite",
+        _ => "other",
+    }
 }
 
 /// The request, if `body` is one of these.
@@ -1888,6 +2036,71 @@ impl World {
                 let video = words.next().is_some_and(|v| v == "1" || v == "true");
                 self.call_flags.insert(id, (avail, priv_, video));
                 Vec::new()
+            }
+            "voice-forbidden" => {
+                let id = words.next().and_then(|id| id.parse().ok()).unwrap_or(ODALYS);
+                let on = words.next().map_or(true, |v| v == "1" || v == "true");
+                if on {
+                    self.voice_forbidden.insert(id);
+                } else {
+                    self.voice_forbidden.remove(&id);
+                }
+                Vec::new()
+            }
+            "voice-ban" => {
+                if let Some((who, None)) = words.next().and_then(Who::parse) {
+                    let on = words.next().map_or(true, |v| v == "1" || v == "true");
+                    if on {
+                        self.voice_banned.insert(who);
+                    } else {
+                        self.voice_banned.remove(&who);
+                    }
+                }
+                Vec::new()
+            }
+            "transcribe-mode" => {
+                self.transcribe_mode = words.next().unwrap_or("").to_owned();
+                if let Some(trial) = words.next().and_then(|v| v.parse::<i32>().ok()) {
+                    self.transcribe_trial = Some(trial);
+                }
+                Vec::new()
+            }
+            "privacy-refuse" => {
+                self.privacy_refuse = words.next().map_or(true, |v| v != "0" && v != "off");
+                Vec::new()
+            }
+            "autodownload-refuse" => {
+                self.download_refuse = words.next().map_or(true, |v| v != "0" && v != "off");
+                Vec::new()
+            }
+            "autodownload-unread" => {
+                self.download_unread = words.next().map_or(true, |v| v != "0" && v != "off");
+                Vec::new()
+            }
+            "boost-refuse" => {
+                self.boost_refuse = words.next().map_or(true, |v| v != "0" && v != "off");
+                Vec::new()
+            }
+            "start-refuse" => {
+                self.start_refuse = words.next().map_or(true, |v| v != "0" && v != "off");
+                Vec::new()
+            }
+            "transcribe-update" => {
+                // transcribe-update <peer> <msg_id> <pending:0|1> <text...>
+                let peer = words.next().and_then(Who::parse).map(|(w, _)| w).unwrap_or(odalys);
+                let msg_id = words.next().and_then(|v| v.parse::<i32>().ok()).unwrap_or(20);
+                let pending = words.next().is_some_and(|v| v == "1" || v == "true");
+                let text = words.collect::<Vec<_>>().join(" ");
+                vec![update(
+                    tl::types::UpdateTranscribedAudio {
+                        pending,
+                        peer: peer.peer(),
+                        msg_id,
+                        transcription_id: 901,
+                        text,
+                    }
+                    .into(),
+                )]
             }
             "call-event" => {
                 // call-event <out|in> <missed|busy|hangup|disconnect|none|group-live|group-end|conf-live|conf-missed> [video] [duration]
@@ -4215,6 +4428,10 @@ impl World {
             full.phone_calls_private = phone_priv;
             full.video_calls_available = video_avail;
             full.send_paid_messages_stars = self.paid_stars.get(&id).copied();
+            full.voice_messages_forbidden = self.voice_forbidden.contains(&id);
+            if id == BOT {
+                full.bot_info = Some(trail_bot_info());
+            }
             let mut people = users();
             if id == ME {
                 full.about = Some(self.me_about.clone());
@@ -4745,24 +4962,18 @@ impl World {
             return answer(app_config());
         }
         if let Some(request) = asked::<f::account::GetPrivacy>(body) {
-            let name = match request.key {
-                tl::enums::InputPrivacyKey::PhoneCall => "phone_call",
-                tl::enums::InputPrivacyKey::PhoneP2P => "phone_p2p",
-                tl::enums::InputPrivacyKey::VoiceMessages => "voice_messages",
-                _ => "other",
-            };
+            let name = privacy_key_name(&request.key);
             self.log(&format!("account.getPrivacy {name}"));
             let rules = self.privacy.get(name).cloned().unwrap_or_else(|| vec![tl::enums::PrivacyRule::PrivacyValueAllowAll]);
             let found = tl::types::account::PrivacyRules { rules, chats: chats(), users: users() };
             return answer(tl::enums::account::PrivacyRules::Rules(found));
         }
         if let Some(request) = asked::<f::account::SetPrivacy>(body) {
-            let name = match request.key {
-                tl::enums::InputPrivacyKey::PhoneCall => "phone_call",
-                tl::enums::InputPrivacyKey::PhoneP2P => "phone_p2p",
-                tl::enums::InputPrivacyKey::VoiceMessages => "voice_messages",
-                _ => "other",
-            };
+            let name = privacy_key_name(&request.key);
+            if self.privacy_refuse {
+                self.log(&format!("account.setPrivacy {name} refused"));
+                return Err(rpc(403, "PREMIUM_ACCOUNT_REQUIRED", None));
+            }
             let mut mapped: Vec<tl::enums::PrivacyRule> = Vec::new();
             let mut tags: Vec<String> = Vec::new();
             for rule in request.rules {
@@ -4859,6 +5070,91 @@ impl World {
             self.log(&format!("SetDefaultHistoryTtl {}", request.period));
             self.default_ttl = request.period.max(0);
             return answer(true);
+        }
+        if asked::<f::account::GetAutoDownloadSettings>(body).is_some() {
+            if self.download_unread {
+                self.log("account.getAutoDownloadSettings unread");
+                return Err(rpc(400, "CONNECTION_NOT_INITED", None));
+            }
+            self.log("account.getAutoDownloadSettings");
+            let found = tl::types::account::AutoDownloadSettings {
+                low: tl::enums::AutoDownloadSettings::Settings(self.download[0].clone()),
+                medium: tl::enums::AutoDownloadSettings::Settings(self.download[1].clone()),
+                high: tl::enums::AutoDownloadSettings::Settings(self.download[2].clone()),
+            };
+            return answer(tl::enums::account::AutoDownloadSettings::Settings(found));
+        }
+        if let Some(request) = asked::<f::account::SaveAutoDownloadSettings>(body) {
+            if self.download_refuse {
+                self.log("account.saveAutoDownloadSettings refused");
+                return Err(rpc(403, "PREMIUM_ACCOUNT_REQUIRED", None));
+            }
+            let tl::enums::AutoDownloadSettings::Settings(settings) = &request.settings;
+            let slot = if request.low { 0 } else if request.high { 2 } else { 1 };
+            let which = ["low", "medium", "high"][slot];
+            self.log(&format!(
+                "account.saveAutoDownloadSettings {which} photo={} video={} file={} preload={} bitrate={}",
+                settings.photo_size_max, settings.video_size_max, settings.file_size_max,
+                u8::from(settings.video_preload_large), settings.video_upload_maxbitrate
+            ));
+            self.download[slot] = settings.clone();
+            return answer(true);
+        }
+        if let Some(request) = asked::<f::premium::GetBoostsStatus>(body) {
+            let Who::Channel(id) = input_who(&request.peer) else {
+                self.log("premium.getBoostsStatus refused");
+                return Err(rpc(400, "PEER_ID_INVALID", None));
+            };
+            self.log(&format!("premium.getBoostsStatus c{id}"));
+            let url = if id == NOTES { "https://t.me/boost/fieldnotes".to_owned() } else { format!("https://t.me/boost/c{id}") };
+            let status = boost_status(self.boost_level, self.boost_count, self.boost_peer == Some(id), &url);
+            return answer(tl::enums::premium::BoostsStatus::Status(status));
+        }
+        if asked::<f::premium::GetMyBoosts>(body).is_some() {
+            let free = self.boost_peer.is_none();
+            self.log(if free { "premium.getMyBoosts free" } else { "premium.getMyBoosts used" });
+            let mine = tl::types::premium::MyBoosts { my_boosts: vec![one_boost(1, self.boost_peer)], chats: Vec::new(), users: Vec::new() };
+            return answer(tl::enums::premium::MyBoosts::Boosts(mine));
+        }
+        if let Some(request) = asked::<f::premium::ApplyBoost>(body) {
+            if self.boost_refuse {
+                self.log("premium.applyBoost refused");
+                return Err(rpc(403, "PREMIUM_ACCOUNT_REQUIRED", None));
+            }
+            let Who::Channel(id) = input_who(&request.peer) else {
+                self.log("premium.applyBoost refused");
+                return Err(rpc(400, "PEER_ID_INVALID", None));
+            };
+            let slot = request.slots.as_ref().and_then(|slots| slots.first().copied()).unwrap_or(1);
+            if self.boost_peer.is_some_and(|held| held != id) {
+                self.log(&format!("premium.applyBoost c{id} slot={slot} empty"));
+                return Err(rpc(400, "BOOSTS_EMPTY", None));
+            }
+            self.log(&format!("premium.applyBoost c{id} slot={slot}"));
+            self.boost_peer = Some(id);
+            self.boost_count += 1;
+            if self.boost_count >= 20 {
+                self.boost_level += 1;
+            }
+            let mine = tl::types::premium::MyBoosts { my_boosts: vec![one_boost(slot, Some(id))], chats: Vec::new(), users: Vec::new() };
+            return answer(tl::enums::premium::MyBoosts::Boosts(mine));
+        }
+        if let Some(request) = asked::<f::messages::StartBot>(body) {
+            if self.start_refuse {
+                self.log("messages.startBot refused");
+                return Err(rpc(400, "BOT_INVALID", None));
+            }
+            let bot = match &request.bot {
+                tl::enums::InputUser::User(user) => user.user_id,
+                tl::enums::InputUser::UserSelf => self.me,
+                _ => 0,
+            };
+            if bot != BOT {
+                self.log("messages.startBot refused");
+                return Err(rpc(400, "PEER_ID_INVALID", None));
+            }
+            self.log(&format!("messages.startBot u{bot} {}", request.start_param));
+            return answer(updates(Vec::new()));
         }
         if let Some(answered) = self.panes(body, events) {
             return answered;
@@ -5796,6 +6092,23 @@ impl World {
             let options: String = options.iter().filter(|(_, on)| *on).map(|(name, _)| format!(" [{name}]")).collect();
             let noted = super::content::entity_note(request.entities.as_deref().unwrap_or(&[]));
             self.log(&format!("SendMedia {} {kind} {}{noted}{options}", peer.text(), request.message));
+            if kind.starts_with("voice-note") {
+                if let Who::User(id) = peer {
+                    if self.voice_forbidden.contains(&id) {
+                        return Some(Err(Fault::Rpc {
+                            code: 403,
+                            name: "VOICE_MESSAGES_FORBIDDEN".to_owned(),
+                            value: None,
+                        }));
+                    }
+                } else if self.voice_banned.contains(&peer) {
+                    return Some(Err(Fault::Rpc {
+                        code: 403,
+                        name: "CHAT_SEND_VOICES_FORBIDDEN".to_owned(),
+                        value: None,
+                    }));
+                }
+            }
             return Some(self.deliver(events, peer, None, None, vec![(request.random_id, request.message, Some(media), request.entities)], request.schedule_date));
         }
         if let Some(request) = asked::<f::messages::SendMultiMedia>(body) {
@@ -5810,6 +6123,49 @@ impl World {
             }
             self.log(&format!("SendMultiMedia {} {}", peer.text(), kinds.join(",")));
             return Some(self.deliver(events, peer, None, None, items, request.schedule_date));
+        }
+        if let Some(request) = asked::<f::messages::TranscribeAudio>(body) {
+            let peer = input_who(&request.peer);
+            self.log(&format!("TranscribeAudio {} {}", peer.text(), request.msg_id));
+            if self.transcribe_mode == "exhausted" {
+                return Some(Err(Fault::Rpc {
+                    code: 403,
+                    name: "PREMIUM_ACCOUNT_REQUIRED".to_owned(),
+                    value: None,
+                }));
+            }
+            let pending = self.transcribe_mode == "pending";
+            let text = if pending {
+                "Meet at the".to_owned()
+            } else {
+                "Meet at the trailhead at seven.".to_owned()
+            };
+            let trial_remains_num = self.transcribe_trial.map(|n| {
+                let next = (n - 1).max(0);
+                self.transcribe_trial = Some(next);
+                next
+            });
+            let trial_remains_until_date = trial_remains_num.map(|_| t0() + 7 * 86_400);
+            return Some(answer(tl::enums::messages::TranscribedAudio::Audio(
+                tl::types::messages::TranscribedAudio {
+                    pending,
+                    transcription_id: 901,
+                    text,
+                    trial_remains_num,
+                    trial_remains_until_date,
+                },
+            )));
+        }
+        if let Some(request) = asked::<f::messages::RateTranscribedAudio>(body) {
+            let peer = input_who(&request.peer);
+            self.log(&format!(
+                "RateTranscribedAudio {} {} {} {}",
+                peer.text(),
+                request.msg_id,
+                request.transcription_id,
+                request.good
+            ));
+            return Some(answer(true));
         }
         None
     }

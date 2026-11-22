@@ -2003,7 +2003,7 @@ impl SettingsWindow {
 
     /// D1: what tinyclient keeps on this Mac, as a two-part bar.
     fn usage(&mut self, cx: &mut Context<Self>) -> Div {
-        let Some((messages, files)) = self.storage else {
+        let Some((messages, files, chats)) = self.storage.clone() else {
             return row("Storage used", None, div().type_ui().text_color(theme::text_soft()).child("Counting…"));
         };
         let (message_words, file_words, total_words) = usage_words(messages, files);
@@ -2058,6 +2058,26 @@ impl SettingsWindow {
                     .child(legend(theme::accent(), format!("Messages {message_words}")))
                     .child(legend(theme::positive(), format!("Images and files {file_words}"))),
             )
+            .children((!chats.is_empty()).then(|| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .pt(px(4.))
+                    .child(div().type_small().text_color(theme::text_faint()).child("By chat"))
+                    .children(chats.iter().take(12).map(|chat| {
+                        let name = if chat.title.is_empty() { chat.conversation.id.clone() } else { chat.title.clone() };
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(12.))
+                            .type_small()
+                            .text_color(theme::text_soft())
+                            .child(div().flex_1().min_w_0().child(name))
+                            .child(megabytes(chat.bytes))
+                    }))
+            }))
     }
 
     /// P4: a longer time applies at once; a shorter one asks first, with what it deletes.

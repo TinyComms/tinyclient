@@ -188,6 +188,8 @@ pub struct Known {
     pub contact: bool,
     /// A channel proper: only its owners post.
     pub broadcast: bool,
+    /// A supergroup. Telegram still addresses it as a channel. The groups auto-download gate uses this.
+    pub megagroup: bool,
     pub forum: bool,
     /// Membership from a full chat description. A partial channel does not say.
     pub member: Option<bool>,
@@ -216,6 +218,10 @@ pub struct Known {
     pub seen: String,
     /// Call availability and privacy flags from `users.getFullUser`.
     pub call_flags: Option<CallFlags>,
+    /// Recipient refuses voice and round video messages (`UserFull::voice_messages_forbidden`).
+    pub voice_forbidden: Option<bool>,
+    /// Group or supergroup forbids voice / round video messages (`send_voices` / `send_roundvideos`).
+    pub voice_banned: bool,
     /// Protected chat: Telegram refuses forwarding or saving content from here.
     pub noforwards: bool,
 }
@@ -379,6 +385,27 @@ fn member_cannot_send(creator: bool, admin: bool, default_banned: Option<&tl::en
     personal.is_some_and(send_banned) || (!admin && default_banned.is_some_and(send_banned))
 }
 
+/// `send_voices` or `send_roundvideos` is on, and the ban has not expired.
+fn voices_banned(rights: &tl::enums::ChatBannedRights) -> bool {
+    let tl::enums::ChatBannedRights::Rights(rights) = rights;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|age| age.as_secs()).unwrap_or(0);
+    (rights.send_voices || rights.send_roundvideos)
+        && (rights.until_date == 0 || u64::try_from(rights.until_date).unwrap_or(0) > now)
+}
+
+/// A member cannot send voice or round video messages in a group.
+fn member_cannot_send_voices(
+    creator: bool,
+    admin: bool,
+    default_banned: Option<&tl::enums::ChatBannedRights>,
+    personal: Option<&tl::enums::ChatBannedRights>,
+) -> bool {
+    if creator {
+        return false;
+    }
+    personal.is_some_and(voices_banned) || (!admin && default_banned.is_some_and(voices_banned))
+}
+
 fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
     use tl::enums::Chat;
     Some(match chat {
@@ -425,6 +452,7 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                 creator: chat.creator,
                 admin: chat.admin_rights.is_some(),
                 default_banned: chat.default_banned_rights.as_ref().map(BannedRights::from_tl),
+                voice_banned: active && member_cannot_send_voices(chat.creator, chat.admin_rights.is_some(), chat.default_banned_rights.as_ref(), None),
                 rights,
                 photo,
                 photo_dc,
@@ -503,6 +531,7 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                 name: channel.title.clone(),
                 handle: first_username(&channel.username, &channel.usernames),
                 broadcast: channel.broadcast,
+                megagroup: channel.megagroup,
                 forum: channel.forum,
                 member: (!channel.min).then_some(!channel.left),
                 read_only: channel.left || restricted,
@@ -510,6 +539,14 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                 admin: channel.admin_rights.is_some(),
                 default_banned: channel.default_banned_rights.as_ref().map(BannedRights::from_tl),
                 personal_banned: channel.banned_rights.as_ref().map(BannedRights::from_tl),
+                voice_banned: !channel.broadcast
+                    && active
+                    && member_cannot_send_voices(
+                        channel.creator,
+                        channel.admin_rights.is_some(),
+                        channel.default_banned_rights.as_ref(),
+                        channel.banned_rights.as_ref(),
+                    ),
                 rights,
                 photo,
                 photo_dc,
@@ -524,6 +561,7 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                 hash: Some(channel.access_hash),
                 name: channel.title.clone(),
                 broadcast: channel.broadcast,
+                megagroup: channel.megagroup,
                 member: Some(false),
                 read_only: true,
                 ..Known::default()
@@ -546,10 +584,62 @@ pub struct Learned {
     pub chats: Vec<Who>,
 }
 
+/// What kind of file an auto-download rule is deciding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadClass {
+    Photo,
+    Video,
+    Gif,
+    File,
+}
+
+/// Local gates plus the size caps of the preset this device uses (Wi-Fi).
+/// Every flag defaults off, so a full file stays held for the viewer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DownloadRules {
+    pub fetch_full_photos: bool,
+    pub private_chats: bool,
+    pub groups: bool,
+    pub channels: bool,
+    pub photo_max: u64,
+    pub video_max: u64,
+    pub file_max: u64,
+}
+
+impl DownloadRules {
+    /// Whether a full file that would otherwise wait for the viewer should be fetched now.
+    /// A zero size, a chat kind that is off, or a cap of zero stays held.
+    /// `megagroup` is Telegram's flag on a channel. A supergroup follows the groups gate.
+    /// A broadcast channel follows the channels gate.
+    pub fn fetch_full(self, who: Who, megagroup: bool, class: DownloadClass, bytes: u64) -> bool {
+        if bytes == 0 {
+            return false;
+        }
+        let chat_on = match who {
+            Who::User(_) => self.private_chats,
+            Who::Group(_) => self.groups,
+            Who::Channel(_) if megagroup => self.groups,
+            Who::Channel(_) => self.channels,
+        };
+        if !chat_on {
+            return false;
+        }
+        let cap = match class {
+            DownloadClass::Photo => self.fetch_full_photos.then_some(self.photo_max).unwrap_or(0),
+            DownloadClass::Video | DownloadClass::Gif => self.video_max,
+            DownloadClass::File => self.file_max,
+        };
+        cap > 0 && bytes <= cap
+    }
+}
+
 #[derive(Default)]
 pub struct Directory {
     map: HashMap<Who, Known>,
     pub me: i64,
+    /// Honored when a message's full file is classified. The stored gates are applied when the
+    /// account connects, before a message is mapped. Until then every gate is off.
+    pub download: DownloadRules,
 }
 
 pub fn note_key(who: Who) -> String {
@@ -558,7 +648,7 @@ pub fn note_key(who: Who) -> String {
 
 impl Directory {
     pub fn new(me: i64) -> Directory {
-        Directory { map: HashMap::new(), me }
+        Directory { map: HashMap::new(), me, download: DownloadRules::default() }
     }
 
     pub fn get(&self, who: Who) -> Option<&Known> {
@@ -610,6 +700,7 @@ impl Directory {
             let mut known = of_user(user);
             let before = self.map.get(&who);
             known.call_flags = before.and_then(|before| before.call_flags);
+            known.voice_forbidden = before.and_then(|before| before.voice_forbidden);
             if known.hash.is_none() {
                 known.hash = before.and_then(|before| before.hash);
                 // A user seen in passing may come without its picture.
@@ -636,6 +727,7 @@ impl Directory {
             };
             let before = self.map.get(&who);
             known.call_flags = before.and_then(|before| before.call_flags);
+            known.voice_forbidden = before.and_then(|before| before.voice_forbidden);
             if known.hash.is_none() {
                 known.hash = before.and_then(|before| before.hash);
             }
@@ -647,6 +739,7 @@ impl Directory {
                     known.admin = before.admin;
                     known.default_banned = before.default_banned;
                     known.personal_banned = before.personal_banned;
+                    known.voice_banned = before.voice_banned;
                     known.rights = before.rights;
                 }
             }
@@ -670,6 +763,24 @@ impl Directory {
             return false;
         }
         known.call_flags = Some(flags);
+        true
+    }
+
+    pub fn set_voice_forbidden(&mut self, who: Who, forbidden: bool) -> bool {
+        let known = self.map.entry(who).or_default();
+        if known.voice_forbidden == Some(forbidden) {
+            return false;
+        }
+        known.voice_forbidden = Some(forbidden);
+        true
+    }
+
+    pub fn set_voice_banned(&mut self, who: Who, banned: bool) -> bool {
+        let known = self.map.entry(who).or_default();
+        if known.voice_banned == banned {
+            return false;
+        }
+        known.voice_banned = banned;
         true
     }
 
@@ -839,6 +950,9 @@ mod tests {
     #[test]
     fn a_megagroup_members_cannot_post_in_is_read_only_and_its_admins_still_can() {
         let mut members = megagroup("/g/'s Tech Memes Chat");
+        let (_, known) = of_chat(&members.clone().into()).expect("a megagroup");
+        assert!(known.megagroup);
+        assert!(!known.broadcast);
         members.default_banned_rights = Some(ban_send(0));
         assert!(read_only(members.clone().into()));
 
@@ -966,5 +1080,41 @@ mod tests {
         assert!(admin_rules.send_messages && admin_rules.send_media && admin_rules.send_stickers);
         assert_eq!(admin_rules.slowmode_seconds, 0);
         assert_eq!(admin_rules.paid_stars, None);
+    }
+
+    #[test]
+    fn voice_and_round_video_bans_gate_group_members_but_not_admins_or_expired_bans() {
+        let ban_voices = |until: i32| -> tl::enums::ChatBannedRights {
+            let rights: tl::types::ChatBannedRights = blank(&[&put(8_388_608u32), &put(until)]);
+            rights.into()
+        };
+        let ban_round = |until: i32| -> tl::enums::ChatBannedRights {
+            let rights: tl::types::ChatBannedRights = blank(&[&put(2_097_152u32), &put(until)]);
+            rights.into()
+        };
+        let voice_banned = |chat: tl::enums::Chat| of_chat(&chat).expect("a chat").1.voice_banned;
+
+        let mut group = megagroup("No voices");
+        group.default_banned_rights = Some(ban_voices(0));
+        assert!(voice_banned(group.clone().into()));
+
+        let mut creator = group.clone();
+        creator.creator = true;
+        assert!(!voice_banned(creator.into()));
+
+        let mut admin_of = group.clone();
+        admin_of.admin_rights = Some(admin(false));
+        assert!(!voice_banned(admin_of.into()));
+
+        // Expired default ban does not disable voices.
+        group.default_banned_rights = Some(ban_voices(1));
+        assert!(!voice_banned(group.clone().into()));
+
+        // Personal ban on send_roundvideos disables voice/round video for that member.
+        group.default_banned_rights = None;
+        group.banned_rights = Some(ban_round(0));
+        assert!(voice_banned(group.clone().into()));
+        group.banned_rights = Some(ban_round(1));
+        assert!(!voice_banned(group.into()));
     }
 }

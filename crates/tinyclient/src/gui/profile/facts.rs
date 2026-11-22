@@ -1085,6 +1085,7 @@ mod tests {
             moderate: false,
             can_pin: false,
             joined: true,
+            voice_notes_forbidden: String::new(),
         }
     }
 

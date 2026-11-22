@@ -106,6 +106,10 @@ impl Fault {
                 "CHANNEL_ONLY" => "That setting is only available in a channel or supergroup.".to_owned(),
                 "PARTICIPANTS_HIDDEN" => "This group hides its member list.".to_owned(),
                 "USER_PRIVACY_RESTRICTED" => "This person's privacy settings don't allow calls.".to_owned(),
+                "VOICE_MESSAGES_FORBIDDEN" => "This person doesn't accept voice and video messages.".to_owned(),
+                "CHAT_SEND_VOICES_FORBIDDEN" | "CHAT_SEND_ROUNDVIDEOS_FORBIDDEN" => {
+                    "Voice and video messages aren't allowed in this group.".to_owned()
+                }
                 "CALL_PROTOCOL_COMPAT_LAYER_INVALID" => "This call protocol version isn't supported.".to_owned(),
                 "PARTICIPANT_VERSION_OUTDATED" => "The other person's Telegram app needs an update for this call.".to_owned(),
                 "PREMIUM_ACCOUNT_REQUIRED" => "This needs Telegram Premium.".to_owned(),
@@ -131,6 +135,11 @@ impl Fault {
                 "CHANNELS_TOO_MUCH" | "USER_CHANNELS_TOO_MUCH" => "This account can't join any more channels.".to_owned(),
                 "TRANSLATE_REQ_QUOTA_EXCEEDED" => "Telegram's translation limit was reached. Try again later.".to_owned(),
                 "CHAT_SECRET" => "A sealed or secret chat is not translated.".to_owned(),
+                "BOOSTS_EMPTY" => "No boost is free to give.".to_owned(),
+                "BOT_INVALID" => "This bot cannot be started.".to_owned(),
+                "PHONE_NUMBER_INVALID" => "Telegram did not share a phone number.".to_owned(),
+                "TRANSCRIPTION_FAILED" => "Couldn't transcribe this message.".to_owned(),
+                "MSG_VOICE_MISSING" => "This message has no voice or video to transcribe.".to_owned(),
                 // A length or a count past the free plan. `MESSAGE_TOO_LONG` and
                 // `REACTIONS_TOO_MANY` are named above and are not this.
                 name if name.ends_with("_TOO_MUCH") => "This needs Telegram Premium.".to_owned(),
@@ -283,5 +292,15 @@ mod tests {
         assert!(stickers.words().contains("stickers"), "{}", stickers.words());
         let paid = Fault::Rpc { code: 403, name: "ALLOW_PAYMENT_REQUIRED".into(), value: Some(50) };
         assert!(paid.words().contains("50 Telegram Stars"), "{}", paid.words());
+    }
+
+    #[test]
+    fn voice_message_refusal_rpc_errors_map_to_plain_words() {
+        let user = Fault::Rpc { code: 403, name: "VOICE_MESSAGES_FORBIDDEN".into(), value: None };
+        assert!(user.words().contains("voice and video messages"), "{}", user.words());
+        let group = Fault::Rpc { code: 403, name: "CHAT_SEND_VOICES_FORBIDDEN".into(), value: None };
+        assert!(group.words().contains("aren't allowed in this group"), "{}", group.words());
+        let round = Fault::Rpc { code: 403, name: "CHAT_SEND_ROUNDVIDEOS_FORBIDDEN".into(), value: None };
+        assert!(round.words().contains("aren't allowed in this group"), "{}", round.words());
     }
 }

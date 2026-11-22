@@ -3728,6 +3728,263 @@ fn privacy_settings_read_and_write_rules_with_user_and_chat_exceptions() {
 }
 
 #[test]
+fn privacy_last_seen_sets_contacts_with_one_exception_and_a_premium_refusal() {
+    use protocol::{ErrorCode, PrivacyAudience, PrivacyException, PrivacyKey, PrivacyPolicy};
+    let world = World::signed_in();
+    world.connected();
+
+    let Response::Privacy { policy: seen, .. } = world.ask(Request::GetPrivacy {
+        account: account(),
+        key: PrivacyKey::LastSeen,
+    }) else {
+        panic!("expected Privacy for LastSeen");
+    };
+    assert_eq!(seen.audience, PrivacyAudience::Everybody);
+    assert!(!seen.premium_only);
+
+    let Response::Privacy { policy: phone, .. } = world.ask(Request::GetPrivacy {
+        account: account(),
+        key: PrivacyKey::PhoneNumber,
+    }) else {
+        panic!("expected Privacy for PhoneNumber");
+    };
+    assert_eq!(phone.audience, PrivacyAudience::Contacts);
+
+    let Response::Privacy { policy: photo, .. } = world.ask(Request::GetPrivacy {
+        account: account(),
+        key: PrivacyKey::ProfilePhoto,
+    }) else {
+        panic!("expected Privacy for ProfilePhoto");
+    };
+    assert_eq!(photo.audience, PrivacyAudience::Everybody);
+
+    let Response::Privacy { policy: invite, .. } = world.ask(Request::GetPrivacy {
+        account: account(),
+        key: PrivacyKey::ChatInvite,
+    }) else {
+        panic!("expected Privacy for ChatInvite");
+    };
+    assert_eq!(invite.audience, PrivacyAudience::Everybody);
+
+    let updated = PrivacyPolicy {
+        audience: PrivacyAudience::Contacts,
+        always_allow: vec![PrivacyException { id: "u7002".into(), name: String::new(), chat: false }],
+        never_allow: Vec::new(),
+        premium_only: false,
+    };
+    let Response::Privacy { policy: saved, .. } = world.ask(Request::SetPrivacy {
+        account: account(),
+        key: PrivacyKey::LastSeen,
+        policy: updated,
+    }) else {
+        panic!("expected Privacy after SetPrivacy LastSeen");
+    };
+    assert_eq!(saved.audience, PrivacyAudience::Contacts);
+    assert!(saved.always_allow.iter().any(|e| e.id == "u7002" && !e.chat));
+    assert!(
+        world.calls().iter().any(|c| c.contains("account.setPrivacy status_timestamp")
+            && c.contains("allow_users:[7002]")
+            && c.contains("allow_contacts")),
+        "expected last-seen rules on the wire, got: {:#?}",
+        world.calls()
+    );
+
+    world.steer("privacy-refuse");
+    let refused = world.ask(Request::SetPrivacy {
+        account: account(),
+        key: PrivacyKey::LastSeen,
+        policy: PrivacyPolicy { audience: PrivacyAudience::Nobody, ..PrivacyPolicy::default() },
+    });
+    match refused {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("Telegram Premium"), "{detail}");
+        }
+        other => panic!("expected a premium refusal, got {other:?}"),
+    }
+    assert!(
+        world.calls().iter().any(|c| c.contains("account.setPrivacy status_timestamp refused")),
+        "expected the refused setPrivacy on the wire, got: {:#?}",
+        world.calls()
+    );
+}
+
+#[test]
+fn auto_download_reads_wifi_limits_and_refuses_a_save() {
+    use protocol::{AutoDownload, AutoDownloadPreset, ErrorCode};
+    let mut world = World::signed_in();
+    world.connected();
+
+    let Response::AutoDownload { settings } = world.ask(Request::GetAutoDownload { account: account() }) else {
+        panic!("expected AutoDownload");
+    };
+    assert!(settings.roaming.disabled);
+    assert_eq!(settings.wifi.photo_size_max, 1_048_576);
+    assert_eq!(settings.wifi.video_size_max, 10_485_760);
+    assert!(!settings.fetch_full_photos);
+    assert!(!settings.private_chats);
+    assert!(world.calls().iter().any(|c| c == "account.getAutoDownloadSettings"));
+
+    let mut next = settings;
+    next.fetch_full_photos = true;
+    next.private_chats = true;
+    next.wifi = AutoDownloadPreset { disabled: false, photo_size_max: 2_048, video_size_max: 8_192, file_size_max: 4_096 };
+    let Response::AutoDownload { settings: saved } = world.ask(Request::SetAutoDownload { account: account(), settings: next }) else {
+        panic!("expected AutoDownload after save");
+    };
+    assert!(saved.fetch_full_photos && saved.private_chats);
+    assert_eq!(saved.wifi.photo_size_max, 2_048);
+    assert!(
+        world.calls().iter().any(|c| c.contains("account.saveAutoDownloadSettings high photo=2048 video=8192 file=4096 preload=1 bitrate=64")),
+        "expected the wifi preset to keep the preload flag, got: {:#?}",
+        world.calls()
+    );
+    assert!(world.calls().iter().any(|c| c.contains("account.saveAutoDownloadSettings low ")));
+    assert!(world.calls().iter().any(|c| c.contains("account.saveAutoDownloadSettings medium ")));
+
+    let saves = world.called("account.saveAutoDownloadSettings");
+    world.steer("autodownload-unread");
+    match world.ask(Request::SetAutoDownload { account: account(), settings: AutoDownload::default() }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("CONNECTION_NOT_INITED"), "{detail}");
+        }
+        other => panic!("expected an unread preset to refuse the save, got {other:?}"),
+    }
+    assert_eq!(world.called("account.saveAutoDownloadSettings"), saves, "an unread preset is not overwritten: {:#?}", world.calls());
+
+    world.restart();
+    world.connected();
+    world.watch(Watching { conversation: Some(key("u7002")), ..Watching::default() });
+    world.steer("photo");
+    world.until("the saved private-chat gate to fetch the photo without opening settings", || {
+        (world.called("GetFile photo 6014 y") > 0).then_some(())
+    });
+
+    world.steer("autodownload-refuse");
+    let refused = world.ask(Request::SetAutoDownload {
+        account: account(),
+        settings: AutoDownload::default(),
+    });
+    match refused {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("Telegram Premium"), "{detail}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(world.calls().iter().any(|c| c.contains("account.saveAutoDownloadSettings refused")));
+}
+
+#[test]
+fn channel_boosts_read_the_level_and_applying_one_can_be_refused() {
+    use protocol::ErrorCode;
+    let world = World::signed_in();
+    world.connected();
+
+    let Response::Boosts { status, .. } = world.ask(Request::GetBoosts { conversation: key("c9001") }) else {
+        panic!("expected Boosts");
+    };
+    assert_eq!(status.level, 3);
+    assert_eq!(status.boosts, 12);
+    assert_eq!(status.next_level_boosts, Some(20));
+    assert!(!status.my_boost);
+    assert!(
+        world.calls().iter().any(|c| c == "premium.getBoostsStatus c9001"),
+        "expected getBoostsStatus on the wire, got: {:#?}",
+        world.calls()
+    );
+
+    world.steer("boost-refuse");
+    match world.ask(Request::ApplyBoost { conversation: key("c9001") }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("Telegram Premium"), "{detail}");
+        }
+        other => panic!("expected a premium refusal, got {other:?}"),
+    }
+    assert!(
+        world.calls().iter().any(|c| c.contains("premium.applyBoost refused")),
+        "expected the refused apply on the wire, got: {:#?}",
+        world.calls()
+    );
+
+    world.steer("boost-refuse 0");
+    let Response::Boosts { status, .. } = world.ask(Request::ApplyBoost { conversation: key("c9001") }) else {
+        panic!("expected Boosts after apply");
+    };
+    assert!(status.my_boost);
+    assert_eq!(status.level, 3);
+    assert_eq!(status.boosts, 13);
+    assert!(
+        world.calls().iter().any(|c| c.contains("premium.applyBoost c9001 slot=1")),
+        "expected applyBoost on the wire, got: {:#?}",
+        world.calls()
+    );
+}
+
+#[test]
+fn bot_commands_keyboard_and_start_can_be_refused() {
+    use protocol::BotKeyKind;
+    let world = World::signed_in();
+    world.connected();
+
+    let Response::BotMenu { menu, .. } = world.ask(Request::GetBotMenu { conversation: key("u7004") }) else {
+        panic!("expected BotMenu");
+    };
+    assert_eq!(menu.description, "Trail reports.");
+    assert_eq!(menu.menu_label, "Map");
+    assert_eq!(menu.menu_url, "https://t.me/trail_bot");
+    assert_eq!(
+        menu.commands.iter().map(|cmd| cmd.command.as_str()).collect::<Vec<_>>(),
+        ["start", "report", "closures"]
+    );
+
+    match world.ask(Request::GetBotMenu { conversation: key("u7003") }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("cannot be started"), "{detail}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+
+    let trail = world.message("u7004", "4").expect("trail message");
+    let board = trail.keyboard.expect("reply keyboard");
+    assert!(board.resize);
+    assert_eq!(board.placeholder.as_deref(), Some("Ask the trail"));
+    assert_eq!(board.rows[0][0].text, "Ridge");
+    assert_eq!(board.rows[0][0].kind, BotKeyKind::Text);
+
+    world.send("u7004", "1", "Ridge", None);
+    assert!(
+        world.calls().iter().any(|call| call.contains("SendMessage u7004 Ridge")),
+        "expected the keyboard text on the wire, got: {:#?}",
+        world.calls()
+    );
+
+    assert!(matches!(
+        world.ask(Request::StartBot { conversation: key("u7004"), start_param: "ridge".into() }),
+        Response::Ok
+    ));
+    assert!(
+        world.calls().iter().any(|call| call.contains("messages.startBot u7004 ridge")),
+        "expected startBot on the wire, got: {:#?}",
+        world.calls()
+    );
+
+    world.steer("start-refuse");
+    match world.ask(Request::StartBot { conversation: key("u7004"), start_param: "ridge".into() }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("cannot be started"), "{detail}");
+        }
+        other => panic!("expected a start refusal, got {other:?}"),
+    }
+    assert!(world.calls().iter().any(|call| call.contains("messages.startBot refused")));
+
+    match world.ask(Request::SharePhone { conversation: key("u7004") }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.to_lowercase().contains("phone"), "{detail}");
+        }
+        other => panic!("expected a phone refusal, got {other:?}"),
+    }
+}
+
+#[test]
 fn shared_contact_send_and_receive() {
     let world = World::signed_in();
     world.connected();
@@ -5794,5 +6051,194 @@ fn send_rules_reflect_media_bans_slow_mode_and_paid_stars() {
         world.calls().iter().any(|c| c.contains("SendMessage u7003 paid hello") && c.contains("[stars=25]")),
         "{:#?}",
         world.calls()
+    );
+}
+
+#[test]
+fn voice_messages_forbidden_disables_mic_and_refused_send_returns_plain_words() {
+    let world = World::signed_in();
+    world.connected();
+    world.until("history", || world.message("u7002", "12"));
+
+    // 1. Before full profile is known, Odalys forbids voice messages on the server: sending fails
+    //    with plain words and updates the conversation's `voice_notes_forbidden` field.
+    world.steer("voice-forbidden 7002 1");
+    let dir = std::path::absolute(format!("/tmp/tinyclient-tg-voice-forbid-{}", std::process::id())).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("voice-refused.opus");
+    std::fs::write(&path, vec![7u8; 1024]).unwrap();
+    let file = || protocol::OutgoingFile {
+        path: path.to_string_lossy().into_owned(),
+        name: String::new(),
+        spoiler: false,
+        as_file: false,
+        original: false,
+        view_once: false,
+        media: None,
+    };
+    let voice = || protocol::VoiceNote { duration: 4_000, waveform: vec![120, 60, 200, 30] };
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: key("u7002"),
+            client_id: "vf-1".into(),
+            text: String::new(),
+            reply_to: None,
+            with: protocol::Outgoing { files: vec![file()], voice: Some(voice()), ..Default::default() },
+        }),
+        Response::Sent { .. }
+    ));
+    let failed = world.until("voice send refused", || {
+        world.messages("u7002").into_iter().find(|m| m.client_id.as_deref() == Some("vf-1") && m.state != SendState::Pending)
+    });
+    match &failed.state {
+        SendState::Failed { reason } => {
+            assert!(
+                reason.contains("doesn't accept voice and video messages"),
+                "expected plain-words refusal, got: {reason}"
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    let updated = world.until("conversation marks voice_notes_forbidden", || {
+        world.conversation("u7002").filter(|c| !c.allows_voice_notes())
+    });
+    assert!(updated.voice_notes_forbidden.contains("Odalys Brandt"), "{}", updated.voice_notes_forbidden);
+
+    // 2. Fetching full profile for Tobin (u7003) with voice_messages_forbidden sets the flag proactively,
+    //    so chatd refuses a subsequent voice send before it reaches the wire.
+    world.steer("voice-forbidden 7003 1");
+    assert!(matches!(
+        world.ask(Request::ConversationInfo { conversation: key("u7003") }),
+        Response::ConversationInfo { .. }
+    ));
+    let tobin = world.until("tobin voice_notes_forbidden", || {
+        world.conversation("u7003").filter(|c| !c.allows_voice_notes())
+    });
+    assert!(tobin.voice_notes_forbidden.contains("Tobin Reyes"), "{}", tobin.voice_notes_forbidden);
+    let calls_before = world.called("SendMedia u7003");
+    let refused = world.ask(Request::Send {
+        conversation: key("u7003"),
+        client_id: "vf-2".into(),
+        text: String::new(),
+        reply_to: None,
+        with: protocol::Outgoing { files: vec![file()], voice: Some(voice()), ..Default::default() },
+    });
+    match refused {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("doesn't accept voice and video messages"), "{detail}");
+        }
+        other => panic!("expected immediate Refused, got {other:?}"),
+    }
+    assert_eq!(world.called("SendMedia u7003"), calls_before, "proactively blocked send must not hit Telegram");
+
+    // 3. Group with send_voices banned fails with plain group wording and records the restriction.
+    world.steer("voice-ban g8001 1");
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: key("g8001"),
+            client_id: "vf-3".into(),
+            text: String::new(),
+            reply_to: None,
+            with: protocol::Outgoing { files: vec![file()], voice: Some(voice()), ..Default::default() },
+        }),
+        Response::Sent { .. }
+    ));
+    let group_failed = world.until("group voice send refused", || {
+        world.messages("g8001").into_iter().find(|m| m.client_id.as_deref() == Some("vf-3") && m.state != SendState::Pending)
+    });
+    match &group_failed.state {
+        SendState::Failed { reason } => {
+            assert!(reason.contains("aren't allowed in this group"), "{reason}");
+        }
+        other => panic!("expected Failed for group, got {other:?}"),
+    }
+    let group_row = world.until("group marks voice_notes_forbidden", || {
+        world.conversation("g8001").filter(|c| !c.allows_voice_notes())
+    });
+    assert!(group_row.voice_notes_forbidden.contains("aren't allowed in this group"), "{}", group_row.voice_notes_forbidden);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn voice_transcription_streams_update_persists_across_restart_and_reports_trial_exhausted() {
+    let mut world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.transcribe, "Telegram must advertise transcribe capability");
+
+    // Incoming voice message (id 15 in u7002 via `steer("voice")`).
+    world.steer("voice");
+    let voice_msg = world.until("incoming voice message", || {
+        world.messages("u7002").into_iter().find(|m| m.attachments.iter().any(|a| !a.waveform.is_empty()))
+    });
+    assert!(voice_msg.attachments[0].transcript.is_none(), "never transcribe automatically");
+    assert_eq!(world.called("TranscribeAudio"), 0, "no automatic transcription call");
+
+    // 1. Pending transcription response followed by `updateTranscribedAudio` completing the text.
+    world.steer("transcribe-mode pending 2");
+    let resp = world.ask(Request::Transcribe {
+        conversation: key("u7002"),
+        message_id: voice_msg.id.clone(),
+    });
+    let pending = match resp {
+        Response::Transcript { transcript } => transcript,
+        other => panic!("expected Transcript, got {other:?}"),
+    };
+    assert!(pending.pending);
+    assert_eq!(pending.id, 901);
+    assert_eq!(pending.text, "Meet at the");
+    assert_eq!(pending.trial_remains, Some(1));
+    assert!(pending.trial_resets_at.is_some());
+    assert_eq!(world.called(&format!("TranscribeAudio u7002 {}", voice_msg.id)), 1);
+
+    // Final part arrives via updateTranscribedAudio.
+    world.steer(&format!("transcribe-update u7002 {} 0 Meet at the trailhead at seven.", voice_msg.id));
+    let completed = world.until("transcript completed by update", || {
+        let msg = world.message("u7002", &voice_msg.id)?;
+        let tr = msg.attachments.first()?.transcript.clone()?;
+        (!tr.pending && tr.text == "Meet at the trailhead at seven.").then_some(tr)
+    });
+    assert_eq!(completed.id, 901);
+    assert_eq!(completed.trial_remains, Some(1));
+
+    // Rate thumbs up via messages.rateTranscribedAudio.
+    assert_eq!(
+        world.ask(Request::RateTranscript {
+            conversation: key("u7002"),
+            message_id: voice_msg.id.clone(),
+            transcription_id: 901,
+            good: true,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.called(&format!("RateTranscribedAudio u7002 {} 901 true", voice_msg.id)), 1);
+
+    // Persisted in store across chatd restart.
+    world.restart();
+    world.connected();
+    let after_restart = world.until("transcript survives restart", || {
+        let msg = world.message("u7002", &voice_msg.id)?;
+        let tr = msg.attachments.first()?.transcript.clone()?;
+        (tr.text == "Meet at the trailhead at seven." && tr.rated == Some(true)).then_some(tr)
+    });
+    assert!(!after_restart.pending);
+
+    // 2. Trial exhausted (PREMIUM_ACCOUNT_REQUIRED) records the Premium explanation.
+    world.steer("transcribe-mode exhausted 0");
+    let resp = world.ask(Request::Transcribe {
+        conversation: key("u7002"),
+        message_id: voice_msg.id.clone(),
+    });
+    let exhausted = match resp {
+        Response::Transcript { transcript } => transcript,
+        other => panic!("expected Transcript on exhausted trial, got {other:?}"),
+    };
+    assert!(!exhausted.pending);
+    assert_eq!(exhausted.trial_remains, Some(0));
+    assert!(
+        exhausted.failed.as_deref().unwrap_or("").contains("Telegram Premium"),
+        "expected Premium explanation, got: {:?}",
+        exhausted.failed
     );
 }

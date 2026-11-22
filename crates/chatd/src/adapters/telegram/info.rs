@@ -50,14 +50,18 @@ pub(super) fn birthday_line(day: i32, month: i32, year: Option<i32>) -> Option<S
     })
 }
 
-/// Records call capability flags from `users.getFullUser` and refreshes the DM row when changed.
+/// Records call and voice-message capability flags from `users.getFullUser` and refreshes the DM row when changed.
 fn record_call_flags(account: &Account, who: Who, user: &tl::types::UserFull) {
     let flags = peers::CallFlags {
         phone_available: user.phone_calls_available,
         phone_private: user.phone_calls_private,
         video_available: user.video_calls_available,
     };
-    if account.dir().set_call_flags(who, flags) {
+    let mut dir = account.dir();
+    let call_changed = dir.set_call_flags(who, flags);
+    let voice_changed = dir.set_voice_forbidden(who, user.voice_messages_forbidden);
+    drop(dir);
+    if call_changed || voice_changed {
         sync::refresh_row(account, who);
     }
 }
@@ -1693,6 +1697,10 @@ fn tl_privacy_key(key: protocol::PrivacyKey) -> tl::enums::InputPrivacyKey {
         protocol::PrivacyKey::PhoneCall => tl::enums::InputPrivacyKey::PhoneCall,
         protocol::PrivacyKey::PhoneP2p => tl::enums::InputPrivacyKey::PhoneP2P,
         protocol::PrivacyKey::VoiceMessages => tl::enums::InputPrivacyKey::VoiceMessages,
+        protocol::PrivacyKey::LastSeen => tl::enums::InputPrivacyKey::StatusTimestamp,
+        protocol::PrivacyKey::PhoneNumber => tl::enums::InputPrivacyKey::PhoneNumber,
+        protocol::PrivacyKey::ProfilePhoto => tl::enums::InputPrivacyKey::ProfilePhoto,
+        protocol::PrivacyKey::ChatInvite => tl::enums::InputPrivacyKey::ChatInvite,
     }
 }
 
@@ -1804,6 +1812,267 @@ pub(super) fn set_privacy(
         account.ask(&tl::functions::account::SetPrivacy { key: tl_privacy_key(key), rules })?;
     account.learn(&got.users, &got.chats);
     Ok(map_privacy_rules(account, key, &got.rules))
+}
+
+fn preset_from(settings: &tl::enums::AutoDownloadSettings) -> protocol::AutoDownloadPreset {
+    let tl::enums::AutoDownloadSettings::Settings(settings) = settings;
+    protocol::AutoDownloadPreset {
+        disabled: settings.disabled,
+        photo_size_max: i64::from(settings.photo_size_max),
+        video_size_max: settings.video_size_max,
+        file_size_max: settings.file_size_max,
+    }
+}
+
+/// Writes the four fields this app edits onto the preset Telegram already has.
+/// Preload, call, story, bitrate and queue fields stay as they were read.
+fn preset_to(current: &tl::types::AutoDownloadSettings, preset: &protocol::AutoDownloadPreset) -> tl::enums::AutoDownloadSettings {
+    let mut settings = current.clone();
+    settings.disabled = preset.disabled;
+    settings.photo_size_max = preset.photo_size_max.clamp(0, i64::from(i32::MAX)) as i32;
+    settings.video_size_max = preset.video_size_max.max(0);
+    settings.file_size_max = preset.file_size_max.max(0);
+    tl::enums::AutoDownloadSettings::Settings(settings)
+}
+
+fn wifi_caps(preset: &protocol::AutoDownloadPreset) -> (u64, u64, u64) {
+    let cap = |bytes: i64| if preset.disabled { 0 } else { bytes.max(0) as u64 };
+    (cap(preset.photo_size_max), cap(preset.video_size_max), cap(preset.file_size_max))
+}
+
+/// This desktop uses the Wi-Fi preset. Chat-kind gates stay local and default off.
+fn rules_of(settings: &protocol::AutoDownload) -> super::peers::DownloadRules {
+    let (photo_max, video_max, file_max) = wifi_caps(&settings.wifi);
+    super::peers::DownloadRules {
+        fetch_full_photos: settings.fetch_full_photos,
+        private_chats: settings.private_chats,
+        groups: settings.groups,
+        channels: settings.channels,
+        photo_max,
+        video_max,
+        file_max,
+    }
+}
+
+fn local_gates(account: &Account) -> (bool, bool, bool, bool) {
+    use protocol::settings::{TELEGRAM_DOWNLOAD_CHANNELS, TELEGRAM_DOWNLOAD_GROUPS, TELEGRAM_DOWNLOAD_PHOTOS, TELEGRAM_DOWNLOAD_PRIVATE};
+    (
+        account.ctx.account_switch(TELEGRAM_DOWNLOAD_PHOTOS),
+        account.ctx.account_switch(TELEGRAM_DOWNLOAD_PRIVATE),
+        account.ctx.account_switch(TELEGRAM_DOWNLOAD_GROUPS),
+        account.ctx.account_switch(TELEGRAM_DOWNLOAD_CHANNELS),
+    )
+}
+
+fn remember_download(account: &Account, settings: &protocol::AutoDownload) {
+    account.dir().download = rules_of(settings);
+}
+
+/// The stored chat-kind gates, plus the Wi-Fi caps when Telegram answers.
+/// A miss leaves the caps off and still applies the gates. Sign-on calls this before any
+/// message is mapped, so a restart does not wait for the Accounts page.
+pub(super) fn load_remembered_download(account: &Account) {
+    let (fetch_full_photos, private_chats, groups, channels) = local_gates(account);
+    let mut rules = super::peers::DownloadRules {
+        fetch_full_photos,
+        private_chats,
+        groups,
+        channels,
+        ..super::peers::DownloadRules::default()
+    };
+    if let Ok(tl::enums::account::AutoDownloadSettings::Settings(got)) = account.ask(&tl::functions::account::GetAutoDownloadSettings {}) {
+        let (photo_max, video_max, file_max) = wifi_caps(&preset_from(&got.high));
+        (rules.photo_max, rules.video_max, rules.file_max) = (photo_max, video_max, file_max);
+    }
+    account.dir().download = rules;
+}
+
+/// Reads `account.getAutoDownloadSettings` and the local chat-kind gates.
+pub(super) fn get_auto_download(account: &Account) -> Result<protocol::AutoDownload, Fault> {
+    let tl::enums::account::AutoDownloadSettings::Settings(got) = account.ask(&tl::functions::account::GetAutoDownloadSettings {})?;
+    let (fetch_full_photos, private_chats, groups, channels) = local_gates(account);
+    let settings = protocol::AutoDownload {
+        roaming: preset_from(&got.low),
+        mobile: preset_from(&got.medium),
+        wifi: preset_from(&got.high),
+        fetch_full_photos,
+        private_chats,
+        groups,
+        channels,
+    };
+    remember_download(account, &settings);
+    Ok(settings)
+}
+
+/// Writes each preset with `account.saveAutoDownloadSettings` and stores the local gates.
+/// The cloud preset is read first. Only `disabled` and the three size caps change.
+/// When that read fails, nothing is written over the preset.
+pub(super) fn set_auto_download(account: &Account, settings: &protocol::AutoDownload) -> Result<protocol::AutoDownload, Fault> {
+    let tl::enums::account::AutoDownloadSettings::Settings(got) = account.ask(&tl::functions::account::GetAutoDownloadSettings {})?;
+    let save = |low: bool, high: bool, current: &tl::enums::AutoDownloadSettings, preset: &protocol::AutoDownloadPreset| -> Result<(), Fault> {
+        let tl::enums::AutoDownloadSettings::Settings(current) = current;
+        let _: bool = account.ask(&tl::functions::account::SaveAutoDownloadSettings { low, high, settings: preset_to(current, preset) })?;
+        Ok(())
+    };
+    save(true, false, &got.low, &settings.roaming)?;
+    save(false, false, &got.medium, &settings.mobile)?;
+    save(false, true, &got.high, &settings.wifi)?;
+    use protocol::settings::{TELEGRAM_DOWNLOAD_CHANNELS, TELEGRAM_DOWNLOAD_GROUPS, TELEGRAM_DOWNLOAD_PHOTOS, TELEGRAM_DOWNLOAD_PRIVATE};
+    account.ctx.set_account_switch(TELEGRAM_DOWNLOAD_PHOTOS, settings.fetch_full_photos);
+    account.ctx.set_account_switch(TELEGRAM_DOWNLOAD_PRIVATE, settings.private_chats);
+    account.ctx.set_account_switch(TELEGRAM_DOWNLOAD_GROUPS, settings.groups);
+    account.ctx.set_account_switch(TELEGRAM_DOWNLOAD_CHANNELS, settings.channels);
+    remember_download(account, settings);
+    Ok(settings.clone())
+}
+
+fn free_slots(boosts: &[tl::enums::MyBoost]) -> Vec<i32> {
+    boosts
+        .iter()
+        .filter_map(|one| {
+            let tl::enums::MyBoost::Boost(one) = one;
+            (one.peer.is_none() && one.cooldown_until_date.is_none()).then_some(one.slot)
+        })
+        .collect()
+}
+
+fn boosts_of(account: &Account, who: Who) -> Result<protocol::ChannelBoosts, Fault> {
+    let peer = account.input(who)?;
+    let tl::enums::premium::BoostsStatus::Status(status) = account.ask(&tl::functions::premium::GetBoostsStatus { peer })?;
+    let can_boost = account.dir().get(Who::User(account.me)).is_some_and(|known| known.premium);
+    let slots = if can_boost {
+        let tl::enums::premium::MyBoosts::Boosts(mine) = account.ask(&tl::functions::premium::GetMyBoosts {})?;
+        account.learn(&mine.users, &mine.chats);
+        free_slots(&mine.my_boosts)
+    } else {
+        Vec::new()
+    };
+    Ok(protocol::ChannelBoosts {
+        level: status.level,
+        boosts: status.boosts,
+        current_level_boosts: status.current_level_boosts,
+        next_level_boosts: status.next_level_boosts,
+        my_boost: status.my_boost,
+        slots,
+        boost_url: status.boost_url,
+        can_boost,
+    })
+}
+
+/// A channel's boost level. Anything that is not a channel is refused.
+pub(super) fn get_boosts(account: &Account, conversation: &str) -> Result<protocol::ChannelBoosts, Fault> {
+    let (who @ Who::Channel(_), None) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))? else {
+        return Err(invalid("PEER_ID_INVALID"));
+    };
+    boosts_of(account, who)
+}
+
+/// Gives one free Premium slot to the channel, after the shell has confirmed.
+pub(super) fn apply_boost(account: &Account, conversation: &str) -> Result<protocol::ChannelBoosts, Fault> {
+    let (who @ Who::Channel(_), None) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))? else {
+        return Err(invalid("PEER_ID_INVALID"));
+    };
+    let peer = account.input(who)?;
+    let tl::enums::premium::MyBoosts::Boosts(mine) = account.ask(&tl::functions::premium::GetMyBoosts {})?;
+    account.learn(&mine.users, &mine.chats);
+    let Some(&slot) = free_slots(&mine.my_boosts).first() else {
+        return Err(invalid("BOOSTS_EMPTY"));
+    };
+    let tl::enums::premium::MyBoosts::Boosts(applied) = account.ask(&tl::functions::premium::ApplyBoost { slots: Some(vec![slot]), peer })?;
+    account.learn(&applied.users, &applied.chats);
+    boosts_of(account, who)
+}
+
+fn http_url(url: &str) -> Option<String> {
+    (url.starts_with("https://") || url.starts_with("http://")).then(|| url.to_owned())
+}
+
+fn menu_of(info: Option<&tl::enums::BotInfo>) -> protocol::BotMenu {
+    let Some(tl::enums::BotInfo::Info(info)) = info else {
+        return protocol::BotMenu::default();
+    };
+    let commands = info
+        .commands
+        .iter()
+        .flatten()
+        .filter_map(|cmd| {
+            let tl::enums::BotCommand::Command(cmd) = cmd;
+            let command = cmd.command.trim().trim_start_matches('/').to_owned();
+            (!command.is_empty()).then(|| protocol::BotCommand { command, description: cmd.description.clone() })
+        })
+        .take(32)
+        .collect();
+    let (menu_label, menu_url) = match &info.menu_button {
+        Some(tl::enums::BotMenuButton::Button(button)) => match http_url(&button.url) {
+            Some(url) => (button.text.clone(), url),
+            None => (String::new(), String::new()),
+        },
+        _ => (String::new(), String::new()),
+    };
+    protocol::BotMenu { description: info.description.clone().unwrap_or_default(), commands, menu_label, menu_url }
+}
+
+/// Commands and the menu button of a user-bot. A chat that is not one is refused.
+pub(super) fn bot_menu(account: &Account, conversation: &str) -> Result<protocol::BotMenu, Fault> {
+    let (who @ Who::User(_), None) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))? else {
+        return Err(invalid("PEER_ID_INVALID"));
+    };
+    let input = {
+        let dir = account.dir();
+        if !dir.get(who).is_some_and(|known| known.bot) {
+            return Err(invalid("BOT_INVALID"));
+        }
+        dir.input_user(who).ok_or_else(|| invalid("PEER_ID_INVALID"))?
+    };
+    let tl::enums::users::UserFull::Full(found) = account.ask(&tl::functions::users::GetFullUser { id: input })?;
+    account.learn(&found.users, &found.chats);
+    let tl::enums::UserFull::Full(user) = found.full_user;
+    Ok(menu_of(user.bot_info.as_ref()))
+}
+
+/// `messages.startBot` in this bot's chat. The peer is the bot.
+pub(super) fn start_bot(account: &Account, conversation: &str, start_param: &str) -> Result<(), Fault> {
+    let (who @ Who::User(_), None) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))? else {
+        return Err(invalid("PEER_ID_INVALID"));
+    };
+    let bot = {
+        let dir = account.dir();
+        if !dir.get(who).is_some_and(|known| known.bot) {
+            return Err(invalid("BOT_INVALID"));
+        }
+        dir.input_user(who).ok_or_else(|| invalid("PEER_ID_INVALID"))?
+    };
+    let peer = account.input(who)?;
+    let random_id = super::random_id(&format!("start:{conversation}:{start_param}"));
+    let _: tl::enums::Updates = account.ask(&tl::functions::messages::StartBot { bot, peer, random_id, start_param: start_param.to_owned() })?;
+    Ok(())
+}
+
+/// Sends this account's own phone as a contact, after the shell confirmed. No phone is a refusal.
+pub(super) fn share_phone(account: &Account, conversation: &str) -> Result<(), Fault> {
+    let (who @ Who::User(_), None) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))? else {
+        return Err(invalid("PEER_ID_INVALID"));
+    };
+    let (name, me) = {
+        let dir = account.dir();
+        if !dir.get(who).is_some_and(|known| known.bot) {
+            return Err(invalid("BOT_INVALID"));
+        }
+        let name = dir.name(Who::User(account.me));
+        let me = dir.input_user(Who::User(account.me)).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+        (name, me)
+    };
+    let users = account.ask(&tl::functions::users::GetUsers { id: vec![me] })?;
+    let phone = users.into_iter().find_map(|user| {
+        let tl::enums::User::User(user) = user else { return None };
+        (user.id == account.me).then_some(user.phone).flatten().filter(|phone| !phone.is_empty())
+    });
+    let Some(phone) = phone else {
+        return Err(invalid("PHONE_NUMBER_INVALID"));
+    };
+    let contact = protocol::SharedContact { name, phones: vec![phone], ..protocol::SharedContact::default() };
+    super::send::send_contact(account, conversation, &format!("phone-{}", crate::hub::now()), "", None, &contact, super::Options::default())?;
+    Ok(())
 }
 
 fn tl_report_reason(reason: protocol::ReportReason) -> tl::enums::ReportReason {
@@ -2324,6 +2593,126 @@ pub(super) fn mark_unread_items_read(
             } else if let Ok(Some(row)) = account.ctx.known(conversation_id) {
                 let seen = message_ids.len() as u32;
                 let _ = account.ctx.unread_reactions(conversation_id, protocol::badge_after_jump(row.unread_reactions, seen));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Finds the voice or round video attachment on a message to attach a transcript to.
+fn transcript_slot(attachments: &mut [protocol::Attachment]) -> Option<&mut protocol::Attachment> {
+    let idx = attachments
+        .iter()
+        .position(|a| !a.waveform.is_empty() || a.round || a.file.kind == protocol::MediaKind::Audio)
+        .or_else(|| (!attachments.is_empty()).then_some(0))?;
+    attachments.get_mut(idx)
+}
+
+/// Requests server-side transcription of a voice or round video message (`messages.transcribeAudio`).
+/// Never invoked automatically; persists the result on the stored message's attachment so it survives restarts.
+pub(super) fn transcribe(
+    account: &Account,
+    conversation: &str,
+    message_id: &str,
+) -> Result<protocol::Transcript, Fault> {
+    let (who, _) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    let msg_id = message_id.parse::<i32>().map_err(|_| invalid("MESSAGE_ID_INVALID"))?;
+    let peer = account.input(who)?;
+    let transcript = match account.ask(&tl::functions::messages::TranscribeAudio { peer, msg_id }) {
+        Ok(tl::enums::messages::TranscribedAudio::Audio(res)) => {
+            let trial_remains = res.trial_remains_num.map(|n| n.max(0) as u32);
+            let trial_resets_at = res.trial_remains_until_date.map(i64::from);
+            let failed = if !res.pending && res.text.trim().is_empty() && trial_remains == Some(0) {
+                Some("Free transcriptions used up for this week. Telegram Premium unlocks unlimited transcriptions.".to_owned())
+            } else {
+                None
+            };
+            protocol::Transcript {
+                id: res.transcription_id,
+                text: res.text,
+                pending: res.pending,
+                failed,
+                trial_remains,
+                trial_resets_at,
+                rated: None,
+            }
+        }
+        Err(fault) if fault.is("PREMIUM_ACCOUNT_REQUIRED") => protocol::Transcript {
+            id: 0,
+            text: String::new(),
+            pending: false,
+            failed: Some("Free transcriptions used up for this week. Telegram Premium unlocks unlimited transcriptions.".to_owned()),
+            trial_remains: Some(0),
+            trial_resets_at: None,
+            rated: None,
+        },
+        Err(fault) if fault.is("TRANSCRIPTION_FAILED") => protocol::Transcript {
+            id: 0,
+            text: String::new(),
+            pending: false,
+            failed: Some(fault.words()),
+            trial_remains: None,
+            trial_resets_at: None,
+            rated: None,
+        },
+        Err(fault) => return Err(fault),
+    };
+    if let Ok(Some(mut stored)) = account.ctx.stored_message(conversation, message_id) {
+        if let Some(att) = transcript_slot(&mut stored.attachments) {
+            att.transcript = Some(transcript.clone());
+            let _ = account.ctx.history(conversation, std::slice::from_ref(&stored));
+        }
+    }
+    Ok(transcript)
+}
+
+/// Applies an incremental or final `updateTranscribedAudio` update onto the stored message.
+pub(super) fn apply_transcript_update(
+    account: &Account,
+    conversation: &str,
+    msg_id: i32,
+    transcription_id: i64,
+    text: &str,
+    pending: bool,
+) {
+    let message_id = msg_id.to_string();
+    let Ok(Some(mut stored)) = account.ctx.stored_message(conversation, &message_id) else {
+        return;
+    };
+    let Some(att) = transcript_slot(&mut stored.attachments) else {
+        return;
+    };
+    let mut next = att.transcript.clone().unwrap_or_default();
+    next.id = transcription_id;
+    next.text = text.to_owned();
+    next.pending = pending;
+    next.failed = None;
+    att.transcript = Some(next);
+    let _ = account.ctx.history(conversation, std::slice::from_ref(&stored));
+}
+
+/// Rates a completed transcription thumbs up or down (`messages.rateTranscribedAudio`).
+pub(super) fn rate_transcript(
+    account: &Account,
+    conversation: &str,
+    message_id: &str,
+    transcription_id: i64,
+    good: bool,
+) -> Result<(), Fault> {
+    let (who, _) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    let msg_id = message_id.parse::<i32>().map_err(|_| invalid("MESSAGE_ID_INVALID"))?;
+    let peer = account.input(who)?;
+    account.ask(&tl::functions::messages::RateTranscribedAudio {
+        peer,
+        msg_id,
+        transcription_id,
+        good,
+    })?;
+    if let Ok(Some(mut stored)) = account.ctx.stored_message(conversation, message_id) {
+        if let Some(att) = transcript_slot(&mut stored.attachments) {
+            if let Some(tr) = att.transcript.as_mut() {
+                tr.rated = Some(good);
+                let _ = account.ctx.history(conversation, std::slice::from_ref(&stored));
             }
         }
     }

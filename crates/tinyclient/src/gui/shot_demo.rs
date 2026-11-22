@@ -1154,6 +1154,8 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
         },
         Request::Catalog { .. } => Response::Catalog { items: Vec::new(), cursor: None },
         Request::SaveGif { .. } | Request::StickerSet { .. } | Request::FaveSticker { .. } => Response::Ok,
+        Request::Transcribe { .. } => Response::Transcript { transcript: protocol::Transcript::default() },
+        Request::RateTranscript { .. } => Response::Ok,
         Request::Watch(watching) => {
             let people = watching
                 .people
@@ -1240,7 +1242,7 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
         Request::GetDefaultDisappearing { .. } => Response::DefaultDisappearing { seconds: 0 },
         Request::SuggestedFolders { .. } => Response::SuggestedFolders { folders: Vec::new() },
         Request::TopicIcons { .. } => Response::Catalog { items: Vec::new(), cursor: None },
-        Request::Storage => Response::Storage { messages: 48_213, files: 734_003_200 },
+        Request::Storage => Response::Storage { messages: 48_213, files: 734_003_200, chats: Vec::new() },
         Request::Prunable { .. } => Response::Prunable { messages: 0, bytes: 0 },
         Request::SignIn { .. } => Response::Error { code: protocol::ErrorCode::SignIn, detail: "The sign-in window was closed.".into() },
         Request::TinyCommunity { .. } => Response::TinyCommunity { community: premier() },

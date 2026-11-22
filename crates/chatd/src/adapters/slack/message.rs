@@ -1383,6 +1383,7 @@ impl Slack {
             round: false,
             view_once: false,
             sticker_set: String::new(),
+            transcript: None,
         })
     }
 

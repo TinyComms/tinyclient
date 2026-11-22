@@ -163,6 +163,7 @@ impl SettingsWindow {
                 }
                 if network == Network::Telegram && account.link == Link::Connected {
                     group = group.child(self.telegram_call_privacy_rows(account, ix, cx));
+                    group = group.child(self.telegram_download_rows(account, ix, cx));
                 }
                 if account.can.notify_defaults && account.link == Link::Connected {
                     group = group.child(self.notify_defaults_rows(account, ix, cx));
@@ -545,6 +546,10 @@ impl SettingsWindow {
             protocol::PrivacyKey::PhoneCall,
             protocol::PrivacyKey::PhoneP2p,
             protocol::PrivacyKey::VoiceMessages,
+            protocol::PrivacyKey::LastSeen,
+            protocol::PrivacyKey::PhoneNumber,
+            protocol::PrivacyKey::ProfilePhoto,
+            protocol::PrivacyKey::ChatInvite,
         ];
         cx.spawn(async move |this, cx| {
             let acc = account.clone();
@@ -668,10 +673,14 @@ impl SettingsWindow {
             .stored(&scope, protocol::settings::TELEGRAM_ALWAYS_RELAY)
             == Some("on");
         let mut box_div = div().flex().flex_col();
-        let rows: [(&str, &str, protocol::PrivacyKey); 3] = [
+        let rows: [(&str, &str, protocol::PrivacyKey); 7] = [
             ("Who can call me", "Controls who can place voice or video calls to you on Telegram.", protocol::PrivacyKey::PhoneCall),
             ("Peer-to-Peer", "Controls when Telegram may share your IP address directly during a call.", protocol::PrivacyKey::PhoneP2p),
             ("Voice & video messages", "Controls who may send you voice and round video messages.", protocol::PrivacyKey::VoiceMessages),
+            ("Who can see my last seen", "Controls who can see when you were last online.", protocol::PrivacyKey::LastSeen),
+            ("Who can see my phone number", "Controls who can see the phone number on this account.", protocol::PrivacyKey::PhoneNumber),
+            ("Who can see my photo", "Controls who can see your profile photo.", protocol::PrivacyKey::ProfilePhoto),
+            ("Who can add me", "Controls who can add you to groups and channels.", protocol::PrivacyKey::ChatInvite),
         ];
         for (row_ix, (title, sub, pkey)) in rows.into_iter().enumerate() {
             let policy = self.tg_privacy.get(&(account.key.clone(), pkey)).cloned();
@@ -1007,6 +1016,154 @@ impl SettingsWindow {
                 .child(create_row)
                 .children(self.tg_folder_error.get(&account.key).map(|err| div().type_small().text_color(theme::danger()).child(err.clone()))),
         )
+    }
+
+    fn load_telegram_download(&mut self, account: protocol::AccountKey, cx: &mut Context<Self>) {
+        if !self.tg_download_requested.insert(account.clone()) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let acc = account.clone();
+            let loaded = cx
+                .background_executor()
+                .spawn(async move { crate::client::ask(&protocol::Request::GetAutoDownload { account: acc }) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Ok(protocol::Response::AutoDownload { settings }) = loaded {
+                    this.tg_download.insert(account, settings);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn set_telegram_download(&mut self, account: protocol::AccountKey, settings: protocol::AutoDownload, cx: &mut Context<Self>) {
+        let Some(previous) = self.tg_download.get(&account).cloned() else {
+            return;
+        };
+        self.tg_download.insert(account.clone(), settings.clone());
+        cx.notify();
+        let restore = previous.clone();
+        cx.spawn(async move |this, cx| {
+            let acc = account.clone();
+            let sent = settings.clone();
+            let answer = cx
+                .background_executor()
+                .spawn(async move { crate::client::ask(&protocol::Request::SetAutoDownload { account: acc, settings: sent }) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match answer {
+                    Ok(protocol::Response::AutoDownload { settings }) => {
+                        this.tg_download.insert(account, settings);
+                    }
+                    _ => {
+                        this.tg_download.insert(account, restore.clone());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn telegram_download_rows(&mut self, account: &AccountStatus, ix: usize, cx: &mut Context<Self>) -> Div {
+        self.load_telegram_download(account.key.clone(), cx);
+        let Some(settings) = self.tg_download.get(&account.key).cloned() else {
+            return div().px(px(12.)).py(px(8.)).type_small().text_color(theme::text_faint()).child("Loading automatic downloads…");
+        };
+        let caps: [(&str, i64); 4] = [("Off", 0), ("1 MB", 1 << 20), ("10 MB", 10 << 20), ("100 MB", 100 << 20)];
+        let networks: [(&str, usize); 3] = [("Roaming", 0), ("Mobile", 1), ("Wi-Fi", 2)];
+        let mut box_div = div().flex().flex_col().child(rule()).child(
+            div()
+                .px(px(12.))
+                .pt(px(10.))
+                .pb(px(4.))
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(div().type_ui().text_color(theme::text()).child("Automatic downloads"))
+                .child(div().type_small().text_color(theme::text_soft()).child("Full photos, videos and files stay on Telegram until you open them, unless a chat kind is on and the file is under that network's limit. This device follows the Wi-Fi limit.")),
+        );
+        let switches: [(&str, bool); 4] = [
+            ("Fetch full photos", settings.fetch_full_photos),
+            ("Private chats", settings.private_chats),
+            ("Groups", settings.groups),
+            ("Channels", settings.channels),
+        ];
+        for (switch_ix, (label, on)) in switches.into_iter().enumerate() {
+            let base = settings.clone();
+            let acc = account.key.clone();
+            box_div = box_div.child(rule()).child(
+                div()
+                    .px(px(12.))
+                    .py(px(8.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .child(div().type_ui().text_color(theme::text()).child(label))
+                    .child(super::controls::switch(("tg-dl-sw", ix * 10 + switch_ix), label, on).on_click(cx.listener(move |this, _, _, cx| {
+                        let mut next = base.clone();
+                        match switch_ix {
+                            0 => next.fetch_full_photos = !on,
+                            1 => next.private_chats = !on,
+                            2 => next.groups = !on,
+                            _ => next.channels = !on,
+                        }
+                        this.set_telegram_download(acc.clone(), next, cx);
+                    }))),
+            );
+        }
+        for (net_ix, (name, slot)) in networks.into_iter().enumerate() {
+            let preset = match slot {
+                0 => &settings.roaming,
+                1 => &settings.mobile,
+                _ => &settings.wifi,
+            };
+            let mut seg = div().flex().items_center().gap(px(4.));
+            for (cap_ix, (label, bytes)) in caps.into_iter().enumerate() {
+                let active = if bytes == 0 {
+                    preset.disabled || preset.photo_size_max <= 0
+                } else {
+                    !preset.disabled && preset.photo_size_max == bytes
+                };
+                let acc = account.key.clone();
+                let base = settings.clone();
+                seg = seg.child(
+                    button(("tg-dl-cap", ix * 100 + net_ix * 10 + cap_ix), if active { ButtonKind::Primary } else { ButtonKind::Secondary }, label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let mut next = base.clone();
+                            let preset = match slot {
+                                0 => &mut next.roaming,
+                                1 => &mut next.mobile,
+                                _ => &mut next.wifi,
+                            };
+                            if bytes <= 0 {
+                                *preset = protocol::AutoDownloadPreset::default();
+                            } else {
+                                preset.disabled = false;
+                                preset.photo_size_max = bytes;
+                                preset.video_size_max = bytes.saturating_mul(10);
+                                preset.file_size_max = bytes;
+                            }
+                            this.set_telegram_download(acc.clone(), next, cx);
+                        })),
+                );
+            }
+            box_div = box_div.child(rule()).child(
+                div()
+                    .px(px(12.))
+                    .py(px(8.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .child(div().type_ui().text_color(theme::text()).child(name))
+                    .child(seg),
+            );
+        }
+        box_div
     }
 
     pub(super) fn sign_out(&mut self, account: protocol::AccountKey, cx: &mut Context<Self>) {

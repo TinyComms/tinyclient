@@ -11,6 +11,56 @@ use crate::gui::theme::{self, Type};
 use gpui::{div, prelude::*, px, Context, Div, MouseButton, Window};
 use protocol::{CallSupport, Conversation, ConversationKind, Key, Network, Notify, Presence, Request};
 
+/// A Telegram channel's boost level, and a confirmed Boost for a Premium account.
+fn boost_row(pane: &InfoPane, row: &Conversation, cx: &mut Context<InfoPane>) -> Option<Div> {
+    if row.key.network != Network::Telegram || row.kind != ConversationKind::Channel {
+        return None;
+    }
+    if pane.boosts_waiting(&row.key) {
+        return Some(div().type_small().text_color(theme::text_faint()).child("Loading boosts…"));
+    }
+    let status = pane.channel_boosts(&row.key)?;
+    let mut line = div().flex().flex_col().gap(px(6.)).child(div().type_ui().text_color(theme::text()).child(format!("Boosts: level {}", status.level)));
+    let progress = match status.next_level_boosts {
+        Some(next) => format!("{} of {next} boosts", status.boosts),
+        None => format!("{} boosts", status.boosts),
+    };
+    line = line.child(div().type_small().text_color(theme::text_soft()).child(progress));
+    if pane.boost_confirming(&row.key) {
+        line = line.child(
+            div()
+                .p(px(8.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(theme::raised())
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(div().type_small().child("Give this channel one of your boosts?"))
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(6.))
+                        .child(button("boost-cancel", ButtonKind::Ghost, "Cancel").h(px(24.)).px(px(8.)).type_small().on_click(cx.listener(|pane, _, _, cx| pane.cancel_boost(cx))))
+                        .child(button("boost-confirm", ButtonKind::Primary, "Boost").h(px(24.)).px(px(10.)).type_small().on_click(cx.listener(|pane, _, _, cx| pane.confirm_boost(cx)))),
+                ),
+        );
+        return Some(line);
+    }
+    if status.my_boost {
+        line = line.child(div().type_small().text_color(theme::text_soft()).child("You boosted this channel."));
+    } else if status.can_boost && !status.slots.is_empty() {
+        line = line.child(
+            button("details-boost", ButtonKind::Secondary, "Boost")
+                .h(px(26.))
+                .px(px(8.))
+                .type_small()
+                .on_click(cx.listener(|pane, _, _, cx| pane.ask_boost_confirm(cx))),
+        );
+    }
+    Some(line)
+}
+
 /// S6: this conversation's own notification sound, kept here only (the network never sees it),
 /// over its account's and the global one. Picking one plays it.
 fn sound_row(row: &Conversation, cx: &mut Context<InfoPane>) -> Div {
@@ -270,6 +320,9 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
         top = top.child(div().type_small().text_color(theme::text_faint()).child("Kept on this device."));
     }
     top = top.child(sound_row(row, cx).mt(px(8.)));
+    if let Some(boosts) = boost_row(pane, row, cx) {
+        top = top.child(boosts.mt(px(8.)));
+    }
     if let Some(timer_row) = disappearing_row(pane, row, info, cx) {
         top = top.child(timer_row.mt(px(8.)));
     }

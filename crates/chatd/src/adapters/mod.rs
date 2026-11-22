@@ -996,6 +996,20 @@ pub enum Command {
         unfave: bool,
         reply: Reply<()>,
     },
+    /// Transcribe a voice or round video message on the network (`messages.transcribeAudio`).
+    Transcribe {
+        conversation_id: String,
+        message_id: String,
+        reply: Reply<protocol::Transcript>,
+    },
+    /// Rate a completed transcription (`messages.rateTranscribedAudio`).
+    RateTranscript {
+        conversation_id: String,
+        message_id: String,
+        transcription_id: i64,
+        good: bool,
+        reply: Reply<()>,
+    },
     /// What was shared in a conversation, from the network's own search, because the user
     /// clicked "Search all". `before` continues below an item already listed.
     SearchShared {
@@ -1042,6 +1056,40 @@ pub enum Command {
     SpaceTags {
         space_id: String,
         reply: Reply<Vec<protocol::TeamTag>>,
+    },
+    /// Telegram auto-download presets and the local chat-kind gates.
+    GetAutoDownload {
+        reply: Reply<protocol::AutoDownload>,
+    },
+    SetAutoDownload {
+        settings: protocol::AutoDownload,
+        reply: Reply<protocol::AutoDownload>,
+    },
+    /// A channel's boost level.
+    GetBoosts {
+        conversation_id: String,
+        reply: Reply<protocol::ChannelBoosts>,
+    },
+    /// Gives a free Premium boost to that channel.
+    ApplyBoost {
+        conversation_id: String,
+        reply: Reply<protocol::ChannelBoosts>,
+    },
+    /// A bot's commands and menu button.
+    GetBotMenu {
+        conversation_id: String,
+        reply: Reply<protocol::BotMenu>,
+    },
+    /// Starts a bot, with the deep-link payload when there is one.
+    StartBot {
+        conversation_id: String,
+        start_param: String,
+        reply: Reply<()>,
+    },
+    /// Shares this account's phone number with a bot.
+    SharePhone {
+        conversation_id: String,
+        reply: Reply<()>,
     },
     /// A picker's catalog: custom emoji (of one Space when `space_id` is set), stickers, or GIFs
     /// for `query`. Register every preview through [`Context::media`]. Only on a key press:
@@ -1286,6 +1334,8 @@ impl Command {
             Command::Forward { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SaveGif { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StickerSet { reply, .. } | Command::FaveSticker { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Transcribe { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::RateTranscript { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1294,6 +1344,13 @@ impl Command {
             Command::GetOutOfOffice { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetOutOfOffice { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SpaceTags { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetAutoDownload { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetAutoDownload { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetBoosts { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ApplyBoost { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetBotMenu { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::StartBot { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SharePhone { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Catalog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityFeed { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityMarkRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1421,6 +1478,18 @@ impl Context {
 
     pub fn key(&self, id: &str) -> Key {
         Key::new(&self.account, id)
+    }
+
+    /// A stored on/off setting for this account. Absent is off.
+    pub fn account_switch(&self, key: &str) -> bool {
+        let scope = protocol::settings::account_scope(&self.account);
+        self.hub.store().settings().ok().is_some_and(|rows| rows.iter().any(|row| row.scope == scope && row.key == key && row.value == "on"))
+    }
+
+    /// Stores an on/off setting for this account.
+    pub fn set_account_switch(&self, key: &str, on: bool) {
+        let scope = protocol::settings::account_scope(&self.account);
+        let _ = self.hub.store().set_setting(&scope, key, Some(if on { "on" } else { "off" }));
     }
 
     /// Whether a conversation may appear where the user asked for what is listed: hidden

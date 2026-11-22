@@ -586,7 +586,7 @@ impl Chat {
         let dir = support_dir();
         let size = |name: &str| std::fs::metadata(dir.join(name)).map_or(0, |meta| meta.len());
         let messages = size("chat.sqlite") + size("chat.sqlite-wal") + size("chat.sqlite-shm");
-        Response::Storage { messages, files: self.blobs.bytes() }
+        Response::Storage { messages, files: self.blobs.bytes(), chats: self.hub.store().chat_cache(40).unwrap_or_default() }
     }
 
     /// Clear (D3): the files, then the messages, then every window reads what is left.
@@ -1294,6 +1294,9 @@ impl Chat {
                         row.read_only_reason
                     };
                     return error(ErrorCode::Refused, why);
+                }
+                Ok(Some(row)) if with.voice.is_some() && !row.voice_notes_forbidden.is_empty() => {
+                    return error(ErrorCode::Refused, row.voice_notes_forbidden);
                 }
                 Ok(Some(_)) => store.ingest(&conversation, &message, true),
                 Ok(None) => return error(ErrorCode::NotFound, "no such conversation"),
@@ -2732,6 +2735,81 @@ impl Chat {
         }
     }
 
+    fn get_auto_download(&self, account: AccountKey) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::GetAutoDownload { reply }) {
+            Ok(settings) => Response::AutoDownload { settings },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn get_boosts(&self, conversation: Key) -> Response {
+        if let Err(refused) = self.online(&conversation.account()) {
+            return *refused;
+        }
+        let conversation_id = conversation.id.clone();
+        match self.ask(&conversation.account(), |reply| Command::GetBoosts { conversation_id, reply }) {
+            Ok(status) => Response::Boosts { conversation, status },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn bot_menu(&self, conversation: Key) -> Response {
+        if let Err(refused) = self.online(&conversation.account()) {
+            return *refused;
+        }
+        let conversation_id = conversation.id.clone();
+        match self.ask(&conversation.account(), |reply| Command::GetBotMenu { conversation_id, reply }) {
+            Ok(menu) => Response::BotMenu { conversation, menu },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn start_bot(&self, conversation: Key, start_param: String) -> Response {
+        if let Err(refused) = self.online(&conversation.account()) {
+            return *refused;
+        }
+        let conversation_id = conversation.id.clone();
+        match self.ask(&conversation.account(), |reply| Command::StartBot { conversation_id, start_param, reply }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
+    fn share_phone(&self, conversation: Key) -> Response {
+        if let Err(refused) = self.online(&conversation.account()) {
+            return *refused;
+        }
+        let conversation_id = conversation.id.clone();
+        match self.ask(&conversation.account(), |reply| Command::SharePhone { conversation_id, reply }) {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
+    fn apply_boost(&self, conversation: Key) -> Response {
+        if let Err(refused) = self.online(&conversation.account()) {
+            return *refused;
+        }
+        let conversation_id = conversation.id.clone();
+        match self.ask(&conversation.account(), |reply| Command::ApplyBoost { conversation_id, reply }) {
+            Ok(status) => Response::Boosts { conversation, status },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn set_auto_download(&self, account: AccountKey, settings: protocol::AutoDownload) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::SetAutoDownload { settings, reply }) {
+            Ok(settings) => Response::AutoDownload { settings },
+            Err(refused) => *refused,
+        }
+    }
+
     /// Drops an unsent row locally. A queued send is cancelled this way: the adapter never had it.
     fn drop_unsent(&self, conversation: Key, client_id: &str, message: &Message) -> Response {
         match self.hub.store().delete_message(&conversation, client_id) {
@@ -3252,6 +3330,30 @@ impl Chat {
                         self.hub.catalogs.forget_where(|(acct, kind, ..)| acct == &account && *kind == CatalogKind::Stickers);
                         Response::Ok
                     }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::Transcribe { conversation, message_id } => {
+                let account = conversation.account();
+                match self.ask(&account, |reply| Command::Transcribe {
+                    conversation_id: conversation.id,
+                    message_id,
+                    reply,
+                }) {
+                    Ok(transcript) => Response::Transcript { transcript },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::RateTranscript { conversation, message_id, transcription_id, good } => {
+                let account = conversation.account();
+                match self.ask(&account, |reply| Command::RateTranscript {
+                    conversation_id: conversation.id,
+                    message_id,
+                    transcription_id,
+                    good,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
                     Err(refused) => *refused,
                 }
             }
@@ -4001,6 +4103,13 @@ impl Chat {
             Request::GetOutOfOffice { account } => self.get_out_of_office(account),
             Request::SetOutOfOffice { account, ooo } => self.set_out_of_office(account, ooo),
             Request::SpaceTags { space } => self.space_tags(space),
+            Request::GetAutoDownload { account } => self.get_auto_download(account),
+            Request::SetAutoDownload { account, settings } => self.set_auto_download(account, settings),
+            Request::GetBoosts { conversation } => self.get_boosts(conversation),
+            Request::ApplyBoost { conversation } => self.apply_boost(conversation),
+            Request::GetBotMenu { conversation } => self.bot_menu(conversation),
+            Request::StartBot { conversation, start_param } => self.start_bot(conversation, start_param),
+            Request::SharePhone { conversation } => self.share_phone(conversation),
             Request::Relate { person, action } => self.relate(person, action),
             Request::AddFriend { account, username } => self.add_friend(account, username),
             Request::Moderate { space, person, action, reason } => {

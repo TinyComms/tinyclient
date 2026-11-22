@@ -579,6 +579,10 @@ pub struct Conversation {
     /// Whether this account has joined the conversation (`false` when previewing an unjoined public channel).
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub joined: bool,
+    /// Why voice and round video messages are not allowed in this conversation (e.g. the recipient's
+    /// Telegram setting or group banned rights). Empty when allowed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub voice_notes_forbidden: String,
 }
 
 /// What became of my newest message, as its mark says it (`design/06-live-signals.md` §4).
@@ -650,12 +654,18 @@ impl Conversation {
             moderate: false,
             can_pin: false,
             joined: true,
+            voice_notes_forbidden: String::new(),
         }
     }
 
     /// Whether this account may post messages in this conversation.
     pub fn can_post(&self) -> bool {
         !self.read_only
+    }
+
+    /// Whether voice and round video messages may be sent in this conversation.
+    pub fn allows_voice_notes(&self) -> bool {
+        self.voice_notes_forbidden.is_empty()
     }
 
     /// The mark on my newest message. `None` when the newest is not mine.
@@ -1854,6 +1864,24 @@ pub enum Request {
     SpaceTags {
         space: Key,
     },
+    /// Telegram's auto-download presets and this device's chat-kind gates.
+    GetAutoDownload { account: AccountKey },
+    /// Writes the presets (`account.saveAutoDownloadSettings`) and the local chat-kind gates.
+    SetAutoDownload { account: AccountKey, settings: AutoDownload },
+    /// A channel's boost level (`premium.getBoostsStatus`).
+    GetBoosts { conversation: Key },
+    /// Gives this Premium account's free boost to the channel (`premium.applyBoost`).
+    ApplyBoost { conversation: Key },
+    /// A bot's description, commands, and menu button (`users.getFullUser`).
+    GetBotMenu { conversation: Key },
+    /// `messages.startBot`. An empty `start_param` is the Start button.
+    StartBot {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        start_param: String,
+    },
+    /// Shares this account's phone number with a bot, after the shell has confirmed.
+    SharePhone { conversation: Key },
     /// Answer, withdraw or end a friendship, or block. The list changes when the network says so
     /// (a `People` change).
     Relate {
@@ -3039,6 +3067,19 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "String::is_empty")]
         to: String,
     },
+    /// Transcribe a voice or round video message on the network (`messages.transcribeAudio`).
+    /// Never called automatically. Answers `Response::Transcript`.
+    Transcribe {
+        conversation: Key,
+        message_id: String,
+    },
+    /// Rate a transcription good (`true`) or bad (`false`) (`messages.rateTranscribedAudio`).
+    RateTranscript {
+        conversation: Key,
+        message_id: String,
+        transcription_id: i64,
+        good: bool,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -3365,6 +3406,19 @@ pub enum Response {
         space: Key,
         tags: Vec<TeamTag>,
     },
+    AutoDownload {
+        settings: AutoDownload,
+    },
+    /// A channel's boost level, and the free slots this account can still give.
+    Boosts {
+        conversation: Key,
+        status: ChannelBoosts,
+    },
+    /// A bot's command menu for the composer's `/` list.
+    BotMenu {
+        conversation: Key,
+        menu: BotMenu,
+    },
     Folders {
         folders: Vec<Folder>,
     },
@@ -3469,6 +3523,9 @@ pub enum Response {
     Storage {
         messages: u64,
         files: u64,
+        /// Per-chat cache, largest first. Chats with nothing on disk are left out.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        chats: Vec<ChatCache>,
     },
     /// What a shorter retention would delete: messages, and about how many bytes of them.
     Prunable {
@@ -3648,6 +3705,10 @@ pub enum Response {
     /// Unread mention or reaction message IDs in a conversation (`Request::UnreadItems`).
     UnreadItems {
         message_ids: Vec<String>,
+    },
+    /// Answers `Request::Transcribe`: the transcript state returned by the network.
+    Transcript {
+        transcript: Transcript,
     },
 }
 

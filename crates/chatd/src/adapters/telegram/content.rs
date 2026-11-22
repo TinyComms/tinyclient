@@ -2,11 +2,11 @@
 //! service messages to one grey line, and whatever tinyclient cannot draw to a named line with a
 //! link into Telegram's own app. Nothing here asks the network anything.
 
-use super::peers::{is_replies, message_link, thread_id, Directory, Who};
+use super::peers::{is_replies, message_link, thread_id, Directory, DownloadClass, DownloadRules, Who};
 use grammers_tl_types as tl;
 use protocol::{
-    Attachment, Card, Forwarded, MediaFile, MediaKind, MentionKind, Message, MessageKind, Preview, Reaction, ReplyTo, Sender, Span,
-    Style, ThreadSummary,
+    Attachment, BotKey, BotKeyKind, Card, Forwarded, MediaFile, MediaKind, MentionKind, Message, MessageKind, Preview, Reaction, ReplyKeyboard,
+    ReplyTo, Sender, Span, Style, ThreadSummary,
 };
 use std::collections::HashSet;
 use tl::enums::{DocumentAttribute, MessageAction, MessageEntity, MessageMedia, PhotoSize};
@@ -955,7 +955,7 @@ pub(super) fn stripped_jpeg(stripped: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     Some((u32::from(*width), u32::from(*height), jpeg))
 }
 
-fn photo(photo: &tl::types::Photo, spoiler: bool, wants: &mut Vec<Want>) -> Option<Attachment> {
+fn photo(photo: &tl::types::Photo, spoiler: bool, wants: &mut Vec<Want>, peer: Who, megagroup: bool, rules: DownloadRules) -> Option<Attachment> {
     let location = |kind: &str| -> tl::enums::InputFileLocation {
         tl::types::InputPhotoFileLocation {
             id: photo.id,
@@ -989,7 +989,8 @@ fn photo(photo: &tl::types::Photo, spoiler: bool, wants: &mut Vec<Want>) -> Opti
     if let Some((kind, width, height, bytes, inline)) = pick(&photo.sizes, u32::MAX).filter(|(largest, ..)| *largest != kind) {
         file.id = format!("p{}{kind}", photo.id);
         (file.width, file.height, file.bytes) = (width, height, bytes);
-        wants.push(Want { file: file.clone(), dc: photo.dc_id, location: location(kind), inline: inline.map(<[u8]>::to_vec), row: None, watched: false, original: true });
+        let fetch = rules.fetch_full(peer, megagroup, DownloadClass::Photo, bytes);
+        wants.push(Want { file: file.clone(), dc: photo.dc_id, location: location(kind), inline: inline.map(<[u8]>::to_vec), row: None, watched: false, original: !fetch });
     }
     let mut attachment = Attachment::new("Photo", file);
     attachment.thumb = Some(thumb);
@@ -1045,7 +1046,7 @@ fn preview_image(page: &tl::types::WebPage, wants: &mut Vec<Want>) -> Option<Med
     Some(image)
 }
 
-pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::types::Document, wants: &mut Vec<Want>) -> Attachment {
+pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::types::Document, wants: &mut Vec<Want>, peer: Who, megagroup: bool, rules: DownloadRules) -> Attachment {
     let (mut name, mut size, mut duration, mut wave) = (String::new(), (0u32, 0u32), 0u32, Vec::new());
     let (mut sticker, mut animated, mut video, mut round, mut voice, mut audio) = (false, false, false, false, false, false);
     for attribute in &document.attributes {
@@ -1131,9 +1132,17 @@ pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::t
     } else if let (true, Some(still)) = (sticker, &still) {
         file = still.clone();
     } else if kind != MediaKind::Image || still.is_some() {
-        // A picture sent as a file opens in the viewer like a photo, so it is kept the same way;
-        // so is anything else, which is fetched only when the user plays or opens it.
-        wants.push(Want { file: file.clone(), dc: document.dc_id, location: location.into(), inline: None, row: None, watched: false, original: true });
+        // A picture sent as a file opens in the viewer like a photo, so it is kept the same way
+        // unless this chat's auto-download rule says the full file is small enough to fetch now.
+        // GIFs are not autoplayed; a GIF under the video cap is only fetched ahead.
+        let class = match kind {
+            MediaKind::Video => DownloadClass::Video,
+            MediaKind::Gif => DownloadClass::Gif,
+            MediaKind::Image => DownloadClass::Photo,
+            _ => DownloadClass::File,
+        };
+        let fetch = rules.fetch_full(peer, megagroup, class, file.bytes);
+        wants.push(Want { file: file.clone(), dc: document.dc_id, location: location.into(), inline: None, row: None, watched: false, original: !fetch });
     }
     let mut attachment = Attachment::new(if name.is_empty() { label.to_owned() } else { name }, file);
     attachment.thumb = still;
@@ -2223,6 +2232,8 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                 }
             }
             let mut wants = Vec::new();
+            let rules = dir.download;
+            let megagroup = dir.get(peer).is_some_and(|known| known.megagroup);
             match &raw.media {
                 None | Some(MessageMedia::Empty) => {}
                 // `ttl_seconds` is view-once (`0x7FFFFFFF`) or a shorter timer. Either way the
@@ -2230,12 +2241,12 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                 // Telegram's own app, and Save has nothing to copy.
                 Some(MessageMedia::Photo(media)) if media.photo.is_some() && media.ttl_seconds.is_none() => {
                     if let Some(tl::enums::Photo::Photo(picture)) = &media.photo {
-                        message.attachments.extend(photo(picture, media.spoiler, &mut wants));
+                        message.attachments.extend(photo(picture, media.spoiler, &mut wants, peer, megagroup, rules));
                     }
                 }
                 Some(MessageMedia::Document(media)) if media.document.is_some() && media.ttl_seconds.is_none() => {
                     if let Some(tl::enums::Document::Document(file)) = &media.document {
-                        let attachment = document(media, file, &mut wants);
+                        let attachment = document(media, file, &mut wants, peer, megagroup, rules);
                         let playable = !attachment.view_once && (attachment.round || attachment.file.kind == MediaKind::Audio);
                         if raw.media_unread && playable {
                             message.media_unread = true;
@@ -2303,6 +2314,7 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                 _ => None,
             };
             let reply_note = if replies { None } else { reply_note(dir, peer, raw.reply_to.as_ref()) };
+            message.keyboard = raw.reply_markup.as_ref().and_then(reply_keyboard);
             Some(Mapped {
                 peer,
                 id: raw.id,
@@ -2317,6 +2329,66 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
             })
         }
     }
+}
+
+fn http_url(url: &str) -> Option<String> {
+    (url.starts_with("https://") || url.starts_with("http://")).then(|| url.to_owned())
+}
+
+fn bot_key(button: &tl::enums::KeyboardButton) -> BotKey {
+    use tl::enums::KeyboardButton as Key;
+    let text = button.text();
+    let (kind, url) = match button {
+        Key::Url(one) => (BotKeyKind::Url, http_url(&one.url)),
+        Key::WebView(one) => (BotKeyKind::Url, http_url(&one.url)),
+        Key::SimpleWebView(one) => (BotKeyKind::Url, http_url(&one.url)),
+        Key::UrlAuth(one) => (BotKeyKind::Url, http_url(&one.url)),
+        Key::RequestPhone(_) => (BotKeyKind::Phone, None),
+        Key::RequestGeoLocation(_) => (BotKeyKind::Location, None),
+        Key::RequestPeer(_) | Key::InputKeyboardButtonRequestPeer(_) => (BotKeyKind::Peer, None),
+        _ => (BotKeyKind::Text, None),
+    };
+    BotKey { text, url, kind }
+}
+
+/// `replyKeyboardMarkup`, or an empty keyboard for `replyKeyboardHide`.
+/// Inline keyboards and a force-reply stay off the message. No markup is `None`,
+/// so a later plain message does not clear the keyboard that is showing.
+fn reply_keyboard(markup: &tl::enums::ReplyMarkup) -> Option<ReplyKeyboard> {
+    if let tl::enums::ReplyMarkup::ReplyKeyboardHide(hide) = markup {
+        return Some(ReplyKeyboard {
+            rows: Vec::new(),
+            resize: false,
+            single_use: false,
+            selective: hide.selective,
+            persistent: false,
+            placeholder: None,
+        });
+    }
+    let tl::enums::ReplyMarkup::ReplyKeyboardMarkup(board) = markup else {
+        return None;
+    };
+    let rows = board
+        .rows
+        .iter()
+        .filter_map(|row| {
+            let tl::enums::KeyboardButtonRow::Row(row) = row;
+            let keys: Vec<BotKey> = row.buttons.iter().map(bot_key).filter(|key| !key.text.is_empty()).take(8).collect();
+            (!keys.is_empty()).then_some(keys)
+        })
+        .take(8)
+        .collect::<Vec<_>>();
+    if rows.is_empty() {
+        return None;
+    }
+    Some(ReplyKeyboard {
+        rows,
+        resize: board.resize,
+        single_use: board.single_use,
+        selective: board.selective,
+        persistent: board.persistent,
+        placeholder: board.placeholder.clone().filter(|hint| !hint.is_empty()),
+    })
 }
 
 fn user_id(who: Who) -> String {
@@ -2672,7 +2744,7 @@ pub(super) fn prove_stickers() -> Result<(), String> {
             ttl_seconds: None,
         };
         let mut wants = Vec::new();
-        let attachment = document(&media, &raw, &mut wants);
+        let attachment = document(&media, &raw, &mut wants, Who::User(0), false, DownloadRules::default());
         let file_id = format!("d{id}");
         let thumb_id = format!("d{id}m");
         if !attachment.sticker || attachment.file.id != file_id || attachment.file.kind != kind || attachment.file.bytes != 30_000 {
@@ -2722,7 +2794,7 @@ pub(super) fn prove_stickers() -> Result<(), String> {
         (media, raw)
     };
     let mut wants = Vec::new();
-    let still = document(&media, &raw, &mut wants);
+    let still = document(&media, &raw, &mut wants, Who::User(0), false, DownloadRules::default());
     if still.file.id != "d6412m" || wants.iter().any(|want| want.file.id == "d6412") {
         return Err("a static sticker must stay its thumbnail".into());
     }
@@ -3553,7 +3625,7 @@ mod tests {
     #[test]
     fn a_photo_with_a_stripped_thumbnail_has_its_preview_on_disk_with_the_page() {
         let mut wants = Vec::new();
-        let attachment = photo(&a_photo(vec![stripped(RIDGE), sized("m", 320, 240), sized("y", 1_280, 960)]), false, &mut wants).unwrap();
+        let attachment = photo(&a_photo(vec![stripped(RIDGE), sized("m", 320, 240), sized("y", 1_280, 960)]), false, &mut wants, Who::User(0), false, DownloadRules::default()).unwrap();
         let preview = attachment.preview.as_ref().unwrap();
         assert_eq!((preview.id.as_str(), preview.kind, preview.width, preview.height), ("p6016i", MediaKind::Image, 40, 30));
         assert_eq!(attachment.thumb.as_ref().map(|thumb| thumb.id.as_str()), Some("p6016m"));
@@ -3569,6 +3641,59 @@ mod tests {
     }
 
     #[test]
+    fn auto_download_fetches_a_full_photo_only_when_the_chat_and_the_cap_allow_it() {
+        let picture = a_photo(vec![sized("m", 320, 240), sized("y", 1_280, 960)]);
+        let allow = DownloadRules {
+            fetch_full_photos: true,
+            private_chats: true,
+            photo_max: 8_192,
+            ..DownloadRules::default()
+        };
+        let mut wants = Vec::new();
+        photo(&picture, false, &mut wants, Who::User(7002), false, allow).unwrap();
+        assert!(wants.iter().any(|want| want.file.id == "p6016y" && !want.original), "under the cap, the full photo is fetched");
+        assert!(wants.iter().any(|want| want.file.id == "p6016m" && !want.original));
+
+        let mut held = Vec::new();
+        photo(&picture, false, &mut held, Who::Channel(9001), false, allow).unwrap();
+        assert!(held.iter().any(|want| want.file.id == "p6016y" && want.original), "a channel stays held when only private chats are on");
+
+        let groups = DownloadRules { groups: true, photo_max: 8_192, fetch_full_photos: true, ..DownloadRules::default() };
+        let mut supergroup = Vec::new();
+        photo(&picture, false, &mut supergroup, Who::Channel(9001), true, groups).unwrap();
+        assert!(supergroup.iter().any(|want| want.file.id == "p6016y" && !want.original), "a megagroup follows the groups gate");
+        let mut broadcast = Vec::new();
+        photo(&picture, false, &mut broadcast, Who::Channel(9001), false, groups).unwrap();
+        assert!(broadcast.iter().any(|want| want.file.id == "p6016y" && want.original), "a broadcast channel stays on the channels gate");
+
+        let over = DownloadRules { photo_max: 1_000, ..allow };
+        assert!(!over.fetch_full(Who::User(7002), false, DownloadClass::Photo, 4_096));
+        let mut refused = Vec::new();
+        photo(&picture, false, &mut refused, Who::User(7002), false, over).unwrap();
+        assert!(refused.iter().any(|want| want.file.id == "p6016y" && want.original), "over the cap, the full photo waits for the viewer");
+
+        let off = DownloadRules::default();
+        assert!(!off.fetch_full(Who::User(7002), false, DownloadClass::Photo, 4_096));
+        assert!(!off.fetch_full(Who::Group(8001), false, DownloadClass::Video, 4_096));
+        let videos = DownloadRules { groups: true, video_max: 10_000, ..DownloadRules::default() };
+        assert!(videos.fetch_full(Who::Group(8001), false, DownloadClass::Gif, 4_096));
+        assert!(videos.fetch_full(Who::Channel(9001), true, DownloadClass::Gif, 4_096));
+        assert!(!videos.fetch_full(Who::Channel(9001), false, DownloadClass::Gif, 4_096));
+        assert!(!videos.fetch_full(Who::Group(8001), false, DownloadClass::Gif, 20_000));
+    }
+
+    #[test]
+    fn a_reply_keyboard_hide_is_empty_and_other_markups_are_absent() {
+        let hide = reply_keyboard(&tl::types::ReplyKeyboardHide { selective: false }.into()).expect("a hide");
+        assert!(hide.rows.is_empty());
+        assert!(!hide.selective);
+        let aimed = reply_keyboard(&tl::types::ReplyKeyboardHide { selective: true }.into()).expect("a selective hide");
+        assert!(aimed.rows.is_empty() && aimed.selective);
+        assert!(reply_keyboard(&tl::types::ReplyInlineMarkup { rows: Vec::new() }.into()).is_none());
+        assert!(reply_keyboard(&tl::types::ReplyKeyboardForceReply { single_use: false, selective: false, placeholder: None }.into()).is_none());
+    }
+
+    #[test]
     fn a_photo_without_a_usable_stripped_thumbnail_has_no_preview() {
         for sizes in [
             vec![sized("m", 320, 240)],
@@ -3576,14 +3701,14 @@ mod tests {
             vec![stripped(&[]), sized("m", 320, 240)],
         ] {
             let mut wants = Vec::new();
-            let attachment = photo(&a_photo(sizes), false, &mut wants).unwrap();
+            let attachment = photo(&a_photo(sizes), false, &mut wants, Who::User(0), false, DownloadRules::default()).unwrap();
             assert!(attachment.preview.is_none());
             assert!(wants.iter().all(|want| want.file.id != "p6016i"));
         }
         // A row's size that came inside the message is on disk as soon as the preview would be.
         let cached = tl::types::PhotoCachedSize { r#type: "m".to_owned(), w: 320, h: 240, bytes: vec![0xff, 0xd8, 0xff, 0xd9] };
         let mut wants = Vec::new();
-        let attachment = photo(&a_photo(vec![stripped(RIDGE), cached.into()]), false, &mut wants).unwrap();
+        let attachment = photo(&a_photo(vec![stripped(RIDGE), cached.into()]), false, &mut wants, Who::User(0), false, DownloadRules::default()).unwrap();
         assert!(attachment.preview.is_none());
     }
 
@@ -4493,7 +4618,7 @@ mod tests {
     fn an_animated_sticker_names_the_lottie_file_and_keeps_the_still() {
         let (media, raw) = sticker_media(6_410, "application/x-tgsticker");
         let mut wants = Vec::new();
-        let attachment = document(&media, &raw, &mut wants);
+        let attachment = document(&media, &raw, &mut wants, Who::User(0), false, DownloadRules::default());
         assert!(attachment.sticker);
         assert_eq!(attachment.mime, "application/x-tgsticker");
         assert_eq!(attachment.file.id, "d6410", "the document is the file the row plays");
@@ -4510,7 +4635,7 @@ mod tests {
     fn a_video_sticker_names_the_webm_and_keeps_the_still() {
         let (media, raw) = sticker_media(6_411, "video/webm");
         let mut wants = Vec::new();
-        let attachment = document(&media, &raw, &mut wants);
+        let attachment = document(&media, &raw, &mut wants, Who::User(0), false, DownloadRules::default());
         assert!(attachment.sticker);
         assert_eq!(attachment.file.id, "d6411");
         assert_eq!(attachment.file.kind, MediaKind::Video);
@@ -4524,7 +4649,7 @@ mod tests {
     fn a_static_sticker_stays_its_thumbnail() {
         let (media, raw) = sticker_media(6_412, "image/webp");
         let mut wants = Vec::new();
-        let attachment = document(&media, &raw, &mut wants);
+        let attachment = document(&media, &raw, &mut wants, Who::User(0), false, DownloadRules::default());
         assert!(attachment.sticker);
         assert_eq!(attachment.file.id, "d6412m");
         assert!(attachment.thumb.as_ref().is_some_and(|thumb| thumb.id == "d6412m"));
