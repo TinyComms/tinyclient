@@ -6886,10 +6886,15 @@ fn slack_slash_commands_builtins_unknown_handoff_completion_and_ephemeral() {
     let general = alpha("C0GEN");
     world.general();
 
-    // 1. `/me waves` sends `chat.meMessage` (never `chat.postMessage`).
+    // 1. `/me waves` sends `chat.meMessage` (never `chat.postMessage`). The send answers
+    // while the row is still pending; Slack's acceptance is the stored row.
     let post_before = world.fake.calls(ALPHA, "chat.postMessage").len();
-    let me_sent = world.send(&general, "slash-me-1", "/me waves");
-    assert_eq!(me_sent.state, SendState::Sent);
+    world.send(&general, "slash-me-1", "/me waves");
+    let me_sent = world.until("the /me action to be sent", || {
+        world.messages(&general).into_iter().find(|message| {
+            message.client_id.as_deref() == Some("slash-me-1") && message.state == SendState::Sent
+        })
+    });
     assert_eq!(me_sent.text, "waves");
     assert_eq!(world.fake.calls(ALPHA, "chat.postMessage").len(), post_before);
     let me_call = world.fake.calls(ALPHA, "chat.meMessage").pop().expect("chat.meMessage called");
@@ -6937,8 +6942,12 @@ fn slack_slash_commands_builtins_unknown_handoff_completion_and_ephemeral() {
     });
 
     // 3. `/shrug hello` posts `hello ¯\_(ツ)_/¯` via chat.postMessage.
-    let shrug = world.send(&general, "slash-shrug-1", "/shrug hello");
-    assert_eq!(shrug.state, SendState::Sent);
+    world.send(&general, "slash-shrug-1", "/shrug hello");
+    let shrug = world.until("the shrug to be sent", || {
+        world.messages(&general).into_iter().find(|message| {
+            message.client_id.as_deref() == Some("slash-shrug-1") && message.state == SendState::Sent
+        })
+    });
     assert_eq!(shrug.text, "hello ¯\\_(ツ)_/¯");
 
     // 4. `/topic Ship v2` calls conversations.setTopic, removes temporary pending send, and emits Change::Ephemeral.

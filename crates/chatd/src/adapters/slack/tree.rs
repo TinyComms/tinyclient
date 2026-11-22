@@ -536,15 +536,16 @@ impl Slack {
             self.check_paid_section_error(&err);
             return Err(err);
         }
-        if let Some(mut group) = self
+        // The store guard has to end before `group` takes it again.
+        let updated = self
             .ctx
             .hub
             .store()
             .tree(&self.ctx.key(&self.ctx.account.account), 0, 1)
             .ok()
             .flatten()
-            .and_then(|t| t.groups.into_iter().find(|g| g.id == section_id))
-        {
+            .and_then(|t| t.groups.into_iter().find(|g| g.id == section_id));
+        if let Some(mut group) = updated {
             group.name = name.to_owned();
             if let Some(e) = clean_emoji {
                 group.emoji = section_emoji((!e.is_empty()).then_some(e));
