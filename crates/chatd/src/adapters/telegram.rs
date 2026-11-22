@@ -707,12 +707,12 @@ fn offline(ctx: &Context, command: Command) {
     match command {
         Command::Send { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
         Command::React { reply, .. }
-        | Command::StarsBalance { reply }
         | Command::SendPaidReaction { reply, .. }
         | Command::TogglePaidReactionPrivacy { reply, .. }
         | Command::SetDefaultReaction { reply, .. }
         | Command::Edit { reply, .. }
         | Command::Delete { reply, .. } => drop(reply.send(Err(down()))),
+        Command::StarsBalance { reply } => drop(reply.send(Err(down()))),
         Command::Members { reply, .. } => drop(reply.send(Err(down()))),
         Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(down()))),
         Command::ConversationInfo { reply, .. } => drop(reply.send(Err(down()))),
