@@ -2143,8 +2143,17 @@ impl Chat {
         let mut query = query.trim().to_owned();
         clip(&mut query, 100);
         let asked = (account.clone(), kind, space.clone(), query.clone(), cursor.clone());
-        if let Some((items, cursor)) = self.hub.catalogs.get(&asked) {
-            return Response::Catalog { items, cursor };
+        // The first page of Telegram stickers is rebuilt on every open. A pack can be installed
+        // on another device between opens, and the adapter refetches that page for that reason.
+        // The few-minute catalog cache would keep showing the old list.
+        let refetch = account.network == Network::Telegram
+            && kind == CatalogKind::Stickers
+            && query.is_empty()
+            && cursor.is_none();
+        if !refetch {
+            if let Some((items, cursor)) = self.hub.catalogs.get(&asked) {
+                return Response::Catalog { items, cursor };
+            }
         }
         if let Err(refused) = self.online(&account) {
             return *refused;
