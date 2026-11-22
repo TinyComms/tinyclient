@@ -191,6 +191,22 @@ struct Fake {
     pushed: AtomicU32,
     posted: AtomicU32,
     mailbox_ooo: Mutex<Value>,
+    /// Dynamic thread pinnedMessages JSON per thread id (for #655).
+    pinned: Mutex<HashMap<String, Value>>,
+    /// Saved messages in 48:saved (for #655).
+    saved: Mutex<Vec<Value>>,
+    /// Dynamically created group threads (for #619).
+    threads: Mutex<HashMap<String, Value>>,
+    /// Blocked user MRIs (for #621).
+    blocked: Mutex<Vec<String>>,
+    /// Teams joined via public browse or join code (for #629).
+    extra_teams: Mutex<Vec<Value>>,
+    /// Channels created inside teams (for #629).
+    extra_channels: Mutex<HashMap<String, Vec<Value>>>,
+    /// Team ids left by the user (for #629).
+    left_teams: Mutex<Vec<String>>,
+    /// Thread ids for which `GET /v1/threads/{id}` returns 500 (for transient-failure tests).
+    fail_describe: Mutex<Vec<String>>,
     /// Optional replacement payload for `/api/csa/api/v1/teams/users/me`.
     teams_override: Mutex<Option<Value>>,
 }
@@ -215,6 +231,34 @@ impl Fake {
                 "internalReplyMessage": "",
                 "externalReplyMessage": "",
             })),
+            pinned: Mutex::new(HashMap::from([(
+                CHAT_ANA.to_owned(),
+                json!([{"messageId": "1760000500100", "pinnedBy": ANA, "pinnedTime": 1_760_000_500_200u64}]),
+            )])),
+            saved: Mutex::new(vec![json!({
+                "id": "1760000500100",
+                "type": "Message",
+                "messagetype": "RichText/Html",
+                "contenttype": "text",
+                "content": "<p>Saved deploy checklist</p>",
+                "conversationid": "48:saved",
+                "from": format!("https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/{ANA}"),
+                "imdisplayname": "Ana Ruiz",
+                "composetime": iso(1_760_000_500_100),
+                "properties": {
+                    "sourceConversationId": CHAT_ANA,
+                    "sourceMessageId": "1760000500100"
+                }
+            })]),
+            threads: Mutex::default(),
+            blocked: Mutex::new(vec![
+                "8:orgid:00000000-0000-4000-8000-0000000000bb".to_owned(),
+                "8:live:bare_blocked_user".to_owned(),
+            ]),
+            extra_teams: Mutex::default(),
+            extra_channels: Mutex::default(),
+            left_teams: Mutex::default(),
+            fail_describe: Mutex::default(),
             teams_override: Mutex::default(),
         });
         let serving = fake.clone();
@@ -245,6 +289,7 @@ impl Fake {
             ("https://teams.microsoft.com/api/mt/emea", "/api/mt/emea"),
             ("https://presence.teams.microsoft.com", "/presence"),
             ("https://eu-api.asm.skype.com", "/ams"),
+            ("https://eu-prod.asyncgw.teams.microsoft.com/msgsearch", "/msgsearch"),
         ] {
             text = text.replace(host, &format!("{}{at}", self.base));
         }
@@ -330,13 +375,45 @@ impl Fake {
                 ok(authz)
             }
             "/api/csa/api/v1/teams/users/me" if bearer("csa") && header("x-skypetoken") == skype => {
-                let body = self
-                    .teams_override
-                    .lock()
-                    .unwrap()
-                    .clone()
-                    .unwrap_or_else(|| self.fixture("teams.users.me").unwrap());
+                let overridden = self.teams_override.lock().unwrap().clone();
+                let mut body = overridden.clone().unwrap_or_else(|| self.fixture("teams.users.me").unwrap());
+                if overridden.is_none() {
+                    let left = self.left_teams.lock().unwrap().clone();
+                    let extra_teams = self.extra_teams.lock().unwrap().clone();
+                    let extra_channels = self.extra_channels.lock().unwrap().clone();
+                    if let Some(teams) = body["teams"].as_array_mut() {
+                        teams.retain(|t| t["id"].as_str().is_none_or(|id| !left.iter().any(|l| l == id)));
+                        for t in teams.iter_mut() {
+                            if let Some(tid) = t["id"].as_str().map(str::to_owned) {
+                                if let Some(added) = extra_channels.get(&tid) {
+                                    if let Some(chans) = t["channels"].as_array_mut() {
+                                        chans.extend(added.iter().cloned());
+                                    }
+                                }
+                            }
+                        }
+                        teams.extend(extra_teams);
+                    }
+                }
                 ok(body)
+            }
+            _ if path.starts_with("/api/csa/api/v1/teams/") && path.ends_with("/channels") && bearer("csa") && header("x-skypetoken") == skype => {
+                let tid = path
+                    .trim_start_matches("/api/csa/api/v1/teams/")
+                    .trim_end_matches("/channels");
+                let body = self.fixture("teams.users.me").unwrap();
+                let mut chans: Vec<Value> = body["teams"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|t| t["id"].as_str() == Some(tid))
+                    .and_then(|t| t["channels"].as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(added) = self.extra_channels.lock().unwrap().get(tid) {
+                    chans.extend(added.iter().cloned());
+                }
+                ok(json!({"channels": chans}))
             }
             "/v4/a" if header("x-skypetoken") == skype => ok(json!({
                 "socketio": format!("{}/", self.base), "surl": format!("{}/v4/f/abc123/", self.base),
@@ -373,6 +450,7 @@ impl Fake {
             "/presence/v1/presence/getpresence/" if bearer("presence") => ok(self.fixture("presence").unwrap()),
             "/presence/v1/me/forceavailability/" if bearer("presence") => ok(json!({})),
             "/presence/v1/me/publishnote" if bearer("presence") => ok(json!({})),
+            _ if path.starts_with("/msgsearch") && bearer("substrate") => self.search_endpoint(call),
             // A shared file's bytes. The cache asks Graph's shares route; this stands in for it.
             _ if call.method == "GET" && path.contains("/shares/u!") && path.ends_with("/driveItem/content") => Reply {
                 status: "200 OK",
@@ -415,6 +493,7 @@ impl Fake {
             scope if scope.starts_with("https://api.spaces.skype.com/.default ") => "spaces",
             scope if scope.starts_with("https://chatsvcagg.teams.microsoft.com/.default ") => "csa",
             scope if scope.starts_with("https://presence.teams.microsoft.com/.default ") => "presence",
+            scope if scope.starts_with("https://substrate.office.com/.default ") => "substrate",
             scope if scope.starts_with("https://graph.microsoft.com/.default ") => "graph",
             _ => return answer("400 Bad Request", json!({"error": "invalid_scope", "error_description": "AADSTS70011: The provided value for the input parameter 'scope' is not valid."})),
         };
@@ -441,15 +520,29 @@ impl Fake {
     fn chat(&self, call: &Call, path: &str) -> Reply {
         if path == "/v1/threads" && call.method == "POST" {
             let body = call.json();
-            let target = if body["properties"]["topic"].as_str().is_some_and(|t| !t.is_empty())
-                || body["members"].as_array().is_some_and(|m| m.len() > 2)
-            {
-                "19:tagchat@thread.v2"
+            let unique = body["properties"]["uniquerosterthread"] == true;
+            let thread_id = if unique {
+                CHAT_DEE.to_owned()
+            } else if body["properties"]["topic"] == "On-Call" {
+                // The tag-chat fixture has a fixed id.
+                "19:tagchat@thread.v2".to_owned()
             } else {
-                CHAT_DEE
+                let mut threads = self.threads.lock().unwrap();
+                let id = format!("19:newgrp{}@thread.v2", threads.len() + 1);
+                let members = body["members"].clone();
+                let properties = body["properties"].clone();
+                threads.insert(
+                    id.clone(),
+                    json!({
+                        "id": id,
+                        "properties": properties,
+                        "members": members,
+                    }),
+                );
+                id
             };
             let mut created = answer("201 Created", json!({}));
-            created.headers.push(("Location", format!("{}/chat/v1/threads/{target}", self.base)));
+            created.headers.push(("Location", format!("{}/chat/v1/threads/{thread_id}", self.base)));
             return created;
         }
         if let Some(thread) = path.strip_prefix("/v1/threads/").and_then(|rest| rest.strip_suffix("/consumptionhorizons")) {
@@ -466,24 +559,150 @@ impl Fake {
         }
         if let Some(thread) = path.strip_prefix("/v1/threads/") {
             if call.method == "DELETE" && thread.contains("/members/") {
+                if let Some((tid, mri)) = thread.split_once("/members/") {
+                    if tid == "19:lastowner@thread.tacv2" {
+                        return answer("403 Forbidden", json!({"errorCode": 403, "message": "last owner cannot leave"}));
+                    }
+                    if mri == ME && (tid.contains("@thread.tacv2") || tid.contains("@thread.skype")) {
+                        let mut left = self.left_teams.lock().unwrap();
+                        if !left.iter().any(|l| l == tid) {
+                            left.push(tid.to_owned());
+                        }
+                    }
+                    if let Some(existing) = self.threads.lock().unwrap().get_mut(tid) {
+                        if let Some(arr) = existing["members"].as_array_mut() {
+                            arr.retain(|m| m["id"].as_str() != Some(mri));
+                        }
+                    }
+                }
                 return ok(json!({}));
             }
-            let described = match thread {
-                CHAT_ANA => Some(json!({
-                    "id": thread,
-                    "properties": {"threadType": "chat"},
-                    "members": [{"id": ME, "role": "Admin"}, {"id": ANA, "role": "Admin"}]
-                })),
-                CHAT_DEE => self.fixture("thread.dee"),
-                GENERAL => self.fixture("thread.general"),
-                "19:tagchat@thread.v2" => Some(json!({
-                    "id": thread,
-                    "properties": {"threadType": "chat", "topic": "On-Call"},
-                    "members": [{"id": ME, "role": "Admin"}, {"id": ANA, "role": "Admin"}, {"id": BEN, "role": "Admin"}]
-                })),
-                "19:grp1@thread.v2" => Some(json!({"id": thread, "properties": {"threadType": "chat"}, "members": [{}, {}, {}]})),
-                _ => None,
-            };
+            if call.method == "PUT" {
+                if let Some((tid, mri)) = thread.split_once("/members/") {
+                    let body = call.json();
+                    if tid == "19:eng0general@thread.tacv2" && mri == ME {
+                        let mut extra = self.extra_teams.lock().unwrap();
+                        if !extra.iter().any(|t| t["id"].as_str() == Some(tid)) {
+                            extra.push(json!({
+                                "id": tid,
+                                "displayName": "Engineering",
+                                "isFavorite": true,
+                                "isDeleted": false,
+                                "isArchived": false,
+                                "tenantId": HOME,
+                                "teamSiteInformation": {"groupId": "e0873025-0000-4000-8000-00000000e199"},
+                                "channels": [{
+                                    "id": tid,
+                                    "displayName": "General",
+                                    "parentTeamId": tid,
+                                    "isGeneral": true,
+                                    "isFavorite": true,
+                                    "isMember": true,
+                                    "isDeleted": false,
+                                    "isArchived": false,
+                                    "channelType": 0
+                                }]
+                            }));
+                        }
+                    }
+                    if let Some(existing) = self.threads.lock().unwrap().get_mut(tid) {
+                        if let Some(arr) = existing["members"].as_array_mut() {
+                            if !arr.iter().any(|m| m["id"].as_str() == Some(mri)) {
+                                arr.push(json!({"id": mri, "role": body["role"].as_str().unwrap_or("Admin")}));
+                            }
+                        }
+                    }
+                    return ok(json!({}));
+                }
+                if let Some(tid) = thread.strip_suffix("/properties") {
+                    if call.query.contains("name=pinnedMessages") {
+                        let raw = call.json()["pinnedMessages"].as_str().unwrap_or("[]").to_owned();
+                        let parsed: Value = serde_json::from_str(&raw).unwrap_or_else(|_| json!([]));
+                        self.pinned.lock().unwrap().insert(tid.to_owned(), parsed);
+                        return ok(json!({}));
+                    }
+                    if call.query.contains("name=topic") {
+                        let new_topic = call.json()["topic"].as_str().unwrap_or("").to_owned();
+                        if let Some(existing) = self.threads.lock().unwrap().get_mut(tid) {
+                            existing["properties"]["topic"] = json!(new_topic);
+                        }
+                        return ok(json!({}));
+                    }
+                    if call.query.contains("name=description") {
+                        let new_desc = call.json()["description"].as_str().unwrap_or("").to_owned();
+                        if let Some(existing) = self.threads.lock().unwrap().get_mut(tid) {
+                            existing["properties"]["description"] = json!(new_desc);
+                        }
+                        return ok(json!({}));
+                    }
+                }
+            }
+            if call.method == "GET" && self.fail_describe.lock().unwrap().iter().any(|t| t == thread) {
+                return answer("500 Internal Server Error", json!({"errorCode": 500, "message": "transient error"}));
+            }
+            let mut described = self
+                .threads
+                .lock()
+                .unwrap()
+                .get(thread)
+                .cloned()
+                .or_else(|| match thread {
+                    CHAT_DEE => self.fixture("thread.dee"),
+                    GENERAL => self.fixture("thread.general"),
+                    CHAT_ANA => Some(json!({
+                        "id": thread,
+                        "properties": {"threadType": "chat", "uniquerosterthread": "true"},
+                        "members": [{"id": ME, "role": "Admin"}, {"id": ANA, "role": "Admin"}]
+                    })),
+                    "19:archive0chat@thread.v2" => Some(json!({
+                        "id": thread,
+                        "properties": {"threadType": "chat", "topic": "Budget Archive"},
+                        "members": [{"id": ME, "role": "Admin"}, {"id": ANA, "role": "Admin"}, {"id": BEN, "role": "Admin"}]
+                    })),
+                    "19:extreq1@unq.gbl.spaces" => Some(json!({
+                        "id": thread,
+                        "properties": {
+                            "threadType": "chat",
+                            "uniquerosterthread": "true",
+                            "isExternal": "true",
+                            "externalChatState": "pending"
+                        },
+                        "members": [
+                            {"id": ME, "role": "Admin"},
+                            {"id": "8:orgid:00000000-0000-4000-8000-0000000000e1", "role": "Admin", "tenantId": "99999999-9999-4999-8999-999999999999"}
+                        ]
+                    })),
+                    "19:extreq2@unq.gbl.spaces" => Some(json!({
+                        "id": thread,
+                        "properties": {
+                            "threadType": "chat",
+                            "uniquerosterthread": "true",
+                            "isExternal": "true",
+                            "externalChatState": "pending"
+                        },
+                        "members": [
+                            {"id": ME, "role": "Admin"},
+                            {"id": "8:live:personal_spammer", "role": "Admin"}
+                        ]
+                    })),
+                    "19:tagchat@thread.v2" => Some(json!({
+                        "id": thread,
+                        "properties": {"threadType": "chat", "topic": "On-Call"},
+                        "members": [{"id": ME, "role": "Admin"}, {"id": ANA, "role": "Admin"}, {"id": BEN, "role": "Admin"}]
+                    })),
+                    "19:grp1@thread.v2" => Some(json!({"id": thread, "properties": {"threadType": "chat"}, "members": [{}, {}, {}]})),
+                    "19:platform0hidden@thread.tacv2" => Some(json!({
+                        "id": thread,
+                        "properties": {"threadType": "topic", "topic": "Hidden one"},
+                        "members": [{"id": ME, "role": "User"}]
+                    })),
+                    _ => None,
+                });
+            if let Some(desc) = described.as_mut() {
+                if let Some(pins) = self.pinned.lock().unwrap().get(thread) {
+                    desc["properties"]["pinnedMessages"] = json!(pins.to_string());
+                }
+            }
             return described.map_or_else(|| answer("404 Not Found", json!({"errorCode": 404, "message": "no such thread"})), ok);
         }
         let Some(rest) = path.strip_prefix("/v1/users/ME/conversations/") else {
@@ -509,10 +728,80 @@ impl Fake {
                         return ok(json!({"messages": msgs, "_metadata": {}}));
                     }
                     chain if chain == format!("{GENERAL};messageid={ROOT}") => "messages.chain",
-                    "48:notifications" => "messages.activity",
+                    "48:notifications" => {
+                        if call.query.contains("syncState=actpage2") {
+                            return ok(json!({
+                                "messages": [
+                                    {
+                                        "id": "1760000800001",
+                                        "type": "Message",
+                                        "messagetype": "Text",
+                                        "contenttype": "text",
+                                        "content": "Missed call from Ana Ruiz",
+                                        "conversationid": "48:notifications",
+                                        "from": format!("https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/{ANA}"),
+                                        "imdisplayname": "Ana Ruiz",
+                                        "composetime": "2025-10-09T09:01:00.0000000Z",
+                                        "properties": {
+                                            "activity": json!({
+                                                "activityType": "missedCall",
+                                                "sourceThreadId": CHAT_ANA,
+                                                "sourceMessageId": "1760000500100",
+                                                "sourceUserId": ANA,
+                                                "sourceUserImDisplayName": "Ana Ruiz",
+                                                "messagePreview": "Missed call"
+                                            }).to_string()
+                                        }
+                                    },
+                                    {
+                                        "id": "1760000800002",
+                                        "type": "Message",
+                                        "messagetype": "Text",
+                                        "contenttype": "text",
+                                        "content": "You were added to Platform",
+                                        "conversationid": "48:notifications",
+                                        "from": format!("https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/{BEN}"),
+                                        "imdisplayname": "Ben Okafor",
+                                        "composetime": "2025-10-09T09:00:00.0000000Z",
+                                        "properties": {
+                                            "activity": json!({
+                                                "activityType": "reply",
+                                                "sourceThreadId": GENERAL,
+                                                "sourceMessageId": "1760000210210",
+                                                "sourceReplyChainId": ROOT,
+                                                "sourceUserId": BEN,
+                                                "sourceUserImDisplayName": "Ben Okafor",
+                                                "messagePreview": "On it"
+                                            }).to_string()
+                                        }
+                                    }
+                                ],
+                                "_metadata": {}
+                            }));
+                        }
+                        let mut first = self.fixture("messages.activity").unwrap();
+                        first["_metadata"]["backwardLink"] = json!("https://example.invalid/messages?syncState=actpage2");
+                        return ok(first);
+                    }
+                    "19:archive0chat@thread.v2" => {
+                        let msgs = vec![
+                            message("19:archive0chat@thread.v2", None, 1_758_000_000_200, ANA, "Ana Ruiz", "<p>Quarterly budget spreadsheet attached</p>"),
+                            message("19:archive0chat@thread.v2", None, 1_758_000_000_100, BEN, "Ben Okafor", "<p>Before budget</p>"),
+                        ];
+                        return ok(json!({"messages": msgs, "_metadata": {}}));
+                    }
+                    "48:saved" => {
+                        let msgs = self.saved.lock().unwrap().clone();
+                        return ok(json!({"messages": msgs, "_metadata": {}}));
+                    }
                     _ => return ok(json!({"messages": [], "_metadata": {}})),
                 };
                 ok(self.fixture(name).unwrap())
+            }
+            ("GET", rest_msg) if rest_msg.starts_with("messages/") => {
+                let mid = rest_msg.trim_start_matches("messages/");
+                let id_num = mid.parse::<u64>().unwrap_or(1_760_000_500_100);
+                ok(message(conversation, None, id_num, ANA, "Ana Ruiz", &format!("<p>Fetched message {mid}</p>")))
             }
             ("POST", "messages") => self.post(call, conversation),
             ("POST", _) if tail.starts_with("messages/") && tail.ends_with("/invoke") => {
@@ -520,6 +809,35 @@ impl Fake {
             }
             ("PUT", "properties") => ok(json!({})),
             ("DELETE", "") => ok(json!({})),
+            ("PUT", rest_msg) if conversation == "48:saved" && rest_msg.starts_with("messages/") => {
+                let mid = rest_msg.trim_start_matches("messages/").to_owned();
+                let body = call.json();
+                let src_conv = body["sourceConversationId"].as_str().unwrap_or(CHAT_ANA).to_owned();
+                let mut saved = self.saved.lock().unwrap();
+                saved.retain(|m| m["id"].as_str() != Some(mid.as_str()));
+                let id_num = mid.parse::<u64>().unwrap_or(1_760_000_500_900);
+                saved.push(json!({
+                    "id": mid,
+                    "type": "Message",
+                    "messagetype": "RichText/Html",
+                    "contenttype": "text",
+                    "content": format!("<p>Saved item {mid}</p>"),
+                    "conversationid": "48:saved",
+                    "from": format!("https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/{ANA}"),
+                    "imdisplayname": "Ana Ruiz",
+                    "composetime": iso(id_num),
+                    "properties": {
+                        "sourceConversationId": src_conv,
+                        "sourceMessageId": mid
+                    }
+                }));
+                ok(json!({}))
+            }
+            ("DELETE", rest_msg) if conversation == "48:saved" && rest_msg.starts_with("messages/") => {
+                let mid = rest_msg.trim_start_matches("messages/");
+                self.saved.lock().unwrap().retain(|m| m["id"].as_str() != Some(mid));
+                ok(json!({}))
+            }
             ("PUT" | "DELETE", _) if tail.starts_with("messages/") => ok(json!({})),
             _ => answer("404 Not Found", json!({"errorCode": 404, "message": "not here"})),
         }
@@ -662,10 +980,32 @@ impl Fake {
         }))
     }
 
-    /// The middle tier: people by id, people by name, and their pictures.
+    /// The middle tier: people by id, people by name, federated lookup, blocklist, and previews.
     fn middle(&self, call: &Call) -> Reply {
-        let users = self.fixture("users").unwrap();
-        let users = users.as_array().unwrap();
+        let mut users = self.fixture("users").unwrap().as_array().cloned().unwrap_or_default();
+        users.push(json!({
+            "mri": "8:orgid:00000000-0000-4000-8000-0000000000e1",
+            "displayName": "Eva Vance",
+            "email": "eva@fabrikam.com",
+            "userPrincipalName": "eva@fabrikam.com",
+            "tenantId": "99999999-9999-4999-8999-999999999999",
+            "tenantName": "Fabrikam",
+            "userType": "Federated",
+            "type": "ADUser"
+        }));
+        users.push(json!({
+            "mri": "8:live:personal_spammer",
+            "displayName": "Sam Consumer",
+            "email": "sam@outlook.com",
+            "type": "Consumer"
+        }));
+        users.push(json!({
+            "mri": "8:orgid:00000000-0000-4000-8000-0000000000bb",
+            "displayName": "Blocked Bob",
+            "email": "bob@other.org",
+            "tenantId": "88888888-8888-4888-8888-888888888888",
+            "tenantName": "OtherCorp"
+        }));
         if call.path.ends_with("/beta/users/fetchShortProfile") {
             let wanted = call.json();
             let wanted: Vec<&str> = wanted.as_array().unwrap().iter().filter_map(Value::as_str).collect();
@@ -674,7 +1014,13 @@ impl Fake {
         }
         if call.path.ends_with("/beta/users/searchV2") {
             let query = call.body.to_lowercase();
-            let found: Vec<&Value> = users.iter().filter(|user| user["displayName"].as_str().unwrap().to_lowercase().contains(&query)).collect();
+            let found: Vec<&Value> = users
+                .iter()
+                .filter(|user| {
+                    user["tenantName"].as_str() == Some("Contoso")
+                        && user["displayName"].as_str().unwrap().to_lowercase().contains(&query)
+                })
+                .collect();
             return ok(json!({"type": "Microsoft.SkypeSpaces.MiddleTier.Models.IUserIdentity", "value": found}));
         }
         if call.path.ends_with("/tags") && call.path.contains("/beta/teams/") {
@@ -702,6 +1048,156 @@ impl Fake {
                 ]
             }));
         }
+        if call.path.ends_with("/externalsearchv3") {
+            let email = call
+                .path
+                .trim_end_matches("/externalsearchv3")
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+                .to_lowercase();
+            let found: Vec<&Value> = users
+                .iter()
+                .filter(|u| u["email"].as_str().is_some_and(|e| e.to_lowercase() == email))
+                .collect();
+            return ok(json!({"value": found}));
+        }
+        if call.path.ends_with("/beta/users/blocklist") && call.method == "GET" {
+            let list: Vec<Value> = self
+                .blocked
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|mri| {
+                    users
+                        .iter()
+                        .find(|u| u["mri"].as_str() == Some(mri.as_str()))
+                        .cloned()
+                        .unwrap_or_else(|| json!(mri))
+                })
+                .collect();
+            return ok(json!({"blockedUsers": list}));
+        }
+        if let Some(mri) = call.path.split("/beta/users/blocklist/").nth(1) {
+            if call.method == "PUT" {
+                let mut blocked = self.blocked.lock().unwrap();
+                if !blocked.iter().any(|b| b == mri) {
+                    blocked.push(mri.to_owned());
+                }
+                return ok(json!({}));
+            }
+            if call.method == "DELETE" {
+                self.blocked.lock().unwrap().retain(|b| b != mri);
+                return ok(json!({}));
+            }
+        }
+        if call.path.ends_with("/beta/teams/public") && call.method == "GET" {
+            return ok(json!({
+                "teams": [
+                    {
+                        "id": "19:eng0general@thread.tacv2",
+                        "displayName": "Engineering",
+                        "description": "Public engineering hub",
+                        "memberCount": 18,
+                        "isArchived": false,
+                        "isDeleted": false
+                    },
+                    {
+                        "id": GENERAL,
+                        "displayName": "Platform",
+                        "description": "Platform team",
+                        "memberCount": 4,
+                        "isArchived": false,
+                        "isDeleted": false
+                    }
+                ]
+            }));
+        }
+        if let Some(code) = call.path.split("/beta/teams/joinCode/").nth(1) {
+            if call.method == "GET" {
+                if code == "TEAM42" {
+                    return ok(json!({
+                        "id": "19:code0general@thread.tacv2",
+                        "displayName": "Release Guild",
+                        "description": "Coordinating weekly releases",
+                        "memberCount": 12
+                    }));
+                }
+                return answer("404 Not Found", json!({"errorCode": 404, "message": "not found"}));
+            }
+        }
+        if call.path.ends_with("/beta/teams/joinByCode") && call.method == "POST" {
+            let code = call.json()["joinCode"].as_str().unwrap_or("").to_owned();
+            if code == "BLOCKED42" {
+                return answer("403 Forbidden", json!({"errorCode": 403, "message": "policy forbids join"}));
+            }
+            if code == "TEAM42" {
+                let tid = "19:code0general@thread.tacv2";
+                let mut extra = self.extra_teams.lock().unwrap();
+                if !extra.iter().any(|t| t["id"].as_str() == Some(tid)) {
+                    extra.push(json!({
+                        "id": tid,
+                        "displayName": "Release Guild",
+                        "isFavorite": true,
+                        "isDeleted": false,
+                        "isArchived": false,
+                        "tenantId": HOME,
+                        "teamSiteInformation": {"groupId": "e0873025-0000-4000-8000-00000000c0de"},
+                        "channels": [{
+                            "id": tid,
+                            "displayName": "General",
+                            "parentTeamId": tid,
+                            "isGeneral": true,
+                            "isFavorite": true,
+                            "isMember": true,
+                            "isDeleted": false,
+                            "isArchived": false,
+                            "channelType": 0
+                        }]
+                    }));
+                }
+                return ok(json!({
+                    "id": tid,
+                    "displayName": "Release Guild",
+                    "generalChannelId": tid
+                }));
+            }
+            return answer("404 Not Found", json!({"errorCode": 404, "message": "invalid code"}));
+        }
+        if let Some(rest) = call.path.split("/beta/teams/").nth(1) {
+            if call.method == "POST" && rest.ends_with("/channels") {
+                let tid = rest.trim_end_matches("/channels").to_owned();
+                let body = call.json();
+                let name = body["displayName"].as_str().unwrap_or("").to_owned();
+                if name.to_ascii_lowercase().contains("forbidden") {
+                    return answer("403 Forbidden", json!({"errorCode": 403, "message": "policy blocks channel creation"}));
+                }
+                let private = body["membershipType"].as_str() == Some("private");
+                let mut map = self.extra_channels.lock().unwrap();
+                let list = map.entry(tid.clone()).or_default();
+                let cid = format!("19:newchan{}@thread.tacv2", list.len() + 1);
+                list.push(json!({
+                    "id": cid,
+                    "displayName": name,
+                    "parentTeamId": tid,
+                    "isGeneral": false,
+                    "isFavorite": true,
+                    "isMember": true,
+                    "isDeleted": false,
+                    "isArchived": false,
+                    "channelType": if private { 1 } else { 0 }
+                }));
+                return answer("201 Created", json!({"id": cid, "displayName": name}));
+            }
+            if call.method == "DELETE" && rest.contains("/channels/") {
+                if let Some((tid, cid)) = rest.split_once("/channels/") {
+                    if let Some(list) = self.extra_channels.lock().unwrap().get_mut(tid) {
+                        list.retain(|c| c["id"].as_str() != Some(cid));
+                    }
+                    return ok(json!({}));
+                }
+            }
+        }
         if call.path.ends_with("/v1/urlpreview") {
             let asked = call.json();
             let url = asked["url"].as_str().unwrap_or("");
@@ -716,6 +1212,99 @@ impl Fake {
             }
         }
         answer("404 Not Found", json!({"errorCode": 404, "message": "not here"}))
+    }
+
+    /// Microsoft Search / Substrate endpoint for server-side Teams search (#642).
+    fn search_endpoint(&self, call: &Call) -> Reply {
+        let req = call.json();
+        let entity = &req["EntityRequests"][0];
+        let query = entity["Query"]["QueryString"].as_str().unwrap_or("").to_lowercase();
+        let thread_filter = entity["Filter"]["ThreadId"].as_str().unwrap_or("");
+        let team_filter = entity["Filter"]["TeamId"].as_str().unwrap_or("");
+        let group_filter = entity["Filter"]["GroupId"].as_str().unwrap_or("");
+
+        let corpus = vec![
+            json!({
+                "HitHighlightedSummary": "Quarterly <c0>budget</c0> spreadsheet attached",
+                "Source": {
+                    "ThreadId": "19:archive0chat@thread.v2",
+                    "MessageId": "1758000000200",
+                    "ThreadTopic": "Budget Archive",
+                    "From": {"Mri": ANA, "Name": "Ana Ruiz"},
+                    "HasAttachments": true,
+                    "HasLinks": false,
+                    "MentionsMe": false
+                }
+            }),
+            json!({
+                "HitHighlightedSummary": "Reply in chain about <c0>budget</c0> rollout",
+                "Source": {
+                    "ThreadId": GENERAL,
+                    "MessageId": "1760000210210",
+                    "ParentMessageId": ROOT,
+                    "TeamId": GENERAL,
+                    "TeamName": "Platform",
+                    "ChannelName": "General",
+                    "From": {"Mri": BEN, "Name": "Ben Okafor"},
+                    "HasAttachments": false,
+                    "HasLinks": true,
+                    "MentionsMe": true
+                }
+            }),
+            json!({
+                "HitHighlightedSummary": "Check <c0>deploy</c0> logs in Deploys",
+                "Source": {
+                    "ThreadId": DEPLOYS,
+                    "MessageId": "1760000400400",
+                    "TeamId": GENERAL,
+                    "TeamName": "Platform",
+                    "ChannelName": "Deploys",
+                    "From": {"Mri": BEN, "Name": "Ben Okafor"},
+                    "HasAttachments": false,
+                    "HasLinks": false,
+                    "MentionsMe": false
+                }
+            }),
+            json!({
+                "HitHighlightedSummary": "Quarterly <c0>roadmap</c0> milestone",
+                "Source": {
+                    "ThreadId": "19:platform0unseen@thread.tacv2",
+                    "MessageId": "1760000450450",
+                    "GroupId": "e0873025-0000-4000-8000-00000000beef",
+                    "TeamName": "Platform",
+                    "ChannelName": "Roadmap",
+                    "From": {"Mri": ANA, "Name": "Ana Ruiz"}
+                }
+            }),
+        ];
+
+        let mut matched = Vec::new();
+        for item in corpus {
+            let src = &item["Source"];
+            let summary = item["HitHighlightedSummary"].as_str().unwrap_or("").to_lowercase();
+            let word = query.split_whitespace().next().unwrap_or("");
+            if !word.is_empty() && !word.contains(':') && !summary.contains(word) {
+                continue;
+            }
+            if !thread_filter.is_empty() && src["ThreadId"].as_str() != Some(thread_filter) {
+                continue;
+            }
+            if !team_filter.is_empty() {
+                let by_team = src["TeamId"].as_str() == Some(team_filter);
+                let by_group = !group_filter.is_empty() && src["GroupId"].as_str() == Some(group_filter);
+                if !by_team && !by_group {
+                    continue;
+                }
+            }
+            matched.push(item);
+        }
+        ok(json!({
+            "EntitySets": [{
+                "ResultSets": [{
+                    "Results": matched
+                }]
+            }]
+        }))
     }
 
     // Push.
@@ -1031,11 +1620,19 @@ fn one_sign_in_is_a_tenant_each_with_teams_channels_chats_and_their_unread_state
     assert_eq!(partners, [("Ana Ruiz", "ana@contoso.com", "msteams:/l/chat/0/0?users=ana%40contoso.com")]);
 
     // Connecting listed everything from one call, looked the chats' people up together, and
-    // fetched history only for the one unread chat.
+    // fetched history only for the one unread chat. The blocklist names Bob and also a bare
+    // MRI the chat batch never saw, so that person is a second lookup.
     world.until("the unread chat to be warmed", || world.fake.calls("GET", &format!("{CHAT_ANA}/messages")).pop());
     let calls = world.fake.calls.lock().unwrap().clone();
     let asked = |method: &str, ending: &str| calls.iter().filter(|call| call.method == method && call.path.ends_with(ending)).count();
-    assert_eq!(asked("POST", "/beta/users/fetchShortProfile"), 1);
+    let profiles: Vec<Value> = calls
+        .iter()
+        .filter(|call| call.method == "POST" && call.path.ends_with("/beta/users/fetchShortProfile"))
+        .map(|call| call.json())
+        .collect();
+    assert_eq!(profiles.len(), 2);
+    assert!(profiles.iter().any(|body| body.as_array().is_some_and(|ids| ids.len() > 1)), "the chats' people are one batch");
+    assert!(profiles.iter().any(|body| body == &json!(["8:live:bare_blocked_user"])));
     assert_eq!(asked("GET", "/v1/users/ME/conversations"), 0);
     assert_eq!(asked("GET", &format!("{GENERAL}/messages")) + asked("GET", "19:grp1@thread.v2/messages"), 0);
     assert_eq!(asked("POST", "/beta/users/searchV2"), 0, "the directory is never listed");
@@ -1560,15 +2157,23 @@ fn mentions_missed_while_closed_info_mute_seen_hidden_chats_and_files_through_on
     };
     assert_eq!(counts.mentions, 1);
 
-    // What connecting asked, once each: the token audiences, authz, the one list, one lookup of
-    // the chats' people, and one page of the Activity stream; history for the unread chats only.
+    // What connecting asked: the token audiences, authz, the one list, one lookup of the chats'
+    // people, one lookup of the blocklist's unnamed person, and one page of the Activity stream.
+    // History is fetched for the unread chats only.
     world.until("the unread chat to be warmed", || world.fake.calls("GET", &format!("{CHAT_ANA}/messages")).pop());
     let calls = world.fake.calls.lock().unwrap().clone();
     let at_connect: Vec<String> = calls.iter().map(|call| format!("{} {}", call.method, call.path.rsplit('/').next().unwrap_or(""))).collect();
     let lists = calls.iter().filter(|call| call.path.ends_with("/teams/users/me")).count();
     // The list is answered 401 once by the fake (a stale token), so twice.
     assert_eq!(lists, 2, "{at_connect:#?}");
-    assert_eq!(calls.iter().filter(|call| call.path.ends_with("/fetchShortProfile")).count(), 1);
+    let profiles: Vec<Value> = calls
+        .iter()
+        .filter(|call| call.method == "POST" && call.path.ends_with("/fetchShortProfile"))
+        .map(|call| call.json())
+        .collect();
+    assert_eq!(profiles.len(), 2, "{at_connect:#?}");
+    assert!(profiles.iter().any(|body| body.as_array().is_some_and(|ids| ids.len() > 1)), "the chats' people are one batch");
+    assert!(profiles.iter().any(|body| body == &json!(["8:live:bare_blocked_user"])));
     assert_eq!(calls.iter().filter(|call| call.path.contains("/48:")).count(), 1, "the call log is not read");
 
     // The info pane: one description of the thread.
@@ -3154,6 +3759,944 @@ fn team_tags_fetch_mentions_me_outgoing_wire_format_and_group_chat() {
     };
     assert_eq!(group_chat.key.id, "19:tagchat@thread.v2");
     assert_eq!(group_chat.title, "On-Call");
+}
+
+#[test]
+fn pinned_and_saved_messages_read_write_and_push_update() {
+    let world = World::start();
+    world.ready();
+
+    let caps = world.account(HOME).can;
+    assert!(caps.pins && caps.save_messages);
+
+    let ana = key(CHAT_ANA);
+    let general = key(GENERAL);
+    world.open(&ana, 3);
+    world.open(&general, 6);
+
+    // 1. Conversation info reports pinned count, and Pinned returns pinned messages with metadata.
+    let info = match world.ask(Request::ConversationInfo { conversation: ana.clone() }) {
+        Response::ConversationInfo { info } => info,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(info.pinned, Some(1));
+
+    let pinned = match world.ask(Request::Pinned { conversation: ana.clone() }) {
+        Response::Pinned { messages, .. } => messages,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(pinned.len(), 1);
+    assert_eq!(pinned[0].id, "1760000500100");
+    assert!(pinned[0].pinned);
+    assert_eq!(pinned[0].pinned_by.as_deref(), Some("Ana Ruiz"));
+    assert_eq!(pinned[0].pinned_at, Some(1_760_000_500));
+
+    // 2. Pinning a post in a channel writes properties.pinnedMessages and marks it pinned.
+    assert_eq!(
+        world.ask(Request::Pin {
+            conversation: general.clone(),
+            message_id: "1760000100100".to_owned(),
+            pinned: true,
+            notify: false,
+            me_only: false,
+        }),
+        Response::Ok
+    );
+    let pin_call = world.fake.calls("PUT", &format!("{GENERAL}/properties")).pop().expect("pin PUT");
+    assert!(pin_call.query.contains("name=pinnedMessages"));
+    assert!(pin_call.json()["pinnedMessages"].as_str().unwrap_or("").contains("1760000100100"));
+    assert!(world.message(&general, "1760000100100").unwrap().pinned);
+
+    let gen_pinned = match world.ask(Request::Pinned { conversation: general.clone() }) {
+        Response::Pinned { messages, .. } => messages,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(gen_pinned.len(), 1);
+    assert_eq!(gen_pinned[0].id, "1760000100100");
+
+    // 3. Unpinning removes it from properties.pinnedMessages and clears pinned flag.
+    assert_eq!(
+        world.ask(Request::Pin {
+            conversation: general.clone(),
+            message_id: "1760000100100".to_owned(),
+            pinned: false,
+            notify: false,
+            me_only: false,
+        }),
+        Response::Ok
+    );
+    assert!(!world.message(&general, "1760000100100").unwrap().pinned);
+
+    // 4. Live ThreadUpdate push with pinnedMessages updates local store.
+    world.fake.push(
+        "ThreadUpdate",
+        json!({
+            "id": GENERAL,
+            "properties": {
+                "pinnedMessages": json!([{"messageId": "1760000200200", "pinnedBy": BEN, "pinnedTime": 1_760_000_600_000u64}]).to_string()
+            }
+        }),
+        false,
+    );
+    world.until("live pinned push applied", || {
+        world.message(&general, "1760000200200").filter(|m| m.pinned)
+    });
+
+    // 5. Saved messages: StarredMessages reads 48:saved, StarMessage saves and unsaves.
+    let saved = match world.ask(Request::StarredMessages {
+        account: ana.account(),
+        conversation: None,
+        limit: 50,
+    }) {
+        Response::Pinned { messages, .. } => messages,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].id, "1760000500100");
+    assert!(saved[0].starred);
+
+    assert_eq!(
+        world.ask(Request::StarMessage {
+            conversation: general.clone(),
+            message_id: "1760000100100".to_owned(),
+            starred: true,
+        }),
+        Response::Ok
+    );
+    assert!(world.message(&general, "1760000100100").unwrap().starred);
+    let saved_after = match world.ask(Request::StarredMessages {
+        account: ana.account(),
+        conversation: None,
+        limit: 50,
+    }) {
+        Response::Pinned { messages, .. } => messages,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(saved_after.len(), 2);
+
+    assert_eq!(
+        world.ask(Request::StarMessage {
+            conversation: general.clone(),
+            message_id: "1760000100100".to_owned(),
+            starred: false,
+        }),
+        Response::Ok
+    );
+    assert!(!world.message(&general, "1760000100100").unwrap().starred);
+}
+
+#[test]
+fn activity_feed_pages_filters_marks_read_and_handles_live_push() {
+    let world = World::start();
+    world.ready();
+
+    let account = key(GENERAL).account();
+    assert!(world.account(HOME).can.activity_feed);
+
+    // 1. The first page is the whole stream: mentions, a reaction, a reply, a missed
+    // call, and an invite, with a cursor to the next page.
+    let (items, cursor) = match world.ask(Request::ActivityFeed {
+        account: account.clone(),
+        kind: None,
+        cursor: None,
+        limit: 20,
+    }) {
+        Response::ActivityFeed { items, cursor } => (items, cursor),
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(items.len(), 6);
+    assert_eq!(items[0].kind, protocol::ActivityItemKind::Mention);
+    assert_eq!(items[0].conversation, key("19:grp1@thread.v2"));
+    assert_eq!(items[0].message_id, "1759600000000");
+    assert_eq!(items[0].actor, "Ben Okafor");
+    assert!(items[0].unread);
+    assert_eq!(items[2].kind, protocol::ActivityItemKind::Reaction);
+    assert_eq!(items[3].kind, protocol::ActivityItemKind::ThreadReply);
+    assert_eq!(items[4].kind, protocol::ActivityItemKind::MissedCall);
+    assert_eq!(items[5].kind, protocol::ActivityItemKind::Invite);
+    assert_eq!(cursor.as_deref(), Some("actpage2"));
+
+    // 2. Second page via cursor returns missed call and thread reply (pointing at the reply chain).
+    let (page2, cursor2) = match world.ask(Request::ActivityFeed {
+        account: account.clone(),
+        kind: None,
+        cursor,
+        limit: 20,
+    }) {
+        Response::ActivityFeed { items, cursor } => (items, cursor),
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(page2.len(), 2);
+    assert_eq!(page2[0].kind, protocol::ActivityItemKind::MissedCall);
+    assert_eq!(page2[0].actor, "Ana Ruiz");
+    assert_eq!(page2[1].kind, protocol::ActivityItemKind::ThreadReply);
+    assert_eq!(page2[1].thread_id.as_deref(), Some("19:platform0general@thread.tacv2;messageid=1760000200200"));
+    assert_eq!(page2[1].conversation, key("19:platform0general@thread.tacv2;messageid=1760000200200"));
+    assert!(cursor2.is_none());
+
+    // 3. Kind filter narrows the feed to only matching entries.
+    let only_reactions = match world.ask(Request::ActivityFeed {
+        account: account.clone(),
+        kind: Some(protocol::ActivityItemKind::Reaction),
+        cursor: None,
+        limit: 20,
+    }) {
+        Response::ActivityFeed { items, .. } => items,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(only_reactions.len(), 1);
+    assert_eq!(only_reactions[0].kind, protocol::ActivityItemKind::Reaction);
+
+    // 4. Mark single activity item read writes isRead property to 48:notifications and flips unread=false.
+    assert_eq!(
+        world.ask(Request::ActivityMarkRead {
+            account: account.clone(),
+            item_id: Some("1760000900001".to_owned()),
+        }),
+        Response::Ok
+    );
+    let read_call = world
+        .fake
+        .calls("PUT", "/48:notifications/messages/1760000900001/properties")
+        .pop()
+        .expect("activity item mark read PUT");
+    assert!(read_call.query.contains("name=isRead"));
+
+    let after_one = match world.ask(Request::ActivityFeed {
+        account: account.clone(),
+        kind: None,
+        cursor: None,
+        limit: 20,
+    }) {
+        Response::ActivityFeed { items, .. } => items,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert!(!after_one.iter().find(|i| i.id == "1760000900001").unwrap().unread);
+    assert!(after_one.iter().find(|i| i.id == "1760000900003").unwrap().unread);
+
+    // 5. Mark all activity read writes consumptionhorizon on 48:notifications.
+    assert_eq!(
+        world.ask(Request::ActivityMarkRead { account: account.clone(), item_id: None }),
+        Response::Ok
+    );
+    let horizon_call = world
+        .fake
+        .calls("PUT", "/48:notifications/properties")
+        .pop()
+        .expect("activity mark all read PUT");
+    assert!(horizon_call.query.contains("name=consumptionhorizon"));
+    let after_all = match world.ask(Request::ActivityFeed {
+        account: account.clone(),
+        kind: None,
+        cursor: None,
+        limit: 20,
+    }) {
+        Response::ActivityFeed { items, .. } => items,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert!(after_all.iter().all(|i| !i.unread));
+
+    // 6. Live push on 48:notifications is handled instead of dropped and increments mentions badge.
+    let deploys = key(DEPLOYS);
+    let mentions_before = world.conversation(&deploys).unwrap().mentions;
+    world.fake.push(
+        "NewMessage",
+        json!({
+            "id": "1760009990001",
+            "type": "Message",
+            "messagetype": "Text",
+            "contenttype": "text",
+            "content": "Check the release pipeline",
+            "conversationid": "48:notifications",
+            "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/48:notifications",
+            "from": format!("https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/{ANA}"),
+            "imdisplayname": "Ana Ruiz",
+            "properties": {
+                "activity": json!({
+                    "activityType": "mention",
+                    "sourceThreadId": DEPLOYS,
+                    "sourceMessageId": "1760009990000",
+                    "sourceUserId": ANA,
+                    "sourceUserImDisplayName": "Ana Ruiz",
+                    "messagePreview": "Check the release pipeline"
+                }).to_string()
+            }
+        }),
+        false,
+    );
+    world.until("live activity mention updates deploys badge", || {
+        world.conversation(&deploys).filter(|row| row.mentions > mentions_before)
+    });
+}
+
+#[test]
+fn server_side_search_across_account_team_conversation_filters_and_jump() {
+    let world = World::start();
+    world.ready();
+
+    let caps = world.account(HOME).can;
+    assert!(caps.search && caps.search_global);
+    let account = key(GENERAL).account();
+
+    // 1. Account-wide search finds a hit in a chat not yet in the cache AND a hit inside a reply chain.
+    let hits = match world.ask(Request::SearchNetwork {
+        conversation: None,
+        space: None,
+        account: Some(account.clone()),
+        network: Some(Network::Teams),
+        query: "budget".to_owned(),
+        filters: protocol::SearchFilters::default(),
+        cursor: None,
+    }) {
+        Response::MessageHits { hits, .. } => hits,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(hits.len(), 2, "{hits:?}");
+    let uncached = hits.iter().find(|h| h.conversation == key("19:archive0chat@thread.v2")).expect("uncached chat hit");
+    assert_eq!(uncached.message_id, "1758000000200");
+    assert!(uncached.snippet.contains("budget") && !uncached.snippet.contains("<c0>"));
+
+    let chain_hit = hits
+        .iter()
+        .find(|h| h.conversation == key(&format!("{GENERAL};messageid={ROOT}")))
+        .expect("reply chain hit mapped to chain conversation");
+    assert_eq!(chain_hit.message_id, "1760000210210");
+
+    // 2. Jumping to the uncached chat hit via Messages::Around loads the page around it.
+    let archive_chat = key("19:archive0chat@thread.v2");
+    assert!(matches!(
+        world.ask(Request::Messages {
+            conversation: archive_chat.clone(),
+            page: Page::Around { id: "1758000000200".to_owned() },
+            limit: 20,
+        }),
+        Response::Messages { .. }
+    ));
+    let jumped = world.until("HistoryAround loads uncached search hit", || {
+        world.message(&archive_chat, "1758000000200")
+    });
+    assert!(jumped.text.contains("Quarterly budget spreadsheet attached"));
+
+    // 3. Team-scoped search (Scope::Space) restricts hits to that team.
+    let team_hits = match world.ask(Request::SearchNetwork {
+        conversation: None,
+        space: Some(key(GENERAL)),
+        account: None,
+        network: None,
+        query: "budget".to_owned(),
+        filters: protocol::SearchFilters::default(),
+        cursor: None,
+    }) {
+        Response::MessageHits { hits, .. } => hits,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(team_hits.len(), 1);
+    assert_eq!(team_hits[0].message_id, "1760000210210");
+
+    // 4. In-conversation search (Scope::Conversation) restricts hits to that single conversation.
+    let conv_hits = match world.ask(Request::SearchNetwork {
+        conversation: Some(key(DEPLOYS)),
+        space: None,
+        account: None,
+        network: None,
+        query: "deploy".to_owned(),
+        filters: protocol::SearchFilters::default(),
+        cursor: None,
+    }) {
+        Response::MessageHits { hits, .. } => hits,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(conv_hits.len(), 1);
+    assert_eq!(conv_hits[0].conversation, key(DEPLOYS));
+
+    // 5. Structured filters (from + has:Files + mentions_me) filter hits and pass KQL to Teams.
+    let filtered = match world.ask(Request::SearchNetwork {
+        conversation: None,
+        space: None,
+        account: Some(account.clone()),
+        network: Some(Network::Teams),
+        query: "budget".to_owned(),
+        filters: protocol::SearchFilters {
+            from: Some(key(ANA)),
+            has: Some(protocol::SearchHas::Files),
+            ..Default::default()
+        },
+        cursor: None,
+    }) {
+        Response::MessageHits { hits, .. } => hits,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].message_id, "1758000000200");
+    let search_call = world.fake.calls("POST", "/msgsearch/v2/query").pop().expect("search POST");
+    let qs = search_call.json()["EntityRequests"][0]["Query"]["QueryString"].as_str().unwrap_or("").to_owned();
+    assert!(qs.contains("hasAttachment:true"), "{qs}");
+    assert!(qs.contains("from:"), "{qs}");
+}
+
+#[test]
+fn group_chat_create_rename_add_with_history_remove_and_live_topic_update() {
+    let world = World::start();
+    world.ready();
+
+    let account = key(GENERAL).account();
+    assert_eq!(world.account(HOME).can.groups, 250);
+
+    // 1. Create a 3-person group chat (me + Ana + Ben) with a name, without uniquerosterthread.
+    let created = match world.ask(Request::StartGroup {
+        account: account.clone(),
+        people: vec![key(ANA), key(BEN)],
+        title: Some("Incident Bridge".to_owned()),
+    }) {
+        Response::Conversation { conversation } => conversation,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(created.kind, ConversationKind::Group);
+    assert_eq!(created.title, "Incident Bridge");
+    assert!(created.rights.rename && created.rights.add_members && created.rights.remove_members);
+
+    let post_thread = world.fake.calls("POST", "/chat/v1/threads").pop().expect("POST /v1/threads");
+    let post_body = post_thread.json();
+    assert!(post_body["properties"]["uniquerosterthread"].is_null());
+    assert_eq!(post_body["properties"]["topic"].as_str(), Some("Incident Bridge"));
+    assert_eq!(post_body["members"].as_array().unwrap().len(), 3);
+
+    // 2. Rename the group chat -> PUT /v1/threads/{id}/properties?name=topic and local title updates.
+    let grp_key = created.key.clone();
+    assert_eq!(
+        world.ask(Request::ConversationUpdate {
+            conversation: grp_key.clone(),
+            title: Some("Postmortem Crew".to_owned()),
+            topic: None,
+            description: None,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.conversation(&grp_key).unwrap().title, "Postmortem Crew");
+    let rename_call = world
+        .fake
+        .calls("PUT", &format!("{}/properties", grp_key.id))
+        .pop()
+        .expect("topic PUT");
+    assert!(rename_call.query.contains("name=topic"));
+    assert_eq!(rename_call.json()["topic"].as_str(), Some("Postmortem Crew"));
+
+    // 3. Add a fourth member (Dee) with 7-day history sharing -> shareHistoryTime > 0.
+    assert_eq!(
+        world.ask(Request::MembersAdd {
+            conversation: grp_key.clone(),
+            people: vec![DEE.to_owned()],
+            share_history: Some(protocol::HistoryShare::Days { days: 7 }),
+        }),
+        Response::Ok
+    );
+    let add_call = world
+        .fake
+        .calls("PUT", &format!("{}/members/{DEE}", grp_key.id))
+        .pop()
+        .expect("member PUT");
+    let share_ms = add_call.json()["shareHistoryTime"].as_i64().expect("shareHistoryTime");
+    assert!(share_ms > 0, "7-day history share should send positive unix ms, got {share_ms}");
+
+    // 4. Adding a member to a 1:1 chat is refused with a clear message.
+    match world.ask(Request::MembersAdd {
+        conversation: key(CHAT_ANA),
+        people: vec![BEN.to_owned()],
+        share_history: None,
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("group chat"), "{detail}"),
+        other => panic!("expected refusal on 1:1 add, got {other:?}"),
+    }
+
+    // 5. Remove member (Ben) -> DELETE /v1/threads/{id}/members/{BEN}.
+    assert_eq!(
+        world.ask(Request::MembersRemove {
+            conversation: grp_key.clone(),
+            person: BEN.to_owned(),
+        }),
+        Response::Ok
+    );
+    assert!(!world.fake.calls("DELETE", &format!("{}/members/{BEN}", grp_key.id)).is_empty());
+
+    // 6. Live ThreadActivity/TopicUpdate push updates the row's title immediately.
+    let mut rename_evt = message(
+        &grp_key.id,
+        None,
+        1_760_009_500_000,
+        ANA,
+        "Ana Ruiz",
+        "<topicupdate><initiator>8:orgid:00000000-0000-4000-8000-0000000000a1</initiator><value>Resolved Bridge</value></topicupdate>",
+    );
+    rename_evt["messagetype"] = json!("ThreadActivity/TopicUpdate");
+    world.fake.push("NewMessage", rename_evt, false);
+    world.until("live TopicUpdate updates row title", || {
+        world.conversation(&grp_key).filter(|row| row.title == "Resolved Bridge")
+    });
+}
+
+#[test]
+fn external_federated_badge_request_accept_block_and_email_lookup() {
+    let world = World::start();
+    world.ready();
+
+    assert!(world.account(HOME).can.blocks);
+
+    // 1. Blocked list loaded on connect surfaces Blocked Bob under Relation::Blocked.
+    let blocked = world.until("initial blocked list loaded", || {
+        match world.ask(Request::People {
+            network: Some(Network::Teams),
+            relation: Some(Relation::Blocked),
+            query: None,
+            offset: 0,
+            limit: 20,
+        }) {
+            Response::People { people, .. } if !people.is_empty() => Some(people),
+            _ => None,
+        }
+    });
+    assert!(blocked.iter().any(|p| p.key.id == "8:orgid:00000000-0000-4000-8000-0000000000bb"));
+
+    // 2. Email search invokes federated externalsearchv3 and marks the outside user Mark::External
+    //    with their organization name ("Fabrikam").
+    let eva = world.until("federated email search finds Eva", || {
+        match world.ask(Request::People {
+            network: Some(Network::Teams),
+            relation: None,
+            query: Some("eva@fabrikam.com".to_owned()),
+            offset: 0,
+            limit: 20,
+        }) {
+            Response::People { people, .. } => people
+                .into_iter()
+                .find(|p| p.key.id == "8:orgid:00000000-0000-4000-8000-0000000000e1"),
+            _ => None,
+        }
+    });
+    assert_eq!(eva.mark, Some(protocol::Mark::External));
+    let eva_profile = match world.ask(Request::Profile { person: eva.key.clone(), space: None }) {
+        Response::Profile { profile } => profile,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert!(eva_profile.fields.iter().any(|(k, v)| k == "Organization" && v == "Fabrikam"), "{:?}", eva_profile.fields);
+
+    // 3. Incoming pending external chat lands on Shelf::Requests with Mark::External & Special::Request.
+    let ext_req1 = key("19:extreq1@unq.gbl.spaces");
+    world.fake.push(
+        "NewMessage",
+        message(
+            "19:extreq1@unq.gbl.spaces",
+            None,
+            1_760_009_600_001,
+            "8:orgid:00000000-0000-4000-8000-0000000000e1",
+            "Eva Vance",
+            "<p>Hello from Fabrikam!</p>",
+        ),
+        false,
+    );
+    let pending_row = world.until("pending external request arrives", || {
+        world.conversation(&ext_req1).filter(|r| r.special == protocol::Special::Request)
+    });
+    assert_eq!(pending_row.mark, Some(protocol::Mark::External));
+
+    let req_shelf = match world.ask(Request::Home {
+        network: Network::Teams,
+        account: None,
+        folder: None,
+        shelf: protocol::Shelf::Requests,
+        offset: 0,
+        limit: 20,
+    }) {
+        Response::Conversations { conversations, .. } => conversations,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert!(req_shelf.iter().any(|c| c.key == ext_req1));
+
+    // ConversationInfo surfaces the external org name.
+    let ext_info = match world.ask(Request::ConversationInfo { conversation: ext_req1.clone() }) {
+        Response::ConversationInfo { info } => info,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(ext_info.external, "Fabrikam");
+
+    // 4. Accepting the request clears Special::Request, keeps Mark::External, and writes accepted state.
+    assert_eq!(
+        world.ask(Request::AnswerMessageRequest { conversation: ext_req1.clone(), accept: true }),
+        Response::Ok
+    );
+    let accepted = world.conversation(&ext_req1).unwrap();
+    assert_eq!(accepted.special, protocol::Special::None);
+    assert_eq!(accepted.mark, Some(protocol::Mark::External));
+
+    // 5. Declining/blocking a second external request (personal account) blocks the sender and removes the chat.
+    let ext_req2 = key("19:extreq2@unq.gbl.spaces");
+    world.fake.push(
+        "NewMessage",
+        message(
+            "19:extreq2@unq.gbl.spaces",
+            None,
+            1_760_009_600_002,
+            "8:live:personal_spammer",
+            "Sam Consumer",
+            "<p>Buy my widgets</p>",
+        ),
+        false,
+    );
+    world.until("second external request arrives", || {
+        world.conversation(&ext_req2).filter(|r| r.special == protocol::Special::Request)
+    });
+    assert_eq!(
+        world.ask(Request::AnswerMessageRequest { conversation: ext_req2.clone(), accept: false }),
+        Response::Ok
+    );
+    assert!(world.conversation(&ext_req2).is_none());
+    assert!(
+        !world.fake.calls("PUT", "/beta/users/blocklist/8:live:personal_spammer").is_empty(),
+        "declining external request must block sender"
+    );
+
+    // 6. Unblocking restores relation via DELETE /beta/users/blocklist/{mri}.
+    assert_eq!(
+        world.ask(Request::Relate {
+            person: key("8:live:personal_spammer"),
+            action: protocol::RelateAction::Unblock,
+        }),
+        Response::Ok
+    );
+    assert!(!world.fake.calls("DELETE", "/beta/users/blocklist/8:live:personal_spammer").is_empty());
+}
+
+#[test]
+fn team_and_channel_browse_join_create_rename_delete_members_leave_and_manage_link() {
+    let world = World::start();
+    world.ready();
+
+    let account = world.account(HOME);
+    assert!(account.can.browse_channels);
+    assert!(account.can.join_space_by_invite);
+    assert!(account.can.leave_space);
+
+    let spaces = || match world.ask(Request::Spaces { network: Some(Network::Teams) }) {
+        Response::Spaces { spaces, .. } => spaces,
+        other => panic!("unexpected spaces: {other:?}"),
+    };
+    let platform = spaces().into_iter().find(|s| s.key == key(GENERAL)).expect("Platform space");
+    assert!(platform.can_create_channels);
+
+    // 1. SpaceInfo returns a working "Manage in Teams" deep link carrying groupId & tenantId.
+    let info = match world.ask(Request::SpaceInfo { space: key(GENERAL) }) {
+        Response::SpaceInfo { info } => info,
+        other => panic!("unexpected space info: {other:?}"),
+    };
+    assert!(
+        info.link.starts_with("https://teams.microsoft.com/l/team/")
+            && info.link.contains("groupId=e0873025-0000-4000-8000-00000000beef")
+            && info.link.contains(&format!("tenantId={HOME}")),
+        "unexpected team manage link: {}",
+        info.link
+    );
+
+    // 2. Browse hidden channels in Platform, preview, then show (Join -> isFavorite=true).
+    let browsed = match world.ask(Request::BrowseChannels {
+        space: key(GENERAL),
+        query: "Hidden".into(),
+        cursor: None,
+        limit: 20,
+    }) {
+        Response::BrowsedChannels { channels, .. } => channels,
+        other => panic!("unexpected browse: {other:?}"),
+    };
+    assert_eq!(browsed.len(), 1);
+    assert_eq!(browsed[0].key, key("19:platform0hidden@thread.tacv2"));
+    assert!(!browsed[0].joined);
+
+    let previewed = match world.ask(Request::PreviewChannel {
+        conversation: key("19:platform0hidden@thread.tacv2"),
+    }) {
+        Response::Conversation { conversation } => conversation,
+        other => panic!("unexpected preview: {other:?}"),
+    };
+    assert!(!previewed.joined && previewed.read_only);
+
+    let shown = match world.ask(Request::Join {
+        conversation: key("19:platform0hidden@thread.tacv2"),
+    }) {
+        Response::Conversation { conversation } => conversation,
+        other => panic!("unexpected join hidden channel: {other:?}"),
+    };
+    assert!(shown.joined && !shown.opted_out && !shown.read_only);
+    assert!(!world.fake.calls("PUT", "/v1/users/ME/conversations/19:platform0hidden@thread.tacv2/properties").is_empty());
+
+    // 3. Browse public teams (empty space id) and join Engineering.
+    let public_teams = match world.ask(Request::BrowseChannels {
+        space: key(""),
+        query: String::new(),
+        cursor: None,
+        limit: 20,
+    }) {
+        Response::BrowsedChannels { channels, .. } => channels,
+        other => panic!("unexpected public browse: {other:?}"),
+    };
+    let eng = public_teams
+        .iter()
+        .find(|c| c.key == key("19:eng0general@thread.tacv2"))
+        .expect("Engineering public team");
+    assert!(!eng.joined && eng.members == 18);
+    let plat_pub = public_teams.iter().find(|c| c.key == key(GENERAL)).expect("Platform in public list");
+    assert!(plat_pub.joined);
+
+    let _ = world.ask(Request::Join {
+        conversation: key("19:eng0general@thread.tacv2"),
+    });
+    assert!(
+        spaces().iter().any(|s| s.key == key("19:eng0general@thread.tacv2")),
+        "Engineering should appear in Spaces after joining"
+    );
+
+    // 4. Join team by code: preview, policy refusal, and successful join.
+    let acc_key = protocol::AccountKey { network: Network::Teams, account: HOME.to_owned() };
+    let preview = match world.ask(Request::InvitePreview {
+        account: acc_key.clone(),
+        code: "https://teams.microsoft.com/l/team/join?code=TEAM42".into(),
+    }) {
+        Response::InvitePreview { preview } => preview,
+        other => panic!("unexpected invite preview: {other:?}"),
+    };
+    assert_eq!(preview.code, "TEAM42");
+    assert_eq!(preview.name, "Release Guild");
+    assert_eq!(preview.members, Some(12));
+
+    match world.ask(Request::InviteJoin {
+        account: acc_key.clone(),
+        code: "BLOCKED42".into(),
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("organization's policy"), "detail: {detail}"),
+        other => panic!("expected policy refusal, got {other:?}"),
+    }
+
+    match world.ask(Request::InviteJoin {
+        account: acc_key,
+        code: "TEAM42".into(),
+    }) {
+        Response::InviteJoined { space, .. } => assert_eq!(space, Some(key("19:code0general@thread.tacv2"))),
+        other => panic!("unexpected invite join: {other:?}"),
+    }
+    assert!(spaces().iter().any(|s| s.key == key("19:code0general@thread.tacv2")));
+
+    // 5. Create channel (standard + policy refusal), rename, add member to private channel, delete channel.
+    match world.ask(Request::CreateChannel {
+        space: key(GENERAL),
+        name: "Forbidden Channel".into(),
+        kind: ConversationKind::Channel,
+        private: false,
+        group: None,
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("organization's policy"), "detail: {detail}"),
+        other => panic!("expected channel create policy refusal, got {other:?}"),
+    }
+
+    let created = match world.ask(Request::CreateChannel {
+        space: key(GENERAL),
+        name: "Incident War Room".into(),
+        kind: ConversationKind::Channel,
+        private: false,
+        group: None,
+    }) {
+        Response::Conversation { conversation } => conversation,
+        other => panic!("unexpected create channel: {other:?}"),
+    };
+    assert_eq!(created.title, "Incident War Room");
+    assert!(created.rights.rename && created.rights.edit_topic);
+
+    assert_eq!(
+        world.ask(Request::ConversationUpdate {
+            conversation: created.key.clone(),
+            title: Some("Incident Response".into()),
+            topic: None,
+            description: Some("Active sev-1 coordination".into()),
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.conversation(&created.key).unwrap().title, "Incident Response");
+
+    // Add member to private channel Leads.
+    let leads = world.conversation(&key("19:platform0leads@thread.tacv2")).expect("Leads channel");
+    assert!(leads.private && leads.rights.add_members);
+    assert_eq!(
+        world.ask(Request::MembersAdd {
+            conversation: leads.key.clone(),
+            people: vec![DEE.to_owned()],
+            share_history: None,
+        }),
+        Response::Ok
+    );
+    assert!(!world.fake.calls("PUT", &format!("/v1/threads/19:platform0leads@thread.tacv2/members/{DEE}")).is_empty());
+
+    // Archive hides a channel. It does not delete it, including General.
+    assert_eq!(
+        world.ask(Request::File {
+            conversation: key(GENERAL),
+            pinned: None,
+            archived: Some(true),
+            folder_add: None,
+            folder_remove: None,
+        }),
+        Response::Ok
+    );
+    assert!(world.conversation(&key(GENERAL)).is_some());
+    assert_eq!(
+        world.ask(Request::File {
+            conversation: created.key.clone(),
+            pinned: None,
+            archived: Some(true),
+            folder_add: None,
+            folder_remove: None,
+        }),
+        Response::Ok
+    );
+    assert!(world.conversation(&created.key).is_some());
+
+    // 6. Leave Design team and verify last-owner refusal.
+    assert!(spaces().iter().any(|s| s.key == key("19:design0general@thread.tacv2")));
+    assert_eq!(
+        world.ask(Request::LeaveSpace { space: key("19:design0general@thread.tacv2") }),
+        Response::Ok
+    );
+    assert!(!spaces().iter().any(|s| s.key == key("19:design0general@thread.tacv2")));
+    assert!(!world.fake.calls("DELETE", &format!("/v1/threads/19:design0general@thread.tacv2/members/{ME}")).is_empty());
+
+    match world.ask(Request::LeaveSpace { space: key("19:lastowner@thread.tacv2") }) {
+        Response::Error { detail, .. } => assert!(detail.contains("last owner"), "detail: {detail}"),
+        other => panic!("expected last owner refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn wave7b_review_regressions_pin_failure_activity_dedup_blocklist_group_search_and_preview_rights() {
+    let world = World::start();
+    world.ready();
+
+    // 1. Bare-MRI blocklist entries (no displayName/email) still surface under Relation::Blocked.
+    let blocked = world.until("bare MRI blocked user loaded", || {
+        match world.ask(Request::People {
+            network: Some(Network::Teams),
+            relation: Some(Relation::Blocked),
+            query: None,
+            offset: 0,
+            limit: 50,
+        }) {
+            Response::People { people, .. }
+                if people.iter().any(|p| p.key.id == "8:live:bare_blocked_user") =>
+            {
+                Some(people)
+            }
+            _ => None,
+        }
+    });
+    let bare = blocked.iter().find(|p| p.key.id == "8:live:bare_blocked_user").unwrap();
+    assert_eq!(bare.relation, Relation::Blocked);
+    assert_eq!(bare.mark, Some(protocol::Mark::External));
+
+    // 2. pin_message propagates GET /v1/threads/{id} failure and does NOT overwrite existing pins.
+    let ana = key(CHAT_ANA);
+    world.open(&ana, 3);
+    world.fake.fail_describe.lock().unwrap().push(CHAT_ANA.to_owned());
+    let pin_put_before = world.fake.calls("PUT", &format!("{CHAT_ANA}/properties")).len();
+    assert!(
+        matches!(
+            world.ask(Request::Pin {
+                conversation: ana.clone(),
+                message_id: "1760000500200".to_owned(),
+                pinned: true,
+                notify: false,
+                me_only: false,
+            }),
+            Response::Error { .. }
+        ),
+        "pin_message must fail when described() fails"
+    );
+    assert_eq!(
+        world.fake.calls("PUT", &format!("{CHAT_ANA}/properties")).len(),
+        pin_put_before,
+        "must not PUT pinnedMessages after describe failure"
+    );
+    world.fake.fail_describe.lock().unwrap().clear();
+    let pins_still = match world.ask(Request::Pinned { conversation: ana.clone() }) {
+        Response::Pinned { messages, .. } => messages,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(pins_still.len(), 1);
+    assert_eq!(pins_still[0].id, "1760000500100");
+
+    // 3. MessageUpdate / duplicate push on 48:notifications does not double-count mentions.
+    let deploys = key(DEPLOYS);
+    let mentions_before = world.conversation(&deploys).unwrap().mentions;
+    let activity_evt = json!({
+        "id": "1760009995001",
+        "type": "Message",
+        "messagetype": "Text",
+        "contenttype": "text",
+        "content": "Dedup mention check",
+        "conversationid": "48:notifications",
+        "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/48:notifications",
+        "from": format!("https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/{ANA}"),
+        "imdisplayname": "Ana Ruiz",
+        "properties": {
+            "activity": json!({
+                "activityType": "mention",
+                "sourceThreadId": DEPLOYS,
+                "sourceMessageId": "1760009995000",
+                "sourceUserId": ANA,
+                "sourceUserImDisplayName": "Ana Ruiz",
+                "messagePreview": "Dedup mention check"
+            }).to_string()
+        }
+    });
+    world.fake.push("NewMessage", activity_evt.clone(), false);
+    let after_first = world.until("first live activity mention increments once", || {
+        world.conversation(&deploys).filter(|r| r.mentions == mentions_before + 1)
+    });
+    assert_eq!(after_first.mentions, mentions_before + 1);
+    // Push MessageUpdate and a duplicate NewMessage for the same activity item, then a barrier message.
+    world.fake.push("MessageUpdate", activity_evt.clone(), false);
+    world.fake.push("NewMessage", activity_evt, false);
+    world.fake.push("NewMessage", message(CHAT_ANA, None, 1_760_009_995_100, ANA, "Ana Ruiz", "<p>barrier</p>"), false);
+    world.until("barrier message processed", || world.message(&ana, "1760009995100"));
+    assert_eq!(
+        world.conversation(&deploys).unwrap().mentions,
+        mentions_before + 1,
+        "MessageUpdate / duplicate NewMessage must not double-count mentions"
+    );
+
+    // 4. GroupId-only team search hits (missing TeamId) match SearchScope::Space via group:{space_id}.
+    let group_hits = match world.ask(Request::SearchNetwork {
+        conversation: None,
+        space: Some(key(GENERAL)),
+        account: None,
+        network: None,
+        query: "roadmap".to_owned(),
+        filters: protocol::SearchFilters::default(),
+        cursor: None,
+    }) {
+        Response::MessageHits { hits, .. } => hits,
+        other => panic!("unexpected search: {other:?}"),
+    };
+    assert_eq!(group_hits.len(), 1, "{group_hits:?}");
+    assert_eq!(group_hits[0].conversation, key("19:platform0unseen@thread.tacv2"));
+    assert_eq!(group_hits[0].message_id, "1760000450450");
+
+    // 5. Channel rights (rename, edit_topic, pin) are preserved across PreviewChannel -> Join.
+    let hidden_key = key("19:platform0hidden@thread.tacv2");
+    let previewed = match world.ask(Request::PreviewChannel { conversation: hidden_key.clone() }) {
+        Response::Conversation { conversation } => conversation,
+        other => panic!("unexpected preview: {other:?}"),
+    };
+    assert!(!previewed.joined && previewed.read_only);
+    let shown = match world.ask(Request::Join { conversation: hidden_key }) {
+        Response::Conversation { conversation } => conversation,
+        other => panic!("unexpected join: {other:?}"),
+    };
+    assert!(shown.joined && !shown.opted_out && !shown.read_only);
+    assert!(shown.can_pin && shown.rights.pin && shown.rights.rename && shown.rights.edit_topic);
 }
 
 #[test]

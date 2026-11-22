@@ -2150,7 +2150,14 @@ impl Shell {
     }
 
     pub(in crate::gui) fn leave_space_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
-        let (_, name) = self.sidebar_state.leave_space.as_ref()?;
+        let (space, name) = self.sidebar_state.leave_space.as_ref()?;
+        let is_teams = space.network == Network::Teams;
+        let leave_btn = if is_teams { "Leave team" } else { "Leave server" };
+        let body_copy = if is_teams {
+            "You will lose access to this team's channels unless you rejoin or are added again."
+        } else {
+            "You will lose access to its channels and need a new invite to rejoin."
+        };
         let card = div()
             .id("leave-space-card")
             .w(px(360.))
@@ -2169,7 +2176,7 @@ impl Shell {
                 div()
                     .type_small()
                     .text_color(theme::text_soft())
-                    .child("You will lose access to its channels and need a new invite to rejoin."),
+                    .child(body_copy),
             )
             .child(
                 div()
@@ -2181,7 +2188,7 @@ impl Shell {
                         this.sidebar_state.leave_space = None;
                         cx.notify();
                     })))
-                    .child(button("leave-space-confirm", ButtonKind::Danger, "Leave server").on_click(
+                    .child(button("leave-space-confirm", ButtonKind::Danger, leave_btn).on_click(
                         cx.listener(|this, _, _, cx| this.confirm_leave_space(cx)),
                     )),
             );
@@ -2203,7 +2210,12 @@ impl Shell {
     }
 
     pub(super) fn open_join_server(&mut self, account: AccountKey, cx: &mut Context<Self>) {
-        let input = cx.new(|cx| crate::gui::input::TextInput::new("discord.gg/… or invite code", cx));
+        let placeholder = if account.network == Network::Teams {
+            "Team join code or link"
+        } else {
+            "discord.gg/… or invite code"
+        };
+        let input = cx.new(|cx| crate::gui::input::TextInput::new(placeholder, cx));
         self.sidebar_state.join_server = Some(JoinServerModal {
             account,
             input,
@@ -2273,6 +2285,8 @@ impl Shell {
         modal.error = None;
         let account = modal.account.clone();
         cx.notify();
+        let is_teams = account.network == Network::Teams;
+        let noun = if is_teams { "team" } else { "server" };
         let req = Request::InviteJoin { account, code };
         cx.spawn(async move |shell, cx| {
             let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
@@ -2282,7 +2296,7 @@ impl Shell {
                     if let Some(space) = space {
                         this.go(Mode::Space(space), cx);
                     }
-                    this.toast(Some(("icons/check.svg", theme::text_soft())), "Joined server", cx);
+                    this.toast(Some(("icons/check.svg", theme::text_soft())), format!("Joined {noun}"), cx);
                     cx.notify();
                 }
                 Ok(Response::Error { detail, .. }) => {
@@ -2295,7 +2309,7 @@ impl Shell {
                 Ok(_) => {
                     if let Some(modal) = this.sidebar_state.join_server.as_mut() {
                         modal.busy = false;
-                        modal.error = Some("Could not join server.".to_owned());
+                        modal.error = Some(format!("Could not join {noun}."));
                     }
                     cx.notify();
                 }
@@ -2313,6 +2327,8 @@ impl Shell {
 
     pub(in crate::gui) fn join_server_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let modal = self.sidebar_state.join_server.as_ref()?;
+        let is_teams = modal.account.network == Network::Teams;
+        let modal_title = if is_teams { "Join a team" } else { "Join a server" };
         let ready = !modal.input.read(cx).text().trim().is_empty() && !modal.busy;
         let preview_box = modal.preview.as_ref().map(|p| {
             let mut meta = Vec::new();
@@ -2352,7 +2368,7 @@ impl Shell {
             .flex_col()
             .gap(px(10.))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(div().type_title().text_color(theme::text()).child("Join a server"))
+            .child(div().type_title().text_color(theme::text()).child(modal_title))
             .child(
                 div()
                     .px(px(8.))
@@ -2456,6 +2472,7 @@ impl Shell {
         let ready = !modal.name.read(cx).text().trim().is_empty();
         let is_voice = modal.kind == ConversationKind::Voice;
         let is_private = modal.private;
+        let is_teams = modal.space.network == Network::Teams;
         let card = div()
             .id("create-channel-card")
             .w(px(360.))
@@ -2486,7 +2503,7 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap(px(12.))
-                    .when(modal.space.network != Network::Slack, |row| {
+                    .when(modal.space.network != Network::Slack && !is_teams, |row| {
                         row.child(
                             div()
                                 .id("create-chan-kind")
@@ -2523,6 +2540,14 @@ impl Shell {
                             .child(if is_private { "☑ Private channel" } else { "☐ Private channel" }),
                     ),
             )
+            .when(is_teams, |card| {
+                card.child(
+                    div()
+                        .type_micro()
+                        .text_color(theme::text_faint())
+                        .child("Creates a channel in this Microsoft Teams team under your account; your organization's policy may restrict this."),
+                )
+            })
             .child(
                 div()
                     .flex()

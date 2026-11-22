@@ -1522,6 +1522,8 @@ pub enum Request {
     MembersAdd {
         conversation: Key,
         people: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        share_history: Option<HistoryShare>,
     },
     /// Removes one person (by person id) from a group or channel.
     MembersRemove {
@@ -3805,7 +3807,7 @@ mod tests {
     #[test]
     fn conversation_management_requests_and_rights_round_trip() {
         let key = Key::new(&AccountKey { network: Network::Slack, account: "w1".into() }, "C1");
-        let add = Request::MembersAdd { conversation: key.clone(), people: vec!["U1".into(), "U2".into()] };
+        let add = Request::MembersAdd { conversation: key.clone(), people: vec!["U1".into(), "U2".into()], share_history: None };
         assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&add).unwrap()).unwrap(), add);
 
         let remove = Request::MembersRemove { conversation: key.clone(), person: "U2".into() };

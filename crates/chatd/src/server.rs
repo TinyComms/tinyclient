@@ -2003,6 +2003,11 @@ impl Chat {
             Ok(about) => about,
             Err(refused) => return *refused,
         };
+        let mut link = about.link.trim().to_owned();
+        if !link.starts_with("https://") || protocol::link::Destination::parse(&link).is_none() {
+            link.clear();
+        }
+        clip(&mut link, 2_000);
         let mut info = SpaceInfo {
             space: known,
             description: about.description,
@@ -2012,6 +2017,7 @@ impl Chat {
             roles: about.roles,
             notify: about.notify,
             tags: about.tags,
+            link,
         };
         clip(&mut info.description, 4_000);
         clip(&mut info.nickname, 100);
@@ -3149,11 +3155,11 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
-            Request::MembersAdd { conversation, people } => {
+            Request::MembersAdd { conversation, people, share_history } => {
                 if people.is_empty() {
                     return error(ErrorCode::Refused, "Pick at least one person to add.");
                 }
-                let res = self.act(&conversation, |conversation_id, reply| Command::MembersAdd { conversation_id, people, reply });
+                let res = self.act(&conversation, |conversation_id, reply| Command::MembersAdd { conversation_id, people, share_history, reply });
                 if res == Response::Ok {
                     self.hub.infos.forget(&conversation);
                 }
@@ -5627,7 +5633,7 @@ mod tests {
 
         // Empty people list and empty title are refused cleanly.
         assert!(matches!(
-            chat.handle(Request::MembersAdd { conversation: conv.clone(), people: vec![] }),
+            chat.handle(Request::MembersAdd { conversation: conv.clone(), people: vec![], share_history: None }),
             Response::Error { code: ErrorCode::Refused, .. }
         ));
         assert!(matches!(
@@ -5641,7 +5647,7 @@ mod tests {
         ));
 
         // Add, remove, rename + topic, and picture succeed.
-        assert_eq!(chat.handle(Request::MembersAdd { conversation: conv.clone(), people: vec!["U2".into()] }), Response::Ok);
+        assert_eq!(chat.handle(Request::MembersAdd { conversation: conv.clone(), people: vec!["U2".into()], share_history: None }), Response::Ok);
         assert_eq!(*members.lock().unwrap(), vec!["U1".to_owned(), "U2".to_owned()]);
         assert_eq!(chat.handle(Request::MembersRemove { conversation: conv.clone(), person: "U2".into() }), Response::Ok);
         assert_eq!(*members.lock().unwrap(), vec!["U1".to_owned()]);

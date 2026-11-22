@@ -384,6 +384,9 @@ pub struct SpaceInfo {
     /// Mentionable team tags in this Space (Teams).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<TeamTag>,
+    /// Optional `https://` hand-off link to open or manage this Space in the network's app.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub link: String,
 }
 
 /// Which of a custom emoji set this account may send.
@@ -914,8 +917,10 @@ pub enum ActivityItemKind {
     Mention,
     ThreadReply,
     Reaction,
+    MissedCall,
     App,
     Invite,
+    #[serde(other)]
     Other,
 }
 
@@ -991,6 +996,16 @@ pub fn format_disappearing(seconds: u32) -> String {
     } else {
         format!("{seconds}s")
     }
+}
+
+/// How much prior chat history a newly added member receives (Teams group chats).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum HistoryShare {
+    #[default]
+    None,
+    Days { days: u32 },
+    All,
 }
 
 /// Content-type filter for network message search (`SearchFilters::has`).
@@ -1411,5 +1426,65 @@ mod tests {
         };
         let back_opt: SendAs = serde_json::from_str(&serde_json::to_string(&opt).unwrap()).unwrap();
         assert_eq!(back_opt, opt);
+    }
+
+    #[test]
+    fn activity_item_kind_missed_call_round_trips() {
+        let wire = serde_json::to_string(&ActivityItemKind::MissedCall).unwrap();
+        assert_eq!(wire, "\"missed_call\"");
+        let back: ActivityItemKind = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, ActivityItemKind::MissedCall);
+        let unknown: ActivityItemKind = serde_json::from_str("\"future_activity_kind\"").unwrap();
+        assert_eq!(unknown, ActivityItemKind::Other);
+    }
+
+    #[test]
+    fn history_share_round_trips_and_stays_backward_compatible() {
+        for mode in [HistoryShare::None, HistoryShare::Days { days: 7 }, HistoryShare::All] {
+            let wire = serde_json::to_string(&mode).unwrap();
+            let back: HistoryShare = serde_json::from_str(&wire).unwrap();
+            assert_eq!(back, mode);
+        }
+        let legacy = json_members_add_without_share();
+        let req: Request = serde_json::from_str(&legacy).unwrap();
+        assert!(matches!(req, Request::MembersAdd { share_history: None, .. }));
+    }
+
+    fn json_members_add_without_share() -> String {
+        r#"{"op":"members_add","conversation":{"network":"teams","account":"t1","id":"19:g@thread.v2"},"people":["8:orgid:a"]}"#.to_owned()
+    }
+
+    #[test]
+    fn space_info_link_round_trips_and_defaults_empty() {
+        let space = Space {
+            key: Key { network: Network::Teams, account: "t1".into(), id: "19:g@thread.tacv2".into() },
+            name: "Platform".into(),
+            icon: None,
+            position: 0,
+            attention: 0,
+            unread: false,
+            folder: None,
+            muted: false,
+            hide_muted: false,
+            can_create_channels: true,
+        };
+        let info = SpaceInfo {
+            space,
+            description: "Core".into(),
+            members: Some(4),
+            online: None,
+            nickname: String::new(),
+            roles: vec!["Owner".into()],
+            notify: Notify::All,
+            tags: Vec::new(),
+            link: "https://teams.microsoft.com/l/team/19%3Ag/conversations?groupId=g1&tenantId=t1".into(),
+        };
+        let wire = serde_json::to_string(&info).unwrap();
+        let back: SpaceInfo = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, info);
+
+        let without_link = wire.replace(&format!(r#","link":"{}""#, info.link), "");
+        let legacy: SpaceInfo = serde_json::from_str(&without_link).unwrap();
+        assert!(legacy.link.is_empty());
     }
 }

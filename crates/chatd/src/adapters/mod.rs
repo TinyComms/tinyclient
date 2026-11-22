@@ -219,6 +219,7 @@ pub struct SpaceAbout {
     pub roles: Vec<String>,
     pub notify: Notify,
     pub tags: Vec<protocol::TeamTag>,
+    pub link: String,
 }
 
 /// A page of what was shared, from the network's own search.
@@ -430,6 +431,7 @@ pub enum Command {
     MembersAdd {
         conversation_id: String,
         people: Vec<String>,
+        share_history: Option<protocol::HistoryShare>,
         reply: Reply<()>,
     },
     /// Remove one person from a group or channel.

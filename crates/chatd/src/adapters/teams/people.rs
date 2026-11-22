@@ -4,7 +4,10 @@
 use super::{escaped, iso_utc, Auth, Body, Fault, Teams, GRAPH, PRESENCE, REMEMBERED, SPACES};
 use crate::adapters::{About, Members};
 use crate::store::{PersonDetails, PersonRow};
-use protocol::{Activity, ActivityKind, Contact, ContactKind, Mark, MediaFile, MediaKind, MemberSection, Person, Presence, Relation};
+use protocol::{
+    Activity, ActivityKind, Contact, ContactKind, Mark, MediaFile, MediaKind, MemberSection,
+    Person, Presence, RelateAction, Relation,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -35,6 +38,86 @@ pub(super) struct Known {
     /// A guest in this tenant.
     #[serde(rename = "g", default)]
     pub guest: bool,
+    /// Home tenant id of this person when reported by Teams.
+    #[serde(rename = "tid", default)]
+    pub tenant_id: String,
+    /// Organization or tenant display name (e.g. "Fabrikam", "Personal account").
+    #[serde(rename = "org", default)]
+    pub tenant_name: String,
+    /// Federated, cross-tenant, or personal/consumer account outside our tenant.
+    #[serde(rename = "x", default)]
+    pub external: bool,
+}
+
+/// True when a Teams MRI belongs to a personal / consumer or Skype federated account.
+pub(super) fn is_consumer_mri(id: &str) -> bool {
+    id.starts_with("8:live:") || id.starts_with("8:msa:") || id.starts_with("8:tfl:") || id.starts_with("8:sfb:")
+}
+
+/// True when a user profile from Teams belongs to an external organization or personal account.
+pub(super) fn is_external_user(user: &Value, id: &str, home_tenant: &str) -> bool {
+    if is_consumer_mri(id) {
+        return true;
+    }
+    if user["isExternal"] == true || user["isFederated"] == true || user["isTflUser"] == true {
+        return true;
+    }
+    let user_type = user["userType"].as_str().unwrap_or("");
+    if matches!(
+        user_type.to_ascii_lowercase().as_str(),
+        "federated" | "external" | "consumer" | "personal" | "tfl"
+    ) {
+        return true;
+    }
+    let tenant = user["tenantId"]
+        .as_str()
+        .or_else(|| user["tenant_id"].as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    !tenant.is_empty() && !home_tenant.is_empty() && !tenant.eq_ignore_ascii_case(home_tenant)
+}
+
+/// Human-readable organization label for an external or personal account.
+pub(super) fn external_org_name(user: &Value, id: &str) -> String {
+    if is_consumer_mri(id) || user["isTflUser"] == true {
+        return "Personal account".to_owned();
+    }
+    let named = [
+        user["tenantName"].as_str(),
+        user["organizationName"].as_str(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|s| !s.is_empty() && !s.eq_ignore_ascii_case("Shared channel"));
+    if let Some(org) = named {
+        return org.to_owned();
+    }
+    let mail = user["email"]
+        .as_str()
+        .or_else(|| user["userPrincipalName"].as_str())
+        .unwrap_or("");
+    if let Some((_, domain)) = mail.split_once('@') {
+        let domain = domain.trim();
+        if !domain.is_empty() {
+            return domain.to_owned();
+        }
+    }
+    "External".to_owned()
+}
+
+/// True when a search query is shaped like an email address for federated lookup.
+pub(super) fn looks_like_email(query: &str) -> bool {
+    let trimmed = query.trim();
+    let Some((local, domain)) = trimmed.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && !domain.is_empty()
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && !trimmed.chars().any(char::is_whitespace)
 }
 
 /// Extracts the Entra object id from a Teams user MRI (`8:orgid:<oid>`).
@@ -355,6 +438,15 @@ impl Teams {
                 name if name.is_empty() => format!("{} {}", text("givenName"), text("surname")).trim().to_owned(),
                 name => name,
             };
+            let tenant_id = Some(text("tenantId"))
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| text("tenant_id"));
+            let external = is_external_user(user, id, &self.session.tenant);
+            let tenant_name = if external {
+                external_org_name(user, id)
+            } else {
+                text("tenantName")
+            };
             let known = Known {
                 name,
                 mail: Some(text("userPrincipalName")).filter(|mail| !mail.is_empty()).unwrap_or_else(|| text("email")),
@@ -362,6 +454,9 @@ impl Teams {
                 department: text("department"),
                 bot: id.starts_with("28:") || user["type"].as_str().is_some_and(|kind| kind.eq_ignore_ascii_case("bot")),
                 guest: user["userType"].as_str().is_some_and(|kind| kind.eq_ignore_ascii_case("guest")),
+                tenant_id,
+                tenant_name,
+                external,
             };
             learned.push((id.to_owned(), known));
         }
@@ -372,7 +467,13 @@ impl Teams {
         let details: Vec<(String, PersonDetails)> = learned
             .iter()
             .map(|(id, known)| {
-                let mark = known.guest.then_some(Mark::Guest);
+                let mark = if known.external {
+                    Some(Mark::External)
+                } else if known.guest {
+                    Some(Mark::Guest)
+                } else {
+                    None
+                };
                 (id.clone(), PersonDetails { title: known.title.clone(), mark, ..PersonDetails::default() })
             })
             .collect();
@@ -435,26 +536,187 @@ impl Teams {
         }
     }
 
-    /// The tenant's directory, searched on Teams' side. At most 25 land in the store.
+    /// The tenant's directory, searched on Teams' side. When `query` looks like an email address,
+    /// also asks Teams' federated external lookup (`externalsearchv3`) so people in other
+    /// organizations or personal Teams accounts can be found and messaged.
     pub(super) fn search(&self, query: &str) -> Result<(), Fault> {
         let path = "/beta/users/searchV2?includeDLs=false&includeBots=false&enableGuest=true&source=newChat&skypeTeamsInfo=true";
         let found = self.middle(path, Body::Text(query))?;
         let people = Teams::listed(&found);
         self.learn(&people[..people.len().min(25)]);
+        if looks_like_email(query) {
+            let email = query.trim();
+            let ext_url = format!(
+                "{}/beta/users/{}/externalsearchv3?includeTFLUsers=true",
+                self.place()?.middle,
+                escaped(email)
+            );
+            if let Ok(answer) = self.call("GET", &ext_url, Auth::Both(SPACES), Body::None, true) {
+                let mut external_people: Vec<Value> = Teams::listed(&answer.body).to_vec();
+                if external_people.is_empty() && answer.body.is_object() && answer.body["mri"].is_string() {
+                    external_people.push(answer.body);
+                }
+                for person in &mut external_people {
+                    if let Some(obj) = person.as_object_mut() {
+                        let tenant = obj.get("tenantId").and_then(Value::as_str).unwrap_or("");
+                        if tenant.is_empty() || !tenant.eq_ignore_ascii_case(&self.session.tenant) {
+                            obj.insert("isExternal".to_owned(), Value::Bool(true));
+                        }
+                    }
+                }
+                self.learn(&external_people[..external_people.len().min(10)]);
+            }
+        }
         Ok(())
     }
 
+    /// Reads the user's blocked-people list from Teams' middle tier (best-effort) and updates
+    /// local `Relation::Blocked` entries.
+    pub(super) fn load_blocklist(&self) {
+        let Ok(place) = self.place() else {
+            return;
+        };
+        let url = format!("{}/beta/users/blocklist", place.middle);
+        let Ok(answer) = self.call("GET", &url, Auth::Both(SPACES), Body::None, true) else {
+            return;
+        };
+        let list = [
+            &answer.body["blockedUsers"],
+            &answer.body["value"],
+            &answer.body["users"],
+            &answer.body,
+        ]
+        .into_iter()
+        .find_map(Value::as_array);
+        let Some(entries) = list else {
+            return;
+        };
+        let mut blocked_ids = Vec::new();
+        let mut user_objs = Vec::new();
+        let mut with_profile = std::collections::HashSet::new();
+        for entry in entries {
+            if let Some(mri) = entry.as_str().filter(|s| !s.is_empty()) {
+                blocked_ids.push(mri.to_owned());
+            } else if let Some(mri) = entry["mri"].as_str().or_else(|| entry["id"].as_str()).filter(|s| !s.is_empty()) {
+                blocked_ids.push(mri.to_owned());
+                if entry["displayName"].is_string() || entry["email"].is_string() {
+                    let mut normalized = entry.clone();
+                    if let Some(obj) = normalized.as_object_mut() {
+                        obj.entry("mri".to_owned()).or_insert_with(|| Value::String(mri.to_owned()));
+                    }
+                    with_profile.insert(mri.to_owned());
+                    user_objs.push(normalized);
+                }
+            }
+        }
+        if !user_objs.is_empty() {
+            self.learn(&user_objs);
+        }
+        let missing_ids: Vec<String> = blocked_ids
+            .iter()
+            .filter(|id| !with_profile.contains(id.as_str()) && self.cached(id).is_none())
+            .cloned()
+            .collect();
+        if !missing_ids.is_empty() {
+            self.lookup(&missing_ids);
+        }
+        let mut placeholders = Vec::new();
+        let mut placeholder_details = Vec::new();
+        for id in &blocked_ids {
+            if self.cached(id).is_none() {
+                placeholders.push(PersonRow {
+                    id: id.clone(),
+                    name: id.clone(),
+                    handle: String::new(),
+                    avatar: self.picture(id, id).map(|file| file.id),
+                    bot: id.starts_with("28:"),
+                    status: String::new(),
+                    link: String::new(),
+                });
+                let mark = is_consumer_mri(id).then_some(Mark::External);
+                placeholder_details.push((id.clone(), PersonDetails { mark, ..PersonDetails::default() }));
+            }
+        }
+        if !placeholders.is_empty() {
+            if let Err(err) = self.ctx.people(&placeholders) {
+                tracing::warn!("chatd: Teams: {err}");
+            }
+            if let Err(err) = self.ctx.details(&placeholder_details) {
+                tracing::warn!("chatd: Teams: {err}");
+            }
+        }
+        {
+            let mut state = self.state();
+            state.blocked = blocked_ids.iter().cloned().collect();
+        }
+        for id in blocked_ids {
+            if let Err(err) = self.ctx.relation(&id, Relation::Blocked) {
+                tracing::warn!("chatd: Teams: {err}");
+            }
+        }
+    }
+
+    /// Blocks or unblocks a person on Teams via the middle-tier blocklist endpoint.
+    pub(super) fn relate(&self, person_id: &str, action: RelateAction) -> Result<(), Fault> {
+        let place = self.place()?;
+        let url = format!("{}/beta/users/blocklist/{}", place.middle, escaped(person_id));
+        match action {
+            RelateAction::Block => {
+                self.call("PUT", &url, Auth::Both(SPACES), Body::Json(&json!({"mri": person_id})), false)?;
+                self.state().blocked.insert(person_id.to_owned());
+                self.ctx.relation(person_id, Relation::Blocked)?;
+                Ok(())
+            }
+            RelateAction::Unblock => {
+                self.call("DELETE", &url, Auth::Both(SPACES), Body::None, false)?;
+                let restored = {
+                    let mut state = self.state();
+                    state.blocked.remove(person_id);
+                    if state.partners.contains_key(person_id) {
+                        Relation::Contact
+                    } else {
+                        Relation::None
+                    }
+                };
+                self.ctx.relation(person_id, restored)?;
+                Ok(())
+            }
+            _ => Err(Fault::Refused {
+                status: 400,
+                message: "Teams only supports blocking and unblocking people here.".to_owned(),
+            }),
+        }
+    }
+
     fn person(&self, id: &str, known: &Known) -> Person {
+        let relation = {
+            let state = self.state();
+            if state.blocked.contains(id) {
+                Relation::Blocked
+            } else if state.partners.contains_key(id) {
+                Relation::Contact
+            } else {
+                Relation::None
+            }
+        };
+        let mark = if known.external {
+            Some(Mark::External)
+        } else if known.guest {
+            Some(Mark::Guest)
+        } else {
+            None
+        };
         Person {
             key: self.ctx.key(id),
             name: if known.name.is_empty() { id.to_owned() } else { known.name.clone() },
             handle: known.mail.clone(),
             avatar: self.picture(id, &known.name),
             bot: known.bot,
-            relation: if self.state().partners.contains_key(id) { Relation::Contact } else { Relation::None },
+            relation,
             presence: self.ctx.presence_of(id),
             status: String::new(),
             link: Teams::link(&known.mail),
+            mark,
             ..Person::new(self.ctx.key(id), "")
         }
     }
@@ -622,6 +884,7 @@ impl Teams {
             department,
             bot: false,
             guest: user["userType"].as_str().is_some_and(|k| k.eq_ignore_ascii_case("guest")),
+            ..Known::default()
         };
         let row = self.row(&mri, &known);
         let _ = self.ctx.people(&[row]);
@@ -636,6 +899,164 @@ impl Teams {
             name,
             title,
         })
+    }
+
+    /// Computes Teams' `shareHistoryTime` value (milliseconds since epoch, `0` = all history,
+    /// `-1` = no history) from [`protocol::HistoryShare`].
+    pub(super) fn share_history_ms(share: Option<protocol::HistoryShare>, now_ms: i64) -> i64 {
+        match share.unwrap_or(protocol::HistoryShare::None) {
+            protocol::HistoryShare::None => -1,
+            protocol::HistoryShare::All => 0,
+            protocol::HistoryShare::Days { days } => {
+                now_ms.saturating_sub(i64::from(days.max(1)).saturating_mul(86_400_000)).max(1)
+            }
+        }
+    }
+
+    /// Starts a new Teams group chat with multiple people and an optional topic/name.
+    /// Uses `POST /v1/threads` without `uniquerosterthread` or `fixedRoster`.
+    pub(super) fn start_group(&self, people: &[String], title: Option<&str>) -> Result<String, Fault> {
+        let me = self.me();
+        let mut unique: Vec<String> = Vec::new();
+        for person in people {
+            let trimmed = person.trim();
+            if !trimmed.is_empty() && trimmed != me && !unique.iter().any(|p| p == trimmed) {
+                unique.push(trimmed.to_owned());
+            }
+        }
+        if unique.is_empty() {
+            return Err(Fault::Refused {
+                status: 400,
+                message: "Pick at least one other person to start a group chat.".to_owned(),
+            });
+        }
+        if unique.len() == 1 && title.map(str::trim).unwrap_or("").is_empty() {
+            return self.start_direct(&unique[0]);
+        }
+        let mut members = vec![json!({"id": me, "role": "Admin"})];
+        for person in &unique {
+            members.push(json!({"id": person, "role": "Admin"}));
+        }
+        let mut props = serde_json::Map::new();
+        props.insert("threadType".to_owned(), Value::String("chat".to_owned()));
+        let topic = title.map(str::trim).filter(|t| !t.is_empty());
+        if let Some(topic) = topic {
+            props.insert("topic".to_owned(), Value::String(topic.to_owned()));
+        }
+        let wanted = json!({
+            "members": members,
+            "properties": Value::Object(props),
+        });
+        let created = self.chat("POST", "/v1/threads", Body::Json(&wanted), false)?;
+        let named = created.location.rsplit('/').next().unwrap_or("").split('?').next().unwrap_or("");
+        let id = match named {
+            "" => super::id_of(&created.body["id"]),
+            named => named.replace("%3A", ":").replace("%3a", ":").replace("%40", "@"),
+        };
+        if !id.starts_with("19:") {
+            return Err(Fault::Net("Teams created the group chat but did not name it".to_owned()));
+        }
+        self.lookup(&unique);
+        if !self.known(&id)? {
+            return Err(Fault::Net("Teams does not describe the group chat it created".to_owned()));
+        }
+        if let Some(topic) = topic {
+            let _ = self.rename_row(&id, topic);
+        }
+        Ok(id)
+    }
+
+    /// Adds one or more people to a Teams group chat (with optional history sharing) or to a
+    /// team / private channel. Refuses 1:1 chats with a clear message telling the user to start
+    /// a new group chat instead.
+    pub(super) fn members_add(
+        &self,
+        conversation: &str,
+        people: &[String],
+        share_history: Option<protocol::HistoryShare>,
+    ) -> Result<(), Fault> {
+        let thread = super::thread_of(conversation);
+        let row = self.ctx.known(thread)?;
+        let is_one_on_one = thread.ends_with("@unq.gbl.spaces")
+            || row.as_ref().is_some_and(|r| r.kind == protocol::ConversationKind::Direct);
+        if is_one_on_one {
+            return Err(Fault::Refused {
+                status: 400,
+                message: "A 1:1 Teams chat cannot add more people. Start a new group chat instead.".to_owned(),
+            });
+        }
+        let is_channel_or_team = super::tree::is_channel(thread);
+        let role = if is_channel_or_team { "User" } else { "Admin" };
+        let share_ts = Self::share_history_ms(share_history, super::now_ms());
+        for person in people {
+            let mri = person.trim();
+            if mri.is_empty() {
+                continue;
+            }
+            let path = format!("/v1/threads/{}/members/{}", escaped(thread), escaped(mri));
+            let body = if is_channel_or_team {
+                json!({"role": role})
+            } else {
+                json!({"role": role, "shareHistoryTime": share_ts})
+            };
+            self.chat("PUT", &path, Body::Json(&body), false).map_err(|fault| match fault {
+                Fault::Refused { status: 403, .. } if is_channel_or_team => Fault::Refused {
+                    status: 403,
+                    message: "Only team or channel owners can add members here.".to_owned(),
+                },
+                other => other,
+            })?;
+        }
+        self.ctx.info_stale(thread);
+        Ok(())
+    }
+
+    /// Removes one person from a Teams group chat, team, or private channel.
+    pub(super) fn members_remove(&self, conversation: &str, person: &str) -> Result<(), Fault> {
+        let mri = person.trim();
+        if mri.is_empty() {
+            return Err(Fault::Refused {
+                status: 400,
+                message: "Pick a person to remove.".to_owned(),
+            });
+        }
+        let thread = super::thread_of(conversation);
+        let row = self.ctx.known(thread)?;
+        let is_one_on_one = thread.ends_with("@unq.gbl.spaces")
+            || row.as_ref().is_some_and(|r| r.kind == protocol::ConversationKind::Direct);
+        if is_one_on_one {
+            return Err(Fault::Refused {
+                status: 400,
+                message: "People cannot be removed from a 1:1 Teams chat.".to_owned(),
+            });
+        }
+        let is_channel_or_team = super::tree::is_channel(thread);
+        let path = format!("/v1/threads/{}/members/{}", escaped(thread), escaped(mri));
+        self.chat("DELETE", &path, Body::None, false).map_err(|fault| match fault {
+            Fault::Refused { status: 403, .. } if is_channel_or_team => Fault::Refused {
+                status: 403,
+                message: "Only team or channel owners can remove members here.".to_owned(),
+            },
+            other => other,
+        })?;
+        if mri == self.me() {
+            let remaining_spaces = {
+                let mut state = self.state();
+                let was_space = state.spaces.iter().any(|s| s.id == thread);
+                if was_space {
+                    state.spaces.retain(|s| s.id != thread);
+                    Some(state.spaces.clone())
+                } else {
+                    None
+                }
+            };
+            if let Some(spaces) = remaining_spaces {
+                self.ctx.spaces(&spaces)?;
+            }
+            self.ctx.conversation_gone(thread)?;
+        }
+        self.ctx.info_stale(thread);
+        Ok(())
     }
 
     /// One person's card: what their organization says of them, enriched from Microsoft Graph
@@ -653,6 +1074,10 @@ impl Teams {
         self.refresh_picture(person, &known.name);
         self.fetch_presence_for(&[person.to_owned()]);
         let (away, away_until) = self.away_of(person);
+        let mut fields = Vec::new();
+        if known.external && !known.tenant_name.is_empty() {
+            fields.push(("Organization".to_owned(), known.tenant_name.clone()));
+        }
 
         let mut office = raw_short
             .and_then(|u| u["userLocation"].as_str().or_else(|| u["officeLocation"].as_str()))
@@ -769,6 +1194,7 @@ impl Teams {
             pronouns,
             time_zone,
             utc_offset,
+            fields,
             contacts,
             away,
             away_until,
@@ -1113,5 +1539,40 @@ mod tests {
         assert_eq!(timezone_offset_secs("UTC+-5"), None);
         assert_eq!(timezone_offset_secs("UTC++5"), None);
         assert_eq!(timezone_offset_secs("Mars/Olympus"), None);
+    }
+
+    #[test]
+    fn share_history_maps_none_days_and_all_to_teams_wire_values() {
+        let now = 1_760_000_000_000i64;
+        assert_eq!(Teams::share_history_ms(None, now), -1);
+        assert_eq!(Teams::share_history_ms(Some(protocol::HistoryShare::None), now), -1);
+        assert_eq!(Teams::share_history_ms(Some(protocol::HistoryShare::All), now), 0);
+        assert_eq!(
+            Teams::share_history_ms(Some(protocol::HistoryShare::Days { days: 7 }), now),
+            now - 7 * 86_400_000
+        );
+    }
+
+    #[test]
+    fn external_detection_and_email_shape_distinguish_federated_and_personal_accounts() {
+        let home = "11111111-1111-4111-8111-111111111111";
+        let internal = json!({"tenantId": home, "userType": "Member", "tenantName": "Contoso"});
+        assert!(!is_external_user(&internal, "8:orgid:ana", home));
+
+        let federated = json!({"tenantId": "99999999-9999-4999-8999-999999999999", "tenantName": "Fabrikam"});
+        assert!(is_external_user(&federated, "8:orgid:ext1", home));
+        assert_eq!(external_org_name(&federated, "8:orgid:ext1"), "Fabrikam");
+
+        let personal = json!({"email": "sam@outlook.com", "companyName": "Contoso"});
+        assert!(is_external_user(&personal, "8:live:sam123", home));
+        assert_eq!(external_org_name(&personal, "8:live:sam123"), "Personal account");
+
+        let spoofed_shared = json!({"tenantId": "99999999-9999-4999-8999-999999999999", "tenantName": "Shared channel"});
+        assert_eq!(external_org_name(&spoofed_shared, "8:orgid:ext2"), "External");
+
+        assert!(looks_like_email("eva@fabrikam.com"));
+        assert!(!looks_like_email("eva"));
+        assert!(!looks_like_email("eva@localhost"));
+        assert!(!looks_like_email("eva @fabrikam.com"));
     }
 }

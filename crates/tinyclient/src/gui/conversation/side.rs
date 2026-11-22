@@ -115,7 +115,7 @@ fn network_searches(can: &Capabilities, network: Network, scope: Scope) -> bool 
         return false;
     }
     match network {
-        Network::Discord | Network::Slack => true,
+        Network::Discord | Network::Slack | Network::Teams => true,
         Network::Tiny => scope != Scope::Everywhere,
         Network::Telegram => scope == Scope::Conversation,
         _ => false,
@@ -127,6 +127,7 @@ impl Scope {
         match (self, network) {
             (Scope::Conversation, _) => "This conversation",
             (Scope::Space, Some(Network::Discord)) => "This server",
+            (Scope::Space, Some(Network::Teams)) => "This team",
             (Scope::Space, _) => "This space",
             (Scope::Everywhere, _) => "Everywhere",
         }
@@ -1944,10 +1945,12 @@ mod tests {
         assert!(!network_searches(&searching, Network::Tiny, Scope::Everywhere));
         assert!(network_searches(&searching, Network::Telegram, Scope::Conversation));
         assert!(!network_searches(&searching, Network::Telegram, Scope::Space), "Telegram searches one conversation at a time");
-        assert!(!network_searches(&searching, Network::Teams, Scope::Space), "Teams is not asked yet");
-        assert!(!network_searches(&searching, Network::Slack, Scope::Everywhere), "Everywhere is the cache alone");
+        assert!(network_searches(&searching, Network::Teams, Scope::Conversation));
+        assert!(network_searches(&searching, Network::Teams, Scope::Space));
+        assert!(!network_searches(&searching, Network::Slack, Scope::Everywhere), "Everywhere requires search_global");
         let global = Capabilities { search: true, search_global: true, ..Capabilities::default() };
         assert!(network_searches(&global, Network::Telegram, Scope::Everywhere), "Telegram global search asks at Everywhere scope");
+        assert!(network_searches(&global, Network::Teams, Scope::Everywhere), "Teams global search asks at Everywhere scope");
         // A network that has not said it searches is never asked, whatever the scope.
         let quiet = Capabilities::default();
         assert!(!network_searches(&quiet, Network::Slack, Scope::Conversation));

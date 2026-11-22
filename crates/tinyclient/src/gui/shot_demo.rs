@@ -1211,6 +1211,7 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
                     roles: vec!["Member".into()],
                     notify: Notify::Mentions,
                     tags: Vec::new(),
+                    link: String::new(),
                 }),
             },
             None => Response::Error { code: protocol::ErrorCode::NotFound, detail: "Not in the demo.".into() },

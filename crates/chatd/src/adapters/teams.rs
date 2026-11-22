@@ -141,6 +141,7 @@ pub fn prove_team_info() -> Result<(), String> {
 }
 mod people;
 mod push;
+mod search;
 mod send;
 mod tags;
 mod tree;
@@ -176,11 +177,25 @@ const TEAMS: &str = "https://teams.microsoft.com";
 const SPACES: &str = "https://api.spaces.skype.com";
 const AGGREGATOR: &str = "https://chatsvcagg.teams.microsoft.com";
 const PRESENCE: &str = "https://presence.teams.microsoft.com";
+/// Microsoft Search (Substrate) audience for server-side Teams search.
+const SUBSTRATE: &str = "https://substrate.office.com";
 /// The second audience: Microsoft Graph, for the user's OneDrive (files in chats). Unverified
 /// that Teams' client id may mint it.
 const GRAPH: &str = "https://graph.microsoft.com";
 /// Hosts a service address handed out by Teams may be on. A token goes nowhere else.
-const OURS: &[&str] = &["teams.microsoft.com", "skype.com", "teams.cloud.microsoft", "teams.office.com", "graph.microsoft.com"];
+const OURS: &[&str] = &[
+    "teams.microsoft.com",
+    "skype.com",
+    "teams.cloud.microsoft",
+    "teams.office.com",
+    "graph.microsoft.com",
+];
+/// Hosts a Microsoft Search (Substrate) token may be sent to.
+const SUBSTRATE_HOSTS: &[&str] = &[
+    "substrate.office.com",
+    "teams.microsoft.com",
+    "teams.cloud.microsoft",
+];
 
 /// Messages per page of history, and per opening of a reply chain.
 const PAGE: u32 = 50;
@@ -260,7 +275,12 @@ fn reason(fault: Fault) -> String {
         Fault::Auth(why) => why,
         Fault::Net(_) => "Teams could not be reached.".to_owned(),
         Fault::Refused { status: 403, message } => {
-            if message.contains("moderator") || message.contains("Only channel") {
+            if message.contains("moderator")
+                || message.contains("Only channel")
+                || message.contains("Only team")
+                || message.contains("organization's policy")
+                || message.contains("last owner")
+            {
                 message
             } else {
                 "Teams does not let you do that here.".to_owned()
@@ -291,6 +311,7 @@ struct Place {
     middle: String,
     presence: String,
     urlp: Option<String>,
+    search: Option<String>,
     ams: Option<String>,
 }
 
@@ -341,6 +362,10 @@ struct State {
     file_props: HashMap<(String, String), Vec<Value>>,
     /// Chat ids pinned in Teams, in Teams' own order.
     pinned_chats: Vec<String>,
+    /// Pinned messages per conversation/thread id.
+    pinned_messages: HashMap<String, Vec<info::PinnedEntry>>,
+    /// Saved (bookmarked) message ids for this account.
+    saved_ids: HashSet<String>,
     /// Channel ids pinned in Teams, in Teams' own order.
     pinned_channels: Vec<String>,
     /// Per-conversation notification level as reported by Teams.
@@ -354,6 +379,20 @@ struct State {
     /// Team tags per Space id, and tag ids the signed-in user belongs to.
     tags: HashMap<String, Vec<protocol::TeamTag>>,
     my_tags: HashSet<String>,
+    /// Newest activity item timestamp (ms) marked read across the `48:notifications` stream.
+    activity_read_horizon: i64,
+    /// Individual activity item ids marked read locally / on Teams.
+    activity_read_ids: HashSet<String>,
+    /// Mapping from activity item id -> `(thread_id, source_message_id)` for syncing read state.
+    activity_targets: HashMap<String, (String, String)>,
+    /// Newest activity item id seen from `48:notifications`.
+    activity_newest_ms: i64,
+    /// When the last server-side search ran, for separate pacing.
+    search_at: Option<Instant>,
+    /// Blocked user MRIs on Teams.
+    blocked: HashSet<String>,
+    /// Last listed teams (Spaces), kept so leaving one updates the Spaces list cleanly.
+    spaces: Vec<crate::store::SpaceRow>,
     /// Activity feed item ids marked read locally this session.
     activity_read: HashSet<String>,
     /// Per-thread member consumption horizons (thread_id -> member_id -> arrival_ms), excluding me.
@@ -666,6 +705,12 @@ impl Teams {
             || https_host(url).is_some_and(|host| OURS.iter().any(|domain| within(host, domain)))
     }
 
+    /// True for an address a Microsoft Search (Substrate) bearer token may be sent to.
+    fn substrate_host(&self, url: &str) -> bool {
+        self.moved.as_ref().is_some_and(|base| url.starts_with(base.as_str()))
+            || https_host(url).is_some_and(|host| SUBSTRATE_HOSTS.iter().any(|domain| within(host, domain)))
+    }
+
     /// True for an address a picture in a message may be fetched from: the media store.
     fn pictures(&self, url: &str) -> bool {
         let media = |host: &str| within(host, "asm.skype.com") || within(host, "asyncgw.teams.microsoft.com");
@@ -798,6 +843,10 @@ impl Teams {
                 middle,
                 presence: named("unifiedPresence").unwrap_or_else(|| PRESENCE.to_owned()),
                 urlp: named("urlp"),
+                search: gtms["search"]
+                    .as_str()
+                    .map(|url| url.trim_end_matches('/').to_owned())
+                    .filter(|url| self.substrate_host(url)),
                 ams: named("ams"),
             });
             let life = body["tokens"]["expiresIn"].as_u64().unwrap_or(3600).clamp(60, 86_400);
@@ -870,7 +919,11 @@ impl Teams {
         if let Some(why) = self.state().expired.clone() {
             return Err(Fault::Auth(why));
         }
-        if !self.ours(url) {
+        let allowed = match auth {
+            Auth::Bearer(scope) | Auth::Both(scope) if scope == SUBSTRATE => self.substrate_host(url),
+            _ => self.ours(url),
+        };
+        if !allowed {
             return Err(Fault::Net(format!("{} is not a Teams address", bare(url))));
         }
         let (mut renewed, mut limited, mut wait) = (false, false, 0);
@@ -948,9 +1001,17 @@ impl Teams {
             edit: true,
             delete: true,
             threads: true,
-            pins: false,
-            pin_chats: 15,
+            pins: true,
+            save_messages: true,
+            activity_feed: true,
+            search: true,
+            search_global: true,
             groups: 250,
+            blocks: true,
+            browse_channels: true,
+            join_space_by_invite: true,
+            leave_space: true,
+            pin_chats: 15,
             close_direct: true,
             clear_history: true,
             suppress_embeds: true,
@@ -968,7 +1029,6 @@ impl Teams {
                 multiple: true,
                 anonymous: true,
             }),
-            activity_feed: true,
             read_by: true,
             ..protocol::Capabilities::default()
         });
@@ -1039,6 +1099,23 @@ impl Teams {
             Command::StartGroup { people, title, reply } => {
                 let _ = reply.send(self.start_group(&people, title.as_deref()).map_err(refuse));
             }
+            Command::MembersAdd { conversation_id, people, share_history, reply } => {
+                let _ = reply.send(self.members_add(&conversation_id, &people, share_history).map_err(refuse));
+            }
+            Command::MembersRemove { conversation_id, person, reply } => {
+                let _ = reply.send(self.members_remove(&conversation_id, &person).map_err(refuse));
+            }
+            Command::ConversationUpdate { conversation_id, title, topic, description, reply } => {
+                let _ = reply.send(
+                    self.update_conversation(
+                        &conversation_id,
+                        title.as_deref(),
+                        topic.as_deref(),
+                        description.as_deref(),
+                    )
+                    .map_err(refuse),
+                );
+            }
             Command::Profile { person_id, reply } => {
                 let _ = reply.send(self.profile(&person_id).map_err(refuse));
             }
@@ -1051,12 +1128,6 @@ impl Teams {
             Command::SpaceTags { space_id, reply } => {
                 let _ = reply.send(self.space_tags(&space_id).map_err(refuse));
             }
-            Command::ActivityFeed { kind, cursor, limit, reply } => {
-                let _ = reply.send(self.fetch_activity_feed(kind, cursor.as_deref(), limit).map_err(refuse));
-            }
-            Command::ActivityMarkRead { item_id, reply } => {
-                let _ = reply.send(self.mark_activity_read(item_id.as_deref()).map_err(refuse));
-            }
             Command::ReadBy { conversation_id, message_id, reply } => {
                 let _ = reply.send(self.read_by(&conversation_id, &message_id).map_err(refuse));
             }
@@ -1066,8 +1137,56 @@ impl Teams {
             Command::Leave { conversation_id, reply } => {
                 let _ = reply.send(self.leave(&conversation_id).map_err(refuse));
             }
+            Command::LeaveSpace { space_id, reply } => {
+                let _ = reply.send(self.leave_team(&space_id).map_err(refuse));
+            }
+            Command::BrowseChannels { space_id, query, cursor, limit, reply } => {
+                let _ = reply.send(self.browse_channels(&space_id, &query, cursor.as_deref(), limit).map_err(refuse));
+            }
+            Command::PreviewChannel { conversation_id, reply } => {
+                let _ = reply.send(self.preview_channel(&conversation_id).map_err(refuse));
+            }
+            Command::Join { conversation_id, reply } => {
+                let _ = reply.send(self.join_channel_or_team(&conversation_id).map_err(refuse));
+            }
+            Command::CreateChannel { space_id, name, kind: _, private, group: _, reply } => {
+                let _ = reply.send(self.create_channel(&space_id, &name, private).map_err(refuse));
+            }
+            Command::InvitePreview { code, reply } => {
+                let _ = reply.send(self.invite_preview(&code).map_err(refuse));
+            }
+            Command::InviteJoin { code, reply } => {
+                let _ = reply.send(self.invite_join(&code).map_err(refuse));
+            }
             Command::File { conversation_id, pinned, archived, folder_add: _, folder_remove: _, reply } => {
                 let _ = reply.send(self.file_conversation(&conversation_id, pinned, archived).map_err(refuse));
+            }
+            Command::Pinned { conversation_id, reply } => {
+                let _ = reply.send(self.pinned_messages(&conversation_id).map_err(refuse));
+            }
+            Command::Pin { conversation_id, message_id, pinned, notify: _, me_only: _, reply } => {
+                let _ = reply.send(self.pin_message(&conversation_id, &message_id, pinned).map_err(refuse));
+            }
+            Command::StarMessage { conversation_id, message_id, starred, reply } => {
+                let _ = reply.send(self.save_message(&conversation_id, &message_id, starred).map_err(refuse));
+            }
+            Command::StarredMessages { conversation_id, limit, reply } => {
+                let _ = reply.send(self.saved_messages(conversation_id.as_deref(), limit).map_err(refuse));
+            }
+            Command::ActivityFeed { kind, cursor, limit, reply } => {
+                let _ = reply.send(self.activity_feed_page(kind, cursor.as_deref(), limit).map_err(refuse));
+            }
+            Command::ActivityMarkRead { item_id, reply } => {
+                let _ = reply.send(self.activity_mark_read(item_id.as_deref()).map_err(refuse));
+            }
+            Command::Search { query, scope, filters, cursor, at, reply } => {
+                let _ = reply.send(self.search_messages(&query, &scope, &filters, cursor.as_deref(), at).map_err(refuse));
+            }
+            Command::Relate { person_id, action, reply } => {
+                let _ = reply.send(self.relate(&person_id, action).map_err(refuse));
+            }
+            Command::AnswerMessageRequest { conversation_id, accept, reply } => {
+                let _ = reply.send(self.answer_external_request(&conversation_id, accept).map_err(refuse));
             }
             Command::CloseDirect { conversation_id, reply } => {
                 let _ = reply.send(self.hide_chat(&conversation_id).map_err(refuse));
@@ -1176,6 +1295,7 @@ impl Teams {
         if let Some((channel, root)) = chain_of(conversation) {
             self.clear_chain_unread(channel, root)?;
         }
+        self.mark_activity_for_conversation(thread, message);
         Ok(())
     }
 
