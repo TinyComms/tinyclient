@@ -117,6 +117,11 @@ pub(crate) fn prove_stale_page() -> Result<(), &'static str> {
     conversation::prove_stale_page()
 }
 
+/// The lab's return-to-bottom driver. Returning to a chat left at the bottom lands at the bottom.
+pub(crate) fn prove_return_to_bottom() -> Result<(), &'static str> {
+    conversation::prove_return_to_bottom()
+}
+
 /// The lab's text-drag driver. A release outside the message pane ends the selection drag.
 pub(crate) fn prove_text_drag() -> Result<(), &'static str> {
     let mut dragging = true;
