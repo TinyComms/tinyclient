@@ -3,7 +3,9 @@
 //! scan, or a phone number, the code Telegram sends and, for accounts that have one, the two-step
 //! password. Signal: only the code to scan from the phone, which links this computer as one more
 //! device; a number typed here would take the account from the phone, so none is asked.
-//! Messages uses Google account sign-in in a browser and an emoji confirmation on the phone. A Tiny
+//! Messages pairs either by scanning a QR code from Google Messages on an Android phone (with no
+//! Google account in a browser) or through Google account sign-in in a browser and an emoji
+//! confirmation on the phone. A Tiny
 //! server takes the code someone on it gave, or the address of one you already belong to; the
 //! rest happens in the system browser, at the server's sign-in provider, while the sheet waits.
 //!
@@ -344,12 +346,26 @@ fn waiting() -> SignInStep {
     SignInStep::Qr { link: String::new(), expires: 0, problem: None }
 }
 
+/// Instructions shown under the QR tile for each network that supports QR sign-in.
+fn qr_steps(network: Network) -> [&'static str; 3] {
+    match network {
+        Network::Signal => ["Open Signal on your phone.", "Go to Settings > Linked devices > Link new device.", "Point the phone at this code."],
+        Network::Messages => ["Open Messages on your Android phone.", "Go to Settings > Device pairing > QR code scanner.", "Point your phone at this code."],
+        Network::Tiny => ["Paste the code you were given.", "Continue in your browser.", "Come back here when it's done."],
+        Network::Telegram | Network::Discord | Network::Slack | Network::Teams => ["Open Telegram on your phone.", "Go to Settings > Devices > Link Desktop Device.", "Point the phone at this code."],
+    }
+}
+
 /// What the sheet draws before chatd has answered. Tiny starts on the code.
 fn waiting_for(network: Network) -> SignInStep {
     if network == Network::Tiny {
         SignInStep::Invite { server: String::new(), problem: None }
     } else if network == Network::Messages {
-        SignInStep::Browser { server: "https://messages.google.com".into(), provider: "Google".into(), waiting: false, problem: None }
+        if phone::active() {
+            waiting()
+        } else {
+            SignInStep::Browser { server: "https://messages.google.com".into(), provider: "Google".into(), waiting: false, problem: None }
+        }
     } else {
         waiting()
     }
@@ -671,6 +687,13 @@ impl Sheet {
         cx.notify();
         match answer {
             Ok(Response::SignIn { step, .. }) => {
+                if phone::active()
+                    && self.network == Network::Messages
+                    && matches!(step, SignInStep::Browser { waiting: false, .. })
+                {
+                    self.answer(SignInInput::UseQr, cx);
+                    return self.face.is_some();
+                }
                 self.show(step, cx);
                 self.face.is_some()
             }
@@ -1042,9 +1065,6 @@ impl Sheet {
     }
 
     fn qr_step(&self, problem: Option<&SignInProblem>, cx: &Context<Sheet>) -> Div {
-        if self.network == Network::Messages {
-            return self.browser_step("https://messages.google.com", "Google", false, problem, cx);
-        }
         let tile = match (problem, &self.code) {
             (Some(problem), _) => quiet_tile()
                 .gap(px(12.))
@@ -1054,25 +1074,34 @@ impl Sheet {
             (None, None) => quiet_tile().child(div().text_center().child(format!("Getting a code from {}", self.network.label()))),
         };
         let phone_only = matches!(self.network, Network::Signal | Network::Messages | Network::Tiny);
-        let steps = match self.network {
-            Network::Signal => ["Open Signal on your phone.", "Go to Settings > Linked devices > Link new device.", "Point the phone at this code."],
-            Network::Messages => unreachable!("Messages uses Google sign-in and emoji confirmation"),
-            Network::Tiny => ["Paste the code you were given.", "Continue in your browser.", "Come back here when it's done."],
-            Network::Telegram | Network::Discord | Network::Slack | Network::Teams => ["Open Telegram on your phone.", "Go to Settings > Devices > Link Desktop Device.", "Point the phone at this code."],
-        };
+        let steps = qr_steps(self.network);
         // Signal links a computer only from the phone: there is no other way in to offer.
-        // On a phone the code cannot be scanned by the phone it is on: the number is the way in,
+        // On a phone Telegram's code cannot be scanned by the phone it is on: the number is the way in,
         // and the code is for linking from another device.
         if phone::active() && !phone_only {
             return self.phone_qr_step(tile, steps, cx);
         }
-        let other_way = (!phone_only).then(|| self.answer_link("signin-use-phone", "Use a phone number instead", || SignInInput::UsePhone, cx));
+        let other_way = if self.network == Network::Messages {
+            (!phone::active()).then(|| self.answer_link("signin-use-google", "Continue with Google instead", || SignInInput::Back, cx))
+        } else {
+            (!phone_only).then(|| self.answer_link("signin-use-phone", "Use a phone number instead", || SignInInput::UsePhone, cx))
+        };
+        let mobile_note = (self.network == Network::Messages && phone::active()).then(|| {
+            div()
+                .mt(px(12.))
+                .type_small()
+                .phone_preview()
+                .whitespace_normal()
+                .text_color(theme::text_soft())
+                .child("Texts arrive only while tinyclient is open. Your Android phone has to stay online.")
+        });
         div()
             .flex()
             .flex_col()
-            .child(self.header(self.title(), false, cx))
+            .child(self.header(self.title(), self.network == Network::Messages && !phone::active(), cx))
             .child(div().mt(px(20.)).mb(px(18.)).flex().justify_center().child(tile))
             .child(div().flex().flex_col().gap(px(8.)).children(steps.into_iter().enumerate().map(|(at, words)| numbered(at + 1, words))))
+            .children(mobile_note)
             .child(footer(22.).child(other_way.map_or_else(|| div().into_any_element(), IntoElement::into_any_element)).child(self.cancel("Cancel", cx)))
     }
 
@@ -1453,21 +1482,31 @@ impl Sheet {
     /// After it stopped: why, and a way to begin again with the same provider.
     fn browser_step(&self, server: &str, provider: &str, waiting: bool, problem: Option<&SignInProblem>, cx: &Context<Sheet>) -> Div {
         if self.network == Network::Messages {
+            let qr_link = self.answer_link("signin-use-qr", "Scan a QR code", || SignInInput::UseQr, cx);
             return div().flex().flex_col()
-                .child(self.header(if waiting { "Sign in with Google" } else { "Continue in your browser" }, false, cx))
+                .child(self.header(if waiting { "Sign in with Google" } else { self.title() }, false, cx))
                 .child(div().mt(px(12.)).whitespace_normal().text_color(theme::text_soft())
                     .child(if waiting {
                         "Sign in in the browser window using the same Google account as Messages on your Android phone. Then return here to confirm the matching emoji on your phone."
+                    } else if phone::active() {
+                        "Pair this device by scanning a QR code from Google Messages on your Android phone. Texts arrive only while tinyclient is open."
                     } else {
-                        "Sign in with the Google account used by Messages on your Android phone. Keep your phone online to pair this computer."
+                        "Sign in with the Google account used by Messages on your Android phone, or scan a QR code without signing in to Google. Keep your phone online."
                     }))
                 .children(problem.map(|problem| error_line(problem_words(self.network, problem)).mt(px(12.))))
-                .child(footer(22.).child(div()).child(if waiting {
-                    buttons().child(self.cancel("Cancel", cx))
+                .child(if phone::active() {
+                    footer(22.).child(div()).child(
+                        buttons().child(self.cancel("Cancel", cx))
+                            .child(self.primary("Scan a QR code", Sheet::use_qr, cx)),
+                    )
                 } else {
-                    buttons().child(self.cancel("Cancel", cx))
-                        .child(self.primary("Continue with Google", |this, cx| this.answer(SignInInput::OpenBrowser, cx), cx))
-                }));
+                    footer(22.).child(qr_link).child(if waiting {
+                        buttons().child(self.cancel("Cancel", cx))
+                    } else {
+                        buttons().child(self.cancel("Cancel", cx))
+                            .child(self.primary("Continue with Google", |this, cx| this.answer(SignInInput::OpenBrowser, cx), cx))
+                    })
+                });
         }
         let (title, line) = if waiting {
             ("Waiting for your browser…", waiting_words(server, provider))
@@ -1976,6 +2015,14 @@ mod tests {
         assert!(notice.contains("unencrypted HTTP"));
         assert!(notice.contains("replace"));
         assert!(!notice.contains("first.example"));
+    }
+
+    #[test]
+    fn messages_qr_steps_name_the_android_scanner() {
+        let steps = qr_steps(Network::Messages);
+        assert!(steps.iter().any(|s| s.contains("Android phone")));
+        assert!(steps.iter().any(|s| s.contains("QR code scanner")));
+        assert!(matches!(waiting_for(Network::Messages), SignInStep::Browser { waiting: false, .. }));
     }
 
     #[test]
