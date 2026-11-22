@@ -826,6 +826,7 @@ fn my_own_profile_shows_and_an_edit_reaches_the_wire() {
             pronouns: None,
             emoji: None,
             username: None,
+            birthday: None,
             photo: false,
         }),
         Response::Ok
@@ -850,6 +851,7 @@ fn my_own_profile_shows_and_an_edit_reaches_the_wire() {
         pronouns: None,
         emoji: None,
         username: Some("nope".into()),
+        birthday: None,
         photo: false,
     });
     match username {
@@ -863,6 +865,7 @@ fn my_own_profile_shows_and_an_edit_reaches_the_wire() {
         pronouns: None,
         emoji: None,
         username: None,
+        birthday: None,
         photo: true,
     });
     match photo {

@@ -134,6 +134,16 @@ pub enum Style {
     Emoji {
         file: MediaFile,
     },
+    /// A clickable hashtag or cashtag (`#rust`, `$BTC`): clicking searches for it in the chat.
+    Hashtag,
+    /// A clickable bot command (`/start`, `/help@bot`): clicking sends it in the open chat.
+    Command,
+    /// A clickable `@username` without a known user id: clicking resolves and opens in-app.
+    Username {
+        username: String,
+    },
+    /// A clickable phone number or bank card number: clicking copies it to the clipboard.
+    Copyable,
 }
 
 /// A styled range of [`Message::text`]. `start` and `end` are byte offsets into the UTF-8 text
@@ -1444,5 +1454,20 @@ mod tests {
         assert_eq!(back.buttons, msg.buttons);
         msg.tombstone();
         assert!(msg.buttons.is_empty());
+    }
+
+    #[test]
+    fn clickable_telegram_span_styles_round_trip() {
+        let styles = vec![
+            Style::Hashtag,
+            Style::Command,
+            Style::Username { username: "forest_wren".into() },
+            Style::Copyable,
+        ];
+        for style in styles {
+            let span = Span { start: 0, end: 5, style };
+            let wire = serde_json::to_string(&span).unwrap();
+            assert_eq!(serde_json::from_str::<Span>(&wire).unwrap(), span);
+        }
     }
 }

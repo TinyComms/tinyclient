@@ -4810,6 +4810,8 @@ fn slack_create_channel_and_start_group_dm() {
         kind: ConversationKind::Channel,
         private: false,
         group: None,
+        description: None,
+        username: None,
     }) else {
         panic!("expected Conversation for public CreateChannel");
     };
@@ -4825,6 +4827,8 @@ fn slack_create_channel_and_start_group_dm() {
         kind: ConversationKind::Channel,
         private: true,
         group: None,
+        description: None,
+        username: None,
     }) else {
         panic!("expected Conversation for private CreateChannel");
     };
@@ -4843,6 +4847,8 @@ fn slack_create_channel_and_start_group_dm() {
         kind: ConversationKind::Channel,
         private: false,
         group: None,
+        description: None,
+        username: None,
     }) {
         Response::Error { code: ErrorCode::Refused, detail } => {
             assert!(detail.to_lowercase().contains("lowercase"), "got: {detail}");
@@ -4876,6 +4882,8 @@ fn slack_create_channel_and_start_group_dm() {
         kind: ConversationKind::Channel,
         private: false,
         group: None,
+        description: None,
+        username: None,
     }) {
         Response::Error { code: ErrorCode::Refused, .. } => {}
         other => panic!("expected Refused for restricted_action, got {other:?}"),

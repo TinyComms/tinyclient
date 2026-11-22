@@ -189,7 +189,21 @@ pub(super) fn starts_thread(message: &Message, caps: &Capabilities, kind: Conver
 }
 
 /// Whether `message` is still within `caps.edit_window` at unix second `now`.
-fn within_edit_window(message: &Message, caps: &Capabilities, now: i64) -> bool {
+/// Telegram's 48-hour edit window does not apply to Saved Messages or own channel posts.
+fn within_edit_window(
+    message: &Message,
+    network: Network,
+    kind: ConversationKind,
+    special: protocol::Special,
+    caps: &Capabilities,
+    now: i64,
+) -> bool {
+    if network == Network::Telegram
+        && (special == protocol::Special::Saved
+            || matches!(kind, ConversationKind::Channel | ConversationKind::Announcement))
+    {
+        return true;
+    }
     caps.edit_window == 0
         || now <= 0
         || message.sent <= 0
@@ -282,6 +296,21 @@ pub fn can_with_network_topic(
     topic: &str,
     now: i64,
 ) -> Can {
+    can_with_network_context(message, network, caps, rights, kind, protocol::Special::None, in_thread, topic, now)
+}
+
+/// Full capability + network + rights + topic + special-role check used by the conversation pane.
+pub fn can_with_network_context(
+    message: &Message,
+    network: Network,
+    caps: &Capabilities,
+    rights: ConversationRights,
+    kind: ConversationKind,
+    special: protocol::Special,
+    in_thread: bool,
+    topic: &str,
+    now: i64,
+) -> Can {
     let sent = message.state == SendState::Sent;
     let said = matches!(message.kind, MessageKind::Normal | MessageKind::Unsupported { .. }) && !message.deleted;
     let act = sent && said;
@@ -292,7 +321,7 @@ pub fn can_with_network_topic(
         && !message.saved_history
         && match message.can_edit {
             Some(allowed) => allowed,
-            None => own && caps.edit && messages_rcs && within_edit_window(message, caps, now),
+            None => own && caps.edit && messages_rcs && within_edit_window(message, network, kind, special, caps, now),
         };
     let delete_everyone = !message.deleted
         && sent
@@ -607,12 +636,13 @@ impl Pane {
                 if open.can_pin {
                     rights.pin = true;
                 }
-                can_with_network_topic(
+                can_with_network_context(
                     message,
                     open.key.network,
                     &open.can,
                     rights,
                     open.kind,
+                    open.special,
                     self.is_thread(),
                     &open.topic,
                     now,
@@ -3199,10 +3229,27 @@ mod tests {
         let overridden = can(&mine_sms, &messages_caps(), none, ConversationKind::Direct, false, 1_100);
         assert!(overridden.edit && overridden.delete);
 
-        // Telegram edit_window (48h): edit offered inside window, hidden past window.
+        // Telegram edit_window (48h): edit offered inside window, hidden past window in DMs/groups,
+        // but Saved Messages and own channel posts stay editable indefinitely.
         let mine_tg = Message::plain("t1", "Me", "hi", 1_000, true);
-        assert!(can(&mine_tg, &telegram_caps(), none, ConversationKind::Direct, false, 1_000 + 3_600).edit);
-        assert!(!can(&mine_tg, &telegram_caps(), none, ConversationKind::Direct, false, 1_000 + 48 * 3_600 + 1).edit);
+        let past_48h = 1_000 + 48 * 3_600 + 1;
+        assert!(can_with_network(&mine_tg, Network::Telegram, &telegram_caps(), none, ConversationKind::Direct, false, 1_000 + 3_600).edit);
+        assert!(!can_with_network(&mine_tg, Network::Telegram, &telegram_caps(), none, ConversationKind::Direct, false, past_48h).edit);
+        assert!(can_with_network(&mine_tg, Network::Telegram, &telegram_caps(), none, ConversationKind::Channel, false, past_48h).edit);
+        assert!(
+            can_with_network_context(
+                &mine_tg,
+                Network::Telegram,
+                &telegram_caps(),
+                none,
+                ConversationKind::Direct,
+                protocol::Special::Saved,
+                false,
+                "",
+                past_48h,
+            )
+            .edit
+        );
 
         let mut mine = Message::plain("2", "Robin", "on it", 2, true);
         let own = can(&mine, &discord_caps(), none, channel, false, 100);

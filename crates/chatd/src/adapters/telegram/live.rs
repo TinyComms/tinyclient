@@ -658,6 +658,11 @@ pub(super) fn apply(account: &Account, update: &Update) {
                 let _ = account.ctx.relation(&who.text(), relation);
             }
         }
+        Update::PendingJoinRequests(pending) => {
+            let who = Who::of(&pending.peer);
+            let count = pending.requests_pending.max(0) as u32;
+            account.live().pending_requests.insert(who, count);
+        }
         Update::DraftMessage(drafted) => {
             let who = Who::of(&drafted.peer);
             let id = if account.dir().get(who).is_some_and(|known| known.forum) {

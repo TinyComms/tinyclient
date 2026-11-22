@@ -189,6 +189,32 @@ pub(super) fn ensure_row(account: &Account, who: Who, topic: Option<i32>) -> boo
     account.ctx.conversation(&thread).is_ok()
 }
 
+/// Records a non-member public channel or group as a read-only preview row outside the sidebar.
+/// Never subscribes or joins. True once the row is in the store.
+pub(super) fn ensure_preview_row(account: &Account, who: Who) -> bool {
+    if member(account, who) {
+        return ensure_row(account, who, None);
+    }
+    if !matches!(who, Who::Channel(_)) {
+        return false;
+    }
+    let id = who.text();
+    if matches!(account.ctx.known(&id), Ok(Some(_))) {
+        return true;
+    }
+    if account.input(who).is_err() {
+        return false;
+    }
+    let Some(known) = account.dir().get(who).cloned() else {
+        return false;
+    };
+    let mut fresh = row(account, who, &known);
+    fresh.joined = false;
+    fresh.read_only = true;
+    fresh.listed = false;
+    account.ctx.conversation(&fresh).is_ok()
+}
+
 /// A group or channel was renamed, or its picture or our rights in it changed. Its filing is
 /// left as stored.
 pub(super) fn refresh_row(account: &Account, who: Who) {
@@ -196,6 +222,9 @@ pub(super) fn refresh_row(account: &Account, who: Who) {
         return;
     };
     if known.member == Some(false) {
+        if matches!(account.ctx.known(&who.text()), Ok(Some(stored)) if !stored.joined) {
+            return;
+        }
         remove_chat(account, who);
         return;
     }
@@ -364,6 +393,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         clear_history: true,
         reply: true,
         edit: true,
+        edit_media: true,
         delete: true,
         threads: false,
         direct_threads: false,
@@ -375,13 +405,21 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         gif_file: false,
         mention_format: protocol::MentionFormat::Plain,
         mention_spans: true,
+        profile_name: true,
+        profile_about: true,
+        profile_avatar: true,
+        profile_username: true,
+        profile_birthday: true,
+        rich_status: premium,
         pin_chats: if premium { 10 } else { 5 },
         archive: true,
         folders_edit: true,
         disappearing: true,
+        groups: 200,
         effects: false,
         view_once: false,
         blocks: true,
+        join_space_by_invite: true,
         share_contact: true,
         save_gif: true,
         notify_defaults: true,

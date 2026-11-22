@@ -206,8 +206,10 @@ pub fn source(message: &Message) -> (String, Vec<Token>) {
         let marker = match &span.style {
             Style::Bold => "**",
             Style::Italic => "_",
+            Style::Underline => "__",
             Style::Strike => "~~",
             Style::Code => "`",
+            Style::Spoiler => "||",
             Style::Mention { kind, id } => {
                 let (kind, id) = match kind {
                     MentionKind::User => (Kind::Person, id.clone()),
@@ -487,5 +489,17 @@ mod tests {
         assert!(field.contains("@Dev") && field.contains("#ops") && field.contains("@core"));
         assert!(field.contains(":ferris:") && field.contains(":party:"));
         assert_eq!(wire(&field, &tokens, MentionFormat::Discord), raw);
+    }
+
+    #[test]
+    fn caption_formatting_preserves_underline_and_spoiler_in_source() {
+        let mut msg = Message::plain("c1", "me", "bold under secret", 0, true);
+        msg.spans = vec![
+            Span { start: 0, end: 4, style: Style::Bold },
+            Span { start: 5, end: 10, style: Style::Underline },
+            Span { start: 11, end: 17, style: Style::Spoiler },
+        ];
+        let (text, _) = source(&msg);
+        assert_eq!(text, "**bold** __under__ ||secret||");
     }
 }

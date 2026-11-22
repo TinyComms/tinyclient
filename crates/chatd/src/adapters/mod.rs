@@ -207,6 +207,7 @@ pub struct ConversationAbout {
     pub link: String,
     pub disappearing: Option<u32>,
     pub bookmarks: Vec<protocol::Bookmark>,
+    pub pending_requests: u32,
 }
 
 /// What a Space's info says, as the network tells it.
@@ -398,6 +399,17 @@ pub enum Command {
         spans: Vec<protocol::Span>,
         reply: Reply<()>,
     },
+    /// Replace the media (photo/file) on one of our messages, optionally updating its caption.
+    /// Report the edited message through [`Context::message`] before answering.
+    EditMedia {
+        conversation_id: String,
+        message_id: String,
+        file: protocol::OutgoingFile,
+        text: String,
+        spans: Vec<protocol::Span>,
+        invert_media: bool,
+        reply: Reply<()>,
+    },
     /// Fetch the raw source text of a message for lossless editing.
     Source {
         conversation_id: String,
@@ -454,6 +466,9 @@ pub enum Command {
     Watch(Arc<Watching>),
     /// Search the network's directory. Results go to [`Context::people`]; at most 25.
     SearchPeople(String),
+    /// Resolve a public `@username` on click (cached on the adapter; never joins a chat).
+    /// Answers `Some((conversation_id, title))` when found.
+    ResolveUsername { username: String, reply: Reply<Option<(String, String)>> },
     Members {
         conversation_id: String,
         offset: u32,
@@ -503,6 +518,8 @@ pub enum Command {
         kind: protocol::ConversationKind,
         private: bool,
         group: Option<String>,
+        description: Option<String>,
+        username: Option<String>,
         reply: Reply<String>,
     },
     /// Create a group conversation with two or more members (person ids or phone numbers) and an optional name.
@@ -608,7 +625,44 @@ pub enum Command {
     /// Join a Space from an invite link or code; returns `(space_id, channel_id)`.
     InviteJoin {
         code: String,
-        reply: Reply<(Option<String>, Option<String>)>,
+        /// `(space_id, conversation_id, pending_approval)`.
+        reply: Reply<(Option<String>, Option<String>, bool)>,
+    },
+    /// Lists exported invite links for a group or channel.
+    ChatInvites {
+        conversation_id: String,
+        revoked: bool,
+        reply: Reply<Vec<protocol::ChatInviteLink>>,
+    },
+    /// Creates a new invite link for a group or channel.
+    CreateInvite {
+        conversation_id: String,
+        title: Option<String>,
+        expire_date: Option<i64>,
+        usage_limit: Option<u32>,
+        request_needed: bool,
+        reply: Reply<protocol::ChatInviteLink>,
+    },
+    /// Revokes an exported invite link.
+    RevokeInvite {
+        conversation_id: String,
+        link: String,
+        reply: Reply<protocol::ChatInviteLink>,
+    },
+    /// Lists pending join requests for a group or channel.
+    JoinRequests {
+        conversation_id: String,
+        link: Option<String>,
+        limit: u32,
+        reply: Reply<Vec<protocol::JoinRequest>>,
+    },
+    /// Approves or declines one (`user_id: Some`) or all (`user_id: None`) pending join requests.
+    HandleJoinRequest {
+        conversation_id: String,
+        user_id: Option<String>,
+        approved: bool,
+        link: Option<String>,
+        reply: Reply<()>,
     },
     /// Moderate a member in a Space (kick, ban, timeout, untimeout, nickname).
     Moderate {
@@ -994,6 +1048,9 @@ pub enum Command {
         name: Option<String>,
         about: Option<String>,
         pronouns: Option<String>,
+        username: Option<String>,
+        emoji: Option<String>,
+        birthday: Option<String>,
         reply: Reply<()>,
     },
     /// Set (or clear, when `path` is empty) our own profile picture from a local file path.
@@ -1080,6 +1137,7 @@ impl Command {
     pub fn unsupported(self, ctx: &Context) {
         match self {
             Command::Members { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ResolveUsername { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MembersAdd { reply, .. }
             | Command::MembersRemove { reply, .. }
             | Command::ConversationUpdate { reply, .. }
@@ -1102,6 +1160,11 @@ impl Command {
             Command::SpaceInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ChatInvites { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateInvite { reply, .. }
+            | Command::RevokeInvite { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::JoinRequests { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::HandleJoinRequest { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetMute { reply, .. }
             | Command::Moderate { reply, .. }
             | Command::Unban { reply, .. }
@@ -1181,6 +1244,7 @@ impl Command {
             }
             Command::React { reply, .. }
             | Command::Edit { reply, .. }
+            | Command::EditMedia { reply, .. }
             | Command::Delete { reply, .. }
             | Command::DeleteMany { reply, .. }
             | Command::DeleteParticipantHistory { reply, .. }

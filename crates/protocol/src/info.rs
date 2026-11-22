@@ -385,6 +385,9 @@ pub struct ConversationInfo {
     /// Channel bookmarks (links, canvases, folders; Slack `bookmarks.list`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bookmarks: Vec<Bookmark>,
+    /// Pending join requests awaiting admin approval (Telegram groups/channels).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pending_requests: u32,
 }
 
 /// Kind of a channel bookmark.
@@ -668,6 +671,9 @@ pub struct Capabilities {
     /// This account supports editing own messages.
     #[serde(default, skip_serializing_if = "is_false")]
     pub edit: bool,
+    /// This account supports replacing the photo or file of an already-sent message (`Request::EditMedia`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub edit_media: bool,
     /// This account supports deleting messages.
     #[serde(default, skip_serializing_if = "is_false")]
     pub delete: bool,
@@ -708,6 +714,10 @@ pub struct Capabilities {
     pub profile_pronouns: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub profile_avatar: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub profile_username: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub profile_birthday: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub profile_nickname: bool,
     /// Most chats this account may pin on the network (`Request::File`). 0: cannot pin.
@@ -929,6 +939,44 @@ pub struct InvitePreview {
     pub space_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_id: Option<String>,
+    /// True when joining via this invite submits a join request for admin approval (Telegram).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub request_needed: bool,
+}
+
+/// One exported invite link for a group or channel (Telegram `ChatInviteExported`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatInviteLink {
+    pub link: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub permanent: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub revoked: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub request_needed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expire_date: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub usage: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pending_requests: u32,
+}
+
+/// One person who requested to join a chat via an approval-gated invite link (Telegram `ChatInviteImporter`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinRequest {
+    pub user_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub handle: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub about: String,
+    #[serde(default)]
+    pub date: i64,
 }
 
 /// One public channel returned by [`crate::Request::BrowseChannels`].
@@ -1134,7 +1182,13 @@ impl Capabilities {
 
     /// True if any own-profile field (name, about, pronouns, avatar) can be edited on this network.
     pub fn can_edit_profile(&self) -> bool {
-        self.profile_name || self.profile_about || self.profile_pronouns || self.profile_avatar
+        self.profile_name
+            || self.profile_about
+            || self.profile_pronouns
+            || self.profile_avatar
+            || self.profile_username
+            || self.profile_birthday
+            || self.rich_status
     }
 }
 
@@ -1417,6 +1471,7 @@ mod tests {
                 pronouns: Some("she/her".into()),
                 emoji: None,
                 username: None,
+                birthday: None,
                 photo: false,
             },
             Request::SetAvatar { account: account.clone(), path: "/tmp/avatar.png".into() },

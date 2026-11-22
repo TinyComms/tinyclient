@@ -5108,3 +5108,536 @@ fn unread_mentions_jump_three_times_and_the_count_reaches_zero() {
     assert_eq!(cleared.unread_reactions, 0);
     assert_eq!(cleared.mentions, 0);
 }
+
+#[test]
+fn clicking_a_telegram_username_resolves_once_and_caches_result() {
+    let world = World::signed_in();
+    world.connected();
+
+    // Resolving an uncached @username calls contacts.resolveUsername once and creates the chat row.
+    let Response::Resolved { conversation, title, .. } = world.ask(Request::Resolve {
+        url: "https://t.me/forest_wren".into(),
+    }) else {
+        panic!("expected Resolved");
+    };
+    assert_eq!(conversation, Some(key("u7010")));
+    assert_eq!(title, "Forest Wren");
+    assert_eq!(world.called("ResolveUsername forest_wren"), 1);
+
+    // Clicking the same username again hits cache without repeating the flood-limited RPC.
+    let Response::Resolved { conversation: again, .. } = world.ask(Request::Resolve {
+        url: "https://t.me/forest_wren".into(),
+    }) else {
+        panic!("expected Resolved");
+    };
+    assert_eq!(again, Some(key("u7010")));
+    assert_eq!(world.called("ResolveUsername forest_wren"), 1);
+
+    // Unknown usernames cache the miss so repeated clicks do not hammer ResolveUsername.
+    let Response::Resolved { conversation: missing, .. } = world.ask(Request::Resolve {
+        url: "https://t.me/nobody_here_495".into(),
+    }) else {
+        panic!("expected Resolved");
+    };
+    assert_eq!(missing, None);
+    let Response::Resolved { conversation: missing_again, .. } = world.ask(Request::Resolve {
+        url: "https://t.me/nobody_here_495".into(),
+    }) else {
+        panic!("expected Resolved");
+    };
+    assert_eq!(missing_again, None);
+    assert_eq!(world.called("ResolveUsername nobody_here_495"), 1);
+}
+
+#[test]
+fn replace_media_and_edit_caption_formatting() {
+    let world = World::signed_in();
+    world.connected();
+
+    let dir = std::env::temp_dir().join(format!("tinyclient-tg-edit-media-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let photo_a = dir.join("first.jpg");
+    let photo_b = dir.join("second.jpg");
+    std::fs::write(&photo_a, vec![3u8; 4_096]).unwrap();
+    std::fs::write(&photo_b, vec![9u8; 8_192]).unwrap();
+
+    // Send a photo with a plain caption first.
+    let file_a = protocol::OutgoingFile {
+        path: photo_a.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: key("u7002"),
+            client_id: "edit-media-1".into(),
+            text: "initial caption".into(),
+            reply_to: None,
+            with: protocol::Outgoing { files: vec![file_a], ..Default::default() },
+        }),
+        Response::Sent { .. }
+    ));
+    let sent = world.until("photo sent", || {
+        world
+            .messages("u7002")
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("edit-media-1") && m.state == SendState::Sent)
+    });
+    assert_eq!(sent.attachments.len(), 1);
+    let old_file_id = sent.attachments[0].file.id.clone();
+
+    // Edit only the caption's formatting (bold, italic, spoiler) via Request::Edit.
+    assert_eq!(
+        world.ask(Request::Edit {
+            conversation: key("u7002"),
+            message_id: sent.id.clone(),
+            text: "**bold** _italic_ ||secret||".into(),
+            spans: Vec::new(),
+        }),
+        Response::Ok
+    );
+    let formatted = world.until("caption formatted", || {
+        world
+            .messages("u7002")
+            .into_iter()
+            .find(|m| m.id == sent.id && m.text == "bold italic secret")
+    });
+    assert!(formatted.spans.iter().any(|s| s.style == protocol::Style::Bold), "{:?}", formatted.spans);
+    assert!(formatted.spans.iter().any(|s| s.style == protocol::Style::Italic), "{:?}", formatted.spans);
+    assert!(formatted.spans.iter().any(|s| s.style == protocol::Style::Spoiler), "{:?}", formatted.spans);
+
+    // Clearing the caption on a media message is allowed.
+    assert_eq!(
+        world.ask(Request::Edit {
+            conversation: key("u7002"),
+            message_id: sent.id.clone(),
+            text: String::new(),
+            spans: Vec::new(),
+        }),
+        Response::Ok
+    );
+    let cleared = world.until("caption cleared", || {
+        world.messages("u7002").into_iter().find(|m| m.id == sent.id && m.text.is_empty())
+    });
+    assert_eq!(cleared.attachments.len(), 1);
+
+    // Replace the photo with a new file + spoiler and a formatted caption via Request::EditMedia.
+    let file_b = protocol::OutgoingFile {
+        path: photo_b.to_string_lossy().into_owned(),
+        spoiler: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        world.ask(Request::EditMedia {
+            conversation: key("u7002"),
+            message_id: sent.id.clone(),
+            file: file_b,
+            text: "**new** photo".into(),
+            spans: Vec::new(),
+            invert_media: true,
+        }),
+        Response::Ok
+    );
+    let replaced = world.until("media replaced", || {
+        world
+            .messages("u7002")
+            .into_iter()
+            .find(|m| m.id == sent.id && m.text == "new photo")
+    });
+    assert_eq!(replaced.attachments.len(), 1);
+    assert_ne!(replaced.attachments[0].file.id, old_file_id);
+    assert!(replaced.attachments[0].spoiler);
+    assert!(replaced.spans.iter().any(|s| s.style == protocol::Style::Bold));
+    assert!(
+        world.calls().iter().any(|c| c.contains("EditMessage u7002") && c.contains("media=photo+spoiler") && c.contains("[invert]")),
+        "expected EditMessage with replacement media and invert_media on wire: {:#?}",
+        world.calls()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn edit_own_profile_name_bio_username_avatar_birthday_and_emoji_status() {
+    let world = World::signed_in();
+    world.connected();
+
+    let me = key("u7001");
+    let account = me.account();
+
+    // Update name, bio, username, and birthday in one SetProfile call.
+    assert_eq!(
+        world.ask(Request::SetProfile {
+            account: account.clone(),
+            name: Some("Mira Vance".into()),
+            about: Some("Alpine maps and trails".into()),
+            pronouns: None,
+            emoji: None,
+            username: Some("@mira_vance".into()),
+            birthday: Some("1994-03-14".into()),
+            photo: false,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.called("UpdateProfile Mira Vance | Alpine maps and trails"), 1);
+    assert_eq!(world.called("CheckUsername mira_vance"), 1);
+    assert_eq!(world.called("UpdateUsername mira_vance"), 1);
+    assert_eq!(world.called("UpdateBirthday 1994-3-14"), 1);
+
+    // Own profile card reflects the updated name, bio, username, and birthday.
+    let Response::Profile { profile } = world.ask(Request::Profile { person: me.clone(), space: None }) else {
+        panic!("expected Profile");
+    };
+    assert_eq!(profile.person.name, "Mira Vance");
+    assert_eq!(profile.bio, "Alpine maps and trails");
+    assert!(profile.fields.iter().any(|(k, v)| k == "Username" && v == "@mira_vance"), "{:?}", profile.fields);
+    assert!(profile.fields.iter().any(|(k, v)| k == "Birthday" && v == "14 March 1994"), "{:?}", profile.fields);
+
+    // Taken username is checked and refused cleanly without calling UpdateUsername.
+    let taken = world.ask(Request::SetProfile {
+        account: account.clone(),
+        name: None,
+        about: None,
+        pronouns: None,
+        emoji: None,
+        username: Some("taken_name".into()),
+        birthday: None,
+        photo: false,
+    });
+    assert!(matches!(taken, Response::Error { code: ErrorCode::Refused, .. }), "{taken:?}");
+    assert_eq!(world.called("UpdateUsername taken_name"), 0);
+
+    // Upload a new profile photo and then remove it via SetAvatar.
+    let dir = std::env::temp_dir().join(format!("tinyclient-tg-avatar-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let avatar = dir.join("me.jpg");
+    std::fs::write(&avatar, vec![5u8; 2_048]).unwrap();
+    assert_eq!(
+        world.ask(Request::SetAvatar {
+            account: account.clone(),
+            path: avatar.to_string_lossy().into_owned(),
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.called("UploadProfilePhoto"), 1);
+    assert_eq!(world.ask(Request::SetAvatar { account: account.clone(), path: String::new() }), Response::Ok);
+    assert_eq!(world.called("GetUserPhotos"), 1);
+    assert_eq!(world.called("DeletePhotos 1"), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Non-Premium account setting emoji status gets a clear Premium refusal and never sends UpdateStatus offline.
+    let emoji_err = world.ask(Request::SetPresence {
+        account: account.clone(),
+        presence: Presence::Online,
+        status: None,
+        status_emoji: Some("5002".into()),
+        clear_at: Some(1_800_000_000),
+    });
+    assert!(
+        matches!(emoji_err, Response::Error { code: ErrorCode::Refused, ref detail } if detail.contains("Premium")),
+        "{emoji_err:?}"
+    );
+    // Clearing emoji status succeeds cleanly.
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Online,
+            status: None,
+            status_emoji: Some(String::new()),
+            clear_at: None,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.called("UpdateEmojiStatus clear"), 1);
+    assert_eq!(world.called("UpdateStatus"), 0, "never send account.updateStatus offline from status edits");
+}
+
+#[test]
+fn create_group_channel_and_add_members_with_missing_invitees() {
+    let world = World::signed_in();
+    world.connected();
+
+    let account = key("u7001").account();
+
+    // 1. Create a basic group with two people via StartGroup.
+    let Response::Conversation { conversation: group } = world.ask(Request::StartGroup {
+        account: account.clone(),
+        people: vec![key("u7002"), key("u7003")],
+        title: Some("Summit Team".into()),
+    }) else {
+        panic!("expected Conversation from StartGroup");
+    };
+    assert_eq!(group.title, "Summit Team");
+    assert_eq!(group.kind, ConversationKind::Group);
+    assert!(group.rights.add_members);
+    assert_eq!(world.called("CreateChat Summit Team users=[7002, 7003]"), 1);
+    let group_msgs = world.messages(&group.key.id);
+    assert!(
+        group_msgs.iter().any(|m| m.kind == MessageKind::System),
+        "expected creation system message in new group: {group_msgs:?}"
+    );
+
+    // 2. Create a public broadcast channel with description and public @username.
+    let Response::Conversation { conversation: pub_chan } = world.ask(Request::CreateChannel {
+        space: Key::new(&account, ""),
+        name: "Trail Bulletins".into(),
+        kind: ConversationKind::Channel,
+        private: false,
+        group: None,
+        description: Some("Weekly snowpack updates".into()),
+        username: Some("@trail_bulletins".into()),
+    }) else {
+        panic!("expected Conversation from public CreateChannel");
+    };
+    assert_eq!(pub_chan.title, "Trail Bulletins");
+    assert_eq!(pub_chan.kind, ConversationKind::Channel);
+    assert!(pub_chan.rights.add_members);
+    assert_eq!(world.called("CreateChannel Trail Bulletins broadcast=true megagroup=false about=Weekly snowpack updates"), 1);
+    assert_eq!(world.called("ChannelCheckUsername trail_bulletins"), 1);
+    assert!(
+        world.calls().iter().any(|c| c.starts_with("ChannelUpdateUsername") && c.ends_with(" trail_bulletins")),
+        "{:#?}",
+        world.calls()
+    );
+
+    // 3. Create a private channel (must not claim a public username).
+    let Response::Conversation { conversation: priv_chan } = world.ask(Request::CreateChannel {
+        space: Key::new(&account, ""),
+        name: "Private Log".into(),
+        kind: ConversationKind::Channel,
+        private: true,
+        group: None,
+        description: None,
+        username: Some("should_be_ignored".into()),
+    }) else {
+        panic!("expected Conversation from private CreateChannel");
+    };
+    assert_eq!(priv_chan.title, "Private Log");
+    assert_eq!(world.called("ChannelCheckUsername should_be_ignored"), 0);
+
+    // 4. Add a member to a basic group and to the new channel.
+    assert_eq!(
+        world.ask(Request::MembersAdd {
+            conversation: key("g8001"),
+            people: vec!["u7002".into()],
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.called("AddChatUser g8001 u7002"), 1);
+
+    assert_eq!(
+        world.ask(Request::MembersAdd {
+            conversation: pub_chan.key.clone(),
+            people: vec!["u7002".into()],
+        }),
+        Response::Ok
+    );
+    assert!(
+        world.calls().iter().any(|c| c.starts_with("InviteToChannel ") && c.contains("[7002]")),
+        "{:#?}",
+        world.calls()
+    );
+
+    // 5. Missing invitees (privacy-restricted person u7005) produce a clear refusal suggesting an invite link.
+    let privacy = world.ask(Request::MembersAdd {
+        conversation: pub_chan.key.clone(),
+        people: vec!["u7005".into()],
+    });
+    assert!(
+        matches!(privacy, Response::Error { code: ErrorCode::Refused, ref detail } if detail.contains("invite link")),
+        "expected privacy refusal naming invite link, got {privacy:?}"
+    );
+}
+
+#[test]
+fn invite_links_join_preview_revoke_and_join_requests() {
+    let world = World::signed_in();
+    world.connected();
+
+    let account = key("u7001").account();
+
+    // 1. Preview a normal Telegram invite link without joining.
+    let Response::InvitePreview { preview } = world.ask(Request::InvitePreview {
+        account: account.clone(),
+        code: "https://t.me/+alpine_invite".into(),
+    }) else {
+        panic!("expected InvitePreview");
+    };
+    assert_eq!(preview.name, "Alpine Club");
+    assert_eq!(preview.members, Some(128));
+    assert!(!preview.request_needed);
+    assert_eq!(world.called("CheckChatInvite alpine_invite"), 1);
+
+    // 2. Join via the invite link: calls ImportChatInvite and records the new channel row.
+    let Response::InviteJoined { space, conversation, pending } = world.ask(Request::InviteJoin {
+        account: account.clone(),
+        code: "https://t.me/+alpine_invite".into(),
+    }) else {
+        panic!("expected InviteJoined");
+    };
+    assert_eq!(space, None);
+    assert_eq!(conversation, Some(key("c9201")));
+    assert!(!pending);
+    assert_eq!(world.called("ImportChatInvite alpine_invite"), 1);
+    let joined_row = world.conversation("c9201").expect("joined channel row recorded");
+    assert_eq!(joined_row.title, "Alpine Club");
+
+    // 3. Approval-gated invite link: preview sets request_needed, join reports pending=true on INVITE_REQUEST_SENT.
+    let Response::InvitePreview { preview: gated } = world.ask(Request::InvitePreview {
+        account: account.clone(),
+        code: "https://t.me/joinchat/approval_invite".into(),
+    }) else {
+        panic!("expected gated InvitePreview");
+    };
+    assert!(gated.request_needed);
+    let Response::InviteJoined { pending: req_sent, .. } = world.ask(Request::InviteJoin {
+        account: account.clone(),
+        code: "https://t.me/+approval_invite".into(),
+    }) else {
+        panic!("expected pending InviteJoined");
+    };
+    assert!(req_sent);
+
+    // 4. Expired invite returns a clear Refused error.
+    let expired = world.ask(Request::InvitePreview {
+        account: account.clone(),
+        code: "https://t.me/+expired_invite".into(),
+    });
+    assert!(
+        matches!(expired, Response::Error { code: ErrorCode::Refused, ref detail } if detail.contains("expired")),
+        "{expired:?}"
+    );
+
+    // 5. Admin invite management: create, list active, revoke, list revoked.
+    let Response::ChatInvite { invite: created } = world.ask(Request::CreateInvite {
+        conversation: key("g8001"),
+        title: Some("Trail guests".into()),
+        expire_date: Some(1_900_000_000),
+        usage_limit: Some(10),
+        request_needed: false,
+    }) else {
+        panic!("expected ChatInvite from CreateInvite");
+    };
+    assert!(created.link.starts_with("https://t.me/+"));
+    assert!(!created.revoked);
+    assert_eq!(created.usage_limit, Some(10));
+
+    let Response::ChatInvites { invites: active, .. } = world.ask(Request::ChatInvites {
+        conversation: key("g8001"),
+        revoked: false,
+    }) else {
+        panic!("expected ChatInvites");
+    };
+    assert!(active.iter().any(|i| i.link == created.link), "{active:?}");
+
+    let Response::ChatInvite { invite: revoked } = world.ask(Request::RevokeInvite {
+        conversation: key("g8001"),
+        link: created.link.clone(),
+    }) else {
+        panic!("expected ChatInvite from RevokeInvite");
+    };
+    assert!(revoked.revoked);
+
+    // 6. Admin join request management: list requests, approve one, decline remaining.
+    let Response::JoinRequests { requests, .. } = world.ask(Request::JoinRequests {
+        conversation: key("g8001"),
+        link: None,
+        limit: 50,
+    }) else {
+        panic!("expected JoinRequests");
+    };
+    assert_eq!(requests.len(), 2, "{requests:?}");
+
+    assert_eq!(
+        world.ask(Request::HandleJoinRequest {
+            conversation: key("g8001"),
+            user_id: Some("u7002".into()),
+            approved: true,
+            link: None,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.called("HideChatJoinRequest g8001 u7002 approved=true"), 1);
+
+    assert_eq!(
+        world.ask(Request::HandleJoinRequest {
+            conversation: key("g8001"),
+            user_id: None,
+            approved: false,
+            link: None,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.called("HideAllChatJoinRequests g8001 approved=false"), 1);
+
+    let Response::JoinRequests { requests: after, .. } = world.ask(Request::JoinRequests {
+        conversation: key("g8001"),
+        link: None,
+        limit: 50,
+    }) else {
+        panic!("expected empty JoinRequests");
+    };
+    assert!(after.is_empty());
+}
+
+#[test]
+fn a_search_previews_a_public_channel_until_it_is_joined() {
+    let world = World::signed_in();
+    world.connected();
+
+    // A link is not a join target. The private-invite path is separate, and this must not subscribe.
+    let joins = world.called("JoinChannel");
+    let link = world.ask(Request::Join { conversation: key("https://t.me/larchpress") });
+    assert!(matches!(link, Response::Error { code: ErrorCode::Refused, .. }), "{link:?}");
+    assert_eq!(world.called("JoinChannel"), joins);
+
+    let search = |query: &str| Request::People {
+        network: Some(Network::Telegram), relation: None, query: Some(query.into()), offset: 0, limit: 20,
+    };
+    world.ask(search("larch"));
+    world.until("the channel search", || world.calls().contains(&"contacts.Search larch".to_owned()).then_some(()));
+    let larch = world.until("the channel preview", || {
+        world.conversation("c9010").filter(|row| row.title == "Larch Press" && !row.joined)
+    });
+    assert_eq!(larch.kind, ConversationKind::Channel);
+    let trail = world.until("the group preview", || {
+        world.conversation("c9014").filter(|row| row.title == "Larch Trail" && row.kind == ConversationKind::Group && !row.joined)
+    });
+    assert_eq!(trail.title, "Larch Trail");
+
+    let Response::Conversation { conversation: preview } = world.ask(Request::PreviewChannel { conversation: key("c9010") }) else {
+        panic!("expected a preview");
+    };
+    assert!(!preview.joined);
+    assert!(world.messages("c9010").iter().any(|message| message.text == "The ridge is clear."));
+    assert!(world.calls().iter().any(|call| call.starts_with("GetHistory c9010")));
+
+    let Response::Conversation { conversation: joined } = world.ask(Request::Join { conversation: key("c9010") }) else {
+        panic!("expected the joined channel");
+    };
+    assert!(joined.joined);
+    assert_eq!(joined.title, "Larch Press");
+    assert_eq!(world.called("JoinChannel c9010"), 1);
+    assert!(world.calls().iter().any(|call| call == "GetChannelRecommendations c9010"));
+    let similar = world.conversation("c9013").expect("a similar channel stays a preview");
+    assert_eq!((similar.title.as_str(), similar.joined), ("Similar Peaks", false));
+    assert!(!world.conversation("c9014").expect("the group was not joined").joined);
+
+    world.ask(search("shelf"));
+    world.until("the full channel search", || world.calls().contains(&"contacts.Search shelf".to_owned()).then_some(()));
+    world.until("the full channel preview", || world.conversation("c9012").filter(|row| row.title == "Full Shelf" && !row.joined).map(drop));
+    let full = world.ask(Request::Join { conversation: key("c9012") });
+    assert!(
+        matches!(full, Response::Error { code: ErrorCode::Refused, ref detail } if detail == "This account can't join any more channels."),
+        "{full:?}"
+    );
+    assert!(!world.conversation("c9012").expect("still a preview").joined);
+
+    world.ask(search("closed"));
+    world.until("the closed group search", || world.calls().contains(&"contacts.Search closed".to_owned()).then_some(()));
+    world.until("the closed group preview", || world.conversation("c9011").filter(|row| row.title == "Closed Ridge" && !row.joined).map(drop));
+    let closed = world.ask(Request::Join { conversation: key("c9011") });
+    assert!(
+        matches!(closed, Response::Error { code: ErrorCode::Refused, ref detail } if detail == "Request sent."),
+        "{closed:?}"
+    );
+    assert!(!world.conversation("c9011").expect("a request does not join").joined);
+}

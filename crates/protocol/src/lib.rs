@@ -1630,6 +1630,10 @@ pub enum Request {
         private: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         group: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        username: Option<String>,
     },
     /// Starts a new group conversation with two or more members (by person id or phone number)
     /// and an optional group name. Answers `Response::Conversation`.
@@ -1855,9 +1859,10 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         clear_at: Option<i64>,
     },
-    /// Our own profile on one account. `None` leaves that part. An empty about or emoji clears
-    /// it. A username, or `photo`, is refused: those are still changed on the phone. Signal is
-    /// the account that accepts a name, about, and about emoji.
+    /// Our own profile on one account. `None` leaves that part. An empty about, emoji,
+    /// username, or birthday clears it where supported. Signal accepts name, about, and about
+    /// emoji (refusing username/photo); Telegram accepts name, about, username, emoji status,
+    /// and birthday (and uses `SetAvatar` for profile photos).
     SetProfile {
         account: AccountKey,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1870,6 +1875,8 @@ pub enum Request {
         emoji: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         username: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        birthday: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         photo: bool,
     },
@@ -1900,10 +1907,50 @@ pub enum Request {
         account: AccountKey,
         code: String,
     },
-    /// Join a Space from an invite link or code (e.g. Discord `POST /invites/{code}`).
+    /// Join a Space or chat from an invite link or code (Discord `POST /invites/{code}`, Telegram `messages.importChatInvite`).
     InviteJoin {
         account: AccountKey,
         code: String,
+    },
+    /// Lists exported invite links for a group or channel (Telegram `messages.getExportedChatInvites`).
+    ChatInvites {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "is_false")]
+        revoked: bool,
+    },
+    /// Creates a new invite link for a group or channel (Telegram `messages.exportChatInvite`).
+    CreateInvite {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expire_date: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage_limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        request_needed: bool,
+    },
+    /// Revokes an exported invite link (Telegram `messages.editExportedChatInvite { revoked: true }`).
+    RevokeInvite {
+        conversation: Key,
+        link: String,
+    },
+    /// Lists pending join requests (or importers) for a group or channel (Telegram `messages.getChatInviteImporters`).
+    JoinRequests {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link: Option<String>,
+        #[serde(default)]
+        limit: u32,
+    },
+    /// Approves or declines one pending join request (`user_id: Some(..)`) or all pending requests (`user_id: None`).
+    HandleJoinRequest {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_id: Option<String>,
+        approved: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link: Option<String>,
     },
     Watch(Watching),
 
@@ -2077,6 +2124,19 @@ pub enum Request {
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         spans: Vec<Span>,
+    },
+    /// Replaces the photo or file on one of our own sent messages, with an optional updated
+    /// caption and formatting spans (Telegram `messages.editMessage` with `media`).
+    EditMedia {
+        conversation: Key,
+        message_id: String,
+        file: OutgoingFile,
+        #[serde(default)]
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        spans: Vec<Span>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        invert_media: bool,
     },
     /// Deletes a message. `scope` defaults to `Everyone` (so older shells keep working);
     /// `Me` removes it on this user's side only (Telegram, Signal, Google Messages).
@@ -3257,6 +3317,20 @@ pub enum Response {
         space: Option<Key>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conversation: Option<Key>,
+        /// True when joining submitted a pending join request (`INVITE_REQUEST_SENT`) awaiting admin approval.
+        #[serde(default, skip_serializing_if = "is_false")]
+        pending: bool,
+    },
+    ChatInvites {
+        conversation: Key,
+        invites: Vec<ChatInviteLink>,
+    },
+    ChatInvite {
+        invite: ChatInviteLink,
+    },
+    JoinRequests {
+        conversation: Key,
+        requests: Vec<JoinRequest>,
     },
     Pinned {
         conversation: Key,

@@ -247,6 +247,7 @@ pub fn hits(query: &str, conversations: &[Rc<Conversation>], spaces: &[Space], p
     let mut seen: std::collections::HashSet<&Key> = std::collections::HashSet::new();
     let ours = |key: &Key| network.is_none_or(|network| key.network == network);
     let mut chats: Vec<(u32, i64, Hit)> = Vec::new();
+    let mut discovered: Vec<(u32, i64, Hit)> = Vec::new();
     for c in conversations.iter().filter(|c| seen.insert(&c.key) && ours(&c.key)) {
         // `#` leaves out people; `@` leaves out everything else.
         if (only_channels && c.kind.is_direct()) || (only_people && !c.kind.is_direct()) || c.kind == ConversationKind::Thread {
@@ -258,7 +259,10 @@ pub fn hits(query: &str, conversations: &[Rc<Conversation>], spaces: &[Space], p
         if let Some((score, matched)) = match_person(typed, &c.title, peer.map_or("", |p| p.handle.as_str())) {
             let badge = c.badge();
             let lift = rank::boost(matches!(badge, Badge::Count(_)), badge != Badge::None, c.kind.is_direct(), c.updated, now);
-            chats.push((score + lift, c.updated, conversation_hit(c, matched, None)));
+            let hit = (score + lift, c.updated, conversation_hit(c, matched, None));
+            // A Telegram search hit stays out of the chat list until the user joins it.
+            let preview = c.key.network == Network::Telegram && !c.joined && !c.kind.is_direct();
+            if preview { discovered.push(hit) } else { chats.push(hit) }
         }
     }
     let mut places: Vec<(u32, i64, Hit)> = Vec::new();
@@ -300,9 +304,10 @@ pub fn hits(query: &str, conversations: &[Rc<Conversation>], spaces: &[Space], p
         group.truncate(most);
     };
     rank(&mut chats, CONVERSATIONS);
+    rank(&mut discovered, CONVERSATIONS);
     rank(&mut folk, PEOPLE);
     rank(&mut places, SPACES);
-    let mut groups: Vec<(&'static str, Ranked)> = vec![("Conversations", chats), ("People", folk), ("Spaces", places)];
+    // "Asking…" stays with People. The new section is only chats the account has not joined.
     if !asking.is_empty() && !only_channels {
         let names: Vec<&str> = asking.iter().map(|n| n.label()).collect();
         let words = match names.split_last() {
@@ -311,8 +316,14 @@ pub fn hits(query: &str, conversations: &[Rc<Conversation>], spaces: &[Space], p
             None => String::new(),
         };
         let hit = Hit { title: words.clone(), context: String::new(), matched: Vec::new(), target: Target::Asking(words), section: None, trailing: None };
-        groups[1].1.push((0, 0, hit));
+        folk.push((0, 0, hit));
     }
+    let mut groups: Vec<(&'static str, Ranked)> = vec![
+        ("Conversations", chats),
+        ("Channels and groups", discovered),
+        ("People", folk),
+        ("Spaces", places),
+    ];
     groups.sort_by_key(|(_, group)| std::cmp::Reverse(group.iter().map(|(score, ..)| *score).max().unwrap_or(0)));
     let mut rows = Vec::new();
     for (label, group) in groups {
@@ -590,25 +601,10 @@ impl Shell {
             return;
         }
         let name = narrowed(&query).1.trim_start_matches(['#', '@']).to_owned();
-        switcher.found_asked += 1;
         switcher.people_asked += 1;
         switcher.asking.clear();
-        let (found_asked, people_asked) = (switcher.found_asked, switcher.people_asked);
-        let find = Request::Find { network: narrowed(&query).0, query: name.clone(), limit: FOUND };
-        self.off_thread(cx, move || ask(&find), move |this, answer, cx| {
-            let Some(switcher) = this.sidebar_state.switcher.as_mut().filter(|switcher| switcher.found_asked == found_asked) else {
-                return;
-            };
-            match answer {
-                Ok(Response::Conversations { conversations, .. }) if !conversations.is_empty() || !name_is_empty(&switcher.input, cx) => {
-                    switcher.conversations = conversations.into_iter().map(Rc::new).collect();
-                    switcher.down = false;
-                }
-                Ok(_) => switcher.down = false,
-                Err(_) => switcher.down = true,
-            }
-            this.rehit(true, cx);
-        });
+        let people_asked = switcher.people_asked;
+        self.find_typed(cx);
         if name.chars().count() < SEARCH_MIN_CHARS || query.starts_with('#') {
             return;
         }
@@ -666,7 +662,39 @@ impl Shell {
         let query = switcher.input.read(cx).text().trim().to_owned();
         let (narrow, name) = people_query(&query);
         let (name, asked) = (name.to_owned(), switcher.people_asked);
+        // The first find ran before this search stored its previews.
+        self.find_typed(cx);
         self.ask_people(name, narrow, asked, cx);
+    }
+
+    /// The store's matches for what is typed. A finished network search calls it again: a
+    /// public channel is a row only after that search, and the first find could not see it.
+    fn find_typed(&mut self, cx: &mut Context<Self>) {
+        let Some(switcher) = &mut self.sidebar_state.switcher else {
+            return;
+        };
+        let query = switcher.input.read(cx).text().trim().to_owned();
+        if query.starts_with('>') {
+            return;
+        }
+        let name = narrowed(&query).1.trim_start_matches(['#', '@']).to_owned();
+        switcher.found_asked += 1;
+        let found_asked = switcher.found_asked;
+        let find = Request::Find { network: narrowed(&query).0, query: name, limit: FOUND };
+        self.off_thread(cx, move || ask(&find), move |this, answer, cx| {
+            let Some(switcher) = this.sidebar_state.switcher.as_mut().filter(|switcher| switcher.found_asked == found_asked) else {
+                return;
+            };
+            match answer {
+                Ok(Response::Conversations { conversations, .. }) if !conversations.is_empty() || !name_is_empty(&switcher.input, cx) => {
+                    switcher.conversations = conversations.into_iter().map(Rc::new).collect();
+                    switcher.down = false;
+                }
+                Ok(_) => switcher.down = false,
+                Err(_) => switcher.down = true,
+            }
+            this.rehit(true, cx);
+        });
     }
 
     fn move_pick(&mut self, down: bool, cx: &mut Context<Self>) {
@@ -1263,6 +1291,41 @@ mod tests {
 
     fn person(id: &str) -> Person {
         Person { relation: Relation::Friend, ..Person::new(key(id), id) }
+    }
+
+    fn section_of<'a>(hits: &'a [Hit], title: &str) -> Option<&'a str> {
+        let mut current = None;
+        for hit in hits {
+            if let Some(section) = hit.section {
+                current = Some(section);
+            }
+            if hit.title == title {
+                return current;
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn an_unjoined_telegram_chat_is_listed_under_channels_and_groups() {
+        let telegram = |id: &str, kind, title: &str, joined: bool| {
+            let mut row = Conversation::new(Key { network: Network::Telegram, account: "7001".into(), id: id.into() }, kind, title);
+            row.joined = joined;
+            Rc::new(row)
+        };
+        let mut discord = Conversation::new(Key { network: Network::Discord, account: "me".into(), id: "general".into() }, ConversationKind::Channel, "Notes lounge");
+        discord.joined = false;
+        let rows = vec![
+            telegram("c1", ConversationKind::Channel, "Notes desk", false),
+            telegram("c2", ConversationKind::Group, "Notes trail", false),
+            telegram("c3", ConversationKind::Channel, "Notes crew", true),
+            Rc::new(discord),
+        ];
+        let found = hits("notes", &rows, &[], &[], &[], false, 100);
+        assert_eq!(section_of(&found, "Notes desk"), Some("Channels and groups"));
+        assert_eq!(section_of(&found, "Notes trail"), Some("Channels and groups"));
+        assert_eq!(section_of(&found, "Notes crew"), Some("Conversations"));
+        assert_eq!(section_of(&found, "Notes lounge"), Some("Conversations"));
     }
 
     #[test]

@@ -814,6 +814,32 @@ impl Shell {
                             }))
                             .into_any_element(),
                     );
+                } else if network == Network::Telegram {
+                    if let Some(account) = snapshot
+                        .accounts
+                        .iter()
+                        .find(|a| a.key.network == Network::Telegram && a.link == Link::Connected)
+                        .map(|a| a.key.clone())
+                    {
+                        let join_account = account.clone();
+                        items.push(menu_separator().into_any_element());
+                        items.push(
+                            menu_item("tg-new-channel", Some("icons/plus.svg"), "New channel…", None)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.open_create_channel(Key::new(&account, ""), None, cx);
+                                }))
+                                .into_any_element(),
+                        );
+                        items.push(
+                            menu_item("tg-join-invite", Some("icons/log-in.svg"), "Join by invite link…", None)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.open_join_invite(join_account.clone(), None, cx);
+                                }))
+                                .into_any_element(),
+                        );
+                    }
                 } else if let Some(account) = snapshot
                     .accounts
                     .iter()

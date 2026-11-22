@@ -454,6 +454,9 @@ struct Editing {
     id: String,
     /// The message as it was put in the field: saving this unchanged is a cancel.
     original: String,
+    /// The message being edited carries media (photo/file), so an empty caption is allowed
+    /// and networks with `Capabilities::edit_media` may replace the attachment.
+    has_media: bool,
     /// What was in the field before, and the reply it was for. Back on save or cancel.
     stash: Draft,
     reply: Option<Reply>,
@@ -542,6 +545,12 @@ pub struct Composer {
     /// One line under the card, until the text changes: why something did not happen.
     caption: Option<(String, Tone)>,
     sending: bool,
+    /// A join is already on its way. Another click does not send a second one.
+    joining: bool,
+    /// Which click `joining` belongs to. A late answer for an older click does not clear a newer one.
+    join_epoch: u64,
+    /// The conversation just joined, until the user leaves it or undoes the join.
+    undo_join: Option<Key>,
     /// The conversation the network was last told we are typing in, and when.
     told_typing: Option<(Key, Instant)>,
     list: Option<List>,
@@ -684,6 +693,9 @@ impl Composer {
             editing: None,
             caption: None,
             sending: false,
+            joining: false,
+            join_epoch: 0,
+            undo_join: None,
             told_typing: None,
             list: None,
             dismissed: None,
@@ -740,7 +752,13 @@ impl Composer {
 
     fn controls(&self) -> Controls {
         match &self.target {
-            Some(target) => controls(&target.can, self.editing.is_some()),
+            Some(target) => {
+                let mut c = controls(&target.can, self.editing.is_some());
+                if target.can.edit_media && target.can.max_file_bytes > 0 && self.editing.as_ref().is_some_and(|e| e.has_media) {
+                    c.attach = true;
+                }
+                c
+            }
             None => Controls::default(),
         }
     }
@@ -768,6 +786,8 @@ impl Composer {
             self.reply = draft.reply;
             self.caption = self.scan_caption_for(&target.key).or(note);
             self.sending = false;
+            self.joining = false;
+            self.undo_join = None;
             self.no_preview = false;
             self.broadcast = false;
             self.armed = None;
@@ -1623,9 +1643,19 @@ impl Composer {
                 chip
             })
             .collect();
+        let editing_media = here && self.editing.as_ref().is_some_and(|e| e.has_media) && can.edit_media;
+        let incoming: Vec<Staged> = if editing_media {
+            incoming.into_iter().take(1).collect()
+        } else {
+            incoming
+        };
         let converting: Vec<(u64, PathBuf)> = incoming.iter().filter(|chip| chip.converting).map(|chip| (chip.id, chip.path.clone())).collect();
         let kept: Vec<u64> = incoming.iter().map(|chip| chip.id).collect();
         let turned_away: Vec<PathBuf> = incoming.iter().skip(attach::most(&can).saturating_sub(room)).filter(|chip| chip.owned).map(|chip| chip.path.clone()).collect();
+        if editing_media && !incoming.is_empty() {
+            let replaced: Vec<PathBuf> = self.tray.drain(..).filter(|chip| chip.owned).map(|chip| chip.path).collect();
+            delete_later(replaced);
+        }
         let destination = if here {
             &mut self.tray
         } else {
@@ -2323,7 +2353,8 @@ impl Composer {
             }
         };
         let (text, tokens) = mention::source(message);
-        self.editing = Some(Editing { id: message.id.clone(), original: text.clone(), stash, reply });
+        let has_media = !message.attachments.is_empty();
+        self.editing = Some(Editing { id: message.id.clone(), original: text.clone(), has_media, stash, reply });
         self.set_field(&Draft { text, subject: String::new(), tokens, files: Vec::new(), note: None, reply: None }, cx);
         self.close_picker(cx);
         self.caption = None;
@@ -2363,7 +2394,8 @@ impl Composer {
             return;
         };
         self.set_field(&editing.stash, cx);
-        self.tray = editing.stash.files;
+        let replaced = std::mem::replace(&mut self.tray, editing.stash.files);
+        delete_later(replaced.into_iter().filter(|chip| chip.owned).map(|chip| chip.path).collect());
         self.reply = editing.reply;
         self.refresh_placeholder(cx);
         self.caption = None;
@@ -2399,16 +2431,19 @@ impl Composer {
     }
 
     fn save_edit(&mut self, target: &Target, cx: &mut Context<Self>) {
-        let Some((id, original)) = self.editing.as_ref().map(|editing| (editing.id.clone(), editing.original.clone())) else {
+        let Some((id, original, has_media)) =
+            self.editing.as_ref().map(|editing| (editing.id.clone(), editing.original.clone(), editing.has_media))
+        else {
             return;
         };
         self.follow_text(cx);
         let field = self.input.read(cx).text().to_owned();
-        if field.trim() == original.trim() {
+        let replacement = self.tray.iter().filter_map(Staged::outgoing).next();
+        if replacement.is_none() && field.trim() == original.trim() {
             self.end_edit(cx);
             return;
         }
-        if field.trim().is_empty() {
+        if replacement.is_none() && !has_media && field.trim().is_empty() {
             self.caption = Some(("A message can't be saved empty. Delete it from its menu instead.".to_owned(), Tone::Note));
             cx.notify();
             return;
@@ -2418,16 +2453,27 @@ impl Composer {
         }
         let key = target.key.clone();
         let (wire, spans) = length::wire_with_spans(&field, &self.tokens, &target.can, false);
-        if let Some(words) = length::edit_refusal(wire.chars().count(), target.can.text_limit) {
+        let limit = if has_media || replacement.is_some() { target.can.caption_limit } else { target.can.text_limit };
+        if let Some(words) = length::edit_refusal(wire.chars().count(), limit) {
             self.caption = Some((words, Tone::Refused));
             cx.notify();
             return;
         }
-        let request = Request::Edit {
-            conversation: key.clone(),
-            message_id: id.clone(),
-            text: wire,
-            spans,
+        let request = match replacement {
+            Some(file) => Request::EditMedia {
+                conversation: key.clone(),
+                message_id: id.clone(),
+                file,
+                text: wire,
+                spans,
+                invert_media: false,
+            },
+            None => Request::Edit {
+                conversation: key.clone(),
+                message_id: id.clone(),
+                text: wire,
+                spans,
+            },
         };
         self.sending = true;
         cx.notify();
@@ -2757,11 +2803,68 @@ impl Composer {
         let _ = self.shell.update(cx, |shell, cx| shell.sign_in(network, cx));
     }
 
+    /// Subscribe on a Telegram channel. Join on a Telegram group. Other networks keep the old label.
+    fn join_label(network: Network, kind: ConversationKind) -> &'static str {
+        match (network, kind) {
+            (Network::Telegram, ConversationKind::Channel | ConversationKind::Announcement) => "Subscribe",
+            (Network::Telegram, _) => "Join",
+            _ => "Join channel",
+        }
+    }
+
+    /// A join finished. Success offers one Undo, which leaves. A refusal stays on the preview.
+    fn note_join(&mut self, conversation: Key, answer: std::io::Result<Response>, cx: &mut Context<Self>) {
+        if self.target.as_ref().is_none_or(|target| target.key != conversation) {
+            return;
+        }
+        match answer {
+            Ok(Response::Ok | Response::Conversation { .. }) => self.undo_join = Some(conversation),
+            Ok(Response::Error { detail, .. }) => self.caption = Some((detail, Tone::Refused)),
+            _ => self.caption = Some(("Telegram did not confirm the join.".to_owned(), Tone::Refused)),
+        }
+        cx.notify();
+    }
+
+    /// One click undoes a join that just succeeded. Moving to another conversation clears it.
+    fn undo_join_bar(&self, target: &Target, cx: &mut Context<Self>) -> Option<Div> {
+        let key = self.undo_join.clone().filter(|key| key == &target.key)?;
+        let word = match target.kind {
+            ConversationKind::Channel | ConversationKind::Announcement => "Subscribed",
+            _ => "Joined",
+        };
+        Some(
+            div()
+                .h(px(28.))
+                .mb(px(6.))
+                .px(px(12.))
+                .rounded(px(theme::R_FLOAT))
+                .border_1()
+                .border_color(theme::border())
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .type_ui()
+                .text_color(theme::text_soft())
+                .child(div().flex_1().child(word))
+                .child(button("undo-join", ButtonKind::Secondary, "Undo").on_click(cx.listener(move |this, _, _, cx| {
+                    if this.undo_join.as_ref() != Some(&key) {
+                        return;
+                    }
+                    this.undo_join = None;
+                    let conversation = key.clone();
+                    ask_later(cx, Request::Leave { conversation }, |_, _| {});
+                    cx.notify();
+                }))),
+        )
+    }
+
     /// The 40 pt bar that stands where the card would be.
     fn bar(&self, locked: Locked, network: Network, cx: &mut Context<Self>) -> Div {
         if matches!(locked, Locked::NotJoined) {
             let key = self.target.as_ref().map(|t| t.key.clone());
+            let kind = self.target.as_ref().map(|t| t.kind).unwrap_or(ConversationKind::Channel);
             let title = self.target.as_ref().map(|t| t.title.clone()).unwrap_or_else(|| "this channel".to_owned());
+            let label = Self::join_label(network, kind);
             return div()
                 .h(px(card_height()))
                 .pl(px(12.))
@@ -2777,10 +2880,26 @@ impl Composer {
                 .child(glyph("icons/hash.svg", 16., theme::text_faint()))
                 .child(div().flex_1().min_w_0().truncate().child(format!("Previewing {title}")))
                 .child(
-                    button("join-channel", ButtonKind::Primary, "Join channel").on_click(cx.listener(move |_, _, _, cx| {
-                        if let Some(conversation) = key.clone() {
-                            ask_later(cx, Request::Join { conversation }, |_, _| {});
+                    button("join-channel", ButtonKind::Primary, label).on_click(cx.listener(move |this, _, _, cx| {
+                        if this.joining {
+                            return;
                         }
+                        let Some(conversation) = key.clone() else { return };
+                        this.join_epoch = this.join_epoch.wrapping_add(1);
+                        let epoch = this.join_epoch;
+                        this.joining = true;
+                        let joined = conversation.clone();
+                        let entity = cx.weak_entity();
+                        ask_later(cx, Request::Join { conversation }, move |answer, cx| {
+                            let _ = entity.update(cx, |this, cx| {
+                                // A newer click, or a click after this one was superseded, owns the guard.
+                                if this.join_epoch != epoch {
+                                    return;
+                                }
+                                this.joining = false;
+                                this.note_join(joined, answer, cx);
+                            });
+                        });
                     })),
                 );
         }
@@ -3011,10 +3130,30 @@ impl Composer {
                 cx.notify();
             }))
             .child(glyph("icons/x.svg", 14., theme::text_soft()));
-        if self.editing.is_some() {
+        if let Some(editing) = &self.editing {
+            let can_replace = editing.has_media && self.target.as_ref().is_some_and(|t| t.can.edit_media && t.can.max_file_bytes > 0);
+            let replace_btn = can_replace.then(|| {
+                div()
+                    .id("edit-replace-file")
+                    .flex_none()
+                    .h(px(if phone { 32. } else { 22. }))
+                    .px(px(6.))
+                    .rounded(px(theme::R_CONTROL))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::hover()))
+                    .font_weight(theme::MEDIUM)
+                    .text_color(theme::accent_text())
+                    .child("Replace file")
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|this, _, _, cx| this.attach_files(cx)))
+            });
             return Some(
                 bar.child(glyph("icons/pencil.svg", 14., theme::accent_text()))
                     .child(strong("Editing message".to_owned()))
+                    .children(replace_btn)
                     .child(div().flex_1())
                     // A phone's keyboard has no Esc, and its Return is the send button.
                     .when(!phone, |bar| bar.child(div().flex_none().text_color(theme::text_faint()).child("Return to save · Esc to cancel")))
@@ -3244,7 +3383,8 @@ impl Composer {
 
     fn card(&mut self, focused: bool, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let controls = self.controls();
-        let ready = !self.sending && !self.scan_blocks_current() && (!self.input.read(cx).text().trim().is_empty() || !self.tray.is_empty());
+        let editing_media = self.editing.as_ref().is_some_and(|e| e.has_media);
+        let ready = !self.sending && !self.scan_blocks_current() && (editing_media || !self.input.read(cx).text().trim().is_empty() || !self.tray.is_empty());
         let focus = self.input.focus_handle(cx);
         let open_tab = self.picking.as_ref().map(|picking| picking.picker.read(cx).tab());
         let send_icon = if self.editing.is_some() { "icons/check.svg" } else { "icons/send-horizontal.svg" };
@@ -3803,7 +3943,7 @@ impl Composer {
             }
         } else if staged("edit") {
             let original = "Sounds good. I'll keep the consumers paused until it finishes.";
-            self.editing = Some(Editing { id: "1".into(), original: original.into(), stash: Draft::default(), reply: None });
+            self.editing = Some(Editing { id: "1".into(), original: original.into(), has_media: false, stash: Draft::default(), reply: None });
             self.set_field(&field(original, Vec::new()), cx);
         } else if staged("complete") {
             let person = |name: &str, handle: &str, presence| Person {
@@ -4129,6 +4269,7 @@ impl Render for Composer {
         let Some(target) = self.target.clone() else {
             return dock;
         };
+        let undo = self.undo_join_bar(&target, cx);
         let body = match target.locked() {
             Some(locked) => self.bar(locked, target.key.network, cx),
             None => self.card(focus.is_focused(window), window, cx),
@@ -4139,7 +4280,7 @@ impl Render for Composer {
             .children(self.ooo_banner(&target))
             .children(self.send_options_bar(cx))
             .children(self.poll_composer_panel(cx))
-            .child(div().relative().child(body).children(self.popover(cx)))
+            .child(div().relative().children(undo).child(body).children(self.popover(cx)))
             .children(self.caption_line(&target, cx))
             .children(self.picker_layer(window, cx))
             .children(self.send_menu_layer(window, cx))

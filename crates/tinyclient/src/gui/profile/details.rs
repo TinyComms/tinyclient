@@ -394,6 +394,47 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
         any = true;
         sections = sections.child(draw::label("About", true)).child(div().type_ui().line_clamp(6).child(about));
     }
+    if network == Network::Telegram && row.kind != ConversationKind::Direct {
+        if let Some(url) = link.as_ref().filter(|url| protocol::link::telegram_invite_hash(url).is_some()) {
+            let first = !any;
+            any = true;
+            let shown = url.clone();
+            let copy = url.clone();
+            sections = sections.child(draw::label("Invite link", first)).child(
+                div()
+                    .min_h(px(theme::ROW_ONE))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(shown))
+                    .child(
+                        button("details-invite-copy", ButtonKind::Secondary, "Copy")
+                            .h(px(26.))
+                            .px(px(8.))
+                            .type_small()
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.clone()));
+                            })),
+                    ),
+            );
+        }
+        if let Some(count) = info.map(|info| info.pending_requests).filter(|count| *count > 0) {
+            let first = !any;
+            any = true;
+            sections = sections.child(
+                div()
+                    .h(px(theme::ROW_ONE))
+                    .mt(px(if first { 0. } else { 8. }))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .type_ui()
+                    .text_color(theme::text())
+                    .child(glyph("icons/users.svg", 16., theme::text_soft()))
+                    .child(format!("Requests ({count})")),
+            );
+        }
+    }
     match facts::members_shown(row, info) {
         MembersShown::Inline => {
             let (hub, ..) = pane.parts();

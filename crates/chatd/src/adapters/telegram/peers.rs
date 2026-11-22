@@ -247,11 +247,16 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                 &chat.default_banned_rights,
                 Some(tl::enums::ChatBannedRights::Rights(r)) if r.pin_messages
             );
+            let invite_banned = matches!(
+                &chat.default_banned_rights,
+                Some(tl::enums::ChatBannedRights::Rights(r)) if r.invite_users
+            );
             let active = !chat.left && !chat.deactivated;
             let rights = protocol::ConversationRights {
                 pin: active && (chat.creator || admin.is_some_and(|r| r.pin_messages) || !pin_banned),
                 delete_others: active && (chat.creator || admin.is_some_and(|r| r.delete_messages)),
                 manage_members: active && (chat.creator || admin.is_some_and(|r| r.ban_users || r.invite_users)),
+                add_members: active && (chat.creator || admin.is_some_and(|r| r.invite_users) || !invite_banned),
                 ..protocol::ConversationRights::default()
             };
             let known = Known {
@@ -293,6 +298,13 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
             );
             let topics_banned = banned_active(channel.default_banned_rights.as_ref(), |r| r.manage_topics)
                 || banned_active(channel.banned_rights.as_ref(), |r| r.manage_topics);
+            let invite_banned = matches!(
+                &channel.default_banned_rights,
+                Some(tl::enums::ChatBannedRights::Rights(r)) if r.invite_users
+            ) || matches!(
+                &channel.banned_rights,
+                Some(tl::enums::ChatBannedRights::Rights(r)) if r.invite_users
+            );
             let active = !channel.left;
             let rights = protocol::ConversationRights {
                 pin: active
@@ -304,6 +316,12 @@ fn of_chat(chat: &tl::enums::Chat) -> Option<(Who, Known)> {
                 delete_others: active && (channel.creator || admin.is_some_and(|r| r.delete_messages)),
                 manage_members: active && (channel.creator || admin.is_some_and(|r| r.ban_users || r.invite_users)),
                 manage_topics: active && channel.forum && (channel.creator || admin.is_some_and(|r| r.manage_topics) || !topics_banned),
+                add_members: active
+                    && if channel.broadcast {
+                        channel.creator || admin.is_some_and(|r| r.invite_users)
+                    } else {
+                        channel.creator || admin.is_some_and(|r| r.invite_users) || !invite_banned
+                    },
                 ..protocol::ConversationRights::default()
             };
             let known = Known {
@@ -372,6 +390,18 @@ impl Directory {
     /// People this account has learned, id then what is known of them.
     pub fn users(&self) -> Vec<(i64, Known)> {
         self.map.iter().filter_map(|(who, known)| match who { Who::User(id) => Some((*id, known.clone())), _ => None }).collect()
+    }
+
+    /// Finds a known peer (user or channel) by public username, case-insensitively.
+    pub fn find_by_handle(&self, handle: &str) -> Option<Who> {
+        let bare = handle.trim().trim_start_matches('@');
+        if bare.is_empty() {
+            return None;
+        }
+        self.map
+            .iter()
+            .find(|(_, known)| !known.handle.is_empty() && known.handle.eq_ignore_ascii_case(bare))
+            .map(|(who, _)| *who)
     }
 
     pub fn name(&self, who: Who) -> String {

@@ -1648,7 +1648,9 @@ impl Chat {
         let conversation_id = conversation.id;
         let asked = match text {
             Some(_) if !message.outgoing => return error(ErrorCode::Refused, "Only your own messages can be edited."),
-            Some(text) if text.trim().is_empty() => return error(ErrorCode::Refused, "A message cannot be edited to nothing. Delete it instead."),
+            Some(text) if text.trim().is_empty() && message.attachments.is_empty() => {
+                return error(ErrorCode::Refused, "A message cannot be edited to nothing. Delete it instead.");
+            }
             Some(text) => self.ask(&account, |reply| Command::Edit {
                 conversation_id,
                 message_id,
@@ -1664,6 +1666,48 @@ impl Chat {
             }),
         };
         match asked {
+            Ok(()) => Response::Ok,
+            Err(refused) => *refused,
+        }
+    }
+
+    fn edit_media(
+        &self,
+        conversation: Key,
+        message_id: String,
+        file: protocol::OutgoingFile,
+        text: String,
+        spans: Vec<protocol::Span>,
+        invert_media: bool,
+    ) -> Response {
+        let account = conversation.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let message = match self.hub.store().message(&conversation, &message_id) {
+            Ok(Some(message)) => message,
+            Ok(None) => return error(ErrorCode::NotFound, "no such message"),
+            Err(err) => return internal(err),
+        };
+        if message.state != SendState::Sent {
+            return error(ErrorCode::Refused, "This message was never sent. Discard it instead.");
+        }
+        if !message.outgoing {
+            return error(ErrorCode::Refused, "Only your own messages can be edited.");
+        }
+        if file.path.trim().is_empty() {
+            return error(ErrorCode::Refused, "Choose a file to replace the attachment with.");
+        }
+        let conversation_id = conversation.id;
+        match self.ask(&account, |reply| Command::EditMedia {
+            conversation_id,
+            message_id,
+            file,
+            text,
+            spans,
+            invert_media,
+            reply,
+        }) {
             Ok(()) => Response::Ok,
             Err(refused) => *refused,
         }
@@ -1734,10 +1778,105 @@ impl Chat {
             return error(ErrorCode::Refused, "Enter an invite link or code.");
         }
         match self.ask(&account, |reply| Command::InviteJoin { code, reply }) {
-            Ok((space_id, channel_id)) => Response::InviteJoined {
+            Ok((space_id, channel_id, pending)) => Response::InviteJoined {
                 space: space_id.map(|id| Key::new(&account, id)),
                 conversation: channel_id.map(|id| Key::new(&account, id)),
+                pending,
             },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn chat_invites(&self, conversation: Key, revoked: bool) -> Response {
+        let account = conversation.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let conversation_id = conversation.id.clone();
+        match self.ask(&account, |reply| Command::ChatInvites { conversation_id, revoked, reply }) {
+            Ok(invites) => Response::ChatInvites { conversation, invites },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn create_invite(
+        &self,
+        conversation: Key,
+        title: Option<String>,
+        expire_date: Option<i64>,
+        usage_limit: Option<u32>,
+        request_needed: bool,
+    ) -> Response {
+        let account = conversation.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let conversation_id = conversation.id.clone();
+        match self.ask(&account, |reply| Command::CreateInvite {
+            conversation_id,
+            title,
+            expire_date,
+            usage_limit,
+            request_needed,
+            reply,
+        }) {
+            Ok(invite) => {
+                self.hub.infos.forget(&conversation);
+                Response::ChatInvite { invite }
+            }
+            Err(refused) => *refused,
+        }
+    }
+
+    fn revoke_invite(&self, conversation: Key, link: String) -> Response {
+        let account = conversation.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let link = link.trim().to_owned();
+        if link.is_empty() {
+            return error(ErrorCode::Refused, "No invite link named to revoke.");
+        }
+        let conversation_id = conversation.id.clone();
+        match self.ask(&account, |reply| Command::RevokeInvite { conversation_id, link, reply }) {
+            Ok(invite) => {
+                self.hub.infos.forget(&conversation);
+                Response::ChatInvite { invite }
+            }
+            Err(refused) => *refused,
+        }
+    }
+
+    fn join_requests(&self, conversation: Key, link: Option<String>, limit: u32) -> Response {
+        let account = conversation.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let conversation_id = conversation.id.clone();
+        let limit = if limit == 0 { 50 } else { limit.min(100) };
+        match self.ask(&account, |reply| Command::JoinRequests { conversation_id, link, limit, reply }) {
+            Ok(requests) => Response::JoinRequests { conversation, requests },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn handle_join_request(&self, conversation: Key, user_id: Option<String>, approved: bool, link: Option<String>) -> Response {
+        let account = conversation.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let conversation_id = conversation.id.clone();
+        match self.ask(&account, |reply| Command::HandleJoinRequest {
+            conversation_id,
+            user_id,
+            approved,
+            link,
+            reply,
+        }) {
+            Ok(()) => {
+                self.hub.infos.forget(&conversation);
+                Response::Ok
+            }
             Err(refused) => *refused,
         }
     }
@@ -1829,6 +1968,7 @@ impl Chat {
         pronouns: Option<String>,
         emoji: Option<String>,
         username: Option<String>,
+        birthday: Option<String>,
         photo: bool,
     ) -> Response {
         if account.network == Network::Signal {
@@ -1853,7 +1993,15 @@ impl Chat {
         if let Err(refused) = self.online(&account) {
             return *refused;
         }
-        match self.ask(&account, |reply| Command::SetProfile { name, about, pronouns, reply }) {
+        match self.ask(&account, |reply| Command::SetProfile {
+            name,
+            about,
+            pronouns,
+            username,
+            emoji,
+            birthday,
+            reply,
+        }) {
             Ok(()) => {
                 self.forget_own_profile(&account, None);
                 Response::Ok
@@ -2003,6 +2151,7 @@ impl Chat {
             external: about.external,
             link: about.link,
             bookmarks: about.bookmarks,
+            pending_requests: about.pending_requests,
         };
         clip(&mut info.description, 4_000);
         clip(&mut info.creator, 100);
@@ -2186,7 +2335,30 @@ impl Chat {
                 message_id: parsed.message_id,
                 title: conv.title,
             },
-            Ok(None) => Response::Resolved { conversation: None, message_id: None, title: String::new() },
+            Ok(None) => {
+                if parsed.network == Network::Telegram && parsed.space.is_none() {
+                    let accounts: Vec<AccountKey> = self
+                        .hub
+                        .links()
+                        .into_iter()
+                        .filter(|linked| linked.account.network == Network::Telegram && linked.link == Link::Connected)
+                        .map(|linked| linked.account)
+                        .collect();
+                    for account in accounts {
+                        if let Ok(Some((id, title))) = self.ask(&account, |reply| Command::ResolveUsername {
+                            username: parsed.channel.clone(),
+                            reply,
+                        }) {
+                            return Response::Resolved {
+                                conversation: Some(Key::new(&account, id)),
+                                message_id: parsed.message_id,
+                                title,
+                            };
+                        }
+                    }
+                }
+                Response::Resolved { conversation: None, message_id: None, title: String::new() }
+            }
             Err(err) => internal(err),
         }
     }
@@ -3412,7 +3584,7 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
-            Request::CreateChannel { space, name, kind, private, group } => {
+            Request::CreateChannel { space, name, kind, private, group, description, username } => {
                 let account = space.account();
                 if let Err(refused) = self.online(&account) {
                     return *refused;
@@ -3422,8 +3594,22 @@ impl Chat {
                 if name.is_empty() {
                     return error(ErrorCode::Refused, "Channel name cannot be empty.");
                 }
+                let description = description.map(|mut d| {
+                    protocol::clip(&mut d, 255);
+                    d.trim().to_owned()
+                }).filter(|d| !d.is_empty());
+                let username = username.map(|u| u.trim().to_owned()).filter(|u| !u.is_empty());
                 let space_id = space.id.clone();
-                let id = match self.ask(&account, |reply| Command::CreateChannel { space_id, name, kind, private, group, reply }) {
+                let id = match self.ask(&account, |reply| Command::CreateChannel {
+                    space_id,
+                    name,
+                    kind,
+                    private,
+                    group,
+                    description,
+                    username,
+                    reply,
+                }) {
                     Ok(id) => id,
                     Err(refused) => return *refused,
                 };
@@ -3589,14 +3775,23 @@ impl Chat {
             Request::Report { target, reason, note, block } => self.report(target, reason, note, block),
             Request::ReportReasons { target } => self.report_reasons(target),
             Request::SetPresence { account, presence, status, status_emoji, clear_at } => self.set_presence(account, presence, status, status_emoji, clear_at),
-            Request::SetProfile { account, name, about, pronouns, emoji, username, photo } => {
-                self.set_profile(account, name, about, pronouns, emoji, username, photo)
+            Request::SetProfile { account, name, about, pronouns, emoji, username, birthday, photo } => {
+                self.set_profile(account, name, about, pronouns, emoji, username, birthday, photo)
             }
             Request::SetAvatar { account, path } => self.set_avatar(account, path),
             Request::SetNickname { space, nickname } => self.set_nickname(space, nickname),
             Request::SetFriendNickname { person, nickname } => self.set_friend_nickname(person, nickname),
             Request::InvitePreview { account, code } => self.invite_preview(account, code),
             Request::InviteJoin { account, code } => self.invite_join(account, code),
+            Request::ChatInvites { conversation, revoked } => self.chat_invites(conversation, revoked),
+            Request::CreateInvite { conversation, title, expire_date, usage_limit, request_needed } => {
+                self.create_invite(conversation, title, expire_date, usage_limit, request_needed)
+            }
+            Request::RevokeInvite { conversation, link } => self.revoke_invite(conversation, link),
+            Request::JoinRequests { conversation, link, limit } => self.join_requests(conversation, link, limit),
+            Request::HandleJoinRequest { conversation, user_id, approved, link } => {
+                self.handle_join_request(conversation, user_id, approved, link)
+            }
             Request::Watch(watching) => self.watch(watching),
 
             Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),
@@ -3731,6 +3926,9 @@ impl Chat {
                 self.reactors(conversation, message_id, emoji, burst, after, limit)
             }
             Request::Edit { conversation, message_id, text, spans } => self.rewrite(conversation, message_id, Some(text), spans, protocol::DeleteScope::Everyone),
+            Request::EditMedia { conversation, message_id, file, text, spans, invert_media } => {
+                self.edit_media(conversation, message_id, file, text, spans, invert_media)
+            }
             Request::Delete { conversation, message_id, scope } => self.rewrite(conversation, message_id, None, Vec::new(), scope),
             Request::DeleteMany { conversation, message_ids, scope } => {
                 if message_ids.is_empty() {

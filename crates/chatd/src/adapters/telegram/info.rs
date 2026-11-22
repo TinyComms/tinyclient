@@ -212,6 +212,18 @@ pub(super) fn conversation(account: &Account, conversation: &str) -> Result<Conv
                 about.description = chat.about;
                 about.disappearing = chat.ttl_period.filter(|&s| s > 0).map(|s| s as u32);
                 let _ = account.ctx.disappearing(conversation, about.disappearing);
+                about.pending_requests = chat
+                    .requests_pending
+                    .map(|n| n.max(0) as u32)
+                    .or_else(|| account.live().pending_requests.get(&who).copied())
+                    .unwrap_or(0);
+                if about.link.is_empty() {
+                    if let Some(tl::enums::ExportedChatInvite::ChatInviteExported(inv)) = &chat.exported_invite {
+                        if !inv.revoked && !inv.link.is_empty() {
+                            about.link = inv.link.clone();
+                        }
+                    }
+                }
                 if let tl::enums::ChatParticipants::Participants(list) = chat.participants {
                     about.members = Some(list.participants.len() as u32);
                     about.creator = list
@@ -235,10 +247,393 @@ pub(super) fn conversation(account: &Account, conversation: &str) -> Result<Conv
                 about.online = channel.online_count.map(|count| count.max(0) as u32);
                 about.disappearing = channel.ttl_period.filter(|&s| s > 0).map(|s| s as u32);
                 let _ = account.ctx.disappearing(conversation, about.disappearing);
+                about.pending_requests = channel
+                    .requests_pending
+                    .map(|n| n.max(0) as u32)
+                    .or_else(|| account.live().pending_requests.get(&who).copied())
+                    .unwrap_or(0);
+                if about.link.is_empty() {
+                    if let Some(tl::enums::ExportedChatInvite::ChatInviteExported(inv)) = &channel.exported_invite {
+                        if !inv.revoked && !inv.link.is_empty() {
+                            about.link = inv.link.clone();
+                        }
+                    }
+                }
             }
         }
     }
     Ok(about)
+}
+
+fn invite_hash(raw: &str) -> Result<String, Fault> {
+    if let Some(hash) = protocol::link::telegram_invite_hash(raw) {
+        return Ok(hash);
+    }
+    let trimmed = raw.trim().trim_start_matches('+');
+    if !trimmed.is_empty()
+        && trimmed.len() <= 128
+        && trimmed.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Ok(trimmed.to_owned());
+    }
+    Err(Fault::Net("Enter a valid Telegram invite link (t.me/+… or t.me/joinchat/…).".to_owned()))
+}
+
+fn chat_peer_and_title(chat: &tl::enums::Chat) -> Option<(Who, String, Option<u32>)> {
+    match chat {
+        tl::enums::Chat::Chat(c) => Some((Who::Group(c.id), c.title.clone(), Some(c.participants_count.max(0) as u32))),
+        tl::enums::Chat::Channel(c) => Some((Who::Channel(c.id), c.title.clone(), c.participants_count.map(|n| n.max(0) as u32))),
+        _ => None,
+    }
+}
+
+fn map_exported_invite(inv: tl::types::ChatInviteExported) -> protocol::ChatInviteLink {
+    protocol::ChatInviteLink {
+        link: inv.link,
+        title: inv.title.unwrap_or_default(),
+        permanent: inv.permanent,
+        revoked: inv.revoked,
+        request_needed: inv.request_needed,
+        expire_date: inv.expire_date.map(i64::from),
+        usage_limit: inv.usage_limit.map(|n| n.max(0) as u32),
+        usage: inv.usage.unwrap_or(0).max(0) as u32,
+        pending_requests: inv.requested.unwrap_or(0).max(0) as u32,
+    }
+}
+
+/// Previews a Telegram invite link without joining (`messages.checkChatInvite`).
+pub(super) fn invite_preview(account: &Account, raw: &str) -> Result<protocol::InvitePreview, Fault> {
+    let hash = invite_hash(raw)?;
+    let checked = match account.ask(&tl::functions::messages::CheckChatInvite { hash: hash.clone() }) {
+        Ok(found) => found,
+        Err(fault) if fault.is("INVITE_HASH_EXPIRED") || fault.is("INVITE_HASH_INVALID") || fault.is("INVITE_HASH_EMPTY") => {
+            return Err(Fault::Net("This invite link is invalid or has expired.".to_owned()));
+        }
+        Err(fault) => return Err(fault),
+    };
+    match checked {
+        tl::enums::ChatInvite::Already(already) => {
+            account.learn(&[], std::slice::from_ref(&already.chat));
+            let (who, name, members) = chat_peer_and_title(&already.chat)
+                .ok_or_else(|| Fault::Net("Telegram returned an unreadable chat for this invite.".to_owned()))?;
+            sync::ensure_row(account, who, None);
+            Ok(protocol::InvitePreview {
+                code: hash,
+                name,
+                description: "You are already a member of this chat.".to_owned(),
+                icon: None,
+                members,
+                online: None,
+                space_id: None,
+                channel_id: Some(who.text()),
+                request_needed: false,
+            })
+        }
+        tl::enums::ChatInvite::Invite(inv) => {
+            if let Some(ref people) = inv.participants {
+                account.learn(people, &[]);
+            }
+            let mut description = inv.about.unwrap_or_default();
+            if inv.request_needed {
+                if !description.is_empty() {
+                    description.push_str(" · ");
+                }
+                description.push_str("Admin approval required to join.");
+            }
+            Ok(protocol::InvitePreview {
+                code: hash,
+                name: inv.title,
+                description,
+                icon: None,
+                members: Some(inv.participants_count.max(0) as u32),
+                online: None,
+                space_id: None,
+                channel_id: None,
+                request_needed: inv.request_needed,
+            })
+        }
+        tl::enums::ChatInvite::Peek(peek) => {
+            account.learn(&[], std::slice::from_ref(&peek.chat));
+            let (who, name, members) = chat_peer_and_title(&peek.chat)
+                .ok_or_else(|| Fault::Net("Telegram returned an unreadable chat for this invite.".to_owned()))?;
+            Ok(protocol::InvitePreview {
+                code: hash,
+                name,
+                description: String::new(),
+                icon: None,
+                members,
+                online: None,
+                space_id: None,
+                channel_id: Some(who.text()),
+                request_needed: false,
+            })
+        }
+    }
+}
+
+/// Joins a Telegram group or channel by invite link (`messages.importChatInvite`).
+/// Returns `(None, Some(conversation_id), false)` when joined, or `(None, None, true)`
+/// when Telegram returned `INVITE_REQUEST_SENT` (awaiting admin approval).
+pub(super) fn invite_join(account: &Account, raw: &str) -> Result<(Option<String>, Option<String>, bool), Fault> {
+    let hash = invite_hash(raw)?;
+    match account.ask(&tl::functions::messages::ImportChatInvite { hash: hash.clone() }) {
+        Ok(tl::enums::messages::ChatInviteJoinResult::Ok(joined)) => {
+            super::learn_updates(account, &joined.updates);
+            super::live::answered(account, &joined.updates);
+            let chats = match &joined.updates {
+                tl::enums::Updates::Updates(u) => u.chats.as_slice(),
+                tl::enums::Updates::Combined(u) => u.chats.as_slice(),
+                _ => &[],
+            };
+            let who = chats.iter().find_map(|c| chat_peer_and_title(c).map(|(w, ..)| w));
+            if let Some(who) = who {
+                sync::ensure_row(account, who, None);
+                return Ok((None, Some(who.text()), false));
+            }
+            Ok((None, None, false))
+        }
+        Ok(tl::enums::messages::ChatInviteJoinResult::WebView(_)) => {
+            Err(Fault::Net("This invite requires confirmation in Telegram's official app.".to_owned()))
+        }
+        Err(fault) if fault.is("INVITE_REQUEST_SENT") => Ok((None, None, true)),
+        Err(fault) if fault.is("USER_ALREADY_PARTICIPANT") => {
+            let preview = invite_preview(account, &hash)?;
+            Ok((None, preview.channel_id, false))
+        }
+        Err(fault) if fault.is("INVITE_HASH_EXPIRED") || fault.is("INVITE_HASH_INVALID") || fault.is("INVITE_HASH_EMPTY") => {
+            Err(Fault::Net("This invite link is invalid or has expired.".to_owned()))
+        }
+        Err(fault) => Err(fault),
+    }
+}
+
+/// A stored conversation id for a channel or megagroup. A URL, a person, or a basic group is not one.
+fn public_who(conversation: &str) -> Result<Who, Fault> {
+    match Who::parse(conversation) {
+        Some((who @ Who::Channel(_), None)) => Ok(who),
+        _ => Err(invalid("PEER_ID_INVALID")),
+    }
+}
+
+/// Shows a public channel or group the account has not joined. Reads one page and does not subscribe.
+pub(super) fn preview_public(account: &Account, conversation: &str) -> Result<(), Fault> {
+    let who = public_who(conversation)?;
+    let recorded = if sync::member(account, who) {
+        sync::ensure_row(account, who, None)
+    } else {
+        sync::ensure_preview_row(account, who)
+    };
+    if !recorded {
+        return Err(invalid("CHANNEL_PRIVATE"));
+    }
+    sync::history(account, conversation, sync::Around::Newest);
+    Ok(())
+}
+
+/// Joins one public channel or megagroup (`channels.joinChannel`). A search result stays a preview until this.
+pub(super) fn join_public(account: &Account, conversation: &str) -> Result<(), Fault> {
+    let who = public_who(conversation)?;
+    if sync::member(account, who) {
+        return sync::ensure_row(account, who, None).then_some(()).ok_or_else(|| invalid("CHANNEL_PRIVATE"));
+    }
+    let channel = account.input_channel(who)?;
+    match account.ask(&tl::functions::channels::JoinChannel { channel: channel.clone() }) {
+        Ok(tl::enums::messages::ChatInviteJoinResult::Ok(joined)) => {
+            super::learn_updates(account, &joined.updates);
+            super::live::answered(account, &joined.updates);
+            if !sync::ensure_row(account, who, None) {
+                return Err(invalid("CHANNEL_PRIVATE"));
+            }
+            similar(account, channel);
+            Ok(())
+        }
+        Ok(tl::enums::messages::ChatInviteJoinResult::WebView(_)) => {
+            Err(Fault::Net("This channel requires confirmation in Telegram's official app.".to_owned()))
+        }
+        Err(fault) if fault.is("INVITE_REQUEST_SENT") => Err(fault),
+        Err(fault) if fault.is("USER_ALREADY_PARTICIPANT") => {
+            if let Ok(found) = account.ask(&tl::functions::channels::GetChannels { id: vec![channel] }) {
+                account.learn(&[], &found.chats());
+            }
+            if sync::ensure_row(account, who, None) { Ok(()) } else { Err(fault) }
+        }
+        Err(fault) => Err(fault),
+    }
+}
+
+/// Channels Telegram suggests after a join. Each one is a preview until the user joins it.
+fn similar(account: &Account, channel: tl::enums::InputChannel) {
+    let found = match account.ask(&tl::functions::channels::GetChannelRecommendations { channel: Some(channel) }) {
+        Ok(found) => found,
+        Err(fault) => {
+            tracing::warn!("chatd: Telegram: similar channels: {fault}");
+            return;
+        }
+    };
+    let chats = found.chats();
+    account.learn(&[], &chats);
+    for chat in &chats {
+        let Some((who, ..)) = chat_peer_and_title(chat) else { continue };
+        if sync::member(account, who) {
+            sync::ensure_row(account, who, None);
+        } else {
+            sync::ensure_preview_row(account, who);
+        }
+    }
+}
+
+/// Lists exported invite links for a chat (`messages.getExportedChatInvites`).
+pub(super) fn chat_invites(account: &Account, conversation: &str, revoked: bool) -> Result<Vec<protocol::ChatInviteLink>, Fault> {
+    let (who, _) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    let peer = account.input(who)?;
+    let tl::enums::messages::ExportedChatInvites::Invites(found) = account.ask(&tl::functions::messages::GetExportedChatInvites {
+        revoked,
+        peer,
+        admin_id: tl::enums::InputUser::UserSelf,
+        offset_date: None,
+        offset_link: None,
+        limit: 50,
+    })?;
+    account.learn(&found.users, &[]);
+    Ok(found
+        .invites
+        .into_iter()
+        .filter_map(|inv| match inv {
+            tl::enums::ExportedChatInvite::ChatInviteExported(exp) => Some(map_exported_invite(exp)),
+            _ => None,
+        })
+        .collect())
+}
+
+/// Creates a new invite link for a chat (`messages.exportChatInvite`).
+pub(super) fn create_invite(
+    account: &Account,
+    conversation: &str,
+    title: Option<String>,
+    expire_date: Option<i64>,
+    usage_limit: Option<u32>,
+    request_needed: bool,
+) -> Result<protocol::ChatInviteLink, Fault> {
+    let (who, _) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    let peer = account.input(who)?;
+    let usage_limit = if request_needed { None } else { usage_limit.and_then(|n| i32::try_from(n).ok()).filter(|&n| n > 0) };
+    let exported = account.ask(&tl::functions::messages::ExportChatInvite {
+        legacy_revoke_permanent: false,
+        request_needed,
+        peer,
+        expire_date: expire_date.and_then(|t| i32::try_from(t).ok()).filter(|&t| t > 0),
+        usage_limit,
+        title: title.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty()),
+        subscription_pricing: None,
+    })?;
+    match exported {
+        tl::enums::ExportedChatInvite::ChatInviteExported(exp) => Ok(map_exported_invite(exp)),
+        _ => Err(Fault::Net("Telegram did not return an invite link.".to_owned())),
+    }
+}
+
+/// Revokes an existing invite link (`messages.editExportedChatInvite { revoked: true }`).
+pub(super) fn revoke_invite(account: &Account, conversation: &str, link: &str) -> Result<protocol::ChatInviteLink, Fault> {
+    let (who, _) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    let peer = account.input(who)?;
+    let edited = account.ask(&tl::functions::messages::EditExportedChatInvite {
+        revoked: true,
+        peer,
+        link: link.to_owned(),
+        expire_date: None,
+        usage_limit: None,
+        request_needed: None,
+        title: None,
+    })?;
+    let invite = match edited {
+        tl::enums::messages::ExportedChatInvite::Invite(one) => {
+            account.learn(&one.users, &[]);
+            one.invite
+        }
+        tl::enums::messages::ExportedChatInvite::Replaced(rep) => {
+            account.learn(&rep.users, &[]);
+            rep.invite
+        }
+    };
+    match invite {
+        tl::enums::ExportedChatInvite::ChatInviteExported(exp) => Ok(map_exported_invite(exp)),
+        _ => Err(Fault::Net("Telegram did not return the revoked invite link.".to_owned())),
+    }
+}
+
+/// Lists pending join requests for a chat (`messages.getChatInviteImporters { requested: true }`).
+pub(super) fn join_requests(
+    account: &Account,
+    conversation: &str,
+    link: Option<String>,
+    limit: u32,
+) -> Result<Vec<protocol::JoinRequest>, Fault> {
+    let (who, _) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    let peer = account.input(who)?;
+    let tl::enums::messages::ChatInviteImporters::Importers(found) =
+        account.ask(&tl::functions::messages::GetChatInviteImporters {
+            requested: true,
+            subscription_expired: false,
+            peer,
+            link,
+            q: None,
+            offset_date: 0,
+            offset_user: tl::enums::InputUser::Empty,
+            limit: limit.clamp(1, 100) as i32,
+        })?;
+    account.learn(&found.users, &[]);
+    let dir = account.dir();
+    Ok(found
+        .importers
+        .into_iter()
+        .map(|imp| {
+            let tl::enums::ChatInviteImporter::Importer(imp) = imp;
+            let user_who = Who::User(imp.user_id);
+            let known = dir.get(user_who);
+            protocol::JoinRequest {
+                user_id: user_who.text(),
+                name: dir.name(user_who),
+                handle: known.map(|k| k.handle.clone()).unwrap_or_default(),
+                about: imp.about.unwrap_or_default(),
+                date: i64::from(imp.date),
+            }
+        })
+        .collect())
+}
+
+/// Approves or declines one (`user_id: Some`) or all (`user_id: None`) pending join requests.
+pub(super) fn handle_join_request(
+    account: &Account,
+    conversation: &str,
+    user_id: Option<&str>,
+    approved: bool,
+    link: Option<String>,
+) -> Result<(), Fault> {
+    let (who, _) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    let peer = account.input(who)?;
+    let answer = match user_id {
+        Some(raw) => {
+            let Some((user_who @ Who::User(_), None)) = Who::parse(raw) else {
+                return Err(invalid("USER_ID_INVALID"));
+            };
+            account.input(user_who)?;
+            let input_user = account.dir().input_user(user_who).ok_or_else(|| invalid("USER_ID_INVALID"))?;
+            account.ask(&tl::functions::messages::HideChatJoinRequest {
+                approved,
+                peer,
+                user_id: input_user,
+            })?
+        }
+        None => account.ask(&tl::functions::messages::HideAllChatJoinRequests { approved, peer, link })?,
+    };
+    super::learn_updates(account, &answer);
+    super::live::answered(account, &answer);
+    if user_id.is_none() {
+        account.live().pending_requests.insert(who, 0);
+    } else if let Some(count) = account.live().pending_requests.get_mut(&who) {
+        *count = count.saturating_sub(1);
+    }
+    Ok(())
 }
 
 /// Sets or clears Telegram's auto-delete timer (`messages.setHistoryTTL`).
@@ -461,6 +856,169 @@ pub(super) fn reschedule(
         post_at,
         created: 0,
     })
+}
+
+/// Parses `"YYYY-MM-DD"`, `"MM-DD"`, `"--MM-DD"`, or empty string (clear) into Telegram's `Birthday`.
+pub(super) fn parse_birthday(raw: &str) -> Result<Option<tl::enums::Birthday>, Fault> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let stripped = trimmed.strip_prefix("--").unwrap_or(trimmed);
+    let parts: Vec<&str> = stripped.split('-').collect();
+    let (year, month, day) = match parts.as_slice() {
+        [y, m, d] => {
+            let y: i32 = y.parse().map_err(|_| Fault::Net("Enter birthday as YYYY-MM-DD or MM-DD.".to_owned()))?;
+            let m: i32 = m.parse().map_err(|_| Fault::Net("Enter birthday as YYYY-MM-DD or MM-DD.".to_owned()))?;
+            let d: i32 = d.parse().map_err(|_| Fault::Net("Enter birthday as YYYY-MM-DD or MM-DD.".to_owned()))?;
+            if !(1900..=2100).contains(&y) {
+                return Err(Fault::Net("Birthday year must be between 1900 and 2100.".to_owned()));
+            }
+            (Some(y), m, d)
+        }
+        [m, d] => {
+            let m: i32 = m.parse().map_err(|_| Fault::Net("Enter birthday as YYYY-MM-DD or MM-DD.".to_owned()))?;
+            let d: i32 = d.parse().map_err(|_| Fault::Net("Enter birthday as YYYY-MM-DD or MM-DD.".to_owned()))?;
+            (None, m, d)
+        }
+        _ => return Err(Fault::Net("Enter birthday as YYYY-MM-DD or MM-DD.".to_owned())),
+    };
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return Err(Fault::Net("Enter a valid calendar date for birthday.".to_owned()));
+    }
+    Ok(Some(tl::types::Birthday { day, month, year }.into()))
+}
+
+/// Parses a custom emoji status specifier (`""` clears; `"5002"` or `"e5002"` sets by document id).
+pub(super) fn parse_emoji_status(raw: &str, until: Option<i64>) -> Result<tl::enums::EmojiStatus, Fault> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(tl::enums::EmojiStatus::Empty);
+    }
+    let digits = trimmed.strip_prefix('e').unwrap_or(trimmed);
+    let document_id = digits
+        .parse::<i64>()
+        .map_err(|_| Fault::Net("Choose a custom emoji id for your Telegram emoji status.".to_owned()))?;
+    let until = until.and_then(|ts| i32::try_from(ts).ok()).filter(|&ts| ts > 0);
+    Ok(tl::types::EmojiStatus { document_id, until }.into())
+}
+
+fn refresh_own_identity(account: &Account) {
+    let (name, premium) = {
+        let dir = account.dir();
+        (dir.name(Who::User(account.me)), dir.get(Who::User(account.me)).is_some_and(|known| known.premium))
+    };
+    if !name.is_empty() {
+        let shown = if premium { format!("{name} · Premium") } else { name };
+        let _ = account.ctx.describe(&shown, &Who::User(account.me).text());
+    }
+}
+
+/// Updates our own Telegram profile fields: name, bio, username, birthday, and/or emoji status.
+pub(super) fn set_profile(
+    account: &Account,
+    name: Option<String>,
+    about: Option<String>,
+    username: Option<String>,
+    emoji: Option<String>,
+    birthday: Option<String>,
+) -> Result<(), Fault> {
+    if name.is_some() || about.is_some() {
+        let (first_name, last_name) = match name {
+            Some(ref full) => {
+                let trimmed = full.trim();
+                if trimmed.is_empty() {
+                    return Err(Fault::Net("First name cannot be empty.".to_owned()));
+                }
+                let (first, last) = super::split_name(trimmed);
+                (Some(first), Some(last))
+            }
+            None => (None, None),
+        };
+        let updated = account.ask(&tl::functions::account::UpdateProfile {
+            first_name,
+            last_name,
+            about: about.map(|s| s.trim().to_owned()),
+        })?;
+        account.learn(&[updated], &[]);
+        refresh_own_identity(account);
+    }
+    if let Some(raw_username) = username {
+        let bare = raw_username.trim().trim_start_matches('@').to_owned();
+        if !bare.is_empty() {
+            let valid = (5..=32).contains(&bare.len()) && bare.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_');
+            if !valid {
+                return Err(Fault::Net("Telegram usernames must be 5–32 letters, digits, or underscores.".to_owned()));
+            }
+            let available = account.ask(&tl::functions::account::CheckUsername { username: bare.clone() })?;
+            if !available {
+                return Err(Fault::Net(format!("@{bare} is already taken or unavailable.")));
+            }
+        }
+        let updated = account.ask(&tl::functions::account::UpdateUsername { username: bare })?;
+        account.learn(&[updated], &[]);
+        refresh_own_identity(account);
+    }
+    if let Some(raw_birthday) = birthday {
+        let parsed = parse_birthday(&raw_birthday)?;
+        account.ask(&tl::functions::account::UpdateBirthday { birthday: parsed })?;
+    }
+    if let Some(raw_emoji) = emoji {
+        set_emoji_status(account, &raw_emoji, None)?;
+    }
+    Ok(())
+}
+
+/// Sets or clears our Telegram Premium emoji status (`account.updateEmojiStatus`).
+/// Never calls `account.updateStatus { offline: true }`.
+pub(super) fn set_emoji_status(account: &Account, raw: &str, until: Option<i64>) -> Result<(), Fault> {
+    let status = parse_emoji_status(raw, until)?;
+    match account.ask(&tl::functions::account::UpdateEmojiStatus { emoji_status: status }) {
+        Ok(_) => Ok(()),
+        Err(fault) if fault.is("PREMIUM_ACCOUNT_REQUIRED") => {
+            Err(Fault::Net("Setting an emoji status requires Telegram Premium.".to_owned()))
+        }
+        Err(fault) => Err(fault),
+    }
+}
+
+/// Uploads a new profile photo (`photos.uploadProfilePhoto`) or deletes the current one
+/// (`photos.getUserPhotos` + `photos.deletePhotos`) when `path` is empty.
+pub(super) fn set_avatar(account: &Account, path: &str) -> Result<(), Fault> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        let listed = account.ask(&tl::functions::photos::GetUserPhotos {
+            user_id: tl::enums::InputUser::UserSelf,
+            offset: 0,
+            max_id: 0,
+            limit: 1,
+        })?;
+        let photos = match listed {
+            tl::enums::photos::Photos::Photos(p) => p.photos,
+            tl::enums::photos::Photos::Slice(p) => p.photos,
+        };
+        if let Some(tl::enums::Photo::Photo(first)) = photos.into_iter().next() {
+            let input: tl::enums::InputPhoto = tl::types::InputPhoto {
+                id: first.id,
+                access_hash: first.access_hash,
+                file_reference: first.file_reference,
+            }
+            .into();
+            account.ask(&tl::functions::photos::DeletePhotos { id: vec![input] })?;
+        }
+        return Ok(());
+    }
+    let file = super::send::upload_input_file(account, "own-avatar", trimmed).map_err(Fault::Net)?;
+    let tl::enums::photos::Photo::Photo(saved) = account.ask(&tl::functions::photos::UploadProfilePhoto {
+        fallback: false,
+        bot: None,
+        file: Some(file),
+        video: None,
+        video_start_ts: None,
+        video_emoji_markup: None,
+    })?;
+    account.learn(&saved.users, &[]);
+    Ok(())
 }
 
 /// The network's own mute. Telegram has no "mentions only" for a chat: a muted chat still
@@ -1755,5 +2313,27 @@ mod tests {
         assert_eq!(pick_report_option(&opts, protocol::ReportReason::Spam).as_deref(), Some(&b"spam"[..]));
         assert_eq!(pick_report_option(&opts, protocol::ReportReason::Violence).as_deref(), Some(&b"violence"[..]));
         assert_eq!(pick_report_option(&opts, protocol::ReportReason::Impersonation).as_deref(), Some(&b"other"[..]));
+    }
+
+    #[test]
+    fn parse_birthday_and_emoji_status_validate_inputs() {
+        assert_eq!(parse_birthday("").unwrap(), None);
+        assert_eq!(
+            parse_birthday("1994-03-14").unwrap(),
+            Some(tl::types::Birthday { day: 14, month: 3, year: Some(1994) }.into())
+        );
+        assert_eq!(
+            parse_birthday("--07-04").unwrap(),
+            Some(tl::types::Birthday { day: 4, month: 7, year: None }.into())
+        );
+        assert!(parse_birthday("1994-13-01").is_err());
+        assert!(parse_birthday("not-a-date").is_err());
+
+        assert_eq!(parse_emoji_status("", None).unwrap(), tl::enums::EmojiStatus::Empty);
+        assert_eq!(
+            parse_emoji_status("e5002", Some(1_800_000_000)).unwrap(),
+            tl::types::EmojiStatus { document_id: 5002, until: Some(1_800_000_000) }.into()
+        );
+        assert!(parse_emoji_status("not_an_id", None).is_err());
     }
 }

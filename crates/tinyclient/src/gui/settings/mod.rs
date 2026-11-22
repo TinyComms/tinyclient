@@ -460,6 +460,9 @@ pub struct SettingsWindow {
     pub(super) profile_name: Entity<TextInput>,
     pub(super) profile_about: Entity<TextInput>,
     pub(super) profile_pronouns: Entity<TextInput>,
+    pub(super) profile_username: Entity<TextInput>,
+    pub(super) profile_birthday: Entity<TextInput>,
+    pub(super) profile_emoji_status: Entity<TextInput>,
     /// The Linux passphrase for the screen lock. Other systems use the device prompt.
     #[cfg(target_os = "linux")]
     lock_phrase: Entity<TextInput>,
@@ -505,6 +508,9 @@ impl SettingsWindow {
         let profile_name = cx.new(|cx| TextInput::new("Display name", cx));
         let profile_about = cx.new(|cx| TextInput::new("About me", cx));
         let profile_pronouns = cx.new(|cx| TextInput::new("Pronouns", cx));
+        let profile_username = cx.new(|cx| TextInput::new("@username", cx));
+        let profile_birthday = cx.new(|cx| TextInput::new("YYYY-MM-DD or MM-DD", cx));
+        let profile_emoji_status = cx.new(|cx| TextInput::new("Custom emoji id (empty clears)", cx));
         #[cfg(target_os = "linux")]
         let lock_phrase = cx.new(|cx| TextInput::secret("Passphrase", cx));
         let mut subscriptions = vec![
@@ -603,6 +609,9 @@ impl SettingsWindow {
             profile_name,
             profile_about,
             profile_pronouns,
+            profile_username,
+            profile_birthday,
+            profile_emoji_status,
             #[cfg(target_os = "linux")]
             lock_phrase,
             _subscriptions: subscriptions,

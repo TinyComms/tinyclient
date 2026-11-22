@@ -402,6 +402,61 @@ fn files(account: &Account, conversation: &str, client_id: &str, text: &str, rep
     first.ok_or_else(|| "Nothing was sent.".to_owned())
 }
 
+/// Uploads one local file in 512 KB parts and returns Telegram's `InputFile` handle
+/// (used for profile photos and chat avatars).
+pub(super) fn upload_input_file(account: &Account, key_seed: &str, path: &str) -> Result<tl::enums::InputFile, String> {
+    let source = protocol::OutgoingFile { path: path.to_owned(), ..Default::default() };
+    let mut up = Upload::with_progress(&account.ctx.account, key_seed, std::slice::from_ref(&source), |_, _| {})?;
+    let (name, bytes) = {
+        let s = &up.files()[0];
+        (s.name.clone(), s.bytes)
+    };
+    let file_id = random_id(&format!("{key_seed}/{name}"));
+    let big = bytes > BIG;
+    let mut parts = 1;
+    let result = up.parts(0, PART, 0, |part| {
+        parts = part.count as i32;
+        let saved = match big {
+            true => account.ask(&tl::functions::upload::SaveBigFilePart {
+                file_id,
+                file_part: part.index as i32,
+                file_total_parts: part.count as i32,
+                bytes: part.bytes.to_vec(),
+            }),
+            false => account.ask(&tl::functions::upload::SaveFilePart {
+                file_id,
+                file_part: part.index as i32,
+                bytes: part.bytes.to_vec(),
+            }),
+        };
+        match saved {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(format!("{name} could not be uploaded: Telegram did not keep a part of it.")),
+            Err(fault) => Err(format!("{name} could not be uploaded: {}", fault.words())),
+        }
+    });
+    up.done();
+    result?;
+    Ok(match big {
+        true => tl::types::InputFileBig { id: file_id, parts, name }.into(),
+        false => tl::types::InputFile { id: file_id, parts, name, md5_checksum: String::new() }.into(),
+    })
+}
+
+/// Uploads one replacement file for `messages.editMessage` (`media`), reusing the same
+/// part-streaming, photo/document detection, spoiler, and video/audio probing as sends.
+pub(super) fn upload_single(
+    account: &Account,
+    conversation: &str,
+    key_seed: &str,
+    source: &protocol::OutgoingFile,
+) -> Result<tl::enums::InputMedia, String> {
+    let mut up = Upload::with_progress(&account.ctx.account, key_seed, std::slice::from_ref(source), |_, _| {})?;
+    let uploaded = file(account, conversation, key_seed, 0, None, &mut up);
+    up.done();
+    uploaded.map(|u| u.media)
+}
+
 /// One file of a send, in parts, as Telegram's `InputMedia`. A voice send carries its facts in
 /// `voice` and is sent as a voice note, as Telegram's apps send one.
 fn file(account: &Account, conversation: &str, client_id: &str, at: usize, voice: Option<&VoiceNote>, up: &mut Upload) -> Result<Uploaded, String> {
