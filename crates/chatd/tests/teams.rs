@@ -1487,13 +1487,13 @@ fn people_are_searched_watched_and_called_through_the_official_app() {
     });
     // What she is doing comes before her note.
     assert_eq!(told, Some((Presence::Busy, "In a meeting".to_owned())));
-    let presence = world.fake.calls("POST", "/presence/v1/presence/getpresence/");
-    assert!(
-        presence.iter().any(|call| call.json() == json!([{"mri": ANA}, {"mri": ME}])),
-        "who is on screen, and me"
-    );
+    // Opening the card asks for her alone. The watch then asks for her and me, on the adapter thread.
+    let together = json!([{"mri": ANA}, {"mri": ME}]);
+    world.until("who is on screen, and me", || {
+        world.fake.calls("POST", "/presence/v1/presence/getpresence/").into_iter().any(|call| call.json() == together).then_some(())
+    });
     // Asked again at once for the same people, Teams is not asked again.
-    let asked = presence.len();
+    let asked = world.fake.calls("POST", "/presence/v1/presence/getpresence/").len();
     world.ask(watch());
     sleep(Duration::from_millis(400));
     assert_eq!(world.fake.calls("POST", "/presence/v1/presence/getpresence/").len(), asked);
