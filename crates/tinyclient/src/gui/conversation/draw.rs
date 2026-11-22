@@ -3398,14 +3398,14 @@ impl Pane {
                 (Some(on), None) => Some(format!("{on} online")),
                 (None, None) => error_note.clone().or_else(|| (state == InviteState::Unresolved).then(|| "Loading invite…".to_owned())),
             };
-            let avatar = self.face(
-                Avatar::new(space_id.as_deref().unwrap_or(&invite.code), &title, 40.).shape(Shape::Place),
-                icon_file.as_ref(),
-                40.,
-                Shape::Place,
-                window,
-                cx,
-            );
+            let place_id = space_id.as_deref().unwrap_or(invite.code.as_str());
+            let place_key = self.open.as_ref().map(|open| Key::new(&open.key.account(), place_id));
+            let tile = match &place_key {
+                Some(key) => Avatar::new(key, &title, 40.),
+                None => Avatar::named(&title, 40.),
+            }
+            .shape(Shape::Place);
+            let avatar = self.face(tile, icon_file.as_ref(), 40., Shape::Place, window, cx);
             let code = invite.code.clone();
             let url = invite.url.clone();
             let valid_url = url.starts_with("https://") || url.starts_with("http://");

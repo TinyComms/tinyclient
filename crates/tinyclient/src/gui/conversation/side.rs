@@ -936,9 +936,9 @@ impl Shell {
     fn search_lookup_lists(&self, account: Option<&protocol::AccountKey>) -> (Vec<(String, String)>, Vec<(String, String)>) {
         let mut channels: Vec<(String, String)> = Vec::new();
         let mut seen_ch = std::collections::HashSet::new();
-        let all_rows = self
-            .held_rows()
-            .chain(self.trees.values().flat_map(|tree| tree.conversations.iter()));
+        let all_rows = self.held_rows().chain(
+            self.trees.values().flat_map(|tree| tree.conversations.iter().map(|row| row.as_ref())),
+        );
         for row in all_rows {
             if account.is_some_and(|a| row.key.account() != *a) {
                 continue;

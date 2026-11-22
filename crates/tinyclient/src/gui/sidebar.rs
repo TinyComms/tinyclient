@@ -2791,13 +2791,13 @@ impl Shell {
             && (!media || !files.is_empty())
             && !(body_text.is_empty() && files.is_empty());
         let mut chips = div().flex().flex_wrap().gap(px(6.));
-        for tag in tags {
+        for (ix, tag) in tags.iter().enumerate() {
             let on = picked.iter().any(|id| id == &tag.id);
             let id = tag.id.clone();
             let label = if tag.emoji.is_empty() { tag.name.clone() } else { format!("{} {}", tag.emoji, tag.name) };
             chips = chips.child(
                 div()
-                    .id(("forum-tag", tag.id))
+                    .id(("forum-tag", ix))
                     .px(px(8.))
                     .py(px(4.))
                     .rounded(px(theme::R_CONTROL))
