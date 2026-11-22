@@ -799,10 +799,11 @@ mod tests {
     fn background_blur_softens_corners_while_keeping_portrait_center_sharp() {
         let (w, h) = (32u32, 32u32);
         let mut pixels = vec![0u8; (w * h * 4) as usize];
-        // Checkerboard everywhere so blur averages high-contrast pixels toward mid-gray.
+        // Checkerboard everywhere so blur averages high-contrast pixels toward mid-gray. Its cells
+        // are 4 px, the blur's own downscale step: one sample per cell, so it sees both colours.
         for y in 0..h {
             for x in 0..w {
-                let v = if (x + y) % 2 == 0 { 255 } else { 0 };
+                let v = if (x / 4 + y / 4) % 2 == 0 { 255 } else { 0 };
                 let p = ((y * w + x) * 4) as usize;
                 pixels[p] = v;
                 pixels[p + 1] = v;
@@ -815,7 +816,7 @@ mod tests {
         let mut frame = Rgba { width: w, height: h, pixels, bgra: false };
         apply_background_blur(&mut frame);
         assert_eq!(frame.pixels[center_idx], center_before, "portrait center remains sharp");
-        // Top-left corner had alternating 0/255; blur moves it off the extreme.
+        // The top-left corner was 255 beside 0 cells; blur moves it off the extreme.
         let corner = frame.pixels[0];
         assert!(corner > 0 && corner < 255, "corner pixel should be softened, got {corner}");
     }

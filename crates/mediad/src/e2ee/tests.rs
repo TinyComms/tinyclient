@@ -490,9 +490,10 @@ fn a_sealed_picture_keeps_its_nal_header_and_opens() {
     assert_eq!(bea.open_video(ADA, &frame), None, "a clear picture is dropped in an end-to-end call");
 }
 
-/// Multi-stream video: one sender sending camera and screen share interleaved through `seal_video`
-/// opens cleanly in any arrival order for that sender, while a frame arriving after a mid changes
-/// owner fails to open under the new owner's identity.
+/// Multi-stream video: one sender's camera and screen share are sealed by one encryptor, so they
+/// share one nonce counter. After the first picture of theirs has opened, the rest open in any
+/// arrival order (DAVE keeps the nonces it skipped), none opens twice, and a frame arriving after
+/// a mid changes owner fails to open under the new owner's identity.
 #[test]
 fn interleaved_camera_and_share_from_one_sender_both_open_and_wrong_owner_is_dropped() {
     let (_, mut ada, mut bea, _) = three();
@@ -507,10 +508,13 @@ fn interleaved_camera_and_share_from_one_sender_both_open_and_wrong_owner_is_dro
     let s_share_b = ada.seal_video(&share_b).expect("seal share_b");
 
     // Arrive out of order across the two concurrent streams from Ada.
-    assert_eq!(bea.open_video(ADA, &s_share_a).as_deref(), Some(&share_a[..]));
     assert_eq!(bea.open_video(ADA, &s_cam_a).as_deref(), Some(&cam_a[..]));
     assert_eq!(bea.open_video(ADA, &s_share_b).as_deref(), Some(&share_b[..]));
     assert_eq!(bea.open_video(ADA, &s_cam_b).as_deref(), Some(&cam_b[..]));
+    assert_eq!(bea.open_video(ADA, &s_share_a).as_deref(), Some(&share_a[..]));
+    // Replay protection is whole: what opened once does not open again.
+    assert_eq!(bea.open_video(ADA, &s_cam_b), None);
+    assert_eq!(bea.open_video(ADA, &s_share_a), None);
 
     // Slot changes owner to Cy: a stale frame sealed by Ada is rejected under Cy's identity.
     assert_eq!(bea.open_video(CY, &s_share_a), None);
