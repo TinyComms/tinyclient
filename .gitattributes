@@ -1,3 +1,5 @@
 # Shell scripts keep LF on a Windows checkout too: the release workflow runs them under Git Bash.
 *.sh text eol=lf
 packaging/linux/AppRun text eol=lf
+# Generated and compared byte for byte by a chatd test (include_str!), so it must not become CRLF.
+docs/parity.md text eol=lf
