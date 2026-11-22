@@ -2602,8 +2602,14 @@ impl Discord {
         let conversation = self.ctx.known(channel).map_err(|err| err.to_string())?;
         let conversation = conversation.ok_or_else(|| "This conversation is gone.".to_owned())?;
         let guild = self.guild_of(&conversation);
+        // As on the path with files: without Nitro, an emoji this server cannot send goes as its link.
+        let content = if matches!(premium, 1..=3) {
+            text.to_owned()
+        } else {
+            send::rewrite_locked_emoji(text, &self.sendable_emoji(guild.as_deref()))
+        };
         let mut body = json!({
-            "content": text,
+            "content": content,
             "nonce": client_id,
             "tts": false,
             "flags": 0,

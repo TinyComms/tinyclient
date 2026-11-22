@@ -713,11 +713,13 @@ impl Discord {
             media.push((file.clone(), url));
             file
         });
-        let accent = member_text
+        // The server's own colours count only when the profile was asked in that server.
+        let member_colors = space.and_then(|_| member_text);
+        let accent = member_colors
             .and_then(|p| p.accent_color)
             .or_else(|| text.and_then(|p| p.accent_color))
             .or_else(|| profile.user.as_ref().and_then(|u| u.accent_color))
-            .or_else(|| member_text.and_then(|p| p.theme_colors.as_ref()).and_then(|c| c.first().copied()))
+            .or_else(|| member_colors.and_then(|p| p.theme_colors.as_ref()).and_then(|c| c.first().copied()))
             .or_else(|| text.and_then(|p| p.theme_colors.as_ref()).and_then(|c| c.first().copied()));
 
         let mut seen_badges = std::collections::HashSet::new();

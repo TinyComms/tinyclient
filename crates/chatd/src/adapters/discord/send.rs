@@ -161,7 +161,7 @@ impl Discord {
 
     /// Custom emoji this channel's server may send without Nitro: its own, not animated, and
     /// not locked to a role we lack.
-    fn sendable_emoji(&self, guild: Option<&str>) -> HashSet<String> {
+    pub(super) fn sendable_emoji(&self, guild: Option<&str>) -> HashSet<String> {
         let mut allowed = HashSet::new();
         let Some(guild) = guild else {
             return allowed;

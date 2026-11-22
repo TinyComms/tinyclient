@@ -607,7 +607,8 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
                 }),
             )
         }
-        ("GET", ["channels", channel, "threads", "search"]) => {
+        // A text channel's threads. A forum's or media channel's posts are scripted by their own tests.
+        ("GET", ["channels", channel, "threads", "search"]) if !matches!(*channel, "4106" | "4109") => {
             let mut threads = vec![
                 json!({
                     "id": "4510",
@@ -978,7 +979,8 @@ impl World {
     }
 
     fn spawn(&self) -> Child {
-        Command::new(env!("CARGO_BIN_EXE_chatd"))
+        // `CHATD_TEST_BIN` names a copy of the binary, for a target directory other builds also write to.
+        Command::new(std::env::var("CHATD_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_chatd").to_owned()))
             .env("TINYCLIENT_DIR", &self.dir)
             .env("TINYCLIENT_DISCORD_API", &self.api)
             .env("TINYCLIENT_DISCORD_GATEWAY", format!("{}/?encoding=json&v=9", self.gateway))
@@ -5948,6 +5950,8 @@ fn leave_space_sends_delete_refuses_owner_and_cleans_tree() {
 fn discord_buttons_selects_and_modals_round_trip() {
     let world = World::launch(&[], |_| {});
     wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+    // Open channel 4101 so live messages are stored.
+    wait("channel 4101 history", || (!world.messages("4101").is_empty()).then_some(()));
     let channel = world.key("4101");
 
     // Push a bot message containing buttons + a string select menu.
@@ -7527,7 +7531,13 @@ fn moderator_manage_messages_flag_delete_others_and_clear_reactions() {
         Response::Ok
     );
     assert_eq!(
-        world.discord.requests_to("DELETE", &format!("/channels/4101/messages/{}", other_msg.id)).len(),
+        // `requests_to` matches by prefix, and the reaction removals above share this one.
+        world
+            .discord
+            .requests_to("DELETE", &format!("/channels/4101/messages/{}", other_msg.id))
+            .iter()
+            .filter(|seen| !seen.path.contains("/reactions"))
+            .count(),
         1
     );
 
@@ -8366,11 +8376,12 @@ fn create_invite_checks_permissions_picks_first_channel_and_supports_friend_invi
     wait("4101 loses create invite", || (!world.conversation("4101").rights.create_invite).then_some(()));
     assert!(guild_can_invite(), "one channel losing invite must leave the server flag set");
 
-    for (id, kind) in [("4102", 5), ("4106", 15), ("4201", 2)] {
+    // 4104 is ours through role 4010 and may invite too, so it goes with the others.
+    for (id, kind) in [("4102", 5), ("4104", 0), ("4106", 15), ("4201", 2)] {
         world.discord.push("CHANNEL_DELETE", json!({"id": id, "type": kind, "guild_id": "4000"}));
     }
     wait("other invite channels deleted but one remains", || {
-        let gone = ["4102", "4106", "4201"].iter().all(|id| {
+        let gone = ["4102", "4104", "4106", "4201"].iter().all(|id| {
             matches!(world.ask(Request::Conversation { conversation: world.key(id) }), Response::Error { .. })
         });
         (gone && guild_can_invite()).then_some(())
@@ -8818,7 +8829,8 @@ fn group_dm_rename_icon_remove_transfer_owner_and_silent_leave() {
         world.ask(Request::Leave { conversation: world.key("3003"), silent: true }),
         Response::Ok
     );
-    let deletes = world.discord.requests_to("DELETE", "/channels/3003");
+    // `requests_to` matches by prefix: the member removed earlier is not this leave.
+    let deletes: Vec<_> = world.discord.requests_to("DELETE", "/channels/3003").into_iter().filter(|seen| !seen.path.contains("/recipients/")).collect();
     assert_eq!(deletes.len(), 1);
     assert!(
         deletes[0].path.contains("silent=true"),
@@ -9332,6 +9344,8 @@ fn announcement_publish_crosspost_source_and_follow() {
 fn channel_mentions_message_links_and_special_tokens_resolve_in_app() {
     let world = World::launch(&[], |_| {});
     wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+    // Open channel 4101 so live messages are stored.
+    wait("channel 4101 history", || (!world.messages("4101").is_empty()).then_some(()));
 
     world.discord.push("MESSAGE_CREATE", json!({
         "id": "1300000010000001200",
@@ -9405,6 +9419,8 @@ fn edit_suppresses_embeds_merging_existing_flags_and_removes_attachments() {
         *shared.ready.lock().unwrap() = ready.to_string();
     });
     wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+    // Open channel 4101 so live messages are stored.
+    wait("channel 4101 history", || (!world.messages("4101").is_empty()).then_some(()));
 
     // 1. Seed another user's message with an embed and existing flags = 1 (CROSSPOSTED) | 4096 (SUPPRESS_NOTIFICATIONS).
     let other_id = "1300000010000001300";
@@ -9559,7 +9575,8 @@ fn text_attachment_head_preview_uses_range_request_and_keeps_full_download_separ
     use std::io::{BufRead, BufReader, Write as _};
     use std::sync::mpsc::channel;
 
-    let payload: Vec<u8> = (1..=2500).flat_map(|n| format!("log line {n:04}: ok\n").into_bytes()).collect();
+    // 6000 lines of 19 bytes: past the 100 KiB preview, which 2500 lines were not.
+    let payload: Vec<u8> = (1..=6000).flat_map(|n| format!("log line {n:04}: ok\n").into_bytes()).collect();
     let payload_len = payload.len();
     assert!(payload_len > protocol::TEXT_PREVIEW_MAX_BYTES as usize);
 
@@ -9615,6 +9632,8 @@ fn text_attachment_head_preview_uses_range_request_and_keeps_full_download_separ
     let world = World::launch(&[], |_| {});
     wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
 
+    // Open channel 4101 so live messages are stored.
+    wait("channel 4101 history", || (!world.messages("4101").is_empty()).then_some(()));
     let url = format!("http://127.0.0.1:{port}/attachments/4101/88001/server.log");
     world.discord.push("MESSAGE_CREATE", json!({
         "id": "1300000010000001400",

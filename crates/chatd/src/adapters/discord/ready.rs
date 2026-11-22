@@ -754,6 +754,8 @@ impl Discord {
             }
         };
         if moved {
+            // What the server's info says we may do (our nickname) follows our permissions.
+            self.ctx.space_info_stale(guild);
             self.replant(guild)?;
         }
         Ok(())
@@ -1620,6 +1622,8 @@ impl Discord {
             Some(mut row) => {
                 row.space = Some(guild);
                 self.ctx.conversation(&row)?;
+                // The upsert keeps the stored rights when the new mask is zero; the last right lost is written here.
+                self.ctx.rights(&row.id, row.rights)?;
                 self.ctx.muted(&row.id, muted)?;
                 self.release_slowmode(&row.id, row.slowmode_seconds, row.rights.slowmode_exempt);
                 self.sync_child_threads(&row.id)?;

@@ -451,7 +451,8 @@ impl Rest {
                 return Err(Refused::Challenge);
             }
             match status {
-                401 => {
+                // A 401 that asks for a 2FA code (60003, 60008) is about this request; the session stands.
+                401 if !matches!(code, 60003 | 60008) => {
                     self.expired.store(true, Ordering::Relaxed);
                     return Err(Refused::Expired);
                 }
