@@ -1228,7 +1228,9 @@ impl Discord {
             pins: true,
             forward: true,
             abuse_reports: true,
-            polls: None,
+            polls: Some(protocol::PollCapabilities {
+                max_options: 10, max_duration_secs: 7 * 24 * 3600, multiple: true, anonymous: false,
+            }),
             reactions: true,
             reactors: true,
             gif_file: false,

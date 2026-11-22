@@ -1804,6 +1804,7 @@ pub enum Command {
         reply: Reply<()>,
     },
     SetVoiceChannelStatus { conversation_id: String, status: Option<String>, reply: Reply<()> },
+    PollVoters { conversation_id: String, message_id: String, choice: u32, after: Option<String>, reply: Reply<ReactorsPage> },
     DiscordVoiceSettings { conversation_id: String, reply: Reply<protocol::DiscordVoiceSettings> },
     EditDiscordVoiceChannel { conversation_id: String, edit: protocol::DiscordChannelVoice, reply: Reply<()> },
     SetDiscordCallRegion { conversation_id: String, region: String, reply: Reply<()> },
@@ -2199,6 +2200,7 @@ impl Command {
             | Command::SetDefaultReaction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reactors { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::PollVoters { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ClearReactions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendWith { conversation_id, client_id, .. } => {
                 let why = format!("Sending files and options is not built for {} yet.", ctx.account.network.label());

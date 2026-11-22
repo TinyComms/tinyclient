@@ -36,6 +36,24 @@ use std::time::Duration;
 /// How long the tint on a jump's target takes to fade.
 pub const FLASH: Duration = Duration::from_millis(1200);
 
+fn poll_percentage(count: u32, total: u32) -> u32 {
+    if total == 0 {
+        return 0;
+    }
+    let count = u64::from(count.min(total));
+    let total = u64::from(total);
+    ((100 * count + total / 2) / total) as u32
+}
+
+#[cfg(test)]
+#[test]
+fn poll_result_percentages_round_and_stay_within_the_card() {
+    assert_eq!(poll_percentage(0, 0), 0);
+    assert_eq!(poll_percentage(2, 3), 67);
+    assert_eq!(poll_percentage(u32::MAX, u32::MAX), 100);
+    assert_eq!(poll_percentage(5, 2), 100);
+}
+
 /// The line under a send that is queued until the account is back.
 pub(crate) fn waiting_line(network: &str) -> String {
     format!("Waiting for {network}")
@@ -1248,7 +1266,8 @@ impl Pane {
                         )
                 }))
                 .children(message.all_cards().enumerate().map(|(ix, card)| self.app_card(message, ix, card, window, cx)))
-                .children(message.poll.as_deref().map(|poll| self.poll_card(message, poll, cx)))
+                .children(message.poll.as_deref().filter(|_| !matches!(message.kind, MessageKind::Unsupported { .. }))
+                    .map(|poll| self.poll_card(message, poll, cx)))
                 .children(message.contacts.iter().enumerate().map(|(idx, contact)| self.contact_card(message, contact, idx, cx)))
                 .children(message.invites.iter().enumerate().map(|(ix, invite)| self.invite_card(message, ix, invite, window, cx)))
                 .children(self.message_controls(message, cx))
@@ -4116,10 +4135,11 @@ impl Pane {
     /// Interactive poll card: question, choices with bar & count, my selection, Show results, End poll.
     fn poll_card(&self, message: &Rc<Message>, poll: &protocol::Poll, cx: &mut Context<Self>) -> AnyElement {
         let total = poll.total_votes();
-        let show_results = poll.closed || !poll.mine.is_empty() || self.poll_results.contains(&message.id);
+        let ended = poll.closed || poll.closes_at.is_some_and(|expiry| expiry <= crate::view::now());
+        let show_results = ended || !poll.mine.is_empty() || self.poll_results.contains(&message.id);
         let subtitle = {
             let mut parts: Vec<String> = Vec::new();
-            if poll.closed {
+            if ended {
                 parts.push("Poll closed".to_owned());
             } else if poll.multiple {
                 parts.push("Select one or more".to_owned());
@@ -4129,7 +4149,7 @@ impl Pane {
             if poll.anonymous {
                 parts.push("Anonymous".to_owned());
             }
-            if !poll.closed {
+            if !ended {
                 if let Some(closes_at) = poll.closes_at {
                     let left = closes_at.saturating_sub(crate::view::now());
                     if left <= 0 {
@@ -4150,10 +4170,21 @@ impl Pane {
         for (idx, choice) in poll.choices.iter().enumerate() {
             let idx_u32 = idx as u32;
             let picked = poll.mine.contains(&idx_u32);
-            let pct = if total > 0 { ((choice.count as f32 / total as f32) * 100.).round() as u32 } else { 0 };
+            let pct = poll_percentage(choice.count, total);
             let next = poll.next_votes(idx_u32);
             let msg_id = message.id.clone();
-            let clickable = !poll.closed;
+            let clickable = !ended && !self.poll_voting.contains(&message.id) && message.state == SendState::Sent;
+            let emoji_path = choice.emoji_file.as_ref().and_then(|file| {
+                let account = self.open.as_ref()?.key.account();
+                let shell = self.shell.upgrade()?;
+                let hub = shell.read(cx).people_state.hub().clone();
+                hub.file(&account, file, cx).path.map(std::path::PathBuf::from)
+            });
+            let emoji = if let Some(path) = emoji_path {
+                Some(gpui::img(path).flex_none().size(px(18.)).into_any_element())
+            } else {
+                (!choice.emoji.is_empty()).then(|| div().flex_none().child(choice.emoji.clone()).into_any_element())
+            };
 
             let row = div()
                 .id(name_id(&format!("poll-{}-{}", message.id, idx), ""))
@@ -4198,6 +4229,7 @@ impl Pane {
                         .when(picked, |el| {
                             el.child(div().type_small().font_weight(theme::SEMIBOLD).text_color(theme::accent()).child("✓"))
                         })
+                        .children(emoji)
                         .child(div().type_ui().truncate().text_color(theme::text()).child(choice.text.clone())),
                 )
                 .when(show_results, |el| {
@@ -4211,6 +4243,30 @@ impl Pane {
                     )
                 });
             rows = rows.child(row);
+            if show_results && choice.answer_id.is_some() && choice.count > 0 {
+                let id = message.id.clone();
+                rows = rows.child(button(("poll-voters-choice", idx), ButtonKind::Ghost, "View voters")
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_poll_voters(id.clone(), idx_u32, cx))));
+            }
+            if let Some(list) = self.poll_voters.as_ref().filter(|list| list.message_id == message.id && list.choice == idx_u32) {
+                let mut voters = div().p(px(8.)).bg(theme::overlay()).rounded(px(theme::R_CONTROL)).flex().flex_col().gap(px(3.))
+                    .child(div().type_small().font_weight(theme::SEMIBOLD).child(format!("Voters · {}", choice.text)))
+                    .child(div().id(("poll-voters-list", idx)).max_h(px(180.)).overflow_y_scroll().children(
+                        list.voters.iter().map(|voter| div().type_small().child(voter.name.clone())),
+                    ));
+                if list.loading {
+                    voters = voters.child(div().type_small().child("Loading…"));
+                } else if let Some(error) = &list.error {
+                    voters = voters.child(div().type_small().text_color(theme::danger()).child(error.clone()));
+                } else if list.voters.is_empty() {
+                    voters = voters.child(div().type_small().child("No votes"));
+                }
+                if !list.loading && (list.more || list.error.is_some()) {
+                    voters = voters.child(button(("poll-more-voters", idx), ButtonKind::Secondary, if list.error.is_some() { "Retry" } else { "Load more" })
+                        .on_click(cx.listener(|this, _, _, cx| this.load_poll_voters(cx))));
+                }
+                rows = rows.child(voters);
+            }
         }
 
         let vote_label = if total == 1 { "1 vote".to_owned() } else { format!("{total} votes") };
@@ -4223,7 +4279,7 @@ impl Pane {
             .child(div().type_small().text_color(theme::text_faint()).child(vote_label));
 
         let mut actions = div().flex().items_center().gap(px(8.));
-        if !poll.closed && poll.mine.is_empty() {
+        if !ended && poll.mine.is_empty() {
             let msg_id = message.id.clone();
             let toggle_label = if show_results { "Hide results" } else { "Show results" };
             actions = actions.child(
@@ -4237,7 +4293,7 @@ impl Pane {
                     .child(toggle_label),
             );
         }
-        if message.outgoing && !poll.closed {
+        if message.outgoing && !ended && message.state == SendState::Sent && !self.poll_voting.contains(&message.id) {
             let msg_id = message.id.clone();
             actions = actions.child(
                 div()

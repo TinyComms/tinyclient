@@ -1,0 +1,12 @@
+{
+  "id": "discord-wave11",
+  "title": "Discord polls, voice controls, image descriptions, bot embeds, and DM pins",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "The Wave 11 driver uses desktop pointer menus. Android coverage requires a touch driver and a Discord fixture.",
+    "ios": "The Wave 11 driver uses desktop pointer menus. iOS coverage requires a touch driver and a Discord fixture."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

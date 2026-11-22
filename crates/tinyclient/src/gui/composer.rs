@@ -537,6 +537,7 @@ struct PollComposer {
     multiple: bool,
     allow_multiple: bool,
     max_options: usize,
+    duration_secs: Option<u32>,
 }
 
 struct ThreadComposer {
@@ -3284,6 +3285,7 @@ impl Composer {
             multiple: false,
             allow_multiple: caps.multiple,
             max_options,
+            duration_secs: self.target.as_ref().filter(|target| target.key.network == Network::Discord).map(|_| 24 * 3600),
         });
         cx.notify();
     }
@@ -3305,6 +3307,7 @@ impl Composer {
             question: question.clone(),
             options,
             multiple: form.multiple && form.allow_multiple,
+            duration_secs: form.duration_secs,
             ..protocol::PollDraft::default()
         };
         self.poll_composer = None;
@@ -3420,6 +3423,22 @@ impl Composer {
                     }))
                     .child(if mult { "☑ Multiple choices" } else { "☐ Multiple choices" }),
             );
+        }
+        if let Some(duration) = form.duration_secs {
+            let choices = [(1, "1 hour"), (4, "4 hours"), (8, "8 hours"), (24, "1 day"), (72, "3 days"), (168, "1 week")];
+            left = left.child(div()
+                .id("poll-duration")
+                .type_small()
+                .text_color(theme::accent())
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(form) = this.poll_composer.as_mut() {
+                        let ix = choices.iter().position(|(hours, _)| *hours * 3600 == duration).unwrap_or(0);
+                        form.duration_secs = Some(choices[(ix + 1) % choices.len()].0 * 3600);
+                        cx.notify();
+                    }
+                }))
+                .child(format!("Duration · {}", choices.iter().find(|(hours, _)| *hours * 3600 == duration).map_or("1 day", |(_, label)| *label))));
         }
         footer = footer.child(left).child(
             div()

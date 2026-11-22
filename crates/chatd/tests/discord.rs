@@ -481,6 +481,22 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
         }
         ("POST", ["auth", "logout"]) => (204, Value::Null),
         ("GET", ["channels", channel, "messages"]) => (200, serde_json::from_str(history(channel)).unwrap()),
+        ("GET", ["channels", _, "polls", _, "answers", _]) => (200, json!({"users":[{"id":"2001","username":"mara"}]})),
+        ("PUT", ["channels", channel, "polls", id, "answers", "@me"]) => {
+            let route = format!("/channels/{channel}/polls/{id}/answers/@me");
+            let writes = shared.requests_to("PUT", &route);
+            let ids = |body: &Value| body["answer_ids"].as_array().cloned().unwrap_or_default();
+            let previous = writes.iter().rev().nth(1).map_or_else(Vec::new, |seen| ids(&seen.body));
+            let current = ids(&seen.body);
+            for (kind, from, into) in [("REMOVE", &previous, &current), ("ADD", &current, &previous)] {
+                for answer in from.iter().filter(|answer| !into.contains(answer)) {
+                    shared.push(&format!("MESSAGE_POLL_VOTE_{kind}"), json!({
+                        "channel_id":channel,"message_id":id,"user_id":"1000","answer_id":answer
+                    }));
+                }
+            }
+            (204, Value::Null)
+        }
         ("POST", ["channels", channel, "messages"]) => {
             let mut message = json!({
                 "id": shared.snowflake(),
@@ -529,6 +545,16 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
                 })
                 .collect();
             message["attachments"] = json!(attached);
+            if let Some(poll) = seen.body.get("poll") {
+                let mut poll = poll.clone();
+                if let Some(answers) = poll["answers"].as_array_mut() {
+                    for (ix, answer) in answers.iter_mut().enumerate() {
+                        answer["answer_id"] = json!(ix + 1);
+                    }
+                }
+                poll["expiry"] = json!("2099-01-01T00:00:00Z");
+                message["poll"] = poll;
+            }
             if let Some(stickers) = seen.body["sticker_ids"].as_array() {
                 let items: Vec<Value> = stickers.iter().map(|id| json!({"id": id, "name": "wave", "format_type": 1})).collect();
                 message["sticker_items"] = json!(items);
@@ -1999,11 +2025,13 @@ fn messages_map_to_the_one_model_and_follow_live_events() {
     let quoted = rich.reply_to.as_ref().unwrap();
     assert_eq!((quoted.id.as_str(), quoted.sender.as_str(), quoted.snippet.as_str()), ("1300000000000000009", "Justin", "is the deploy done?"));
 
-    // Our own message, a system line, a poll we cannot draw, a sticker.
+    // Our own message, a system line, a native poll, a sticker.
     assert!(messages[3].outgoing);
     assert_eq!((messages[2].kind.clone(), messages[2].text.as_str()), (MessageKind::System, "Missed call from Mara O"));
-    let poll_link = "https://discord.com/channels/@me/3001/1300000000000000007".to_owned();
-    assert_eq!((messages[1].kind.clone(), messages[1].text.as_str()), (MessageKind::Unsupported { link: poll_link }, "Poll: Lunch?"));
+    assert_eq!(messages[1].kind, MessageKind::Normal);
+    let poll = messages[1].poll.as_deref().expect("the Discord poll");
+    assert_eq!(poll.question, "Lunch?");
+    assert_eq!(poll.choices.iter().map(|choice| choice.text.as_str()).collect::<Vec<_>>(), ["Tacos", "Ramen"]);
     assert_eq!(messages[0].attachments[0].name, "Wave");
     assert_eq!(messages[0].attachments[0].file.id, "sticker:9001");
 
@@ -3271,6 +3299,75 @@ fn discord_voice_settings_are_loaded_on_demand_and_apply_to_the_right_route() {
     assert_eq!(world.ask(Request::SetDiscordCallRegion { conversation: dm, region: "us-east".into() }), Response::Ok);
     assert_eq!(world.discord.requests_to("PATCH", "/channels/3001/call")[0].body, json!({"region":"us-east"}));
     assert_eq!(world.discord.requests_to("GET", "/voice/regions").len(), 1);
+}
+
+#[test]
+fn discord_polls_have_live_answers_and_use_discord_answer_ids_for_votes() {
+    let world = World::start();
+    let channel = world.key("3001");
+    // Above this fixture's newest history id, so static backfill cannot interpret it as deleted.
+    let id = "1300000090000042010";
+    let poll = || world.messages("3001").into_iter().find(|message| message.id == id).and_then(|message| message.poll);
+    let vote = |votes| world.ask(Request::Poll { conversation: channel.clone(), message_id: id.into(), votes });
+    let answer = |answer_id, text, emoji| json!({"answer_id":answer_id,"poll_media":{"text":text,"emoji":emoji}});
+    let raw = json!({
+        "question":{"text":"Where next?"}, "answers":[answer(3,"Lounge",json!({"name":"🎧"})),answer(7,"Studio",Value::Null)],
+        "allow_multiselect":true, "expiry":"2099-01-01T00:00:00Z", "results":{"is_finalized":false,"answer_counts":[{"id":7,"count":2,"me_voted":false}]}
+    });
+    world.discord.push("MESSAGE_CREATE", json!({"channel_id":"3001","id":id,"author":me(),"poll":raw,"content":"","type":0,
+        "timestamp":"2026-10-13T08:15:00Z"}));
+    let first = wait("a real poll card", poll);
+    assert_eq!(first.question, "Where next?");
+    assert!(first.multiple && !first.closed && first.closes_at.is_some());
+    assert_eq!(first.choices[0].emoji, "🎧");
+    assert_eq!(first.choices[1].count, 2);
+    let event = |name, user, answer| world.discord.push(name, json!({"channel_id":"3001","message_id":id,"user_id":user,"answer_id":answer}));
+    event("MESSAGE_POLL_VOTE_ADD", "2001", 7);
+    wait("another user's vote", || poll().filter(|poll| poll.choices[1].count == 3));
+    event("MESSAGE_POLL_VOTE_REMOVE", "2001", 7);
+    wait("another user's retraction", || poll().filter(|poll| poll.choices[1].count == 2));
+    assert_eq!(vote(Some(vec![1])), Response::Ok);
+    let route = format!("/channels/3001/polls/{id}/answers/@me");
+    assert_eq!(world.discord.requests_to("PUT", &route)[0].body, json!({"answer_ids":[7]}));
+    wait("our vote", || poll().filter(|poll| poll.mine == [1] && poll.choices[1].count == 3));
+    assert_eq!(vote(Some(vec![])), Response::Ok);
+    assert_eq!(world.discord.requests_to("PUT", &route)[1].body, json!({"answer_ids":[]}));
+    wait("our vote to retract", || poll().filter(|poll| poll.mine.is_empty() && poll.choices[1].count == 2));
+    match world.ask(Request::PollVoters { conversation: channel.clone(), message_id: id.into(), choice: 1, after: None }) {
+        Response::PollVoters { voters, .. } => assert_eq!(voters[0].key.id, "2001"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(world.discord.requests_to("GET", &format!("/channels/3001/polls/{id}/answers/7")).len(), 1);
+    let mut finished = raw.clone();
+    finished["results"]["is_finalized"] = json!(true);
+    world.discord.script(&format!("/channels/3001/polls/{id}/expire"), 200, json!({"channel_id":"3001","id":id,"poll":finished}));
+    assert_eq!(vote(None), Response::Ok);
+    wait("the finalized poll", || poll().filter(|poll| poll.closed));
+    let result_id = "1300000090000042011";
+    world.discord.push("MESSAGE_CREATE", json!({
+        "channel_id":"3001","id":result_id,"author":me(),"type":46,"message_reference":{"message_id":id,"channel_id":"3001"},
+        "embeds":[{"type":"poll_result","fields":[{"name":"victor_answer_text","value":"Studio"}]}]
+    }));
+    let result = wait("the poll's result", || world.messages("3001").into_iter().find(|message| message.id == result_id));
+    assert_eq!(result.jump.as_deref(), Some(id));
+    assert!(result.text.contains("Studio"));
+}
+
+#[test]
+fn discord_posts_a_poll_from_the_shared_composer_payload() {
+    let world = World::start();
+    assert!(can(&world).polls.is_some());
+    let draft = protocol::PollDraft { question: "Where next?".into(), options: vec!["Lounge".into(), "Studio".into()],
+        multiple: true, duration_secs: Some(3600), ..protocol::PollDraft::default() };
+    let client_id = "1730000000000042012";
+    world.ask(Request::Send { conversation: world.key("3001"), client_id: client_id.into(), text: "Poll: Where next?".into(),
+        reply_to: None, with: protocol::Outgoing { poll: Some(draft), ..protocol::Outgoing::default() } });
+    let sent = wait("the poll POST", || world.discord.requests_to("POST", "/channels/3001/messages").pop());
+    assert_eq!(sent.body["content"], "");
+    assert_eq!(sent.body["poll"], json!({"question":{"text":"Where next?"},"answers":[{"poll_media":{"text":"Lounge"}},{"poll_media":{"text":"Studio"}}],
+        "duration":1, "allow_multiselect":true,"layout_type":1}));
+    wait("the poll from Discord", || world.messages("3001").into_iter()
+        .find(|message| message.client_id.as_deref() == Some(client_id) && message.state == protocol::SendState::Sent && message.poll.is_some()));
 }
 
 #[test]

@@ -73,6 +73,7 @@ pub const MANAGE_WEBHOOKS: u64 = 1 << 29;
 pub const MANAGE_EVENTS: u64 = 1 << 33;
 pub const SEND_VOICE_MESSAGES: u64 = 1 << 46;
 pub const SET_VOICE_CHANNEL_STATUS: u64 = 1 << 48;
+pub const SEND_POLLS: u64 = 1 << 49;
 pub const MANAGE_GUILD_EXPRESSIONS: u64 = 1 << 30;
 pub const CREATE_GUILD_EXPRESSIONS: u64 = 1 << 43;
 pub const PIN_MESSAGES: u64 = 1 << 51;
@@ -1774,12 +1775,39 @@ pub struct Sticker {
 pub struct PollText {
     #[serde(default)]
     pub text: Option<String>,
+    pub emoji: Option<Emoji>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct Poll {
     #[serde(default)]
     pub question: Option<PollText>,
+    pub answers: Option<Vec<PollAnswer>>,
+    pub allow_multiselect: Option<bool>,
+    pub expiry: Option<String>,
+    pub results: Option<PollResults>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct PollAnswer {
+    pub answer_id: u32,
+    pub poll_media: PollText,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct PollResults {
+    #[serde(default)]
+    pub is_finalized: bool,
+    #[serde(default)]
+    pub answer_counts: Vec<PollCount>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct PollCount {
+    pub id: u32,
+    pub count: u32,
+    #[serde(default)]
+    pub me_voted: bool,
 }
 
 #[derive(Deserialize, Clone, Debug)]

@@ -780,9 +780,16 @@ pub struct Delivery {
 }
 
 /// One choice on a [`Poll`], and who currently picked it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PollChoice {
     pub text: String,
+    /// Discord's answer id. The protocol's voting commands still use choice indices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub emoji: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emoji_file: Option<MediaFile>,
     #[serde(default)]
     pub count: u32,
     /// People who picked this, when the network names them. Shorter than `count` once the list is full.
@@ -850,7 +857,7 @@ impl Poll {
     pub fn open(question: impl Into<String>, options: impl IntoIterator<Item = impl Into<String>>, multiple: bool) -> Poll {
         Poll {
             question: question.into(),
-            choices: options.into_iter().map(|text| PollChoice { text: text.into(), count: 0, voters: Vec::new() }).collect(),
+            choices: options.into_iter().map(|text| PollChoice { text: text.into(), ..PollChoice::default() }).collect(),
             multiple,
             closed: false,
             closes_at: None,
@@ -863,7 +870,7 @@ impl Poll {
 
     /// Total votes cast across all choices (or the network-supplied `total` when present).
     pub fn total_votes(&self) -> u32 {
-        self.total.unwrap_or_else(|| self.choices.iter().map(|c| c.count).sum())
+        self.total.unwrap_or_else(|| self.choices.iter().fold(0u32, |total, choice| total.saturating_add(choice.count)))
     }
 
     /// Compute the next `mine` selection when the user clicks `choice`.
@@ -1748,10 +1755,11 @@ impl Message {
             card.bound();
         }
         if let Some(poll) = &mut self.poll {
-            clip(&mut poll.question, 100);
+            clip(&mut poll.question, 300);
             poll.choices.truncate(POLL_OPTIONS);
             for choice in &mut poll.choices {
                 clip(&mut choice.text, 100);
+                clip(&mut choice.emoji, 96);
                 choice.voters.truncate(POLL_VOTERS);
             }
             poll.mine.truncate(POLL_OPTIONS);
@@ -1941,6 +1949,7 @@ impl Message {
             .chain(cards)
             .chain(self.invites.iter().filter_map(|invite| invite.icon.as_ref()))
             .chain(self.reactions.iter().filter_map(|reaction| reaction.file.as_ref()))
+            .chain(self.poll.iter().flat_map(|poll| poll.choices.iter().filter_map(|choice| choice.emoji_file.as_ref())))
             .chain(emoji)
             .chain(self.reply_to.as_ref().and_then(|reply| reply.thumb.as_ref()))
             .chain(&self.sender.avatar)
@@ -1969,6 +1978,7 @@ impl Message {
             .chain(cards)
             .chain(self.invites.iter_mut().filter_map(|invite| invite.icon.as_mut()))
             .chain(self.reactions.iter_mut().filter_map(|reaction| reaction.file.as_mut()))
+            .chain(self.poll.iter_mut().flat_map(|poll| poll.choices.iter_mut().filter_map(|choice| choice.emoji_file.as_mut())))
             .chain(emoji)
             .chain(self.reply_to.as_mut().and_then(|reply| reply.thumb.as_mut()))
             .chain(&mut self.sender.avatar)

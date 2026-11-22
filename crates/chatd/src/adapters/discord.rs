@@ -28,6 +28,7 @@ mod commands;
 mod interactions;
 mod members;
 mod model;
+mod polls;
 mod picker;
 mod proto;
 mod ready;
@@ -4201,6 +4202,13 @@ impl Discord {
             }
             Command::Download { id, url, reply } => self.download(id, url, reply),
             Command::Handoff { conversation_id, reply } => drop(reply.send(self.handoff(&conversation_id))),
+            Command::Vote { conversation_id, message_id, votes, reply } => {
+                answer(reply, self.vote_poll(&conversation_id, &message_id, votes))
+            }
+            Command::SendRules { conversation_id, reply } => answer(reply, self.poll_send_rules(&conversation_id)),
+            Command::PollVoters { conversation_id, message_id, choice, after, reply } => {
+                answer(reply, self.poll_voters(&conversation_id, &message_id, choice, after.as_deref()))
+            }
             Command::DiscordVoiceSettings { conversation_id, reply } => {
                 answer(reply, self.discord_voice_settings(&conversation_id))
             }

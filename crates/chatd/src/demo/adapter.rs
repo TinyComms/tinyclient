@@ -918,6 +918,7 @@ impl Demo {
                 let _ = reply.send(Ok(link));
             }
             Command::DiscordVoiceSettings { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::PollVoters { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallJoin(conversation_id) => Demo::call_join(demo, &conversation_id),
             Command::CallLeave(conversation_id) => demo.call_leave(&conversation_id),
             Command::CallPicture(_) => {}

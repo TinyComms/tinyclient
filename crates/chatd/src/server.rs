@@ -6103,6 +6103,16 @@ impl Chat {
             Request::Follow { conversation, into } => self.follow_announcement(conversation, into),
 
             Request::Poll { conversation, message_id, votes } => self.poll(conversation, message_id, votes),
+            Request::PollVoters { conversation, message_id, choice, after } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::PollVoters { conversation_id: conversation.id, message_id, choice, after, reply }) {
+                    Ok(page) => Response::PollVoters { voters: page.reactors, more: page.more },
+                    Err(refused) => *refused,
+                }
+            }
 
             Request::Fetch { account, ids, size, retry, span } => {
                 let adapter = lock(&self.adapters).get(&account).map(Adapter::sender);

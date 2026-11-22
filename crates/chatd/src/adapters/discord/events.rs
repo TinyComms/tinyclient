@@ -185,6 +185,9 @@ impl Discord {
             "READY_SUPPLEMENTAL" => self.supplemental(from_str(data)?),
             "MESSAGE_CREATE" => self.created(from_str(data)?)?,
             "MESSAGE_UPDATE" => self.updated(from_str(data)?)?,
+            "MESSAGE_POLL_VOTE_ADD" | "MESSAGE_POLL_VOTE_REMOVE" => {
+                self.poll_vote_event(from_str(data)?, event == "MESSAGE_POLL_VOTE_ADD")?;
+            }
             "MESSAGE_DELETE" | "MESSAGE_DELETE_BULK" => {
                 let removed: Removed = from_str(data)?;
                 for id in removed.ids.iter().chain(Some(&removed.id)).filter(|id| !id.is_empty()) {
@@ -565,11 +568,18 @@ impl Discord {
         let guild = posted.guild_id.clone().or_else(|| self.guild_of(&conversation));
         let files = if posted.author.is_some() {
             // Whole: translate it again, keeping what only the first arrival knew.
-            let (mut message, files) = self.convert(&posted, guild.as_deref(), conversation.kind);
+            let (mut message, mut files) = self.convert(&posted, guild.as_deref(), conversation.kind);
             message.mentions_me = stored.mentions_me;
             message.client_id = stored.client_id.take();
             if posted.reactions.is_none() {
                 message.reactions = std::mem::take(&mut stored.reactions);
+            }
+            if let Some(raw) = &posted.poll {
+                let (poll, added) = super::polls::convert(raw, stored.poll.as_deref());
+                message.poll = poll.map(Box::new);
+                files.files.extend(added);
+            } else if stored.poll.is_some() {
+                message.poll = stored.poll.take();
             }
             if message.thread.is_none() {
                 message.thread = stored.thread.take();

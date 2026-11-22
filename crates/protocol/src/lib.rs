@@ -3040,6 +3040,13 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         votes: Option<Vec<u32>>,
     },
+    PollVoters {
+        conversation: Key,
+        message_id: String,
+        choice: u32,
+        #[serde(default)]
+        after: Option<String>,
+    },
 
     /// Custom emoji, stickers or GIFs for the picker, asked when its tab opens and never before,
     /// kept five minutes. `space` narrows custom emoji to one Space's; `query` searches;
@@ -4381,6 +4388,7 @@ pub fn language_name(tag: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Response {
+    PollVoters { voters: Vec<Reactor>, more: bool },
     DiscordVoiceSettings { settings: DiscordVoiceSettings },
     Pong,
     /// Done, with nothing to say.

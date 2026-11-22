@@ -924,7 +924,11 @@ fn system_line(posted: &Posted, kind: u8, who: &str, content: &str, mentioned: &
                 None => format!("{who} made a purchase."),
             }
         }
-        46 => "A poll has closed.".to_owned(),
+        46 => {
+            let winner = posted.embeds.as_deref().unwrap_or_default().iter().find(|embed| embed.kind.as_deref() == Some("poll_result"))
+                .and_then(|embed| embed_field(embed, "victor_answer_text").or_else(|| embed_field(embed, "victor_answer_emoji_name")));
+            winner.map_or_else(|| "A poll has closed.".to_owned(), |winner| format!("A poll has closed. {winner} won."))
+        }
         67 => format!("{who} accepted your friend request."),
         _ => {
             tracing::debug!(message_type = kind, "chatd: Discord: unsupported system message type");
@@ -1225,7 +1229,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         }
         attachments.extend(part.sticker_items.iter().map(|item| sticker(&mut rich, item)));
         // The alert's embed is the system line. A preview would glue those fields back on.
-        if kind != 24 {
+        if kind != 24 && kind != 46 {
             embeds.extend(part.embeds.as_deref().unwrap_or(&[]).iter().cloned());
         }
         composed |= part.author.as_ref().is_some_and(|author| author.bot) || part.webhook_id.is_some();
@@ -1261,12 +1265,19 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         forwarded_from = posted.message_reference.as_ref().map(|origin| Box::new(referenced(origin, place)));
     }
 
-    if let Some(poll) = &posted.poll {
-        let question = poll.question.as_ref().and_then(|question| question.text.as_deref()).unwrap_or("");
-        rich.text = format!("Poll: {question}");
-        rich.spans.clear();
-        message_kind = MessageKind::Unsupported { link: link.clone() };
-    } else if message_kind == MessageKind::Normal
+    let poll = posted.poll.as_ref().and_then(|raw| {
+        let (poll, files) = super::polls::convert(raw, None);
+        rich.files.files.extend(files);
+        poll.map(Box::new)
+    });
+    if poll.is_none() {
+        if let Some(question) = posted.poll.as_ref().and_then(|poll| poll.question.as_ref()).and_then(|question| question.text.as_deref()) {
+            rich.text = format!("Poll: {question}");
+            rich.spans.clear();
+            message_kind = MessageKind::Unsupported { link: link.clone() };
+        }
+    }
+    if poll.is_none() && message_kind == MessageKind::Normal
         && rich.text.is_empty()
         && attachments.is_empty()
         && previews.is_empty()
@@ -1399,7 +1410,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         reactions,
         reply_to,
         thread,
-        poll: None,
+        poll,
         views: None,
         edited: posted.edited_timestamp.is_some(),
         edited_at: posted.edited_timestamp.as_deref().and_then(model::iso_seconds),
@@ -1554,6 +1565,17 @@ fn cards(
 /// Applies the fields a partial `MESSAGE_UPDATE` carries to the message as stored.
 pub fn patch(stored: &mut Message, update: &Posted, place: &Place) -> Files {
     let mut rich = Rich::default();
+    if let Some(raw) = &update.poll {
+        let (poll, files) = super::polls::convert(raw, stored.poll.as_deref());
+        if let Some(poll) = poll {
+            stored.poll = Some(Box::new(poll));
+            stored.kind = MessageKind::Normal;
+            if update.content.is_none() && stored.text.starts_with("Poll: ") {
+                stored.text.clear();
+            }
+            rich.files.files.extend(files);
+        }
+    }
     if let Some(content) = &update.content {
         if stored.kind == MessageKind::Normal {
             markdown_in(&mut rich, content, place.names, place.guild);
