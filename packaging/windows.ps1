@@ -4,13 +4,15 @@
 #
 #   packaging\windows.ps1                        build --release, then package as tinyclient-v<version>-windows-x86_64*
 #   packaging\windows.ps1 -NoBuild -Label LABEL  package what is already in target\release as tinyclient-LABEL-windows-x86_64*
+#   packaging\windows.ps1 -Arch aarch64          build and package from a native Windows Arm64 toolchain
 #
 # Building needs protoc on the PATH and WebView2 (current Windows includes it). Packaging needs
 # Inno Setup 6 (`choco install innosetup`, or jrsoftware.org); iscc.exe is found on the PATH or in
 # its default folder. The installer is not code-signed, so SmartScreen warns before the first run.
 param(
     [switch]$NoBuild,
-    [string]$Label = ""
+    [string]$Label = "",
+    [ValidateSet('x86_64', 'aarch64')][string]$Arch = "x86_64"
 )
 $ErrorActionPreference = "Stop"
 
@@ -18,11 +20,15 @@ $root = Split-Path -Parent $PSScriptRoot
 $release = Join-Path $root "target\release"
 $version = (Select-String -Path (Join-Path $root "Cargo.toml") -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
 if (-not $Label) { $Label = "v$version" }
-$name = "tinyclient-$Label-windows-x86_64"
+$name = "tinyclient-$Label-windows-$Arch"
 $dist = Join-Path $root "dist"
 $programs = "tinyclient.exe", "chatd.exe", "mediad.exe", "tinyclient-login.exe"
 
 if (-not $NoBuild) {
+    $targetHost = "$Arch-pc-windows-msvc"
+    if ((rustc -vV) -notcontains "host: $targetHost") {
+        throw "windows.ps1: select the native $targetHost Rust toolchain before building"
+    }
     cargo build --release -p tinyclient --features tinyclient/gui -p chatd -p mediad -p login
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
@@ -51,7 +57,9 @@ if (-not $iscc) {
     }
 }
 if (-not $iscc) { throw "windows.ps1: Inno Setup 6 (iscc.exe) is not installed" }
-& $iscc /Q "/DVersion=$version" "/DSource=$release" "/DOutputDir=$dist" "/DOutput=$name-setup" (Join-Path $root "packaging\windows\tinyclient.iss")
+$defines = @("/DVersion=$version", "/DSource=$release", "/DOutputDir=$dist", "/DOutput=$name-setup")
+if ($Arch -eq "aarch64") { $defines += "/DArm64Package" }
+& $iscc /Q @defines (Join-Path $root "packaging\windows\tinyclient.iss")
 if ($LASTEXITCODE -ne 0) { throw "windows.ps1: iscc failed ($LASTEXITCODE)" }
 
 Get-ChildItem (Join-Path $dist "$name*") | Format-Table Name, Length

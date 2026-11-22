@@ -261,6 +261,7 @@ fn account() -> AccountKey {
 
 fn staged(path: &Path, name: &str) -> OutgoingFile {
     OutgoingFile {
+        alt: String::new(),
         path: path.to_string_lossy().into_owned(),
         name: name.to_owned(),
         spoiler: false,

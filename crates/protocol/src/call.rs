@@ -6,6 +6,29 @@
 use crate::{is_false, Key, Network};
 use serde::{Deserialize, Serialize};
 
+/// The settings Discord returns when a voice channel editor is opened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscordChannelVoice {
+    pub bitrate: u32,
+    pub user_limit: u32,
+    pub rtc_region: Option<String>,
+    pub video_quality_mode: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscordVoiceRegion {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscordVoiceSettings {
+    pub channel: Option<DiscordChannelVoice>,
+    pub max_bitrate: u32,
+    pub regions: Vec<DiscordVoiceRegion>,
+    pub current_region: Option<String>,
+}
+
 /// One entry in a network's recent calls list (`Request::CallHistory`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallLogEntry {
@@ -25,6 +48,21 @@ pub struct CallLogEntry {
     pub note: crate::CallNote,
     /// Unix seconds when the call happened.
     pub time: i64,
+}
+
+/// The network asked for a quality rating after a call ended (Telegram `phoneCallDiscarded.need_rating`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallRatingPrompt {
+    /// The conversation the call belonged to.
+    pub conversation: Key,
+    /// Network-specific call identifier passed back to `Request::CallRate`.
+    pub call_id: String,
+    /// True when the call carried video.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub video: bool,
+    /// Duration of the call in seconds, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seconds: Option<u32>,
 }
 
 /// Most device names of one kind a call lists.

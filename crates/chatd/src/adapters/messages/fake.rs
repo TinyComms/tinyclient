@@ -31,6 +31,8 @@ pub const CLUB: &str = "phone-club";
 pub const GRACE_PARTICIPANT: &str = "participant-grace";
 pub const EMOJI: &str = "🐢";
 pub const EMOJI_AGAIN: &str = "🐈";
+pub const QR_LINK: &str = "https://support.google.com/messages/?p=web_computer#?c=Cj0AfykVEmKirgiiArHB50PkhjgeYDOpTt3b6WA6sMcvlBjKSqO01t0U9seRD9JEr/guOhSjXdDmBdNdjjQgEiB6eK1NUJBpBl8gdj5IKoYsNDZXZWn013SzCK4ATZgSHRogkLrgDh0lXYS9fgIdnhMyVLbHGS7DSb6qTdQnjF2cVt4=";
+pub const QR_LINK_AGAIN: &str = "https://support.google.com/messages/?p=web_computer#?c=Cj0B9xL2mPqR8vWtYzN4kJ7hF6dS3aQ1wE5rT8yU0iO2pL4kJ6hG8fD0sA2zX4cV6bN8mQ1wE3rT5yU7iO9pEiB2fH4jK6lM8nP0qR2sT4uV6wX8yZ0aB2cD4eF6gH8iJ0kL2mN4oP6qR8sT0uV2wX4yZ6aB8cD0eF2gH4iJ=";
 
 #[derive(Clone)]
 struct SentCopy {
@@ -1416,6 +1418,47 @@ impl FakeLinker {
                 }
                 Some("fail") => {
                     outcome = Some(Err("Messages could not pair.".into()));
+                    false
+                }
+                _ => true,
+            }
+        });
+        record("pairing stopped");
+        outcome.unwrap_or_else(|| Err("the pairing was interrupted".into()))
+    }
+
+    /// Pairs via QR when the test says the phone scanned the code (`confirm`), rotated (`expire`), or failed (`fail`).
+    pub fn link_qr(
+        attempt: u32,
+        show: &dyn Fn(String, i64),
+        cancelled: &AtomicBool,
+    ) -> Result<String, String> {
+        let control = script::control("messages.signin.ctl");
+        let link = if attempt == 0 {
+            QR_LINK
+        } else {
+            QR_LINK_AGAIN
+        };
+        let expires = crate::hub::now() + 180;
+        show(link.to_owned(), expires);
+        let mut outcome = None;
+        script::follow(&control, |line| {
+            if cancelled.load(Ordering::Acquire) {
+                outcome = Some(Err("cancelled".into()));
+                return false;
+            }
+            match line.map(str::trim) {
+                Some("confirm") => {
+                    let session = serde_json::json!({ "account": ME, "name": "Ada Quill" });
+                    outcome = Some(Ok(session.to_string()));
+                    false
+                }
+                Some("expire") => {
+                    outcome = Some(Err("The QR code expired before your phone scanned it.".into()));
+                    false
+                }
+                Some("fail") => {
+                    outcome = Some(Err("Messages could not pair via QR code.".into()));
                     false
                 }
                 _ => true,

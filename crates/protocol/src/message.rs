@@ -96,6 +96,17 @@ impl MediaFile {
     }
 }
 
+/// The name, snowflake and animation flag of a Discord custom emoji token.
+pub fn discord_emoji_token(token: &str) -> Option<(&str, &str, bool)> {
+    let inner = token.strip_prefix('<')?.strip_suffix('>')?;
+    let (marker, emoji) = inner.split_once(':')?;
+    let (name, id) = emoji.split_once(':')?;
+    if !matches!(marker, "" | "a") || name.is_empty() || id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some((name, id, marker == "a"))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MentionKind {
@@ -418,6 +429,9 @@ pub struct Attachment {
     /// Hidden until the user asks to see it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub spoiler: bool,
+    /// A description of the picture, for a reader who cannot see it. At most [`ALT_LIMIT`] characters.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub alt: String,
     /// A sticker: drawn at its own size with no frame, and its transparency kept.
     #[serde(default, skip_serializing_if = "is_false")]
     pub sticker: bool,
@@ -444,6 +458,9 @@ pub struct Attachment {
     /// Optional clip transcript preview and lazy caption track (Slack clips).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript: Option<Transcript>,
+    /// Alternative video quality variants offered by the network (Telegram `alt_documents`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variants: Vec<MediaFile>,
 }
 
 impl Attachment {
@@ -465,8 +482,18 @@ impl Attachment {
             page: String::new(),
             transcription: None,
             transcript: None,
+            variants: Vec::new(),
+            alt: String::new(),
         }
     }
+}
+
+/// Discord's limit for an image description.
+pub const ALT_LIMIT: usize = 1024;
+
+/// The description a network will keep: trimmed, and no longer than [`ALT_LIMIT`] characters.
+pub fn clip_alt(text: &str) -> String {
+    text.trim().chars().take(ALT_LIMIT).collect()
 }
 
 /// A link's card, as the network or sender built it. Readers never fetch the linked site;
@@ -605,20 +632,38 @@ pub struct CardAction {
 pub struct Card {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub author: String,
+    /// Where a click on the author line goes. Empty: nowhere.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub author_link: String,
+    /// The small picture before the author's name (when hosted by the network).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_icon: Option<MediaFile>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub title: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub title_link: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
+    /// Styles over `text`, as on a message: a masked link stays a link.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text_spans: Vec<Span>,
     /// Label and value, in the network's order, at most [`CARD_FIELDS`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<(String, String)>,
+    /// One for each of `fields`: it shares its row with its neighbours. Empty: every field does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inline: Vec<bool>,
     /// Labelled links or action buttons, in the network's order, at most [`CARD_ACTIONS`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<CardAction>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub footer: String,
+    /// The small picture before the footer (when hosted by the network).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footer_icon: Option<MediaFile>,
+    /// Unix seconds the card names as its own time, shown after the footer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<i64>,
     /// Full-width image inside the card (when hosted by the network).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<MediaFile>,
@@ -636,11 +681,16 @@ pub struct Card {
 impl Card {
     pub fn bound(&mut self) {
         clip(&mut self.author, 256);
+        clip(&mut self.author_link, 2_000);
         clip(&mut self.title, 256);
         clip(&mut self.title_link, 2_000);
         clip(&mut self.text, 4_000);
+        // A style that reached past the cut goes with it.
+        let kept = self.text.len();
+        self.text_spans.retain(|span| span.start <= span.end && span.end as usize <= kept);
         clip(&mut self.footer, 256);
         self.fields.truncate(CARD_FIELDS);
+        self.inline.truncate(self.fields.len());
         for (label, value) in &mut self.fields {
             clip(label, 256);
             clip(value, 1_000);
@@ -734,9 +784,16 @@ pub struct Delivery {
 }
 
 /// One choice on a [`Poll`], and who currently picked it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PollChoice {
     pub text: String,
+    /// Discord's answer id. The protocol's voting commands still use choice indices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub emoji: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emoji_file: Option<MediaFile>,
     #[serde(default)]
     pub count: u32,
     /// People who picked this, when the network names them. Shorter than `count` once the list is full.
@@ -804,7 +861,7 @@ impl Poll {
     pub fn open(question: impl Into<String>, options: impl IntoIterator<Item = impl Into<String>>, multiple: bool) -> Poll {
         Poll {
             question: question.into(),
-            choices: options.into_iter().map(|text| PollChoice { text: text.into(), count: 0, voters: Vec::new() }).collect(),
+            choices: options.into_iter().map(|text| PollChoice { text: text.into(), ..PollChoice::default() }).collect(),
             multiple,
             closed: false,
             closes_at: None,
@@ -817,7 +874,7 @@ impl Poll {
 
     /// Total votes cast across all choices (or the network-supplied `total` when present).
     pub fn total_votes(&self) -> u32 {
-        self.total.unwrap_or_else(|| self.choices.iter().map(|c| c.count).sum())
+        self.total.unwrap_or_else(|| self.choices.iter().fold(0u32, |total, choice| total.saturating_add(choice.count)))
     }
 
     /// Compute the next `mine` selection when the user clicks `choice`.
@@ -1434,6 +1491,12 @@ pub struct Message {
     /// How many people saw a channel's post, when the network counts them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub views: Option<u32>,
+    /// How many times a channel's post was forwarded, when the network counts them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shares: Option<u32>,
+    /// Who signed a channel's post, or an anonymous admin's title, when the network says.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub signature: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub mentions_me: bool,
     #[serde(default, skip_serializing_if = "MessageKind::is_normal")]
@@ -1555,6 +1618,9 @@ pub struct CallNote {
     pub participants: Vec<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub video: bool,
+    /// Network call id for rating a finished call from its row (`Request::CallRate`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
 }
 
 /// An earlier wording of one message, oldest first when several are kept. Only a network that
@@ -1619,6 +1685,8 @@ impl Message {
             pinned_at: None,
             starred: false,
             views: None,
+            shares: None,
+            signature: String::new(),
             mentions_me: false,
             kind: MessageKind::Normal,
             state: SendState::Sent,
@@ -1702,10 +1770,11 @@ impl Message {
             card.bound();
         }
         if let Some(poll) = &mut self.poll {
-            clip(&mut poll.question, 100);
+            clip(&mut poll.question, 300);
             poll.choices.truncate(POLL_OPTIONS);
             for choice in &mut poll.choices {
                 clip(&mut choice.text, 100);
+                clip(&mut choice.emoji, 96);
                 choice.voters.truncate(POLL_VOTERS);
             }
             poll.mine.truncate(POLL_OPTIONS);
@@ -1733,6 +1802,7 @@ impl Message {
         if let Some(via) = &mut self.sent_via {
             clip(via, 64);
         }
+        clip(&mut self.signature, 128);
         if let Some(jump) = &mut self.jump {
             clip(jump, 128);
         }
@@ -1895,6 +1965,7 @@ impl Message {
             .chain(cards)
             .chain(self.invites.iter().filter_map(|invite| invite.icon.as_ref()))
             .chain(self.reactions.iter().filter_map(|reaction| reaction.file.as_ref()))
+            .chain(self.poll.iter().flat_map(|poll| poll.choices.iter().filter_map(|choice| choice.emoji_file.as_ref())))
             .chain(emoji)
             .chain(self.reply_to.as_ref().and_then(|reply| reply.thumb.as_ref()))
             .chain(&self.sender.avatar)
@@ -1923,6 +1994,7 @@ impl Message {
             .chain(cards)
             .chain(self.invites.iter_mut().filter_map(|invite| invite.icon.as_mut()))
             .chain(self.reactions.iter_mut().filter_map(|reaction| reaction.file.as_mut()))
+            .chain(self.poll.iter_mut().flat_map(|poll| poll.choices.iter_mut().filter_map(|choice| choice.emoji_file.as_mut())))
             .chain(emoji)
             .chain(self.reply_to.as_mut().and_then(|reply| reply.thumb.as_mut()))
             .chain(&mut self.sender.avatar)
@@ -2122,6 +2194,26 @@ mod tests {
         };
         let mwire = serde_json::to_string(&modal).unwrap();
         assert_eq!(serde_json::from_str::<InteractionModal>(&mwire).unwrap(), modal);
+    }
+
+    #[test]
+    fn a_cards_styles_and_row_flags_never_outlast_what_they_describe() {
+        let link = |start, end| Span { start, end, style: Style::Link { url: "https://ci.example".into() } };
+        let mut card = Card {
+            text: "a".repeat(4_010),
+            text_spans: vec![link(0, 8), link(3_990, 4_010)],
+            fields: vec![("Duration".into(), "3m".into())],
+            inline: vec![false, true, true],
+            ..Card::default()
+        };
+        card.bound();
+        assert_eq!(card.text.len(), 4_000);
+        assert_eq!(card.text_spans, [link(0, 8)], "a style past the cut goes with it");
+        assert_eq!(card.inline, [false]);
+        // An old card has none of the new parts, and says nothing about them on the wire.
+        let plain: Card = serde_json::from_str(r#"{"title":"Build"}"#).unwrap();
+        assert!(plain.text_spans.is_empty() && plain.inline.is_empty() && plain.time.is_none() && plain.author_icon.is_none());
+        assert_eq!(serde_json::to_string(&plain).unwrap(), r#"{"title":"Build"}"#);
     }
 
     #[test]

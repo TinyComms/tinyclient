@@ -62,6 +62,20 @@ use std::time::{Duration, Instant};
 
 /// What a cancelled send is answered with.
 pub const CANCELLED: &str = "Cancelled";
+
+/// The effective per-file limit for the destination, shared by preflight and sending.
+pub(crate) fn size_refusal(network: Network, file: &str, bytes: u64) -> String {
+    let limit = if bytes >= 1 << 30 {
+        format!("{} GB", bytes >> 30)
+    } else {
+        format!("{} MB", bytes >> 20)
+    };
+    if network == Network::Discord {
+        format!("{file} is too big. Discord allows up to {limit} per file here.")
+    } else {
+        format!("{file} is too big for {} (limit {limit}).", network.label())
+    }
+}
 /// Largest part [`Upload::parts`] holds: the upload buffer's whole budget.
 pub const LARGEST_PART: usize = 8 * 1024 * 1024;
 /// Progress is told no more often than this, and once at the end.
@@ -82,6 +96,8 @@ pub struct Source {
     pub spoiler: bool,
     pub as_file: bool,
     pub original: bool,
+    /// A description of the picture, already clipped. Empty: none.
+    pub alt: String,
     /// The shell staged it in `outbox/`, so it goes once the message went.
     outbox: bool,
     file: File,
@@ -235,6 +251,7 @@ impl Upload {
                 spoiler: staged.spoiler,
                 as_file: staged.as_file,
                 original: staged.original,
+                alt: protocol::clip_alt(&staged.alt),
                 outbox,
                 file,
                 media: staged.media.clone(),
@@ -840,6 +857,7 @@ mod tests {
     #[test]
     fn names_are_one_plain_file_name_and_types_come_from_the_extension() {
         let staged = |path: &str, name: &str| OutgoingFile {
+            alt: String::new(),
             path: path.to_owned(),
             name: name.to_owned(),
             spoiler: false,

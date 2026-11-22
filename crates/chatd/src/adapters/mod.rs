@@ -1235,6 +1235,19 @@ pub enum Command {
     TopicIcons {
         reply: Reply<CatalogPage>,
     },
+    /// The message effects the account can send.
+    MessageEffects {
+        reply: Reply<CatalogPage>,
+    },
+    /// Rates a finished call on Telegram (`phone.setCallRating`).
+    CallRate {
+        call_id: String,
+        rating: u8,
+        reasons: Vec<String>,
+        comment: String,
+        user_initiative: bool,
+        reply: Reply<()>,
+    },
     /// Fetch network-suggested chat folders.
     SuggestedFolders {
         reply: Reply<Vec<protocol::SuggestedFolder>>,
@@ -1413,6 +1426,8 @@ pub enum Command {
         me_only: bool,
         reply: Reply<()>,
     },
+    /// Unpins every message of a conversation on the network.
+    UnpinAll { conversation_id: String, reply: Reply<()> },
     /// Executes an interactive control on a message (Slack `blocks.actions`, Telegram giveaways / games / callbacks).
     MessageAction {
         conversation_id: String,
@@ -1465,6 +1480,9 @@ pub enum Command {
         session_id: String,
         reply: Reply<()>,
     },
+    EndOtherDiscordSessions { reply: Reply<()> },
+    DiscordAccountEntries { list: protocol::DiscordAccountList, reply: Reply<Vec<protocol::DiscordAccountEntry>> },
+    RemoveDiscordAccountEntry { target: protocol::DiscordAccountEntryId, reply: Reply<()> },
     /// Fetches unread mention or reaction message IDs in a conversation.
     UnreadItems {
         conversation_id: String,
@@ -1791,6 +1809,12 @@ pub enum Command {
     /// also takes it as what is on screen: a picture a message shows goes ahead of those that
     /// are not, even one no page has named yet. Others ignore it.
     Wanted(Vec<String>),
+    /// A byte range `[start, end)` of files the player asked for (`Fetch { span }`), for
+    /// progressive/ranged playback without downloading the entire file first.
+    WantedSpan {
+        ids: Vec<String>,
+        span: (u64, u64),
+    },
     /// The link that opens this conversation's call in the official app.
     Handoff { conversation_id: String, reply: Reply<String> },
     /// Today's meetings, soonest first. A calendar the account cannot read answers with what
@@ -1803,6 +1827,19 @@ pub enum Command {
         propose: Option<i64>,
         reply: Reply<()>,
     },
+    SetVoiceChannelStatus { conversation_id: String, status: Option<String>, reply: Reply<()> },
+    PollVoters { conversation_id: String, message_id: String, choice: u32, after: Option<String>, reply: Reply<ReactorsPage> },
+    DiscordVoiceSettings { conversation_id: String, reply: Reply<protocol::DiscordVoiceSettings> },
+    EditDiscordVoiceChannel { conversation_id: String, edit: protocol::DiscordChannelVoice, reply: Reply<()> },
+    SetDiscordCallRegion { conversation_id: String, region: String, reply: Reply<()> },
+    CallModerate {
+        conversation_id: String,
+        person_id: String,
+        server_muted: Option<bool>,
+        server_deafened: Option<bool>,
+        reply: Reply<()>,
+    },
+    CallMove { conversation_id: String, person_id: String, to: Option<String>, reply: Reply<()> },
     /// mediad is up: join or ring on the network, then report through [`Context::voice`].
     CallJoin(String),
     /// Leave, cancel or decline on the network. Also sent when the call failed here (mediad
@@ -1995,12 +2032,18 @@ impl Command {
             | Command::UpdateChatSettings { reply, .. }
             | Command::SetDefaultSendAs { reply, .. }
             | Command::EditChannel { reply, .. }
+            | Command::SetVoiceChannelStatus { reply, .. }
+            | Command::EditDiscordVoiceChannel { reply, .. }
+            | Command::SetDiscordCallRegion { reply, .. }
+            | Command::CallModerate { reply, .. }
+            | Command::CallMove { reply, .. }
             | Command::MoveChannels { reply, .. }
             | Command::DeleteChannel { reply, .. }
             | Command::SetOverwrite { reply, .. }
             | Command::DeleteOverwrite { reply, .. }
             | Command::SyncChannelPermissions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ChannelPermissions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DiscordVoiceSettings { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::AuditLog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::AutomodRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SaveAutomodRule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -2112,13 +2155,14 @@ impl Command {
             Command::FolderSave { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::LoadTopics { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::TopicCreate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::TopicIcons { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::TopicIcons { reply } | Command::MessageEffects { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CallRate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SuggestedFolders { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StarredMessages { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Pinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::Pin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Pin { reply, .. } | Command::UnpinAll { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MessageAction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::PressButton { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::GetNotifyDefaults { reply }
@@ -2127,7 +2171,10 @@ impl Command {
             Command::SavedDialogs { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SavedHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActiveSessions { reply } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::EndSession { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::EndSession { reply, .. }
+            | Command::EndOtherDiscordSessions { reply }
+            | Command::RemoveDiscordAccountEntry { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DiscordAccountEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::UnreadItems { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MarkUnreadItemsRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Commands { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -2181,6 +2228,7 @@ impl Command {
             | Command::SetDefaultReaction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reactors { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::PollVoters { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ClearReactions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendWith { conversation_id, client_id, .. } => {
                 let why = format!("Sending files and options is not built for {} yet.", ctx.account.network.label());
@@ -2492,6 +2540,14 @@ impl Context {
     /// is not announced: the row is told alone.
     pub fn occupants(&self, conversation_id: &str, people: Vec<Occupant>, total: u32) {
         self.hub.set_occupants(self.key(conversation_id), Occupants { people, total });
+    }
+
+    pub fn voice_status(&self, conversation_id: &str, status: Option<String>) {
+        self.hub.set_voice_status(self.key(conversation_id), status);
+    }
+
+    pub fn voice_status_channels(&self, guild_id: &str) -> Vec<Key> {
+        self.hub.voice_status_channels(&self.account, guild_id)
     }
 
     /// Records when this account may send again in a slowmode conversation (Unix seconds).
@@ -2851,6 +2907,24 @@ impl Context {
         Ok(())
     }
 
+    /// A channel post's views and shares as the network now counts them. `None` leaves one as it is.
+    pub fn post_counts(&self, conversation_id: &str, message_id: &str, views: Option<u32>, shares: Option<u32>) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().set_post_counts(&conversation, message_id, views, shares)? {
+            self.hub.changed(Change::Messages { conversation });
+        }
+        Ok(())
+    }
+
+    /// Clears the pin on every stored message of a conversation.
+    pub fn unpin_all(&self, conversation_id: &str) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().unpin_all(&conversation)? {
+            self.hub.changed(Change::Messages { conversation });
+        }
+        Ok(())
+    }
+
     /// Drops every ephemeral message of this account and tells the shell which chats changed.
     pub fn drop_ephemeral(&self) -> rusqlite::Result<Vec<String>> {
         let conversations = self.hub.store().drop_ephemeral(&self.account)?;
@@ -3132,6 +3206,11 @@ impl Context {
     /// A Tiny server's people, roles, invites or rooms changed: the shell reads them again.
     pub fn community_changed(&self) {
         self.hub.changed(Change::Tiny { account: self.account.clone() });
+    }
+
+    /// Something was pinned or unpinned in a conversation.
+    pub fn pins_changed(&self, conversation_id: &str) {
+        self.hub.changed(Change::Pins { conversation: self.key(conversation_id) });
     }
 
     /// Rows of a conversation's member list were added, removed or moved.

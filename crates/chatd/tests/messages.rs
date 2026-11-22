@@ -60,7 +60,20 @@ impl World {
         World::open(session, false, false)
     }
 
+    fn with_relay(relay_url: &str, qr_ttl_ms: Option<u64>) -> World {
+        World::open_inner(None, false, false, Some((relay_url, qr_ttl_ms)))
+    }
+
     fn open(session: Option<&str>, many: bool, offline: bool) -> World {
+        World::open_inner(session, many, offline, None)
+    }
+
+    fn open_inner(
+        session: Option<&str>,
+        many: bool,
+        offline: bool,
+        relay: Option<(&str, Option<u64>)>,
+    ) -> World {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let dir = std::path::absolute(format!(
             "/tmp/tinyclient-msg-{}-{}",
@@ -71,10 +84,16 @@ impl World {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let log = std::fs::File::create(dir.join("stderr.log")).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_chatd"));
+        // `CHATD_TEST_BIN` names a copy of the binary, for a target directory other builds also write to.
+        let mut command = Command::new(
+            std::env::var("CHATD_TEST_BIN")
+                .unwrap_or_else(|_| env!("CARGO_BIN_EXE_chatd").to_owned()),
+        );
         command
             .env("TINYCLIENT_DIR", &dir)
-            .env("TINYCLIENT_MESSAGES_FAKE", "1")
+            .env_remove("TINYCLIENT_MESSAGES_FAKE")
+            .env_remove("TINYCLIENT_MESSAGES_RELAY")
+            .env_remove("TINYCLIENT_MESSAGES_QR_TTL_MS")
             .env_remove("TINYCLIENT_SESSION_DISCORD")
             .env_remove("TINYCLIENT_SESSION_SLACK")
             .env_remove("TINYCLIENT_SESSION_TELEGRAM")
@@ -83,6 +102,14 @@ impl World {
             .env_remove("TINYCLIENT_SESSION_MESSAGES")
             .env_remove("TINYCLIENT_MESSAGES_OFFLINE")
             .stderr(Stdio::from(log));
+        if let Some((url, qr_ttl_ms)) = relay {
+            command.env("TINYCLIENT_MESSAGES_RELAY", url);
+            if let Some(ms) = qr_ttl_ms {
+                command.env("TINYCLIENT_MESSAGES_QR_TTL_MS", ms.to_string());
+            }
+        } else {
+            command.env("TINYCLIENT_MESSAGES_FAKE", "1");
+        }
         if offline {
             command.env("TINYCLIENT_MESSAGES_OFFLINE", "1");
         }
@@ -576,6 +603,7 @@ fn a_file_we_send_is_read_and_shown_back() {
         reply_to: None,
         with: Outgoing {
             files: vec![OutgoingFile {
+                alt: String::new(),
                 path: path.to_string_lossy().into_owned(),
                 name: "note.txt".into(),
                 spoiler: false,
@@ -621,6 +649,7 @@ fn a_file_we_send_is_read_and_shown_back() {
         reply_to: None,
         with: Outgoing {
             files: vec![OutgoingFile {
+                alt: String::new(),
                 path: photo.to_string_lossy().into_owned(),
                 name: "shot.jpg".into(),
                 spoiler: false,
@@ -672,6 +701,7 @@ fn a_mov_is_sent_as_a_video() {
         reply_to: None,
         with: Outgoing {
             files: vec![OutgoingFile {
+                alt: String::new(),
                 path: path.to_string_lossy().into_owned(),
                 name: "clip.mov".into(),
                 spoiler: false,
@@ -728,6 +758,7 @@ fn three_files_are_one_message_and_a_cancel_stops_the_send() {
         let path = dir.join(name);
         std::fs::write(&path, bytes).unwrap();
         files.push(OutgoingFile {
+            alt: String::new(),
             path: path.to_string_lossy().into_owned(),
             name: name.into(),
             spoiler: false,
@@ -808,6 +839,7 @@ fn three_files_are_one_message_and_a_cancel_stops_the_send() {
         reply_to: None,
         with: Outgoing {
             files: vec![OutgoingFile {
+                alt: String::new(),
                 path: later.to_string_lossy().into_owned(),
                 name: "later.txt".into(),
                 spoiler: false,
@@ -957,8 +989,6 @@ fn pairing_uses_google_browser_then_phone_emoji_confirmation() {
 fn google_pairing_can_be_cancelled_and_restarted() {
     let world = World::start(None);
     assert!(matches!(world.sign_in(None), SignInStep::Browser { waiting: false, .. }));
-    // Legacy QR requests must never begin the obsolete pairing flow.
-    assert!(matches!(world.sign_in(Some(SignInInput::UseQr)), SignInStep::Browser { waiting: false, .. }));
     world.sign_in(Some(SignInInput::OpenBrowser));
     world.until("the emoji challenge", || matches!(world.sign_in(None), SignInStep::Emoji { .. }).then_some(()));
     world.ask(Request::SignInCancel { network: Network::Messages });
@@ -1055,6 +1085,7 @@ fn an_sms_chat_says_text_and_an_encrypted_rcs_chat_does_not_claim_this_computer_
         reply_to: None,
         with: Outgoing {
             files: vec![OutgoingFile {
+                alt: String::new(),
                 path: path.to_string_lossy().into_owned(),
                 name: "note.txt".into(),
                 spoiler: false,
@@ -1242,6 +1273,7 @@ fn an_rcs_reply_quotes_the_original_and_an_sms_reply_stays_plain() {
         reply_to: Some(original.id.clone()),
         with: Outgoing {
             files: vec![OutgoingFile {
+                alt: String::new(),
                 path: path.to_string_lossy().into_owned(),
                 name: "note.txt".into(),
                 spoiler: false,
@@ -2567,4 +2599,508 @@ fn dual_sim_settings_publish_chooser_and_send_with_sim_2_carries_sim() {
     world.steer("incoming-sim grace sim-2 Work reply");
     let incoming = world.arrived(GRACE, "Work reply");
     assert_eq!(incoming.sent_via.as_deref(), Some("Work"));
+}
+
+#[test]
+fn qr_pairing_shows_a_code_rotates_on_expiry_and_completes_on_scan() {
+    let world = World::start(None);
+    assert!(matches!(
+        world.sign_in(None),
+        SignInStep::Browser { waiting: false, .. }
+    ));
+    let (_, seq) = world.status();
+    let initial = world.sign_in(Some(SignInInput::UseQr));
+    assert!(matches!(initial, SignInStep::Qr { .. }), "{initial:?}");
+    let (first, expires) = world.until("a QR pairing link", || match world.sign_in(None) {
+        SignInStep::Qr { link, expires, .. } if !link.is_empty() => Some((link, expires)),
+        _ => None,
+    });
+    assert!(
+        first.starts_with("https://support.google.com/messages/?p=web_computer#?c="),
+        "{first}"
+    );
+    assert!(expires > 0, "QR step should carry an expiry timestamp");
+
+    let phone_attempt = world.sign_in(Some(SignInInput::UsePhone));
+    assert!(
+        matches!(
+            &phone_attempt,
+            SignInStep::Qr {
+                link,
+                problem: Some(protocol::SignInProblem::Other { .. }),
+                ..
+            } if *link == first
+        ),
+        "{phone_attempt:?}"
+    );
+
+    world.steer_link("expire");
+    let second = world.changed(seq, "a rotated QR link", |change| match change {
+        Change::SignIn {
+            network: Network::Messages,
+            step: SignInStep::Qr { link, .. },
+        } if !link.is_empty() && *link != first => Some(link.clone()),
+        _ => None,
+    });
+    assert!(
+        second.starts_with("https://support.google.com/messages/?p=web_computer#?c="),
+        "{second}"
+    );
+    assert_ne!(first, second);
+
+    let (_, seq) = world.status();
+    world.steer_link("confirm");
+    let done = world.changed(seq, "QR pairing completion", |change| match change {
+        Change::SignIn {
+            network: Network::Messages,
+            step: SignInStep::Done { account },
+        } => Some(account.clone()),
+        _ => None,
+    });
+    assert_eq!(done, Some(account()));
+    world.connected();
+}
+
+#[test]
+fn qr_pairing_fails_after_repeated_expiry_and_on_error_without_adopting() {
+    let world = World::start(None);
+    world.sign_in(None);
+    world.sign_in(Some(SignInInput::UseQr));
+    world.until("first QR code", || match world.sign_in(None) {
+        SignInStep::Qr { link, .. } if !link.is_empty() => Some(()),
+        _ => None,
+    });
+    let (_, seq) = world.status();
+    world.steer_link("expire");
+    world.steer_link("expire");
+    world.steer_link("expire");
+    let expired_reason = world.changed(seq, "expiry limit failure", |change| match change {
+        Change::SignIn {
+            network: Network::Messages,
+            step: SignInStep::Failed { reason },
+        } => Some(reason.clone()),
+        _ => None,
+    });
+    assert!(
+        expired_reason.to_ascii_lowercase().contains("expir"),
+        "{expired_reason}"
+    );
+    assert!(world
+        .status()
+        .0
+        .iter()
+        .all(|status| status.key.network != Network::Messages || status.link == Link::SignedOut));
+
+    // Restarting after failure works and reports an explicit pairing error cleanly.
+    assert!(matches!(
+        world.sign_in(None),
+        SignInStep::Browser { waiting: false, .. }
+    ));
+    world.sign_in(Some(SignInInput::UseQr));
+    world.until("restarted QR code", || match world.sign_in(None) {
+        SignInStep::Qr { link, .. } if !link.is_empty() => Some(()),
+        _ => None,
+    });
+    let (_, seq) = world.status();
+    world.steer_link("fail");
+    let failed_reason = world.changed(seq, "QR failure", |change| match change {
+        Change::SignIn {
+            network: Network::Messages,
+            step: SignInStep::Failed { reason },
+        } => Some(reason.clone()),
+        _ => None,
+    });
+    assert!(!failed_reason.is_empty());
+    assert!(world
+        .status()
+        .0
+        .iter()
+        .all(|status| status.key.network != Network::Messages || status.link == Link::SignedOut));
+}
+
+#[test]
+fn qr_pairing_can_switch_back_to_google_and_complete() {
+    let world = World::start(None);
+    assert!(matches!(
+        world.sign_in(None),
+        SignInStep::Browser { waiting: false, .. }
+    ));
+    world.sign_in(Some(SignInInput::UseQr));
+    world.until("QR code before switching", || match world.sign_in(None) {
+        SignInStep::Qr { link, .. } if !link.is_empty() => Some(()),
+        _ => None,
+    });
+    assert!(matches!(
+        world.sign_in(Some(SignInInput::Back)),
+        SignInStep::Browser { waiting: false, .. }
+    ));
+    world.heard("pairing stopped");
+    world.sign_in(Some(SignInInput::OpenBrowser));
+    world.until("emoji after switching back", || {
+        matches!(world.sign_in(None), SignInStep::Emoji { .. }).then_some(())
+    });
+    let (_, seq) = world.status();
+    world.steer_link("confirm");
+    world.changed(seq, "completion after switching", |change| match change {
+        Change::SignIn {
+            network: Network::Messages,
+            step: SignInStep::Done { .. },
+        } => Some(()),
+        _ => None,
+    });
+    world.connected();
+}
+
+#[test]
+fn qr_pairing_over_http_fake_relay_registers_pairs_and_renews_with_signing_key() {
+    use base64::Engine;
+    use p256::ecdsa::{signature::Verifier, DerSignature, VerifyingKey};
+    use p256::pkcs8::DecodePublicKey;
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    fn pb_varint(out: &mut Vec<u8>, mut n: u64) {
+        loop {
+            let mut b = (n & 0x7f) as u8;
+            n >>= 7;
+            if n != 0 {
+                b |= 0x80;
+            }
+            out.push(b);
+            if n == 0 {
+                break;
+            }
+        }
+    }
+    fn pb_int(out: &mut Vec<u8>, field: u32, n: u64) {
+        pb_varint(out, ((field as u64) << 3) | 0);
+        pb_varint(out, n);
+    }
+    fn pb_bytes(out: &mut Vec<u8>, field: u32, data: &[u8]) {
+        pb_varint(out, ((field as u64) << 3) | 2);
+        pb_varint(out, data.len() as u64);
+        out.extend_from_slice(data);
+    }
+    fn read_varint(input: &mut &[u8]) -> Option<u64> {
+        let mut n = 0u64;
+        let mut shift = 0;
+        for _ in 0..10 {
+            let b = *input.first()?;
+            *input = &input[1..];
+            n |= ((b & 0x7f) as u64) << shift;
+            if b & 0x80 == 0 {
+                return Some(n);
+            }
+            shift += 7;
+        }
+        None
+    }
+    fn parse_fields(mut input: &[u8]) -> Vec<(u32, Option<u64>, Vec<u8>)> {
+        let mut out = Vec::new();
+        while !input.is_empty() {
+            let Some(key) = read_varint(&mut input) else { break };
+            let field = (key >> 3) as u32;
+            match key & 7 {
+                0 => {
+                    let Some(v) = read_varint(&mut input) else { break };
+                    out.push((field, Some(v), Vec::new()));
+                }
+                2 => {
+                    let Some(len) = read_varint(&mut input) else { break };
+                    let len = len as usize;
+                    if input.len() < len {
+                        break;
+                    }
+                    let (data, rest) = input.split_at(len);
+                    input = rest;
+                    out.push((field, None, data.to_vec()));
+                }
+                _ => break,
+            }
+        }
+        out
+    }
+
+    #[derive(Default)]
+    struct RelayState {
+        public_der: Option<Vec<u8>>,
+        refresh_calls: u32,
+        verified_refresh: bool,
+        saw_renewed_poll_token: bool,
+        receive_calls: u32,
+    }
+
+    let state = Arc::new(Mutex::new(RelayState::default()));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    let server_state = state.clone();
+    let server_stop = stop.clone();
+    let server = std::thread::spawn(move || {
+        while !server_stop.load(Ordering::Acquire) {
+            let Ok((mut stream, _)) = listener.accept() else {
+                sleep(Duration::from_millis(10));
+                continue;
+            };
+            let state = server_state.clone();
+            let stop = server_stop.clone();
+            std::thread::spawn(move || {
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 4096];
+                let header_end = loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => raw.extend_from_slice(&buf[..n]),
+                    }
+                    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&raw[..header_end]).into_owned();
+                let path = head
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("")
+                    .to_owned();
+                let content_len: usize = head
+                    .lines()
+                    .find_map(|line| {
+                        let (k, v) = line.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                while raw.len() < header_end + content_len {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => raw.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let body = &raw[header_end..(header_end + content_len).min(raw.len())];
+
+                let respond = |stream: &mut std::net::TcpStream, content_type: &str, payload: &[u8]| {
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        payload.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.write_all(payload);
+                    let _ = stream.flush();
+                };
+
+                if path.ends_with(".Pairing/RegisterPhoneRelay") {
+                    let top = parse_fields(body);
+                    let keys = top
+                        .iter()
+                        .find(|(f, _, _)| *f == 4)
+                        .map(|(_, _, b)| parse_fields(b))
+                        .unwrap_or_default();
+                    let ecdsa = keys
+                        .iter()
+                        .find(|(f, _, _)| *f == 6)
+                        .map(|(_, _, b)| parse_fields(b))
+                        .unwrap_or_default();
+                    let pub_der = ecdsa
+                        .iter()
+                        .find(|(f, _, _)| *f == 2)
+                        .map(|(_, _, b)| b.clone())
+                        .unwrap_or_default();
+                    state.lock().unwrap().public_der = Some(pub_der);
+
+                    let mut dev = Vec::new();
+                    pb_int(&mut dev, 1, 7);
+                    pb_bytes(&mut dev, 2, b"browser-qr-test");
+                    let mut tok = Vec::new();
+                    pb_bytes(&mut tok, 1, b"initial-reg-token");
+                    pb_int(&mut tok, 2, 86_400_000_000);
+                    let mut reply = Vec::new();
+                    pb_bytes(&mut reply, 2, &dev);
+                    pb_bytes(&mut reply, 3, b"relay-pairing-key-1234567890");
+                    pb_bytes(&mut reply, 5, &tok);
+                    respond(&mut stream, "application/x-protobuf", &reply);
+                } else if path.ends_with(".Registration/RegisterRefresh") {
+                    let mut guard = state.lock().unwrap();
+                    guard.refresh_calls += 1;
+                    let call = guard.refresh_calls;
+                    let pub_der = guard.public_der.clone().unwrap_or_default();
+                    drop(guard);
+
+                    if call == 1 {
+                        // Simulate clock skew on the first attempt to prove retry with server timestamp.
+                        let mut skew = Vec::new();
+                        pb_int(&mut skew, 3, 1);
+                        pb_int(&mut skew, 4, 1_795_000_111_222_333);
+                        respond(&mut stream, "application/x-protobuf", &skew);
+                    } else {
+                        let top = parse_fields(body);
+                        let dev = top
+                            .iter()
+                            .find(|(f, _, _)| *f == 2)
+                            .map(|(_, _, b)| parse_fields(b))
+                            .unwrap_or_default();
+                        let source = dev
+                            .iter()
+                            .find(|(f, _, _)| *f == 2)
+                            .map(|(_, _, b)| String::from_utf8_lossy(b).into_owned())
+                            .unwrap_or_default();
+                        let ts = top
+                            .iter()
+                            .find(|(f, _, _)| *f == 3)
+                            .and_then(|(_, v, _)| *v)
+                            .unwrap_or(0);
+                        let sig_bytes = top
+                            .iter()
+                            .find(|(f, _, _)| *f == 4)
+                            .map(|(_, _, b)| b.clone())
+                            .unwrap_or_default();
+                        let vk = VerifyingKey::from_public_key_der(&pub_der).unwrap();
+                        let sig = DerSignature::from_bytes(&sig_bytes).unwrap();
+                        let signed = format!("{source}:{ts}");
+                        assert_eq!(source, "browser-qr-test");
+                        assert_eq!(ts, 1_795_000_111_222_333);
+                        vk.verify(signed.as_bytes(), &sig)
+                            .expect("RegisterRefresh ECDSA signature must verify");
+                        state.lock().unwrap().verified_refresh = true;
+
+                        let mut tok = Vec::new();
+                        pb_bytes(&mut tok, 1, b"renewed-tachyon-token");
+                        pb_int(&mut tok, 2, 86_400_000_000);
+                        let mut ok = Vec::new();
+                        pb_bytes(&mut ok, 2, &tok);
+                        respond(&mut stream, "application/x-protobuf", &ok);
+                    }
+                } else if path.ends_with(".Messaging/ReceiveMessages") {
+                    let call = {
+                        let mut guard = state.lock().unwrap();
+                        guard.receive_calls += 1;
+                        guard.receive_calls
+                    };
+                    if call == 1 {
+                        // Wait a moment so the test can observe the emitted QR link before scan arrives.
+                        sleep(Duration::from_millis(120));
+                        let mut mobile = Vec::new();
+                        pb_int(&mut mobile, 1, 11);
+                        pb_bytes(&mut mobile, 2, b"phone-qr-live");
+                        let mut tok = Vec::new();
+                        pb_bytes(&mut tok, 1, b"paired-tachyon-token");
+                        pb_int(&mut tok, 2, 86_400_000_000);
+                        let mut browser = Vec::new();
+                        pb_int(&mut browser, 1, 7);
+                        pb_bytes(&mut browser, 2, b"browser-qr-test");
+                        let mut paired = Vec::new();
+                        pb_bytes(&mut paired, 1, &mobile);
+                        pb_bytes(&mut paired, 2, &tok);
+                        pb_bytes(&mut paired, 3, &browser);
+                        let mut rpc_pair = Vec::new();
+                        pb_bytes(&mut rpc_pair, 4, &paired);
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&rpc_pair);
+                        let payload = serde_json::json!([[
+                            [null, ["pair-1", 14, null, null, null, null, null, null, null, null, null, b64]]
+                        ]])
+                        .to_string();
+                        respond(&mut stream, "application/json+protobuf", payload.as_bytes());
+                    } else {
+                        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) {
+                            let tok_b64 = json
+                                .get(0)
+                                .and_then(|a| a.get(5))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if let Ok(raw_tok) = base64::engine::general_purpose::STANDARD.decode(tok_b64) {
+                                if raw_tok == b"renewed-tachyon-token" {
+                                    state.lock().unwrap().saw_renewed_poll_token = true;
+                                }
+                            }
+                        }
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json+protobuf\r\nConnection: close\r\n\r\n[[",
+                        );
+                        let _ = stream.flush();
+                        let wait_until = Instant::now() + Duration::from_secs(2);
+                        while !stop.load(Ordering::Acquire) && Instant::now() < wait_until {
+                            sleep(Duration::from_millis(20));
+                        }
+                        let _ = stream.write_all(b"]]");
+                        let _ = stream.flush();
+                    }
+                } else {
+                    respond(&mut stream, "application/json+protobuf", b"[]");
+                }
+            });
+        }
+    });
+
+    let relay_url = format!(
+        "http://{addr}/$rpc/google.internal.communications.instantmessaging.v1"
+    );
+    let world = World::with_relay(&relay_url, Some(15_000));
+    let (_, seq) = world.status();
+    assert!(matches!(
+        world.sign_in(None),
+        SignInStep::Browser { waiting: false, .. }
+    ));
+    let _ = world.sign_in(Some(SignInInput::UseQr));
+
+    // Observe the real QR URL produced from RegisterPhoneRelay.
+    let qr_link = world.changed(seq, "QR URL from fake HTTP relay", |change| match change {
+        Change::SignIn {
+            network: Network::Messages,
+            step: SignInStep::Qr { link, .. },
+        } if !link.is_empty() => Some(link.clone()),
+        _ => None,
+    });
+    let encoded = qr_link
+        .strip_prefix("https://support.google.com/messages/?p=web_computer#?c=")
+        .expect("QR URL prefix");
+    let qr_proto = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .expect("valid base64 QR payload");
+    let qr_fields = parse_fields(&qr_proto);
+    assert_eq!(
+        qr_fields.iter().find(|(f, _, _)| *f == 1).map(|(_, _, b)| b.as_slice()),
+        Some(b"relay-pairing-key-1234567890".as_slice())
+    );
+    assert_eq!(
+        qr_fields.iter().find(|(f, _, _)| *f == 2).map(|(_, _, b)| b.len()),
+        Some(32),
+        "AES-256 key"
+    );
+    assert_eq!(
+        qr_fields.iter().find(|(f, _, _)| *f == 3).map(|(_, _, b)| b.len()),
+        Some(32),
+        "HMAC-SHA256 key"
+    );
+
+    // Wait for pairing completion from route 14 RPCPairData.
+    let done = world.changed(seq, "HTTP QR pairing completion", |change| match change {
+        Change::SignIn {
+            network: Network::Messages,
+            step: SignInStep::Done { account },
+        } => Some(account.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        done,
+        Some(AccountKey {
+            network: Network::Messages,
+            account: "phone-qr-live".into(),
+        })
+    );
+
+    // Wait for Session::open to renew the token via signing-key RegisterRefresh (with clock-skew retry)
+    // and open ReceiveMessages with the renewed token.
+    world.until("signing-key renewal and renewed poll", || {
+        let g = state.lock().unwrap();
+        (g.verified_refresh && g.saw_renewed_poll_token).then_some(())
+    });
+
+    stop.store(true, Ordering::Release);
+    drop(world);
+    let _ = server.join();
 }

@@ -52,10 +52,12 @@ def run(ctx):
     log("build step took %.0f s (cargo and bundling %s s on the Mac)" % (time.time() - t, _mac.value(text, "BUILD_SECONDS")))
 
     _mac.put_dir(host, ctx.scenario_dir, "/tmp/tiny-lab-runs/%s/scenario" % run_id)
-    env = {"RUN": run_id}
+    env = {"RUN": run_id, "SCENARIO": ctx.scenario["id"], "SRC_TAR": remote_tar}
     if os.environ.get("E2E_SABOTAGE"):
         env["E2E_SABOTAGE"] = os.environ["E2E_SABOTAGE"]
-    code, text = _mac.remote(host, _read("run-macos.sh"), env, log, timeout=int(host.get("driver_timeout", 600)))
+    headless = ctx.scenario["id"] == "tiny-video-received"
+    timeout = int(host.get("build_timeout", 3600) if headless else host.get("driver_timeout", 600))
+    code, text = _mac.remote(host, _read("run-macos.sh"), env, log, timeout=timeout)
     run_log = os.path.join(ctx.out_dir, "run.log")
     with open(run_log, "w", encoding="utf-8") as f:
         f.write(text)

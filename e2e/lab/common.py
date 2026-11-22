@@ -5,6 +5,7 @@ e2e/README.md says what a lab run is. This file is that, in code.
 """
 import dataclasses
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -146,6 +147,37 @@ def validate(path, seconds, steps, spec=None, expect_pass=True, vfr=False):
     limit = spec.get("max_still_seconds", 20)
     if shown["longest_still"] > limit:
         problems.append("the picture is frozen for %.0fs in one stretch (limit %ds)" % (shown["longest_still"], limit))
+    if spec.get("id") == "call-video-seen":
+        problems.extend(validate_video_cards(path, steps, covered))
+    return problems
+
+
+def validate_video_cards(path, steps, covered):
+    """Re-read the actual video at the viewer's six pixel assertions."""
+    checker = os.path.join(os.path.dirname(__file__), "..", "scenarios", "call-video-seen", "pixels.py")
+    spec = importlib.util.spec_from_file_location("lab_call_video_pixels", checker)
+    pixels = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pixels)
+    cards = [s["video_card"] for s in steps if s.get("ok") and "video_card" in s]
+    if len(cards) != 6:
+        return ["expected seen, changed and cleared card steps for both calls"]
+    ffmpeg = tool("ffmpeg")
+    problems = []
+    for start, change, stop in (cards[:3], cards[3:]):
+        first, second = start["number"], change["number"]
+        if (first is None or second is None or first == second or stop["number"] is not None
+                or not 0 <= start["at"] < change["at"] < stop["at"] <= covered
+                or not start["rect"] == change["rect"] == stop["rect"]):
+            problems.append("card steps must show a changing number followed by a clear frame")
+            continue
+        for card in (start, change, stop):
+            answer = (card["number"] is not None, card["number"])
+            for offset in (0, .25, .5, .75):
+                at = min(covered - .05, card["at"] + offset)
+                if pixels.read_card(ffmpeg, path, card["rect"], at) == answer:
+                    break
+            else:
+                problems.append("recorded card at %.2fs does not match the viewer's step" % card["at"])
     return problems
 
 

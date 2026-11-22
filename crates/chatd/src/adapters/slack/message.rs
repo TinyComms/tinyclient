@@ -1301,6 +1301,7 @@ impl Slack {
             color: Some(0x1d_9bd1),
             sponsored: false,
             actions: Vec::new(),
+            ..Card::default()
         }
     }
 
@@ -1327,6 +1328,7 @@ impl Slack {
             color: Some(0x4a_154b),
             sponsored: false,
             actions: Vec::new(),
+            ..Card::default()
         }
     }
 
@@ -1470,6 +1472,7 @@ impl Slack {
         let duration = if duration_ms > 0 { (duration_ms / 1000).max(1) as u32 } else { 0 };
         let transcript = self.clip_transcript(id, file, media);
         Some(Attachment {
+            alt: String::new(),
             // Slack has neither spoilers nor stickers.
             spoiler: false,
             sticker: false,
@@ -1486,6 +1489,7 @@ impl Slack {
             page: String::new(),
             transcription: None,
             transcript,
+            variants: Vec::new(),
         })
     }
 
@@ -1692,6 +1696,7 @@ impl Slack {
             color: Some(0x4a_154b),
             sponsored: false,
             actions: Vec::new(),
+            ..Card::default()
         }
     }
 
@@ -1788,6 +1793,7 @@ impl Slack {
             color: Some(0x2e_7d6f),
             sponsored: false,
             actions: Vec::new(),
+            ..Card::default()
         }
     }
 

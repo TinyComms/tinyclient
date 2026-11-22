@@ -28,6 +28,12 @@ pub struct Want {
     /// A picture itself, for the viewer: kept until the shell asks for it, never fetched for a
     /// row.
     pub original: bool,
+    /// True when a video carries `supports_streaming` (`moov` atom at the start); false means
+    /// a ranged reader must fetch the tail first to find the `moov` atom.
+    pub supports_streaming: bool,
+    /// The peer and message id this file came from, so an expired `file_reference` can be
+    /// refreshed mid-stream.
+    pub source: Option<(Who, i32)>,
 }
 
 /// What a reply header says besides the id of the message it answers.
@@ -977,12 +983,12 @@ fn photo(photo: &tl::types::Photo, spoiler: bool, wants: &mut Vec<Want>, peer: W
         let mut preview = MediaFile::new(format!("p{}{}", photo.id, stripped.r#type), MediaKind::Image);
         (preview.width, preview.height, preview.bytes) = (width, height, jpeg.len() as u64);
         let location = location(&stripped.r#type);
-        wants.push(Want { file: preview.clone(), dc: photo.dc_id, location, inline: Some(jpeg), row: None, watched: false, original: false });
+        wants.push(Want { file: preview.clone(), dc: photo.dc_id, location, inline: Some(jpeg), row: None, watched: false, original: false, supports_streaming: false, source: None });
         Some(preview)
     });
     let mut thumb = MediaFile::new(format!("p{}{kind}", photo.id), MediaKind::Image);
     (thumb.width, thumb.height, thumb.bytes) = (width, height, bytes);
-    wants.push(Want { file: thumb.clone(), dc: photo.dc_id, location: location(kind), inline: inline.map(<[u8]>::to_vec), row: None, watched: false, original: false });
+    wants.push(Want { file: thumb.clone(), dc: photo.dc_id, location: location(kind), inline: inline.map(<[u8]>::to_vec), row: None, watched: false, original: false, supports_streaming: false, source: None });
     // The picture itself is the largest size Telegram keeps: the viewer fills a screen with
     // it, at the screen's own pixels.
     let mut file = thumb.clone();
@@ -990,7 +996,7 @@ fn photo(photo: &tl::types::Photo, spoiler: bool, wants: &mut Vec<Want>, peer: W
         file.id = format!("p{}{kind}", photo.id);
         (file.width, file.height, file.bytes) = (width, height, bytes);
         let fetch = rules.fetch_full(peer, megagroup, DownloadClass::Photo, bytes);
-        wants.push(Want { file: file.clone(), dc: photo.dc_id, location: location(kind), inline: inline.map(<[u8]>::to_vec), row: None, watched: false, original: !fetch });
+        wants.push(Want { file: file.clone(), dc: photo.dc_id, location: location(kind), inline: inline.map(<[u8]>::to_vec), row: None, watched: false, original: !fetch, supports_streaming: false, source: None });
     }
     let mut attachment = Attachment::new("Photo", file);
     attachment.thumb = Some(thumb);
@@ -1021,6 +1027,8 @@ fn preview_image(page: &tl::types::WebPage, wants: &mut Vec<Want>) -> Option<Med
             row: None,
             watched: false,
             original: false,
+            supports_streaming: false,
+            source: None,
         });
         return Some(image);
     }
@@ -1042,13 +1050,15 @@ fn preview_image(page: &tl::types::WebPage, wants: &mut Vec<Want>) -> Option<Med
         row: None,
         watched: false,
         original: false,
+        supports_streaming: false,
+        source: None,
     });
     Some(image)
 }
 
 pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::types::Document, wants: &mut Vec<Want>, peer: Who, megagroup: bool, rules: DownloadRules) -> Attachment {
     let (mut name, mut size, mut duration, mut wave) = (String::new(), (0u32, 0u32), 0u32, Vec::new());
-    let (mut sticker, mut animated, mut video, mut round, mut voice, mut audio) = (false, false, false, false, false, false);
+    let (mut sticker, mut animated, mut video, mut round, mut voice, mut audio, mut supports_streaming) = (false, false, false, false, false, false, false);
     for attribute in &document.attributes {
         match attribute {
             DocumentAttribute::Filename(file) => name = file.file_name.clone(),
@@ -1058,6 +1068,7 @@ pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::t
             DocumentAttribute::Video(attribute) => {
                 video = true;
                 round = attribute.round_message;
+                supports_streaming = attribute.supports_streaming;
                 size = (attribute.w as u32, attribute.h as u32);
                 duration = attribute.duration.max(0.) as u32;
             }
@@ -1091,6 +1102,8 @@ pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::t
             row: None,
             watched: false,
             original: false,
+            supports_streaming: false,
+            source: None,
         });
         thumb
     });
@@ -1128,13 +1141,13 @@ pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::t
     if moving {
         // `.tgs` arrives gzipped, like a custom emoji, so the fetch unpacks it for the Lottie player.
         file.kind = if mime == "application/x-tgsticker" { MediaKind::Emoji } else { MediaKind::Video };
-        wants.push(Want { file: file.clone(), dc: document.dc_id, location: location.into(), inline: None, row: None, watched: false, original: false });
+        wants.push(Want { file: file.clone(), dc: document.dc_id, location: location.into(), inline: None, row: None, watched: false, original: false, supports_streaming: false, source: None });
     } else if let (true, Some(still)) = (sticker, &still) {
         file = still.clone();
     } else if kind != MediaKind::Image || still.is_some() {
         // A picture sent as a file opens in the viewer like a photo, so it is kept the same way
         // unless this chat's auto-download rule says the full file is small enough to fetch now.
-        // GIFs are not autoplayed; a GIF under the video cap is only fetched ahead.
+        // GIFs under the video cap are fetched ahead; larger videos stream on demand via ranged reads.
         let class = match kind {
             MediaKind::Video => DownloadClass::Video,
             MediaKind::Gif => DownloadClass::Gif,
@@ -1142,7 +1155,50 @@ pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::t
             _ => DownloadClass::File,
         };
         let fetch = rules.fetch_full(peer, megagroup, class, file.bytes);
-        wants.push(Want { file: file.clone(), dc: document.dc_id, location: location.into(), inline: None, row: None, watched: false, original: !fetch });
+        wants.push(Want { file: file.clone(), dc: document.dc_id, location: location.into(), inline: None, row: None, watched: false, original: !fetch, supports_streaming, source: None });
+    }
+    // Alternative video qualities (`alt_documents`): expose each variant for the viewer's quality
+    // selector and register its location for on-demand ranged streaming.
+    let mut variants = Vec::new();
+    if let Some(alts) = media.alt_documents.as_deref() {
+        for alt in alts {
+            let tl::enums::Document::Document(alt) = alt else { continue };
+            if alt.id == document.id {
+                continue;
+            }
+            let (mut alt_size, mut alt_streaming) = ((0u32, 0u32), false);
+            for attr in &alt.attributes {
+                if let DocumentAttribute::Video(v) = attr {
+                    alt_size = (v.w as u32, v.h as u32);
+                    alt_streaming = v.supports_streaming;
+                }
+            }
+            let mut variant = MediaFile::new(format!("d{}", alt.id), MediaKind::Video);
+            (variant.width, variant.height) = alt_size;
+            variant.bytes = alt.size.max(0) as u64;
+            if variants.iter().any(|seen: &MediaFile| seen.id == variant.id) {
+                continue;
+            }
+            wants.push(Want {
+                file: variant.clone(),
+                dc: alt.dc_id,
+                location: tl::types::InputDocumentFileLocation {
+                    id: alt.id,
+                    access_hash: alt.access_hash,
+                    file_reference: alt.file_reference.clone(),
+                    thumb_size: String::new(),
+                }
+                .into(),
+                inline: None,
+                row: None,
+                watched: false,
+                original: true,
+                supports_streaming: alt_streaming,
+                source: None,
+            });
+            variants.push(variant);
+        }
+        variants.sort_by(|a, b| b.height.cmp(&a.height).then_with(|| b.bytes.cmp(&a.bytes)));
     }
     let mut attachment = Attachment::new(if name.is_empty() { label.to_owned() } else { name }, file);
     attachment.thumb = still;
@@ -1153,6 +1209,7 @@ pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::t
     attachment.waveform = wave;
     attachment.round = round || media.round;
     attachment.sticker_set = sticker_set_key(&document.attributes);
+    attachment.variants = variants;
     attachment
 }
 
@@ -1247,6 +1304,33 @@ pub(super) fn poll_card(poll: &tl::types::Poll, results: &tl::types::PollResults
 fn plain(text: &tl::enums::TextWithEntities) -> &str {
     let tl::enums::TextWithEntities::Entities(text) = text;
     &text.text
+}
+
+/// Keep the shared poll state for callers while the quiz card preserves Telegram's hand-off.
+fn shared_poll(poll: &tl::types::Poll, results: &tl::types::PollResults) -> protocol::Poll {
+    let hidden = results.min || (poll.hide_results_until_close && !poll.closed);
+    let mut shared = protocol::Poll::open(plain(&poll.question), std::iter::empty::<String>(), poll.multiple_choice);
+    shared.closed = poll.closed;
+    shared.closes_at = poll.close_date.map(i64::from);
+    shared.anonymous = !poll.public_voters;
+    shared.total = if hidden { None } else { results.total_voters.and_then(|total| u32::try_from(total).ok()) };
+    let results = results.results.as_deref().unwrap_or_default();
+    let answers = poll.answers.iter().filter_map(|answer| match answer {
+        tl::enums::PollAnswer::Answer(answer) => Some(answer),
+        _ => None,
+    });
+    for (index, answer) in answers.take(protocol::POLL_OPTIONS).enumerate() {
+        let result = results.iter().find_map(|result| match result {
+            tl::enums::PollAnswerVoters::Voters(result) if result.option == answer.option => Some(result),
+            _ => None,
+        });
+        if result.is_some_and(|result| result.chosen) {
+            shared.mine.push(index as u32);
+        }
+        let count = if hidden { 0 } else { result.and_then(|result| result.voters).and_then(|count| u32::try_from(count).ok()).unwrap_or(0) };
+        shared.choices.push(protocol::PollChoice { text: plain(&answer.text).to_owned(), count, ..Default::default() });
+    }
+    shared
 }
 
 /// View-once is Telegram's `ttl_seconds` of `0x7FFFFFFF`. Anything shorter is a timer.
@@ -2425,7 +2509,7 @@ pub(super) fn call_action(
                     (CallOutcome::Ended, line)
                 }
             };
-            Some((text, CallNote { outcome, caller_id, seconds, participants: Vec::new(), video }))
+            Some((text, CallNote { outcome, caller_id, seconds, participants: Vec::new(), video, call_id: Some(call.call_id.to_string()) }))
         }
         MessageAction::GroupCall(call) => {
             let (outcome, seconds, text) = match call.duration {
@@ -2436,7 +2520,7 @@ pub(super) fn call_action(
                 ),
                 None => (CallOutcome::Live, None, format!("{who} started a video chat")),
             };
-            Some((text, CallNote { outcome, caller_id, seconds, participants: Vec::new(), video: true }))
+            Some((text, CallNote { outcome, caller_id, seconds, participants: Vec::new(), video: true, call_id: None }))
         }
         MessageAction::ConferenceCall(conf) => {
             let video = conf.video;
@@ -2457,7 +2541,7 @@ pub(super) fn call_action(
                 let line = if video { "Declined group video call" } else { "Declined group call" };
                 (CallOutcome::Declined, line.to_owned())
             };
-            Some((text, CallNote { outcome, caller_id, seconds, participants: Vec::new(), video }))
+            Some((text, CallNote { outcome, caller_id, seconds, participants: Vec::new(), video, call_id: None }))
         }
         _ => None,
     }
@@ -2516,7 +2600,7 @@ fn action(dir: &Directory, who: &str, action: &MessageAction) -> (String, bool) 
         A::GroupCallScheduled(_) => named(format!("{who} scheduled a video chat")),
         A::ConferenceCall(conf) => {
             let (text, _) = call_action(&A::ConferenceCall(conf.clone()), false, who, String::new())
-                .unwrap_or_else(|| (format!("{who} started a group call"), protocol::CallNote { outcome: protocol::CallOutcome::Live, caller_id: String::new(), seconds: None, participants: Vec::new(), video: conf.video }));
+                .unwrap_or_else(|| (format!("{who} started a group call"), protocol::CallNote { outcome: protocol::CallOutcome::Live, caller_id: String::new(), seconds: None, participants: Vec::new(), video: conf.video, call_id: None }));
             named(text)
         }
         A::ScreenshotTaken => named(format!("{who} took a screenshot")),
@@ -2819,6 +2903,12 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
             message.edited_at = if raw.edit_hide { None } else { raw.edit_date.map(i64::from) };
             message.edited = message.edited_at.is_some();
             message.pinned = raw.pinned;
+            // The effect it was sent with, by its emoji; one Telegram has not named yet is a bare mark.
+            message.effect = raw.effect.map(|id| dir.effects.get(&id).cloned().unwrap_or_default());
+            // A signed channel post names its author; an anonymous admin's message, their title.
+            message.signature = raw.post_author.clone().unwrap_or_default();
+            message.shares = raw.forwards.filter(|_| raw.post).map(|count| count.max(0) as u32);
+            message.permalink = super::peers::permalink(peer, dir.get(peer), topic_of(raw.reply_to.as_ref()).0, raw.id);
             message.mentions_me = raw.mentioned;
             message.reactions = raw.reactions.as_ref().map(reactions).unwrap_or_default();
             message.buttons = raw.reply_markup.as_ref().map(inline_buttons).unwrap_or_default();
@@ -2877,6 +2967,11 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                 Some(MessageMedia::Document(media)) if media.document.is_some() && media.ttl_seconds.is_none() => {
                     if let Some(tl::enums::Document::Document(file)) = &media.document {
                         let attachment = document(media, file, &mut wants, peer, megagroup, rules);
+                        for want in &mut wants {
+                            if want.source.is_none() {
+                                want.source = Some((peer, raw.id));
+                            }
+                        }
                         let playable = !attachment.view_once && (attachment.round || attachment.file.kind == MediaKind::Audio);
                         if raw.media_unread && playable {
                             message.media_unread = true;
@@ -2949,6 +3044,7 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                         let tl::enums::Poll::Poll(poll) = &media.poll;
                         let tl::enums::PollResults::Results(results) = &media.results;
                         message.card = Some(Box::new(poll_card(poll, results)));
+                        message.poll = Some(Box::new(shared_poll(poll, results)));
                     }
                 }
             }
@@ -5207,6 +5303,8 @@ mod tests {
             other => panic!("a poll stays a hand-off, got {other:?}"),
         }
         let card = mapped.message.card.as_ref().expect("a poll is a card");
+        let poll = mapped.message.poll.as_deref().expect("shared poll");
+        assert_eq!((poll.question.as_str(), poll.mine.as_slice(), poll.choices[0].count), ("Saturday or Sunday?", &[0][..], 3));
         assert_eq!(card.title, "Saturday or Sunday?");
         assert_eq!(card.footer, "Open in Telegram");
         assert_eq!(card.text, "4 votes");

@@ -438,7 +438,7 @@ fn files_go_from_their_paths_with_progress_within_the_account_s_limits_and_can_b
     let telegram = at(Network::Telegram, TELEGRAM, "u7000001");
     let photo = chatd.pick("trail.png", 900 * 1024);
     let with = |path: &std::path::Path| Outgoing {
-        files: vec![OutgoingFile { path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: true, as_file: false, original: false, view_once: false, media: None }],
+        files: vec![OutgoingFile { alt: String::new(), path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: true, as_file: false, original: false, view_once: false, media: None }],
         ..Outgoing::default()
     };
     let send = |client_id: &str, with: Outgoing| {
@@ -467,7 +467,7 @@ fn files_go_from_their_paths_with_progress_within_the_account_s_limits_and_can_b
     let big = chatd.pick("big.mov", 0);
     std::fs::File::create(&big).unwrap().set_len(11 << 20).unwrap();
     let refused = chatd.ask(Request::Send { conversation: at(Network::Discord, ROBIN, "500000000000000001"), client_id: "1700000000000002".to_owned(), text: String::new(), reply_to: None, with: with(&big) });
-    assert!(matches!(&refused, Response::Error { code: ErrorCode::Refused, detail } if detail.contains("too big for Discord (limit 10 MB)")), "{refused:?}");
+    assert!(matches!(&refused, Response::Error { code: ErrorCode::Refused, detail } if detail.contains("is too big. Discord allows up to 10 MB per file here.")), "{refused:?}");
     assert!(chatd.message(&at(Network::Discord, ROBIN, "500000000000000001"), "1700000000000002").is_none());
 
     // Cancelled on its way: failed, in words, and Retry sends the file again.
@@ -518,7 +518,7 @@ fn the_pickers_are_answered_on_demand_by_page_and_what_an_account_may_send_is_in
 
 fn with_file(path: &std::path::Path) -> Outgoing {
     Outgoing {
-        files: vec![OutgoingFile { path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: false, as_file: false, original: false, view_once: false, media: None }],
+        files: vec![OutgoingFile { alt: String::new(), path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: false, as_file: false, original: false, view_once: false, media: None }],
         ..Outgoing::default()
     }
 }
@@ -619,6 +619,7 @@ fn a_pending_send_shows_my_cached_identity_before_the_network_acks() {
     let photo = chatd.pick("identity.png", 32 * 1024);
     let with = Outgoing {
         files: vec![OutgoingFile {
+            alt: String::new(),
             path: photo.to_string_lossy().into_owned(),
             name: String::new(),
             spoiler: false,

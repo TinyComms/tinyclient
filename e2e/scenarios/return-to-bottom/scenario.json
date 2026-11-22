@@ -1,0 +1,12 @@
+{
+  "id": "return-to-bottom",
+  "title": "Returning to a chat left at the bottom opens scrolled all the way down",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window. The same conversation pane records and restores scroll places on a phone.",
+    "ios": "The phone proof build does not run the desktop window. The same conversation pane records and restores scroll places on a phone."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

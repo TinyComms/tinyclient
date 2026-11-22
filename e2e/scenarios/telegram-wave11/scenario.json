@@ -1,0 +1,12 @@
+{
+  "id": "telegram-wave11",
+  "title": "Wave 11 Telegram pinned bar and unpin all, chat pin and archive limits, message permalinks, channel post signatures/shares/views, reactor and read-by lists, message effects, post-call rating, and ranged video streaming with alt qualities",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "Desktop Wave 11 Telegram enhancements verified by unit and integration test suites.",
+    "ios": "Desktop Wave 11 Telegram enhancements verified by unit and integration test suites."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

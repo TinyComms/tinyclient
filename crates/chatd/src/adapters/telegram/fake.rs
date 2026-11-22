@@ -43,6 +43,9 @@ const ME: i64 = 7001;
 const ODALYS: i64 = 7002;
 const TOBIN: i64 = 7003;
 const CREW: i64 = 8001;
+/// Message effects: one anyone may send, and one that needs Premium.
+const EFFECT_PARTY: i64 = 5_046_509_860_389_126_442;
+const EFFECT_PREMIUM: i64 = 5_104_841_245_755_180_586;
 const NOTES: i64 = 9001;
 const WORKSHOP: i64 = 9002;
 /// "Field Notes chat", the channel's linked discussion group: where its post's comments live.
@@ -568,6 +571,31 @@ fn big_piece(offset: i64, limit: i32) -> Vec<u8> {
     (from..to).map(|at| (at % 251) as u8).collect()
 }
 
+/// Deterministic synthetic bytes for 50 MB / 12 MB streaming videos (`9500`, `9501`, `9502`):
+/// starts with `"FTYP"`, marks the 25 MB scrub point with `"SCRB"`, and ends `9502` with `"MOOV"`.
+fn stream_piece(doc_id: i64, offset: i64, limit: i32) -> Vec<u8> {
+    let total: usize = if doc_id == 9_501 { 12 * 1024 * 1024 } else { 50 * 1024 * 1024 };
+    let at = offset.max(0) as usize;
+    let end = (at + limit.max(0) as usize).min(total);
+    if at >= end {
+        return Vec::new();
+    }
+    let mut out = vec![(doc_id & 0xff) as u8; end - at];
+    if at == 0 && out.len() >= 4 {
+        out[..4].copy_from_slice(b"FTYP");
+    }
+    let scrub_off = 25 * 1024 * 1024;
+    if at <= scrub_off && scrub_off + 4 <= end {
+        let rel = scrub_off - at;
+        out[rel..rel + 4].copy_from_slice(b"SCRB");
+    }
+    if doc_id == 9_502 && end == total && out.len() >= 4 {
+        let n = out.len();
+        out[n - 4..].copy_from_slice(b"MOOV");
+    }
+    out
+}
+
 fn cdn_digest() -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(CDN_PLAIN);
@@ -630,6 +658,14 @@ struct World {
     /// The next `upload.GetFile` is refused with a flood wait of this many seconds, once.
     flood_file: Option<u32>,
     revoked: bool,
+    /// The effect the send being delivered carries.
+    send_effect: Option<i64>,
+    /// How many times `getAvailableEffects` was asked.
+    effects_asked: u32,
+    /// How many times `getMessagesViews` was asked to count a view.
+    viewed_posts: i32,
+    /// The account has as many pinned chats as Telegram allows (`pins-full`).
+    pins_full: bool,
     /// Tobin was added to the Family folder (`folder`).
     family_grew: bool,
     /// The Work folder now takes its chats by kind and leaves read ones out (`exclude-read`).
@@ -809,6 +845,10 @@ impl World {
             flood_send: None,
             flood_file: None,
             revoked: false,
+            pins_full: false,
+            viewed_posts: 0,
+            send_effect: None,
+            effects_asked: 0,
             family_grew: false,
             lost_reads: false,
             unread_marks: HashMap::new(),
@@ -1076,6 +1116,7 @@ impl World {
             self.next += 1;
             let id = self.next;
             let mut sent = message(peer, id, ME, schedule.unwrap_or(crate::hub::now() as i32), &text);
+            sent.effect = self.send_effect.take();
             sent.media = media;
             sent.entities = entities;
             sent.grouped_id = group;
@@ -1116,6 +1157,44 @@ impl World {
             count_raised(self, events, &mut all);
         }
         answer(updates(all))
+    }
+
+    /// What is pinned in a chat, newest first: what a test pinned, and in the chat with Odalys
+    /// message 12, which was pinned before the script starts.
+    fn pinned_ids(&self, peer: Who) -> Vec<i32> {
+        let mut ids: Vec<i32> = self
+            .messages
+            .get(&peer.text())
+            .into_iter()
+            .flat_map(|held| held.values())
+            .filter_map(|message| match message {
+                tl::enums::Message::Message(message) if message.pinned => Some(message.id),
+                _ => None,
+            })
+            .rev()
+            .collect();
+        if peer == Who::User(ODALYS) && !ids.contains(&12) {
+            ids.push(12);
+        }
+        ids
+    }
+
+    /// Pins or unpins one message of a chat (every pinned one for `None`), and the update
+    /// Telegram tells every session of it.
+    fn pin_messages(&mut self, peer: Who, id: Option<i32>, pinned: bool) -> tl::enums::Update {
+        let mut ids = Vec::new();
+        for message in self.messages.get_mut(&peer.text()).into_iter().flat_map(|held| held.values_mut()) {
+            if let tl::enums::Message::Message(message) = message {
+                if id.map_or(message.pinned, |id| id == message.id) {
+                    message.pinned = pinned;
+                    ids.push(message.id);
+                }
+            }
+        }
+        match peer {
+            Who::Channel(channel_id) => tl::types::UpdatePinnedChannelMessages { pinned, channel_id, messages: ids, pts: 0, pts_count: 0 }.into(),
+            _ => tl::types::UpdatePinnedMessages { pinned, peer: peer.peer(), messages: ids, pts: 0, pts_count: 0 }.into(),
+        }
     }
 
     fn store(&mut self, topic: Option<i32>, message: tl::types::Message) {
@@ -2803,6 +2882,19 @@ impl World {
                     .into(),
                 )]
             }
+            // The channel's post is signed by its author, as an edit says it; then Telegram
+            // tells the post's new counts while the channel is open.
+            "signed" => {
+                let mut post = message(Who::Channel(NOTES), 5, 0, t0() - 7_200, "Snow line is at 1,900 m this week.");
+                post.post_author = Some("Mira K.".to_owned());
+                post.forwards = Some(31);
+                self.store(None, post.clone());
+                vec![update(tl::types::UpdateEditChannelMessage { message: post.into(), pts: 0, pts_count: 0 }.into())]
+            }
+            "post-counts" => vec![
+                update(tl::types::UpdateChannelMessageViews { channel_id: NOTES, id: 5, views: 13_000 }.into()),
+                update(tl::types::UpdateChannelMessageForwards { channel_id: NOTES, id: 5, forwards: 40 }.into()),
+            ],
             // The channel's post gains a section of comments: the post says its count and the
             // linked group it is answered in, and two comments stand in the thread. A number
             // after the word says how many of them the user has not read.
@@ -2844,6 +2936,199 @@ impl World {
             // Telegram's own apps pinned the group; then reordered the pins without saying how.
             "pin" => vec![update(tl::types::UpdateDialogPinned { pinned: true, folder_id: None, peer: tl::types::DialogPeer { peer: Who::Group(CREW).peer() }.into() }.into())],
             "pins" => vec![update(tl::types::UpdatePinnedDialogs { folder_id: None, order: None }.into())],
+            // Odalys sends a message with the party effect.
+            "effect" => {
+                let mut said = message(odalys, 71, ODALYS, t0() + 71, "Happy birthday!");
+                said.effect = Some(EFFECT_PARTY);
+                self.store(None, said.clone());
+                vec![new(said)]
+            }
+            "effects-asked" => {
+                self.log(&format!("effects asked {}", self.effects_asked));
+                Vec::new()
+            }
+            // A finished call with Odalys that Telegram asks to rate (and asks for debug, which
+            // tinyclient does not send), plus a call row in Odalys's chat carrying its call_id.
+            "call-rate" => {
+                let protocol = tl::types::PhoneCallProtocol {
+                    udp_p2p: true,
+                    udp_reflector: true,
+                    min_layer: 65,
+                    max_layer: 92,
+                    library_versions: vec!["1.0".into()],
+                }
+                .into();
+                let waiting = tl::types::UpdatePhoneCall {
+                    phone_call: tl::types::PhoneCallWaiting {
+                        video: false,
+                        id: 90_001,
+                        access_hash: 4_242,
+                        date: t0() + 85,
+                        admin_id: ME,
+                        participant_id: ODALYS,
+                        protocol,
+                        receive_date: None,
+                    }
+                    .into(),
+                };
+                let discarded = tl::types::UpdatePhoneCall {
+                    phone_call: tl::types::PhoneCallDiscarded {
+                        need_rating: true,
+                        need_debug: true,
+                        video: false,
+                        id: 90_001,
+                        reason: Some(tl::enums::PhoneCallDiscardReason::Hangup),
+                        duration: Some(95),
+                    }
+                    .into(),
+                };
+                let service = tl::types::MessageService {
+                    out: true,
+                    mentioned: false,
+                    media_unread: false,
+                    reactions_are_possible: false,
+                    silent: false,
+                    post: false,
+                    legacy: false,
+                    id: 72,
+                    from_id: Some(Who::User(ME).peer()),
+                    peer_id: odalys.peer(),
+                    saved_peer_id: None,
+                    reply_to: None,
+                    date: t0() + 90,
+                    action: tl::types::MessageActionPhoneCall {
+                        video: false,
+                        call_id: 90_001,
+                        reason: Some(tl::enums::PhoneCallDiscardReason::Hangup),
+                        duration: Some(95),
+                    }
+                    .into(),
+                    reactions: None,
+                    ttl_period: None,
+                };
+                self.messages.entry(key(odalys, None)).or_default().insert(service.id, service.clone().into());
+                vec![
+                    update(waiting.into()),
+                    update(discarded.into()),
+                    update(tl::types::UpdateNewMessage { message: service.into(), pts: 0, pts_count: 0 }.into()),
+                ]
+            }
+            // A finished call that Telegram does NOT ask to rate.
+            "call-discard-no-rate" => {
+                let protocol = tl::types::PhoneCallProtocol {
+                    udp_p2p: true,
+                    udp_reflector: true,
+                    min_layer: 65,
+                    max_layer: 92,
+                    library_versions: vec!["1.0".into()],
+                }
+                .into();
+                let waiting = tl::types::UpdatePhoneCall {
+                    phone_call: tl::types::PhoneCallWaiting {
+                        video: false,
+                        id: 90_002,
+                        access_hash: 4_243,
+                        date: t0() + 80,
+                        admin_id: ME,
+                        participant_id: ODALYS,
+                        protocol,
+                        receive_date: None,
+                    }
+                    .into(),
+                };
+                let discarded = tl::types::UpdatePhoneCall {
+                    phone_call: tl::types::PhoneCallDiscarded {
+                        need_rating: false,
+                        need_debug: false,
+                        video: false,
+                        id: 90_002,
+                        reason: Some(tl::enums::PhoneCallDiscardReason::Hangup),
+                        duration: Some(15),
+                    }
+                    .into(),
+                };
+                vec![update(waiting.into()), update(discarded.into())]
+            }
+            // Two 50 MB videos in Odalys's chat:
+            // - msg 73 (doc 9500): fast-start 1080p with an `alt_documents` 480p variant (doc 9501)
+            // - msg 74 (doc 9502): non-fast-start 720p (`supports_streaming = false`, `moov` at tail)
+            "video-stream" => {
+                let make_doc = |id: i64, size: i64, w: i32, h: i32, streaming: bool, name: &str| {
+                    tl::enums::Document::Document(tl::types::Document {
+                        id,
+                        access_hash: id * 10,
+                        file_reference: vec![1, 2, 3],
+                        date: t0() + 92,
+                        mime_type: "video/mp4".to_owned(),
+                        size,
+                        thumbs: None,
+                        video_thumbs: None,
+                        dc_id: 2,
+                        attributes: vec![
+                            tl::types::DocumentAttributeVideo {
+                                round_message: false,
+                                supports_streaming: streaming,
+                                nosound: false,
+                                duration: 120.0,
+                                w,
+                                h,
+                                preload_prefix_size: None,
+                                video_start_ts: None,
+                                video_codec: None,
+                            }
+                            .into(),
+                            tl::types::DocumentAttributeFilename { file_name: name.to_owned() }.into(),
+                        ],
+                    })
+                };
+                let fifty_mb: i64 = 50 * 1024 * 1024;
+                let twelve_mb: i64 = 12 * 1024 * 1024;
+                let mut fast = message(odalys, 73, ODALYS, t0() + 93, "");
+                fast.media = Some(
+                    tl::types::MessageMediaDocument {
+                        nopremium: false,
+                        spoiler: false,
+                        video: true,
+                        round: false,
+                        voice: false,
+                        document: Some(make_doc(9_500, fifty_mb, 1920, 1080, true, "ridge-1080p.mp4")),
+                        alt_documents: Some(vec![make_doc(9_501, twelve_mb, 854, 480, true, "ridge-480p.mp4")]),
+                        video_cover: None,
+                        video_timestamp: None,
+                        ttl_seconds: None,
+                    }
+                    .into(),
+                );
+                let mut slow = message(odalys, 74, ODALYS, t0() + 94, "");
+                slow.media = Some(
+                    tl::types::MessageMediaDocument {
+                        nopremium: false,
+                        spoiler: false,
+                        video: true,
+                        round: false,
+                        voice: false,
+                        document: Some(make_doc(9_502, fifty_mb, 1280, 720, false, "ridge-moov-end.mp4")),
+                        alt_documents: None,
+                        video_cover: None,
+                        video_timestamp: None,
+                        ttl_seconds: None,
+                    }
+                    .into(),
+                );
+                self.store(None, fast.clone());
+                self.store(None, slow.clone());
+                vec![new(fast), new(slow)]
+            }
+            "pins-full" => {
+                self.pins_full = true;
+                Vec::new()
+            }
+            // Someone pinned or unpinned a message of the group from another device:
+            // `message-pin 20`, `message-unpin 20`.
+            word @ ("message-pin" | "message-unpin") => {
+                let id = words.next().and_then(|id| id.parse().ok()).unwrap_or(0);
+                vec![update(self.pin_messages(Who::Group(CREW), Some(id), word == "message-pin"))]
+            }
             // Tobin was added to the Family folder.
             "folder" => {
                 self.family_grew = true;
@@ -3546,6 +3831,129 @@ impl World {
                 make(101, "Personal", true, false, "Only private chats with contacts."),
             ]);
         }
+        // Two effects: one anyone may send and one that needs Premium. The ask is not logged
+        // (a message that carries an effect makes it, whenever one is mapped); `effects-asked`
+        // says how many there were.
+        if asked::<f::messages::GetAvailableEffects>(body).is_some() {
+            self.effects_asked += 1;
+            let effect = |id: i64, emoticon: &str, premium_required: bool| {
+                tl::enums::AvailableEffect::Effect(tl::types::AvailableEffect {
+                    premium_required,
+                    id,
+                    emoticon: emoticon.to_owned(),
+                    static_icon_id: None,
+                    effect_sticker_id: id + 1,
+                    effect_animation_id: None,
+                })
+            };
+            let found = tl::types::messages::AvailableEffects {
+                hash: 1,
+                effects: vec![effect(EFFECT_PARTY, "\u{1F389}", false), effect(EFFECT_PREMIUM, "\u{1F525}", true)],
+                documents: Vec::new(),
+            };
+            return answer(tl::enums::messages::AvailableEffects::Effects(found));
+        }
+        if let Some(request) = asked::<f::phone::SetCallRating>(body) {
+            let tl::enums::InputPhoneCall::Call(peer) = request.peer;
+            if peer.id != 90_001 || peer.access_hash != 4_242 {
+                return Err(rpc(400, "CALL_PEER_INVALID", None));
+            }
+            if !(1..=5).contains(&request.rating) {
+                return Err(rpc(400, "RATING_INVALID", None));
+            }
+            let flat = request.comment.replace('\n', "\\n");
+            self.log(&format!(
+                "SetCallRating {} stars={} user={} comment={flat}",
+                peer.id, request.rating, request.user_initiative
+            ));
+            return answer(updates(Vec::new()));
+        }
+        if let Some(request) = asked::<f::phone::SaveCallDebug>(body) {
+            let tl::enums::InputPhoneCall::Call(peer) = request.peer;
+            self.log(&format!("SaveCallDebug {}", peer.id));
+            return answer(true);
+        }
+        // Who reacted, and who read: Odalys and Tobin reacted in the group and Odalys read it.
+        // Odalys shares when she read a private message, and Tobin's chat needs mine shared.
+        if let Some(request) = asked::<f::messages::GetMessageReactionsList>(body) {
+            let peer = input_who(&request.peer);
+            let emoji = match &request.reaction {
+                Some(tl::enums::Reaction::Emoji(emoji)) => emoji.emoticon.clone(),
+                Some(tl::enums::Reaction::CustomEmoji(custom)) => format!("e{}", custom.document_id),
+                Some(tl::enums::Reaction::Paid) => "paid".to_owned(),
+                _ => "all".to_owned(),
+            };
+            self.log(&format!("GetMessageReactionsList {} {} {emoji} offset={:?} limit={}", peer.text(), request.id, request.offset, request.limit));
+            let reactions = [ODALYS, TOBIN]
+                .into_iter()
+                .filter_map(|user| {
+                    Some(tl::enums::MessagePeerReaction::Reaction(tl::types::MessagePeerReaction {
+                        big: false,
+                        unread: false,
+                        my: false,
+                        peer_id: Who::User(user).peer(),
+                        date: t0() + 90,
+                        reaction: request.reaction.clone()?,
+                    }))
+                })
+                .collect::<Vec<_>>();
+            let found = tl::types::messages::MessageReactionsList { count: reactions.len() as i32, reactions, chats: chats(), users: users(), next_offset: None };
+            return answer(tl::enums::messages::MessageReactionsList::List(found));
+        }
+        if let Some(request) = asked::<f::messages::GetMessageReadParticipants>(body) {
+            let peer = input_who(&request.peer);
+            self.log(&format!("GetMessageReadParticipants {} {}", peer.text(), request.msg_id));
+            let read: Vec<tl::enums::ReadParticipantDate> = vec![tl::types::ReadParticipantDate { user_id: ODALYS, date: t0() + 100 }.into()];
+            return answer(read);
+        }
+        if let Some(request) = asked::<f::messages::GetOutboxReadDate>(body) {
+            let peer = input_who(&request.peer);
+            self.log(&format!("GetOutboxReadDate {} {}", peer.text(), request.msg_id));
+            if peer != Who::User(ODALYS) {
+                return Err(rpc(403, "YOUR_PRIVACY_RESTRICTED", None));
+            }
+            return answer(tl::enums::OutboxReadDate::Date(tl::types::OutboxReadDate { date: t0() + 100 }));
+        }
+        if let Some(request) = asked::<f::messages::ToggleDialogPin>(body) {
+            let tl::enums::InputDialogPeer::Peer(dialog) = &request.peer else {
+                return Err(rpc(400, "PEER_ID_INVALID", None));
+            };
+            let peer = input_who(&dialog.peer);
+            if request.pinned && self.pins_full {
+                self.log(&format!("ToggleDialogPin {} refused", peer.text()));
+                return Err(rpc(400, "PINNED_DIALOGS_TOO_MUCH", None));
+            }
+            self.log(&format!("ToggleDialogPin {} {}", peer.text(), request.pinned));
+            return answer(true);
+        }
+        if let Some(request) = asked::<f::folders::EditPeerFolders>(body) {
+            for moved in &request.folder_peers {
+                let tl::enums::InputFolderPeer::Peer(moved) = moved;
+                self.log(&format!("EditPeerFolders {} {}", input_who(&moved.peer).text(), moved.folder_id));
+            }
+            return answer(updates(Vec::new()));
+        }
+        if let Some(request) = asked::<f::messages::UpdatePinnedMessage>(body) {
+            let peer = input_who(&request.peer);
+            self.log(&format!(
+                "UpdatePinnedMessage {} {} unpin={} silent={} oneside={}",
+                peer.text(),
+                request.id,
+                request.unpin,
+                request.silent,
+                request.pm_oneside
+            ));
+            if !self.messages.get(&peer.text()).is_some_and(|held| held.contains_key(&request.id)) {
+                return Err(rpc(400, "MESSAGE_ID_INVALID", None));
+            }
+            return answer(updates(vec![self.pin_messages(peer, Some(request.id), !request.unpin)]));
+        }
+        if let Some(request) = asked::<f::messages::UnpinAllMessages>(body) {
+            let peer = input_who(&request.peer);
+            self.log(&format!("UnpinAllMessages {} topic={:?}", peer.text(), request.top_msg_id));
+            self.pin_messages(peer, None, false);
+            return answer(tl::enums::messages::AffectedHistory::History(tl::types::messages::AffectedHistory { pts: 0, pts_count: 0, offset: 0 }));
+        }
         if let Some(request) = asked::<f::messages::GetPinnedDialogs>(body) {
             self.log(&format!("GetPinnedDialogs {}", request.folder_id));
             let (read, unread) = self.crew();
@@ -3746,10 +4154,21 @@ impl World {
         // was asked, in the order it was asked, and the post here has its count.
         if let Some(request) = asked::<f::messages::GetMessagesViews>(body) {
             let peer = input_who(&request.peer);
-            self.log(&format!("GetMessagesViews {} {}", peer.text(), request.id.iter().map(i32::to_string).collect::<Vec<_>>().join(" ")));
+            let ids = request.id.iter().map(i32::to_string).collect::<Vec<_>>().join(" ");
+            // A view counted is logged apart, so a test can tell the two asks from each other.
+            if request.increment {
+                self.viewed_posts += 1;
+                self.log(&format!("GetMessagesViews {} {ids} increment", peer.text()));
+            } else {
+                self.log(&format!("GetMessagesViews {} {ids}", peer.text()));
+            }
             let views: Vec<tl::enums::MessageViews> = request.id.iter().map(|id| {
-                let seen = (*id == 5 && peer == Who::Channel(NOTES)).then_some(12_400);
-                tl::enums::MessageViews::Views(tl::types::MessageViews { views: seen, forwards: None, replies: None })
+                let post = *id == 5 && peer == Who::Channel(NOTES);
+                tl::enums::MessageViews::Views(tl::types::MessageViews {
+                    views: post.then_some(12_400 + self.viewed_posts),
+                    forwards: post.then_some(31),
+                    replies: None,
+                })
             }).collect();
             let found = tl::types::messages::MessageViews { views, chats: chats(), users: users() };
             return answer(tl::enums::messages::MessageViews::Views(found));
@@ -3977,6 +4396,14 @@ impl World {
                 true => key(peer, reply),
                 false => key(peer, topic),
             };
+            if let Some(effect) = request.effect {
+                // Telegram plays an effect in a private chat only.
+                if !matches!(peer, Who::User(_)) || ![EFFECT_PARTY, EFFECT_PREMIUM].contains(&effect) {
+                    return Err(rpc(400, "EFFECT_ID_INVALID", None));
+                }
+                options.push_str(&format!(" [effect={effect}]"));
+            }
+            self.send_effect = request.effect;
             let noted = super::content::entity_note(request.entities.as_deref().unwrap_or(&[]));
             self.log(&format!("SendMessage {said} {}{noted}{options}", request.message));
             return self.deliver(events, peer, topic, reply, vec![(request.random_id, request.message, None, request.entities)], request.schedule_date);
@@ -4365,6 +4792,9 @@ impl World {
                 location if is_ridge_thumb(location) => piece_of(RIDGE_M, request.offset, request.limit),
                 location if is_crew_thumb(location) => piece_of(CREW_PHOTO_M, request.offset, request.limit),
                 tl::enums::InputFileLocation::InputDocumentFileLocation(document) if document.id == 9_400 => big_piece(request.offset, request.limit),
+                tl::enums::InputFileLocation::InputDocumentFileLocation(document) if matches!(document.id, 9_500 | 9_501 | 9_502) => {
+                    stream_piece(document.id, request.offset, request.limit)
+                }
                 _ => file_piece(request.offset, request.limit),
             };
             let piece = tl::types::upload::File { r#type: tl::enums::storage::FileType::FileJpeg, mtime: t0(), bytes: held };
@@ -5319,7 +5749,7 @@ impl World {
             }
             let peer = input_who(&request.peer);
             let (name, mut count, ids): (&str, i32, Vec<i32>) = match request.filter {
-                tl::enums::MessagesFilter::InputMessagesFilterPinned => ("pinned", 1, vec![12]),
+                tl::enums::MessagesFilter::InputMessagesFilterPinned => ("pinned", 1, self.pinned_ids(peer)),
                 tl::enums::MessagesFilter::InputMessagesFilterPhotoVideo => ("media", 37, vec![14]),
                 tl::enums::MessagesFilter::InputMessagesFilterUrl => ("links", 4, vec![17]),
                 tl::enums::MessagesFilter::InputMessagesFilterMusic => ("music", 1, Vec::new()),
@@ -6113,7 +6543,14 @@ impl World {
             let peer = input_who(&request.peer);
             let (kind, media) = held_media(&request.media, self.next + 2_000);
             let options = [("silent", request.silent), ("scheduled", request.schedule_date.is_some())];
-            let options: String = options.iter().filter(|(_, on)| *on).map(|(name, _)| format!(" [{name}]")).collect();
+            let mut options: String = options.iter().filter(|(_, on)| *on).map(|(name, _)| format!(" [{name}]")).collect();
+            if let Some(effect) = request.effect {
+                if !matches!(peer, Who::User(_)) || ![EFFECT_PARTY, EFFECT_PREMIUM].contains(&effect) {
+                    return Some(Err(rpc(400, "EFFECT_ID_INVALID", None)));
+                }
+                options.push_str(&format!(" [effect={effect}]"));
+            }
+            self.send_effect = request.effect;
             let noted = super::content::entity_note(request.entities.as_deref().unwrap_or(&[]));
             self.log(&format!("SendMedia {} {kind} {}{noted}{options}", peer.text(), request.message));
             if kind.starts_with("voice-note") {

@@ -23,6 +23,7 @@ fn place(account: &Account, who: Who, topic: Option<i32>) -> String {
 /// Maps a message and makes sure its conversation is recorded. `None` for one that cannot be
 /// placed (an empty message, a chat Telegram never described).
 fn placed(account: &Account, raw: &tl::enums::Message) -> Option<(String, Mapped)> {
+    super::catalog::name_effects(account, std::iter::once(raw));
     let mut mapped = content::map(&account.dir(), raw)?;
     let conversation = conversation_of(account, &mapped);
     // A topic's first message has the forum's row made for it (`ensure_row`); a comment of
@@ -620,6 +621,30 @@ pub(super) fn apply(account: &Account, update: &Update) {
             read(account, &conversation, seen.max_id, seen.still_unread_count);
         }
         Update::ReadChannelInbox(seen) => read(account, &Who::Channel(seen.channel_id).text(), seen.max_id, seen.still_unread_count),
+        // A channel post's counts, told while the channel is open.
+        Update::ChannelMessageViews(seen) => {
+            let _ = account.ctx.post_counts(&Who::Channel(seen.channel_id).text(), &seen.id.to_string(), Some(seen.views.max(0) as u32), None);
+        }
+        Update::ChannelMessageForwards(shared) => {
+            let _ = account.ctx.post_counts(&Who::Channel(shared.channel_id).text(), &shared.id.to_string(), None, Some(shared.forwards.max(0) as u32));
+        }
+        // A pin or an unpin made on another device, or by someone else in the chat.
+        Update::PinnedMessages(p) => {
+            let conversation = Who::of(&p.peer).text();
+            for id in &p.messages {
+                let _ = account.ctx.pinned(&conversation, &id.to_string(), p.pinned);
+            }
+        }
+        Update::PinnedChannelMessages(p) => {
+            let who = Who::Channel(p.channel_id);
+            let forum = account.dir().get(who).is_some_and(|known| known.forum);
+            for id in &p.messages {
+                let conversation = if forum { account.placed(Some(who), *id) } else { Some(who.text()) };
+                if let Some(conversation) = conversation {
+                    let _ = account.ctx.pinned(&conversation, &id.to_string(), p.pinned);
+                }
+            }
+        }
         Update::PinnedForumTopic(p) => sync::note_topic_pin(account, Who::of(&p.peer), p.topic_id, p.pinned),
         Update::PinnedForumTopics(p) => {
             if let Some(order) = &p.order {
@@ -790,9 +815,61 @@ pub(super) fn apply(account: &Account, update: &Update) {
         Update::Config => {
             account.live().default_reaction = None;
         }
+        // Call lifecycle updates: remember `(id, access_hash, peer)` for rating, and when Telegram
+        // asks for feedback on `phoneCallDiscarded` (`need_rating`), surface the rating prompt.
+        // `need_debug` is intentionally ignored: tinyclient's media stack is not tgcalls, so we do
+        // not upload incompatible call debug logs via `phone.saveCallDebug`.
+        Update::PhoneCall(phone) => phone_call(account, &phone.phone_call),
         // A chat joined, left or changed: what changed came with the update's chats, which
         // `learn` has already written.
         _ => {}
+    }
+}
+
+fn remember_phone_call(account: &Account, id: i64, access_hash: i64, admin_id: i64, participant_id: i64) {
+    let peer_id = if admin_id == account.me { participant_id } else { admin_id };
+    let peer = (peer_id != 0).then_some(Who::User(peer_id));
+    let mut live = account.live();
+    live.phone_calls.retain(|(known_id, _, _)| *known_id != id);
+    if live.phone_calls.len() >= 64 {
+        live.phone_calls.pop_front();
+    }
+    live.phone_calls.push_back((id, access_hash, peer));
+}
+
+fn phone_call(account: &Account, call: &tl::enums::PhoneCall) {
+    match call {
+        tl::enums::PhoneCall::Waiting(c) => remember_phone_call(account, c.id, c.access_hash, c.admin_id, c.participant_id),
+        tl::enums::PhoneCall::Requested(c) => remember_phone_call(account, c.id, c.access_hash, c.admin_id, c.participant_id),
+        tl::enums::PhoneCall::Accepted(c) => remember_phone_call(account, c.id, c.access_hash, c.admin_id, c.participant_id),
+        tl::enums::PhoneCall::Call(c) => remember_phone_call(account, c.id, c.access_hash, c.admin_id, c.participant_id),
+        tl::enums::PhoneCall::Discarded(discarded) => {
+            if discarded.need_debug {
+                tracing::debug!("chatd: Telegram: phoneCallDiscarded {} asked for debug stats; skipped (non-tgcalls stack)", discarded.id);
+            }
+            if !discarded.need_rating {
+                return;
+            }
+            let known = account
+                .live()
+                .phone_calls
+                .iter()
+                .rev()
+                .find(|(id, _, _)| *id == discarded.id)
+                .cloned();
+            let Some((_, _, Some(peer))) = known else {
+                return;
+            };
+            account.ctx.hub.changed(protocol::Change::CallRating {
+                prompt: protocol::CallRatingPrompt {
+                    conversation: account.ctx.key(&peer.text()),
+                    call_id: discarded.id.to_string(),
+                    video: discarded.video,
+                    seconds: discarded.duration.filter(|&d| d > 0).map(|d| d as u32),
+                },
+            });
+        }
+        tl::enums::PhoneCall::Empty(_) => {}
     }
 }
 

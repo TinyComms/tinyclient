@@ -81,6 +81,8 @@ pub struct Staged {
     pub converted: Option<PathBuf>,
     pub converting: bool,
     pub original: bool,
+    /// A description of the picture. Empty: none.
+    pub alt: String,
     /// The shell wrote `path` (a paste) and deletes it once the message is settled.
     pub owned: bool,
 }
@@ -109,6 +111,7 @@ impl Staged {
             converted: None,
             converting,
             original: false,
+            alt: String::new(),
             owned: false,
         }
     }
@@ -136,6 +139,7 @@ impl Staged {
             _ => (self.path.clone(), self.name.clone()),
         };
         Some(OutgoingFile {
+            alt: protocol::clip_alt(&self.alt),
             path: path.to_string_lossy().into_owned(),
             name,
             spoiler: self.spoiler,
@@ -164,6 +168,9 @@ pub fn refusal(found: Found, can: &Capabilities, network: Network) -> Option<Str
         Found::Folder => Some("Folders can't be sent".to_owned()),
         Found::Missing => Some("Not on disk anymore".to_owned()),
         Found::File(_) if can.max_file_bytes == 0 => Some(format!("{name} can't take files here")),
+        Found::File(bytes) if network == Network::Discord && bytes > can.max_file_bytes => {
+            Some(format!("Too big for Discord · {} max here", size(can.max_file_bytes)))
+        }
         Found::File(bytes) if bytes > can.max_file_bytes => Some(format!("Too big for {name} · limit {}", size(can.max_file_bytes))),
         Found::File(_) => None,
     }
@@ -246,11 +253,13 @@ pub struct Options {
     pub spoiler: bool,
     pub as_file: bool,
     pub original: bool,
+    /// The network takes a description on a picture.
+    pub alt_text: bool,
 }
 
 impl Options {
     pub fn any(&self) -> bool {
-        self.spoiler || self.as_file || self.original
+        self.spoiler || self.as_file || self.original || self.alt_text
     }
 }
 
@@ -264,6 +273,7 @@ pub fn options(chip: &Staged, can: &Capabilities, network: Network) -> Options {
         spoiler: can.spoiler && (network != Network::Telegram || media),
         as_file: can.as_file && media,
         original: chip.converted.is_some(),
+        alt_text: can.alt_text && chip.pictured(),
     }
 }
 
@@ -386,7 +396,7 @@ mod tests {
     fn a_file_over_the_limit_is_refused_on_its_chip_before_anything_is_sent() {
         let can = discord();
         let big = chip(1, "clip.mov", Found::File(84_000_000), &can, Network::Discord);
-        assert_eq!(big.refused.as_deref(), Some("Too big for Discord · limit 20 MB"));
+        assert_eq!(big.refused.as_deref(), Some("Too big for Discord · 20 MB max here"));
         assert!(big.outgoing().is_none());
         let fits = chip(2, "photo.jpg", Found::File(20_000_000), &can, Network::Discord);
         assert!(fits.refused.is_none());
@@ -428,11 +438,25 @@ mod tests {
     fn options_are_only_those_the_network_has_for_that_kind_of_file() {
         let photo = chip(1, "a.jpg", Found::File(1), &telegram(), Network::Telegram);
         let pdf = chip(2, "a.pdf", Found::File(1), &telegram(), Network::Telegram);
-        assert_eq!(options(&photo, &telegram(), Network::Telegram), Options { spoiler: true, as_file: true, original: false });
+        assert_eq!(options(&photo, &telegram(), Network::Telegram), Options { spoiler: true, as_file: true, ..Options::default() });
         assert_eq!(options(&pdf, &telegram(), Network::Telegram), Options::default());
         let any = chip(3, "a.pdf", Found::File(1), &discord(), Network::Discord);
         assert_eq!(options(&any, &discord(), Network::Discord), Options { spoiler: true, ..Options::default() });
         assert!(!options(&photo, &Capabilities::default(), Network::Slack).any());
+    }
+
+    #[test]
+    fn a_picture_can_carry_a_description_where_the_network_takes_one() {
+        let can = Capabilities { alt_text: true, ..discord() };
+        let mut photo = chip(1, "a.jpg", Found::File(1), &can, Network::Discord);
+        assert!(options(&photo, &can, Network::Discord).alt_text);
+        let pdf = chip(2, "a.pdf", Found::File(1), &can, Network::Discord);
+        assert!(!options(&pdf, &can, Network::Discord).alt_text);
+        assert!(!options(&photo, &discord(), Network::Discord).alt_text);
+        photo.alt = "  the ridge  ".into();
+        assert_eq!(photo.outgoing().unwrap().alt, "the ridge");
+        photo.alt = format!("{}{}", "é", "b".repeat(1100));
+        assert_eq!(photo.outgoing().unwrap().alt.chars().count(), protocol::ALT_LIMIT);
     }
 
     #[test]

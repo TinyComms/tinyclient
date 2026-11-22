@@ -183,8 +183,16 @@ impl Discord {
     pub(super) fn dispatch(&self, event: &str, data: &str) -> Result<(), Failure> {
         match event {
             "READY_SUPPLEMENTAL" => self.supplemental(from_str(data)?),
+            "AUTH_SESSION_CHANGE" => {
+                let change: serde_json::Value = from_str(data)?;
+                self.state.lock().unwrap().auth_session_id_hash =
+                    change["auth_session_id_hash"].as_str().map(str::to_owned);
+            }
             "MESSAGE_CREATE" => self.created(from_str(data)?)?,
             "MESSAGE_UPDATE" => self.updated(from_str(data)?)?,
+            "MESSAGE_POLL_VOTE_ADD" | "MESSAGE_POLL_VOTE_REMOVE" => {
+                self.poll_vote_event(from_str(data)?, event == "MESSAGE_POLL_VOTE_ADD")?;
+            }
             "MESSAGE_DELETE" | "MESSAGE_DELETE_BULK" => {
                 let removed: Removed = from_str(data)?;
                 for id in removed.ids.iter().chain(Some(&removed.id)).filter(|id| !id.is_empty()) {
@@ -244,6 +252,13 @@ impl Discord {
             }
             "PRESENCE_UPDATE" => self.presence(&from_str(data)?),
             "TYPING_START" => self.typing_started(from_str(data)?),
+            // Says only that the channel's pins changed, never which: an open pins list asks again.
+            "CHANNEL_PINS_UPDATE" => {
+                let pins: serde_json::Value = from_str(data)?;
+                if let Some(channel) = pins["channel_id"].as_str() {
+                    self.ctx.pins_changed(channel);
+                }
+            }
             "CHANNEL_UNREAD_UPDATE" | "PASSIVE_UPDATE_V2" => self.passive(from_str(data)?)?,
             "USER_UPDATE" => {
                 let user: User = from_str(data)?;
@@ -306,6 +321,11 @@ impl Discord {
             "GUILD_MEMBER_LIST_UPDATE" => self.member_list(from_str(data)?),
             "GUILD_MEMBERS_CHUNK" => self.members_chunk(from_str(data)?)?,
             "VOICE_STATE_UPDATE" => self.voice_state(from_str(data)?),
+            "VOICE_CHANNEL_STATUS_UPDATE" => {
+                let update: super::voice::ChannelStatus = from_str(data)?;
+                self.voice_channel_status(update);
+            }
+            "CHANNEL_STATUSES" => self.voice_channel_statuses(from_str(data)?),
             "GUILD_EMOJIS_UPDATE" | "GUILD_STICKERS_UPDATE" => self.pickables_changed(from_str(data)?),
             "VOICE_SERVER_UPDATE" => self.voice_server(from_str(data)?),
             "STREAM_CREATE" => self.stream_created(data)?,
@@ -553,11 +573,18 @@ impl Discord {
         let guild = posted.guild_id.clone().or_else(|| self.guild_of(&conversation));
         let files = if posted.author.is_some() {
             // Whole: translate it again, keeping what only the first arrival knew.
-            let (mut message, files) = self.convert(&posted, guild.as_deref(), conversation.kind);
+            let (mut message, mut files) = self.convert(&posted, guild.as_deref(), conversation.kind);
             message.mentions_me = stored.mentions_me;
             message.client_id = stored.client_id.take();
             if posted.reactions.is_none() {
                 message.reactions = std::mem::take(&mut stored.reactions);
+            }
+            if let Some(raw) = &posted.poll {
+                let (poll, added) = super::polls::convert(raw, stored.poll.as_deref());
+                message.poll = poll.map(Box::new);
+                files.files.extend(added);
+            } else if stored.poll.is_some() {
+                message.poll = stored.poll.take();
             }
             if message.thread.is_none() {
                 message.thread = stored.thread.take();

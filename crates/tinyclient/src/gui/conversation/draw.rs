@@ -36,6 +36,24 @@ use std::time::Duration;
 /// How long the tint on a jump's target takes to fade.
 pub const FLASH: Duration = Duration::from_millis(1200);
 
+fn poll_percentage(count: u32, total: u32) -> u32 {
+    if total == 0 {
+        return 0;
+    }
+    let count = u64::from(count.min(total));
+    let total = u64::from(total);
+    ((100 * count + total / 2) / total) as u32
+}
+
+#[cfg(test)]
+#[test]
+fn poll_result_percentages_round_and_stay_within_the_card() {
+    assert_eq!(poll_percentage(0, 0), 0);
+    assert_eq!(poll_percentage(2, 3), 67);
+    assert_eq!(poll_percentage(u32::MAX, u32::MAX), 100);
+    assert_eq!(poll_percentage(5, 2), 100);
+}
+
 /// The line under a send that is queued until the account is back.
 pub(crate) fn waiting_line(network: &str) -> String {
     format!("Waiting for {network}")
@@ -634,6 +652,42 @@ impl Pane {
             Some(div().flex_none().flex().items_center().gap(px(3.)).children(shown))
         });
         let call_support = self.open.as_ref().map_or(protocol::CallSupport::None, |open| open.call);
+        let rate_pill = message
+            .call
+            .as_ref()
+            .filter(|note| note.outcome == protocol::CallOutcome::Ended)
+            .and_then(|note| {
+                let call_id = note.call_id.clone()?;
+                let key = open_key.clone()?;
+                let shell = self.shell.clone();
+                let prompt = protocol::CallRatingPrompt {
+                    conversation: key,
+                    call_id,
+                    video: note.video,
+                    seconds: note.seconds,
+                };
+                Some(
+                    div()
+                        .id(SharedString::from(format!("call-row-rate-{}", message.id)))
+                        .flex_none()
+                        .h(px(24.))
+                        .px(px(10.))
+                        .rounded_full()
+                        .bg(theme::quiet_fill())
+                        .text_color(theme::text_soft())
+                        .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .type_micro()
+                        .font_weight(theme::SEMIBOLD)
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            let prompt = prompt.clone();
+                            let _ = shell.update(cx, |shell, cx| shell.call_open_rating(prompt, true, cx));
+                        }))
+                        .child("Rate"),
+                )
+            });
         let shell = self.shell.clone();
         let pill = spec.pill.and_then(|words| {
             let key = open_key?;
@@ -710,6 +764,7 @@ impl Pane {
                     .children(faces)
                     .child(div().type_micro().text_color(theme::text_faint()).child(short_clock(message.sent))),
             )
+            .children(rate_pill)
             .children(pill)
     }
 
@@ -1229,7 +1284,7 @@ impl Pane {
                                 .bg(tokens::card())
                                 .type_micro()
                                 .text_color(theme::accent())
-                                .child(format!("✨ {effect}")),
+                                .child(if effect.is_empty() { "✨".to_owned() } else { format!("✨ {effect}") }),
                         )
                 }))
                 .children(message.sent_via.as_deref().map(|via| {
@@ -1247,8 +1302,9 @@ impl Pane {
                                 .child(via.to_owned()),
                         )
                 }))
-                .children(message.all_cards().enumerate().map(|(ix, card)| self.app_card(message, ix, card, cx)))
-                .children(message.poll.as_deref().map(|poll| self.poll_card(message, poll, cx)))
+                .children(message.all_cards().enumerate().map(|(ix, card)| self.app_card(message, ix, card, window, cx)))
+                .children(message.poll.as_deref().filter(|_| !matches!(message.kind, MessageKind::Unsupported { .. }))
+                    .map(|poll| self.poll_card(message, poll, cx)))
                 .children(message.contacts.iter().enumerate().map(|(idx, contact)| self.contact_card(message, contact, idx, cx)))
                 .children(message.invites.iter().enumerate().map(|(ix, invite)| self.invite_card(message, ix, invite, window, cx)))
                 .children(self.message_controls(message, cx))
@@ -2719,6 +2775,11 @@ impl Pane {
                     (true, true) if anim::badged(Play::Inline) => tile.child(badge("GIF".to_owned()).left(px(6.))),
                     _ => tile,
                 };
+                // A described picture says so, and says what on hover.
+                let tile = match attachment.alt.is_empty() {
+                    true => tile,
+                    false => tile.tooltip(tip(attachment.alt.clone(), None)).child(badge("ALT".to_owned()).right(px(6.))),
+                };
                 tile.on_click(cx.listener(move |this, _, window, cx| this.open_viewer(&id, index, window, cx)))
             }
         };
@@ -3131,16 +3192,91 @@ impl Pane {
     }
 
     /// What a bot or app posts instead of text: one framed card, its bar in one of our colors.
-    fn app_card(&self, message: &Message, ix: usize, card: &Card, cx: &mut Context<Self>) -> AnyElement {
+    /// A small picture inside a card (an icon, a thumbnail), once it is on disk. Nothing until then.
+    fn card_picture(&mut self, file: &MediaFile, edge: f32, radius: f32, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.held_back(file) {
+            return None;
+        }
+        let size = media::decode_edge((file.width, file.height), edge, edge, Fit::Cover, window.scale_factor());
+        let Picture::Ready(decoded) = self.still(file, size, size, None, cx) else {
+            return None;
+        };
+        let shown = anim::picture(decoded, ObjectFit::Cover, radius, Play::Inline);
+        Some(div().size(px(edge)).flex_none().rounded(px(radius)).overflow_hidden().child(shown).into_any_element())
+    }
+
+    /// A card's own words with their styles: a link opens on a click and a spoiler shows. Text
+    /// here is not part of a selection.
+    fn card_text(&mut self, message: &Message, ix: usize, card: &Card, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let key = format!("{}/card{ix}", message.id);
+        let revealed: Vec<u32> = self.revealed.iter().filter(|(id, _)| *id == key).map(|(_, span)| *span).collect();
+        let me = self.open.as_ref().map(|open| open.me.clone()).unwrap_or_default();
+        let edge = media::square_size(18., window.scale_factor());
+        let color = theme::text_soft().into_color();
+        let mut out = Vec::new();
+        for (at, block) in rich::blocks(&card.text, &card.text_spans).iter().enumerate() {
+            let inline = match block {
+                Block::Code { text, .. } => {
+                    out.push(div().px(px(6.)).py(px(4.)).rounded(px(theme::R_CONTROL)).bg(tokens::code_bg()).type_code().child(text.clone()).into_any_element());
+                    continue;
+                }
+                Block::Text(inline) | Block::Small(inline) | Block::Quote(inline) | Block::Heading { text: inline, .. } | Block::Item { text: inline, .. } => inline,
+            };
+            // What each run does on a click, read once: the handler outlives this draw.
+            let acts: Vec<(Option<String>, Option<u32>)> = inline.runs.iter().map(|run| (run.link.clone(), run.spoiler)).collect();
+            let (this, key) = (cx.weak_entity(), key.clone());
+            let mut emoji = |file: &MediaFile| match self.still(file, edge, edge, None, cx) {
+                Picture::Ready(image) => Some(image),
+                _ => None,
+            };
+            let look = Look {
+                color,
+                hovered: None,
+                revealed: &|span| revealed.contains(&span),
+                me: &me,
+                mentions_me: false,
+                emoji: &mut emoji,
+                selection: None,
+                dragging: false,
+                history: false,
+            };
+            let words = Rich::new(("card-text", ix * 256 + at), inline, look, move |event, window, cx| {
+                let TextEvent::Click(run, alt) = event else { return };
+                let Some((link, spoiler)) = acts.get(run).cloned() else { return };
+                let _ = this.update(cx, |this, cx| {
+                    if spoiler.is_some_and(|spoiler| this.revealed.insert((key.clone(), spoiler))) {
+                        cx.notify();
+                    } else if let Some(url) = link {
+                        this.open_link(&url, alt, window, cx);
+                    }
+                });
+            });
+            let body = div().min_w_0().flex_1().flex().flex_col().type_ui().child(words);
+            let marker = |words: String| div().w(px(20.)).flex_none().type_ui().text_color(theme::text_faint()).child(words);
+            out.push(match block {
+                Block::Heading { .. } => body.font_weight(theme::SEMIBOLD).into_any_element(),
+                Block::Quote(_) => div().flex().gap(px(8.)).child(div().w(px(3.)).flex_none().rounded(px(2.)).bg(tokens::border_strong())).child(body).into_any_element(),
+                Block::Item { ordered, depth, number, .. } => {
+                    let words = if *ordered { format!("{number}.") } else { "\u{2022}".to_owned() };
+                    div().pl(px(20. * f32::from(*depth))).flex().child(marker(words)).child(body).into_any_element()
+                }
+                _ => body.into_any_element(),
+            });
+        }
+        out
+    }
+
+    fn app_card(&mut self, message: &Message, ix: usize, card: &Card, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let bar = match media::card_tone(card.color) {
             media::Tone::Positive => theme::positive(),
             media::Tone::Danger => theme::danger(),
             media::Tone::Warning => theme::warning(),
             media::Tone::Neutral => tokens::border_strong(),
         };
-        let field = |(label, value): &(String, String)| {
+        let field = |(at, (label, value)): (usize, &(String, String))| {
             div()
-                .w(px(190.))
+                // A field that does not share its row takes the row.
+                .map(|field| if media::card_field_inline(card, at) { field.w(px(190.)) } else { field.w_full() })
                 .min_w_0()
                 .flex()
                 .flex_col()
@@ -3243,10 +3379,39 @@ impl Pane {
                     )
                     .into_any_element(),
             )
-        } else if !card.footer.is_empty() {
-            Some(div().mt(px(2.)).type_small().text_color(theme::text_faint()).child(card.footer.clone()).into_any_element())
         } else {
-            None
+            let said = media::card_footer(card, |unix| time::stamp(crate::view::now(), unix));
+            let icon = card.footer_icon.as_ref().and_then(|file| self.card_picture(file, 16., 8., window, cx));
+            (!said.is_empty()).then(|| {
+                let words = div().min_w_0().type_small().text_color(theme::text_faint()).child(said);
+                let line = div().mt(px(2.)).flex().items_center().gap(px(6.)).children(icon).child(words);
+                match card.time {
+                    Some(unix) => line.id(SharedString::from(format!("card-time-{}-{ix}", message.id))).tooltip(tip(time::tooltip(unix), None)).into_any_element(),
+                    None => line.into_any_element(),
+                }
+            })
+        };
+        let author_el = (!card.author.is_empty()).then(|| {
+            let icon = card.author_icon.as_ref().and_then(|file| self.card_picture(file, 20., 10., window, cx));
+            let name = div().min_w_0().truncate().type_small().font_weight(theme::MEDIUM).text_color(theme::text_soft()).child(card.author.clone());
+            let line = div().flex().items_center().gap(px(6.)).children(icon).child(name);
+            if card.author_link.is_empty() {
+                return line.into_any_element();
+            }
+            let url = card.author_link.clone();
+            line.id(SharedString::from(format!("card-author-{}-{ix}", message.id)))
+                .cursor_pointer()
+                .hover(|s| s.underline())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.open_external_link(&url, window, cx);
+                }))
+                .into_any_element()
+        });
+        let thumbnail_el = card.thumbnail.as_ref().and_then(|file| self.card_picture(file, 72., 6., window, cx));
+        let text_el: Vec<AnyElement> = match card.text_spans.is_empty() {
+            true => (!card.text.is_empty()).then(|| div().type_ui().text_color(theme::text_soft()).child(card.text.clone()).into_any_element()).into_iter().collect(),
+            false => self.card_text(message, ix, card, window, cx),
         };
         let title_el = (!card.title.is_empty()).then(|| {
             if card.title_link.is_empty() {
@@ -3301,10 +3466,10 @@ impl Pane {
             .flex()
             .flex_col()
             .gap(px(4.))
-            .children((!card.author.is_empty()).then(|| div().type_small().font_weight(theme::MEDIUM).text_color(theme::text_soft()).child(card.author.clone())))
+            .children(author_el)
             .children(title_el)
-            .children((!card.text.is_empty()).then(|| div().type_ui().text_color(theme::text_soft()).child(card.text.clone())))
-            .children((!card.fields.is_empty()).then(|| div().mt(px(2.)).flex().flex_wrap().gap_x(px(12.)).gap_y(px(6.)).children(card.fields.iter().map(field))))
+            .children(text_el)
+            .children((!card.fields.is_empty()).then(|| div().mt(px(2.)).flex().flex_wrap().gap_x(px(12.)).gap_y(px(6.)).children(card.fields.iter().enumerate().map(field))))
             .children(actions_el)
             .children(footer_el);
         let framed = div()
@@ -3318,7 +3483,8 @@ impl Pane {
             .overflow_hidden()
             .flex()
             .child(div().w(px(3.)).flex_none().bg(bar))
-            .child(words);
+            .child(words)
+            .children(thumbnail_el.map(|picture| div().flex_none().pt(px(10.)).pr(px(12.)).child(picture)));
         div().pt(px(5.)).flex().child(framed).into_any_element()
     }
 
@@ -4006,10 +4172,11 @@ impl Pane {
     /// Interactive poll card: question, choices with bar & count, my selection, Show results, End poll.
     fn poll_card(&self, message: &Rc<Message>, poll: &protocol::Poll, cx: &mut Context<Self>) -> AnyElement {
         let total = poll.total_votes();
-        let show_results = poll.closed || !poll.mine.is_empty() || self.poll_results.contains(&message.id);
+        let ended = poll.closed || poll.closes_at.is_some_and(|expiry| expiry <= crate::view::now());
+        let show_results = ended || !poll.mine.is_empty() || self.poll_results.contains(&message.id);
         let subtitle = {
             let mut parts: Vec<String> = Vec::new();
-            if poll.closed {
+            if ended {
                 parts.push("Poll closed".to_owned());
             } else if poll.multiple {
                 parts.push("Select one or more".to_owned());
@@ -4019,7 +4186,7 @@ impl Pane {
             if poll.anonymous {
                 parts.push("Anonymous".to_owned());
             }
-            if !poll.closed {
+            if !ended {
                 if let Some(closes_at) = poll.closes_at {
                     let left = closes_at.saturating_sub(crate::view::now());
                     if left <= 0 {
@@ -4040,10 +4207,21 @@ impl Pane {
         for (idx, choice) in poll.choices.iter().enumerate() {
             let idx_u32 = idx as u32;
             let picked = poll.mine.contains(&idx_u32);
-            let pct = if total > 0 { ((choice.count as f32 / total as f32) * 100.).round() as u32 } else { 0 };
+            let pct = poll_percentage(choice.count, total);
             let next = poll.next_votes(idx_u32);
             let msg_id = message.id.clone();
-            let clickable = !poll.closed;
+            let clickable = !ended && !self.poll_voting.contains(&message.id) && message.state == SendState::Sent;
+            let emoji_path = choice.emoji_file.as_ref().and_then(|file| {
+                let account = self.open.as_ref()?.key.account();
+                let shell = self.shell.upgrade()?;
+                let hub = shell.read(cx).people_state.hub().clone();
+                hub.file(&account, file, cx).path.map(std::path::PathBuf::from)
+            });
+            let emoji = if let Some(path) = emoji_path {
+                Some(gpui::img(path).flex_none().size(px(18.)).into_any_element())
+            } else {
+                (!choice.emoji.is_empty()).then(|| div().flex_none().child(choice.emoji.clone()).into_any_element())
+            };
 
             let row = div()
                 .id(name_id(&format!("poll-{}-{}", message.id, idx), ""))
@@ -4088,6 +4266,7 @@ impl Pane {
                         .when(picked, |el| {
                             el.child(div().type_small().font_weight(theme::SEMIBOLD).text_color(theme::accent()).child("✓"))
                         })
+                        .children(emoji)
                         .child(div().type_ui().truncate().text_color(theme::text()).child(choice.text.clone())),
                 )
                 .when(show_results, |el| {
@@ -4101,6 +4280,30 @@ impl Pane {
                     )
                 });
             rows = rows.child(row);
+            if show_results && choice.answer_id.is_some() && choice.count > 0 {
+                let id = message.id.clone();
+                rows = rows.child(button(("poll-voters-choice", idx), ButtonKind::Ghost, "View voters")
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_poll_voters(id.clone(), idx_u32, cx))));
+            }
+            if let Some(list) = self.poll_voters.as_ref().filter(|list| list.message_id == message.id && list.choice == idx_u32) {
+                let mut voters = div().p(px(8.)).bg(theme::overlay()).rounded(px(theme::R_CONTROL)).flex().flex_col().gap(px(3.))
+                    .child(div().type_small().font_weight(theme::SEMIBOLD).child(format!("Voters · {}", choice.text)))
+                    .child(div().id(("poll-voters-list", idx)).max_h(px(180.)).overflow_y_scroll().children(
+                        list.voters.iter().map(|voter| div().type_small().child(voter.name.clone())),
+                    ));
+                if list.loading {
+                    voters = voters.child(div().type_small().child("Loading…"));
+                } else if let Some(error) = &list.error {
+                    voters = voters.child(div().type_small().text_color(theme::danger()).child(error.clone()));
+                } else if list.voters.is_empty() {
+                    voters = voters.child(div().type_small().child("No votes"));
+                }
+                if !list.loading && (list.more || list.error.is_some()) {
+                    voters = voters.child(button(("poll-more-voters", idx), ButtonKind::Secondary, if list.error.is_some() { "Retry" } else { "Load more" })
+                        .on_click(cx.listener(|this, _, _, cx| this.load_poll_voters(cx))));
+                }
+                rows = rows.child(voters);
+            }
         }
 
         let vote_label = if total == 1 { "1 vote".to_owned() } else { format!("{total} votes") };
@@ -4113,7 +4316,7 @@ impl Pane {
             .child(div().type_small().text_color(theme::text_faint()).child(vote_label));
 
         let mut actions = div().flex().items_center().gap(px(8.));
-        if !poll.closed && poll.mine.is_empty() {
+        if !ended && poll.mine.is_empty() {
             let msg_id = message.id.clone();
             let toggle_label = if show_results { "Hide results" } else { "Show results" };
             actions = actions.child(
@@ -4127,7 +4330,7 @@ impl Pane {
                     .child(toggle_label),
             );
         }
-        if message.outgoing && !poll.closed {
+        if message.outgoing && !ended && message.state == SendState::Sent && !self.poll_voting.contains(&message.id) {
             let msg_id = message.id.clone();
             actions = actions.child(
                 div()
@@ -4916,15 +5119,8 @@ impl Pane {
     /// A channel post's footer: how many people saw it, as Telegram's apps say it. Telegram
     /// counts views for channel posts only, so a message without a count draws nothing.
     fn views_line(&self, message: &Message) -> Option<AnyElement> {
-        let views = message.views?;
-        Some(
-            div()
-                .h(px(16.))
-                .type_micro()
-                .text_color(theme::text_faint())
-                .child(format!("{} views", views_short(views)))
-                .into_any_element(),
-        )
+        let words = post_line(&message.signature, message.views, message.shares)?;
+        Some(div().h(px(16.)).type_micro().text_color(theme::text_faint()).child(words).into_any_element())
     }
 
     fn thread_line(&mut self, message: &Rc<Message>, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -5285,6 +5481,20 @@ fn last_reply_label(now: i64, last: i64) -> Option<String> {
 
 /// A view count the way Telegram's apps say it: "987", "12.4K", "1.2M". The number is cut,
 /// not rounded, so a count never reads as more than Telegram said.
+/// A channel post's footer: who signed it, how many saw it, how many times it was forwarded.
+/// Each part is said only when the network gave it; a share count of none is not said.
+fn post_line(signature: &str, views: Option<u32>, shares: Option<u32>) -> Option<String> {
+    let parts: Vec<String> = [
+        (!signature.is_empty()).then(|| signature.to_owned()),
+        views.map(|views| format!("{} views", views_short(views))),
+        shares.filter(|shares| *shares > 0).map(|shares| format!("{} {}", views_short(shares), if shares == 1 { "share" } else { "shares" })),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 fn views_short(views: u32) -> String {
     let (divisor, suffix) = match views {
         0..=999 => return views.to_string(),
@@ -5330,6 +5540,17 @@ mod tests {
 
     fn face(message: &Message, messages: &[Rc<Message>], account: Option<&str>) -> Option<String> {
         own_face(message, None, messages, "me", || account.map(picture)).map(|file| file.id)
+    }
+
+    #[test]
+    fn a_post_says_its_signature_views_and_shares_and_nothing_it_was_not_given() {
+        assert_eq!(post_line("", None, None), None);
+        assert_eq!(post_line("", Some(12_400), None).as_deref(), Some("12.4K views"));
+        assert_eq!(post_line("Mira K.", Some(12_400), Some(31)).as_deref(), Some("Mira K. · 12.4K views · 31 shares"));
+        assert_eq!(post_line("", Some(7), Some(1)).as_deref(), Some("7 views · 1 share"));
+        assert_eq!(post_line("", Some(7), Some(0)).as_deref(), Some("7 views"));
+        // An anonymous admin's title in a group, where nothing is counted.
+        assert_eq!(post_line("Trail boss", None, None).as_deref(), Some("Trail boss"));
     }
 
     #[test]
@@ -5403,7 +5624,7 @@ mod tests {
         let make = |outcome, outgoing, seconds| {
             let mut m = Message::plain("r1", "Bea", "fallback", 100, outgoing);
             m.kind = MessageKind::System;
-            m.call = Some(protocol::CallNote { outcome, caller_id: "u1".into(), seconds, participants: Vec::new(), video: false });
+            m.call = Some(protocol::CallNote { outcome, caller_id: "u1".into(), seconds, participants: Vec::new(), video: false, call_id: None });
             m
         };
         let missed_in = call_line_spec(&make(protocol::CallOutcome::Missed, false, None), "Bea");

@@ -854,6 +854,9 @@ impl Chat {
         if conversation.kind == ConversationKind::Voice || conversation.call == CallSupport::Native {
             conversation.occupants = self.hub.occupants(&conversation.key);
         }
+        if conversation.key.network == Network::Discord && conversation.kind == ConversationKind::Voice {
+            conversation.topic = self.hub.voice_status(&conversation.key).unwrap_or_default();
+        }
         conversation.slowmode_until = if conversation.slowmode_seconds == 0 || conversation.rights.slowmode_exempt {
             None
         } else {
@@ -1708,7 +1711,7 @@ impl Chat {
             match std::fs::metadata(&real) {
                 Ok(meta) if meta.is_dir() => return refuse(format!("{named}: folders can't be sent. Zip it first.")),
                 Ok(meta) if meta.len() > max_file_bytes => {
-                    return refuse(format!("{named} is too big for {name} (limit {}).", megabytes(max_file_bytes)))
+                    return refuse(crate::blobs::upload::size_refusal(account.network, &named, max_file_bytes))
                 }
                 Ok(_) => {}
                 Err(_) => return refuse(format!("{named} is no longer there.")),
@@ -3325,7 +3328,7 @@ impl Chat {
         let conversation_id = conversation.id.clone();
         match self.ask(&account, |reply| Command::Pinned { conversation_id, reply }) {
             Ok(mut messages) => {
-                messages.truncate(protocol::PINNED_LIMIT);
+                messages.truncate(protocol::PINNED_PAGED_LIMIT);
                 messages.iter_mut().for_each(Message::bound);
                 Response::Pinned { conversation, messages }
             }
@@ -4462,6 +4465,42 @@ impl Chat {
             }
             Request::TopicDelete { topic } => {
                 self.act(&topic, |conversation_id, reply| Command::TopicDelete { conversation_id, reply })
+            }
+            Request::MessageEffects { account } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::MessageEffects { reply }) {
+                    Ok(page) => Response::Catalog { items: page.items, cursor: page.cursor },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::CallRate { account, call_id, rating, mut reasons, mut comment, user_initiative } => {
+                if !(1..=5).contains(&rating) {
+                    return error(ErrorCode::Refused, "Choose a rating between one and five stars.");
+                }
+                if call_id.trim().is_empty() {
+                    return error(ErrorCode::Refused, "Missing call id.");
+                }
+                reasons.truncate(8);
+                for reason in &mut reasons {
+                    protocol::clip(reason, 64);
+                }
+                protocol::clip(&mut comment, 512);
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::CallRate {
+                    call_id,
+                    rating,
+                    reasons,
+                    comment,
+                    user_initiative,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
             }
             Request::TopicIcons { account } => {
                 if let Err(refused) = self.online(&account) {
@@ -5776,6 +5815,7 @@ impl Chat {
                     reply,
                 })
             }
+            Request::UnpinAll { conversation } => self.act(&conversation, |conversation_id, reply| Command::UnpinAll { conversation_id, reply }),
             Request::StarMessage { conversation, message_id, starred } => {
                 let account = conversation.account();
                 if let Err(refused) = self.online(&account) {
@@ -6147,6 +6187,16 @@ impl Chat {
             Request::Follow { conversation, into } => self.follow_announcement(conversation, into),
 
             Request::Poll { conversation, message_id, votes } => self.poll(conversation, message_id, votes),
+            Request::PollVoters { conversation, message_id, choice, after } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::PollVoters { conversation_id: conversation.id, message_id, choice, after, reply }) {
+                    Ok(page) => Response::PollVoters { voters: page.reactors, more: page.more },
+                    Err(refused) => *refused,
+                }
+            }
 
             Request::Fetch { account, ids, size, retry, span } => {
                 let adapter = lock(&self.adapters).get(&account).map(Adapter::sender);
@@ -6177,7 +6227,11 @@ impl Chat {
                         // What the cache has never heard of may be the adapter's to fetch itself.
                         let unknown: Vec<String> = ids.iter().filter(|id| !files.iter().any(|file| file.id == **id)).cloned().collect();
                         if let (false, Some(adapter)) = (unknown.is_empty(), adapter) {
-                            let _ = adapter.send(Command::Wanted(unknown));
+                            let command = match span {
+                                Some(span) => Command::WantedSpan { ids: unknown, span },
+                                None => Command::Wanted(unknown),
+                            };
+                            let _ = adapter.send(command);
                         }
                         Response::Media { files }
                     }
@@ -6371,6 +6425,76 @@ impl Chat {
                 Err(err) => call_error(err),
             },
 
+            Request::DiscordVoiceSettings { conversation } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::DiscordVoiceSettings { conversation_id: conversation.id, reply }) {
+                    Ok(settings) => Response::DiscordVoiceSettings { settings },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::EditDiscordVoiceChannel { conversation, edit } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::EditDiscordVoiceChannel { conversation_id: conversation.id, edit, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SetDiscordCallRegion { conversation, region } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::SetDiscordCallRegion { conversation_id: conversation.id, region, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SetVoiceChannelStatus { conversation, status } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::SetVoiceChannelStatus { conversation_id: conversation.id, status, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::CallModerate { conversation, person, server_muted, server_deafened } => {
+                let account = conversation.account();
+                if person.account() != account {
+                    return error(ErrorCode::Refused, "That participant belongs to a different account.");
+                }
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::CallModerate {
+                    conversation_id: conversation.id, person_id: person.id, server_muted, server_deafened, reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::CallMove { conversation, person, to } => {
+                let account = conversation.account();
+                if person.account() != account || to.as_ref().is_some_and(|channel| channel.account() != account) {
+                    return error(ErrorCode::Refused, "The participant and channels must belong to the same account.");
+                }
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::CallMove {
+                    conversation_id: conversation.id, person_id: person.id, to: to.map(|channel| channel.id), reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::CallStart { conversation } => self.call_start(conversation),
             Request::CallAccept => self.call_accept(),
             // A ring waiting beside a call is declined on its own. Ending the call does not
@@ -7110,6 +7234,24 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::EndOtherDiscordSessions { account } => {
+                match self.ask(&account, |reply| Command::EndOtherDiscordSessions { reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::DiscordAccountEntries { account, list } => {
+                match self.ask(&account, |reply| Command::DiscordAccountEntries { list, reply }) {
+                    Ok(entries) => Response::DiscordAccountEntries { entries },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::RemoveDiscordAccountEntry { account, target } => {
+                match self.ask(&account, |reply| Command::RemoveDiscordAccountEntry { target, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::UnreadItems { conversation, kind, limit } => {
                 let account = conversation.account();
                 let conversation_id = conversation.id;
@@ -7421,18 +7563,12 @@ fn kind_of(path: &str) -> MediaKind {
     }
 }
 
-fn megabytes(bytes: u64) -> String {
-    match bytes {
-        bytes if bytes >= 1 << 30 => format!("{} GB", bytes >> 30),
-        bytes => format!("{} MB", bytes >> 20),
-    }
-}
-
 /// The files of an unsent message, to send again from where they were.
 fn outgoing_files(message: &Message) -> Vec<protocol::OutgoingFile> {
     let ours = message.attachments.iter().filter(|attachment| attachment.file.id.starts_with("upload-"));
     ours.filter_map(|attachment| {
         Some(protocol::OutgoingFile {
+            alt: String::new(),
             path: attachment.file.path.clone()?,
             name: attachment.name.clone(),
             spoiler: attachment.spoiler,
@@ -7796,6 +7932,7 @@ pub fn prove_offline_queue() -> Result<(), String> {
         "pic",
         Outgoing {
             files: vec![protocol::OutgoingFile {
+                alt: String::new(),
                 path: "pic.png".into(),
                 name: "pic.png".into(),
                 spoiler: false,

@@ -44,6 +44,11 @@ fn account() -> AccountKey {
     AccountKey { network: Network::Telegram, account: "7001".into() }
 }
 
+/// `CHATD_TEST_BIN` names a copy of the binary, for a target directory other builds also write to.
+fn chatd_bin() -> String {
+    std::env::var("CHATD_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_chatd").to_owned())
+}
+
 struct World {
     child: Child,
     dir: PathBuf,
@@ -113,7 +118,7 @@ impl World {
         std::fs::create_dir_all(&dir).unwrap();
         seed(&mut chatd::store::Store::open(&dir.join("chat.sqlite")).unwrap());
         let log = std::fs::File::create(dir.join("stderr.log")).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_chatd"));
+        let mut command = Command::new(chatd_bin());
         command
             .env("TINYCLIENT_DIR", &dir)
             .env("TINYCLIENT_TELEGRAM_FAKE", qr_seconds)
@@ -146,7 +151,7 @@ impl World {
         let _ = self.child.wait();
         let _ = std::fs::remove_file(self.dir.join("chat.sock"));
         let log = std::fs::File::create(self.dir.join("stderr.log")).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_chatd"))
+        let child = Command::new(chatd_bin())
             .env("TINYCLIENT_DIR", &self.dir)
             .env("TINYCLIENT_TELEGRAM_FAKE", "30")
             .env("TINYCLIENT_TELEGRAM_T0", t0().to_string())
@@ -1365,6 +1370,40 @@ fn a_channel_posts_views_ride_the_post_from_one_ask_for_the_page() {
 }
 
 #[test]
+fn a_channel_post_shows_its_signature_and_shares_and_is_counted_as_viewed_once_read() {
+    let world = World::signed_in();
+    world.connected();
+    // The page's one ask brings the shares with the views, and counts nothing.
+    let post = world.until("the post's counts", || world.message("c9001", "5").filter(|post| post.views.is_some()));
+    assert_eq!((post.views, post.shares, post.signature.as_str()), (Some(12_400), Some(31), ""));
+    assert_eq!(world.called("GetMessagesViews c9001 5 increment"), 0);
+    world.until("the channel to finish opening", || (world.called("GetSponsoredMessages c9001") >= 1).then_some(()));
+
+    // The author signs the post: the signature rides the message, and the counts stay.
+    world.steer("signed");
+    let signed = world.until("the signature", || world.message("c9001", "5").filter(|post| !post.signature.is_empty()));
+    assert_eq!((signed.signature.as_str(), signed.views, signed.shares), ("Mira K.", Some(12_400), Some(31)));
+
+    // Read on screen: Telegram is told to count the view, once, and its new count is written.
+    world.ask(Request::MarkRead { conversation: key("c9001"), message_id: "5".into() });
+    world.until("the view to be counted", || world.message("c9001", "5").filter(|post| post.views == Some(12_401)));
+    // Read again, then a private chat read after it: the adapter takes its commands in order,
+    // so once the chat's read is told the second read of the post has been handled too.
+    world.ask(Request::MarkRead { conversation: key("c9001"), message_id: "5".into() });
+    world.arrived("u7002", "12");
+    world.ask(Request::MarkRead { conversation: key("u7002"), message_id: "12".into() });
+    world.until("the chat's read to be told", || (world.called("ReadHistory u7002") >= 1).then_some(()));
+    assert_eq!(world.called("GetMessagesViews c9001 5 increment"), 1, "{:#?}", world.calls());
+    // A private chat's read counts no view.
+    assert_eq!(world.called("GetMessagesViews u7002"), 0);
+
+    // Telegram tells the post's new counts while the channel is open.
+    world.steer("post-counts");
+    let live = world.until("the live counts", || world.message("c9001", "5").filter(|post| post.shares == Some(40)));
+    assert_eq!((live.views, live.signature.as_str()), (Some(13_000), "Mira K."));
+}
+
+#[test]
 fn a_posts_unread_comments_ride_its_footer_until_they_are_read() {
     let world = World::signed_in();
     world.connected();
@@ -2473,7 +2512,7 @@ fn pickers_and_sending_with_files_options_and_picks() {
         std::fs::write(&path, vec![7u8; bytes]).unwrap();
         path.to_string_lossy().into_owned()
     };
-    let one = |path: String, spoiler: bool, as_file: bool| protocol::OutgoingFile { path, name: String::new(), spoiler, as_file, original: false, view_once: false, media: None };
+    let one = |path: String, spoiler: bool, as_file: bool| protocol::OutgoingFile { alt: String::new(), path, name: String::new(), spoiler, as_file, original: false, view_once: false, media: None };
     let photo = file("ridge.jpg", 700 * 1024);
     let sent = send("8105", "the ridge", protocol::Outgoing { files: vec![one(photo.clone(), true, false)], ..Default::default() });
     assert_eq!(sent.state, SendState::Sent, "{:?}", world.calls());
@@ -2678,7 +2717,7 @@ fn a_recorded_voice_message_is_sent_as_a_telegram_voice_note() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("voice-1234.opus");
     std::fs::write(&path, vec![7u8; 2048]).unwrap();
-    let one = protocol::OutgoingFile { path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: false, as_file: false, original: false, view_once: false, media: None };
+    let one = protocol::OutgoingFile { alt: String::new(), path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: false, as_file: false, original: false, view_once: false, media: None };
     // Bars at the widest and shut: both are exact through Telegram's five bits a bar.
     let voice = protocol::VoiceNote { duration: 7_500, waveform: vec![255, 0, 255, 0, 255, 0, 255, 0] };
     let sent = send("8201", "", protocol::Outgoing { files: vec![one], voice: Some(voice), ..Default::default() });
@@ -4741,6 +4780,427 @@ fn forum_topics_crud_search_icons_and_paging_past_fifty() {
 }
 
 #[test]
+fn a_chat_is_pinned_unpinned_archived_and_unarchived_on_telegram() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.pin_chats > 0 && can.archive, "the row menu offers both only where the account has them");
+    let file = |id: &str, pinned: Option<bool>, archived: Option<bool>| {
+        world.ask(Request::File { conversation: key(id), pinned, archived, folder_add: None, folder_remove: None })
+    };
+    let main = || world.home(None, Shelf::Main).into_iter().map(|row| row.key.id).collect::<Vec<_>>();
+    world.until("the group in the main list", || main().contains(&"g8001".to_owned()).then_some(()));
+    assert_eq!(world.conversation("g8001").unwrap().pin, None);
+
+    // Pinned: one request, and the row goes above the pin that was there, at once.
+    assert_eq!(file("g8001", Some(true), None), Response::Ok);
+    assert_eq!(world.called("ToggleDialogPin g8001 true"), 1, "{:?}", world.calls());
+    world.until("the group pinned first", || (world.conversation("g8001")?.pin == Some(0)).then_some(()));
+    assert_eq!(world.conversation("u7002").unwrap().pin, Some(1));
+    assert_eq!(main()[..2], ["g8001", "u7002"]);
+
+    // Unpinned: Odalys is the first pin again.
+    assert_eq!(file("g8001", Some(false), None), Response::Ok);
+    assert_eq!(world.called("ToggleDialogPin g8001 false"), 1);
+    world.until("the group unpinned", || world.conversation("g8001")?.pin.is_none().then_some(()));
+    assert_eq!(world.conversation("u7002").unwrap().pin, Some(0));
+
+    // Archived: folder 1, and it leaves the main list for the archive's shelf.
+    assert_eq!(file("g8001", None, Some(true)), Response::Ok);
+    assert_eq!(world.called("EditPeerFolders g8001 1"), 1);
+    world.until("the group archived", || world.conversation("g8001")?.archived.then_some(()));
+    assert!(!main().contains(&"g8001".to_owned()));
+    assert!(world.home(None, Shelf::Archive).iter().any(|row| row.key.id == "g8001"));
+
+    // Unarchived: folder 0, back in the main list.
+    assert_eq!(file("g8001", None, Some(false)), Response::Ok);
+    assert_eq!(world.called("EditPeerFolders g8001 0"), 1);
+    world.until("the group back in the main list", || main().contains(&"g8001".to_owned()).then_some(()));
+
+    // Telegram's pin limit is said in words, and the row stays unpinned.
+    world.steer("pins-full");
+    match file("g8001", Some(true), None) {
+        Response::Error { detail, .. } => assert_eq!(detail, "You've pinned as many chats as Telegram allows. Unpin one first."),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(world.conversation("g8001").unwrap().pin, None);
+}
+
+#[test]
+fn message_effects_are_listed_sent_and_shown_by_their_emoji() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.effects, "the composer offers effects only where the account has them");
+    world.arrived("u7002", "12");
+
+    // The effects Telegram offers: the Premium one is locked for this account.
+    let effects = || match world.ask(Request::MessageEffects { account: account() }) {
+        Response::Catalog { items, .. } => items.into_iter().map(|item| (item.id, item.name, item.locked)).collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    let party = "5046509860389126442".to_owned();
+    assert_eq!(effects(), [(party.clone(), "\u{1F389}".to_owned(), false), ("5104841245755180586".to_owned(), "\u{1F525}".to_owned(), true)]);
+
+    // Sent with the effect: the request names it, and the message that comes back shows its emoji.
+    let asked = Request::Send {
+        conversation: key("u7002"),
+        client_id: "fx-1".into(),
+        text: "Congratulations".into(),
+        reply_to: None,
+        with: protocol::Outgoing { effect: Some(party.clone()), ..protocol::Outgoing::default() },
+    };
+    assert!(matches!(world.ask(asked), Response::Sent { .. }));
+    world.until("the send to name the effect", || (world.called(&format!("SendMessage u7002 Congratulations [effect={party}]")) == 1).then_some(()));
+    let sent = world.until("the sent message", || world.messages("u7002").into_iter().find(|message| message.text == "Congratulations" && message.state == SendState::Sent));
+    assert_eq!(sent.effect.as_deref(), Some("\u{1F389}"));
+
+    // One that arrives with an effect is shown the same way, and one without has none.
+    world.steer("effect");
+    assert_eq!(world.arrived("u7002", "71").effect.as_deref(), Some("\u{1F389}"));
+    assert_eq!(world.message("u7002", "12").unwrap().effect, None);
+
+    // Telegram was asked for its effects once on this connection, however often they were used.
+    assert_eq!(effects().len(), 2);
+    world.steer("effects-asked");
+    assert_eq!(world.called("effects asked 1"), 1, "{:?}", world.calls());
+
+    // Telegram plays effects in private chats only, and says so in words.
+    world.arrived("g8001", "20");
+    let refused = Request::Send {
+        conversation: key("g8001"),
+        client_id: "fx-2".into(),
+        text: "Party".into(),
+        reply_to: None,
+        with: protocol::Outgoing { effect: Some(party), ..protocol::Outgoing::default() },
+    };
+    world.ask(refused);
+    let failed = world.until("the refusal on the message", || {
+        world.messages("g8001").into_iter().find(|message| message.text == "Party" && matches!(message.state, SendState::Failed { .. }))
+    });
+    assert!(matches!(&failed.state, SendState::Failed { reason } if reason.contains("private chats only")), "{:?}", failed.state);
+}
+
+#[test]
+fn a_call_discard_with_need_rating_prompts_and_sends_set_call_rating() {
+    let world = World::signed_in();
+    world.connected();
+    world.arrived("u7002", "12");
+
+    // A discard with need_rating=false does not prompt.
+    let since = world.status().1;
+    world.steer("call-discard-no-rate");
+
+    // A discard with need_rating=true and need_debug=true prompts for a rating (never sends SaveCallDebug)
+    // and stores the finished call row with its call_id so the user can also rate from the row.
+    world.steer("call-rate");
+    let mut cursor = since;
+    let prompt = world.until("Change::CallRating prompt", || {
+        match world.ask(Request::Wait { since: cursor }) {
+            Response::Changes { seq, changes, .. } => {
+                cursor = seq;
+                changes.into_iter().find_map(|change| match change {
+                    protocol::Change::CallRating { prompt } => Some(prompt),
+                    _ => None,
+                })
+            }
+            other => panic!("unexpected Wait response: {other:?}"),
+        }
+    });
+    assert_eq!(prompt.conversation, key("u7002"));
+    assert_eq!(prompt.call_id, "90001");
+    assert_eq!(prompt.seconds, Some(95));
+    assert!(!prompt.video);
+
+    // Wait for the call service row in Odalys's chat and confirm it carries call_id.
+    let row = world.arrived("u7002", "72");
+    assert_eq!(row.call.as_ref().and_then(|c| c.call_id.as_deref()), Some("90001"));
+    assert_eq!(row.call.as_ref().map(|c| c.outcome), Some(protocol::CallOutcome::Ended));
+
+    // Tinyclient does not upload non-tgcalls debug logs even when need_debug is true.
+    assert_eq!(world.called("SaveCallDebug"), 0, "{:?}", world.calls());
+
+    // Submitting a 3-star rating from the prompt sends phone.setCallRating with user_initiative=false
+    // and includes the selected issue hashtags plus optional comment.
+    let rated = world.ask(Request::CallRate {
+        account: account(),
+        call_id: "90001".into(),
+        rating: 3,
+        reasons: vec!["Echo".into(), "Noise".into()],
+        comment: "Audio cut out".into(),
+        user_initiative: false,
+    });
+    assert!(matches!(rated, Response::Ok), "expected Ok, got {rated:?}");
+    assert_eq!(
+        world.called("SetCallRating 90001 stars=3 user=false comment=#echo #noise\\nAudio cut out"),
+        1,
+        "{:?}",
+        world.calls()
+    );
+
+    // Rating again from the finished call row sends user_initiative=true; 5 stars omits reason tags.
+    let from_row = world.ask(Request::CallRate {
+        account: account(),
+        call_id: "90001".into(),
+        rating: 5,
+        reasons: vec!["Echo".into()],
+        comment: "Great".into(),
+        user_initiative: true,
+    });
+    assert!(matches!(from_row, Response::Ok), "expected Ok, got {from_row:?}");
+    assert_eq!(
+        world.called("SetCallRating 90001 stars=5 user=true comment=Great"),
+        1,
+        "{:?}",
+        world.calls()
+    );
+
+    // Out-of-range rating and unknown call id are refused with clear words.
+    assert!(matches!(
+        world.ask(Request::CallRate {
+            account: account(),
+            call_id: "90001".into(),
+            rating: 0,
+            reasons: Vec::new(),
+            comment: String::new(),
+            user_initiative: false,
+        }),
+        Response::Error { code: protocol::ErrorCode::Refused, detail } if detail.contains("one and five stars")
+    ));
+    assert!(matches!(
+        world.ask(Request::CallRate {
+            account: account(),
+            call_id: "55555".into(),
+            rating: 4,
+            reasons: Vec::new(),
+            comment: String::new(),
+            user_initiative: true,
+        }),
+        Response::Error { code: protocol::ErrorCode::Refused, detail } if detail.contains("this session")
+    ));
+}
+
+#[test]
+fn a_fifty_megabyte_video_streams_first_bytes_moov_and_alt_quality_without_downloading_the_whole_file() {
+    let world = World::signed_in();
+    world.connected();
+    world.watch(Watching { conversation: Some(key("u7002")), ..Watching::default() });
+    world.arrived("u7002", "12");
+
+    world.steer("video-stream");
+    let fast = world.arrived("u7002", "73");
+    let slow = world.arrived("u7002", "74");
+    let fast_att = &fast.attachments[0];
+    assert_eq!(fast_att.file.id, "d9500");
+    assert_eq!(fast_att.file.bytes, 50 * 1024 * 1024);
+    assert_eq!(fast_att.variants.len(), 1);
+    assert_eq!(fast_att.variants[0].id, "d9501");
+    assert_eq!(fast_att.variants[0].height, 480);
+    assert_eq!(slow.attachments[0].file.id, "d9502");
+
+    // Nothing has been downloaded yet for any of the 50 MB videos.
+    assert_eq!(world.called("GetFile document 9500"), 0);
+    assert_eq!(world.called("GetFile document 9501"), 0);
+    assert_eq!(world.called("GetFile document 9502"), 0);
+
+    let mut cursor = world.status().1;
+    let mut wait_progress = |wanted_id: &str, min_loaded: u64| -> (String, u64, u64, bool) {
+        world.until(&format!("MediaProgress for {wanted_id} >= {min_loaded}"), || {
+            match world.ask(Request::Wait { since: cursor }) {
+                Response::Changes { seq, changes, .. } => {
+                    cursor = seq;
+                    changes.into_iter().find_map(|change| match change {
+                        protocol::Change::MediaProgress { id, path, loaded, total, complete, .. }
+                            if id == wanted_id && loaded >= min_loaded =>
+                        {
+                            Some((path, loaded, total, complete))
+                        }
+                        _ => None,
+                    })
+                }
+                other => panic!("unexpected Wait response: {other:?}"),
+            }
+        })
+    };
+
+    // 1. Ask for the first 256 KB window of the 50 MB fast-start video: player gets its first
+    //    bytes after ONE piece (not after all 50 MB!).
+    let _ = world.ask(Request::Fetch {
+        account: account(),
+        ids: vec!["d9500".into()],
+        size: None,
+        retry: false,
+        span: Some((0, 256 * 1024)),
+    });
+    let (path, loaded, total, complete) = wait_progress("d9500", 256 * 1024);
+    assert!(!complete);
+    assert_eq!(loaded, 256 * 1024);
+    assert_eq!(total, 50 * 1024 * 1024);
+    assert_eq!(world.called("GetFile document 9500"), 1, "only the first piece should be fetched: {:?}", world.calls());
+    let head = std::fs::read(&path).expect("sparse stream file exists");
+    assert_eq!(&head[..4], b"FTYP");
+
+    // 2. Scrub to 25 MB: fetches only that 4 KB-aligned piece into the same sparse cache file.
+    let scrub_off = 25 * 1024 * 1024u64;
+    let _ = world.ask(Request::Fetch {
+        account: account(),
+        ids: vec!["d9500".into()],
+        size: None,
+        retry: false,
+        span: Some((scrub_off, scrub_off + 256 * 1024)),
+    });
+    let (path2, loaded2, _, complete2) = wait_progress("d9500", 512 * 1024);
+    assert!(!complete2);
+    assert_eq!(path2, path);
+    assert_eq!(loaded2, 512 * 1024);
+    assert_eq!(world.called("GetFile document 9500 at 26214400"), 1);
+    assert_eq!(world.called("GetFile document 9500"), 2);
+    let mut f = std::fs::File::open(&path2).unwrap();
+    use std::io::{Read, Seek, SeekFrom};
+    f.seek(SeekFrom::Start(scrub_off)).unwrap();
+    let mut mark = [0u8; 4];
+    f.read_exact(&mut mark).unwrap();
+    assert_eq!(&mark, b"SCRB");
+
+    // 3. Non-fast-start 50 MB video (`supports_streaming = false`): fetches the tail (`moov`) + head
+    //    in just 2 pieces, writing `MOOV` at the end and `FTYP` at offset 0.
+    let _ = world.ask(Request::Fetch {
+        account: account(),
+        ids: vec!["d9502".into()],
+        size: None,
+        retry: false,
+        span: Some((0, 256 * 1024)),
+    });
+    let (slow_path, slow_loaded, slow_total, slow_complete) = wait_progress("d9502", 512 * 1024);
+    assert!(!slow_complete);
+    assert_eq!(slow_loaded, 512 * 1024);
+    assert_eq!(slow_total, 50 * 1024 * 1024);
+    assert_eq!(world.called("GetFile document 9502"), 2, "only moov tail + head: {:?}", world.calls());
+    let mut sf = std::fs::File::open(&slow_path).unwrap();
+    let mut head_mark = [0u8; 4];
+    sf.read_exact(&mut head_mark).unwrap();
+    assert_eq!(&head_mark, b"FTYP");
+    sf.seek(SeekFrom::Start(slow_total - 4)).unwrap();
+    let mut tail_mark = [0u8; 4];
+    sf.read_exact(&mut tail_mark).unwrap();
+    assert_eq!(&tail_mark, b"MOOV");
+
+    // 4. Alternative quality (`alt_documents` 480p variant `d9501`) streams independently on demand.
+    let _ = world.ask(Request::Fetch {
+        account: account(),
+        ids: vec!["d9501".into()],
+        size: None,
+        retry: false,
+        span: Some((0, 256 * 1024)),
+    });
+    let (_, alt_loaded, alt_total, alt_complete) = wait_progress("d9501", 256 * 1024);
+    assert!(!alt_complete);
+    assert_eq!(alt_loaded, 256 * 1024);
+    assert_eq!(alt_total, 12 * 1024 * 1024);
+    assert_eq!(world.called("GetFile document 9501 at 0"), 1);
+}
+
+#[test]
+fn who_reacted_and_who_read_a_message_are_asked_of_telegram_only_on_demand() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.reactors && can.read_by);
+    world.arrived("g8001", "20");
+    world.arrived("u7002", "12");
+    // Nothing is asked until a list is opened.
+    assert_eq!(world.called("GetMessageReactionsList") + world.called("GetMessageReadParticipants") + world.called("GetOutboxReadDate"), 0);
+
+    // The people behind one reaction, by name.
+    let reactors = |conversation: &str, id: &str| {
+        match world.ask(Request::Reactors { conversation: key(conversation), message_id: id.into(), emoji: "\u{1F44D}".into(), burst: false, after: None, limit: 100 }) {
+            Response::Reactors { reactors, more, .. } => (reactors.into_iter().map(|reactor| (reactor.key.id, reactor.name)).collect::<Vec<_>>(), more),
+            other => panic!("{other:?}"),
+        }
+    };
+    let (who, more) = reactors("g8001", "20");
+    assert_eq!(who, [("u7002".to_owned(), "Odalys Brandt".to_owned()), ("u7003".to_owned(), "Tobin Reyes".to_owned())]);
+    assert!(!more);
+    assert_eq!(world.called("GetMessageReactionsList g8001 20 \u{1F44D} offset=None limit=100"), 1, "{:?}", world.calls());
+    // A broadcast channel only counts: nobody is listed, and Telegram is not asked.
+    world.until("the channel's page", || world.message("c9001", "5"));
+    assert_eq!(reactors("c9001", "5"), (Vec::new(), false));
+    assert_eq!(world.called("GetMessageReactionsList c9001"), 0);
+
+    // Who read a message in the group, and when the other side of a private chat read one.
+    let read_by = |conversation: &str, id: &str| world.ask(Request::ReadBy { conversation: key(conversation), message_id: id.into() });
+    let Response::ReadBy { readers } = read_by("g8001", "20") else { panic!("no readers") };
+    assert_eq!(readers.iter().map(|reader| (reader.person.id.as_str(), reader.name.as_str(), reader.at)).collect::<Vec<_>>(), [("u7002", "Odalys Brandt", t0() + 100)]);
+    assert_eq!(world.called("GetMessageReadParticipants g8001 20"), 1);
+    let Response::ReadBy { readers } = read_by("u7002", "12") else { panic!("no read time") };
+    assert_eq!((readers.len(), readers[0].at), (1, t0() + 100));
+    // Telegram's refusal is said in words: read times are shared both ways or not at all.
+    match read_by("u7003", "1") {
+        Response::Error { detail, .. } => assert!(detail.starts_with("Telegram shows read times only if you share your own."), "{detail}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn copy_link_is_filled_for_channels_and_forum_topics_and_not_for_private_chats() {
+    let world = World::signed_in();
+    world.connected();
+    // A public channel's post is addressed by the channel's name.
+    world.watch(Watching { conversation: Some(key("c9001")), ..Watching::default() });
+    world.messages("c9001");
+    assert_eq!(world.arrived("c9001", "5").permalink, "https://t.me/fieldnotes/5");
+    // A private forum's message carries its topic, and only members can open it.
+    world.watch(Watching { conversation: Some(key("c9002")), ..Watching::default() });
+    world.messages("c9002");
+    world.until("the topic row", || world.conversation("c9002_31"));
+    world.watch(Watching { conversation: Some(key("c9002_31")), ..Watching::default() });
+    assert_eq!(world.arrived("c9002_31", "41").permalink, "https://t.me/c/9002/31/41");
+    // A private chat and a basic group have no address anyone else could open.
+    assert_eq!(world.arrived("u7002", "12").permalink, "");
+    assert_eq!(world.arrived("g8001", "20").permalink, "");
+}
+
+#[test]
+fn a_message_is_pinned_unpinned_and_follows_the_pins_made_elsewhere() {
+    let world = World::signed_in();
+    world.connected();
+    // The group's history is here before anything is pinned in it.
+    assert!(!world.arrived("g8001", "20").pinned);
+    let pins = || match world.ask(Request::Pinned { conversation: key("g8001") }) {
+        Response::Pinned { messages, .. } => messages.into_iter().map(|message| message.id).collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    let pinned = |on: bool| world.until(&format!("message 20 pinned={on}"), || world.message("g8001", "20").filter(|message| message.pinned == on).map(drop));
+    let pin = |id: &str, on: bool| world.ask(Request::Pin { conversation: key("g8001"), message_id: id.into(), pinned: on, notify: false, me_only: false });
+
+    // Pinned from here: one request, silent, and the message says so.
+    assert_eq!(pin("20", true), Response::Ok);
+    assert_eq!(world.called("UpdatePinnedMessage g8001 20 unpin=false silent=true oneside=false"), 1, "{:?}", world.calls());
+    pinned(true);
+    assert_eq!(pins(), ["20"]);
+
+    // Unpinned and pinned again on another device: the stored message follows, with no request.
+    let asked = world.called("UpdatePinnedMessage");
+    world.steer("message-unpin 20");
+    pinned(false);
+    world.steer("message-pin 20");
+    pinned(true);
+    assert_eq!(world.called("UpdatePinnedMessage"), asked);
+
+    // Unpin all is one request for the whole chat.
+    assert_eq!(world.ask(Request::UnpinAll { conversation: key("g8001") }), Response::Ok);
+    assert_eq!(world.called("UnpinAllMessages g8001 topic=None"), 1);
+    pinned(false);
+    assert!(pins().is_empty());
+
+    // A refusal is said in Telegram's words, not as a dropped link.
+    match pin("999999", true) {
+        Response::Error { detail, .. } => assert_eq!(detail, "That message is no longer there."),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
 fn scheduled_messages_list_reschedule_send_now_cancel_and_when_online() {
     let world = World::signed_in();
     world.connected();
@@ -6135,6 +6595,7 @@ fn voice_messages_forbidden_disables_mic_and_refused_send_returns_plain_words() 
     let path = dir.join("voice-refused.opus");
     std::fs::write(&path, vec![7u8; 1024]).unwrap();
     let file = || protocol::OutgoingFile {
+        alt: String::new(),
         path: path.to_string_lossy().into_owned(),
         name: String::new(),
         spoiler: false,

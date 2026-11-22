@@ -177,14 +177,17 @@ impl Dirty {
             Change::Messages { .. }
             | Change::People { .. }
             | Change::Media { .. }
+            | Change::MediaProgress { .. }
             | Change::Typing { .. }
             | Change::Ephemeral { .. }
             | Change::Presence { .. }
             | Change::Members { .. }
+            | Change::Pins { .. }
             | Change::Occupants { .. }
             | Change::Searched { .. }
             | Change::SignIn { .. }
             | Change::Call { .. }
+            | Change::CallRating { .. }
             | Change::Upload { .. }
             | Change::Playback { .. }
             | Change::Recording { .. }

@@ -127,6 +127,15 @@ impl Shell {
             let words = super::super::security::badge_words(super::super::security::badge(security, call.participants.is_empty()));
             row("call-phone-more-security", "icons/lock.svg", "Call security", Some(words.to_owned()), Some(chevron())).on_click(cx.listener(|this, _, _, cx| this.call_phone_open_sheet(Sheet::Security, cx)))
         });
+        let status = self.snapshot.as_ref().and_then(|snapshot| snapshot.open.as_ref())
+            .filter(|row| row.key == call.conversation).cloned()
+            .or_else(|| self.sidebar_state.find(&self.trees, &call.conversation))
+            .filter(|channel| crate::gui::sidebar::can_set_discord_voice_status(channel, call.state == protocol::CallState::Joined))
+            .map(|channel| row("call-phone-more-status", "icons/pencil.svg", "Set channel status", None, Some(chevron()))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.call_phone_close_sheet(cx);
+                    this.open_voice_status(&channel, cx);
+                })));
         div()
             .child(sheet_title(subject.title.clone()))
             .children(people)
@@ -135,6 +144,16 @@ impl Shell {
                     .on_click(cx.listener(|this, _, _, cx| this.call_phone_open_sheet(Sheet::Devices, cx))),
             )
             .children(security)
+            .children(status)
+            .children((call.conversation.network == protocol::Network::Discord && call.state == protocol::CallState::Joined).then(|| {
+                let key = call.conversation.clone();
+                let direct = subject.kind.is_direct();
+                row("call-phone-more-region", "icons/info.svg", if direct { "Change region" } else { "Connection details" }, None, Some(chevron()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.call_phone_close_sheet(cx);
+                        this.open_discord_voice_settings(key.clone(), direct, cx);
+                    }))
+            }))
             .child(label("VOICE"))
             .child(
                 row("call-phone-more-ptt", "icons/hand.svg", "Push to talk", Some(if push { "Hold the button to talk".into() } else { "Your microphone opens when you speak".into() }), Some(switch(push)))
@@ -277,6 +296,7 @@ impl Shell {
         others.sort_by_key(|who| who.name.to_lowercase());
         people.extend(others);
         let count = people.len();
+        let channel = self.discord_voice_row(&call.conversation).map(std::rc::Rc::new);
         let rows = people.into_iter().map(|who| {
             let state = if who.sharing {
                 ("Sharing their screen", theme::accent_text())
@@ -292,6 +312,16 @@ impl Shell {
                 ("In the call", theme::text_faint())
             };
             let name = if who.me { format!("{} (you)", who.name) } else { who.name.clone() };
+            let moderate = channel.as_ref().filter(|channel| !who.me && self.discord_voice_target(channel, &who.key))
+                .and_then(|channel| {
+                    let occupant = channel.occupants.as_ref()?.people.iter().find(|occupant| occupant.person == who.key)?.clone();
+                    let channel = channel.clone();
+                    let id = gpui::SharedString::from(format!("call-phone-moderate-{}", who.key.id));
+                    Some(strip_button(id, "icons/ellipsis.svg")
+                        .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                            this.open_menu(crate::gui::layout::Menu::VoiceOccupant(channel.clone(), occupant.clone(), event.position()), cx);
+                        })))
+                });
             div()
                 .min_h(px(64.))
                 .px(px(tokens::GUTTER))
@@ -318,6 +348,7 @@ impl Shell {
                         .children(who.deafened.then(|| glyph("icons/headphone-off.svg", 18., theme::text_faint())))
                         .children(who.muted.then(|| glyph("icons/mic-off.svg", 18., theme::danger()))),
                 )
+                .children(moderate)
         });
         let place = subject.space.clone().map(|space| format!("{} · {space}", subject.title)).unwrap_or_else(|| subject.title.clone());
         div()

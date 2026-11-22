@@ -1,19 +1,31 @@
-# Installs dist\tinyclient-<Label>-windows-x86_64-setup.exe silently for the current user, checks
+# Installs dist\tinyclient-<Label>-windows-<Arch>-setup.exe silently for the current user, checks
 # that the programs run (tinyclient.exe as a windowed program that still prints --version), the Start menu entry and the Apps & features entry exist, then uninstalls
 # silently and checks that nothing is left. Then checks the portable zip. The release workflow
 # runs it after packaging/windows.ps1.
 param(
     [Parameter(Mandatory)][string]$Label,
-    [Parameter(Mandatory)][string]$Version
+    [Parameter(Mandatory)][string]$Version,
+    [ValidateSet('x86_64', 'aarch64')][string]$Arch = "x86_64"
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-$name = "tinyclient-$Label-windows-x86_64"
+$name = "tinyclient-$Label-windows-$Arch"
 $programs = "tinyclient", "chatd", "mediad", "tinyclient-login"
+$machine = if ($Arch -eq "aarch64") { 0xAA64 } else { 0x8664 }
+$runnerArch = if ($Arch -eq "aarch64") { "Arm64" } else { "X64" }
+if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne $runnerArch) {
+    throw "the $Arch smoke test requires a native $runnerArch system"
+}
 
 function Assert-Answers([string]$Dir) {
     foreach ($program in $programs) {
-        $out = (& (Join-Path $Dir "$program.exe") --version | Out-String).Trim()
+        $exe = Join-Path $Dir "$program.exe"
+        $bytes = [System.IO.File]::ReadAllBytes($exe)
+        $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+        if ([BitConverter]::ToUInt32($bytes, $pe) -ne 0x4550 -or [BitConverter]::ToUInt16($bytes, $pe + 4) -ne $machine) {
+            throw "$exe is not a native $Arch PE executable"
+        }
+        $out = (& $exe --version | Out-String).Trim()
         Write-Host "${program}: $out"
         if ($out -ne "$program $Version") { throw "expected '$program $Version', got '$out'" }
     }
@@ -65,6 +77,17 @@ if ($p.ExitCode -ne 0) { Get-Content $log; throw "setup exited $($p.ExitCode)" }
 $app = Join-Path $env:LOCALAPPDATA "Programs\tinyclient"
 Assert-Answers $app
 Assert-Windowed $app
+if ($Arch -eq "aarch64") {
+    $runtime = 'Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+    # WebView2 registers in the machine's 32-bit view or the current user's view.
+    $keys = "HKLM:\SOFTWARE\WOW6432Node\$runtime", "HKCU:\SOFTWARE\$runtime"
+    $versions = Get-ItemPropertyValue -LiteralPath $keys -Name pv -ErrorAction SilentlyContinue
+    if (-not ($versions | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' -and [version]$_ -gt [version]'0.0.0.0' })) {
+        throw "WebView2 Runtime is missing on the Arm64 smoke runner"
+    }
+    & python (Join-Path $root "packaging/ci/microphone-smoke.py") (Join-Path $app "mediad.exe")
+    if ($LASTEXITCODE) { throw "microphone smoke failed ($LASTEXITCODE)" }
+}
 $shortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\tinyclient.lnk"
 if (-not (Test-Path $shortcut)) { throw "no Start menu entry at $shortcut" }
 $target = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut).TargetPath

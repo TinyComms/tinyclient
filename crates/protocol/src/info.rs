@@ -59,6 +59,9 @@ pub const ATTACHMENTS_LIMIT: usize = 10;
 pub const CATALOG_LIMIT: usize = 200;
 /// Most pinned messages one `Pinned` answer carries.
 pub const PINNED_LIMIT: usize = 50;
+/// Most pinned messages an answer carries from a network that pages its pins (Discord keeps
+/// 250 a channel, 50 a page).
+pub const PINNED_PAGED_LIMIT: usize = 250;
 /// Most people each section of `Around` lists.
 pub const AROUND_LIMIT: usize = 100;
 /// Most channel or chat tabs listed in [`ConversationInfo::tabs`].
@@ -1248,6 +1251,15 @@ impl MentionFormat {
 /// Posting follows `Conversation::read_only` (`Conversation::can_post()`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationRights {
+    /// May set the status of a voice channel while connected to it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub set_voice_status: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub voice_mute: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub voice_deafen: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub voice_move: bool,
     /// May pin or unpin messages in this conversation.
     #[serde(default, skip_serializing_if = "is_false")]
     pub pin: bool,
@@ -1353,6 +1365,10 @@ impl ConversationRights {
     const TRANSFER_OWNER: i64 = 1 << 21;
     const ANONYMOUS: i64 = 1 << 22;
     const MANAGE_TOPICS: i64 = 1 << 23;
+    const SET_VOICE_STATUS: i64 = 1 << 24;
+    const VOICE_MUTE: i64 = 1 << 25;
+    const VOICE_DEAFEN: i64 = 1 << 26;
+    const VOICE_MOVE: i64 = 1 << 27;
 
     pub fn is_none(&self) -> bool {
         *self == ConversationRights::default()
@@ -1364,6 +1380,18 @@ impl ConversationRights {
 
     pub fn to_bits(self) -> i64 {
         let mut bits = 0i64;
+        if self.set_voice_status {
+            bits |= Self::SET_VOICE_STATUS;
+        }
+        if self.voice_mute {
+            bits |= Self::VOICE_MUTE;
+        }
+        if self.voice_deafen {
+            bits |= Self::VOICE_DEAFEN;
+        }
+        if self.voice_move {
+            bits |= Self::VOICE_MOVE;
+        }
         if self.pin {
             bits |= Self::PIN;
         }
@@ -1441,6 +1469,10 @@ impl ConversationRights {
 
     pub fn from_bits(bits: i64) -> Self {
         Self {
+            set_voice_status: bits & Self::SET_VOICE_STATUS != 0,
+            voice_mute: bits & Self::VOICE_MUTE != 0,
+            voice_deafen: bits & Self::VOICE_DEAFEN != 0,
+            voice_move: bits & Self::VOICE_MOVE != 0,
             pin: (bits & Self::PIN) != 0,
             delete_others: (bits & Self::DELETE_OTHERS) != 0,
             manage_members: (bits & Self::MANAGE_MEMBERS) != 0,
@@ -1571,11 +1603,35 @@ pub struct AdminLogEntry {
     pub summary: String,
 }
 
+/// The subscription plan Discord reports for the signed-in account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscordPlan {
+    Free,
+    Classic,
+    Nitro,
+    Basic,
+}
+
+impl DiscordPlan {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Free => "No Nitro",
+            Self::Classic => "Nitro Classic",
+            Self::Nitro => "Nitro",
+            Self::Basic => "Nitro Basic",
+        }
+    }
+}
+
 /// What an account may send and do on messages, as the session says (the plan, the workspace's
 /// settings). A control the account lacks is absent in the shell, never disabled. Nothing is
 /// allowed until the adapter reports it (`Context::capabilities`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
+    /// Absent for other networks and before Discord reports its plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discord_plan: Option<DiscordPlan>,
     /// This Tiny account can ring a member before a direct conversation exists.
     #[serde(default, skip_serializing_if = "is_false")]
     pub direct_calls: bool,
@@ -1646,6 +1702,9 @@ pub struct Capabilities {
     /// This Tiny server takes archives. Ignored unless `file_scan` is set.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_archives: bool,
+    /// The network takes a description on a picture (`OutgoingFile::alt`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub alt_text: bool,
     /// This Tiny server accepts abuse reports (`POST /v1/reports`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub abuse_reports: bool,
@@ -1852,7 +1911,7 @@ pub struct Capabilities {
     /// This account supports browsing Saved Messages grouped by source chat and reaction tags (Telegram).
     #[serde(default, skip_serializing_if = "is_false")]
     pub saved_subdialogs: bool,
-    /// This account supports listing active signed-in devices/sessions and ending another session (Telegram).
+    /// This account supports listing active signed-in devices and ending another session.
     #[serde(default, skip_serializing_if = "is_false")]
     pub active_sessions: bool,
     /// This account supports jumping to unread mentions and reactions per conversation (Telegram).
@@ -1940,7 +1999,7 @@ pub struct SavedTag {
     pub count: u32,
 }
 
-/// One active signed-in device/session on an account (`account.getAuthorizations`).
+/// One active signed-in device/session on an account.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveSession {
     /// Opaque session identifier (`"0"` for the current session on Telegram).
@@ -1957,6 +2016,27 @@ pub struct ActiveSession {
     pub last_active: i64,
     #[serde(default, skip_serializing_if = "is_false")]
     pub current: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscordAccountList {
+    AuthorizedApps,
+    Connections,
+}
+
+/// The identity of a revocable Discord authorization or connection, never its credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DiscordAccountEntryId {
+    AuthorizedApp { id: String },
+    Connection { provider: String, id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscordAccountEntry {
+    pub target: DiscordAccountEntryId,
+    pub name: String,
 }
 
 /// Which unread markers to list or clear in a conversation (`UnreadItems` / `MarkUnreadItemsRead`).
@@ -2423,6 +2503,9 @@ pub struct OutgoingFile {
     /// View-once media (Signal, Telegram): hidden until opened and cannot be kept.
     #[serde(default, skip_serializing_if = "is_false")]
     pub view_once: bool,
+    /// A description of the picture. Empty: none. chatd clips it to [`crate::ALT_LIMIT`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub alt: String,
     /// Optional video/audio metadata and poster thumbnail path staged by the shell.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<OutgoingMedia>,

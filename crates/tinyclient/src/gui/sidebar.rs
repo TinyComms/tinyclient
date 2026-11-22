@@ -18,6 +18,8 @@ mod shot;
 pub mod switcher;
 pub mod tree;
 pub mod walk;
+mod voice_settings;
+pub(super) use voice_settings::discord_voice_editor;
 
 use super::components::{
     badge_dot, badge_mention, banner, banner_action, button, empty_state, glyph, icon_button, keycap, list_row,
@@ -227,6 +229,9 @@ pub struct State {
     pub create_category: Option<CreateCategoryModal>,
     /// Discord "Edit channel" / "Rename category" modal.
     pub edit_channel: Option<EditChannelModal>,
+    voice_status: Option<VoiceStatusModal>,
+    voice_move: Option<VoiceMove>,
+    voice_settings: Option<voice_settings::Editor>,
     /// Discord bulk channel/category reorder modal.
     pub move_channels: Option<MoveChannelsModal>,
     /// Confirmation modal requiring typing the channel/category name before deleting.
@@ -238,6 +243,28 @@ pub struct CreateCategoryModal {
     pub name: Entity<crate::gui::input::TextInput>,
     pub busy: bool,
     pub error: Option<String>,
+}
+
+struct VoiceStatusModal {
+    target: Key,
+    input: Entity<crate::gui::input::TextInput>,
+    saving: bool,
+    error: Option<String>,
+}
+
+#[derive(Clone)]
+struct VoiceMove {
+    channel: Key,
+    person: Key,
+    name: String,
+}
+
+struct VoiceMovePreview(SharedString);
+
+impl gpui::Render for VoiceMovePreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().px(px(8.)).py(px(4.)).bg(theme::overlay()).rounded(px(theme::R_CONTROL)).child(self.0.clone())
+    }
 }
 
 pub struct EditChannelModal {
@@ -485,6 +512,9 @@ impl State {
             browse_channels: None,
             create_category: None,
             edit_channel: None,
+            voice_status: None,
+            voice_move: None,
+            voice_settings: None,
             move_channels: None,
             delete_channel: None,
             discover_input: None,
@@ -1924,7 +1954,11 @@ impl Shell {
                 let content = div().children(indent(*depth, 0.)).child(div().pl(px(28.)).type_small().text_color(theme::text_faint()).child(words.clone()));
                 list_row(("more", ix), height, false, false, content).cursor_default()
             }
-            Row::Occupant { occupant, depth } => {
+            Row::Occupant { channel, occupant, depth } => {
+                let phone = super::phone::active();
+                let can_moderate = self.discord_voice_target(channel, &occupant.person);
+                let (source, target) = (channel.clone(), occupant.clone());
+                let (phone_source, phone_target) = (source.clone(), target.clone());
                 let face = occupant
                     .avatar
                     .as_ref()
@@ -1943,9 +1977,21 @@ impl Shell {
                         row.child(glyph("icons/mic-off.svg", 14., theme::text_faint()))
                     })
                     .when(occupant.server_deafened, |row| row.child(glyph("icons/headphone-off.svg", 14., theme::danger())))
-                    .when(!occupant.server_deafened && occupant.deafened, |row| row.child(glyph("icons/headphone-off.svg", 14., theme::text_faint())));
+                    .when(!occupant.server_deafened && occupant.deafened, |row| row.child(glyph("icons/headphone-off.svg", 14., theme::text_faint())))
+                    .children((phone && can_moderate).then(|| icon_button(("voice-phone-moderate", ix), "icons/ellipsis.svg", false)
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.open_menu(Menu::VoiceOccupant(phone_source.clone(), phone_target.clone(), event.position()), cx);
+                        }))));
+                let drag = VoiceMove { channel: channel.key.clone(), person: occupant.person.clone(), name: occupant.name.clone() };
                 list_row(row_id("occupant", &occupant.person), height, false, false, content)
                     .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, _, cx| this.activate(ix, cx), cx))
+                    .when(can_moderate, |row| row.on_mouse_down(MouseButton::Right, cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                        this.open_menu(Menu::VoiceOccupant(source.clone(), target.clone(), event.position), cx);
+                    })))
+                    .when(can_moderate && channel.rights.voice_move && !phone, |row| row
+                        .on_drag(drag, |drag, _, _, cx| cx.new(|_| VoiceMovePreview(drag.name.clone().into()))))
             }
             Row::Group { space, id, name, collapsed, muted, rollup, depth, .. } => {
                 let lit = *collapsed && (rollup.attention > 0 || rollup.unread);
@@ -2104,19 +2150,16 @@ impl Shell {
         let show_join = voice_join || group_join;
         let hover_group = if c.kind == ConversationKind::Group { "group-call" } else { "voice" };
         let count_icon = if c.kind == ConversationKind::Group { "icons/phone.svg" } else { "icons/volume-2.svg" };
+        let voice_status = discord_voice_status(c);
         let content = div()
             // 16 a level less the gap after it (none at the top), as the tree's other rows.
             .children((depth > 0).then(|| div().flex_none().w(px(16. * f32::from(depth) - 8.))))
             .gap(px(8.))
             .child(leading)
             .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .type_ui()
-                    .font_weight(tone.weight)
-                    .text_color(title_color)
-                    .child(tree_title(c)),
+                div().min_w_0().flex().flex_col()
+                    .child(div().truncate().type_ui().font_weight(tone.weight).text_color(title_color).child(tree_title(c)))
+                    .children(voice_status.as_ref().map(|status| self.voice_status_line(&c.key, status, cx))),
             )
             .children(status.map(|emoji| div().flex_none().type_small().child(emoji)))
             .children(chat::name_mark(c).filter(|_| c.kind.is_direct()))
@@ -2127,7 +2170,16 @@ impl Shell {
             .children(live.map(|line| div().flex_none().type_micro().text_color(theme::text_faint()).child(line)))
             .children(row_badge(c))
             .when(show_join, |row| row.group(hover_group));
-        list_row(row_id("tree", &c.key), theme::row_height(theme::ROW_ONE), selected, focused, content)
+        let height = if voice_status.is_some() { theme::ROW_MID } else { theme::ROW_ONE };
+        let drop = c.clone();
+        list_row(row_id("tree", &c.key), theme::row_height(height), selected, focused, content)
+            .when(c.key.network == Network::Discord && joins_from_list(c), |row| row
+                .drag_over::<VoiceMove>(|style, _, _, _| style.bg(theme::accent_soft()))
+                .on_drop(cx.listener(move |this, dragged: &VoiceMove, _, cx| {
+                    if this.voice_move_rooms(&dragged.channel).iter().any(|room| room.key == drop.key) {
+                        this.send_voice_move(dragged, Some(drop.key.clone()), cx);
+                    }
+                })))
             .map(|row| {
                 if super::phone::active() {
                     let token = super::phone::token(&["place", picked.key.network.label(), &picked.key.account, &picked.key.id]);
@@ -5304,6 +5356,188 @@ impl Shell {
         )
     }
 
+    pub(super) fn open_voice_status(&mut self, row: &Conversation, cx: &mut Context<Self>) {
+        let input = cx.new(|cx| {
+            let mut input = crate::gui::input::TextInput::new("Channel status", cx);
+            input.set_text(&row.topic, cx);
+            input
+        });
+        self.sidebar_state.voice_status = Some(VoiceStatusModal { target: row.key.clone(), input, saving: false, error: None });
+        cx.notify();
+    }
+
+    pub(super) fn voice_status_line(&self, channel: &Key, status: &str, cx: &mut Context<Self>) -> Div {
+        let mut line = div().min_w_0().overflow_hidden().flex().items_center().type_micro().text_color(theme::text_faint());
+        for fragment in status.split_inclusive('>') {
+            let token = fragment.rfind('<').and_then(|start| protocol::discord_emoji_token(&fragment[start..]).map(|emoji| (start, emoji)));
+            if let Some((start, (name, id, _))) = token {
+                let file = protocol::MediaFile::new(format!("emoji:{id}"), protocol::MediaKind::Emoji);
+                let image = self.people_state.hub().file(&channel.account(), &file, cx).path.map(std::path::PathBuf::from);
+                line = line.child(div().truncate().whitespace_nowrap().child(fragment[..start].to_owned()));
+                line = if let Some(image) = image {
+                    line.child(gpui::img(image).flex_none().size(px(14.)))
+                } else {
+                    line.child(div().flex_none().child(format!(":{name}:")))
+                };
+            } else {
+                line = line.child(div().truncate().whitespace_nowrap().child(fragment.to_owned()));
+            }
+        }
+        line
+    }
+
+    fn save_voice_status(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.sidebar_state.voice_status.as_mut().filter(|modal| !modal.saving) else {
+            return;
+        };
+        let text = modal.input.read(cx).text().trim().to_owned();
+        if text.chars().count() > 500 {
+            modal.error = Some("Use 500 characters or fewer.".into());
+            cx.notify();
+            return;
+        }
+        modal.saving = true;
+        modal.error = None;
+        let conversation = modal.target.clone();
+        let input = modal.input.clone();
+        let request = Request::SetVoiceChannelStatus { conversation, status: (!text.is_empty()).then_some(text) };
+        cx.notify();
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                let Some(modal) = this.sidebar_state.voice_status.as_mut().filter(|modal| modal.input == input) else {
+                    return;
+                };
+                match answer {
+                    Ok(Response::Ok) => this.sidebar_state.voice_status = None,
+                    Ok(Response::Error { detail, .. }) => {
+                        modal.saving = false;
+                        modal.error = Some(detail);
+                    }
+                    _ => {
+                        modal.saving = false;
+                        modal.error = Some("Could not set the channel status.".into());
+                    }
+                }
+                cx.notify();
+            });
+        }).detach();
+    }
+
+    pub(super) fn voice_status_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let modal = self.sidebar_state.voice_status.as_ref()?;
+        Some(div().id("voice-status-backdrop").absolute().inset_0().bg(theme::scrim())
+            .flex().items_center().justify_center()
+            .child(div().id("voice-status-card").p(px(16.)).w(px(380.)).max_w_full()
+                .bg(theme::overlay()).rounded(px(theme::R_FLOAT)).flex().flex_col().gap(px(8.))
+                .child(div().type_title().child("Set channel status"))
+                .child(div().p(px(8.)).bg(theme::canvas()).child(modal.input.clone()))
+                .children(modal.error.iter().map(|error| div().type_small().text_color(theme::danger()).child(error.clone())))
+                .child(div().flex().justify_end().gap(px(8.))
+                    .child(button("voice-status-cancel", ButtonKind::Ghost, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_state.voice_status = None;
+                        cx.notify();
+                    })))
+                    .child(button("voice-status-save", ButtonKind::Primary, if modal.saving { "Saving…" } else { "Save" })
+                        .when(!modal.saving, |button| button.on_click(cx.listener(|this, _, _, cx| this.save_voice_status(cx))))))))
+    }
+
+    pub(super) fn discord_voice_row(&self, key: &Key) -> Option<Conversation> {
+        self.snapshot.as_ref().and_then(|snapshot| snapshot.open.as_ref()).filter(|row| row.key == *key)
+            .cloned().or_else(|| self.sidebar_state.find(&self.trees, key))
+    }
+
+    pub(super) fn discord_voice_target(&self, channel: &Conversation, person: &Key) -> bool {
+        discord_voice_moderation(channel)
+            && !self.snapshot.as_ref().into_iter().flat_map(|snapshot| &snapshot.accounts)
+                .any(|account| account.key == person.account() && account.me == person.id)
+    }
+
+    fn voice_move_rooms(&self, channel: &Key) -> Vec<Rc<Conversation>> {
+        let Some(source) = self.discord_voice_row(channel).filter(|row| row.rights.voice_move) else {
+            return Vec::new();
+        };
+        let Some(space) = source.space else {
+            return Vec::new();
+        };
+        let space = Key { id: space, ..channel.clone() };
+        self.trees.get(&space).into_iter().flat_map(|tree| &tree.conversations)
+            .filter(|room| room.key != *channel && joins_from_list(room)).cloned().collect()
+    }
+
+    fn send_voice_move(&mut self, target: &VoiceMove, to: Option<Key>, cx: &mut Context<Self>) {
+        self.call_ask(Request::CallMove { conversation: target.channel.clone(), person: target.person.clone(), to }, cx);
+    }
+
+    pub(super) fn discord_voice_actions(
+        &self, row: &Conversation, person: &Key, muted: bool, deafened: bool, cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        use super::components::menu_item;
+        if !self.discord_voice_target(row, person) {
+            return Vec::new();
+        }
+        let mut items = Vec::new();
+        for (id, allowed, words, mute, deaf) in [
+            ("discord-server-mute", row.rights.voice_mute, super::tiny::model::server_mute_words(muted), Some(!muted), None),
+            ("discord-server-deafen", row.rights.voice_deafen, super::tiny::model::server_deafen_words(deafened), None, Some(!deafened)),
+        ] {
+            if allowed {
+                let req = Request::CallModerate {
+                    conversation: row.key.clone(), person: person.clone(), server_muted: mute, server_deafened: deaf,
+                };
+                items.push(menu_item(id, Some(words.icon), words.label, None).on_click(cx.listener(move |this, _, _, cx| {
+                    this.close_menu(cx);
+                    this.call_menu_close(cx);
+                    this.call_ask(req.clone(), cx);
+                })).into_any_element());
+            }
+        }
+        if row.rights.voice_move {
+            let name = row.occupants.as_ref().and_then(|inside| inside.people.iter().find(|who| who.person == *person))
+                .map(|who| who.name.clone()).unwrap_or_default();
+            let target = VoiceMove { channel: row.key.clone(), person: person.clone(), name };
+            if !self.voice_move_rooms(&row.key).is_empty() {
+                let moving = target.clone();
+                items.push(menu_item("discord-move-person", Some("icons/arrow-right.svg"), "Move to…", None)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_menu(cx);
+                        this.call_menu_close(cx);
+                        this.sidebar_state.voice_move = Some(moving.clone());
+                        cx.notify();
+                    })).into_any_element());
+            }
+            items.push(menu_item("discord-disconnect-person", Some("icons/phone-off.svg"), "Disconnect from call", None)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.close_menu(cx);
+                    this.call_menu_close(cx);
+                    this.send_voice_move(&target, None, cx);
+                })).into_any_element());
+        }
+        items
+    }
+
+    pub(super) fn voice_move_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let target = self.sidebar_state.voice_move.clone()?;
+        let rooms = self.voice_move_rooms(&target.channel);
+        let choices = rooms.into_iter().enumerate().map(|(ix, room)| {
+            let target = target.clone();
+            let key = room.key.clone();
+            super::components::menu_item(("move-discord-voice", ix), Some("icons/volume-2.svg"), room.title.clone(), None)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.sidebar_state.voice_move = None;
+                    this.send_voice_move(&target, Some(key.clone()), cx);
+                }))
+        }).collect::<Vec<_>>();
+        Some(div().id("voice-move-backdrop").absolute().inset_0().bg(theme::scrim()).flex().items_center().justify_center()
+            .child(div().p(px(16.)).w(px(380.)).max_w_full().bg(theme::overlay()).rounded(px(theme::R_FLOAT))
+                .child(div().type_title().child(if target.name.is_empty() { "Move to channel".to_owned() } else { format!("Move {}", target.name) }))
+                .child(div().id("voice-move-rooms").max_h(px(280.)).overflow_y_scroll().children(choices))
+                .child(button("voice-move-cancel", ButtonKind::Ghost, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                    this.sidebar_state.voice_move = None;
+                    cx.notify();
+                })))))
+    }
+
     pub(super) fn open_edit_channel(&mut self, conversation: &Conversation, cx: &mut Context<Self>) {
         let space = match &conversation.space {
             Some(id) => Key { id: id.clone(), ..conversation.key.clone() },
@@ -6337,9 +6571,24 @@ fn voice_count(total: u32, limit: u32) -> Option<(String, bool)> {
 
 /// A stage channel's trailing words: only who is on stage counts, the audience does not.
 /// Nobody on stage reads as an empty channel, so nothing (`02` §4).
+pub(super) fn discord_voice_status(row: &Conversation) -> Option<String> {
+    (row.key.network == Network::Discord && row.kind == ConversationKind::Voice && !row.topic.is_empty())
+        .then(|| row.topic.clone())
+}
+
+pub(super) fn can_set_discord_voice_status(row: &Conversation, joined: bool) -> bool {
+    row.key.network == Network::Discord && row.kind == ConversationKind::Voice
+        && row.rights.set_voice_status && (joined || row.rights.rename)
+}
+
 fn stage_line(occupants: &Occupants) -> Option<String> {
     let speaking = occupants.people.iter().filter(|occupant| occupant.speaking).count();
     (speaking > 0).then(|| format!("Live · {speaking} speaking"))
+}
+
+fn discord_voice_moderation(row: &Conversation) -> bool {
+    row.key.network == Network::Discord && row.kind == ConversationKind::Voice && row.space.is_some()
+        && (row.rights.voice_mute || row.rights.voice_deafen || row.rights.voice_move)
 }
 
 /// Whether a voice row draws its title faint: an empty voice channel, or a stage with
@@ -6656,6 +6905,35 @@ pub(crate) mod tests {
         respliced(&list, &old, &old, |item| Some((*item).to_owned()), |_| 48.);
         let top = list.logical_scroll_top();
         assert_eq!((top.item_ix, top.offset_in_item, list.item_count()), (2, px(4.), 3));
+    }
+
+    #[test]
+    fn discord_voice_moderation_needs_a_server_voice_row_and_a_moderation_right() {
+        let mut voice = row("lounge", ConversationKind::Voice);
+        voice.space = Some("server".to_owned());
+        assert!(!discord_voice_moderation(&voice));
+        voice.rights.voice_deafen = true;
+        assert!(discord_voice_moderation(&voice));
+        voice.space = None;
+        assert!(!discord_voice_moderation(&voice));
+        voice.kind = ConversationKind::Group;
+        assert!(!discord_voice_moderation(&voice));
+    }
+
+    #[test]
+    fn voice_status_actions_require_the_channel_bit_and_either_joining_or_management() {
+        let mut voice = row("lounge", ConversationKind::Voice);
+        voice.topic = "Studying".to_owned();
+        assert_eq!(discord_voice_status(&voice).as_deref(), Some("Studying"));
+        assert!(!can_set_discord_voice_status(&voice, true));
+        voice.rights.set_voice_status = true;
+        assert!(can_set_discord_voice_status(&voice, true));
+        assert!(!can_set_discord_voice_status(&voice, false));
+        voice.rights.rename = true;
+        assert!(can_set_discord_voice_status(&voice, false));
+        voice.kind = ConversationKind::Direct;
+        assert!(discord_voice_status(&voice).is_none());
+        assert!(!can_set_discord_voice_status(&voice, true));
     }
 
     #[test]

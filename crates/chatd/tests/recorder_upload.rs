@@ -78,6 +78,7 @@ fn a_recorded_opus_note_can_be_uploaded_and_private_cache_files_stay_blocked() {
     assert!(hub.player.shown().is_none(), "removing the note stops its preview");
     assert!(hub.player.request(&hub, &media, play(&path, key.clone())).is_err());
     let file = OutgoingFile {
+        alt: String::new(),
         path: path.to_string_lossy().into_owned(),
         name: path.file_name().unwrap().to_string_lossy().into_owned(),
         spoiler: false, as_file: false, original: false, view_once: false, media: None,

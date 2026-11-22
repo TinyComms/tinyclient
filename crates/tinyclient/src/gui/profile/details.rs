@@ -295,6 +295,17 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
         .children((!facts::conversation_line(row, info).is_empty()).then(|| {
             div().type_ui().text_color(theme::text_soft()).line_clamp(2).child(facts::conversation_line(row, info))
         }));
+    if online && crate::gui::sidebar::discord_voice_editor(row) {
+        let target = row.key.clone();
+        top = top.child(
+            div().mt(px(12.)).flex().justify_between().items_center()
+                .child(div().type_small().text_color(theme::text_soft()).child("Voice"))
+                .child(button_with_icon("details-discord-voice", ButtonKind::Secondary, "icons/settings.svg", "Voice settings")
+                    .on_click(cx.listener(move |pane, _, _, cx| {
+                        pane.shell_do(cx, |shell, cx| shell.open_discord_voice_settings(target.clone(), false, cx));
+                    }))),
+        );
+    }
     if let Some(call) = call {
         top = top.child(div().mt(px(16.)).flex().items_center().gap(px(8.)).child(call).children(more));
     }
