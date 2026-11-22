@@ -1013,7 +1013,6 @@ impl Teams {
             mention_spans: true,
             importance: true,
             channel_subject: true,
-            activity_feed: true,
             read_by: true,
             ..protocol::Capabilities::default()
         });
