@@ -825,6 +825,7 @@ impl Chat {
         };
         let typists = watching.conversation.as_ref().map_or_else(Vec::new, |open| self.hub.typists(open));
         // Focus alone is chatd's own business (notifications): the networks are not told again.
+        // `active` (focus + recent input) IS compared so Teams can send `user.activity` heartbeats.
         let mut before = (*self.hub.watching()).clone();
         before.focused = watching.focused;
         let for_networks = before != watching;
@@ -1896,15 +1897,18 @@ impl Chat {
     /// One person's card: asked of the network once, kept five minutes. Opened from a Space,
     /// the adapter is asked for what is said of them there, and failing that for the card alone.
     fn profile(&self, person: Key, space: Option<Key>) -> Response {
+        // Someone not in a chat yet is still asked about: Teams learns them from the short
+        // profile while it answers, including a guest whose Graph user call is refused.
         let known = match self.hub.store().person(&person) {
-            Ok(Some(known)) => known,
-            Ok(None) => return error(ErrorCode::NotFound, "no such person"),
+            Ok(known) => known,
             Err(err) => return internal(err),
         };
         let cached = (person.clone(), space.clone());
-        if let Some(mut profile) = self.hub.profiles.get(&cached) {
-            profile.person = self.with_presence(vec![known]).remove(0);
-            return Response::Profile { profile: Box::new(profile) };
+        if let Some(known) = known.clone() {
+            if let Some(mut profile) = self.hub.profiles.get(&cached) {
+                profile.person = self.with_presence(vec![known]).remove(0);
+                return Response::Profile { profile: Box::new(profile) };
+            }
         }
         let account = person.account();
         let space_id = space.filter(|space| space.account() == account).map(|space| space.id);
@@ -1925,6 +1929,14 @@ impl Chat {
         let about = match asked {
             Ok(about) => about,
             Err(refused) => return *refused,
+        };
+        let known = match known {
+            Some(known) => known,
+            None => match self.hub.store().person(&person) {
+                Ok(Some(known)) => known,
+                Ok(None) => return error(ErrorCode::NotFound, "no such person"),
+                Err(err) => return internal(err),
+            },
         };
         let profile = typed_profile(self.with_presence(vec![known]).remove(0), about);
         self.hub.profiles.keep(cached, profile.clone());
@@ -1993,13 +2005,38 @@ impl Chat {
             nickname: about.nickname,
             roles: about.roles,
             notify: about.notify,
+            tags: about.tags,
         };
         clip(&mut info.description, 4_000);
         clip(&mut info.nickname, 100);
         info.roles.truncate(protocol::PROFILE_ROLES);
         info.roles.iter_mut().for_each(|role| clip(role, 100));
+        info.tags.truncate(200);
+        for tag in &mut info.tags {
+            clip(&mut tag.name, 100);
+            clip(&mut tag.description, 256);
+        }
         self.hub.space_infos.keep(space, info.clone());
         Response::SpaceInfo { info: Box::new(info) }
+    }
+
+    fn space_tags(&self, space: Key) -> Response {
+        let account = space.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let space_id = space.id.clone();
+        match self.ask(&account, |reply| Command::SpaceTags { space_id, reply }) {
+            Ok(mut tags) => {
+                tags.truncate(200);
+                for tag in &mut tags {
+                    clip(&mut tag.name, 100);
+                    clip(&mut tag.description, 256);
+                }
+                Response::SpaceTags { space, tags }
+            }
+            Err(refused) => *refused,
+        }
     }
 
     /// Something the user did to a conversation on the network: mute, leave, close. The answer
@@ -2294,6 +2331,29 @@ impl Chat {
         }
         match self.ask(&account, |reply| Command::SetPrivacy { key, policy, reply }) {
             Ok(policy) => Response::Privacy { key, policy },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn get_out_of_office(&self, account: AccountKey) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::GetOutOfOffice { reply }) {
+            Ok(ooo) => Response::OutOfOffice { ooo },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn set_out_of_office(&self, account: AccountKey, ooo: protocol::OutOfOffice) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::SetOutOfOffice { ooo, reply }) {
+            Ok(ooo) => {
+                self.forget_own_profile(&account, None);
+                Response::OutOfOffice { ooo }
+            }
             Err(refused) => *refused,
         }
     }
@@ -3282,6 +3342,9 @@ impl Chat {
             Request::DeleteCallEntries { account, message_ids, revoke } => self.delete_call_entries(account, message_ids, revoke),
             Request::GetPrivacy { account, key } => self.get_privacy(account, key),
             Request::SetPrivacy { account, key, policy } => self.set_privacy(account, key, policy),
+            Request::GetOutOfOffice { account } => self.get_out_of_office(account),
+            Request::SetOutOfOffice { account, ooo } => self.set_out_of_office(account, ooo),
+            Request::SpaceTags { space } => self.space_tags(space),
             Request::Relate { person, action } => self.relate(person, action),
             Request::AddFriend { account, username } => self.add_friend(account, username),
             Request::Moderate { space, person, action, reason } => {
@@ -4237,8 +4300,17 @@ fn typed_profile(person: Person, mut about: About) -> Profile {
         clip(label, 40);
         clip(value, 200);
     }
-    for text in [&mut about.nickname, &mut about.pronouns, &mut about.title, &mut about.department, &mut about.away] {
+    for text in [&mut about.nickname, &mut about.pronouns, &mut about.title, &mut about.department, &mut about.office, &mut about.away] {
         clip(text, 200);
+    }
+    if let Some(manager) = &mut about.manager {
+        clip(&mut manager.name, 100);
+        clip(&mut manager.title, 120);
+    }
+    about.reports.truncate(10);
+    for report in &mut about.reports {
+        clip(&mut report.name, 100);
+        clip(&mut report.title, 120);
     }
     clip(&mut about.bio, 1_000);
     clip(&mut about.note, 1_000);
@@ -4268,6 +4340,9 @@ fn typed_profile(person: Person, mut about: About) -> Profile {
     profile.pronouns = about.pronouns;
     profile.title = about.title;
     profile.department = about.department;
+    profile.office = about.office;
+    profile.manager = about.manager;
+    profile.reports = about.reports;
     profile.roles = about.roles;
     profile.contacts = about.contacts;
     profile.mutual_total = about.mutual_total;

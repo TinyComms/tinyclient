@@ -701,6 +701,64 @@ pub fn space(pane: &InfoPane, key: &Key, cx: &mut Context<InfoPane>) -> Div {
             let small = Avatar::new(key, &name, 16.).shape(Plate::Place).image(icon.as_ref()).build();
             sections = sections.child(draw::role(&role, Some(small), None));
         }
+        if !info.tags.is_empty() {
+            sections = sections.child(draw::label("Tags", !any));
+            any = true;
+            let mut list = div().flex().flex_col().gap(px(6.));
+            for (tix, tag) in info.tags.iter().enumerate() {
+                let sub = if tag.description.is_empty() {
+                    format!("{} members", tag.member_count)
+                } else {
+                    format!("{} members · {}", tag.member_count, tag.description)
+                };
+                let people: Vec<Key> = tag.members.iter().map(|m| m.key.clone()).collect();
+                let chat_btn = (!people.is_empty()).then(|| {
+                    let account = key.account();
+                    let title = tag.name.clone();
+                    let shell = pane.shell_weak();
+                    button(("space-tag-chat", tix), ButtonKind::Secondary, "Chat").h(px(24.)).on_click(move |_, _, cx| {
+                        let req = Request::StartGroup {
+                            account: account.clone(),
+                            people: people.clone(),
+                            title: Some(title.clone()),
+                        };
+                        let shell = shell.clone();
+                        crate::gui::people::ask_later(cx, req, move |answer, cx| {
+                            if let Ok(protocol::Response::Conversation { conversation }) = answer {
+                                let _ = shell.update(cx, |shell, cx| shell.select(conversation.key, &conversation.title, cx));
+                            }
+                        });
+                    })
+                });
+                list = list.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .child(div().type_ui().text_color(theme::text()).truncate().child(format!("@{}", tag.name)))
+                                .child(div().type_small().text_color(theme::text_soft()).truncate().child(sub)),
+                        )
+                        .children(chat_btn),
+                );
+            }
+            if key.network == Network::Teams {
+                list = list.child(
+                    div().pt(px(4.)).child(
+                        button("space-manage-tags", ButtonKind::Ghost, "Manage tags in Teams ↗")
+                            .h(px(24.))
+                            .on_click(|_, _, cx| crate::gui::conversation::links::open_external_link("https://teams.microsoft.com/", cx)),
+                    ),
+                );
+            }
+            sections = sections.child(list);
+        }
     }
     if any {
         body = body.child(draw::rule().mt(px(16.))).child(sections.pt(px(4.)));

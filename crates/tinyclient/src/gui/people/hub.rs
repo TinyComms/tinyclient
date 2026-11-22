@@ -51,6 +51,9 @@ pub enum Due {
     Nothing,
 }
 
+/// After this long without keyboard/composer input while focused, active presence drops to idle.
+const IDLE_AFTER: Duration = Duration::from_secs(5 * 60);
+
 /// Who and what is on screen, per view, and what chatd was last told.
 #[derive(Default)]
 pub struct WatchSet {
@@ -62,6 +65,9 @@ pub struct WatchSet {
     space: Option<Key>,
     /// The window is the one being typed in.
     focused: bool,
+    /// True while focused and the user interacted within [`IDLE_AFTER`].
+    active: bool,
+    last_input: Option<Instant>,
     sent: Option<Watching>,
     /// When the unsent changes began and when the last one came.
     changing: Option<(Instant, Instant)>,
@@ -104,12 +110,47 @@ impl WatchSet {
 
     /// Whether the window has focus: what arrives in the open conversation then is read.
     pub fn focused(&mut self, focused: bool, now: Instant) -> bool {
-        if self.focused == focused {
+        let next_active = focused;
+        if focused {
+            self.last_input = Some(now);
+        }
+        if self.focused == focused && self.active == next_active {
             return false;
         }
         self.focused = focused;
+        self.active = next_active;
         self.touched(now);
         true
+    }
+
+    /// Records fresh user input while the window is focused so active presence stays on.
+    pub fn touch_input(&mut self, now: Instant) -> bool {
+        self.last_input = Some(now);
+        if self.focused && !self.active {
+            self.active = true;
+            self.touched(now);
+            return true;
+        }
+        false
+    }
+
+    /// Drops `active` to `false` once the window has been focused without input for [`IDLE_AFTER`].
+    pub fn check_idle(&mut self, now: Instant) -> bool {
+        if self.active && self.last_input.is_some_and(|at| now.saturating_duration_since(at) >= IDLE_AFTER) {
+            self.active = false;
+            self.touched(now);
+            return true;
+        }
+        false
+    }
+
+    /// Time remaining before a focused active window becomes idle, or `None` if already unfocused/idle.
+    pub fn idle_remaining(&self, now: Instant) -> Option<Duration> {
+        if !self.focused || !self.active {
+            return None;
+        }
+        let elapsed = self.last_input.map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
+        Some(IDLE_AFTER.saturating_sub(elapsed))
     }
 
     pub fn conversation(&mut self, conversation: Option<Key>, now: Instant) -> bool {
@@ -157,6 +198,7 @@ impl WatchSet {
             space: self.space.clone(),
             conversation: self.conversation.clone(),
             focused: self.focused,
+            active: self.active,
             people,
             members: self.members,
             rows: {
@@ -197,6 +239,7 @@ impl WatchSet {
                     && sent.members == wanted.members
                     && sent.space == wanted.space
                     && sent.focused == wanted.focused
+                    && sent.active == wanted.active
                     && sent.rows == wanted.rows
                     && same_people(sent)
             }
@@ -260,6 +303,7 @@ type Notify = Rc<dyn Fn(&mut App)>;
 struct Inner {
     watch: WatchSet,
     watch_pending: bool,
+    idle_pending: bool,
     presence: HashMap<Key, Seen>,
     /// Counts the times anyone's presence changed, for lists that group by it.
     presence_rev: u64,
@@ -312,11 +356,57 @@ impl Hub {
         }
     }
 
-    /// Whether the window has focus, for chatd's notifications.
+    /// Whether the window has focus, for chatd's notifications and active presence.
     pub fn watch_focus(&self, focused: bool, cx: &mut App) {
         if self.0.borrow_mut().watch.focused(focused, Instant::now()) {
             self.schedule(cx);
         }
+        if focused {
+            self.ensure_idle_timer(cx);
+        }
+    }
+
+    /// Refreshes active presence when the user interacts with the focused window.
+    pub fn watch_input(&self, cx: &mut App) {
+        if self.0.borrow_mut().watch.touch_input(Instant::now()) {
+            self.schedule(cx);
+        }
+        self.ensure_idle_timer(cx);
+    }
+
+    /// Keeps at most one idle timer task running while the window is focused and active.
+    fn ensure_idle_timer(&self, cx: &mut App) {
+        {
+            let mut inner = self.0.borrow_mut();
+            if inner.idle_pending || inner.watch.idle_remaining(Instant::now()).is_none() {
+                return;
+            }
+            inner.idle_pending = true;
+        }
+        let hub = self.clone();
+        cx.spawn(async move |cx| {
+            loop {
+                let wait = {
+                    let mut inner = hub.0.borrow_mut();
+                    let now = Instant::now();
+                    if inner.watch.check_idle(now) {
+                        inner.idle_pending = false;
+                        drop(inner);
+                        let _ = cx.update(|cx| hub.schedule(cx));
+                        return;
+                    }
+                    match inner.watch.idle_remaining(now) {
+                        Some(rem) => rem + Duration::from_secs(1),
+                        None => {
+                            inner.idle_pending = false;
+                            return;
+                        }
+                    }
+                };
+                cx.background_executor().timer(wait).await;
+            }
+        })
+        .detach();
     }
 
     /// The open conversation, for its typing and member list.

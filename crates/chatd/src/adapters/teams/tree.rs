@@ -559,7 +559,7 @@ impl Teams {
                     other => other.clone(),
                 };
                 let kind = text(&activity, "activityType").to_ascii_lowercase();
-                if !kind.contains("mention") {
+                if !(kind.contains("mention") || kind.contains("tag")) {
                     continue;
                 }
                 let (thread, message) = (text(&activity, "sourceThreadId"), id_of(&activity["sourceMessageId"]));

@@ -109,6 +109,10 @@ pub fn telegram_relay_only(p2p_allowed: bool, always_relay: bool) -> bool {
 pub const TYPING: &str = "typing";
 /// P2, per Teams or Signal account. Off: nothing is sent that others would read as a receipt.
 pub const RECEIPTS: &str = "receipts";
+/// Per Teams account. On (default): sends `user.activity` active heartbeats while the window is
+/// focused and receiving input so colleagues do not see you as Away. Turn off to avoid suppressing
+/// Teams mobile notifications.
+pub const PRESENCE_ACTIVITY: &str = "presence_activity";
 /// P4. Days messages are kept on this Mac: 7, 30 or 90.
 pub const KEEP_DAYS: &str = "keep_days";
 /// Client-side link preview cards (e.g. Google Messages). On for known contacts by default.
@@ -284,7 +288,7 @@ fn kind(key: &str) -> Option<Kind> {
         KEEP_DAYS => Kind::Choice(&KEEP_DAYS_CHOICES, 90),
         CACHE_MB => Kind::Choice(&CACHE_MB_CHOICES, 500),
         // Per account; the default is the network's (`typing_default`).
-        TYPING | RECEIPTS => Kind::Switch(true),
+        TYPING | RECEIPTS | PRESENCE_ACTIVITY => Kind::Switch(true),
         TELEGRAM_ALWAYS_RELAY => Kind::Switch(false),
         LOG_LEVEL => Kind::Word(&LOG_LEVEL_CHOICES, "info"),
         LOG_RING | LOG_EXPORT => Kind::Switch(true),
@@ -313,6 +317,7 @@ fn scoped(key: &str, scope: &str) -> bool {
     match key {
         TYPING => account_of(scope).is_some_and(|account| typing_choice(account.network)),
         RECEIPTS => account_of(scope).is_some_and(|account| matches!(account.network, Network::Teams | Network::Signal | Network::Tiny)),
+        PRESENCE_ACTIVITY => account_of(scope).is_some_and(|account| account.network == Network::Teams),
         TELEGRAM_ALWAYS_RELAY => account_of(scope).is_some_and(|account| account.network == Network::Telegram),
         _ if gain_user(key).is_some() => account_of(scope).is_some(),
         NOTIFY_ABOUT => scope == GLOBAL || account_of(scope).is_some() || conversation_of(scope).is_some(),
@@ -616,6 +621,11 @@ impl Values {
     /// the adapter, and stays off until the phone says otherwise.
     pub fn receipts(&self, account: &AccountKey) -> bool {
         self.stored(&account_scope(account), RECEIPTS).is_none_or(|value| value == "on")
+    }
+
+    /// Whether a Teams account sends focus+input active presence heartbeats (`user.activity`).
+    pub fn presence_activity(&self, account: &AccountKey) -> bool {
+        self.stored(&account_scope(account), PRESENCE_ACTIVITY).is_none_or(|value| value == "on")
     }
 
     /// The in-call sound and gain choices, as mediad takes them. S1 off silences every cue.

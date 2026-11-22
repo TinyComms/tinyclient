@@ -82,9 +82,9 @@
 //! Events arrive as requests to answer (`3:::`), `EventMessage` with `NewMessage` or
 //! `MessageUpdate` [C]. The chat service's own long poll is gone (purple-teams 58c649f, Apr
 //! 2025), so there is no fallback. A read marker moved elsewhere (`ConversationUpdate`) [U].
-//! Not sent: `user.activity: active`, which the other clients send. A daemon that is always
-//! on would tell Teams the user is always at the desk, and Teams holds back phone
-//! notifications for someone who is. If nothing arrives live on a real account, try it first.
+//! `user.activity` (`active` / `inactive`) is sent only while the window is focused AND receiving
+//! recent input (and the per-account `presence_activity` Privacy setting is on), heartbeat every
+//! 240 s; when unfocused, idle, or opted out it sends `inactive` so mobile notifications stay normal.
 //!
 //! Deep links: `…/l/meetup-join/{thread}/0` [C]; `msteams:/l/call/0/0?users=`, `/l/chat/…`,
 //! `/l/channel/…` and `/l/message/…` are Microsoft's documented forms, in no client read [U].
@@ -142,6 +142,7 @@ pub fn prove_team_info() -> Result<(), String> {
 mod people;
 mod push;
 mod send;
+mod tags;
 mod tree;
 
 /// The lab's teams-chain-paging driver. A build without this returns to the server and stays up.
@@ -346,6 +347,13 @@ struct State {
     notify: HashMap<String, protocol::Notify>,
     /// Pending scheduled messages: raw Teams message id -> scheduled unix seconds.
     scheduled: HashMap<String, i64>,
+    /// Active trouter registration endpoint id, removed on sign-out.
+    endpoint: Option<String>,
+    /// Adaptive Card invoke metadata for poll messages: `(conversation, message_id)` -> `PollInvoke`.
+    polls: HashMap<(String, String), card::PollInvoke>,
+    /// Team tags per Space id, and tag ids the signed-in user belongs to.
+    tags: HashMap<String, Vec<protocol::TeamTag>>,
+    my_tags: HashSet<String>,
     /// Activity feed item ids marked read locally this session.
     activity_read: HashSet<String>,
     /// Per-thread member consumption horizons (thread_id -> member_id -> arrival_ms), excluding me.
@@ -848,6 +856,8 @@ impl Teams {
             ("DELETE", _) => dressed!(self.agent.delete(url)).call(),
             ("PUT", Body::Json(body)) => dressed!(self.agent.put(url)).send_json(*body),
             ("PUT", _) => dressed!(self.agent.put(url)).send_empty(),
+            ("PATCH", Body::Json(body)) => dressed!(self.agent.patch(url)).send_json(*body),
+            ("PATCH", _) => dressed!(self.agent.patch(url)).send_empty(),
             (_, Body::Json(body)) => dressed!(self.agent.post(url)).send_json(*body),
             (_, Body::Text(text)) => dressed!(self.agent.post(url)).header("Content-Type", "application/json").send(*text),
             (_, Body::None) => dressed!(self.agent.post(url)).send_empty(),
@@ -928,19 +938,19 @@ impl Teams {
         self.ctx.describe(&self.session.name, &self.me())?;
         let mut push = self.open()?;
         self.ctx.link(Link::Connected);
-        // Pasted/attached images go inline through Teams' AMS media store (scoped to the
-        // conversation). Non-image documents stay off (`images_only: true`) until OneDrive
-        // sharing can be scoped to the conversation's members.
+        // Pasted images go inline through Teams' AMS media store, scoped to the conversation.
+        // Other files use the member-scoped upload: recipients are resolved before the
+        // session is created, and the drive item is deleted if the invite fails.
         self.ctx.capabilities(protocol::Capabilities {
-            max_file_bytes: 20 * 1024 * 1024,
-            max_files: 10,
-            images_only: true,
+            max_file_bytes: 250 * 1024 * 1024,
+            max_files: protocol::ATTACHMENTS_LIMIT as u32,
             reply: true,
             edit: true,
             delete: true,
             threads: true,
             pins: false,
             pin_chats: 15,
+            groups: 250,
             close_direct: true,
             clear_history: true,
             suppress_embeds: true,
@@ -951,6 +961,13 @@ impl Teams {
             mention_spans: true,
             importance: true,
             channel_subject: true,
+            out_of_office: true,
+            polls: Some(protocol::PollCapabilities {
+                max_options: 10,
+                max_duration_secs: 0,
+                multiple: true,
+                anonymous: true,
+            }),
             activity_feed: true,
             read_by: true,
             ..protocol::Capabilities::default()
@@ -990,6 +1007,12 @@ impl Teams {
             Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
                 let _ = reply.send(self.react(&conversation_id, &message_id, &emoji, on).map_err(refuse));
             }
+            Command::Vote { conversation_id, message_id, votes, reply } => {
+                let _ = reply.send(self.vote(&conversation_id, &message_id, votes.as_deref()).map_err(refuse));
+            }
+            Command::MessageAction { conversation_id, message_id, block_id, action_id, element_type: _, value, values: _, reply } => {
+                let _ = reply.send(self.invoke_card_action(&conversation_id, &message_id, &block_id, &action_id, &value).map_err(refuse));
+            }
             Command::ReactionRules { reply, .. } => drop(reply.send(Ok(message::reaction_rules()))),
             Command::Edit { conversation_id, message_id, text, spans, reply } => {
                 let _ = reply.send(self.edit(&conversation_id, &message_id, &text, &spans).map_err(refuse));
@@ -1013,6 +1036,9 @@ impl Teams {
             Command::StartDirect { person_id, reply } => {
                 let _ = reply.send(self.start_direct(&person_id).map_err(refuse));
             }
+            Command::StartGroup { people, title, reply } => {
+                let _ = reply.send(self.start_group(&people, title.as_deref()).map_err(refuse));
+            }
             Command::Profile { person_id, reply } => {
                 let _ = reply.send(self.profile(&person_id).map_err(refuse));
             }
@@ -1021,6 +1047,9 @@ impl Teams {
             }
             Command::SpaceInfo { space_id, reply } => {
                 let _ = reply.send(self.space_info(&space_id).map_err(refuse));
+            }
+            Command::SpaceTags { space_id, reply } => {
+                let _ = reply.send(self.space_tags(&space_id).map_err(refuse));
             }
             Command::ActivityFeed { kind, cursor, limit, reply } => {
                 let _ = reply.send(self.fetch_activity_feed(kind, cursor.as_deref(), limit).map_err(refuse));
@@ -1056,8 +1085,14 @@ impl Teams {
             // Each row's line comes with the chat list (`lastMessage`); a row still without one
             // has no message, or one the list did not show.
             Command::Previews(_) => {}
-            Command::SetPresence { presence, status, status_emoji: _, clear_at: _, reply } => {
-                let _ = reply.send(self.set_presence(presence, status.as_deref()).map_err(refuse));
+            Command::SetPresence { presence, status, status_emoji: _, clear_at, reply } => {
+                let _ = reply.send(self.set_presence(presence, status.as_deref(), clear_at).map_err(refuse));
+            }
+            Command::GetOutOfOffice { reply } => {
+                let _ = reply.send(self.get_out_of_office().map_err(refuse));
+            }
+            Command::SetOutOfOffice { ooo, reply } => {
+                let _ = reply.send(self.set_out_of_office(&ooo).map_err(refuse));
             }
             Command::Download { url, reply, .. } => {
                 let _ = reply.send(self.download(url).map_err(refuse));
@@ -1065,9 +1100,14 @@ impl Teams {
             Command::Handoff { conversation_id, reply } => {
                 let _ = reply.send(Ok(self.call_link(&conversation_id)));
             }
-            // The refresh token is Microsoft's to revoke, from the account's own security
-            // page; no client read ends it from here. Signing out forgets it.
-            Command::SignOut(reply) => drop(reply.send(Ok(()))),
+            // Remove the trouter push registration at Microsoft before forgetting the local token.
+            // Entra v2.0 public clients have no single-refresh-token revocation endpoint, and
+            // Graph's `/me/revokeSignInSessions` ends every Microsoft session across all devices,
+            // so session revocation stays on `https://myaccount.microsoft.com/`.
+            Command::SignOut(reply) => {
+                self.unregister_push();
+                let _ = reply.send(Ok(()));
+            }
             command => command.unsupported(&self.ctx),
         }
     }

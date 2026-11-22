@@ -586,6 +586,56 @@ impl InfoPane {
                 });
                 sections = sections.child(draw::role(&role, icon, None));
             }
+            if !profile.office.is_empty() {
+                if !any {
+                    sections = sections.child(draw::label("Role", true));
+                }
+                any = true;
+                sections = sections.child(draw::fact_inline("info-office", "icons/building-2.svg", profile.office.clone(), String::new()));
+            }
+            if profile.manager.is_some() || !profile.reports.is_empty() {
+                sections = sections.child(draw::label("Organization", !any));
+                any = true;
+                let mut org = div().flex().flex_col().gap(px(4.));
+                if let Some(manager) = profile.manager.as_ref() {
+                    let mgr_key = manager.key.clone();
+                    let label = if manager.title.is_empty() {
+                        format!("Reports to {}", manager.name)
+                    } else {
+                        format!("Reports to {} · {}", manager.name, manager.title)
+                    };
+                    org = org.child(
+                        draw::fact_inline("info-manager", "icons/user.svg", label, String::new())
+                            .cursor_pointer()
+                            .hover(|row| row.bg(theme::hover()))
+                            .on_click(cx.listener(move |this, _, _, cx| this.show(mgr_key.clone(), cx))),
+                    );
+                }
+                if !profile.reports.is_empty() {
+                    org = org.child(
+                        div()
+                            .pt(px(4.))
+                            .type_small()
+                            .text_color(theme::text_faint())
+                            .child(format!("Direct reports ({})", profile.reports.len())),
+                    );
+                    for (rix, report) in profile.reports.iter().enumerate() {
+                        let rep_key = report.key.clone();
+                        let label = if report.title.is_empty() {
+                            report.name.clone()
+                        } else {
+                            format!("{} · {}", report.name, report.title)
+                        };
+                        org = org.child(
+                            draw::fact_inline(("info-report", rix), "icons/users.svg", label, String::new())
+                                .cursor_pointer()
+                                .hover(|row| row.bg(theme::hover()))
+                                .on_click(cx.listener(move |this, _, _, cx| this.show(rep_key.clone(), cx))),
+                        );
+                    }
+                }
+                sections = sections.child(org);
+            }
             let shown = facts::sections(person, profile, place, crate::view::now(), ours);
             if shown.about {
                 sections = sections.child(draw::label("About", !any));

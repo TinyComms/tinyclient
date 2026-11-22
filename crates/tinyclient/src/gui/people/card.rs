@@ -356,6 +356,32 @@ impl Floating {
                 }
                 None => {}
             }
+            if !profile.office.is_empty() {
+                any = true;
+                body = body.child(draw::fact_inline("card-office", "icons/building-2.svg", profile.office.clone(), String::new()));
+            }
+            let ours = own_offset(crate::view::now());
+            for (ix, fact) in facts::right_now(person, Some(profile), &line, crate::view::now(), ours).into_iter().enumerate() {
+                if fact.glyph == "icons/clock.svg" {
+                    any = true;
+                    body = body.child(draw::fact_inline(("card-time", ix), fact.glyph, fact.words, fact.soft));
+                }
+            }
+            if let Some(manager) = profile.manager.as_ref() {
+                any = true;
+                let mgr_key = manager.key.clone();
+                let space = self.place.as_ref().map(|(key, _)| key.clone());
+                let label = format!("Reports to {}", manager.name);
+                body = body.child(
+                    draw::fact_inline("card-manager", "icons/user.svg", label, String::new())
+                        .cursor_pointer()
+                        .hover(|row| row.bg(theme::hover()))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let (mgr_key, space) = (mgr_key.clone(), space.clone());
+                            this.shell_do(cx, move |shell, cx| shell.details_person_with(mgr_key, space, None, cx));
+                        })),
+                );
+            }
             if let Some(common) = facts::in_common(network, profile) {
                 any = true;
                 let spaces = self.spaces(cx);

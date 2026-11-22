@@ -193,10 +193,14 @@ impl Teams {
         let role = described["members"].as_array().into_iter().flatten().find(|member| member["id"].as_str() == Some(me.as_str()));
         let role = role.and_then(|member| member["role"].as_str()).and_then(super::people::role_label);
         let members = described["members"].as_array().map(|members| members.len() as u32);
+        let tags = self
+            .space_tags(space)
+            .unwrap_or_else(|_| self.state().tags.get(space).cloned().unwrap_or_default());
         Ok(SpaceAbout {
             description: text("description"),
             members,
             roles: role.map(str::to_owned).into_iter().collect(),
+            tags,
             ..SpaceAbout::default()
         })
     }

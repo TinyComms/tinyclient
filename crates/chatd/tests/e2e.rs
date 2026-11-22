@@ -1116,7 +1116,11 @@ fn a_voice_channel_says_who_is_in_it_and_a_call_that_fails_takes_us_out_of_it() 
     // failure, and again we are taken out of the channel.
     chatd.ask(Request::CallEnd);
     chatd.ask(Request::CallStart { conversation: campfire.clone() });
+    // Joining is told to the network after the call starts, so the row catches up on its own.
+    let back = |answer: &Response| matches!(answer, Response::Conversation { conversation } if names(conversation).len() == 4);
+    chatd.until("joining the channel again", request.clone(), back);
     assert_eq!(names(&chatd.row(&campfire)).len(), 4);
+    assert_eq!(names(&chatd.row(&campfire)).last().map(String::as_str), Some("Robin Vale"));
     let deadline = Instant::now() + Duration::from_secs(13);
     while !failed_with(&chatd.ask(Request::Status), CallFailure::Lost) {
         assert!(Instant::now() < deadline, "the call never timed out");

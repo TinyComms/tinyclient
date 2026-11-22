@@ -9,7 +9,7 @@ use super::Pane;
 use crate::gui::app::prefs;
 use crate::gui::components::{button, fade_in, modal, modal_buttons, ButtonKind};
 use crate::gui::theme::{self, Type};
-use gpui::{anchored, deferred, div, point, prelude::*, px, AnyElement, ClipboardItem, Context, KeyDownEvent, MouseButton, Window};
+use gpui::{anchored, deferred, div, point, prelude::*, px, AnyElement, App, ClipboardItem, Context, KeyDownEvent, MouseButton, Window};
 use protocol::link::{Destination, Risk};
 
 /// The question on screen: the link, and whether "Don't ask again" is ticked.
@@ -112,6 +112,16 @@ pub(super) fn network_link_chip(url: &str, conversations: &[protocol::Conversati
         _ => name.to_owned(),
     };
     Some(if parsed.message_id.is_some() { format!("{label} ↗") } else { label })
+}
+
+/// Opens an external `http://` or `https://` URL from surfaces outside a conversation [`Pane`]
+/// (such as Settings or the right-hand info pane), enforcing the same scheme validation and
+/// tracking-parameter stripping as [`Pane::open_external_link`].
+pub(in crate::gui) fn open_external_link(url: &str, cx: &mut App) {
+    let Some(dest) = Destination::parse(url) else {
+        return;
+    };
+    cx.open_url(&dest.target(prefs::choices().strip_tracking));
 }
 
 impl Pane {

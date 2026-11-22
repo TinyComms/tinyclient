@@ -17,7 +17,7 @@ use crate::gui::hotkeys::{self, Action, Reach};
 use protocol::settings::{
     self as keys, account_scope, DeviceChoice, Values, AUTO_GAIN, CACHE_MB, CAMERA, CACHE_MB_CHOICES, CUE_CONNECTION, CUE_JOINS, CUE_MINE, CUE_VOLUME,
     ECHO_CANCELLATION, GLOBAL, INPUT, INPUT_VOLUME, JOIN_MUTED, KEEP_DAYS, KEEP_DAYS_CHOICES, KEEP_RUNNING, NOISE_CHOICES, NOISE_SUPPRESSION, OUTPUT,
-    PTT_RELEASE_CHOICES, PTT_RELEASE_MS, PUSH_TO_TALK, QUALITY_CHOICES, RECEIPTS, REQUIRE_CALL_E2EE, SENSITIVITY, SOUNDS, TYPING, VOICE_QUALITY,
+    PTT_RELEASE_CHOICES, PTT_RELEASE_MS, PUSH_TO_TALK, PRESENCE_ACTIVITY, QUALITY_CHOICES, RECEIPTS, REQUIRE_CALL_E2EE, SENSITIVITY, SOUNDS, TYPING, VOICE_QUALITY,
     VOICE_VOLUME,
 };
 use protocol::{AccountStatus, Link, Network, Request, Response};
@@ -1416,6 +1416,74 @@ impl SettingsWindow {
                 groups.push(div().pt(px(gap)).flex().flex_col().child(group_label(label_of("P2"))).child(caption("Discord and Slack have no read receipts.")));
             }
             None => {}
+        }
+        let teams_accounts: Vec<_> = accounts.iter().filter(|a| a.key.network == Network::Teams).cloned().collect();
+        if !teams_accounts.is_empty() {
+            let values = prefs::values();
+            let mut active_card = card();
+            for (ix, account) in teams_accounts.iter().enumerate() {
+                let name = if account.name.is_empty() {
+                    network_name(Network::Teams).to_owned()
+                } else {
+                    account.name.clone()
+                };
+                let scope = account_scope(&account.key);
+                let on = values.presence_activity(&account.key);
+                let reset = (!on).then(|| {
+                    let scope = scope.clone();
+                    reset_button(SharedString::from(format!("teams-active-{ix}-reset")), format!("Reset {name} to on").into())
+                        .on_click(cx.listener(move |this, _, _, cx| this.set("P3", scope.clone(), PRESENCE_ACTIVITY, None, cx)))
+                });
+                let lead = div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(network_icon(Network::Teams, 16.))
+                    .child(div().type_ui().text_color(theme::text()).child(name.clone()));
+                let line = div()
+                    .min_h(px(52.))
+                    .px(px(controls::side()))
+                    .py(px(8.))
+                    .flex()
+                    .items_center()
+                    .gap(px(16.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(lead)
+                            .child(div().pl(px(24.)).type_small().text_color(theme::text_soft()).child(
+                                "Sends active presence while tinyclient is focused and you are using it.",
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .child(reset_slot(reset))
+                            .child(switch(SharedString::from(format!("teams-active-{ix}")), &name, on).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    let next = !on;
+                                    let stored = (!next).then(|| "off".to_owned());
+                                    this.set("P3", scope.clone(), PRESENCE_ACTIVITY, stored, cx);
+                                }),
+                            )),
+                    );
+                active_card = active_card.when(ix > 0, |c| c.child(rule())).child(line);
+            }
+            let gap = if groups.is_empty() { 0. } else { 20. };
+            groups.push(
+                div()
+                    .pt(px(gap))
+                    .flex()
+                    .flex_col()
+                    .child(group_label("Share active presence"))
+                    .child(active_card)
+                    .child(caption("Turn off if you prefer Teams mobile notifications not to be held back while tinyclient is open.")),
+            );
         }
         groups
     }

@@ -393,6 +393,7 @@ impl Demo {
             nickname: if self.ctx.account.network == Network::Discord { "Robin 🍄".to_owned() } else { String::new() },
             roles: if self.ctx.account.network == Network::Discord { vec!["Member".to_owned(), "Trail lead".to_owned()] } else { Vec::new() },
             notify: Notify::Mentions,
+            ..SpaceAbout::default()
         })
     }
 
@@ -1024,6 +1025,9 @@ impl Demo {
             Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::GetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetOutOfOffice { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetOutOfOffice { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SpaceTags { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StarredMessages { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)));
             }

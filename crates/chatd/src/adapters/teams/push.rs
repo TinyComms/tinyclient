@@ -2,7 +2,7 @@
 //! to it (the registration), and from then on each event arrives as a small request that has to
 //! be answered. See the notes at the top of `teams.rs` for where each step was read.
 
-use super::{bare, escaped, now_ms, uuid, Auth, Body, Fault, Teams, SPACES};
+use super::{bare, escaped, now_ms, uuid, Auth, Body, Fault, Teams, SPACES, TEAMS};
 use crate::adapters::net::{address, gunzip, Socket};
 use crate::adapters::{Command, Failure};
 use base64::Engine;
@@ -14,8 +14,10 @@ const TROUTER: &str = "https://go.trouter.teams.microsoft.com";
 const VERSION: &str = "49/25113001312";
 const TRACE: &str = "2024.23.01.2";
 /// How long the socket waits for a frame before looking at what else is due.
-const TICK: Duration = Duration::from_secs(5);
+const TICK: Duration = Duration::from_secs(2);
 const PING: Duration = Duration::from_secs(30);
+/// How often `user.activity: active` is repeated while the user is actively using the window.
+const ACTIVITY_HEARTBEAT: Duration = Duration::from_secs(240);
 /// How long a registration lasts, in seconds, and how long before its end it is made again.
 const REGISTERED: u64 = 86_400;
 const RENEW: Duration = Duration::from_secs(REGISTERED - 600);
@@ -31,6 +33,8 @@ pub(super) struct Push {
     sent: u64,
     pinged: Instant,
     registered: Option<Instant>,
+    active_sent: bool,
+    activity_at: Option<Instant>,
 }
 
 /// The payload of a socket.io 0.9 frame: what follows its third colon.
@@ -64,11 +68,12 @@ impl Teams {
     /// which is made when the socket says it is up.
     pub(super) fn open(&self) -> Result<Push, Failure> {
         // One endpoint for as long as the account is here: Teams limits how many a user has.
-        let endpoint = self.ctx.note("endpoint").unwrap_or_else(|| {
+        let endpoint = self.ctx.note("endpoint").filter(|id| !id.is_empty()).unwrap_or_else(|| {
             let made = uuid();
             self.ctx.set_note("endpoint", &made);
             made
         });
+        self.state().endpoint = Some(endpoint.clone());
         let base = address("TINYCLIENT_TEAMS_TROUTER", TROUTER);
         let base = base.trim_end_matches('/');
         let named = self.call("POST", &format!("{base}/v4/a?epid={}", escaped(&endpoint)), Auth::Push, Body::None, true)?.body;
@@ -114,6 +119,8 @@ impl Teams {
             sent: 0,
             pinged: Instant::now(),
             registered: None,
+            active_sent: false,
+            activity_at: None,
         })
     }
 
@@ -132,6 +139,35 @@ impl Teams {
         if push.registered.is_some_and(|at| at.elapsed() > RENEW) {
             self.register(push)?;
         }
+        if push.registered.is_some() {
+            self.sync_activity(push)?;
+        }
+        Ok(())
+    }
+
+    fn want_active_presence(&self) -> bool {
+        let watching = self.ctx.watching();
+        watching.focused && watching.active && self.ctx.hub.settings().presence_activity(&self.ctx.account)
+    }
+
+    /// Sends trouter `user.activity` (`active` on focus+input + 240 s heartbeat, `inactive` when
+    /// unfocused, idle, or when Settings › Privacy turns active presence off).
+    fn sync_activity(&self, push: &mut Push) -> Result<(), Failure> {
+        let want = self.want_active_presence();
+        if want {
+            let due = !push.active_sent || push.activity_at.is_none_or(|at| at.elapsed() >= ACTIVITY_HEARTBEAT);
+            if due {
+                let frame = json!({"name": "user.activity", "args": [{"state": "active"}]});
+                push.socket.send(format!("5:::{frame}"))?;
+                push.active_sent = true;
+                push.activity_at = Some(Instant::now());
+            }
+        } else if push.active_sent {
+            let frame = json!({"name": "user.activity", "args": [{"state": "inactive"}]});
+            push.socket.send(format!("5:::{frame}"))?;
+            push.active_sent = false;
+            push.activity_at = Some(Instant::now());
+        }
         Ok(())
     }
 
@@ -146,6 +182,7 @@ impl Teams {
                 }]});
                 push.socket.send(format!("5:::{hello}"))?;
                 self.register(push)?;
+                self.sync_activity(push)?;
             }
             Some(b'2') => push.socket.send("2::".to_owned())?,
             Some(b'3') => {
@@ -190,8 +227,64 @@ impl Teams {
         });
         let url = format!("{}/registrar/prod/V2/registrations", self.api);
         self.call("POST", &url, Auth::Both(SPACES), Body::Json(&body), true)?;
+        self.state().endpoint = Some(push.endpoint.clone());
         push.registered = Some(Instant::now());
         Ok(())
+    }
+
+    /// Best-effort removal of this device's trouter push registration on sign-out.
+    /// Uses a short 3-second timeout and only already-cached tokens so it never stalls sign-out.
+    pub(super) fn unregister_push(&self) {
+        let (endpoint, cached_auth) = {
+            let mut state = self.state();
+            if state.expired.is_some() {
+                state.endpoint = None;
+                drop(state);
+                self.ctx.set_note("endpoint", "");
+                return;
+            }
+            let endpoint = state.endpoint.take();
+            let bearer = state.access.get(SPACES).map(|t| t.value.clone());
+            let skype = state.skype.as_ref().map(|t| t.value.clone());
+            (endpoint, bearer.zip(skype))
+        };
+        let endpoint = endpoint.or_else(|| self.ctx.note("endpoint")).filter(|id| !id.is_empty());
+        self.ctx.set_note("endpoint", "");
+        let Some(endpoint) = endpoint else {
+            return;
+        };
+        let url = format!("{}/registrar/prod/V2/registrations/{}", self.api, escaped(&endpoint));
+        if !self.ours(&url) {
+            return;
+        }
+        let Some((bearer, skype)) = cached_auth else {
+            return;
+        };
+        let headers = [
+            ("Authorization", format!("Bearer {bearer}")),
+            ("X-Skypetoken", skype),
+        ];
+        let fast: ureq::Agent = crate::adapters::net::apply_proxy(ureq::Agent::config_builder())
+            .tls_config(crate::tls::config())
+            .timeout_global(Some(Duration::from_secs(3)))
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .max_redirects_will_error(false)
+            .user_agent(&self.session.user_agent)
+            .build()
+            .into();
+        let mut req = fast
+            .delete(&url)
+            .header("Accept", "application/json")
+            .header("BehaviorOverride", "redirectAs404")
+            .header("Origin", TEAMS)
+            .header("Referer", "https://teams.microsoft.com/");
+        for (name, value) in &headers {
+            req = req.header(*name, value.as_str());
+        }
+        if let Err(err) = req.call() {
+            tracing::warn!("chatd: Teams: unregister push on sign-out failed: {}", crate::adapters::net::redact(&err.to_string()));
+        }
     }
 
     /// One event, by the path it was delivered to.

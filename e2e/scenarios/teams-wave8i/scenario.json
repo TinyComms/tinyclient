@@ -1,0 +1,12 @@
+{
+  "id": "teams-wave8i",
+  "title": "Teams out-of-office, profile cards, polls, presence, file uploads, sign-out, and tags",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same Teams checks are what this desktop run covers.",
+    "ios": "The phone proof build does not run desktop chatd. The same Teams checks are what this desktop run covers."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

@@ -15,19 +15,19 @@ use super::tokens::{self, Metrics, MEASURE};
 use super::when;
 use super::{edited_tip, Pane, PaneEvent, Selection, Then};
 use crate::gui::anim::{self, Play};
-use crate::gui::components::{glyph, tip, Avatar, Shape};
+use crate::gui::components::{button, glyph, tip, Avatar, ButtonKind, Shape};
 use crate::gui::phone::tokens as tokens_phone;
 use crate::gui::theme::{self, Type};
 use crate::gui::time;
 use crate::view::{age, now};
 use crate::client::ask;
 use gpui::{
-    canvas, div, prelude::*, px, Animation, AnimationExt, AnyElement, ClipboardItem, Context, Div, ElementId,
+    anchored, canvas, deferred, div, prelude::*, px, Animation, AnimationExt, AnyElement, ClipboardItem, Context, Div, ElementId,
     FontWeight, HighlightStyle, Hsla, MouseButton, ObjectFit, Pixels, Point, RenderImage, SharedString, Stateful, StyledText, Window,
 };
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use protocol::{Attachment, Card, Forwarded, Key, MediaFile, MentionKind, Message, MessageKind, Preview, Receipt, Request, Response, SendState};
+use protocol::{Attachment, Card, Forwarded, Key, MediaFile, MentionKind, Message, MessageKind, Network, Preview, Receipt, Request, Response, SendState};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -1579,6 +1579,152 @@ impl Pane {
         .detach();
     }
 
+    /// Opens the Teams tag members popover for a clicked `@Tag` mention span.
+    fn open_tag_popover(&mut self, space: Key, tag_id: String, at: Point<Pixels>, cx: &mut Context<Self>) {
+        self.menu = None;
+        self.revisions = None;
+        self.tag_popover = Some(super::TagPopover {
+            space: space.clone(),
+            tag_id: tag_id.clone(),
+            label: "Tag".to_owned(),
+            at,
+            tag: None,
+            ready: false,
+        });
+        cx.notify();
+        let request = Request::SpaceTags { space: space.clone() };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(pop) = this.tag_popover.as_mut() else {
+                    return;
+                };
+                if pop.space != space || pop.tag_id != tag_id {
+                    return;
+                }
+                pop.ready = true;
+                if let Ok(Response::SpaceTags { tags, .. }) = answer {
+                    if let Some(found) = tags.into_iter().find(|t| t.id == tag_id) {
+                        pop.label = found.name.clone();
+                        pop.tag = Some(found);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Renders the Teams `@Tag` members popover with a "Start group chat" action and
+    /// "Manage tags in Teams" external link.
+    pub(super) fn tag_popover_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let pop = self.tag_popover.as_ref()?;
+        let heading = format!("@{}", pop.label);
+        let mut card = div()
+            .id("tag-popover")
+            .w(px(260.))
+            .p(px(10.))
+            .rounded(px(theme::R_FLOAT))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_popover())
+            .occlude()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).truncate().child(heading))
+                    .child(
+                        div()
+                            .id("tag-popover-close")
+                            .size(px(20.))
+                            .rounded(px(theme::R_CHIP))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::hover()))
+                            .child(glyph("icons/x.svg", 14., theme::text_soft()))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.tag_popover = None;
+                                cx.notify();
+                            })),
+                    ),
+            );
+        if !pop.ready {
+            card = card.child(div().type_small().text_color(theme::text_faint()).child("Loading members…"));
+        } else if let Some(tag) = pop.tag.as_ref() {
+            if !tag.description.is_empty() {
+                card = card.child(div().type_small().text_color(theme::text_soft()).child(tag.description.clone()));
+            }
+            card = card.child(div().type_small().text_color(theme::text_faint()).child(format!("{} members", tag.member_count)));
+            for (mix, member) in tag.members.iter().take(12).enumerate() {
+                let line = if member.title.is_empty() {
+                    member.name.clone()
+                } else {
+                    format!("{} · {}", member.name, member.title)
+                };
+                card = card.child(
+                    div()
+                        .id(("tag-pop-member", mix))
+                        .type_small()
+                        .text_color(theme::text())
+                        .truncate()
+                        .child(line),
+                );
+            }
+            let people: Vec<Key> = tag.members.iter().map(|m| m.key.clone()).collect();
+            let mut footer = div().pt(px(4.)).flex().items_center().justify_between().gap(px(6.));
+            if !people.is_empty() {
+                let account = pop.space.account();
+                let title = tag.name.clone();
+                footer = footer.child(button("tag-pop-chat", ButtonKind::Primary, "Start group chat").h(px(24.)).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        this.tag_popover = None;
+                        cx.notify();
+                        let req = Request::StartGroup {
+                            account: account.clone(),
+                            people: people.clone(),
+                            title: Some(title.clone()),
+                        };
+                        let shell = this.shell.clone();
+                        crate::gui::people::ask_later(cx, req, move |answer, cx| {
+                            if let Ok(Response::Conversation { conversation }) = answer {
+                                let _ = shell.update(cx, |shell, cx| shell.select(conversation.key, &conversation.title, cx));
+                            }
+                        });
+                    }),
+                ));
+            }
+            footer = footer.child(button("tag-pop-manage", ButtonKind::Ghost, "Manage in Teams ↗").h(px(24.)).on_click(
+                cx.listener(|this, _, window, cx| {
+                    this.tag_popover = None;
+                    this.open_external_link("https://teams.microsoft.com/", window, cx);
+                    cx.notify();
+                }),
+            ));
+            card = card.child(footer);
+        } else {
+            card = card
+                .child(div().type_small().text_color(theme::text_faint()).child("Tag details unavailable."))
+                .child(
+                    button("tag-pop-manage-fallback", ButtonKind::Ghost, "Manage tags in Teams ↗").h(px(24.)).on_click(
+                        cx.listener(|this, _, window, cx| {
+                            this.tag_popover = None;
+                            this.open_external_link("https://teams.microsoft.com/", window, cx);
+                            cx.notify();
+                        }),
+                    ),
+                );
+        }
+        Some(deferred(anchored().position(pop.at).child(card)).into_any_element())
+    }
+
     /// The decoded picture of a file on disk, `edge` pixels on its longer side. Asking queues
     /// the decode; the row is drawn again when it is done.
     pub(super) fn picture(&mut self, path: &str, edge: u32, crop: Option<f32>, cx: &mut Context<Self>) -> Picture {
@@ -1704,6 +1850,19 @@ impl Pane {
                         return;
                     };
                     let _ = self.shell.update(cx, |shell, cx| shell.open_profile(person, at, cx));
+                } else if let Some((MentionKind::Role, tag_id)) = &run.mention {
+                    if let (Some(open), at) = (self.open.as_ref(), window.mouse_position()) {
+                        if open.key.network == Network::Teams {
+                            let space_id = self.shell.upgrade().and_then(|shell| {
+                                let shell = shell.read(cx);
+                                shell.snapshot.as_ref()?.open.as_ref()?.space.clone()
+                            });
+                            if let Some(space_id) = space_id {
+                                let space = Key::new(&open.key.account(), space_id);
+                                self.open_tag_popover(space, tag_id.clone(), at, cx);
+                            }
+                        }
+                    }
                 }
                 // LATER: a click on a channel mention opens the channel; it needs the channel's
                 // row, which the sidebar holds.

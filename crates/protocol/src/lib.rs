@@ -861,6 +861,15 @@ pub struct Profile {
     pub title: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub department: String,
+    /// Office / work location (Teams / Graph `officeLocation`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub office: String,
+    /// Who this person reports to in their organization (Teams / Graph `/manager`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manager: Option<ProfilePerson>,
+    /// People who report directly to this person (Teams / Graph `/directReports`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reports: Vec<ProfilePerson>,
     /// Their roles in that Space, names only (colours are left out), at most [`PROFILE_ROLES`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<String>,
@@ -911,6 +920,9 @@ impl Profile {
             pronouns: String::new(),
             title: String::new(),
             department: String::new(),
+            office: String::new(),
+            manager: None,
+            reports: Vec::new(),
             roles: Vec::new(),
             contacts: Vec::new(),
             mutual_total: 0,
@@ -1187,6 +1199,10 @@ pub struct Watching {
     /// it, and plays no sound for any other. Lapses with the rest.
     #[serde(default, skip_serializing_if = "is_false")]
     pub focused: bool,
+    /// True when the window is focused AND the user has interacted recently (within the idle
+    /// threshold). Teams sends `user.activity: active` only while both `focused` and `active` hold.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub active: bool,
 }
 
 /// One hit of a message search: where the message is, and enough of it to choose by.
@@ -1683,6 +1699,19 @@ pub enum Request {
         account: AccountKey,
         key: PrivacyKey,
         policy: PrivacyPolicy,
+    },
+    /// Read an account's out-of-office / automatic replies settings (Teams / Exchange mailbox).
+    GetOutOfOffice {
+        account: AccountKey,
+    },
+    /// Write an account's out-of-office / automatic replies settings (Teams / Exchange mailbox).
+    SetOutOfOffice {
+        account: AccountKey,
+        ooo: OutOfOffice,
+    },
+    /// List mentionable tags in a Space (e.g. Teams team tags).
+    SpaceTags {
+        space: Key,
     },
     /// Answer, withdraw or end a friendship, or block. The list changes when the network says so
     /// (a `People` change).
@@ -3035,6 +3064,13 @@ pub enum Response {
     Privacy {
         key: PrivacyKey,
         policy: PrivacyPolicy,
+    },
+    OutOfOffice {
+        ooo: OutOfOffice,
+    },
+    SpaceTags {
+        space: Key,
+        tags: Vec<TeamTag>,
     },
     Folders {
         folders: Vec<Folder>,

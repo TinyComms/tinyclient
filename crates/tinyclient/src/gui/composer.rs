@@ -80,6 +80,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use typing::TypingRow;
 
+/// How long a peer's cached out-of-office banner stays fresh before re-querying.
+const PEER_AWAY_TTL: Duration = Duration::from_secs(5 * 60);
+
 /// Drafts remembered by this window, one per conversation visited. chatd keeps every draft;
 /// these are the ones newer than the rows the lists hold.
 const DRAFTS: usize = 64;
@@ -272,6 +275,8 @@ struct Target {
     link: Link,
     /// The Space it is in, for `#` completion and the Space's own emoji. A thread pane is not told.
     space: Option<String>,
+    /// Peer person id for a 1:1 Direct chat (used for out-of-office banner).
+    peer: Option<String>,
     read_only: bool,
     read_only_reason: String,
     joined: bool,
@@ -600,6 +605,15 @@ pub struct Composer {
     importance: protocol::Importance,
     broadcast: bool,
     effect: Option<String>,
+    /// Cached out-of-office `(fetched_at, Option<(note, until)>)` for 1:1 direct chat peers.
+    peer_away: HashMap<Key, (Instant, Option<(String, Option<i64>)>)>,
+    /// Peers whose out-of-office profile fetch is currently in flight.
+    peer_away_asked: HashSet<Key>,
+    /// Bumped when a peer's cache is dropped, so an older profile answer cannot write it back.
+    peer_away_gen: HashMap<Key, u64>,
+    /// Cached mentionable team tags per Space (Teams `@tag` completion).
+    space_tags: HashMap<Key, Vec<protocol::TeamTag>>,
+    space_tags_asked: HashSet<Key>,
 }
 
 impl Composer {
@@ -704,6 +718,11 @@ impl Composer {
             importance: protocol::Importance::Normal,
             broadcast: false,
             effect: None,
+            peer_away: HashMap::new(),
+            peer_away_asked: HashSet::new(),
+            peer_away_gen: HashMap::new(),
+            space_tags: HashMap::new(),
+            space_tags_asked: HashSet::new(),
         }
     }
 
@@ -773,8 +792,85 @@ impl Composer {
             input.set_alt_submits(silent);
             input.set_format_discord(discord, cx);
         });
+        self.maybe_fetch_peer_away(&target, cx);
         self.target = Some(target);
         cx.notify();
+    }
+
+    fn maybe_fetch_peer_away(&mut self, target: &Target, cx: &mut Context<Self>) {
+        if target.kind != ConversationKind::Direct
+            || target.link != Link::Connected
+            || !live()
+            || !(target.key.network == Network::Teams || target.can.out_of_office)
+        {
+            return;
+        }
+        let Some(peer_id) = target.peer.as_deref().filter(|id| !id.is_empty()) else {
+            return;
+        };
+        let peer_key = Key::new(&target.key.account(), peer_id);
+        if self.peer_away.get(&peer_key).is_some_and(|(at, _)| at.elapsed() < PEER_AWAY_TTL) {
+            return;
+        }
+        if !self.peer_away_asked.insert(peer_key.clone()) {
+            return;
+        }
+        let this = cx.weak_entity();
+        let asked_key = peer_key.clone();
+        let gen = self.peer_away_gen.get(&peer_key).copied().unwrap_or(0);
+        ask_later(cx, Request::Profile { person: peer_key, space: None }, move |answer, cx| {
+            let _ = this.update(cx, |this, cx| {
+                if this.peer_away_gen.get(&asked_key).copied().unwrap_or(0) != gen {
+                    return;
+                }
+                this.peer_away_asked.remove(&asked_key);
+                if let Ok(Response::Profile { profile }) = answer {
+                    let away = (!profile.away.is_empty()).then_some((profile.away, profile.away_until));
+                    this.peer_away.insert(asked_key, (Instant::now(), away));
+                    cx.notify();
+                }
+            });
+        });
+    }
+
+    fn bump_peer_away(&mut self, person: &Key) {
+        let entry = self.peer_away_gen.entry(person.clone()).or_insert(0);
+        *entry = entry.wrapping_add(1);
+    }
+
+    fn forget_peer_away_account(&mut self, account: &AccountKey, cx: &mut Context<Self>) {
+        let mut keys: HashSet<Key> = self.peer_away.keys().filter(|key| key.account() == *account).cloned().collect();
+        keys.extend(self.peer_away_asked.iter().filter(|key| key.account() == *account).cloned());
+        for key in &keys {
+            self.bump_peer_away(key);
+        }
+        let had = self.peer_away.keys().any(|key| key.account() == *account);
+        self.peer_away.retain(|key, _| key.account() != *account);
+        self.peer_away_asked.retain(|key| key.account() != *account);
+        if had {
+            cx.notify();
+        }
+        if let Some(target) = self.target.take() {
+            if target.key.account() == *account {
+                self.maybe_fetch_peer_away(&target, cx);
+            }
+            self.target = Some(target);
+        }
+    }
+
+    fn forget_peer_away_person(&mut self, person: &Key, cx: &mut Context<Self>) {
+        self.bump_peer_away(person);
+        self.peer_away_asked.remove(person);
+        let had = self.peer_away.remove(person).is_some();
+        if had {
+            cx.notify();
+        }
+        if let Some(target) = self.target.take() {
+            if target.peer.as_deref().is_some_and(|id| Key::new(&target.key.account(), id) == *person) {
+                self.maybe_fetch_peer_away(&target, cx);
+            }
+            self.target = Some(target);
+        }
     }
 
     /// Leaving a conversation: an edit ends, and the draft is saved and kept for the way back,
@@ -863,6 +959,7 @@ impl Composer {
     }
 
     fn typed(&mut self, cx: &mut Context<Self>) {
+        self.hub.watch_input(cx);
         self.follow_text(cx);
         self.touched = true;
         self.caption = None;
@@ -2407,6 +2504,22 @@ impl Composer {
             self.close_list(cx);
             return;
         };
+        if target.key.network == Network::Teams && trigger.kind == mention::Kind::Person && live() {
+            if let Some(space_key) = target.space_key() {
+                if self.space_tags_asked.insert(space_key.clone()) {
+                    let this = cx.weak_entity();
+                    ask_later(cx, Request::SpaceTags { space: space_key.clone() }, move |answer, cx| {
+                        if let Ok(Response::SpaceTags { space, tags }) = answer {
+                            let _ = this.update(cx, |this, cx| {
+                                this.space_tags.insert(space, tags);
+                                this.look_up(cx);
+                                cx.notify();
+                            });
+                        }
+                    });
+                }
+            }
+        }
         let request = complete::request(&trigger, &target.key, target.space.as_deref());
         let (Some(request), false) = (request, self.dismissed == Some(trigger.start)) else {
             self.close_list(cx);
@@ -2512,6 +2625,25 @@ impl Composer {
                                         name: role.name.clone(),
                                         handle: String::new(),
                                         second: "Role".to_owned(),
+                                        person: None,
+                                    });
+                                }
+                            }
+                            rows.truncate(complete::ROWS);
+                        }
+                    }
+                }
+                if target.key.network == protocol::Network::Teams {
+                    if let Some(space_key) = target.space_key() {
+                        if let Some(tags) = self.space_tags.get(&space_key) {
+                            for tag in tags {
+                                if mention::rank(&tag.name, &tag.description, &trigger.query).is_some() {
+                                    rows.push(complete::Row {
+                                        kind: mention::Kind::Role,
+                                        key: Key::new(&account, &tag.id),
+                                        name: tag.name.clone(),
+                                        handle: String::new(),
+                                        second: format!("Tag · {} members", tag.member_count),
                                         person: None,
                                     });
                                 }
@@ -3843,6 +3975,77 @@ fn shot_pictures() -> Vec<PathBuf> {
     found
 }
 
+/// Formats a UTC Unix timestamp as a compact date like `"Mon, Oct 19"` for OOO banners.
+fn format_ooo_until(unix_secs: i64) -> String {
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    let raw_days = unix_secs.div_euclid(86_400);
+    let weekday = WEEKDAYS[raw_days.rem_euclid(7) as usize];
+    let days = raw_days + 719_468;
+    let doe = days.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let month = MONTHS[(m - 1).clamp(0, 11) as usize];
+    format!("{weekday}, {month} {d}")
+}
+
+/// Formats the composer out-of-office banner line for a 1:1 direct chat peer.
+fn ooo_banner_text(name: &str, away: &str, until: Option<i64>) -> (String, Option<String>) {
+    let who = if name.is_empty() { "This person" } else { name };
+    let head = match until.filter(|&ts| ts > 0) {
+        Some(ts) => format!("{who} is out of office until {}", format_ooo_until(ts)),
+        None => format!("{who} is out of office"),
+    };
+    let trimmed = away.trim();
+    let note = (!trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("Out of office")).then(|| {
+        let mut s = trimmed.to_owned();
+        protocol::clip(&mut s, 180);
+        s
+    });
+    (head, note)
+}
+
+impl Composer {
+    /// Compact banner shown above the composer in a 1:1 chat when the peer is out of office.
+    fn ooo_banner(&self, target: &Target) -> Option<Div> {
+        if target.kind != ConversationKind::Direct {
+            return None;
+        }
+        let peer_id = target.peer.as_deref().filter(|id| !id.is_empty())?;
+        let peer_key = Key::new(&target.key.account(), peer_id);
+        let (_, away) = self.peer_away.get(&peer_key)?;
+        let (away, until) = away.as_ref()?;
+        let (head, note) = ooo_banner_text(&target.title, away, *until);
+        Some(
+            div()
+                .mb(px(6.))
+                .px(px(10.))
+                .py(px(6.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(theme::selected())
+                .border_1()
+                .border_color(theme::border())
+                .flex()
+                .items_start()
+                .gap(px(8.))
+                .child(glyph("icons/calendar.svg", 14., theme::warning()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(div().type_small().font_weight(theme::MEDIUM).text_color(theme::text()).child(head))
+                        .children(note.map(|text| div().type_small().text_color(theme::text_soft()).child(text))),
+                ),
+        )
+    }
+}
+
 impl Focusable for Composer {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.input.focus_handle(cx)
@@ -3915,6 +4118,7 @@ impl Render for Composer {
         let anchors = self.anchors.clone();
         // The row sits over the card's text, not its edge.
         dock.child(div().pl(px(13.)).child(self.typing.clone()))
+            .children(self.ooo_banner(&target))
             .children(self.send_options_bar(cx))
             .children(self.poll_composer_panel(cx))
             .child(div().relative().child(body).children(self.popover(cx)))
@@ -3985,6 +4189,7 @@ impl Shell {
             kind,
             link,
             space: open.space.clone(),
+            peer: open.peer.clone(),
             read_only: open.read_only,
             read_only_reason: open.read_only_reason.clone(),
             joined: open.joined,
@@ -4016,6 +4221,7 @@ impl Shell {
             kind: ConversationKind::Thread,
             link,
             space: None,
+            peer: None,
             read_only: false,
             read_only_reason: String::new(),
             joined: true,
@@ -4328,6 +4534,18 @@ impl Shell {
                 }
                 self.recording_ticking(cx);
             }
+            Change::People { account } => {
+                for composer in [self.composer_state.main.get(), self.composer_state.thread.get()].into_iter().flatten() {
+                    let (composer, account) = (composer.clone(), account.clone());
+                    cx.defer(move |cx| composer.update(cx, |composer, cx| composer.forget_peer_away_account(&account, cx)));
+                }
+            }
+            Change::Presence { person, .. } => {
+                for composer in [self.composer_state.main.get(), self.composer_state.thread.get()].into_iter().flatten() {
+                    let (composer, person) = (composer.clone(), person.clone());
+                    cx.defer(move |cx| composer.update(cx, |composer, cx| composer.forget_peer_away_person(&person, cx)));
+                }
+            }
             _ => {}
         }
         let Change::Messages { conversation } = change else {
@@ -4565,6 +4783,17 @@ mod tests {
     }
 
     #[test]
+    fn ooo_banner_formats_return_date_and_note() {
+        let (head, note) = ooo_banner_text("Dee Park", "Back Monday, ask Ben", Some(1_792_396_800));
+        assert_eq!(head, "Dee Park is out of office until Mon, Oct 19");
+        assert_eq!(note.as_deref(), Some("Back Monday, ask Ben"));
+
+        let (head_no_date, note_default) = ooo_banner_text("Ana Ruiz", "Out of office", None);
+        assert_eq!(head_no_date, "Ana Ruiz is out of office");
+        assert_eq!(note_default, None);
+    }
+
+    #[test]
     fn a_parked_draft_is_still_a_reply_until_that_reply_goes() {
         let parked = Draft { text: "On it".into(), reply: reply("m1"), ..Draft::default() };
         // Coming back takes a copy of what was parked: the message it answers comes with it.
@@ -4627,6 +4856,7 @@ mod tests {
             kind,
             link,
             space: None,
+            peer: None,
             read_only,
             read_only_reason: String::new(),
             blocked_peer: None,

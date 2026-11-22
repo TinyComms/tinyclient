@@ -190,6 +190,7 @@ struct Fake {
     heard: Mutex<Vec<String>>,
     pushed: AtomicU32,
     posted: AtomicU32,
+    mailbox_ooo: Mutex<Value>,
     /// Optional replacement payload for `/api/csa/api/v1/teams/users/me`.
     teams_override: Mutex<Option<Value>>,
 }
@@ -208,6 +209,12 @@ impl Fake {
             heard: Mutex::default(),
             pushed: AtomicU32::new(0),
             posted: AtomicU32::new(0),
+            mailbox_ooo: Mutex::new(json!({
+                "status": "disabled",
+                "externalAudience": "none",
+                "internalReplyMessage": "",
+                "externalReplyMessage": "",
+            })),
             teams_override: Mutex::default(),
         });
         let serving = fake.clone();
@@ -343,6 +350,13 @@ impl Fake {
                 body: b"sid-42:180:180:websocket,xhr-polling".to_vec(),
             },
             "/registrar/prod/V2/registrations" if bearer("spaces") && header("x-skypetoken") == skype => answer("202 Accepted", json!({})),
+            _ if call.method == "DELETE"
+                && path.starts_with("/registrar/prod/V2/registrations/")
+                && bearer("spaces")
+                && header("x-skypetoken") == skype =>
+            {
+                answer("202 Accepted", json!({}))
+            }
             _ if path.starts_with("/chat/") => {
                 if header("authentication") != format!("skypetoken={skype}") {
                     return unauthorized();
@@ -426,8 +440,16 @@ impl Fake {
     /// The chat service. `path` is what follows its address.
     fn chat(&self, call: &Call, path: &str) -> Reply {
         if path == "/v1/threads" && call.method == "POST" {
+            let body = call.json();
+            let target = if body["properties"]["topic"].as_str().is_some_and(|t| !t.is_empty())
+                || body["members"].as_array().is_some_and(|m| m.len() > 2)
+            {
+                "19:tagchat@thread.v2"
+            } else {
+                CHAT_DEE
+            };
             let mut created = answer("201 Created", json!({}));
-            created.headers.push(("Location", format!("{}/chat/v1/threads/{CHAT_DEE}", self.base)));
+            created.headers.push(("Location", format!("{}/chat/v1/threads/{target}", self.base)));
             return created;
         }
         if let Some(thread) = path.strip_prefix("/v1/threads/").and_then(|rest| rest.strip_suffix("/consumptionhorizons")) {
@@ -447,8 +469,18 @@ impl Fake {
                 return ok(json!({}));
             }
             let described = match thread {
+                CHAT_ANA => Some(json!({
+                    "id": thread,
+                    "properties": {"threadType": "chat"},
+                    "members": [{"id": ME, "role": "Admin"}, {"id": ANA, "role": "Admin"}]
+                })),
                 CHAT_DEE => self.fixture("thread.dee"),
                 GENERAL => self.fixture("thread.general"),
+                "19:tagchat@thread.v2" => Some(json!({
+                    "id": thread,
+                    "properties": {"threadType": "chat", "topic": "On-Call"},
+                    "members": [{"id": ME, "role": "Admin"}, {"id": ANA, "role": "Admin"}, {"id": BEN, "role": "Admin"}]
+                })),
                 "19:grp1@thread.v2" => Some(json!({"id": thread, "properties": {"threadType": "chat"}, "members": [{}, {}, {}]})),
                 _ => None,
             };
@@ -483,6 +515,9 @@ impl Fake {
                 ok(self.fixture(name).unwrap())
             }
             ("POST", "messages") => self.post(call, conversation),
+            ("POST", _) if tail.starts_with("messages/") && tail.ends_with("/invoke") => {
+                ok(json!({"statusCode": 200, "type": "application/vnd.microsoft.activity.message", "value": "OK"}))
+            }
             ("PUT", "properties") => ok(json!({})),
             ("DELETE", "") => ok(json!({})),
             ("PUT" | "DELETE", _) if tail.starts_with("messages/") => ok(json!({})),
@@ -524,10 +559,82 @@ impl Fake {
         answer("201 Created", json!({"OriginalArrivalTime": arrived}))
     }
 
-    /// Microsoft Graph's OneDrive: an upload session for a file, and a link to share it.
+    /// Microsoft Graph: OneDrive chat uploads + per-member `/invite`, channel SharePoint `filesFolder`, mailbox OOO, and user org/profile.
     fn graph(&self, call: &Call, path: &str) -> Reply {
+        if call.method == "GET" && path == "/v1.0/users/00000000-0000-4000-8000-0000000000a1" {
+            return ok(json!({
+                "id": "00000000-0000-4000-8000-0000000000a1",
+                "displayName": "Ana Ruiz",
+                "mail": "ana@contoso.com",
+                "userPrincipalName": "ana@contoso.com",
+                "jobTitle": "Staff Engineer",
+                "department": "Platform",
+                "officeLocation": "Lisbon — Floor 4",
+                "pronouns": "she/her",
+                "businessPhones": ["+351 21 555 0100"],
+                "mobilePhone": "+351 91 555 0199",
+                "mailboxSettings": {"timeZone": "GMT Standard Time"},
+                "userType": "Member",
+            }));
+        }
+        if call.method == "GET" && path == "/v1.0/users/00000000-0000-4000-8000-0000000000a1/manager" {
+            return ok(json!({
+                "id": "00000000-0000-4000-8000-0000000000b2",
+                "displayName": "Ben Okafor",
+                "jobTitle": "SRE",
+                "mail": "ben@contoso.com",
+                "department": "Platform",
+            }));
+        }
+        if call.method == "GET" && path == "/v1.0/users/00000000-0000-4000-8000-0000000000a1/directReports" {
+            return ok(json!({
+                "value": [{
+                    "id": "00000000-0000-4000-8000-0000000000c3",
+                    "displayName": "Cy Tran",
+                    "jobTitle": "Designer",
+                    "mail": "cy@contoso.com",
+                    "department": "Design",
+                }]
+            }));
+        }
+        if call.method == "GET" && path.starts_with("/v1.0/users/00000000-0000-4000-8000-0000000000d4") {
+            return answer("403 Forbidden", json!({"error": {"code": "Authorization_RequestDenied"}}));
+        }
+        if call.method == "GET" && path == "/v1.0/me/mailboxSettings/automaticRepliesSetting" {
+            return ok(self.mailbox_ooo.lock().unwrap().clone());
+        }
+        if call.method == "PATCH" && path == "/v1.0/me/mailboxSettings" {
+            let body = call.json();
+            if body["automaticRepliesSetting"].is_object() {
+                *self.mailbox_ooo.lock().unwrap() = body["automaticRepliesSetting"].clone();
+            }
+            return ok(json!({"automaticRepliesSetting": self.mailbox_ooo.lock().unwrap().clone()}));
+        }
         if call.method == "POST" && path.starts_with("/v1.0/me/drive/root:/Microsoft Teams Chat Files/") && path.ends_with(":/createUploadSession") {
             return ok(json!({"uploadUrl": format!("{}/upload/session-1?sig=x", self.base), "expirationDateTime": "2026-10-15T00:00:00Z"}));
+        }
+        if call.method == "POST" && path.starts_with("/v1.0/me/drive/items/") && path.ends_with("/invite") {
+            let body = call.json();
+            let has_guest = body["recipients"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|r| r["email"].as_str() == Some("dee@contoso.com"));
+            if has_guest {
+                return answer("403 Forbidden", json!({"error": {"code": "accessDenied", "message": "External sharing is disabled by tenant policy."}}));
+            }
+            return ok(json!({"value": [{"id": "perm-1", "roles": ["read"]}]}));
+        }
+        if call.method == "GET" && path.starts_with("/v1.0/teams/") && path.ends_with("/filesFolder") {
+            return ok(json!({
+                "id": "FOLDER_CH1",
+                "name": "General",
+                "parentReference": {"driveId": "DRIVE_TEAM1"},
+                "webUrl": "https://contoso.sharepoint.com/sites/Platform/Shared Documents/General",
+            }));
+        }
+        if call.method == "POST" && path.starts_with("/v1.0/drives/DRIVE_TEAM1/items/FOLDER_CH1:/") && path.ends_with(":/createUploadSession") {
+            return ok(json!({"uploadUrl": format!("{}/upload/channel-session-1?sig=x", self.base), "expirationDateTime": "2026-10-15T00:00:00Z"}));
         }
         if call.method == "POST" && path.starts_with("/v1.0/me/drive/items/") && path.ends_with("/createLink") {
             return ok(json!({"link": {"type": "view", "scope": "organization", "webUrl": "https://contoso-my.sharepoint.com/:t:/g/personal/me/share-1"}}));
@@ -542,6 +649,12 @@ impl Fake {
         let end: u64 = span.split_once('-').and_then(|(_, end)| end.parse().ok()).unwrap_or(0);
         if end + 1 < total.parse::<u64>().unwrap_or(0) {
             return answer("202 Accepted", json!({"nextExpectedRanges": [format!("{}-", end + 1)]}));
+        }
+        if call.path.contains("channel-session") {
+            return answer("201 Created", json!({
+                "id": "01CHANITEM", "name": "report.txt", "size": total.parse::<u64>().unwrap_or(0),
+                "webUrl": "https://contoso.sharepoint.com/sites/Platform/Shared Documents/General/report.txt",
+            }));
         }
         answer("201 Created", json!({
             "id": "01ITEM", "name": "notes.txt", "size": total.parse::<u64>().unwrap_or(0),
@@ -563,6 +676,31 @@ impl Fake {
             let query = call.body.to_lowercase();
             let found: Vec<&Value> = users.iter().filter(|user| user["displayName"].as_str().unwrap().to_lowercase().contains(&query)).collect();
             return ok(json!({"type": "Microsoft.SkypeSpaces.MiddleTier.Models.IUserIdentity", "value": found}));
+        }
+        if call.path.ends_with("/tags") && call.path.contains("/beta/teams/") {
+            return ok(json!({
+                "tags": [
+                    {
+                        "id": "tag-oncall",
+                        "displayName": "On-Call",
+                        "description": "Incident responders",
+                        "memberCount": 2,
+                        "members": [
+                            {"mri": ME, "displayName": "Me Myself"},
+                            {"mri": ANA, "displayName": "Ana Ruiz"}
+                        ]
+                    },
+                    {
+                        "id": "tag-design",
+                        "displayName": "Design",
+                        "description": "Product design",
+                        "memberCount": 1,
+                        "members": [
+                            {"mri": "8:orgid:00000000-0000-4000-8000-0000000000c3", "displayName": "Cy Tran"}
+                        ]
+                    }
+                ]
+            }));
         }
         if call.path.ends_with("/v1/urlpreview") {
             let asked = call.json();
@@ -1314,6 +1452,10 @@ fn people_are_searched_watched_and_called_through_the_official_app() {
     assert!(matches!(world.ask(Request::StartDirect { person: key(DEE) }), Response::Conversation { conversation } if conversation.key.id == CHAT_DEE));
     assert_eq!(world.fake.calls("POST", "/chat/v1/threads").len(), 1);
 
+    // Opening the card asks for her presence, so the change is in the log from here.
+    let Response::Status { seq, .. } = world.ask(Request::Status) else {
+        panic!("no status");
+    };
     // A person's card says what their organization says of them.
     let Response::Profile { profile } = world.ask(Request::Profile { person: key(ANA), space: None }) else {
         panic!("no profile");
@@ -1321,12 +1463,12 @@ fn people_are_searched_watched_and_called_through_the_official_app() {
     // Title, department and email each in their place; nothing left as a bio.
     assert_eq!((profile.person.name.as_str(), profile.bio.as_str()), ("Ana Ruiz", ""));
     assert_eq!((profile.title.as_str(), profile.department.as_str()), ("Staff Engineer", "Platform"));
-    assert_eq!(profile.contacts.iter().map(|contact| contact.value.as_str()).collect::<Vec<_>>(), ["ana@contoso.com"]);
+    assert_eq!(
+        profile.contacts.iter().map(|contact| contact.value.as_str()).collect::<Vec<_>>(),
+        ["ana@contoso.com", "+351 21 555 0100", "+351 91 555 0199"]
+    );
 
     // Presence is asked for exactly who is on screen, together.
-    let Response::Status { seq, .. } = world.ask(Request::Status) else {
-        panic!("no status");
-    };
     let watch = || Request::Watch(Watching { people: vec![key(ANA)], ..Watching::default() });
     let seen = world.until("Ana's presence", || match world.ask(watch()) {
         Response::Watching { people, .. } => people.into_iter().find(|person| person.presence != Presence::Unknown),
@@ -1345,12 +1487,16 @@ fn people_are_searched_watched_and_called_through_the_official_app() {
     });
     // What she is doing comes before her note.
     assert_eq!(told, Some((Presence::Busy, "In a meeting".to_owned())));
-    let presence = world.fake.calls("POST", "/presence/v1/presence/getpresence/");
-    assert_eq!(presence[0].json(), json!([{"mri": ANA}, {"mri": ME}]), "who is on screen, and me");
+    // Opening the card asks for her alone. The watch then asks for her and me, on the adapter thread.
+    let together = json!([{"mri": ANA}, {"mri": ME}]);
+    world.until("who is on screen, and me", || {
+        world.fake.calls("POST", "/presence/v1/presence/getpresence/").into_iter().any(|call| call.json() == together).then_some(())
+    });
     // Asked again at once for the same people, Teams is not asked again.
+    let asked = world.fake.calls("POST", "/presence/v1/presence/getpresence/").len();
     world.ask(watch());
     sleep(Duration::from_millis(400));
-    assert_eq!(world.fake.calls("POST", "/presence/v1/presence/getpresence/").len(), 1);
+    assert_eq!(world.fake.calls("POST", "/presence/v1/presence/getpresence/").len(), asked);
 
     // My own presence is set only when I ask.
     assert!(world.fake.calls("PUT", "/presence/v1/me/forceavailability/").is_empty());
@@ -1477,8 +1623,8 @@ fn mentions_missed_while_closed_info_mute_seen_hidden_chats_and_files_through_on
     assert_eq!((profile.away.as_str(), profile.away_until), ("Back Monday, ask Ben", Some(1_792_396_800)));
     assert_eq!((profile.title.as_str(), profile.department.as_str()), ("Product Manager", "Product"));
 
-    // A file is refused until it can be shared with the chat's members alone: an
-    // organization-wide link is not what the Teams app makes. Nothing reaches OneDrive.
+    // A file in a 1:1 chat uploads to OneDrive and shares ONLY with the chat's members via
+    // Graph `/invite` — never an organization-wide `/createLink`.
     // On Windows "/tmp" has no drive; chatd takes only absolute paths.
     let staged = std::path::absolute(format!("/tmp/tinyclient-teams-file-{}", std::process::id())).unwrap();
     std::fs::create_dir_all(&staged).unwrap();
@@ -1490,10 +1636,18 @@ fn mentions_missed_while_closed_info_mute_seen_hidden_chats_and_files_through_on
     };
     let asked = Request::Send { conversation: key(CHAT_ANA), client_id: "88001".into(), text: "notes attached".into(), reply_to: None, with };
     let answer = world.ask(asked);
-    assert!(!matches!(answer, Response::Sent { .. }), "a file went to Teams: {answer:?}");
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    assert!(world.fake.calls("POST", ":/createUploadSession").is_empty());
-    assert!(world.fake.calls("POST", "/createLink").is_empty());
+    assert!(matches!(answer, Response::Sent { .. }), "chat file send failed: {answer:?}");
+    world.until("chat file message sent", || {
+        world.messages(&key(CHAT_ANA)).into_iter().find(|m| m.client_id.as_deref() == Some("88001") && m.state == SendState::Sent)
+    });
+    assert!(!world.fake.calls("POST", ":/createUploadSession").is_empty());
+    let invites = world.fake.calls("POST", "/v1.0/me/drive/items/01ITEM/invite");
+    assert_eq!(invites.len(), 1, "expected per-member invite");
+    let invite_body = invites[0].json();
+    assert_eq!(invite_body["recipients"][0]["email"].as_str(), Some("ana@contoso.com"));
+    assert_eq!(invite_body["requireSignIn"], true);
+    assert_eq!(invite_body["sendInvitation"], false);
+    assert!(world.fake.calls("POST", "/createLink").is_empty(), "must never create an organization-wide link");
     let _ = std::fs::remove_dir_all(&staged);
 }
 
@@ -2366,6 +2520,643 @@ fn important_and_urgent_messages_are_parsed_and_sent_with_properties_importance(
 }
 
 #[test]
+fn signing_out_removes_push_registration_for_signed_out_tenant() {
+    let world = World::start();
+    world.ready();
+
+    // Wait until trouter registered the endpoint id.
+    let reg_id = world.until("initial push registration", || {
+        world
+            .fake
+            .calls("POST", "/registrar/prod/V2/registrations")
+            .into_iter()
+            .find_map(|c| c.json()["registrationId"].as_str().map(str::to_owned))
+    });
+    assert!(!reg_id.is_empty());
+
+    // Sign out of the home tenant; only that tenant's push registration should be deleted.
+    // The answer is status, as every other network's sign-out is: the home account is gone and
+    // the guest tenant stays Expired with the refusal it already had at connect. No token is
+    // minted on the way to the registrar DELETE.
+    let minted = world.fake.calls("POST", "/oauth2/v2.0/token").len();
+    let answer = world.ask(Request::SignOut {
+        account: protocol::AccountKey {
+            network: Network::Teams,
+            account: HOME.to_owned(),
+        },
+        erase: false,
+    });
+    let Response::Status { accounts, .. } = answer else {
+        panic!("sign-out returns status: {answer:?}");
+    };
+    assert!(accounts.iter().all(|status| status.key.account != HOME), "home tenant is signed out: {accounts:?}");
+    assert!(
+        accounts.iter().any(|status| status.key.account == GUEST && status.link == Link::Expired),
+        "the other tenant is left as it was: {accounts:?}"
+    );
+    assert_eq!(world.fake.calls("POST", "/oauth2/v2.0/token").len(), minted, "sign-out must not refresh a token");
+
+    let delete_path = format!("/registrar/prod/V2/registrations/{reg_id}");
+    let deleted = world.until("registrar DELETE on sign-out", || {
+        world.fake.calls("DELETE", &delete_path).into_iter().next()
+    });
+    assert!(
+        deleted.headers.get("authorization").is_some_and(|v| v.starts_with("Bearer at.spaces.")),
+        "DELETE carries spaces bearer: {:?}",
+        deleted.headers
+    );
+    assert!(
+        deleted.headers.contains_key("x-skypetoken"),
+        "DELETE carries X-Skypetoken: {:?}",
+        deleted.headers
+    );
+}
+
+#[test]
+fn sending_files_in_channels_uses_sharepoint_folder_and_refused_external_invite_fails_clearly() {
+    let world = World::start();
+    world.ready();
+    let general = key(GENERAL);
+    world.open(&general, 2);
+
+    // Account advertises file upload capabilities.
+    assert!(world.account(HOME).can.max_file_bytes > 0);
+    assert!(world.account(HOME).can.max_files > 0);
+
+    let staged = std::path::absolute(format!("/tmp/tinyclient-teams-chfile-{}", std::process::id())).unwrap();
+    std::fs::create_dir_all(&staged).unwrap();
+    let report = staged.join("report.txt");
+    std::fs::write(&report, b"quarterly report").unwrap();
+
+    // 1. Channel upload goes to the channel's SharePoint filesFolder (no /invite, no /createLink).
+    let with = protocol::Outgoing {
+        files: vec![protocol::OutgoingFile {
+            path: report.to_string_lossy().into_owned(),
+            name: String::new(),
+            spoiler: false,
+            as_file: false,
+            original: false,
+            view_once: false,
+            media: None,
+        }],
+        ..Default::default()
+    };
+    let sent = world.ask(Request::Send {
+        conversation: general.clone(),
+        client_id: "88002".into(),
+        text: "Channel report".into(),
+        reply_to: None,
+        with,
+    });
+    assert!(matches!(sent, Response::Sent { .. }), "{sent:?}");
+    world.until("channel file message sent", || {
+        world
+            .messages(&general)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("88002") && m.state == SendState::Sent)
+    });
+    assert!(!world.fake.calls("GET", "/filesFolder").is_empty(), "queried channel filesFolder");
+    assert!(
+        !world.fake.calls("POST", "/v1.0/drives/DRIVE_TEAM1/items/FOLDER_CH1:/report.txt:/createUploadSession").is_empty(),
+        "uploaded to channel SharePoint drive"
+    );
+    assert!(world.fake.calls("POST", "/invite").is_empty(), "channels do not call /invite");
+    assert!(world.fake.calls("POST", "/createLink").is_empty(), "must never call /createLink");
+    let ch_post = world
+        .fake
+        .calls("POST", &format!("/chat/v1/users/ME/conversations/{GENERAL}/messages"))
+        .into_iter()
+        .find(|c| c.json()["clientmessageid"] == "88002")
+        .expect("channel message POST");
+    let files_prop: Vec<Value> = serde_json::from_str(ch_post.json()["properties"]["files"].as_str().unwrap()).unwrap();
+    assert_eq!(files_prop[0]["permissionScope"].as_str(), Some("channel"));
+    assert_eq!(files_prop[0]["fileChicletState"]["serviceName"].as_str(), Some("sharepoint"));
+
+    // 2. Chat with a guest whose /invite returns 403 surfaces a clear policy refusal and does not post.
+    let Response::Conversation { conversation: dee_row } = world.ask(Request::StartDirect { person: key(DEE) }) else {
+        panic!("expected Response::Conversation for Dee");
+    };
+    let dee_chat = dee_row.key;
+    let with_guest = protocol::Outgoing {
+        files: vec![protocol::OutgoingFile {
+            path: report.to_string_lossy().into_owned(),
+            name: String::new(),
+            spoiler: false,
+            as_file: false,
+            original: false,
+            view_once: false,
+            media: None,
+        }],
+        ..Default::default()
+    };
+    let guest_sent = world.ask(Request::Send {
+        conversation: dee_chat.clone(),
+        client_id: "88003".into(),
+        text: "For Dee".into(),
+        reply_to: None,
+        with: with_guest,
+    });
+    assert!(matches!(guest_sent, Response::Sent { .. }), "{guest_sent:?}");
+    let failed = world.until("guest file send failed", || {
+        world
+            .messages(&dee_chat)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("88003") && matches!(m.state, SendState::Failed { .. }))
+    });
+    let SendState::Failed { reason: err_msg } = failed.state else {
+        panic!("expected SendState::Failed");
+    };
+    assert!(
+        err_msg.contains("external") || err_msg.contains("guest"),
+        "expected clear guest/external policy error, got: {err_msg:?}"
+    );
+    assert!(
+        world
+            .fake
+            .calls("POST", &format!("/chat/v1/users/ME/conversations/{CHAT_DEE}/messages"))
+            .into_iter()
+            .all(|c| c.json()["clientmessageid"] != "88003"),
+        "failed invite must not post message"
+    );
+    let _ = std::fs::remove_dir_all(&staged);
+}
+
+#[test]
+fn out_of_office_profile_fetches_presence_and_mailbox_settings_round_trip() {
+    let world = World::start();
+    world.ready();
+    assert!(world.account(HOME).can.out_of_office);
+
+    // 1. Opening Dee's profile directly (with NO prior Request::Watch) fetches presence so OOO appears.
+    let Response::Profile { profile } = world.ask(Request::Profile { person: key(DEE), space: None }) else {
+        panic!("expected Response::Profile for Dee");
+    };
+    assert_eq!(profile.away, "Back Monday, ask Ben");
+    assert_eq!(profile.away_until, Some(1_792_396_800));
+
+    // 2. Reading our own automatic replies queries Graph mailboxSettings.
+    let account = protocol::AccountKey {
+        network: Network::Teams,
+        account: HOME.to_owned(),
+    };
+    let Response::OutOfOffice { ooo } = world.ask(Request::GetOutOfOffice { account: account.clone() }) else {
+        panic!("expected Response::OutOfOffice");
+    };
+    assert!(!ooo.enabled);
+
+    // 3. Updating automatic replies sends PATCH /v1.0/me/mailboxSettings and updates own profile OOO.
+    let wanted = protocol::OutOfOffice {
+        enabled: true,
+        message: "Out at summit, back Thursday".to_owned(),
+        start: Some(1_792_396_800),
+        end: Some(1_792_656_000),
+        send_external: true,
+        external_message: "External: back Thursday".to_owned(),
+    };
+    let Response::OutOfOffice { ooo: saved } = world.ask(Request::SetOutOfOffice {
+        account: account.clone(),
+        ooo: wanted.clone(),
+    }) else {
+        panic!("expected Response::OutOfOffice after set");
+    };
+    assert_eq!(saved, wanted);
+    let patch = world
+        .fake
+        .calls("PATCH", "/graph/v1.0/me/mailboxSettings")
+        .pop()
+        .expect("PATCH mailboxSettings reached Graph");
+    let sent = patch.json();
+    assert_eq!(sent["automaticRepliesSetting"]["status"].as_str(), Some("scheduled"));
+    assert_eq!(sent["automaticRepliesSetting"]["internalReplyMessage"].as_str(), Some("Out at summit, back Thursday"));
+    assert_eq!(sent["automaticRepliesSetting"]["externalAudience"].as_str(), Some("all"));
+    assert_eq!(sent["automaticRepliesSetting"]["externalReplyMessage"].as_str(), Some("External: back Thursday"));
+
+    // Reading back confirms Graph persisted it.
+    let Response::OutOfOffice { ooo: reread } = world.ask(Request::GetOutOfOffice { account }) else {
+        panic!("expected Response::OutOfOffice on re-read");
+    };
+    assert_eq!(reread, wanted);
+}
+
+#[test]
+fn rich_org_card_populates_phones_office_local_time_org_chart_and_refreshes_avatar() {
+    let world = World::start();
+    world.ready();
+
+    // 1. Ana's profile pulls Graph user details, manager, and direct reports.
+    let Response::Profile { profile } = world.ask(Request::Profile { person: key(ANA), space: None }) else {
+        panic!("expected Response::Profile for Ana");
+    };
+    assert_eq!(profile.office, "Lisbon — Floor 4");
+    assert_eq!(profile.pronouns, "she/her");
+    assert_eq!(profile.time_zone, "GMT Standard Time");
+    assert_eq!(profile.utc_offset, Some(0));
+    let phones: Vec<(&str, bool)> = profile
+        .contacts
+        .iter()
+        .filter(|c| c.kind == protocol::ContactKind::Phone)
+        .map(|c| (c.value.as_str(), c.masked))
+        .collect();
+    assert_eq!(phones, [("+351 21 555 0100", true), ("+351 91 555 0199", true)]);
+    let manager = profile.manager.as_ref().expect("manager populated");
+    assert_eq!(manager.key, key(BEN));
+    assert_eq!(manager.name, "Ben Okafor");
+    assert_eq!(profile.reports.len(), 1);
+    assert_eq!(profile.reports[0].key, key("8:orgid:00000000-0000-4000-8000-0000000000c3"));
+    assert_eq!(profile.reports[0].name, "Cy Tran");
+
+    // 2. Guest whose Graph user endpoint returns 403 still returns short-profile fields cleanly.
+    let Response::Profile { profile: dee } = world.ask(Request::Profile { person: key(DEE), space: None }) else {
+        panic!("expected Response::Profile for guest Dee");
+    };
+    assert_eq!(dee.title, "Product Manager");
+    assert_eq!(dee.office, "Lisbon");
+    assert!(dee.manager.is_none());
+}
+
+#[test]
+fn polls_praise_and_approvals_cards_render_vote_create_and_act() {
+    let world = World::start();
+    world.ready();
+    let ana = key(CHAT_ANA);
+    world.open(&ana, 3);
+
+    // 1. Account advertises poll capability.
+    let poll_can = world.account(HOME).can.polls.expect("Teams advertises polls");
+    assert!(poll_can.max_options >= 10 && poll_can.multiple && poll_can.anonymous);
+
+    // 2. Push incoming Poll, Praise, and Approval Adaptive Cards.
+    let mut poll_msg = message(CHAT_ANA, None, 1_760_000_860_001, ANA, "Ana Ruiz", "");
+    poll_msg["messagetype"] = "RichText/Html".into();
+    poll_msg["properties"] = json!({
+        "cards": json!([{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "appId": "ef56c0de-36fc-4ef8-b417-3d82ba9d073c",
+            "content": json!({
+                "type": "AdaptiveCard",
+                "version": "1.5",
+                "body": [
+                    {"type": "TextBlock", "text": "Lunch today?", "weight": "bolder", "size": "medium"},
+                    {
+                        "type": "Input.ChoiceSet",
+                        "id": "pollChoice",
+                        "isMultiSelect": false,
+                        "choices": [
+                            {"title": "Ramen", "value": "opt_ramen"},
+                            {"title": "Tacos", "value": "opt_tacos"}
+                        ]
+                    }
+                ],
+                "actions": [{"type": "Action.Submit", "title": "Submit vote", "data": {"pollId": "p-99", "action": "vote"}}]
+            }).to_string()
+        }]).to_string()
+    });
+
+    let mut praise_msg = message(CHAT_ANA, None, 1_760_000_860_002, ANA, "Ana Ruiz", "");
+    praise_msg["messagetype"] = "RichText/Html".into();
+    praise_msg["properties"] = json!({
+        "cards": json!([{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "appId": "a6b63365-31a4-4f43-92ec-710b71557af9",
+            "content": json!({
+                "type": "AdaptiveCard",
+                "version": "1.5",
+                "body": [
+                    {"type": "TextBlock", "text": "Ana sent praise to Ben Okafor"},
+                    {"type": "TextBlock", "text": "Awesome", "weight": "bolder", "size": "large"},
+                    {"type": "TextBlock", "text": "Great launch!"}
+                ]
+            }).to_string()
+        }]).to_string()
+    });
+
+    let mut approval_msg = message(CHAT_ANA, None, 1_760_000_860_003, ANA, "Ana Ruiz", "");
+    approval_msg["messagetype"] = "RichText/Html".into();
+    approval_msg["properties"] = json!({
+        "cards": json!([{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "appId": "7c316234-ded0-4f95-8a83-8453d0876592",
+            "content": json!({
+                "type": "AdaptiveCard",
+                "version": "1.5",
+                "body": [
+                    {"type": "TextBlock", "text": "Deploy hotfix #12", "weight": "bolder", "size": "medium"},
+                    {"type": "FactSet", "facts": [
+                        {"title": "Requester", "value": "Ana Ruiz"},
+                        {"title": "Status", "value": "Requested"}
+                    ]}
+                ],
+                "actions": [
+                    {"type": "Action.Submit", "id": "approve", "title": "Approve", "data": {"approvalId": "a-12", "decision": "Approve"}},
+                    {"type": "Action.Submit", "id": "reject", "title": "Reject", "data": {"approvalId": "a-12", "decision": "Reject"}}
+                ]
+            }).to_string()
+        }]).to_string()
+    });
+
+    for m in [poll_msg, praise_msg, approval_msg] {
+        world.fake.push("NewMessage", m, false);
+    }
+    world.until("poll, praise, and approval messages stored", || {
+        let msgs = world.messages(&ana);
+        ["1760000860001", "1760000860002", "1760000860003"]
+            .iter()
+            .all(|id| msgs.iter().any(|m| m.id == *id))
+            .then_some(())
+    });
+
+    let p = world.message(&ana, "1760000860001").unwrap();
+    let poll = p.poll.as_ref().expect("native poll on message");
+    assert_eq!(poll.question, "Lunch today?");
+    assert_eq!(poll.choices.len(), 2);
+
+    let pr = world.message(&ana, "1760000860002").unwrap();
+    let pr_card = pr.card.as_ref().expect("praise card");
+    assert_eq!(pr_card.author, "Praise");
+    assert_eq!(pr_card.title, "Awesome");
+    assert_eq!(pr_card.fields, vec![("To".into(), "Ben Okafor".into())]);
+
+    let ap = world.message(&ana, "1760000860003").unwrap();
+    let ap_card = ap.card.as_ref().expect("approval card");
+    assert_eq!(ap_card.author, "Approval");
+    assert_eq!(ap_card.title, "Deploy hotfix #12");
+    assert_eq!(ap.controls.len(), 2);
+    assert_eq!(ap.controls[0].label, "Approve");
+    assert_eq!(ap.controls[1].label, "Reject");
+
+    // 3. Vote on the poll via Request::Poll -> hits /invoke and updates local mine.
+    let vote_res = world.ask(Request::Poll {
+        conversation: ana.clone(),
+        message_id: "1760000860001".to_owned(),
+        votes: Some(vec![1]),
+    });
+    assert!(matches!(vote_res, Response::Ok), "{vote_res:?}");
+    let vote_call = world
+        .fake
+        .calls("POST", "/messages/1760000860001/invoke")
+        .pop()
+        .expect("poll vote invoke reached Teams");
+    assert_eq!(vote_call.json()["value"]["action"]["data"]["pollChoice"].as_str(), Some("opt_tacos"));
+    let updated_poll = world.message(&ana, "1760000860001").unwrap().poll.unwrap();
+    assert_eq!(updated_poll.mine, vec![1]);
+    assert_eq!(updated_poll.choices[1].count, 1);
+
+    // 4. Approve via Request::MessageAction -> hits /invoke with approval data.
+    let act_res = world.ask(Request::MessageAction {
+        conversation: ana.clone(),
+        message_id: "1760000860003".to_owned(),
+        block_id: ap.controls[0].block_id.clone(),
+        action_id: ap.controls[0].action_id.clone(),
+        element_type: ap.controls[0].element_type.clone(),
+        value: ap.controls[0].value.clone(),
+        values: Vec::new(),
+    });
+    assert!(matches!(act_res, Response::Ok), "{act_res:?}");
+    let apr_call = world
+        .fake
+        .calls("POST", "/messages/1760000860003/invoke")
+        .pop()
+        .expect("approval invoke reached Teams");
+    assert_eq!(apr_call.json()["value"]["action"]["data"]["decision"].as_str(), Some("Approve"));
+
+    // 5. Create a new poll via Request::Send with Outgoing::poll.
+    let created = world.ask(Request::Send {
+        conversation: ana.clone(),
+        client_id: "1760000999000650".to_owned(),
+        text: String::new(),
+        reply_to: None,
+        with: protocol::Outgoing {
+            poll: Some(protocol::PollDraft {
+                question: "Release day?".to_owned(),
+                options: vec!["Tuesday".to_owned(), "Wednesday".to_owned()],
+                multiple: false,
+                duration_secs: None,
+                anonymous: true,
+            }),
+            ..protocol::Outgoing::default()
+        },
+    });
+    assert!(matches!(created, Response::Sent { .. }), "{created:?}");
+    let sent_poll = world.until("created poll stored", || {
+        world
+            .messages(&ana)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("1760000999000650") && m.state == SendState::Sent)
+    });
+    let sp = sent_poll.poll.as_ref().expect("created message carries native poll");
+    assert_eq!(sp.question, "Release day?");
+    assert_eq!(sp.choices.len(), 2);
+    assert!(sp.anonymous);
+}
+
+#[test]
+fn active_presence_heartbeat_privacy_toggle_timed_status_and_reset() {
+    let world = World::start();
+    world.ready();
+
+    let account = protocol::AccountKey {
+        network: Network::Teams,
+        account: HOME.to_owned(),
+    };
+
+    // 1. Focused + active Watch triggers trouter `user.activity` = "active".
+    let _ = world.ask(Request::Watch(Watching {
+        focused: true,
+        active: true,
+        ..Watching::default()
+    }));
+    world.until("user.activity active frame", || {
+        world
+            .fake
+            .heard
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|f| f.contains("\"user.activity\"") && f.contains("\"active\""))
+            .then_some(())
+    });
+
+    // 2. Unfocused / idle transitions to `user.activity` = "inactive".
+    let _ = world.ask(Request::Watch(Watching {
+        focused: false,
+        active: false,
+        ..Watching::default()
+    }));
+    world.until("user.activity inactive frame", || {
+        world
+            .fake
+            .heard
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|f| f.contains("\"user.activity\"") && f.contains("\"inactive\""))
+            .then_some(())
+    });
+
+    // 3. Turning off Privacy `presence_activity` suppresses future "active" heartbeats.
+    let scope = protocol::settings::account_scope(&account);
+    assert_eq!(
+        world.ask(Request::Set {
+            scope,
+            key: protocol::settings::PRESENCE_ACTIVITY.to_owned(),
+            value: Some("off".to_owned()),
+        }),
+        Response::Ok
+    );
+    let active_before = world
+        .fake
+        .heard
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|f| f.contains("\"user.activity\"") && f.contains("\"active\""))
+        .count();
+    let _ = world.ask(Request::Watch(Watching {
+        focused: true,
+        active: true,
+        ..Watching::default()
+    }));
+    sleep(Duration::from_millis(2500));
+    let active_after = world
+        .fake
+        .heard
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|f| f.contains("\"user.activity\"") && f.contains("\"active\""))
+        .count();
+    assert_eq!(active_after, active_before, "privacy opt-out must suppress active heartbeats");
+
+    // 4. Timed forced availability sends `expiry` to forceavailability.
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Busy,
+            status: Some("Deep work".to_owned()),
+            status_emoji: None,
+            clear_at: Some(1_800_000_000),
+        }),
+        Response::Ok
+    );
+    let put = world
+        .fake
+        .calls("PUT", "/presence/v1/me/forceavailability/")
+        .pop()
+        .expect("timed forceavailability PUT");
+    assert_eq!(put.json()["availability"].as_str(), Some("Busy"));
+    assert_eq!(put.json()["expiry"].as_str(), Some("2027-01-15T08:00:00.000Z"));
+    let note = world
+        .fake
+        .calls("PUT", "/presence/v1/me/publishnote")
+        .pop()
+        .expect("timed publishnote PUT");
+    assert_eq!(note.json()["expiry"].as_str(), Some("2027-01-15T08:00:00.000Z"));
+
+    // 5. Reset status (`Presence::Unknown`, `status: None`) sends DELETE /v1/me/forceavailability/.
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account,
+            presence: Presence::Unknown,
+            status: None,
+            status_emoji: None,
+            clear_at: None,
+        }),
+        Response::Ok
+    );
+    assert!(
+        !world.fake.calls("DELETE", "/presence/v1/me/forceavailability/").is_empty(),
+        "Reset status must DELETE /v1/me/forceavailability/"
+    );
+}
+
+#[test]
+fn team_tags_fetch_mentions_me_outgoing_wire_format_and_group_chat() {
+    let world = World::start();
+    world.ready();
+    let general = key(GENERAL);
+    world.open(&general, 2);
+
+    // 1. SpaceTags and SpaceInfo expose the team's tags with member counts and `mine`.
+    let Response::SpaceTags { tags, .. } = world.ask(Request::SpaceTags { space: general.clone() }) else {
+        panic!("expected Response::SpaceTags");
+    };
+    assert_eq!(tags.len(), 2);
+    let design = tags.iter().find(|t| t.id == "tag-design").expect("Design tag");
+    let oncall = tags.iter().find(|t| t.id == "tag-oncall").expect("On-Call tag");
+    assert!(!design.mine && design.member_count == 1);
+    assert!(oncall.mine && oncall.member_count == 2);
+    assert_eq!(oncall.members.len(), 2);
+
+    let Response::SpaceInfo { info } = world.ask(Request::SpaceInfo { space: general.clone() }) else {
+        panic!("expected Response::SpaceInfo");
+    };
+    assert_eq!(info.tags.len(), 2);
+
+    // 2. Incoming message mentioning our tag sets `mentions_me = true`; another tag keeps it false.
+    let mut ping_mine = message(GENERAL, Some("1760000880001"), 1_760_000_880_001, ANA, "Ana Ruiz", "<p><at id=\"0\">On-Call</at> alert!</p>");
+    ping_mine["properties"] = json!({
+        "mentions": json!([{"id": 0, "mri": "tag-oncall", "mentionType": "tag", "displayName": "On-Call"}]).to_string()
+    });
+    let mut ping_other = message(GENERAL, Some("1760000880002"), 1_760_000_880_002, ANA, "Ana Ruiz", "<p><at id=\"0\">Design</at> fyi</p>");
+    ping_other["properties"] = json!({
+        "mentions": json!([{"id": 0, "mri": "tag-design", "mentionType": "tag", "displayName": "Design"}]).to_string()
+    });
+    world.fake.push("NewMessage", ping_mine, false);
+    world.fake.push("NewMessage", ping_other, false);
+    world.until("both tag mention messages stored", || {
+        let msgs = world.messages(&general);
+        ["1760000880001", "1760000880002"]
+            .iter()
+            .all(|id| msgs.iter().any(|m| m.id == *id))
+            .then_some(())
+    });
+    let mine_msg = world.message(&general, "1760000880001").unwrap();
+    assert!(mine_msg.mentions_me, "tag we belong to must set mentions_me");
+    let other_msg = world.message(&general, "1760000880002").unwrap();
+    assert!(!other_msg.mentions_me, "tag we do not belong to must not set mentions_me");
+
+    // 3. Outgoing message with `<@&tag-oncall|On-Call>` posts `mentionType: "tag"` on the wire.
+    let sent = world.ask(Request::Send {
+        conversation: general.clone(),
+        client_id: "1760000999000667".to_owned(),
+        text: "Paging <@&tag-oncall|On-Call>".to_owned(),
+        reply_to: None,
+        with: protocol::Outgoing::default(),
+    });
+    assert!(matches!(sent, Response::Sent { .. }), "{sent:?}");
+    world.until("outgoing tag mention accepted", || {
+        world
+            .messages(&general)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("1760000999000667") && m.state == SendState::Sent)
+    });
+    let post = world
+        .fake
+        .calls("POST", &format!("/chat/v1/users/ME/conversations/{GENERAL}/messages"))
+        .into_iter()
+        .find(|c| c.json()["clientmessageid"] == "1760000999000667")
+        .expect("tag mention POST");
+    let mentions: Vec<Value> = serde_json::from_str(post.json()["properties"]["mentions"].as_str().unwrap()).unwrap();
+    assert_eq!(mentions[0]["mentionType"].as_str(), Some("tag"));
+    assert_eq!(mentions[0]["mri"].as_str(), Some("tag-oncall"));
+
+    // 4. Starting a group chat from a tag's members creates the chat with the tag's name as topic.
+    assert!(world.account(HOME).can.groups > 0);
+    let Response::Conversation { conversation: group_chat } = world.ask(Request::StartGroup {
+        account: protocol::AccountKey {
+            network: Network::Teams,
+            account: HOME.to_owned(),
+        },
+        people: vec![key(ANA), key(BEN)],
+        title: Some("On-Call".to_owned()),
+    }) else {
+        panic!("expected Response::Conversation from StartGroup");
+    };
+    assert_eq!(group_chat.key.id, "19:tagchat@thread.v2");
+    assert_eq!(group_chat.title, "On-Call");
+}
+
+#[test]
 fn activity_feed_lists_mentions_replies_reactions_missed_calls_and_marks_read() {
     let world = World::start();
     world.ready();
@@ -2480,13 +3271,14 @@ fn inline_pasted_images_upload_to_ams_and_send_as_richtext_html() {
     let ana = key(CHAT_ANA);
     world.open(&ana, 3);
 
-    // 1. Account advertises image-only attachment capability.
+    // 1. Account advertises attachments. Documents stay on the member-scoped OneDrive path
+    // (#658), so images_only stays off; a pasted image still goes to AMS.
     let can = world.account(HOME).can;
     assert!(can.max_file_bytes > 0, "Teams should allow image attachments");
     assert!(can.max_files > 0);
-    assert!(can.images_only, "Teams should advertise images_only while OneDrive docs stay off");
+    assert!(!can.images_only, "Teams file upload is not image-only");
 
-    // 2. Stage a valid PNG screenshot (with a real IHDR header for 320x200) and a non-image file.
+    // 2. Stage a valid PNG screenshot (with a real IHDR header for 320x200).
     let staged = std::path::absolute(format!("/tmp/tinyclient-teams-ams-{}", std::process::id())).unwrap();
     std::fs::create_dir_all(&staged).unwrap();
     let img_path = staged.join("screenshot.png");
@@ -2495,30 +3287,6 @@ fn inline_pasted_images_upload_to_ams_and_send_as_richtext_html() {
     png_bytes.extend_from_slice(&200u32.to_be_bytes());
     png_bytes.extend_from_slice(&[8, 6, 0, 0, 0, 0, 0, 0, 0]);
     std::fs::write(&img_path, &png_bytes).unwrap();
-
-    let doc_path = staged.join("spec.txt");
-    std::fs::write(&doc_path, b"not an image").unwrap();
-
-    // Non-image files are still refused.
-    let doc_send = world.ask(Request::Send {
-        conversation: ana.clone(),
-        client_id: "1760000999000646".into(),
-        text: "doc".into(),
-        reply_to: None,
-        with: protocol::Outgoing {
-            files: vec![protocol::OutgoingFile {
-                path: doc_path.to_string_lossy().into_owned(),
-                name: "spec.txt".into(),
-                spoiler: false,
-                as_file: false,
-                original: false,
-                view_once: false,
-                media: None,
-            }],
-            ..Default::default()
-        },
-    });
-    assert!(!matches!(doc_send, Response::Sent { .. }), "non-image must be refused: {doc_send:?}");
 
     // 3. Send the pasted PNG screenshot with caption text.
     let client_id = "1760000999000647";
