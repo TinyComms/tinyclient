@@ -98,10 +98,13 @@ fn send_pick(account: &Account, conversation: &str, client_id: &str, text: &str,
     let random = random_id(client_id);
     let (plain, entities) = super::prepared(account, conversation, text);
     let (answer, caption) = match catalog::find(account, pick).ok_or_else(|| Fault::Rpc { code: 400, name: "PICK_EXPIRED".to_owned(), value: None })? {
-        Pick::Document(id) => {
+        Pick::Document { document, sticker } => {
             remember_random(account, random, client_id);
-            let media = tl::types::InputMediaDocument { spoiler: false, id: id.into(), video_cover: None, video_timestamp: None, ttl_seconds: None, query: None };
-            let answer = account.ask(&send_media(&target, media.into(), &plain, entities, random, opts))?;
+            let media = tl::types::InputMediaDocument { spoiler: false, id: document.into(), video_cover: None, video_timestamp: None, ttl_seconds: None, query: None };
+            let mut request = send_media(&target, media.into(), &plain, entities, random, opts);
+            // Sending a sticker moves its pack up, as Telegram's own apps do.
+            request.update_stickersets_order = sticker;
+            let answer = account.ask(&request)?;
             (answer, plain.as_str())
         }
         Pick::Inline { query_id, result } => {

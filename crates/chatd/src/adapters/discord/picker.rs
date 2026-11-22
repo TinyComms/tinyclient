@@ -156,6 +156,8 @@ impl Discord {
                 file: Some(file.clone()),
                 pack: pack.to_owned(),
                 animated: pickable.animated,
+                set: String::new(),
+                locked: false,
             });
             files.push((file, url));
         }
@@ -250,6 +252,8 @@ impl Discord {
                 file: Some(file),
                 pack: String::new(),
                 animated: true,
+                set: String::new(),
+                locked: false,
             });
         }
         self.ctx.media(&files).map_err(|err| Refusal::Refused(err.to_string()))?;

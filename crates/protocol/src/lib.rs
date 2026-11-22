@@ -1943,6 +1943,31 @@ pub enum Request {
     Reactions {
         conversation: Key,
     },
+    /// Current Telegram Stars balance for an account (`payments.getStarsStatus`).
+    StarsBalance {
+        account: AccountKey,
+    },
+    /// Send a confirmed paid Star reaction on a Telegram message (`messages.sendPaidReaction`).
+    /// Never sent from a stray click on the ⭐ chip; only after explicit user confirmation.
+    SendPaidReaction {
+        conversation: Key,
+        message_id: String,
+        count: u32,
+        #[serde(default, skip_serializing_if = "is_false")]
+        anonymous: bool,
+    },
+    /// Toggle whether our paid Star reaction on a Telegram message is anonymous or public
+    /// (`messages.togglePaidReactionPrivacy`).
+    TogglePaidReactionPrivacy {
+        conversation: Key,
+        message_id: String,
+        anonymous: bool,
+    },
+    /// Change the account's default quick reaction (`messages.setDefaultReaction`).
+    SetDefaultReaction {
+        account: AccountKey,
+        emoji: String,
+    },
     /// Who reacted to a message with `emoji`, paged. Fetched only on demand (clicking or
     /// opening the reactors list), never prefetched.
     Reactors {
@@ -2013,6 +2038,28 @@ pub enum Request {
         id: String,
         #[serde(default, skip_serializing_if = "is_false")]
         unsave: bool,
+    },
+
+    /// Installs or removes one sticker pack, or restacks the installed packs (Telegram).
+    /// `set` is `id:access_hash` or a short name. `install` of `Some(true)` adds the pack and
+    /// `Some(false)` removes it. A non-empty `order` restacks instead: pack ids, first shown first.
+    StickerSet {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        set: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        install: Option<bool>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        order: Vec<i64>,
+    },
+
+    /// Stars or unstars one sticker in Telegram's favourites (`messages.faveSticker`).
+    /// `id` is the catalog item's id.
+    FaveSticker {
+        account: AccountKey,
+        id: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        unfave: bool,
     },
 
     /// Asks for these files to be on disk. Answers with what is known now; each file that lands
@@ -3107,6 +3154,12 @@ pub enum Response {
     Reactions {
         conversation: Key,
         rules: ReactionRules,
+    },
+    /// Current Telegram Stars balance (`Request::StarsBalance`).
+    StarsBalance {
+        balance: i64,
+        #[serde(default)]
+        nanos: i32,
     },
     /// Answers `Reactors`: one page of people who reacted with `emoji`.
     Reactors {

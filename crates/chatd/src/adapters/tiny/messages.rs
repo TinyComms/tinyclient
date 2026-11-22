@@ -629,6 +629,8 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
                             file: Some(file),
                             pack: join_host(&saved.base_url),
                             animated: item.animated,
+                            set: String::new(),
+                            locked: false,
                         }
                     })
                     .collect();

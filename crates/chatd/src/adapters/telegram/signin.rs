@@ -1,6 +1,11 @@
 //! Signing in to Telegram, one step at a time, as the shell's sheet draws it: a QR code scanned
-//! from the phone first; a phone number and the code sent to it otherwise; the second password
-//! where the account has one. Telegram has no web page for this and wants none used.
+//! from the phone first; a phone number and the code sent to it otherwise; a login email when
+//! Telegram asks for one before the code; a name when the number has no account yet; the second
+//! password where the account has one. A recovery email is not used: resetting that password
+//! happens in Telegram's own app. `auth.recoverPassword` with no new settings deletes the cloud
+//! password, so that recovery stays unimplemented (#542).
+//! Passkey sign-in is refused here: a third-party client cannot assert Telegram's passkey domain.
+//! Telegram has no web page for this and wants none used.
 //!
 //! One sign-in at a time. It lives from `SignInBegin` to the step that ends it or to
 //! `SignInCancel`, on a wire of its own that is dropped with it; nothing of Telegram's is
@@ -23,11 +28,19 @@ pub type Adopt = Box<dyn Fn(&str) -> Result<Vec<AccountKey>, String> + Send + Sy
 /// A QR code is replaced this long before Telegram would stop taking it.
 const QR_MARGIN: i64 = 2;
 
+/// Shown instead of starting WebAuthn. `auth.initPasskeyLogin` would ask this client to assert
+/// Telegram's relying-party id, which a third-party app cannot do.
+const NO_PASSKEY: &str = "Passkey sign-in isn't available in tinyclient. A third-party app cannot use Telegram's passkey domain. Use a QR code or a phone number.";
+
 /// Which way in the user is on.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Way {
     Qr,
     Phone,
+    EmailSetup,
+    EmailVerify,
+    SignUp,
+    Passkey,
     /// The second password, and the way that led to it.
     Password { from_qr: bool },
     Ended,
@@ -47,6 +60,12 @@ struct State {
     sent: Option<Sent>,
     /// What Telegram says of the account's second password, for the proof.
     password: Option<tl::types::account::Password>,
+    /// Masked email address shown on `EmailVerify`.
+    email_pattern: String,
+    /// Digit length of the email verification code on `EmailVerify`.
+    email_code_len: u8,
+    /// Terms of service text shown on `SignUp`.
+    signup_terms: String,
     /// The phone accepted the code on show; ask Telegram for the outcome.
     scanned: bool,
     /// The user asked for the code again after the network could not be reached.
@@ -95,6 +114,9 @@ pub fn step(hub: &Arc<Hub>, input: Option<SignInInput>, adopt: Adopt) -> Result<
                         step: waiting(),
                         sent: None,
                         password: None,
+                        email_pattern: String::new(),
+                        email_code_len: 6,
+                        signup_terms: String::new(),
                         scanned: false,
                         retry: false,
                         cancelled: false,
@@ -126,26 +148,38 @@ fn base64url(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-fn via(kind: &tl::enums::auth::SentCodeType) -> (CodeVia, u8) {
+fn via(kind: &tl::enums::auth::SentCodeType) -> Option<(CodeVia, u8)> {
     use tl::enums::auth::SentCodeType as T;
     let (via, length) = match kind {
         T::App(code) => (CodeVia::App, code.length),
         T::Sms(code) => (CodeVia::Sms, code.length),
         T::Call(code) => (CodeVia::Call, code.length),
         T::FragmentSms(code) => (CodeVia::Sms, code.length),
-        T::FirebaseSms(code) => (CodeVia::Sms, code.length),
         T::EmailCode(code) => (CodeVia::Email, code.length),
-        _ => (CodeVia::Other, 5),
+        // MissedCall, FlashCall, FirebaseSms, SmsWord, SmsPhrase, SetUpEmailRequired are handled separately or unsupported.
+        _ => return None,
     };
-    (via, length.clamp(4, 8) as u8)
+    Some((via, length.clamp(4, 8) as u8))
 }
 
 fn next_via(kind: &Option<tl::enums::auth::CodeType>) -> Option<CodeVia> {
     use tl::enums::auth::CodeType as T;
     Some(match kind.as_ref()? {
         T::Sms | T::FragmentSms => CodeVia::Sms,
-        T::Call | T::FlashCall | T::MissedCall => CodeVia::Call,
+        T::Call => CodeVia::Call,
+        T::FlashCall | T::MissedCall => return None,
     })
+}
+
+/// Masked address and reset times from an email login code. The period Telegram sends is seconds
+/// from now; the sheet wants the moment it becomes available.
+fn email_meta(kind: &tl::enums::auth::SentCodeType) -> (String, i64, i64) {
+    let tl::enums::auth::SentCodeType::EmailCode(code) = kind else {
+        return (String::new(), 0, 0);
+    };
+    let available = code.reset_available_period.map(|seconds| now() + i64::from(seconds)).unwrap_or(0);
+    let pending = code.reset_pending_date.map(i64::from).unwrap_or(0);
+    (code.email_pattern.clone(), available, pending)
 }
 
 /// What a refusal means for the step on show.
@@ -159,10 +193,20 @@ fn problem(fault: &Fault) -> SignInProblem {
             "PHONE_NUMBER_INVALID" => SignInProblem::PhoneInvalid,
             "PHONE_NUMBER_UNOCCUPIED" => SignInProblem::PhoneUnknown,
             "PHONE_NUMBER_BANNED" | "PHONE_NUMBER_FLOOD" => SignInProblem::PhoneBanned,
-            "PHONE_CODE_INVALID" | "PHONE_CODE_EMPTY" => SignInProblem::CodeInvalid,
-            "PHONE_CODE_EXPIRED" => SignInProblem::CodeExpired,
+            "PHONE_CODE_INVALID" | "PHONE_CODE_EMPTY" | "CODE_INVALID" | "CODE_EMPTY" => SignInProblem::CodeInvalid,
+            "PHONE_CODE_EXPIRED" | "CODE_EXPIRED" | "PASSWORD_RECOVERY_EXPIRED" => SignInProblem::CodeExpired,
             "PASSWORD_HASH_INVALID" => SignInProblem::PasswordInvalid,
             "PHONE_PASSWORD_FLOOD" => SignInProblem::TooMany { until: now() + 3_600 },
+            "EMAIL_INVALID" => SignInProblem::Other { reason: "That doesn't look like an email address.".to_owned() },
+            "EMAIL_NOT_ALLOWED" => SignInProblem::Other { reason: "Telegram does not allow that email address.".to_owned() },
+            "FIRSTNAME_INVALID" => SignInProblem::Other { reason: "Enter a valid first name.".to_owned() },
+            "LASTNAME_INVALID" => SignInProblem::Other { reason: "Enter a valid last name.".to_owned() },
+            "PASSWORD_RECOVERY_NA" => SignInProblem::Other {
+                reason: "No recovery email is set on this account. Reset it in the Telegram app.".to_owned(),
+            },
+            "PASSKEY_LOGIN_DISABLED" | "AUTH_PASSKEY_UNAVAILABLE" => SignInProblem::Other {
+                reason: "Telegram did not allow passkey sign-in for this client. Sign in with a QR code or phone number instead.".to_owned(),
+            },
             other => SignInProblem::Other { reason: format!("Telegram refused this ({other}).") },
         },
     }
@@ -343,18 +387,66 @@ impl Flow {
             (SignInInput::Phone { number }, Way::Phone) => self.send_code(&number),
             (SignInInput::Resend, Way::Phone) => self.resend(),
             (SignInInput::Code { code }, Way::Phone) => self.check_code(code),
+            (SignInInput::Email { email }, Way::EmailSetup) => self.send_login_email(&email),
+            (SignInInput::EmailCode { code }, Way::EmailVerify) => self.check_login_email(code),
+            (SignInInput::Back, Way::EmailSetup) => {
+                {
+                    let mut state = self.state();
+                    state.way = Way::Phone;
+                    state.sent = None;
+                }
+                self.show(SignInStep::Phone { problem: None }, false)
+            }
+            (SignInInput::Back, Way::EmailVerify) => {
+                let phone = self.state().sent.as_ref().map(|sent| sent.shown.clone()).unwrap_or_default();
+                self.state().way = Way::EmailSetup;
+                self.show(SignInStep::EmailSetup { phone, problem: None }, false)
+            }
+            (SignInInput::SignUp { first_name, last_name }, Way::SignUp) => self.create_account(first_name, last_name),
+            (SignInInput::Back, Way::SignUp) => {
+                {
+                    let mut state = self.state();
+                    state.way = Way::Phone;
+                    state.sent = None;
+                }
+                self.show(SignInStep::Phone { problem: None }, false)
+            }
             (SignInInput::Password { password }, Way::Password { from_qr }) => self.check_password(password, from_qr),
+            // `RecoverPassword` and `RecoveryCode` fall through. They are not sent on:
+            // `auth.recoverPassword` with no new settings deletes the cloud password (#542).
+            // Never `auth.initPasskeyLogin` or `auth.finishPasskeyLogin`: those assert Telegram's domain.
+            (SignInInput::UsePasskey | SignInInput::Passkey { .. }, _) => self.refuse_passkey(),
+            (SignInInput::Back, Way::Passkey) => {
+                self.state().way = Way::Qr;
+                let step = self.show(waiting(), false);
+                self.wake.notify_all();
+                step
+            }
             // Not what the step on show takes: it is shown again.
             _ => self.state().step.clone(),
         }
     }
 
-    fn code_step(&self, sent: &tl::types::auth::SentCode, shown: &str, problem: Option<SignInProblem>) -> SignInStep {
-        let (via, length) = via(&sent.r#type);
+    /// The step a `sentCode` leads to: a login email, the digit boxes, or a stop when the code
+    /// arrives in a way this sheet cannot take (a flash call, a word, a phrase).
+    fn after_sent_code(&self, sent: &tl::types::auth::SentCode, problem: Option<SignInProblem>) -> SignInStep {
+        let shown = self.state().sent.as_ref().map(|held| held.shown.clone()).unwrap_or_default();
+        if matches!(sent.r#type, tl::enums::auth::SentCodeType::SetUpEmailRequired(_)) {
+            self.state().way = Way::EmailSetup;
+            return SignInStep::EmailSetup { phone: shown, problem };
+        }
+        let Some((via, length)) = via(&sent.r#type) else {
+            return self.fail("Telegram wants this code in a way tinyclient cannot take. Sign in with a QR code instead.");
+        };
+        let (email_pattern, reset_available_at, reset_pending_date) = email_meta(&sent.r#type);
+        self.state().way = Way::Phone;
         SignInStep::Code {
             via,
             length,
-            phone: shown.to_owned(),
+            phone: shown,
+            email_pattern,
+            reset_available_at,
+            reset_pending_date,
             next: next_via(&sent.next_type),
             resend_at: sent.timeout.map_or(0, |seconds| now() + i64::from(seconds)),
             problem,
@@ -392,8 +484,12 @@ impl Flow {
         }
         match answer {
             Ok(tl::enums::auth::SentCode::Code(sent)) => {
-                let step = self.code_step(&sent, typed.trim(), None);
-                self.state().sent = Some(Sent { number: format!("+{digits}"), shown: typed.trim().to_owned(), hash: sent.phone_code_hash });
+                self.state().sent = Some(Sent {
+                    number: format!("+{digits}"),
+                    shown: typed.trim().to_owned(),
+                    hash: sent.phone_code_hash.clone(),
+                });
+                let step = self.after_sent_code(&sent, None);
                 self.show(step, false)
             }
             Ok(tl::enums::auth::SentCode::Success(done)) => self.finish(done.authorization, false),
@@ -405,23 +501,25 @@ impl Flow {
     /// The code step again with something wrong, or the number step when there is no code out.
     fn code_again(&self, problem: SignInProblem) -> SignInStep {
         let step = match self.state().step.clone() {
-            SignInStep::Code { via, length, phone, next, resend_at, .. } => SignInStep::Code { via, length, phone, next, resend_at, problem: Some(problem) },
+            SignInStep::Code { via, length, phone, email_pattern, reset_available_at, reset_pending_date, next, resend_at, .. } => {
+                SignInStep::Code { via, length, phone, email_pattern, reset_available_at, reset_pending_date, next, resend_at, problem: Some(problem) }
+            }
             _ => SignInStep::Phone { problem: Some(problem) },
         };
         self.show(step, false)
     }
 
     fn resend(&self) -> SignInStep {
-        let Some((number, shown, hash)) = self.state().sent.as_ref().map(|sent| (sent.number.clone(), sent.shown.clone(), sent.hash.clone())) else {
+        let Some((number, hash)) = self.state().sent.as_ref().map(|sent| (sent.number.clone(), sent.hash.clone())) else {
             return self.show(SignInStep::Phone { problem: None }, false);
         };
         let request = tl::functions::auth::ResendCode { phone_number: number, phone_code_hash: hash, reason: None };
         match wire::call(self.wire.as_ref(), &request) {
             Ok(tl::enums::auth::SentCode::Code(sent)) => {
-                let step = self.code_step(&sent, &shown, None);
                 if let Some(held) = &mut self.state().sent {
-                    held.hash = sent.phone_code_hash;
+                    held.hash = sent.phone_code_hash.clone();
                 }
+                let step = self.after_sent_code(&sent, None);
                 self.show(step, false)
             }
             Ok(tl::enums::auth::SentCode::Success(done)) => self.finish(done.authorization, false),
@@ -455,10 +553,11 @@ impl Flow {
         match wire::call(self.wire.as_ref(), &tl::functions::account::GetPassword {}) {
             Ok(tl::enums::account::Password::Password(password)) => {
                 let hint = password.hint.clone().unwrap_or_default();
+                let has_recovery = password.has_recovery;
                 let mut state = self.state();
                 state.way = Way::Password { from_qr };
                 state.password = Some(password);
-                SignInStep::Password { hint, problem }
+                SignInStep::Password { hint, has_recovery, problem }
             }
             Err(fault) => {
                 self.state().way = Way::Ended;
@@ -507,12 +606,143 @@ impl Flow {
                 // Each try needs fresh numbers from Telegram, right or wrong.
                 let step = self.password_step(from_qr, Some(problem(&fault)));
                 let step = match step {
-                    SignInStep::Password { problem, .. } => SignInStep::Password { hint, problem },
+                    SignInStep::Password { has_recovery, problem, .. } => SignInStep::Password { hint, has_recovery, problem },
                     other => other,
                 };
                 self.show(step, false)
             }
         }
+    }
+
+    fn sent_pair(&self) -> Option<(String, String)> {
+        self.state().sent.as_ref().map(|sent| (sent.number.clone(), sent.hash.clone()))
+    }
+
+    fn login_purpose(&self, number: String, hash: String) -> tl::enums::EmailVerifyPurpose {
+        tl::types::EmailVerifyPurposeLoginSetup { phone_number: number, phone_code_hash: hash }.into()
+    }
+
+    fn send_login_email(&self, typed: &str) -> SignInStep {
+        let email = typed.trim();
+        let phone = self.state().sent.as_ref().map(|sent| sent.shown.clone()).unwrap_or_default();
+        if email.is_empty() {
+            return self.show(SignInStep::EmailSetup { phone, problem: Some(SignInProblem::Other { reason: "Enter an email address.".to_owned() }) }, false);
+        }
+        let Some((number, hash)) = self.sent_pair() else {
+            return self.show(SignInStep::Phone { problem: None }, false);
+        };
+        let request = tl::functions::account::SendVerifyEmailCode { purpose: self.login_purpose(number, hash), email: email.to_owned() };
+        match wire::call(self.wire.as_ref(), &request) {
+            Ok(tl::enums::account::SentEmailCode::Code(sent)) => {
+                let length = sent.length.clamp(4, 8) as u8;
+                let mut state = self.state();
+                state.way = Way::EmailVerify;
+                state.email_pattern = sent.email_pattern.clone();
+                state.email_code_len = length;
+                let step = SignInStep::EmailVerify { email_pattern: sent.email_pattern, length, problem: None };
+                drop(state);
+                self.show(step, false)
+            }
+            Err(fault) => self.show(SignInStep::EmailSetup { phone, problem: Some(problem(&fault)) }, false),
+        }
+    }
+
+    fn email_verify_again(&self, problem: SignInProblem) -> SignInStep {
+        let (email_pattern, length) = {
+            let state = self.state();
+            (state.email_pattern.clone(), state.email_code_len)
+        };
+        self.show(SignInStep::EmailVerify { email_pattern, length, problem: Some(problem) }, false)
+    }
+
+    fn check_login_email(&self, code: String) -> SignInStep {
+        let Some((number, hash)) = self.sent_pair() else {
+            return self.show(SignInStep::Phone { problem: None }, false);
+        };
+        let request = tl::functions::account::VerifyEmail {
+            purpose: self.login_purpose(number.clone(), hash.clone()),
+            verification: tl::types::EmailVerificationCode { code: code.clone() }.into(),
+        };
+        match wire::call(self.wire.as_ref(), &request) {
+            Ok(tl::enums::account::EmailVerified::Login(login)) => match login.sent_code {
+                tl::enums::auth::SentCode::Code(sent) => {
+                    if let Some(held) = &mut self.state().sent {
+                        held.hash = sent.phone_code_hash.clone();
+                    }
+                    let step = self.after_sent_code(&sent, None);
+                    self.show(step, false)
+                }
+                tl::enums::auth::SentCode::Success(done) => self.finish(done.authorization, false),
+                tl::enums::auth::SentCode::PaymentRequired(_) => self.fail("Telegram wants a payment before it sends this number a code. Sign in with a QR code instead."),
+            },
+            Ok(tl::enums::account::EmailVerified::Verified(_)) => {
+                let request = tl::functions::auth::SignIn {
+                    phone_number: number,
+                    phone_code_hash: hash,
+                    phone_code: None,
+                    email_verification: Some(tl::types::EmailVerificationCode { code }.into()),
+                };
+                match wire::call(self.wire.as_ref(), &request) {
+                    Ok(authorization) => self.finish(authorization, false),
+                    Err(fault) if fault.is("SESSION_PASSWORD_NEEDED") => {
+                        let step = self.password_step(false, None);
+                        self.show(step, false)
+                    }
+                    Err(fault) => self.email_verify_again(problem(&fault)),
+                }
+            }
+            Err(fault) => self.email_verify_again(problem(&fault)),
+        }
+    }
+
+    fn begin_signup(&self, required: tl::types::auth::AuthorizationSignUpRequired, announce: bool) -> SignInStep {
+        let terms = match required.terms_of_service {
+            Some(tl::enums::help::TermsOfService::Service(terms)) => terms.text,
+            None => String::new(),
+        };
+        let phone = self.state().sent.as_ref().map(|sent| sent.shown.clone()).unwrap_or_default();
+        {
+            let mut state = self.state();
+            state.way = Way::SignUp;
+            state.signup_terms = terms.clone();
+        }
+        self.show(SignInStep::SignUp { phone, terms, problem: None }, announce)
+    }
+
+    fn signup_again(&self, problem: SignInProblem) -> SignInStep {
+        let (phone, terms) = {
+            let state = self.state();
+            let phone = state.sent.as_ref().map(|sent| sent.shown.clone()).unwrap_or_default();
+            (phone, state.signup_terms.clone())
+        };
+        self.show(SignInStep::SignUp { phone, terms, problem: Some(problem) }, false)
+    }
+
+    fn create_account(&self, first_name: String, last_name: String) -> SignInStep {
+        let first_name = first_name.trim().to_owned();
+        let last_name = last_name.trim().to_owned();
+        if first_name.is_empty() {
+            return self.signup_again(SignInProblem::Other { reason: "Enter a valid first name.".to_owned() });
+        }
+        let Some((number, hash)) = self.sent_pair() else {
+            return self.show(SignInStep::Phone { problem: None }, false);
+        };
+        let request = tl::functions::auth::SignUp { no_joined_notifications: false, phone_number: number, phone_code_hash: hash, first_name, last_name };
+        match wire::call(self.wire.as_ref(), &request) {
+            Ok(authorization) => self.finish(authorization, false),
+            Err(fault) => self.signup_again(problem(&fault)),
+        }
+    }
+
+    fn refuse_passkey(&self) -> SignInStep {
+        self.state().way = Way::Passkey;
+        self.show(
+            SignInStep::Passkey {
+                options: String::new(),
+                problem: Some(SignInProblem::Other { reason: NO_PASSKEY.to_owned() }),
+            },
+            false,
+        )
     }
 
     fn fail(&self, reason: &str) -> SignInStep {
@@ -523,9 +753,11 @@ impl Flow {
     /// Telegram let us in: the session is kept and the account started.
     fn finish(&self, authorization: tl::enums::auth::Authorization, announce: bool) -> SignInStep {
         let user = match authorization {
+            tl::enums::auth::Authorization::SignUpRequired(required) => return self.begin_signup(required, announce),
             tl::enums::auth::Authorization::Authorization(tl::types::auth::Authorization { user: tl::enums::User::User(user), .. }) => user,
-            // tinyclient does not create accounts.
-            _ => return self.show(SignInStep::Phone { problem: Some(SignInProblem::PhoneUnknown) }, announce),
+            tl::enums::auth::Authorization::Authorization(_) => {
+                return self.show(SignInStep::Phone { problem: Some(SignInProblem::PhoneUnknown) }, announce);
+            }
         };
         self.wire.signed_in(&user);
         let first = user.first_name.clone().unwrap_or_default();

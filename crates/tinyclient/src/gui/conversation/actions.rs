@@ -21,6 +21,19 @@ use gpui::{
 use protocol::{Capabilities, ConversationKind, ConversationRights, ErrorCode, Message, MessageKind, Network, ReactionRules, Request, Response, SendState};
 use std::rc::Rc;
 
+/// Pending confirmation sheet for spending Telegram Stars on a paid reaction (#517).
+#[derive(Clone)]
+pub(super) struct PaidReactConfirm {
+    pub conversation: protocol::Key,
+    pub message_id: String,
+    pub count: u32,
+    pub anonymous: bool,
+    pub already_mine: bool,
+    pub balance: Option<i64>,
+    pub loading_balance: bool,
+    pub sending: bool,
+}
+
 /// How far the toolbar rises above its row, and how wide the strip it can occupy is.
 const TOOLBAR_RISE: f32 = 14.;
 const TOOLBAR_REACH: f32 = 320.;
@@ -945,9 +958,19 @@ impl Pane {
     /// is never sent. chatd shows it at once and takes it back if the network refuses, and
     /// then the rules are asked again: they may be what changed.
     pub(super) fn react(&mut self, message_id: &str, emoji: &str, on: bool, cx: &mut Context<Self>) {
+        self.react_with(message_id, emoji, on, false, cx);
+    }
+
+    /// Sends a reaction, optionally with `big` (`burst: true` on Telegram for the full animation).
+    pub(super) fn react_with(&mut self, message_id: &str, emoji: &str, on: bool, big: bool, cx: &mut Context<Self>) {
         let Some(conversation) = self.key().cloned() else {
             return;
         };
+        // Guard: paid Star reactions must never fire through the ordinary React path.
+        if conversation.network == Network::Telegram && protocol::bare_emoji(emoji) == "⭐" {
+            self.say("Paid Star reactions must be confirmed before spending Stars.".to_owned(), cx);
+            return;
+        }
         if on {
             if let Some(why) = self.find(message_id).and_then(|message| self.refusal(&message, emoji)) {
                 self.say(format!("Couldn't react: {why}"), cx);
@@ -958,9 +981,102 @@ impl Pane {
                 emoji::used(emoji);
             }
         }
-        let request = Request::React { conversation, message_id: message_id.to_owned(), emoji: emoji.to_owned(), on, burst: false };
+        let burst = big && on && self.open.as_ref().is_some_and(|open| open.can.burst_reactions);
+        let request = Request::React { conversation, message_id: message_id.to_owned(), emoji: emoji.to_owned(), on, burst };
         self.act_then(request, "Couldn't react", |this, cx| this.ask_reactions(cx), cx);
         cx.notify();
+    }
+
+    /// Opens the paid Star reaction confirmation dialog and fetches the current Stars balance.
+    pub(super) fn open_paid_react(&mut self, message_id: &str, already_mine: bool, cx: &mut Context<Self>) {
+        let Some(conversation) = self.key().cloned() else {
+            return;
+        };
+        let account = conversation.account();
+        self.paid_react = Some(PaidReactConfirm {
+            conversation,
+            message_id: message_id.to_owned(),
+            count: 1,
+            anonymous: false,
+            already_mine,
+            balance: None,
+            loading_balance: true,
+            sending: false,
+        });
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&Request::StarsBalance { account }) }).await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(dialog) = &mut this.paid_react {
+                    dialog.loading_balance = false;
+                    if let Ok(Response::StarsBalance { balance, .. }) = answer {
+                        dialog.balance = Some(balance);
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Submits a confirmed paid Star reaction (`messages.sendPaidReaction`).
+    fn confirm_paid_react(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.paid_react.as_mut() else {
+            return;
+        };
+        if dialog.sending {
+            return;
+        }
+        dialog.sending = true;
+        let request = Request::SendPaidReaction {
+            conversation: dialog.conversation.clone(),
+            message_id: dialog.message_id.clone(),
+            count: dialog.count,
+            anonymous: dialog.anonymous,
+        };
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.paid_react = None;
+                match answer {
+                    Ok(Response::Ok) => {}
+                    Ok(Response::Error { detail, .. }) => this.say(format!("Couldn't send Star reaction: {detail}"), cx),
+                    Ok(_) => {}
+                    Err(err) => this.say(format!("Couldn't send Star reaction: {}", crate::client::trouble_words("send", &err)), cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Toggles public/anonymous privacy for our existing paid Star reaction on this message.
+    fn toggle_paid_react_privacy(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.paid_react.as_ref() else {
+            return;
+        };
+        let request = Request::TogglePaidReactionPrivacy {
+            conversation: dialog.conversation.clone(),
+            message_id: dialog.message_id.clone(),
+            anonymous: dialog.anonymous,
+        };
+        let label = if dialog.anonymous { "Your Star reaction is now anonymous." } else { "Your Star reaction is now shown on the leaderboard." };
+        self.paid_react = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| {
+                match answer {
+                    Ok(Response::Ok) => this.say(label.to_owned(), cx),
+                    Ok(Response::Error { detail, .. }) => this.say(format!("Couldn't update Star privacy: {detail}"), cx),
+                    Ok(_) => {}
+                    Err(err) => this.say(format!("Couldn't update Star privacy: {}", crate::client::trouble_words("send", &err)), cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// A reaction chosen where the message may already carry it: mine toggles off.
@@ -2418,6 +2534,94 @@ impl Pane {
         Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
     }
 
+    fn paid_react_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let dialog = self.paid_react.as_ref()?;
+        let balance_line = if dialog.loading_balance {
+            "Checking your Telegram Stars balance…".to_owned()
+        } else if let Some(bal) = dialog.balance {
+            format!("Your balance: {bal} ⭐")
+        } else {
+            "Balance unavailable (Telegram will verify before spending).".to_owned()
+        };
+        let presets: &[u32] = &[1, 5, 10, 50];
+        let mut preset_row = div().mt(px(10.)).flex().items_center().gap(px(6.));
+        for &n in presets {
+            let active = dialog.count == n;
+            preset_row = preset_row.child(
+                button(
+                    ("paid-star-count", n as usize),
+                    if active { ButtonKind::Primary } else { ButtonKind::Secondary },
+                    format!("{n} ⭐"),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(d) = &mut this.paid_react {
+                        d.count = n;
+                        cx.notify();
+                    }
+                })),
+            );
+        }
+        let anon_label = if dialog.anonymous { "☑ Send anonymously (hidden from top senders)" } else { "☐ Send anonymously (hidden from top senders)" };
+        let anon_row = div()
+            .id("paid-star-anon")
+            .mt(px(10.))
+            .type_small()
+            .text_color(theme::text_soft())
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| {
+                if let Some(d) = &mut this.paid_react {
+                    d.anonymous = !d.anonymous;
+                    cx.notify();
+                }
+            }))
+            .child(anon_label);
+        let mut buttons = modal_buttons().child(button("paid-star-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+            this.paid_react = None;
+            cx.notify();
+        })));
+        if dialog.already_mine {
+            buttons = buttons.child(button("paid-star-privacy", ButtonKind::Secondary, "Save privacy").on_click(cx.listener(|this, _, _, cx| {
+                this.toggle_paid_react_privacy(cx);
+            })));
+        }
+        let send_label = if dialog.sending { "Sending…".to_owned() } else { format!("Send {} ⭐", dialog.count) };
+        buttons = buttons.child(button("paid-star-confirm", ButtonKind::Primary, send_label).on_click(cx.listener(|this, _, _, cx| {
+            this.confirm_paid_react(cx);
+        })));
+        let room = f32::from(window.viewport_size().width) - 32.;
+        let panel = modal("Send Star reaction?")
+            .w(px(if crate::gui::phone::active() { room.min(400.) } else { 400. }))
+            .child(modal_body(format!(
+                "This spends {} Telegram Star{} on this post. {}",
+                dialog.count,
+                if dialog.count == 1 { "" } else { "s" },
+                balance_line,
+            )))
+            .child(preset_row)
+            .child(anon_row)
+            .child(buttons)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        let size = window.viewport_size();
+        let scrim = div()
+            .id("paid-star-scrim")
+            .w(size.width)
+            .h(size.height)
+            .bg(theme::scrim())
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.paid_react = None;
+                    cx.notify();
+                }),
+            )
+            .child(fade_in("paid-star-panel", 160, panel));
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
+    }
+
     pub(super) fn action_layers(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         if crate::gui::phone::active() {
             return [
@@ -2426,6 +2630,7 @@ impl Pane {
                 self.revisions_layer(window, cx),
                 self.picker_sheet(window, cx),
                 self.confirm_layer(window, cx),
+                self.paid_react_layer(window, cx),
                 self.action_confirm_layer(window, cx),
                 self.bulk_confirm_layer(window, cx),
                 self.forward_layer(window, cx),
@@ -2441,6 +2646,7 @@ impl Pane {
             self.revisions_layer(window, cx),
             self.picker_layer(window, cx),
             self.confirm_layer(window, cx),
+            self.paid_react_layer(window, cx),
             self.action_confirm_layer(window, cx),
             self.bulk_confirm_layer(window, cx),
             self.forward_layer(window, cx),

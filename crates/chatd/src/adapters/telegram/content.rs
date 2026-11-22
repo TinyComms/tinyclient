@@ -1134,7 +1134,25 @@ pub(super) fn document(media: &tl::types::MessageMediaDocument, document: &tl::t
     attachment.sticker = sticker;
     attachment.waveform = wave;
     attachment.round = round || media.round;
+    attachment.sticker_set = sticker_set_key(&document.attributes);
     attachment
+}
+
+/// `id:access_hash` or a short name, from a sticker or custom-emoji attribute. Empty otherwise.
+pub(super) fn sticker_set_key(attributes: &[tl::enums::DocumentAttribute]) -> String {
+    attributes.iter().find_map(|attribute| {
+        let set = match attribute {
+            DocumentAttribute::Sticker(sticker) => &sticker.stickerset,
+            DocumentAttribute::CustomEmoji(emoji) => &emoji.stickerset,
+            _ => return None,
+        };
+        let key = match set {
+            tl::enums::InputStickerSet::Id(set) => format!("{}:{}", set.id, set.access_hash),
+            tl::enums::InputStickerSet::ShortName(set) => set.short_name.clone(),
+            _ => String::new(),
+        };
+        (!key.is_empty()).then_some(key)
+    }).unwrap_or_default()
 }
 
 /// The card for a poll or a quiz. Counts stay off while Telegram is still hiding them.
@@ -1569,21 +1587,40 @@ fn reactions(reactions: &tl::enums::MessageReactions) -> Vec<Reaction> {
             tl::enums::Reaction::Empty => return None,
         };
         // The list Telegram already sent with the message names each reactor's peer.
-        let who = listed
-            .then(|| {
-                reactions
-                    .recent_reactions
-                    .iter()
-                    .flatten()
-                    .filter_map(|reacted| match reacted {
-                        tl::enums::MessagePeerReaction::Reaction(reacted) => Some(reacted),
-                    })
-                    .filter(|reacted| same(&reacted.reaction, &count.reaction))
-                    .map(|reacted| Who::of(&reacted.peer_id).text())
-                    .take(protocol::REACTION_REACTORS)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        // Paid Star reactions carry a top-senders leaderboard in `top_reactors` instead.
+        let who = if matches!(&count.reaction, tl::enums::Reaction::Paid) {
+            let mut top: Vec<(i32, String)> = reactions
+                .top_reactors
+                .iter()
+                .flatten()
+                .filter_map(|reactor| {
+                    let tl::enums::MessageReactor::Reactor(reactor) = reactor;
+                    if reactor.anonymous {
+                        return None;
+                    }
+                    let peer = reactor.peer_id.as_ref()?;
+                    Some((reactor.count, Who::of(peer).text()))
+                })
+                .collect();
+            top.sort_by(|a, b| b.0.cmp(&a.0));
+            top.into_iter().map(|(_, id)| id).take(protocol::REACTION_REACTORS).collect()
+        } else {
+            listed
+                .then(|| {
+                    reactions
+                        .recent_reactions
+                        .iter()
+                        .flatten()
+                        .filter_map(|reacted| match reacted {
+                            tl::enums::MessagePeerReaction::Reaction(reacted) => Some(reacted),
+                        })
+                        .filter(|reacted| same(&reacted.reaction, &count.reaction))
+                        .map(|reacted| Who::of(&reacted.peer_id).text())
+                        .take(protocol::REACTION_REACTORS)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
         Some(Reaction {
             emoji,
             file,

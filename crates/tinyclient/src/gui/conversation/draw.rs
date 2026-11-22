@@ -3486,9 +3486,17 @@ impl Pane {
             // A custom one goes by its file, which names it where its `:name:` may not.
             let toggled = reaction.file.as_ref().map_or_else(|| reaction.emoji.clone(), |file| file.id.clone());
             let (id, on) = (message.id.clone(), !reaction.mine);
+            let is_telegram = self.open.as_ref().is_some_and(|open| open.key.network == protocol::Network::Telegram);
+            let is_paid_star = is_telegram && reaction.file.is_none() && protocol::bare_emoji(&reaction.emoji) == "⭐";
+            let paid_allowed = is_paid_star && acts && self.rules().is_some_and(|rules| rules.paid);
+            let can_big = self.rules().is_some_and(|rules| rules.big);
             // Joining one the conversation no longer takes, or past a limit, is not offered:
             // the chip says why instead.
-            let refused = (!reaction.mine).then(|| self.refusal(message, &toggled)).flatten();
+            let refused = if is_paid_star {
+                None
+            } else {
+                (!reaction.mine).then(|| self.refusal(message, &toggled)).flatten()
+            };
             // Who reacted, where the network said or after an on-demand fetch; a chip that is
             // only a count keeps its own words.
             let named = !reaction.who.is_empty();
@@ -3506,15 +3514,28 @@ impl Pane {
                         reactor_words(&ids, |name| name.to_owned())
                     })
             };
-            let words = match (&refused, &names) {
-                (Some(why), _) => why.clone(),
-                (None, Some(names)) => names.clone(),
-                (None, None) if reaction.mine => "Take back your reaction".to_owned(),
-                (None, None) => "React with this too".to_owned(),
+            let words = if is_paid_star {
+                match &names {
+                    Some(top) if paid_allowed => format!("Paid Star reaction · {top} · Click to send Stars"),
+                    Some(top) => format!("Paid Star reaction · {top}"),
+                    None if paid_allowed => "Paid Star reaction · Click to send Stars".to_owned(),
+                    None => "Paid Star reaction".to_owned(),
+                }
+            } else {
+                match (&refused, &names) {
+                    (Some(why), _) => why.clone(),
+                    (None, Some(names)) => names.clone(),
+                    (None, None) if reaction.mine => "Take back your reaction".to_owned(),
+                    (None, None) if can_big => "React with this too (Shift+click for big)".to_owned(),
+                    (None, None) => "React with this too".to_owned(),
+                }
             };
-            let joins = acts && refused.is_none();
+            let joins = !is_paid_star && acts && refused.is_none();
+            let clickable = joins || paid_allowed;
+            let already_mine = reaction.mine;
             // Right-click names them in a list, where one was sent or the account can fetch them.
-            // Left-click keeps its work: joining or taking the reaction back.
+            // Left-click keeps its work: joining or taking the reaction back (or opening the
+            // paid Star confirm sheet for ⭐).
             let can_reactors = self.open.as_ref().is_some_and(|open| open.can.reactors);
             let list = (!phone && (named || can_reactors)).then(|| {
                 let open = message.clone();
@@ -3529,10 +3550,18 @@ impl Pane {
                 chip(("chip", ix).into(), reaction.mine)
                     .child(emoji)
                     .child(count)
-                    .when(acts && !phone, |chip| chip.tooltip(tip(words, None)))
-                    .when(joins, |chip| chip.on_click(cx.listener(move |this, _, _, cx| this.react(&id, &toggled, on, cx))))
+                    .when((acts || is_paid_star) && !phone, |chip| chip.tooltip(tip(words, None)))
+                    .when(paid_allowed, |chip| {
+                        let id = id.clone();
+                        chip.on_click(cx.listener(move |this, _, _, cx| this.open_paid_react(&id, already_mine, cx)))
+                    })
+                    .when(joins, |chip| {
+                        chip.on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+                            this.react_with(&id, &toggled, on, can_big && event.modifiers().shift, cx);
+                        }))
+                    })
                     .when_some(list, |chip, list| chip.on_mouse_down(MouseButton::Right, list))
-                    .when(!joins, |chip| chip.cursor_default()),
+                    .when(!clickable, |chip| chip.cursor_default()),
             );
         }
         let hidden = message.reactions.len().saturating_sub(CHIPS);

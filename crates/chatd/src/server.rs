@@ -1528,6 +1528,10 @@ impl Chat {
         if burst && !self.hub.capabilities(&account).burst_reactions {
             return error(ErrorCode::Unsupported, "Super reactions are not available on this account.");
         }
+        // Paid Telegram Star reactions cost real Stars and must never fire from a normal React call.
+        if conversation.network == Network::Telegram && protocol::bare_emoji(&emoji) == "⭐" {
+            return error(ErrorCode::Refused, "Paid Star reactions must be confirmed before spending Stars.");
+        }
         let ours = |emoji: &str| Reaction {
             emoji: emoji.to_owned(),
             file: None,
@@ -2178,8 +2182,17 @@ impl Chat {
         let mut query = query.trim().to_owned();
         clip(&mut query, 100);
         let asked = (account.clone(), kind, space.clone(), query.clone(), cursor.clone());
-        if let Some((items, cursor)) = self.hub.catalogs.get(&asked) {
-            return Response::Catalog { items, cursor };
+        // The first page of Telegram stickers is rebuilt on every open. A pack can be installed
+        // on another device between opens, and the adapter refetches that page for that reason.
+        // The few-minute catalog cache would keep showing the old list.
+        let refetch = account.network == Network::Telegram
+            && kind == CatalogKind::Stickers
+            && query.is_empty()
+            && cursor.is_none();
+        if !refetch {
+            if let Some((items, cursor)) = self.hub.catalogs.get(&asked) {
+                return Response::Catalog { items, cursor };
+            }
         }
         if let Err(refused) = self.online(&account) {
             return *refused;
@@ -2191,6 +2204,7 @@ impl Chat {
                 for item in &mut page.items {
                     clip(&mut item.name, 100);
                     clip(&mut item.pack, 100);
+                    clip(&mut item.set, 80);
                 }
                 self.hub.catalogs.keep(asked, (page.items.clone(), page.cursor.clone()));
                 Response::Catalog { items: page.items, cursor: page.cursor }
@@ -2779,6 +2793,24 @@ impl Chat {
                 match self.ask(&account, |reply| Command::SaveGif { id, unsave, reply }) {
                     Ok(()) => {
                         self.hub.catalogs.forget_where(|(acct, kind, ..)| acct == &account && *kind == CatalogKind::Gifs);
+                        Response::Ok
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::StickerSet { account, set, install, order } => {
+                match self.ask(&account, |reply| Command::StickerSet { set, install, order, reply }) {
+                    Ok(()) => {
+                        self.hub.catalogs.forget_where(|(acct, kind, ..)| acct == &account && *kind == CatalogKind::Stickers);
+                        Response::Ok
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::FaveSticker { account, id, unfave } => {
+                match self.ask(&account, |reply| Command::FaveSticker { id, unfave, reply }) {
+                    Ok(()) => {
+                        self.hub.catalogs.forget_where(|(acct, kind, ..)| acct == &account && *kind == CatalogKind::Stickers);
                         Response::Ok
                     }
                     Err(refused) => *refused,
@@ -3466,6 +3498,61 @@ impl Chat {
 
             Request::React { conversation, message_id, emoji, on, burst } => self.react(conversation, message_id, emoji, on, burst),
             Request::Reactions { conversation } => self.reactions(conversation),
+            Request::StarsBalance { account } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::StarsBalance { reply }) {
+                    Ok((balance, nanos)) => Response::StarsBalance { balance, nanos },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SendPaidReaction { conversation, message_id, count, anonymous } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                if count == 0 || count > 2_500 {
+                    return error(ErrorCode::Refused, "Choose between 1 and 2,500 Stars for a paid reaction.");
+                }
+                match self.ask(&account, |reply| Command::SendPaidReaction {
+                    conversation_id: conversation.id,
+                    message_id,
+                    count,
+                    anonymous,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::TogglePaidReactionPrivacy { conversation, message_id, anonymous } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::TogglePaidReactionPrivacy {
+                    conversation_id: conversation.id,
+                    message_id,
+                    anonymous,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SetDefaultReaction { account, emoji } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::SetDefaultReaction { emoji, reply }) {
+                    Ok(()) => {
+                        self.hub.reactions.forget_where(|key| key.account() == account);
+                        Response::Ok
+                    }
+                    Err(refused) => *refused,
+                }
+            }
             Request::Reactors { conversation, message_id, emoji, burst, after, limit } => {
                 self.reactors(conversation, message_id, emoji, burst, after, limit)
             }

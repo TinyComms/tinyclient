@@ -74,6 +74,15 @@ pub struct ReactionRules {
     /// Why reactions are off, in words, when `set` is `Off`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub why: String,
+    /// This chat allows paid Telegram Star reactions (`channelFull.paid_reactions_available`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub paid: bool,
+    /// The account's default quick reaction (e.g. Telegram `help.getConfig`'s `reactions_default`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quick: Option<String>,
+    /// Holding or Shift-clicking a reaction sends it with a full "big" animation (Telegram `big: true`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub big: bool,
 }
 
 fn is_any(set: &ReactionSet) -> bool {
@@ -94,6 +103,9 @@ impl Default for ReactionRules {
             replaces: false,
             distinct: 0,
             why: String::new(),
+            paid: false,
+            quick: None,
+            big: false,
         }
     }
 }
@@ -125,6 +137,12 @@ impl ReactionRules {
         self.only.truncate(REACTIONS_LISTED);
         self.only.iter_mut().for_each(|emoji| crate::clip(emoji, 64));
         crate::clip(&mut self.why, 200);
+        if let Some(quick) = &mut self.quick {
+            crate::clip(quick, 64);
+            if quick.is_empty() {
+                self.quick = None;
+            }
+        }
     }
 
     /// The emoji, or the custom emoji with this name or file id, may be chosen as a new

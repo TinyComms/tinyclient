@@ -284,7 +284,12 @@ pub fn quick(rules: Option<&ReactionRules>, used: &[String], reactions: &[Reacti
     let tone = if tones_allowed(rules) { None } else { Some(()) };
     let listed = rules.only.iter().filter(|listed| !listed.starts_with(':') && find(listed).is_some());
     let there = reactions.iter().filter(|have| have.file.is_none()).map(|have| &have.emoji);
-    let candidates = used.iter().filter(|held| !held.starts_with(':')).map(String::as_str).chain(DEFAULTS).chain(listed.chain(there).map(String::as_str));
+    let default_quick = rules.quick.as_deref().filter(|q| !q.starts_with(':'));
+    let candidates = default_quick
+        .into_iter()
+        .chain(used.iter().filter(|held| !held.starts_with(':')).map(String::as_str))
+        .chain(DEFAULTS)
+        .chain(listed.chain(there).map(String::as_str));
     let mut out: Vec<String> = Vec::new();
     for candidate in candidates {
         if out.len() >= count {

@@ -561,6 +561,8 @@ impl Slack {
                 file: Some(file),
                 pack: String::new(),
                 animated: false,
+                set: String::new(),
+                locked: false,
             });
         }
         self.ctx.media(&files).map_err(|err| Fault::Net(err.to_string()))?;
@@ -652,6 +654,8 @@ impl Slack {
                 file,
                 pack,
                 animated: true,
+                set: String::new(),
+                locked: false,
             });
         }
         if !files.is_empty() {

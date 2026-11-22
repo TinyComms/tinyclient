@@ -1,5 +1,6 @@
-//! The picker's catalogs: saved GIFs, a GIF search through Telegram's `@gif` inline bot, the
-//! installed sticker packs one pack a page, and the installed custom-emoji packs the same way.
+//! The picker's catalogs: saved GIFs, a GIF search through Telegram's `@gif` inline bot, sticker
+//! packs one page at a time (recent, favourites, featured, then each installed pack), a sticker
+//! search, and the installed custom-emoji packs the same way.
 //! Every preview is a still (a GIF's or sticker's thumbnail); nothing animated is fetched.
 //! Asked only when a picker tab opens or the query changes, never ahead. What a pick names is
 //! remembered here, so sending it uploads nothing. A custom emoji is also remembered by the
@@ -22,7 +23,8 @@ const EMOJI_LABELS: usize = 2_000;
 #[derive(Debug, Clone)]
 pub(super) enum Pick {
     /// A saved GIF or a sticker: the document itself, sent as it is.
-    Document(tl::types::InputDocument),
+    /// `sticker` asks Telegram to move that pack up in the user's order.
+    Document { document: tl::types::InputDocument, sticker: bool },
     /// A result of an inline query (`@gif`): sent through the bot, as Telegram's apps do.
     Inline { query_id: i64, result: String },
 }
@@ -48,25 +50,39 @@ pub(super) fn remember_document(account: &Account, loc: &tl::types::InputDocumen
     remember(
         account,
         &id,
-        Pick::Document(tl::types::InputDocument {
-            id: loc.id,
-            access_hash: loc.access_hash,
-            file_reference: loc.file_reference.clone(),
-        }),
+        Pick::Document {
+            document: tl::types::InputDocument {
+                id: loc.id,
+                access_hash: loc.access_hash,
+                file_reference: loc.file_reference.clone(),
+            },
+            sticker: false,
+        },
     );
 }
 
 /// Saves or removes a GIF in Telegram's saved GIFs list (`messages.saveGif`).
 pub(super) fn save_gif(account: &Account, id: &str, unsave: bool) -> Result<(), Fault> {
-    let Some(Pick::Document(doc)) = find(account, id) else {
+    let Some(Pick::Document { document: doc, .. }) = find(account, id) else {
         return Err(Fault::Rpc { code: 400, name: "DOCUMENT_INVALID".to_owned(), value: None });
     };
     account.ask(&tl::functions::messages::SaveGif { id: doc.into(), unsave })?;
     Ok(())
 }
 
+/// One page of the Stickers tab, kept so the next page does not ask for the list again.
+#[derive(Debug, Clone)]
+pub(super) enum StickerPage {
+    Recent,
+    Faved,
+    Pack { id: i64, access: i64, title: String, locked: bool, set: String },
+}
+
 /// A document as a picker item: its still, queued to be fetched, and remembered for sending.
-fn item(account: &Account, document: &tl::enums::Document, pack: &str) -> Option<CatalogItem> {
+/// `set` is the install key when the pack is not on the account yet. It stays empty when the
+/// pack is installed, and when it is locked, so the picker does not offer Add. `locked` is a
+/// Premium sticker this account cannot send.
+fn item(account: &Account, document: &tl::enums::Document, pack: &str, locked: bool, set: &str) -> Option<CatalogItem> {
     let tl::enums::Document::Document(document) = document else {
         return None;
     };
@@ -104,7 +120,10 @@ fn item(account: &Account, document: &tl::enums::Document, pack: &str) -> Option
     remember(
         account,
         &id,
-        Pick::Document(tl::types::InputDocument { id: document.id, access_hash: document.access_hash, file_reference: document.file_reference.clone() }),
+        Pick::Document {
+            document: tl::types::InputDocument { id: document.id, access_hash: document.access_hash, file_reference: document.file_reference.clone() },
+            sticker: attachment.sticker,
+        },
     );
     Some(CatalogItem {
         id,
@@ -113,6 +132,8 @@ fn item(account: &Account, document: &tl::enums::Document, pack: &str) -> Option
         file: attachment.thumb,
         pack: pack.to_owned(),
         animated,
+        set: set.to_owned(),
+        locked,
     })
 }
 
@@ -127,7 +148,7 @@ pub(super) fn catalog(
         CatalogKind::Emoji => emojis(account, cursor.and_then(|cursor| cursor.parse().ok()).unwrap_or(0)),
         CatalogKind::Gifs if query.is_empty() => saved_gifs(account),
         CatalogKind::Gifs => inline_search(account, query, cursor.unwrap_or(""), space),
-        CatalogKind::Stickers => stickers(account, cursor.and_then(|cursor| cursor.parse().ok()).unwrap_or(0)),
+        CatalogKind::Stickers => stickers(account, query, cursor.and_then(|cursor| cursor.parse().ok()).unwrap_or(0)),
     }
 }
 
@@ -155,7 +176,7 @@ fn emoji_item(account: &Account, document: &tl::enums::Document, pack: &str) -> 
     let tl::enums::Document::Document(raw) = document else {
         return None;
     };
-    let mut shown = item(account, document, pack)?;
+    let mut shown = item(account, document, pack, false, "")?;
     let alt = raw.attributes.iter().find_map(|attribute| match attribute {
         tl::enums::DocumentAttribute::CustomEmoji(emoji) if !emoji.alt.is_empty() => Some(emoji.alt.clone()),
         _ => None,
@@ -240,7 +261,7 @@ fn saved_gifs(account: &Account) -> Result<CatalogPage, Fault> {
     let tl::enums::messages::SavedGifs::Gifs(found) = account.ask(&tl::functions::messages::GetSavedGifs { hash: 0 })? else {
         return Ok(CatalogPage::default());
     };
-    let items = found.gifs.iter().take(protocol::CATALOG_LIMIT).filter_map(|gif| item(account, gif, "Saved")).collect();
+    let items = found.gifs.iter().take(protocol::CATALOG_LIMIT).filter_map(|gif| item(account, gif, "Saved", false, "")).collect();
     Ok(CatalogPage { items, cursor: None })
 }
 
@@ -326,7 +347,7 @@ fn inline_search(account: &Account, query: &str, offset: &str, space: Option<&st
         let pick_id = format!("i{}:{}", found.query_id, inline_id(result));
         match result {
             tl::enums::BotInlineResult::BotInlineMediaResult(result) => {
-                let Some(mut shown) = result.document.as_ref().and_then(|document| item(account, document, "")) else {
+                let Some(mut shown) = result.document.as_ref().and_then(|document| item(account, document, "", false, "")) else {
                     continue;
                 };
                 remember(account, &pick_id, Pick::Inline { query_id: found.query_id, result: result.id.clone() });
@@ -341,6 +362,8 @@ fn inline_search(account: &Account, query: &str, offset: &str, space: Option<&st
                     file: None,
                     pack: result.description.clone().unwrap_or_default(),
                     animated: false,
+                    set: String::new(),
+                    locked: false,
                 });
             }
         }
@@ -355,31 +378,270 @@ fn inline_id(result: &tl::enums::BotInlineResult) -> &str {
     }
 }
 
-/// One installed pack a page, in the user's order: the list of packs, then that pack.
-fn stickers(account: &Account, at: usize) -> Result<CatalogPage, Fault> {
+/// Recent and favourite stickers, then featured packs, then one installed pack a page.
+/// A word or an emoji in `query` searches instead of paging.
+fn stickers(account: &Account, query: &str, at: usize) -> Result<CatalogPage, Fault> {
+    if !query.is_empty() {
+        return searched(account, query);
+    }
     let held = account.live().sticker_sets.clone().filter(|_| at > 0);
-    let sets = match held {
-        Some(sets) => sets,
+    let pages = match held {
+        Some(pages) => pages,
         None => {
-            let tl::enums::messages::AllStickers::Stickers(all) = account.ask(&tl::functions::messages::GetAllStickers { hash: 0 })? else {
-                return Ok(CatalogPage::default());
-            };
-            let sets: Vec<(i64, i64, String)> = all
-                .sets
-                .iter()
-                .map(|tl::enums::StickerSet::Set(set)| (set.id, set.access_hash, set.title.clone()))
-                .collect();
-            account.live().sticker_sets = Some(sets.clone());
-            sets
+            let pages = sticker_pages(account)?;
+            account.live().sticker_sets = Some(pages.clone());
+            pages
         }
     };
-    let Some((id, access_hash, title)) = sets.get(at).cloned() else {
+    let Some(page) = pages.get(at).cloned() else {
         return Ok(CatalogPage::default());
     };
-    let request = tl::functions::messages::GetStickerSet { stickerset: tl::types::InputStickerSetId { id, access_hash }.into(), hash: 0 };
-    let tl::enums::messages::StickerSet::Set(set) = account.ask(&request)? else {
-        return Ok(CatalogPage::default());
+    let cursor = (at + 1 < pages.len()).then(|| (at + 1).to_string());
+    let (title, locked, set, documents) = match page {
+        StickerPage::Recent => ("Recent".to_owned(), false, String::new(), recent_documents(account)?),
+        StickerPage::Faved => ("Favourites".to_owned(), false, String::new(), faved_documents(account)?),
+        StickerPage::Pack { id, access, title, locked, set } => {
+            let request = tl::functions::messages::GetStickerSet { stickerset: tl::types::InputStickerSetId { id, access_hash: access }.into(), hash: 0 };
+            let documents = match account.ask(&request)? {
+                tl::enums::messages::StickerSet::Set(found) => found.documents,
+                tl::enums::messages::StickerSet::NotModified => Vec::new(),
+            };
+            (title, locked, set, documents)
+        }
     };
-    let items = set.documents.iter().take(protocol::CATALOG_LIMIT).filter_map(|sticker| item(account, sticker, &title)).collect();
-    Ok(CatalogPage { items, cursor: (at + 1 < sets.len()).then(|| (at + 1).to_string()) })
+    let items = documents
+        .iter()
+        .take(protocol::CATALOG_LIMIT)
+        .filter_map(|document| {
+            let install = installable(&pages, document, &set, locked);
+            item(account, document, &title, locked, &install)
+        })
+        .collect();
+    Ok(CatalogPage { items, cursor })
+}
+
+/// The set key to offer an Add for. A locked pack never has one. Otherwise the page's own key,
+/// or the document's when that pack is not installed.
+fn installable(pages: &[StickerPage], document: &tl::enums::Document, page_set: &str, locked: bool) -> String {
+    if locked {
+        return String::new();
+    }
+    if !page_set.is_empty() {
+        return page_set.to_owned();
+    }
+    let tl::enums::Document::Document(raw) = document else {
+        return String::new();
+    };
+    let key = content::sticker_set_key(&raw.attributes);
+    let installed = pages.iter().any(|page| matches!(page, StickerPage::Pack { id, access, set, .. } if set.is_empty() && key == format!("{id}:{access}")));
+    if key.is_empty() || installed { String::new() } else { key }
+}
+
+fn account_premium(account: &Account) -> bool {
+    account.dir().get(Who::User(account.me)).is_some_and(|known| known.premium)
+}
+
+/// Premium featured packs this account cannot add, by id and by short name. Empty when the
+/// account is Premium or the featured list is not a Premium list. Fetched each time: a steer
+/// can change the list.
+struct PremiumPacks {
+    ids: Vec<i64>,
+    names: Vec<String>,
+}
+
+fn premium_packs(account: &Account) -> Result<PremiumPacks, Fault> {
+    if account_premium(account) {
+        return Ok(PremiumPacks { ids: Vec::new(), names: Vec::new() });
+    }
+    let tl::enums::messages::FeaturedStickers::Stickers(found) = account.ask(&tl::functions::messages::GetFeaturedStickers { hash: 0 })? else {
+        return Ok(PremiumPacks { ids: Vec::new(), names: Vec::new() });
+    };
+    if !found.premium {
+        return Ok(PremiumPacks { ids: Vec::new(), names: Vec::new() });
+    }
+    let mut ids = Vec::new();
+    let mut names = Vec::new();
+    for covered in found.sets {
+        let tl::enums::StickerSet::Set(set) = covered.set();
+        ids.push(set.id);
+        if !set.short_name.is_empty() {
+            names.push(set.short_name);
+        }
+    }
+    Ok(PremiumPacks { ids, names })
+}
+
+/// A stickerset key is locked when it names a Premium featured pack, either as `id:access`
+/// or as that pack's short name.
+fn premium_locked(packs: &PremiumPacks, key: &str) -> bool {
+    if let Some((id, _)) = key.split_once(':') {
+        return id.parse::<i64>().ok().is_some_and(|id| packs.ids.contains(&id));
+    }
+    !key.is_empty() && packs.names.iter().any(|name| name == key)
+}
+
+fn sticker_pages(account: &Account) -> Result<Vec<StickerPage>, Fault> {
+    let installed = match account.ask(&tl::functions::messages::GetAllStickers { hash: 0 })? {
+        tl::enums::messages::AllStickers::Stickers(all) => all.sets,
+        _ => Vec::new(),
+    };
+    let mut pages = Vec::new();
+    if !recent_documents(account)?.is_empty() {
+        pages.push(StickerPage::Recent);
+    }
+    if !faved_documents(account)?.is_empty() {
+        pages.push(StickerPage::Faved);
+    }
+    let mut premium_ids = Vec::new();
+    if let tl::enums::messages::FeaturedStickers::Stickers(found) = account.ask(&tl::functions::messages::GetFeaturedStickers { hash: 0 })? {
+        let locked = found.premium && !account_premium(account);
+        for covered in found.sets {
+            let tl::enums::StickerSet::Set(set) = covered.set();
+            if locked {
+                premium_ids.push(set.id);
+            }
+            let already = installed.iter().any(|one| matches!(one, tl::enums::StickerSet::Set(held) if held.id == set.id));
+            if already {
+                continue;
+            }
+            pages.push(StickerPage::Pack {
+                id: set.id,
+                access: set.access_hash,
+                title: set.title,
+                locked,
+                set: if locked { String::new() } else { format!("{}:{}", set.id, set.access_hash) },
+            });
+        }
+    }
+    for set in installed {
+        let tl::enums::StickerSet::Set(set) = set;
+        let locked = premium_ids.contains(&set.id);
+        pages.push(StickerPage::Pack { id: set.id, access: set.access_hash, title: set.title, locked, set: String::new() });
+    }
+    Ok(pages)
+}
+
+fn recent_documents(account: &Account) -> Result<Vec<tl::enums::Document>, Fault> {
+    Ok(match account.ask(&tl::functions::messages::GetRecentStickers { attached: false, hash: 0 })? {
+        tl::enums::messages::RecentStickers::Stickers(found) => found.stickers,
+        tl::enums::messages::RecentStickers::NotModified => Vec::new(),
+    })
+}
+
+fn faved_documents(account: &Account) -> Result<Vec<tl::enums::Document>, Fault> {
+    Ok(match account.ask(&tl::functions::messages::GetFavedStickers { hash: 0 })? {
+        tl::enums::messages::FavedStickers::Stickers(found) => found.stickers,
+        tl::enums::messages::FavedStickers::NotModified => Vec::new(),
+    })
+}
+
+/// A sticker search: words go to `messages.searchStickers`, an emoji to `messages.getStickers`.
+fn searched(account: &Account, query: &str) -> Result<CatalogPage, Fault> {
+    let letters = query.chars().any(|c| c.is_ascii_alphanumeric());
+    let documents = if letters {
+        match account.ask(&tl::functions::messages::SearchStickers {
+            emojis: false,
+            q: query.to_owned(),
+            emoticon: String::new(),
+            lang_code: vec!["en".to_owned()],
+            offset: 0,
+            limit: protocol::CATALOG_LIMIT as i32,
+            hash: 0,
+        })? {
+            tl::enums::messages::FoundStickers::Stickers(found) => found.stickers,
+            tl::enums::messages::FoundStickers::NotModified(_) => Vec::new(),
+        }
+    } else {
+        match account.ask(&tl::functions::messages::GetStickers { emoticon: query.to_owned(), hash: 0 })? {
+            tl::enums::messages::Stickers::Stickers(found) => found.stickers,
+            tl::enums::messages::Stickers::NotModified => Vec::new(),
+        }
+    };
+    let packs = premium_packs(account)?;
+    let mut titles: Vec<(String, String)> = Vec::new();
+    let mut items = Vec::new();
+    for document in documents.iter().take(protocol::CATALOG_LIMIT) {
+        let key = match document {
+            tl::enums::Document::Document(raw) => content::sticker_set_key(&raw.attributes),
+            tl::enums::Document::Empty(_) => String::new(),
+        };
+        let locked = premium_locked(&packs, &key);
+        let title = titled(account, &key, &mut titles);
+        let install = if locked { "" } else { key.as_str() };
+        if let Some(shown) = item(account, document, &title, locked, install) {
+            items.push(shown);
+        }
+    }
+    Ok(CatalogPage { items, cursor: None })
+}
+
+fn titled(account: &Account, key: &str, titles: &mut Vec<(String, String)>) -> String {
+    if key.is_empty() {
+        return String::new();
+    }
+    if let Some((_, title)) = titles.iter().find(|(held, _)| held == key) {
+        return title.clone();
+    }
+    let title = input_set(key).ok().and_then(|stickerset| {
+        match account.ask(&tl::functions::messages::GetStickerSet { stickerset, hash: 0 }) {
+            Ok(tl::enums::messages::StickerSet::Set(found)) => match found.set {
+                tl::enums::StickerSet::Set(set) => Some(set.title),
+            },
+            _ => None,
+        }
+    }).unwrap_or_default();
+    titles.push((key.to_owned(), title.clone()));
+    title
+}
+
+fn input_set(set: &str) -> Result<tl::enums::InputStickerSet, Fault> {
+    if let Some((id, access)) = set.split_once(':') {
+        if let (Ok(id), Ok(access_hash)) = (id.parse::<i64>(), access.parse::<i64>()) {
+            return Ok(tl::types::InputStickerSetId { id, access_hash }.into());
+        }
+    }
+    if set.is_empty() {
+        return Err(Fault::Rpc { code: 400, name: "STICKERSET_INVALID".to_owned(), value: None });
+    }
+    Ok(tl::types::InputStickerSetShortName { short_name: set.to_owned() }.into())
+}
+
+/// Installs or removes a pack, or restacks the installed packs. Clears the page list when it changes.
+/// A Premium featured pack is not installed for an account that is not Premium.
+pub(super) fn sticker_set(account: &Account, set: &str, install: Option<bool>, order: &[i64]) -> Result<(), Fault> {
+    if !order.is_empty() {
+        account.ask(&tl::functions::messages::ReorderStickerSets { masks: false, emojis: false, order: order.to_vec() })?;
+        account.live().sticker_sets = None;
+        return Ok(());
+    }
+    let stickerset = input_set(set)?;
+    match install {
+        Some(true) => {
+            let packs = premium_packs(account)?;
+            let locked = match &stickerset {
+                tl::enums::InputStickerSet::Id(chosen) => packs.ids.contains(&chosen.id),
+                tl::enums::InputStickerSet::ShortName(chosen) => packs.names.iter().any(|name| name == &chosen.short_name),
+                _ => false,
+            };
+            if locked {
+                return Err(Fault::Rpc { code: 403, name: "PREMIUM_ACCOUNT_REQUIRED".to_owned(), value: None });
+            }
+            account.ask(&tl::functions::messages::InstallStickerSet { stickerset, archived: false })?;
+        }
+        Some(false) => {
+            account.ask(&tl::functions::messages::UninstallStickerSet { stickerset })?;
+        }
+        None => return Err(Fault::Rpc { code: 400, name: "STICKERSET_INVALID".to_owned(), value: None }),
+    }
+    account.live().sticker_sets = None;
+    Ok(())
+}
+
+/// Stars or unstars one sticker the picker has already shown.
+pub(super) fn fave_sticker(account: &Account, id: &str, unfave: bool) -> Result<(), Fault> {
+    let Some(Pick::Document { document, .. }) = find(account, id) else {
+        return Err(Fault::Rpc { code: 400, name: "DOCUMENT_INVALID".to_owned(), value: None });
+    };
+    account.ask(&tl::functions::messages::FaveSticker { id: document.into(), unfave })?;
+    Ok(())
 }

@@ -91,6 +91,15 @@ fn unhex(text: &str) -> Vec<u8> {
     (0..text.len()).step_by(2).map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap_or(0)).collect()
 }
 
+/// `m***@example.com`. The local part's first letter only; the rest stays hidden.
+fn mask_email(email: &str) -> String {
+    let Some((name, host)) = email.split_once('@') else {
+        return "email".to_owned();
+    };
+    let first = name.chars().next().unwrap_or('*');
+    format!("{first}***@{host}")
+}
+
 /// One field of a value, written out.
 type Field<'a> = &'a dyn Fn(&mut Vec<u8>);
 
@@ -562,6 +571,30 @@ struct World {
     noforwards: HashSet<Who>,
     /// Saved GIF document IDs, newest first (`messages.getSavedGifs` / `messages.saveGif`).
     saved_gifs: Vec<i64>,
+    /// Current Telegram Stars balance (`payments.getStarsStatus` / `messages.sendPaidReaction`).
+    stars_balance: i64,
+    /// Account default quick reaction (`help.getConfig` / `messages.setDefaultReaction`).
+    default_reaction: String,
+    /// Paid reaction count accumulated per `(peer, msg_id)` in this session.
+    paid_counts: HashMap<(Who, i32), i32>,
+    /// Whether `account.getPassword` reports a recovery email (`has_recovery`).
+    has_recovery: bool,
+    /// Login email set during `SetUpEmailRequired` flow.
+    pending_login_email: Option<String>,
+    /// Whether the phone code flow is testing `authorizationSignUpRequired`.
+    signup_required: bool,
+    /// The Camp pack (id 920) was installed with `messages.installStickerSet`.
+    camp_installed: bool,
+    /// The Gold pack (id 930) is installed as well as featured. Paired with `featured_premium`.
+    gold_installed: bool,
+    /// Installed pack ids, first shown first (`messages.reorderStickerSets`). Empty keeps Hiking, then Camp.
+    sticker_order: Vec<i64>,
+    /// Starred sticker document ids (`messages.faveSticker`).
+    faved: Vec<i64>,
+    /// `messages.getRecentStickers` returns the Hiking sticker.
+    show_recent: bool,
+    /// `messages.getFeaturedStickers` returns one Premium pack.
+    featured_premium: bool,
     /// Account-wide notification defaults: `[users_muted, groups_muted, channels_muted]`.
     notify_defaults: [bool; 3],
     /// Per-peer notification exceptions (`account.getNotifyExceptions`).
@@ -641,6 +674,18 @@ impl World {
             large_broke: false,
             noforwards: HashSet::new(),
             saved_gifs: vec![6_200],
+            stars_balance: 250,
+            default_reaction: "❤".to_owned(),
+            paid_counts: HashMap::new(),
+            has_recovery: false,
+            pending_login_email: None,
+            signup_required: false,
+            camp_installed: false,
+            gold_installed: false,
+            sticker_order: Vec::new(),
+            faved: Vec::new(),
+            show_recent: false,
+            featured_premium: false,
             notify_defaults: [false, false, false],
             notify_exceptions: vec![(Who::Channel(NOTES), true)],
             sessions: vec![
@@ -825,6 +870,17 @@ impl World {
         person
     }
 
+    fn signup_required_auth(&self) -> tl::enums::auth::Authorization {
+        let terms = tl::types::help::TermsOfService {
+            popup: false,
+            id: tl::types::DataJson { data: "{}".to_owned() }.into(),
+            text: "By signing up for Telegram, you agree not to send spam or scam users.".to_owned(),
+            entities: Vec::new(),
+            min_age_confirm: None,
+        };
+        tl::types::auth::AuthorizationSignUpRequired { terms_of_service: Some(terms.into()) }.into()
+    }
+
     fn me(&self) -> tl::enums::auth::Authorization {
         tl::types::auth::Authorization {
             setup_password_required: false,
@@ -844,7 +900,7 @@ impl World {
             p: unhex(PRIME),
         };
         tl::types::account::Password {
-            has_recovery: false,
+            has_recovery: self.has_recovery,
             has_secure_values: false,
             has_password: true,
             current_algo: Some(algo.clone().into()),
@@ -1290,6 +1346,39 @@ impl World {
                 }
                 Vec::new()
             }
+            "paid-reaction" => {
+                // Adds a paid ⭐ reaction with a top-senders leaderboard on Workshop message 41.
+                let peer = Who::Channel(WORKSHOP);
+                self.paid_counts.insert((peer, 41), 5);
+                let reactions = tl::types::MessageReactions {
+                    min: false,
+                    can_see_list: true,
+                    reactions_as_tags: false,
+                    results: vec![tl::enums::ReactionCount::Count(tl::types::ReactionCount {
+                        chosen_order: None,
+                        reaction: tl::enums::Reaction::Paid,
+                        count: 5,
+                    })],
+                    recent_reactions: None,
+                    top_reactors: Some(vec![tl::enums::MessageReactor::Reactor(tl::types::MessageReactor {
+                        top: true,
+                        my: false,
+                        anonymous: false,
+                        peer_id: Some(Who::User(ODALYS).peer()),
+                        count: 5,
+                    })]),
+                };
+                vec![update(
+                    tl::types::UpdateMessageReactions {
+                        peer: peer.peer(),
+                        msg_id: 41,
+                        top_msg_id: Some(TOOLS),
+                        saved_peer_id: None,
+                        reactions: reactions.into(),
+                    }
+                    .into(),
+                )]
+            }
             "file-go" => {
                 self.file_go = true;
                 Vec::new()
@@ -1527,6 +1616,20 @@ impl World {
                 message.edit_date = Some(t0() + 30);
                 self.store(None, message.clone());
                 vec![update(tl::types::UpdateEditMessage { message: message.into(), pts: 0, pts_count: 0 }.into())]
+            }
+            "recent-stickers" => {
+                self.show_recent = true;
+                Vec::new()
+            }
+            "featured-premium" => {
+                self.featured_premium = true;
+                Vec::new()
+            }
+            // Installed, and still on the Premium featured list, so a non-Premium account keeps it locked.
+            "gold-installed" => {
+                self.featured_premium = true;
+                self.gold_installed = true;
+                Vec::new()
             }
             "call-flags" => {
                 let id = words.next().and_then(|id| id.parse().ok()).unwrap_or(ODALYS);
@@ -2171,8 +2274,21 @@ impl World {
                 })
             };
             return match request.phone_number.as_str() {
-                "+15550100142" | "+15550100199" => {
+                "+15550100177" => {
                     self.phone = Some(request.phone_number);
+                    self.has_recovery = false;
+                    self.signup_required = false;
+                    answer(tl::enums::auth::SentCode::Code(tl::types::auth::SentCode {
+                        r#type: tl::types::auth::SentCodeTypeSetUpEmailRequired { apple_signin_allowed: false, google_signin_allowed: false }.into(),
+                        phone_code_hash: "hash-mail".to_owned(),
+                        next_type: None,
+                        timeout: None,
+                    }))
+                }
+                "+15550100142" | "+15550100199" | "+15550100166" | "+15550100188" => {
+                    self.phone = Some(request.phone_number.clone());
+                    self.has_recovery = request.phone_number == "+15550100166";
+                    self.signup_required = request.phone_number == "+15550100188";
                     answer(sms(Some(60)))
                 }
                 "+15550100666" => Err(rpc(400, "PHONE_NUMBER_BANNED", None)),
@@ -2193,10 +2309,11 @@ impl World {
             // What was typed is not written to the log, here as anywhere.
             self.log("SignIn");
             return match (request.phone_code.as_deref(), self.phone.as_deref()) {
-                (Some(CODE), Some("+15550100199")) => {
+                (Some(CODE), Some("+15550100199" | "+15550100166")) => {
                     self.password_owed = true;
                     Err(rpc(401, "SESSION_PASSWORD_NEEDED", None))
                 }
+                (Some(CODE), Some("+15550100188")) if self.signup_required => answer(self.signup_required_auth()),
                 (Some(CODE), Some(_)) => {
                     self.signed_in = true;
                     answer(self.me())
@@ -2204,6 +2321,54 @@ impl World {
                 (Some("00000"), _) => Err(rpc(400, "PHONE_CODE_EXPIRED", None)),
                 _ => Err(rpc(400, "PHONE_CODE_INVALID", None)),
             };
+        }
+        if let Some(request) = asked::<f::account::SendVerifyEmailCode>(body) {
+            self.log("SendVerifyEmailCode");
+            if !request.email.contains('@') || request.email.contains(char::is_whitespace) {
+                return Err(rpc(400, "EMAIL_INVALID", None));
+            }
+            self.pending_login_email = Some(request.email.clone());
+            let pattern = mask_email(&request.email);
+            return answer(tl::enums::account::SentEmailCode::Code(tl::types::account::SentEmailCode { email_pattern: pattern, length: 6 }));
+        }
+        if let Some(request) = asked::<f::account::VerifyEmail>(body) {
+            self.log("VerifyEmail");
+            let tl::enums::EmailVerification::Code(proof) = request.verification else {
+                return Err(rpc(400, "CODE_INVALID", None));
+            };
+            if proof.code != "654321" {
+                return Err(rpc(400, "CODE_INVALID", None));
+            }
+            let email = self.pending_login_email.clone().unwrap_or_default();
+            return answer(tl::enums::account::EmailVerified::Login(tl::types::account::EmailVerifiedLogin {
+                email,
+                sent_code: tl::types::auth::SentCode {
+                    r#type: tl::types::auth::SentCodeTypeApp { length: 5 }.into(),
+                    phone_code_hash: "hash-1".to_owned(),
+                    next_type: Some(tl::enums::auth::CodeType::Sms),
+                    timeout: Some(60),
+                }
+                .into(),
+            }));
+        }
+        if let Some(request) = asked::<f::auth::SignUp>(body) {
+            self.log("SignUp");
+            if request.first_name.trim().is_empty() {
+                return Err(rpc(400, "FIRSTNAME_INVALID", None));
+            }
+            self.signed_in = true;
+            self.signup_required = false;
+            return answer(self.me());
+        }
+        // Neither call reads the code or signs anyone in. `auth.recoverPassword` with no new
+        // settings deletes the cloud password, and that recovery stays unimplemented (#542).
+        if asked::<f::auth::RequestPasswordRecovery>(body).is_some() {
+            self.log("RequestPasswordRecovery");
+            return Err(rpc(400, "PASSWORD_RECOVERY_NA", None));
+        }
+        if asked::<f::auth::RecoverPassword>(body).is_some() {
+            self.log("RecoverPassword");
+            return Err(rpc(400, "PASSWORD_RECOVERY_NA", None));
         }
         if asked::<f::account::GetPassword>(body).is_some() {
             self.log("GetPassword");
@@ -2872,7 +3037,11 @@ impl World {
                 tl::enums::Reaction::Emoji(emoji) => Some(emoji.emoticon.clone()),
                 _ => None,
             }).collect();
-            self.log(&format!("SendReaction {} {} {}", peer.text(), request.msg_id, sent.join("")));
+            if request.big {
+                self.log(&format!("SendReaction {} {} {} big", peer.text(), request.msg_id, sent.join("")));
+            } else {
+                self.log(&format!("SendReaction {} {} {}", peer.text(), request.msg_id, sent.join("")));
+            }
             if sent.iter().any(|emoji| emoji == "🚫") {
                 return Err(rpc(400, "REACTION_INVALID", None));
             }
@@ -2882,6 +3051,92 @@ impl World {
             let reactions = tl::types::MessageReactions { min: false, can_see_list: true, reactions_as_tags: false, results: results.collect(), recent_reactions: None, top_reactors: None };
             let reacted = tl::types::UpdateMessageReactions { peer: peer.peer(), msg_id: request.msg_id, top_msg_id: None, saved_peer_id: None, reactions: reactions.into() };
             return answer(updates(vec![reacted.into()]));
+        }
+        if let Some(request) = asked::<f::messages::SendPaidReaction>(body) {
+            let peer = input_who(&request.peer);
+            let privacy = match &request.private {
+                Some(tl::enums::PaidReactionPrivacy::Anonymous) => "anonymous",
+                _ => "default",
+            };
+            self.log(&format!("SendPaidReaction {} {} count={} private={privacy}", peer.text(), request.msg_id, request.count));
+            if i64::from(request.count) > self.stars_balance {
+                return Err(rpc(400, "BALANCE_TOO_LOW", None));
+            }
+            self.stars_balance -= i64::from(request.count);
+            let entry = self.paid_counts.entry((peer, request.msg_id)).or_insert(0);
+            *entry += request.count;
+            let total = *entry;
+            let anonymous = privacy == "anonymous";
+            let top_reactors = vec![
+                tl::enums::MessageReactor::Reactor(tl::types::MessageReactor {
+                    top: true,
+                    my: true,
+                    anonymous,
+                    peer_id: (!anonymous).then(|| Who::User(ME).peer()),
+                    count: request.count,
+                }),
+                tl::enums::MessageReactor::Reactor(tl::types::MessageReactor {
+                    top: true,
+                    my: false,
+                    anonymous: false,
+                    peer_id: Some(Who::User(ODALYS).peer()),
+                    count: 5,
+                }),
+            ];
+            let reactions = tl::types::MessageReactions {
+                min: false,
+                can_see_list: true,
+                reactions_as_tags: false,
+                results: vec![tl::enums::ReactionCount::Count(tl::types::ReactionCount {
+                    chosen_order: Some(0),
+                    reaction: tl::enums::Reaction::Paid,
+                    count: total,
+                })],
+                recent_reactions: None,
+                top_reactors: Some(top_reactors),
+            };
+            let top_msg_id = (peer == Who::Channel(WORKSHOP) && request.msg_id == 41).then_some(TOOLS);
+            let reacted = tl::types::UpdateMessageReactions {
+                peer: peer.peer(),
+                msg_id: request.msg_id,
+                top_msg_id,
+                saved_peer_id: None,
+                reactions: reactions.into(),
+            };
+            return answer(updates(vec![reacted.into()]));
+        }
+        if let Some(request) = asked::<f::messages::TogglePaidReactionPrivacy>(body) {
+            let peer = input_who(&request.peer);
+            let privacy = match &request.private {
+                tl::enums::PaidReactionPrivacy::Anonymous => "anonymous",
+                _ => "default",
+            };
+            self.log(&format!("TogglePaidReactionPrivacy {} {} private={privacy}", peer.text(), request.msg_id));
+            return answer(true);
+        }
+        if let Some(request) = asked::<f::messages::SetDefaultReaction>(body) {
+            let emoji = match &request.reaction {
+                tl::enums::Reaction::Emoji(e) => e.emoticon.clone(),
+                tl::enums::Reaction::CustomEmoji(c) => format!("e{}", c.document_id),
+                _ => String::new(),
+            };
+            self.default_reaction = emoji.clone();
+            self.log(&format!("SetDefaultReaction {emoji}"));
+            return answer(true);
+        }
+        if asked::<f::payments::GetStarsStatus>(body).is_some() {
+            self.log("GetStarsStatus");
+            let status = tl::types::payments::StarsStatus {
+                balance: tl::enums::StarsAmount::Amount(tl::types::StarsAmount { amount: self.stars_balance, nanos: 0 }),
+                subscriptions: None,
+                subscriptions_next_offset: None,
+                subscriptions_missing_balance: None,
+                history: None,
+                next_offset: None,
+                chats: Vec::new(),
+                users: Vec::new(),
+            };
+            return answer(tl::enums::payments::StarsStatus::Status(status));
         }
         if let Some(request) = asked::<f::messages::MarkDialogUnread>(body) {
             let who = match &request.peer {
@@ -3054,6 +3309,61 @@ impl World {
             };
             self.log(&format!("GetCommonChats {id}"));
             return answer(tl::enums::messages::Chats::Chats(tl::types::messages::Chats { chats: chats() }));
+        }
+        if asked::<f::help::GetConfig>(body).is_some() {
+            self.log("GetConfig");
+            let cfg = tl::types::Config {
+                default_p2p_contacts: false,
+                preload_featured_stickers: false,
+                revoke_pm_inbox: true,
+                blocked_mode: false,
+                force_try_ipv6: false,
+                date: t0(),
+                expires: t0() + 3_600,
+                test_mode: false,
+                this_dc: 2,
+                dc_options: Vec::new(),
+                dc_txt_domain_name: String::new(),
+                chat_size_max: 200,
+                megagroup_size_max: 200_000,
+                forwarded_count_max: 100,
+                online_update_period_ms: 210_000,
+                offline_blur_timeout_ms: 5_000,
+                offline_idle_timeout_ms: 30_000,
+                online_cloud_timeout_ms: 300_000,
+                notify_cloud_delay_ms: 30_000,
+                notify_default_delay_ms: 1_500,
+                push_chat_period_ms: 60_000,
+                push_chat_limit: 2,
+                edit_time_limit: 172_800,
+                revoke_time_limit: i32::MAX,
+                revoke_pm_time_limit: i32::MAX,
+                rating_e_decay: 2_419_200,
+                stickers_recent_limit: 30,
+                channels_read_media_period: 604_800,
+                tmp_sessions: None,
+                call_receive_timeout_ms: 20_000,
+                call_ring_timeout_ms: 90_000,
+                call_connect_timeout_ms: 30_000,
+                call_packet_timeout_ms: 10_000,
+                me_url_prefix: "https://t.me/".to_owned(),
+                autoupdate_url_prefix: None,
+                gif_search_username: Some("gif".to_owned()),
+                venue_search_username: None,
+                img_search_username: None,
+                static_maps_provider: None,
+                caption_length_max: 1_024,
+                message_length_max: 4_096,
+                webfile_dc_id: 4,
+                suggested_lang_code: None,
+                lang_pack_version: None,
+                base_lang_pack_version: None,
+                reactions_default: (!self.default_reaction.is_empty()).then(|| {
+                    tl::types::ReactionEmoji { emoticon: self.default_reaction.clone() }.into()
+                }),
+                autologin_token: None,
+            };
+            return answer(tl::enums::Config::Config(cfg));
         }
         if asked::<f::help::GetAppConfig>(body).is_some() {
             self.log("GetAppConfig");
@@ -3348,6 +3658,7 @@ impl World {
             } else {
                 full.available_reactions = Some(tl::types::ChatReactionsAll { allow_custom: false }.into());
                 full.reactions_limit = Some(2);
+                full.paid_reactions_available = true;
             }
             // Field Notes stays a large channel. Workshop's count is the four people its
             // member list holds, so no empty Members tail is drawn behind them.
@@ -3544,10 +3855,105 @@ impl World {
         }
         if asked::<f::messages::GetAllStickers>(body).is_some() {
             self.log("GetAllStickers");
-            let mut set: tl::types::StickerSet = blank(&[&put(0u32), &put(900i64), &put(901i64), &put("Hiking".to_owned()), &put("hiking".to_owned()), &put(2i32), &put(1i32)]);
-            set.installed_date = Some(t0());
-            let found = tl::types::messages::AllStickers { hash: 1, sets: vec![set.into()] };
+            let mut sets = vec![installed_pack(900, 901, "Hiking", "hiking", 2)];
+            if self.camp_installed {
+                sets.push(installed_pack(920, 921, "Camp", "camp", 1));
+            }
+            if self.gold_installed {
+                sets.push(installed_pack(930, 931, "Gold", "gold", 1));
+            }
+            if !self.sticker_order.is_empty() {
+                let order = self.sticker_order.clone();
+                sets.sort_by_key(|set| order.iter().position(|id| *id == set.id).unwrap_or(usize::MAX));
+            }
+            let found = tl::types::messages::AllStickers { hash: 1, sets: sets.into_iter().map(Into::into).collect() };
             return Some(answer(tl::enums::messages::AllStickers::Stickers(found)));
+        }
+        if asked::<f::messages::GetRecentStickers>(body).is_some() {
+            self.log("GetRecentStickers");
+            let stickers = if self.show_recent { vec![sticker(6_400).into()] } else { Vec::new() };
+            let dates = if self.show_recent { vec![t0()] } else { Vec::new() };
+            let found = tl::types::messages::RecentStickers { hash: 0, packs: Vec::new(), stickers, dates };
+            return Some(answer(tl::enums::messages::RecentStickers::Stickers(found)));
+        }
+        if asked::<f::messages::GetFavedStickers>(body).is_some() {
+            self.log("GetFavedStickers");
+            let stickers = self.faved.iter().copied().map(sticker_by_id).map(Into::into).collect();
+            let found = tl::types::messages::FavedStickers { hash: 0, packs: Vec::new(), stickers };
+            return Some(answer(tl::enums::messages::FavedStickers::Stickers(found)));
+        }
+        if asked::<f::messages::GetFeaturedStickers>(body).is_some() {
+            self.log("GetFeaturedStickers");
+            let (premium, sets) = if self.featured_premium {
+                let covered = tl::types::StickerSetCovered {
+                    set: pack(930, 931, "Gold", "gold", 1).into(),
+                    cover: sticker_in(6_430, "✨", 930, 931).into(),
+                };
+                (true, vec![covered.into()])
+            } else {
+                (false, Vec::new())
+            };
+            let found = tl::types::messages::FeaturedStickers { premium, hash: 1, count: sets.len() as i32, sets, unread: Vec::new() };
+            return Some(answer(tl::enums::messages::FeaturedStickers::Stickers(found)));
+        }
+        if let Some(request) = asked::<f::messages::SearchStickers>(body) {
+            self.log("SearchStickers");
+            let stickers = if request.q.eq_ignore_ascii_case("camp") {
+                vec![sticker_in(6_420, "⛺", 920, 921).into()]
+            } else if request.q.eq_ignore_ascii_case("gold") {
+                vec![sticker_named(6_431, "✨", "gold").into()]
+            } else {
+                Vec::new()
+            };
+            let found = tl::types::messages::FoundStickers { next_offset: None, hash: 1, stickers };
+            return Some(answer(tl::enums::messages::FoundStickers::Stickers(found)));
+        }
+        if let Some(request) = asked::<f::messages::GetStickers>(body) {
+            self.log("GetStickers");
+            let stickers = if request.emoticon == "⛺" {
+                vec![sticker_in(6_420, "⛺", 920, 921).into()]
+            } else if request.emoticon == "🥾" {
+                vec![sticker(6_400).into()]
+            } else if request.emoticon == "✨" {
+                vec![sticker_in(6_430, "✨", 930, 931).into()]
+            } else {
+                Vec::new()
+            };
+            let found = tl::types::messages::Stickers { hash: 1, stickers };
+            return Some(answer(tl::enums::messages::Stickers::Stickers(found)));
+        }
+        if let Some(request) = asked::<f::messages::InstallStickerSet>(body) {
+            let id = set_id(&request.stickerset);
+            self.log(&format!("InstallStickerSet {id}"));
+            if id == 920 {
+                self.camp_installed = true;
+            }
+            return Some(answer(tl::enums::messages::StickerSetInstallResult::Success));
+        }
+        if let Some(request) = asked::<f::messages::UninstallStickerSet>(body) {
+            let id = set_id(&request.stickerset);
+            self.log(&format!("UninstallStickerSet {id}"));
+            if id == 920 {
+                self.camp_installed = false;
+            }
+            return Some(answer(true));
+        }
+        if let Some(request) = asked::<f::messages::ReorderStickerSets>(body) {
+            self.log("ReorderStickerSets");
+            self.sticker_order = request.order.clone();
+            return Some(answer(true));
+        }
+        if let Some(request) = asked::<f::messages::FaveSticker>(body) {
+            let doc_id = match &request.id {
+                tl::enums::InputDocument::Document(doc) => doc.id,
+                tl::enums::InputDocument::Empty => 0,
+            };
+            self.log(&format!("FaveSticker d{doc_id} unfave={}", request.unfave));
+            self.faved.retain(|&id| id != doc_id);
+            if !request.unfave && doc_id != 0 {
+                self.faved.insert(0, doc_id);
+            }
+            return Some(answer(true));
         }
         if asked::<f::messages::GetEmojiStickers>(body).is_some() {
             self.log("GetEmojiStickers");
@@ -3565,10 +3971,10 @@ impl World {
             return Some(answer(tl::enums::messages::Reactions::Reactions(found)));
         }
         if let Some(request) = asked::<f::messages::GetStickerSet>(body) {
-            let emoji = matches!(&request.stickerset, tl::enums::InputStickerSet::Id(set) if set.id == 910);
-            if emoji {
+            let id = set_id(&request.stickerset);
+            if id == 910 {
                 self.log("GetStickerSet emoji");
-                let set: tl::types::StickerSet = blank(&[&put(0u32), &put(910i64), &put(911i64), &put("Faces".to_owned()), &put("faces".to_owned()), &put(1i32), &put(1i32)]);
+                let set = pack(910, 911, "Faces", "faces", 1);
                 let found = tl::types::messages::StickerSet {
                     set: set.into(),
                     packs: Vec::new(),
@@ -3578,8 +3984,12 @@ impl World {
                 return Some(answer(tl::enums::messages::StickerSet::Set(found)));
             }
             self.log("GetStickerSet");
-            let set: tl::types::StickerSet = blank(&[&put(0u32), &put(900i64), &put(901i64), &put("Hiking".to_owned()), &put("hiking".to_owned()), &put(2i32), &put(1i32)]);
-            let found = tl::types::messages::StickerSet { set: set.into(), packs: Vec::new(), keywords: Vec::new(), documents: vec![sticker(6_400).into(), sticker(6_401).into()] };
+            let (set, documents) = match id {
+                920 => (pack(920, 921, "Camp", "camp", 1), vec![sticker_in(6_420, "⛺", 920, 921).into()]),
+                930 => (pack(930, 931, "Gold", "gold", 1), vec![sticker_in(6_430, "✨", 930, 931).into()]),
+                _ => (pack(900, 901, "Hiking", "hiking", 2), vec![sticker(6_400).into(), sticker(6_401).into()]),
+            };
+            let found = tl::types::messages::StickerSet { set: set.into(), packs: Vec::new(), keywords: Vec::new(), documents };
             return Some(answer(tl::enums::messages::StickerSet::Set(found)));
         }
         if let Some(request) = asked::<f::upload::SaveFilePart>(body) {
@@ -3812,6 +4222,10 @@ fn plain_document(id: i64, size: i64, name: &str) -> tl::types::Document {
 }
 
 fn sticker(id: i64) -> tl::types::Document {
+    sticker_in(id, "🥾", 900, 901)
+}
+
+fn sticker_in(id: i64, alt: &str, set_id: i64, access: i64) -> tl::types::Document {
     tl::types::Document {
         id,
         access_hash: id + 1,
@@ -3824,11 +4238,48 @@ fn sticker(id: i64) -> tl::types::Document {
         dc_id: 2,
         attributes: vec![tl::types::DocumentAttributeSticker {
             mask: false,
-            alt: "🥾".to_owned(),
-            stickerset: tl::types::InputStickerSetId { id: 900, access_hash: 901 }.into(),
+            alt: alt.to_owned(),
+            stickerset: tl::types::InputStickerSetId { id: set_id, access_hash: access }.into(),
             mask_coords: None,
         }
         .into()],
+    }
+}
+
+fn sticker_named(id: i64, alt: &str, short: &str) -> tl::types::Document {
+    let mut document = sticker_in(id, alt, 0, 0);
+    document.attributes = vec![tl::types::DocumentAttributeSticker {
+        mask: false,
+        alt: alt.to_owned(),
+        stickerset: tl::types::InputStickerSetShortName { short_name: short.to_owned() }.into(),
+        mask_coords: None,
+    }
+    .into()];
+    document
+}
+
+fn sticker_by_id(id: i64) -> tl::types::Document {
+    match id {
+        6_420 => sticker_in(id, "⛺", 920, 921),
+        6_430 => sticker_in(id, "✨", 930, 931),
+        _ => sticker(id),
+    }
+}
+
+fn pack(id: i64, access: i64, title: &str, short: &str, count: i32) -> tl::types::StickerSet {
+    blank(&[&put(0u32), &put(id), &put(access), &put(title.to_owned()), &put(short.to_owned()), &put(count), &put(1i32)])
+}
+
+fn installed_pack(id: i64, access: i64, title: &str, short: &str, count: i32) -> tl::types::StickerSet {
+    let mut set = pack(id, access, title, short, count);
+    set.installed_date = Some(t0());
+    set
+}
+
+fn set_id(set: &tl::enums::InputStickerSet) -> i64 {
+    match set {
+        tl::enums::InputStickerSet::Id(set) => set.id,
+        _ => 0,
     }
 }
 

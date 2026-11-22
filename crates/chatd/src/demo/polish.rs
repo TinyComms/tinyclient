@@ -94,6 +94,8 @@ pub fn page(files: &[protocol::MediaFile], kind: CatalogKind, items: &[(&str, &s
             file: files.iter().find(|file| file.id == *id).cloned(),
             pack: (*pack).to_owned(),
             animated: kind == CatalogKind::Gifs,
+            set: String::new(),
+            locked: false,
         })
         .collect();
     let next = (from + PAGE < wanted.len()).then(|| (from + PAGE).to_string());

@@ -518,6 +518,7 @@ fn attachment(rich: &mut Rich, attached: &Attached) -> Attachment {
         duration: attached.duration_secs.round() as u32,
         round: false,
         view_once: false,
+        sticker_set: String::new(),
     }
 }
 
@@ -552,6 +553,7 @@ fn sticker(rich: &mut Rich, sticker: &model::Sticker) -> Attachment {
         duration: 0,
         round: false,
         view_once: false,
+        sticker_set: String::new(),
     }
 }
 

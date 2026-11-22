@@ -27,6 +27,15 @@ pub enum Allowed {
     None,
 }
 
+/// The emoji representing a paid Star reaction on a message chip.
+pub const PAID_EMOJI: &str = "⭐";
+
+/// True when `emoji` names the paid Star reaction chip, which must never go through
+/// `messages.sendReaction` as a plain `reactionEmoji`.
+pub fn is_paid(emoji: &str) -> bool {
+    protocol::bare_emoji(emoji) == PAID_EMOJI
+}
+
 /// The rules, from Telegram's list (each emoji and whether it needs Premium), the chat's
 /// setting, whether we have Premium and the chat's own cap on different reactions.
 pub fn rules_of(standard: &[(String, bool)], allowed: Allowed, premium: bool, limit: Option<i32>) -> ReactionRules {
@@ -39,6 +48,7 @@ pub fn rules_of(standard: &[(String, bool)], allowed: Allowed, premium: bool, li
         // Telegram takes the set of ours whole, so a new one past the limit drops the oldest.
         replaces: true,
         distinct: limit.filter(|limit| *limit > 0).map_or(DISTINCT, |limit| limit as u32),
+        big: true,
         ..ReactionRules::default()
     };
     match allowed {
@@ -61,7 +71,7 @@ fn spelled(reaction: &tl::enums::Reaction) -> Option<String> {
     match reaction {
         tl::enums::Reaction::Emoji(emoji) => Some(emoji.emoticon.clone()),
         tl::enums::Reaction::CustomEmoji(custom) => Some(format!("e{}", custom.document_id)),
-        // Paid (⭐) reactions cost Stars and are never offered.
+        // Paid (⭐) reactions cost Stars and are sent only through the confirmed paid flow.
         tl::enums::Reaction::Paid | tl::enums::Reaction::Empty => None,
     }
 }
@@ -77,8 +87,8 @@ fn allowed_of(set: Option<&tl::enums::ChatReactions>) -> Allowed {
     }
 }
 
-/// Telegram's list, asked once a connection.
-fn standard(account: &Account) -> Result<Vec<(String, bool)>, Fault> {
+/// Telegram's list, asked once a connection: `(emoticon, needs_premium, has_around_animation)`.
+fn standard(account: &Account) -> Result<Vec<(String, bool, bool)>, Fault> {
     if let Some(known) = account.live().reactions.clone() {
         return Ok(known);
     }
@@ -88,12 +98,25 @@ fn standard(account: &Account) -> Result<Vec<(String, bool)>, Fault> {
             .into_iter()
             .map(|tl::enums::AvailableReaction::Reaction(one)| one)
             .filter(|one| !one.inactive)
-            .map(|one| (one.reaction, one.premium))
+            .map(|one| (one.reaction, one.premium, one.around_animation.is_some()))
             .collect(),
         tl::enums::messages::AvailableReactions::NotModified => Vec::new(),
     };
     account.live().reactions = Some(list.clone());
     Ok(list)
+}
+
+/// Reads `help.getConfig` once per connection (refreshed on `Update::Config`) for `reactions_default`.
+fn default_reaction(account: &Account) -> Option<String> {
+    if let Some(cached) = account.live().default_reaction.clone() {
+        return cached;
+    }
+    let quick = match super::wire::call(account.wire.as_ref(), &tl::functions::help::GetConfig {}) {
+        Ok(tl::enums::Config::Config(cfg)) => cfg.reactions_default.as_ref().and_then(spelled),
+        Err(_) => return None,
+    };
+    account.live().default_reaction = Some(quick.clone());
+    quick
 }
 
 /// What a chat takes from us: one request for the chat's setting (none for a person), and the
@@ -102,15 +125,17 @@ pub(super) fn rules(account: &Account, conversation: &str) -> Result<ReactionRul
     let invalid = || Fault::Rpc { code: 400, name: "PEER_ID_INVALID".to_owned(), value: None };
     let (who, _) = Who::parse(conversation).ok_or_else(invalid)?;
     let premium = account.dir().get(Who::User(account.me)).is_some_and(|known| known.premium);
-    let (allowed, limit) = match who {
+    let (allowed, limit, paid) = match who {
         // A chat with a person takes every reaction, and custom ones with Premium.
-        Who::User(_) => (Allowed::All { custom: true }, None),
+        Who::User(_) => (Allowed::All { custom: true }, None, false),
         Who::Group(chat_id) => {
             let tl::enums::messages::ChatFull::Full(full) = account.ask(&tl::functions::messages::GetFullChat { chat_id })?;
             account.learn(&full.users, &full.chats);
             match full.full_chat {
-                tl::enums::ChatFull::Full(chat) => (allowed_of(chat.available_reactions.as_ref()), chat.reactions_limit),
-                tl::enums::ChatFull::ChannelFull(channel) => (allowed_of(channel.available_reactions.as_ref()), channel.reactions_limit),
+                tl::enums::ChatFull::Full(chat) => (allowed_of(chat.available_reactions.as_ref()), chat.reactions_limit, false),
+                tl::enums::ChatFull::ChannelFull(channel) => {
+                    (allowed_of(channel.available_reactions.as_ref()), channel.reactions_limit, channel.paid_reactions_available)
+                }
             }
         }
         Who::Channel(_) => {
@@ -118,12 +143,17 @@ pub(super) fn rules(account: &Account, conversation: &str) -> Result<ReactionRul
             let tl::enums::messages::ChatFull::Full(full) = account.ask(&tl::functions::channels::GetFullChannel { channel })?;
             account.learn(&full.users, &full.chats);
             match full.full_chat {
-                tl::enums::ChatFull::ChannelFull(channel) => (allowed_of(channel.available_reactions.as_ref()), channel.reactions_limit),
-                tl::enums::ChatFull::Full(chat) => (allowed_of(chat.available_reactions.as_ref()), chat.reactions_limit),
+                tl::enums::ChatFull::ChannelFull(channel) => {
+                    (allowed_of(channel.available_reactions.as_ref()), channel.reactions_limit, channel.paid_reactions_available)
+                }
+                tl::enums::ChatFull::Full(chat) => (allowed_of(chat.available_reactions.as_ref()), chat.reactions_limit, false),
             }
         }
     };
-    let mut rules = rules_of(&standard(account)?, allowed, premium, limit);
+    let standard_pairs: Vec<(String, bool)> = standard(account)?.into_iter().map(|(e, p, _)| (e, p)).collect();
+    let mut rules = rules_of(&standard_pairs, allowed, premium, limit);
+    rules.paid = paid;
+    rules.quick = default_reaction(account).filter(|q| !is_custom(q) || premium);
     let limits = account.live().limits.clone();
     rules.mine = limits.reactions(premium);
     if limit.is_none() {
@@ -136,7 +166,11 @@ pub(super) fn rules(account: &Account, conversation: &str) -> Result<ReactionRul
 /// it is worked out from the stored message, which already shows the change (chatd made it,
 /// dropping any of ours a new one replaces): ours as stored, with this one added or taken out,
 /// the newest kept where there are more than we may give.
-pub(super) fn react(account: &Account, conversation: &str, message: &str, emoji: &str, on: bool) -> Result<(), Fault> {
+pub(super) fn react(account: &Account, conversation: &str, message: &str, emoji: &str, on: bool, big: bool) -> Result<(), Fault> {
+    // Guard: paid Star reactions must never go through `messages.sendReaction` as `reactionEmoji`.
+    if is_paid(emoji) {
+        return Err(Fault::Rpc { code: 400, name: "PAID_REACTION_CONFIRM_REQUIRED".to_owned(), value: None });
+    }
     let invalid = || Fault::Rpc { code: 400, name: "MESSAGE_ID_INVALID".to_owned(), value: None };
     let ((who, _), msg_id) = (Who::parse(conversation).ok_or_else(invalid)?, message.parse::<i32>().map_err(|_| invalid())?);
     let stored = account.ctx.stored_message(conversation, message).ok().flatten();
@@ -147,7 +181,13 @@ pub(super) fn react(account: &Account, conversation: &str, message: &str, emoji:
         true => emoji.to_owned(),
         false => reactions.iter().find(|have| have.emoji == emoji).map_or_else(|| emoji.to_owned(), named),
     };
-    let mut ours: Vec<String> = reactions.iter().filter(|have| have.mine).map(named).filter(|have| *have != emoji).collect();
+    // Filter out any paid ⭐ reaction already on the message so it is never re-sent as a plain emoji.
+    let mut ours: Vec<String> = reactions
+        .iter()
+        .filter(|have| have.mine)
+        .map(named)
+        .filter(|have| *have != emoji && !is_paid(have))
+        .collect();
     if on {
         ours.push(emoji);
     }
@@ -164,7 +204,7 @@ pub(super) fn react(account: &Account, conversation: &str, message: &str, emoji:
         })
         .collect();
     let request = tl::functions::messages::SendReaction {
-        big: false,
+        big: big && on,
         add_to_recent: on,
         peer: account.input(who)?,
         msg_id,
@@ -172,6 +212,76 @@ pub(super) fn react(account: &Account, conversation: &str, message: &str, emoji:
     };
     let answer = account.ask(&request)?;
     super::live::answered(account, &answer);
+    Ok(())
+}
+
+/// Fetches the current account's Telegram Stars balance via `payments.getStarsStatus`.
+pub(super) fn stars_balance(account: &Account) -> Result<(i64, i32), Fault> {
+    let tl::enums::payments::StarsStatus::Status(status) = account.ask(&tl::functions::payments::GetStarsStatus {
+        ton: false,
+        peer: tl::enums::InputPeer::PeerSelf,
+    })?;
+    let (amount, nanos) = match status.balance {
+        tl::enums::StarsAmount::Amount(stars) => (stars.amount, stars.nanos),
+        _ => (0, 0),
+    };
+    Ok((amount, nanos))
+}
+
+fn paid_privacy(anonymous: bool) -> tl::enums::PaidReactionPrivacy {
+    if anonymous {
+        tl::enums::PaidReactionPrivacy::Anonymous
+    } else {
+        tl::enums::PaidReactionPrivacy::Default
+    }
+}
+
+/// Sends a confirmed paid Star reaction (`messages.sendPaidReaction`) and applies the resulting update.
+pub(super) fn send_paid(account: &Account, conversation: &str, message: &str, count: u32, anonymous: bool) -> Result<(), Fault> {
+    let invalid = || Fault::Rpc { code: 400, name: "MESSAGE_ID_INVALID".to_owned(), value: None };
+    let ((who, _), msg_id) = (Who::parse(conversation).ok_or_else(invalid)?, message.parse::<i32>().map_err(|_| invalid())?);
+    let count = i32::try_from(count).map_err(|_| invalid())?;
+    if count <= 0 {
+        return Err(Fault::Rpc { code: 400, name: "REACTION_INVALID".to_owned(), value: None });
+    }
+    let nonce = format!("paid:{conversation}:{msg_id}:{}:{count}", crate::hub::now());
+    let random_id = super::random_id(&nonce);
+    let request = tl::functions::messages::SendPaidReaction {
+        peer: account.input(who)?,
+        msg_id,
+        count,
+        random_id,
+        private: Some(paid_privacy(anonymous)),
+    };
+    let answer = account.ask(&request)?;
+    super::live::answered(account, &answer);
+    Ok(())
+}
+
+/// Updates the privacy of our paid Star reaction on a message (`messages.togglePaidReactionPrivacy`).
+pub(super) fn toggle_paid_privacy(account: &Account, conversation: &str, message: &str, anonymous: bool) -> Result<(), Fault> {
+    let invalid = || Fault::Rpc { code: 400, name: "MESSAGE_ID_INVALID".to_owned(), value: None };
+    let ((who, _), msg_id) = (Who::parse(conversation).ok_or_else(invalid)?, message.parse::<i32>().map_err(|_| invalid())?);
+    account.ask(&tl::functions::messages::TogglePaidReactionPrivacy {
+        peer: account.input(who)?,
+        msg_id,
+        private: paid_privacy(anonymous),
+    })?;
+    Ok(())
+}
+
+/// Sets the account's default quick reaction (`messages.setDefaultReaction`).
+pub(super) fn set_default(account: &Account, emoji: &str) -> Result<(), Fault> {
+    let emoji = emoji.trim();
+    if emoji.is_empty() || is_paid(emoji) {
+        return Err(Fault::Rpc { code: 400, name: "REACTION_INVALID".to_owned(), value: None });
+    }
+    let reaction: tl::enums::Reaction = match emoji.strip_prefix('e').and_then(|id| id.parse::<i64>().ok()) {
+        Some(document_id) => tl::types::ReactionCustomEmoji { document_id }.into(),
+        None => tl::types::ReactionEmoji { emoticon: emoji.to_owned() }.into(),
+    };
+    account.ask(&tl::functions::messages::SetDefaultReaction { reaction })?;
+    account.live().default_reaction = Some(Some(emoji.to_owned()));
     Ok(())
 }
 
@@ -194,5 +304,7 @@ mod tests {
         assert_eq!(some.only, ["🔥"]);
         assert_eq!(rules_of(&list(), Allowed::Some(vec!["🔥".into(), "e55".into()]), true, None).only, ["🔥", "e55"]);
         assert_eq!(rules_of(&list(), Allowed::None, true, None).set, ReactionSet::Off);
+        assert!(all.big, "Telegram supports big reactions");
+        assert!(is_paid("⭐") && is_paid("⭐\u{FE0F}") && !is_paid("👍"));
     }
 }

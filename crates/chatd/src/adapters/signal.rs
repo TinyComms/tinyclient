@@ -4302,6 +4302,8 @@ fn catalog(account: &Account, kind: CatalogKind, query: &str, cursor: Option<&st
                 file: Some(file),
                 pack: String::new(),
                 animated: true,
+                set: String::new(),
+                locked: false,
             });
             live.gifs.insert(entry.id.clone(), entry);
         }

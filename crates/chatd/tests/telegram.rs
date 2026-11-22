@@ -2455,6 +2455,119 @@ fn pickers_and_sending_with_files_options_and_picks() {
 }
 
 #[test]
+fn an_uninstalled_sticker_can_be_added_and_recent_favourite_and_searched_stickers_show() {
+    let stickers = |world: &World, query: &str, cursor: Option<&str>| match world.ask(Request::Catalog {
+        account: account(),
+        kind: protocol::CatalogKind::Stickers,
+        space: None,
+        query: query.into(),
+        cursor: cursor.map(str::to_owned),
+    }) {
+        Response::Catalog { items, cursor } => (items, cursor),
+        other => panic!("{other:?}"),
+    };
+    let exact = |world: &World, line: &str| world.calls().iter().any(|call| call == line);
+
+    let world = World::signed_in();
+    world.connected();
+    world.until("history", || world.message("u7002", "12"));
+    let (found, next) = stickers(&world, "camp", None);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].name, "⛺");
+    assert_eq!(found[0].pack, "Camp");
+    assert_eq!(found[0].set, "920:921");
+    assert!(!found[0].locked);
+    assert!(next.is_none());
+    assert!(exact(&world, "SearchStickers"), "{:?}", world.calls());
+
+    assert_eq!(
+        world.ask(Request::StickerSet { account: account(), set: found[0].set.clone(), install: Some(true), order: Vec::new() }),
+        Response::Ok
+    );
+    assert!(exact(&world, "InstallStickerSet 920"), "{:?}", world.calls());
+
+    let (page, next) = stickers(&world, "", None);
+    assert_eq!(page.iter().map(|sticker| (sticker.name.as_str(), sticker.pack.as_str())).collect::<Vec<_>>(), [("🥾", "Hiking"), ("🥾", "Hiking")]);
+    assert!(page.iter().all(|sticker| sticker.set.is_empty() && !sticker.locked));
+    assert_eq!(next.as_deref(), Some("1"));
+    let (page, next) = stickers(&world, "", Some("1"));
+    assert_eq!(page.len(), 1, "{page:?}");
+    assert_eq!((page[0].name.as_str(), page[0].pack.as_str()), ("⛺", "Camp"));
+    assert!(next.is_none());
+
+    assert_eq!(
+        world.ask(Request::StickerSet { account: account(), set: String::new(), install: None, order: vec![920, 900] }),
+        Response::Ok
+    );
+    let (page, next) = stickers(&world, "", None);
+    assert_eq!(page[0].pack, "Camp");
+    assert_eq!(next.as_deref(), Some("1"));
+
+    assert_eq!(
+        world.ask(Request::StickerSet { account: account(), set: "920:921".into(), install: Some(false), order: Vec::new() }),
+        Response::Ok
+    );
+    let (page, next) = stickers(&world, "", None);
+    assert_eq!(page.iter().map(|sticker| sticker.pack.as_str()).collect::<Vec<_>>(), ["Hiking", "Hiking"]);
+    assert!(next.is_none());
+    let hiking = page[0].id.clone();
+
+    let (found, _) = stickers(&world, "⛺", None);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].set, "920:921");
+    assert!(exact(&world, "GetStickers"), "{:?}", world.calls());
+
+    assert_eq!(world.ask(Request::FaveSticker { account: account(), id: hiking, unfave: false }), Response::Ok);
+    let (page, next) = stickers(&world, "", None);
+    assert_eq!(page[0].pack, "Favourites");
+    assert_eq!(next.as_deref(), Some("1"));
+
+    let world = World::signed_in();
+    world.connected();
+    world.until("history", || world.message("u7002", "12"));
+    world.steer("featured-premium");
+    let (page, next) = stickers(&world, "", None);
+    assert!(!page.is_empty());
+    assert!(page.iter().all(|sticker| sticker.locked && sticker.set.is_empty()), "{page:?}");
+    assert_eq!(page[0].pack, "Gold");
+    assert_eq!(next.as_deref(), Some("1"));
+    let refused = world.ask(Request::StickerSet { account: account(), set: "930:931".into(), install: Some(true), order: Vec::new() });
+    assert_eq!(refused, Response::Error { code: ErrorCode::Refused, detail: "This needs Telegram Premium.".into() });
+    assert!(!exact(&world, "InstallStickerSet 930"), "{:?}", world.calls());
+    let (found, _) = stickers(&world, "✨", None);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].locked && found[0].set.is_empty(), "{found:?}");
+    assert_eq!(found[0].pack, "Gold");
+    let refused_name = world.ask(Request::StickerSet { account: account(), set: "gold".into(), install: Some(true), order: Vec::new() });
+    assert_eq!(refused_name, Response::Error { code: ErrorCode::Refused, detail: "This needs Telegram Premium.".into() });
+    assert!(!world.calls().iter().any(|call| call.starts_with("InstallStickerSet")), "{:?}", world.calls());
+    let (found, _) = stickers(&world, "gold", None);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].locked && found[0].set.is_empty(), "{found:?}");
+
+    world.steer("gold-installed");
+    let (page, next) = stickers(&world, "", None);
+    assert_eq!(page[0].pack, "Hiking");
+    assert!(page.iter().all(|sticker| sticker.set.is_empty() && !sticker.locked), "{page:?}");
+    assert_eq!(next.as_deref(), Some("1"));
+    let (page, next) = stickers(&world, "", Some("1"));
+    assert_eq!(page[0].pack, "Gold");
+    assert!(page.iter().all(|sticker| sticker.locked && sticker.set.is_empty()), "{page:?}");
+    assert!(next.is_none());
+    let (found, _) = stickers(&world, "✨", None);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].locked && found[0].set.is_empty(), "{found:?}");
+
+    let world = World::signed_in();
+    world.connected();
+    world.until("history", || world.message("u7002", "12"));
+    world.steer("recent-stickers");
+    let (page, next) = stickers(&world, "", None);
+    assert_eq!(page[0].pack, "Recent");
+    assert_eq!(next.as_deref(), Some("1"));
+}
+
+#[test]
 fn an_inline_bot_query_lists_articles_and_a_pick_sends_the_result() {
     let world = World::signed_in();
     world.connected();
@@ -2625,12 +2738,12 @@ fn a_scanned_code_on_an_account_with_a_second_password_asks_for_it() {
     let (_, seq) = world.status();
     world.steer_sign_in("scan-password");
     let hint = world.changed(seq, "the password step", |change| match change {
-        Change::SignIn { step: SignInStep::Password { hint, problem: None }, .. } => Some(hint.clone()),
+        Change::SignIn { step: SignInStep::Password { hint, problem: None, .. }, .. } => Some(hint.clone()),
         _ => None,
     });
     assert_eq!(hint, "the old street");
     let wrong = world.sign_in(Some(SignInInput::Password { password: "hunter2".into() }));
-    assert_eq!(wrong, SignInStep::Password { hint: "the old street".into(), problem: Some(SignInProblem::PasswordInvalid) });
+    assert_eq!(wrong, SignInStep::Password { hint: "the old street".into(), has_recovery: false, problem: Some(SignInProblem::PasswordInvalid) });
     let done = world.sign_in(Some(SignInInput::Password { password: "correct horse".into() }));
     assert_eq!(done, SignInStep::Done { account: Some(account()) });
     world.connected();
@@ -2654,7 +2767,7 @@ fn a_phone_number_a_code_and_a_password_sign_in_and_each_mistake_says_what_it_wa
     assert!(until > 0);
 
     let sent = world.sign_in(Some(SignInInput::Phone { number: "+1 555 010 0199".into() }));
-    let SignInStep::Code { via: CodeVia::App, length: 5, phone, next: Some(CodeVia::Sms), resend_at, problem: None } = sent else {
+    let SignInStep::Code { via: CodeVia::App, length: 5, phone, next: Some(CodeVia::Sms), resend_at, problem: None, .. } = sent else {
         panic!("{sent:?}");
     };
     assert_eq!(phone, "+1 555 010 0199");
@@ -2672,7 +2785,7 @@ fn a_phone_number_a_code_and_a_password_sign_in_and_each_mistake_says_what_it_wa
     assert!(matches!(world.sign_in(None), SignInStep::Code { .. }));
 
     let password = world.sign_in(Some(SignInInput::Code { code: "24680".into() }));
-    assert_eq!(password, SignInStep::Password { hint: "the old street".into(), problem: None });
+    assert_eq!(password, SignInStep::Password { hint: "the old street".into(), has_recovery: false, problem: None });
     assert_eq!(world.sign_in(Some(SignInInput::Password { password: "correct horse".into() })), SignInStep::Done { account: Some(account()) });
     world.connected();
     let said = format!("{}{}", world.stderr(), world.calls().join("\n"));
@@ -2716,6 +2829,78 @@ fn cancelling_keeps_nothing_and_a_build_without_an_app_id_says_so() {
 }
 
 #[test]
+fn a_login_email_a_new_account_and_password_recovery_does_not_sign_in_and_a_passkey_is_refused() {
+    let world = World::start(None, "30");
+    world.sign_in(None);
+    assert_eq!(world.sign_in(Some(SignInInput::UsePhone)), SignInStep::Phone { problem: None });
+    let setup = world.sign_in(Some(SignInInput::Phone { number: "+1 555 010 0177".into() }));
+    assert!(matches!(setup, SignInStep::EmailSetup { ref phone, problem: None } if phone == "+1 555 010 0177"), "{setup:?}");
+    let bad = world.sign_in(Some(SignInInput::Email { email: "not-an-email".into() }));
+    assert!(matches!(bad, SignInStep::EmailSetup { problem: Some(SignInProblem::Other { .. }), .. }), "{bad:?}");
+    let verify = world.sign_in(Some(SignInInput::Email { email: "mira@example.com".into() }));
+    assert!(
+        matches!(verify, SignInStep::EmailVerify { ref email_pattern, length: 6, problem: None } if email_pattern == "m***@example.com"),
+        "{verify:?}"
+    );
+    let sent = world.sign_in(Some(SignInInput::EmailCode { code: "654321".into() }));
+    assert!(matches!(sent, SignInStep::Code { via: CodeVia::App, length: 5, .. }), "{sent:?}");
+    assert_eq!(world.sign_in(Some(SignInInput::Code { code: "24680".into() })), SignInStep::Done { account: Some(account()) });
+    let said = format!("{}{}", world.stderr(), world.calls().join("\n"));
+    assert!(!said.contains("mira@example.com") && !said.contains("654321"), "{said}");
+
+    let world = World::start(None, "30");
+    world.sign_in(None);
+    world.sign_in(Some(SignInInput::UsePhone));
+    world.sign_in(Some(SignInInput::Phone { number: "+1 555 010 0188".into() }));
+    let signup = world.sign_in(Some(SignInInput::Code { code: "24680".into() }));
+    assert!(
+        matches!(signup, SignInStep::SignUp { ref phone, ref terms, problem: None } if phone == "+1 555 010 0188" && terms.contains("spam")),
+        "{signup:?}"
+    );
+    let nameless = world.sign_in(Some(SignInInput::SignUp { first_name: "  ".into(), last_name: String::new() }));
+    assert!(matches!(nameless, SignInStep::SignUp { problem: Some(_), .. }), "{nameless:?}");
+    assert_eq!(
+        world.sign_in(Some(SignInInput::SignUp { first_name: "Ada".into(), last_name: "Lovelace".into() })),
+        SignInStep::Done { account: Some(account()) }
+    );
+    let said = format!("{}{}", world.stderr(), world.calls().join("\n"));
+    assert!(!said.contains("Lovelace") && !said.contains("Ada"), "{said}");
+
+    let world = World::start(None, "30");
+    world.sign_in(None);
+    world.sign_in(Some(SignInInput::UsePhone));
+    world.sign_in(Some(SignInInput::Phone { number: "+1 555 010 0166".into() }));
+    let password = world.sign_in(Some(SignInInput::Code { code: "24680".into() }));
+    assert!(matches!(password, SignInStep::Password { has_recovery: true, problem: None, .. }), "{password:?}");
+    let stayed = world.sign_in(Some(SignInInput::RecoverPassword));
+    assert!(matches!(stayed, SignInStep::Password { has_recovery: true, problem: None, .. }), "{stayed:?}");
+    let still = world.sign_in(Some(SignInInput::RecoveryCode { code: "135790".into() }));
+    assert!(matches!(still, SignInStep::Password { has_recovery: true, problem: None, .. }), "{still:?}");
+    assert_eq!(world.called("RequestPasswordRecovery"), 0);
+    assert_eq!(world.called("RecoverPassword"), 0);
+    assert!(world.status().0.is_empty());
+    let said = format!("{}{}", world.stderr(), world.calls().join("\n"));
+    assert!(!said.contains("135790"), "{said}");
+
+    let world = World::start(None, "30");
+    world.sign_in(None);
+    let refused = world.sign_in(Some(SignInInput::UsePasskey));
+    assert!(matches!(refused, SignInStep::Passkey { ref options, problem: Some(SignInProblem::Other { ref reason }) } if options.is_empty() && reason.contains("passkey domain")), "{refused:?}");
+    let again = world.sign_in(Some(SignInInput::Passkey {
+        id: "cred".into(),
+        raw_id: "raw".into(),
+        client_data: "secret-client-data".into(),
+        authenticator_data: vec![1],
+        signature: vec![2],
+        user_handle: "handle".into(),
+    }));
+    assert!(matches!(again, SignInStep::Passkey { problem: Some(_), .. }), "{again:?}");
+    assert_eq!(world.called("InitPasskeyLogin"), 0);
+    assert_eq!(world.called("FinishPasskeyLogin"), 0);
+    let said = format!("{}{}", world.stderr(), world.calls().join("\n"));
+    assert!(!said.contains("secret-client-data"), "{said}");
+}
+
 fn conversation_search_asks_telegram_with_the_query_and_maps_its_hits() {
     let world = World::signed_in();
     world.connected();
@@ -3816,6 +4001,130 @@ fn save_and_unsave_gif() {
         other => panic!("expected Catalog, got {other:?}"),
     };
     assert!(after_save.iter().any(|i| i.id == "d6200"), "d6200 should be back after save: {after_save:?}");
+}
+
+#[test]
+fn paid_star_reactions_big_reaction_and_default_quick_reaction() {
+    let world = World::signed_in();
+    world.connected();
+    // The dialog list only previews the forum. Opening it lists the topic, and the topic's posts arrive once that row exists.
+    let _ = world.messages("c9002");
+    world.until("the tools topic", || world.conversation("c9002_31"));
+    world.until("workshop tools topic", || world.message("c9002_31", "41"));
+
+    // Read reaction rules for Workshop: paid reactions enabled, big enabled, and default quick reaction from help.getConfig.
+    let rules = match world.ask(Request::Reactions { conversation: key("c9002_31") }) {
+        Response::Reactions { rules, .. } => rules,
+        other => panic!("expected Reactions, got {other:?}"),
+    };
+    assert!(rules.paid, "Workshop channel should advertise paid Star reactions");
+    assert!(rules.big, "Telegram should advertise big reactions");
+    assert_eq!(rules.quick.as_deref(), Some("❤"), "default quick reaction read from help.getConfig");
+
+    // A paid ⭐ reaction arrives on message 41 with a top-senders leaderboard.
+    world.steer("paid-reaction");
+    let with_paid = world.until("paid star reaction", || {
+        let msg = world.message("c9002_31", "41")?;
+        msg.reactions.iter().any(|r| r.emoji == "⭐" && r.count == 5).then_some(msg)
+    });
+    let paid_chip = with_paid.reactions.iter().find(|r| r.emoji == "⭐").unwrap();
+    assert_eq!(paid_chip.who, vec!["u7002".to_owned()], "top_reactors populates the leaderboard");
+
+    // Guard: clicking ⭐ as an ordinary Request::React MUST be refused and NEVER send ReactionEmoji("⭐").
+    let stray = world.ask(Request::React {
+        conversation: key("c9002_31"),
+        message_id: "41".into(),
+        emoji: "⭐".into(),
+        on: true,
+        burst: false,
+    });
+    assert!(matches!(stray, Response::Error { code: ErrorCode::Refused, .. }), "expected refusal for stray ⭐ click, got {stray:?}");
+    assert!(
+        !world.calls().iter().any(|c| c.starts_with("SendReaction") && c.contains("⭐")),
+        "must never send plain reactionEmoji ⭐ on wire: {:#?}",
+        world.calls()
+    );
+
+    // Check Stars balance via payments.getStarsStatus.
+    let Response::StarsBalance { balance, .. } = world.ask(Request::StarsBalance { account: account() }) else {
+        panic!("expected StarsBalance");
+    };
+    assert_eq!(balance, 250);
+
+    // Confirmed paid flow sends messages.sendPaidReaction with the right count and privacy.
+    assert_eq!(
+        world.ask(Request::SendPaidReaction {
+            conversation: key("c9002_31"),
+            message_id: "41".into(),
+            count: 10,
+            anonymous: true,
+        }),
+        Response::Ok
+    );
+    assert!(
+        world.calls().iter().any(|c| c == "SendPaidReaction c9002 41 count=10 private=anonymous"),
+        "expected SendPaidReaction on wire, got: {:#?}",
+        world.calls()
+    );
+    let updated = world.until("paid count incremented", || {
+        let msg = world.message("c9002_31", "41")?;
+        msg.reactions.iter().find(|r| r.emoji == "⭐" && r.count == 15 && r.mine).cloned()
+    });
+    assert_eq!(updated.count, 15);
+
+    // Balance reflects spent Stars.
+    let Response::StarsBalance { balance: after_bal, .. } = world.ask(Request::StarsBalance { account: account() }) else {
+        panic!("expected StarsBalance after spend");
+    };
+    assert_eq!(after_bal, 240);
+
+    // Toggle paid reaction privacy via messages.togglePaidReactionPrivacy.
+    assert_eq!(
+        world.ask(Request::TogglePaidReactionPrivacy {
+            conversation: key("c9002_31"),
+            message_id: "41".into(),
+            anonymous: false,
+        }),
+        Response::Ok
+    );
+    assert!(
+        world.calls().iter().any(|c| c == "TogglePaidReactionPrivacy c9002 41 private=default"),
+        "expected TogglePaidReactionPrivacy on wire, got: {:#?}",
+        world.calls()
+    );
+
+    // Sending a big reaction (`burst: true`) sets `big: true` on messages.sendReaction.
+    assert_eq!(
+        world.ask(Request::React {
+            conversation: key("u7002"),
+            message_id: "12".into(),
+            emoji: "🔥".into(),
+            on: true,
+            burst: true,
+        }),
+        Response::Ok
+    );
+    assert!(
+        world.calls().iter().any(|c| c == "SendReaction u7002 12 🔥 big"),
+        "expected big=true SendReaction on wire, got: {:#?}",
+        world.calls()
+    );
+
+    // Changing the default quick reaction calls messages.setDefaultReaction and updates rules.quick.
+    assert_eq!(
+        world.ask(Request::SetDefaultReaction { account: account(), emoji: "👍".into() }),
+        Response::Ok
+    );
+    assert!(
+        world.calls().iter().any(|c| c == "SetDefaultReaction 👍"),
+        "expected SetDefaultReaction on wire, got: {:#?}",
+        world.calls()
+    );
+    let refreshed = match world.ask(Request::Reactions { conversation: key("u7002") }) {
+        Response::Reactions { rules, .. } => rules,
+        other => panic!("expected refreshed Reactions, got {other:?}"),
+    };
+    assert_eq!(refreshed.quick.as_deref(), Some("👍"));
 }
 
 #[test]
