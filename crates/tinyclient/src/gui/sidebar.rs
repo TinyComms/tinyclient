@@ -1711,7 +1711,7 @@ impl Shell {
                     let id = account.account.clone();
                     banner(tone, words).child(
                         banner_action("continue-slack", "Continue in tinyclient").on_click(cx.listener(move |this, _, _, cx| {
-                            this.continue_slack(id, cx);
+                            this.continue_slack(id.clone(), cx);
                         })),
                     )
                 }
@@ -2012,7 +2012,7 @@ impl Shell {
             if let Some(org_id) = account.as_ref().map(|a| a.account.clone()) {
                 let browse_url = format!("https://app.slack.com/client/{org_id}");
                 menu = menu.child(
-                    super::components::menu_item("slack-browse-workspaces", None, "Browse workspaces").on_click(
+                    super::components::menu_item("slack-browse-workspaces", None, "Browse workspaces", None).on_click(
                         cx.listener(move |this, _, _, cx| {
                             this.sidebar_state.slack_menu = false;
                             cx.open_url(&browse_url);
