@@ -728,6 +728,11 @@ impl Directory {
             let before = self.map.get(&who);
             known.call_flags = before.and_then(|before| before.call_flags);
             known.voice_forbidden = before.and_then(|before| before.voice_forbidden);
+            // A ban learned from a refused send stands until the chat's rights change: the same
+            // rights, read again, are the ones that let the send through to be refused.
+            known.voice_banned |= before.is_some_and(|before| {
+                before.voice_banned && before.default_banned == known.default_banned && before.personal_banned == known.personal_banned
+            });
             if known.hash.is_none() {
                 known.hash = before.and_then(|before| before.hash);
             }
