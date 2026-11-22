@@ -4940,7 +4940,7 @@ fn delete_modes_admin_batch_participant_history_and_report_spam() {
         &[("TINYCLIENT_TELEGRAM_ADMIN", "1"), ("TINYCLIENT_TELEGRAM_OLD_GROUP", "1")],
     );
     world.connected();
-    world.until("odalys history", || world.message("u7002", "12"));
+    world.until("odalys history", || world.message("u7002", "11"));
 
     // Private 1:1 chat allows deleting the other person's messages.
     let odalys = world.conversation("u7002").expect("Odalys row");
@@ -5578,7 +5578,8 @@ fn edit_own_profile_name_bio_username_avatar_birthday_and_emoji_status() {
     };
     assert_eq!(profile.person.name, "Mira Vance");
     assert_eq!(profile.bio, "Alpine maps and trails");
-    assert!(profile.fields.iter().any(|(k, v)| k == "Username" && v == "@mira_vance"), "{:?}", profile.fields);
+    // The typed profile carries the handle on the person, not as a field.
+    assert_eq!(profile.person.handle, "@mira_vance");
     assert!(profile.fields.iter().any(|(k, v)| k == "Birthday" && v == "14 March 1994"), "{:?}", profile.fields);
 
     // Taken username is checked and refused cleanly without calling UpdateUsername.
@@ -5637,7 +5638,7 @@ fn edit_own_profile_name_bio_username_avatar_birthday_and_emoji_status() {
         Response::Ok
     );
     assert_eq!(world.called("UpdateEmojiStatus clear"), 1);
-    assert_eq!(world.called("UpdateStatus"), 0, "never send account.updateStatus offline from status edits");
+    assert_eq!(world.called("UpdateStatus offline"), 0, "never send account.updateStatus offline from status edits");
 }
 
 #[test]

@@ -3338,8 +3338,8 @@ impl World {
                 users: users(),
             }));
         }
-        if asked::<f::account::UpdateStatus>(body).is_some() {
-            self.log("UpdateStatus");
+        if let Some(request) = asked::<f::account::UpdateStatus>(body) {
+            self.log(if request.offline { "UpdateStatus offline" } else { "UpdateStatus" });
             return answer(true);
         }
         if let Some(request) = asked::<f::messages::GetBotCallbackAnswer>(body) {

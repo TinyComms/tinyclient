@@ -261,7 +261,7 @@ pub fn hits(query: &str, conversations: &[Rc<Conversation>], spaces: &[Space], p
             let lift = rank::boost(matches!(badge, Badge::Count(_)), badge != Badge::None, c.kind.is_direct(), c.updated, now);
             let hit = (score + lift, c.updated, conversation_hit(c, matched, None));
             // A Telegram search hit stays out of the chat list until the user joins it.
-            let preview = c.key.network == Network::Telegram && !c.joined && !c.kind.is_direct();
+            let preview = c.key.network == Network::Telegram && !c.joined && c.kind != ConversationKind::Direct;
             if preview { discovered.push(hit) } else { chats.push(hit) }
         }
     }

@@ -111,22 +111,14 @@ pub(super) fn telegram_app_link(url: &str) -> bool {
     let Some(query) = url.strip_prefix("tg://resolve?") else {
         return false;
     };
-    let mut domain = "";
-    let mut app = "";
-    for pair in query.split('&') {
-        let Some((key, value)) = pair.split_once('=') else {
-            return false;
-        };
-        if value.is_empty() || value.len() > 128 || !value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
-            return false;
-        }
-        match key {
-            "domain" if domain.is_empty() => domain = value,
-            "appname" if app.is_empty() => app = value,
-            _ => return false,
-        }
-    }
-    !domain.is_empty() && !app.is_empty()
+    // Exactly `domain=…&appname=…`, in that order: anything reordered or added is not handed over.
+    let mut pairs = query.split('&');
+    let (Some(domain), Some(app), None) =
+        (pairs.next().and_then(|pair| pair.strip_prefix("domain=")), pairs.next().and_then(|pair| pair.strip_prefix("appname=")), pairs.next())
+    else {
+        return false;
+    };
+    [domain, app].iter().all(|value| !value.is_empty() && value.len() <= 128 && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
 }
 
 /// Whether a link to `dest` opens without a question, given what the person chose.

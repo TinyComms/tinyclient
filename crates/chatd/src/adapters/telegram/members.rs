@@ -503,7 +503,7 @@ fn resolve_input_users(account: &Account, people: &[String]) -> Result<Vec<(Who,
     let mut out = Vec::with_capacity(people.len());
     for raw in people {
         let Some((who @ Who::User(_), None)) = Who::parse(raw) else {
-            return Err(Fault::Net(format!("Unknown Telegram person: {raw}")));
+            return Err(Fault::Refused(format!("Unknown Telegram person: {raw}")));
         };
         account.input(who)?;
         let input = account
@@ -536,7 +536,7 @@ fn names_of_missing(account: &Account, missing: &[tl::enums::MissingInvitee]) ->
 pub(super) fn start_group(account: &Account, people: &[String], title: Option<&str>) -> Result<String, Fault> {
     let resolved = resolve_input_users(account, people)?;
     if resolved.is_empty() {
-        return Err(Fault::Net("Pick at least one person for the group.".to_owned()));
+        return Err(Fault::Refused("Pick at least one person for the group.".to_owned()));
     }
     let title = match title.map(str::trim).filter(|t| !t.is_empty()) {
         Some(t) => t.to_owned(),
@@ -561,10 +561,11 @@ pub(super) fn start_group(account: &Account, people: &[String], title: Option<&s
         ttl_period: None,
     })?;
     super::learn_updates(account, &invited.updates);
-    super::live::answered(account, &invited.updates);
     let who = created_peer(&invited.updates)
         .ok_or_else(|| Fault::Net("Telegram created the group but did not name it.".to_owned()))?;
     super::sync::ensure_row(account, who, None);
+    // After the row: the creation line is kept only for a chat that is stored.
+    super::live::answered(account, &invited.updates);
     let id = who.text();
     let missing_names = names_of_missing(account, &invited.missing_invitees);
     if let Some(note) = missing_invitee_words(&missing_names) {
@@ -609,7 +610,7 @@ pub(super) fn create_channel(
             let valid = (5..=32).contains(&raw_user.len())
                 && raw_user.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_');
             if !valid {
-                return Err(Fault::Net(
+                return Err(Fault::Refused(
                     "Telegram channel usernames must be 5–32 letters, digits, or underscores.".to_owned(),
                 ));
             }
@@ -619,7 +620,7 @@ pub(super) fn create_channel(
                 username: raw_user.to_owned(),
             })?;
             if !available {
-                return Err(Fault::Net(format!("@{raw_user} is already taken or unavailable.")));
+                return Err(Fault::Refused(format!("@{raw_user} is already taken or unavailable.")));
             }
             account.ask(&tl::functions::channels::UpdateUsername {
                 channel: input_channel.clone(),
@@ -640,7 +641,7 @@ pub(super) fn add_members(account: &Account, conversation: &str, people: &[Strin
     let (who, _) = Who::parse(conversation).ok_or_else(invalid)?;
     let resolved = resolve_input_users(account, people)?;
     if resolved.is_empty() {
-        return Err(Fault::Net("Pick at least one person to add.".to_owned()));
+        return Err(Fault::Refused("Pick at least one person to add.".to_owned()));
     }
     let mut missing_names: Vec<String> = Vec::new();
     match who {
@@ -661,7 +662,7 @@ pub(super) fn add_members(account: &Account, conversation: &str, people: &[Strin
                         missing_names.push(if name.is_empty() { person_who.text() } else { name });
                     }
                     Err(fault) if fault.is("PEER_FLOOD") => {
-                        return Err(Fault::Net(
+                        return Err(Fault::Refused(
                             "Telegram rate-limited adding people. Share an invite link instead.".to_owned(),
                         ));
                     }
@@ -679,7 +680,7 @@ pub(super) fn add_members(account: &Account, conversation: &str, people: &[Strin
                     missing_names.extend(names_of_missing(account, &invited.missing_invitees));
                 }
                 Err(fault) if fault.is("PEER_FLOOD") => {
-                    return Err(Fault::Net(
+                    return Err(Fault::Refused(
                         "Telegram rate-limited adding people. Share an invite link instead.".to_owned(),
                     ));
                 }
@@ -687,13 +688,13 @@ pub(super) fn add_members(account: &Account, conversation: &str, people: &[Strin
             }
         }
         Who::User(_) => {
-            return Err(Fault::Net("Direct chats cannot add more members. Create a group instead.".to_owned()));
+            return Err(Fault::Refused("Direct chats cannot add more members. Create a group instead.".to_owned()));
         }
     }
     account.live().roster = None;
     let _ = account.ctx.members_changed(conversation);
     if let Some(note) = missing_invitee_words(&missing_names) {
-        return Err(Fault::Net(note));
+        return Err(Fault::Refused(note));
     }
     Ok(())
 }

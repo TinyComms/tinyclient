@@ -218,6 +218,7 @@ fn problem(fault: &Fault) -> SignInProblem {
     }
     match fault {
         Fault::Net(_) => SignInProblem::Unreachable,
+        Fault::Refused(why) => SignInProblem::Other { reason: why.clone() },
         Fault::Rpc { name, .. } => match name.as_str() {
             "PHONE_NUMBER_INVALID" => SignInProblem::PhoneInvalid,
             "PHONE_NUMBER_UNOCCUPIED" => SignInProblem::PhoneUnknown,

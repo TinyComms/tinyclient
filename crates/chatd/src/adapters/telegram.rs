@@ -1640,7 +1640,7 @@ fn edit_media(
 ) -> Result<(), Fault> {
     let invalid = || Fault::Rpc { code: 400, name: "MESSAGE_ID_INVALID".to_owned(), value: None };
     let ((who, _), id) = (Who::parse(conversation).ok_or_else(invalid)?, message.parse::<i32>().map_err(|_| invalid())?);
-    let media = send::upload_single(account, conversation, &format!("edit-{message}"), file).map_err(Fault::Net)?;
+    let media = send::upload_single(account, conversation, &format!("edit-{message}"), file).map_err(Fault::Refused)?;
     let (plain, mut entities) = content::outgoing(text);
     if !plain.is_empty() && entities.is_none() {
         if let Ok(Some(stored)) = account.ctx.stored_message(conversation, message) {

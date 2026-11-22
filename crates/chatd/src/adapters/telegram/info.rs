@@ -280,7 +280,7 @@ fn invite_hash(raw: &str) -> Result<String, Fault> {
     {
         return Ok(trimmed.to_owned());
     }
-    Err(Fault::Net("Enter a valid Telegram invite link (t.me/+… or t.me/joinchat/…).".to_owned()))
+    Err(Fault::Refused("Enter a valid Telegram invite link (t.me/+… or t.me/joinchat/…).".to_owned()))
 }
 
 fn chat_peer_and_title(chat: &tl::enums::Chat) -> Option<(Who, String, Option<u32>)> {
@@ -311,7 +311,7 @@ pub(super) fn invite_preview(account: &Account, raw: &str) -> Result<protocol::I
     let checked = match account.ask(&tl::functions::messages::CheckChatInvite { hash: hash.clone() }) {
         Ok(found) => found,
         Err(fault) if fault.is("INVITE_HASH_EXPIRED") || fault.is("INVITE_HASH_INVALID") || fault.is("INVITE_HASH_EMPTY") => {
-            return Err(Fault::Net("This invite link is invalid or has expired.".to_owned()));
+            return Err(Fault::Refused("This invite link is invalid or has expired.".to_owned()));
         }
         Err(fault) => return Err(fault),
     };
@@ -397,7 +397,7 @@ pub(super) fn invite_join(account: &Account, raw: &str) -> Result<(Option<String
             Ok((None, None, false))
         }
         Ok(tl::enums::messages::ChatInviteJoinResult::WebView(_)) => {
-            Err(Fault::Net("This invite requires confirmation in Telegram's official app.".to_owned()))
+            Err(Fault::Refused("This invite requires confirmation in Telegram's official app.".to_owned()))
         }
         Err(fault) if fault.is("INVITE_REQUEST_SENT") => Ok((None, None, true)),
         Err(fault) if fault.is("USER_ALREADY_PARTICIPANT") => {
@@ -405,7 +405,7 @@ pub(super) fn invite_join(account: &Account, raw: &str) -> Result<(Option<String
             Ok((None, preview.channel_id, false))
         }
         Err(fault) if fault.is("INVITE_HASH_EXPIRED") || fault.is("INVITE_HASH_INVALID") || fault.is("INVITE_HASH_EMPTY") => {
-            Err(Fault::Net("This invite link is invalid or has expired.".to_owned()))
+            Err(Fault::Refused("This invite link is invalid or has expired.".to_owned()))
         }
         Err(fault) => Err(fault),
     }
@@ -452,7 +452,7 @@ pub(super) fn join_public(account: &Account, conversation: &str) -> Result<(), F
             Ok(())
         }
         Ok(tl::enums::messages::ChatInviteJoinResult::WebView(_)) => {
-            Err(Fault::Net("This channel requires confirmation in Telegram's official app.".to_owned()))
+            Err(Fault::Refused("This channel requires confirmation in Telegram's official app.".to_owned()))
         }
         Err(fault) if fault.is("INVITE_REQUEST_SENT") => Err(fault),
         Err(fault) if fault.is("USER_ALREADY_PARTICIPANT") => {
@@ -917,23 +917,23 @@ pub(super) fn parse_birthday(raw: &str) -> Result<Option<tl::enums::Birthday>, F
     let parts: Vec<&str> = stripped.split('-').collect();
     let (year, month, day) = match parts.as_slice() {
         [y, m, d] => {
-            let y: i32 = y.parse().map_err(|_| Fault::Net("Enter birthday as YYYY-MM-DD or MM-DD.".to_owned()))?;
-            let m: i32 = m.parse().map_err(|_| Fault::Net("Enter birthday as YYYY-MM-DD or MM-DD.".to_owned()))?;
-            let d: i32 = d.parse().map_err(|_| Fault::Net("Enter birthday as YYYY-MM-DD or MM-DD.".to_owned()))?;
+            let y: i32 = y.parse().map_err(|_| Fault::Refused("Enter birthday as YYYY-MM-DD or MM-DD.".to_owned()))?;
+            let m: i32 = m.parse().map_err(|_| Fault::Refused("Enter birthday as YYYY-MM-DD or MM-DD.".to_owned()))?;
+            let d: i32 = d.parse().map_err(|_| Fault::Refused("Enter birthday as YYYY-MM-DD or MM-DD.".to_owned()))?;
             if !(1900..=2100).contains(&y) {
-                return Err(Fault::Net("Birthday year must be between 1900 and 2100.".to_owned()));
+                return Err(Fault::Refused("Birthday year must be between 1900 and 2100.".to_owned()));
             }
             (Some(y), m, d)
         }
         [m, d] => {
-            let m: i32 = m.parse().map_err(|_| Fault::Net("Enter birthday as YYYY-MM-DD or MM-DD.".to_owned()))?;
-            let d: i32 = d.parse().map_err(|_| Fault::Net("Enter birthday as YYYY-MM-DD or MM-DD.".to_owned()))?;
+            let m: i32 = m.parse().map_err(|_| Fault::Refused("Enter birthday as YYYY-MM-DD or MM-DD.".to_owned()))?;
+            let d: i32 = d.parse().map_err(|_| Fault::Refused("Enter birthday as YYYY-MM-DD or MM-DD.".to_owned()))?;
             (None, m, d)
         }
-        _ => return Err(Fault::Net("Enter birthday as YYYY-MM-DD or MM-DD.".to_owned())),
+        _ => return Err(Fault::Refused("Enter birthday as YYYY-MM-DD or MM-DD.".to_owned())),
     };
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return Err(Fault::Net("Enter a valid calendar date for birthday.".to_owned()));
+        return Err(Fault::Refused("Enter a valid calendar date for birthday.".to_owned()));
     }
     Ok(Some(tl::types::Birthday { day, month, year }.into()))
 }
@@ -947,7 +947,7 @@ pub(super) fn parse_emoji_status(raw: &str, until: Option<i64>) -> Result<tl::en
     let digits = trimmed.strip_prefix('e').unwrap_or(trimmed);
     let document_id = digits
         .parse::<i64>()
-        .map_err(|_| Fault::Net("Choose a custom emoji id for your Telegram emoji status.".to_owned()))?;
+        .map_err(|_| Fault::Refused("Choose a custom emoji id for your Telegram emoji status.".to_owned()))?;
     let until = until.and_then(|ts| i32::try_from(ts).ok()).filter(|&ts| ts > 0);
     Ok(tl::types::EmojiStatus { document_id, until }.into())
 }
@@ -977,7 +977,7 @@ pub(super) fn set_profile(
             Some(ref full) => {
                 let trimmed = full.trim();
                 if trimmed.is_empty() {
-                    return Err(Fault::Net("First name cannot be empty.".to_owned()));
+                    return Err(Fault::Refused("First name cannot be empty.".to_owned()));
                 }
                 let (first, last) = super::split_name(trimmed);
                 (Some(first), Some(last))
@@ -997,11 +997,11 @@ pub(super) fn set_profile(
         if !bare.is_empty() {
             let valid = (5..=32).contains(&bare.len()) && bare.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_');
             if !valid {
-                return Err(Fault::Net("Telegram usernames must be 5–32 letters, digits, or underscores.".to_owned()));
+                return Err(Fault::Refused("Telegram usernames must be 5–32 letters, digits, or underscores.".to_owned()));
             }
             let available = account.ask(&tl::functions::account::CheckUsername { username: bare.clone() })?;
             if !available {
-                return Err(Fault::Net(format!("@{bare} is already taken or unavailable.")));
+                return Err(Fault::Refused(format!("@{bare} is already taken or unavailable.")));
             }
         }
         let updated = account.ask(&tl::functions::account::UpdateUsername { username: bare })?;
@@ -1025,7 +1025,7 @@ pub(super) fn set_emoji_status(account: &Account, raw: &str, until: Option<i64>)
     match account.ask(&tl::functions::account::UpdateEmojiStatus { emoji_status: status }) {
         Ok(_) => Ok(()),
         Err(fault) if fault.is("PREMIUM_ACCOUNT_REQUIRED") => {
-            Err(Fault::Net("Setting an emoji status requires Telegram Premium.".to_owned()))
+            Err(Fault::Refused("Setting an emoji status requires Telegram Premium.".to_owned()))
         }
         Err(fault) => Err(fault),
     }
@@ -1057,7 +1057,7 @@ pub(super) fn set_avatar(account: &Account, path: &str) -> Result<(), Fault> {
         }
         return Ok(());
     }
-    let file = super::send::upload_input_file(account, "own-avatar", trimmed).map_err(Fault::Net)?;
+    let file = super::send::upload_input_file(account, "own-avatar", trimmed).map_err(Fault::Refused)?;
     let tl::enums::photos::Photo::Photo(saved) = account.ask(&tl::functions::photos::UploadProfilePhoto {
         fallback: false,
         bot: None,

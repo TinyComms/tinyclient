@@ -15,6 +15,9 @@ pub enum Fault {
     Rpc { code: i32, name: String, value: Option<u32> },
     /// The request never got an answer.
     Net(String),
+    /// Refused before or after the wire, in words to show as they are: a bad invite link, a
+    /// taken username, people whose privacy settings kept them out of a group.
+    Refused(String),
 }
 
 impl Fault {
@@ -145,6 +148,7 @@ impl Fault {
                 other => format!("Telegram refused this ({other})."),
             },
             Fault::Net(_) => "Telegram did not answer.".to_owned(),
+            Fault::Refused(why) => why.clone(),
         }
     }
 }
@@ -155,6 +159,7 @@ impl std::fmt::Display for Fault {
             Fault::Rpc { code, name, value: Some(value) } => write!(f, "{code} {name} ({value})"),
             Fault::Rpc { code, name, value: None } => write!(f, "{code} {name}"),
             Fault::Net(why) => f.write_str(why),
+            Fault::Refused(why) => f.write_str(why),
         }
     }
 }
