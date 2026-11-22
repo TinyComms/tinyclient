@@ -5891,6 +5891,7 @@ dependencies = [
  "image",
  "libc",
  "libloading",
+ "memmap2",
  "mio",
  "native-tls",
  "nokhwa",

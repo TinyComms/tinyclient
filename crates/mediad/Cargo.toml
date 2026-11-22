@@ -109,7 +109,8 @@ core-graphics = "0.24"
 # A screen grab over the X11 protocol. Pure Rust, so the release image needs no X11 headers.
 # An X11 session (XFCE, MATE, Cinnamon, i3, and the rest) uses this. A Wayland session uses the
 # desktop portal instead (`picture/portal.rs`).
-x11rb = "0.13"
+x11rb = { version = "0.13", features = ["composite", "randr", "shm", "xfixes"] }
+memmap2 = "0.9"
 # The session bus for xdg-desktop-portal. Pure Rust, so this does not link a second libdbus
 # beside the one chatd already vendors.
 zbus = "5"
