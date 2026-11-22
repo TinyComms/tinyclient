@@ -4269,6 +4269,7 @@ impl Chat {
                 });
                 groups.truncate(cap as usize);
                 Response::AllUnreads { groups }
+            }
             Request::PressButton { conversation, message_id, data } => {
                 let account = conversation.account();
                 let conversation_id = conversation.id;
