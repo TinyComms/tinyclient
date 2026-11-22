@@ -1786,7 +1786,7 @@ fn adding_and_removing_group_members_respects_permissions() {
 
     let dave = "d4d4d4d4-0000-4000-8000-000000000004";
     assert_eq!(
-        world.ask(Request::MembersAdd { conversation: key(CLUB), people: vec![dave.into()] }),
+        world.ask(Request::MembersAdd { conversation: key(CLUB), people: vec![dave.into()], share_history: None }),
         Response::Ok
     );
     world.heard(&format!("group-add {CLUB} {dave}"));
@@ -1840,7 +1840,7 @@ fn adding_and_removing_group_members_respects_permissions() {
         let row = world.conversation(CLUB)?;
         (!row.rights.add_members && !row.rights.remove_members).then_some(())
     });
-    let add_err = world.ask(Request::MembersAdd { conversation: key(CLUB), people: vec![ALAN.into()] });
+    let add_err = world.ask(Request::MembersAdd { conversation: key(CLUB), people: vec![ALAN.into()], share_history: None });
     assert!(matches!(add_err, Response::Error { code: ErrorCode::Refused, .. }), "expected Refused, got {add_err:?}");
     let rem_err = world.ask(Request::MembersRemove { conversation: key(CLUB), person: GRACE.into() });
     assert!(matches!(rem_err, Response::Error { code: ErrorCode::Refused, .. }), "expected Refused, got {rem_err:?}");
