@@ -7,7 +7,7 @@
 //! `:alt:` the composer inserts, which is all a send is given.
 
 use super::content;
-use super::peers::Who;
+use super::peers::{DownloadRules, Who};
 use super::wire::Fault;
 use super::Account;
 use crate::adapters::CatalogPage;
@@ -99,7 +99,8 @@ fn item(account: &Account, document: &tl::enums::Document, pack: &str, locked: b
         ttl_seconds: None,
     };
     let mut wants = Vec::new();
-    let attachment = content::document(&media, document, &mut wants);
+    // A picker tile is a still. Default rules keep the full file held until a message shows it.
+    let attachment = content::document(&media, document, &mut wants, Who::User(0), false, DownloadRules::default());
     let name = document.attributes.iter().find_map(|attribute| match attribute {
         tl::enums::DocumentAttribute::Sticker(sticker) => Some(sticker.alt.clone()),
         _ => None,
@@ -255,6 +256,24 @@ fn emojis(account: &Account, at: usize) -> Result<CatalogPage, Fault> {
     }
     let cursor = (at + 1 < sets.len()).then(|| (at + 1).to_string());
     Ok(CatalogPage { items, cursor })
+}
+
+/// Lists Telegram's default forum topic icon set (`inputStickerSetEmojiDefaultTopicIcons`).
+pub(super) fn topic_icons(account: &Account) -> Result<CatalogPage, Fault> {
+    let request = tl::functions::messages::GetStickerSet {
+        stickerset: tl::enums::InputStickerSet::EmojiDefaultTopicIcons,
+        hash: 0,
+    };
+    let items = match account.ask(&request)? {
+        tl::enums::messages::StickerSet::Set(set) => set
+            .documents
+            .iter()
+            .take(protocol::CATALOG_LIMIT)
+            .filter_map(|document| emoji_item(account, document, "Topic icons"))
+            .collect(),
+        tl::enums::messages::StickerSet::NotModified => Vec::new(),
+    };
+    Ok(CatalogPage { items, cursor: None })
 }
 
 fn saved_gifs(account: &Account) -> Result<CatalogPage, Fault> {

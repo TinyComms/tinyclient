@@ -170,6 +170,11 @@ impl Shell {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_details(cx)))
         });
+        let pop_key = open.key.clone();
+        let windowed = icon_button("pop-out-conversation", "icons/picture-in-picture-2.svg", false)
+            .tooltip(tip("Open in New Window", None))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| this.pop_out_conversation(pop_key.clone(), cx)));
         // The title keeps 96, or its whole width when shorter, so a short name is not padded
         // away from what follows. The line after it truncates first, then the title.
         let title_tip = if direct { "Open profile".to_owned() } else { open.title.clone() };
@@ -193,6 +198,14 @@ impl Shell {
         };
         let space = open.space.clone().map(|id| Key { id, ..open.key.clone() });
         let line = beside.map(|beside| match beside {
+            Beside::Activity(words) => div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .type_ui()
+                .text_color(theme::accent_text())
+                .child(words)
+                .into_any_element(),
             Beside::Person(line) => person_line(&line).into_any_element(),
             Beside::Path(subtitle) => div()
                 .id("reveal")
@@ -248,6 +261,7 @@ impl Shell {
                     .children(role.map(|role| role_chip(&role.name, role.color)))
                     .children(self.encryption_chip(open, cx))
                     .children(self.disappearing_chip(open, cx))
+                    .children(self.meeting_chip(open, cx))
                     .children(line)
                     .children(trouble.map(|words| div().flex_none().type_small().text_color(theme::text_faint()).child(words))),
             )
@@ -255,7 +269,7 @@ impl Shell {
             .children(self.follow_button(open, cx).map(|follow| div().flex_none().ml(px(8.)).child(follow)))
             .children(call.map(|call| div().flex_none().ml(px(8.)).child(call)))
             .children(thread_membership.map(|btn| div().flex_none().ml(px(8.)).child(btn)))
-            .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).children(setup).children(thread_settings).children(threads_btn).child(search).children(members).children(details))
+            .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).children(setup).children(thread_settings).children(threads_btn).child(search).children(members).children(details).child(windowed))
     }
 
     /// Follow button in the header strip for Discord announcement channels.
@@ -360,9 +374,55 @@ impl Shell {
         )
     }
 
-    /// The line after the title (07 §1): beside a direct conversation the person's status or
-    /// presence; elsewhere where it is (`Space › group`) and its topic.
+    /// Today's meeting for this chat: the time, and Join when the link is https.
+    fn meeting_chip(&self, open: &Conversation, cx: &mut Context<Self>) -> Option<gpui::Stateful<Div>> {
+        if open.key.network != Network::Teams {
+            return None;
+        }
+        let event = self.sidebar_state.home.upcoming.iter().find(|event| {
+            event.conversation == open.key.id && (self.sidebar_state.home.upcoming_account.is_empty() || self.sidebar_state.home.upcoming_account == open.key.account)
+        })?;
+        let mut label = crate::gui::time::meeting_display(event, crate::view::now());
+        let join = event.join_url.clone();
+        let can_join = join.starts_with("https://");
+        if can_join {
+            label.push_str(" · Join");
+        }
+        Some(
+            div()
+                .id("conversation-meeting")
+                .flex_none()
+                .self_center()
+                .h(px(18.))
+                .px(px(6.))
+                .rounded(px(999.))
+                .bg(theme::raised())
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .type_small()
+                .text_color(theme::text_soft())
+                .when(can_join, |chip| {
+                    chip.cursor_pointer()
+                        .hover(|style| style.text_color(theme::text()))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let pane = this.pane(cx);
+                            pane.update(cx, |pane, cx| pane.open_external_link(&join, window, cx));
+                        }))
+                })
+                .child(glyph("icons/calendar.svg", 12., theme::text_soft()))
+                .child(label),
+        )
+    }
+
+    /// The line after the title (07 §1): active typing/recording status first, then beside a direct
+    /// conversation the person's status or presence; elsewhere where it is (`Space › group`) and its topic.
     fn beside(&self, open: &Conversation) -> Option<Beside> {
+        let typists = self.people_state.hub().typists_in(&open.key);
+        if let Some(words) = crate::gui::composer::typing_preview_for(&typists, open.kind != ConversationKind::Direct) {
+            return Some(Beside::Activity(words));
+        }
         if open.kind == ConversationKind::Direct {
             if let Some(mut line) = self.peer_line(&open.key) {
                 // The avatar's dot says it; the word is its tooltip. A call and Telegram's
@@ -389,6 +449,7 @@ fn title_floor(title: &str, window: &Window) -> gpui::Pixels {
 
 /// What follows the title. A person's presence is not a place, so it does not reveal the sidebar.
 enum Beside {
+    Activity(String),
     Person(crate::gui::people::PeerLine),
     Path(String),
 }

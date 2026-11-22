@@ -380,6 +380,8 @@ impl Demo {
             link: if self.ctx.account.network == Network::Telegram && !row.kind.is_direct() { format!("https://t.me/{}", row.title.to_lowercase().replace(' ', "_")) } else { String::new() },
             disappearing: row.disappearing,
             bookmarks: Vec::new(),
+            pending_requests: 0,
+            ..ConversationAbout::default()
         })
     }
 
@@ -666,6 +668,7 @@ impl Demo {
             Command::Edit { conversation_id, message_id, text, spans: _, suppress_embeds: _, keep_attachments: _, reply } => {
                 let _ = reply.send(demo.edit(&conversation_id, &message_id, text));
             }
+            Command::EditMedia { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Delete { conversation_id, message_id, scope: _, reply } => {
                 let deleted = demo.ctx.deleted(&conversation_id, &message_id);
                 let _ = reply.send(deleted.map_err(|err| Refusal::Refused(err.to_string())));
@@ -847,9 +850,11 @@ impl Demo {
                         }
                         hits
                     })
+                    .map(Into::into)
                     .map_err(|err| Refusal::Refused(err.to_string()));
                 let _ = reply.send(found);
             }
+            Command::SearchFiles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Catalog { kind, query, cursor, reply, .. } => drop(reply.send(Ok(demo.catalog(kind, &query, cursor.as_deref())))),
             Command::ReactionRules { conversation_id, reply } => drop(reply.send(Ok(demo.reaction_rules(&conversation_id)))),
             Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
@@ -884,7 +889,7 @@ impl Demo {
                 })();
                 let _ = reply.send(outcome);
             }
-            Command::CreateChannel { space_id, name, kind, private, group, reply } => {
+            Command::CreateChannel { space_id, name, kind, private, group, reply, .. } => {
                 let outcome = (|| -> Result<String, Refusal> {
                     let id = format!("chan-{}", demo.made.fetch_add(1, Ordering::Relaxed) + 1);
                     let row = ConversationRow {
@@ -900,6 +905,7 @@ impl Demo {
             }
             Command::StartThread { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchPeople(query) => demo.ctx.searched(&query),
+            Command::ResolveUsername { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Download { url, reply, .. } => drop(reply.send(Ok(Download { url, headers: Vec::new(), sealed: None }))),
             Command::Handoff { conversation_id, reply } => {
                 let account = &demo.ctx.account.account;
@@ -937,6 +943,9 @@ impl Demo {
             Command::Source { reply, .. } | Command::CreateGroup { reply, .. } => {
                 let _ = reply.send(Err(Refusal::Unsupported));
             }
+            Command::OpenLink { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::TranslateMessages { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SendRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StarMessage { reply, .. } => {
                 let _ = reply.send(Err(Refusal::Unsupported));
             }
@@ -958,8 +967,23 @@ impl Demo {
                 }
                 let _ = reply.send(outcome);
             }
-            Command::MembersAdd { reply, .. } | Command::MembersRemove { reply, .. } | Command::ConversationPicture { reply, .. } => {
+            Command::MembersAdd { reply, .. }
+            | Command::MembersRemove { reply, .. }
+            | Command::ConversationPicture { reply, .. }
+            | Command::ModerateMember { reply, .. }
+            | Command::SetAdmin { reply, .. }
+            | Command::TransferOwnership { reply, .. }
+            | Command::UpdateChatSettings { reply, .. }
+            | Command::SetDefaultSendAs { reply, .. } => {
                 let _ = reply.send(Ok(()));
+            }
+            Command::AdminLog { reply, .. } => {
+                let entries: Vec<protocol::AdminLogEntry> = Vec::new();
+                let _ = reply.send(Ok(entries));
+            }
+            Command::SendAsOptions { reply, .. } => {
+                let peers: Vec<protocol::SendAs> = Vec::new();
+                let _ = reply.send(Ok((peers, None)));
             }
             Command::ConversationUpdate { conversation_id, title, topic, description, reply } => {
                 let outcome = match demo.ctx.known(&conversation_id) {
@@ -1033,9 +1057,33 @@ impl Demo {
             | Command::TogglePaidReactionPrivacy { reply, .. }
             | Command::SetDefaultReaction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Favourite { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Transcribe { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::RateTranscript { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Translate { conversation_id, message_id, to, reply } => {
+                let original = demo
+                    .ctx
+                    .stored_message(&conversation_id, &message_id)
+                    .ok()
+                    .flatten()
+                    .map(|m| m.text)
+                    .unwrap_or_default();
+                let target_lang = protocol::normalize_language_tag(&to);
+                let outcome = if original.trim().is_empty() {
+                    Err(Refusal::Refused("Nothing to translate.".to_owned()))
+                } else {
+                    Ok(protocol::Translation {
+                        text: format!("[{target_lang}] {original}"),
+                        source_lang: Some("auto".to_owned()),
+                        target_lang,
+                    })
+                };
+                let _ = reply.send(outcome);
+            }
             Command::PreviewChannel { reply, .. }
             | Command::Join { reply, .. }
-            | Command::DeleteFile { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            | Command::DeleteFile { reply, .. }
+            | Command::InviteMember { reply, .. }
+            | Command::AddCustomEmoji { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MessageAction { conversation_id, message_id, action_id, value, values, reply, .. } => {
                 let outcome = (|| -> Result<(), Refusal> {
                     let stored = demo.ctx.stored_message(&conversation_id, &message_id).ok().flatten();
@@ -1090,7 +1138,7 @@ impl Demo {
                     }
                     demo.ctx.message(&conversation_id, &message).map_err(|err| Refusal::Refused(err.to_string()))
                 })();
-                let _ = reply.send(outcome);
+                let _ = reply.send(outcome.map(|()| None));
             }
             Command::Commands { query, kind, reply, .. } => {
                 let mut cmds = vec![
@@ -1231,6 +1279,18 @@ impl Demo {
                 let res = demo.ctx.message(&conversation_id, &msg).map_err(|err| Refusal::Refused(err.to_string()));
                 let _ = reply.send(res);
             }
+            Command::UserGroups { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::UserGroupCreate { reply, .. }
+            | Command::UserGroupUpdate { reply, .. }
+            | Command::UserGroupMembers { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AppView { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SectionCreate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SectionRename { reply, .. }
+            | Command::SectionDelete { reply, .. }
+            | Command::SectionReorder { reply, .. }
+            | Command::SectionMoveChannel { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SlashCommands { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AllUnreads { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::AccountFiles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallRing { reply, .. } | Command::CallStopRinging { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)));
@@ -1258,7 +1318,7 @@ impl Demo {
             Command::SetFriendNickname { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::CreateInvite { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateInviteLink { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::TransferOwner { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CreateSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Events { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1267,7 +1327,7 @@ impl Demo {
             | Command::DeleteSpace { reply, .. }
             | Command::TransferSpace { reply, .. }
             | Command::DeleteEvent { reply, .. }
-            | Command::RevokeInvite { reply, .. }
+            | Command::RevokeSpaceInvite { reply, .. }
             | Command::SetInvitesPaused { reply, .. }
             | Command::MoveRoles { reply, .. }
             | Command::DeleteRole { reply, .. }
@@ -1285,6 +1345,10 @@ impl Demo {
             Command::SpaceGate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::AcceptRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SubmitOnboarding { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ChatInvites { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateInvite { reply, .. } | Command::RevokeInvite { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::JoinRequests { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::HandleJoinRequest { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::LeaveSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetSpaceNotify { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SpaceIntegrations { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1304,8 +1368,25 @@ impl Demo {
             Command::DeleteEmoji { reply, .. } | Command::DeleteSticker { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
+            Command::GetDefaultDisappearing { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetDefaultDisappearing { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::FolderSave { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::FolderDelete { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::FoldersReorder { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SuggestedFolders { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::LoadTopics { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::TopicCreate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::TopicUpdate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::TopicDelete { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::TopicIcons { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CancelScheduled { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SendScheduledNow { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::JumpToDate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SearchCalendar { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DeleteMany { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DeleteParticipantHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ReportSpamMessages { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::FollowThread { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ForumInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1342,6 +1423,15 @@ impl Demo {
             Command::DeleteAutomodRule { reply, .. } | Command::SaveSpaceSafety { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
+            Command::GetAutoDownload { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetAutoDownload { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetBoosts { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ApplyBoost { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetBotMenu { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::StartBot { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SharePhone { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Meetings { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MeetingRsvp { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Backfill(_)
             | Command::Warm(_)
             | Command::History { .. }
@@ -1353,6 +1443,7 @@ impl Demo {
             | Command::MarkRead { .. }
             | Command::MarkUnread { .. }
             | Command::Viewed { .. }
+            | Command::MarkPlayed { .. }
             | Command::AckBulk { .. }
             | Command::Collapse { .. }
             | Command::Typing { .. }
@@ -1360,6 +1451,7 @@ impl Demo {
             | Command::Draft { .. }
             | Command::Watch(_)
             | Command::Wanted(_)
+            | Command::Played { .. }
             | Command::Stop => {}
         }
     }

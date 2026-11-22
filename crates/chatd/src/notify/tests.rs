@@ -742,3 +742,39 @@ fn urgent_messages_bypass_conversation_mute_and_prefix_notifications() {
     notes.message(&dm(), &important, &imp_verdict, Instant::now());
     assert_eq!(fake.log().posted.last().unwrap().body, "URGENT: prod outage\nIMPORTANT: need review");
 }
+
+#[test]
+fn streamer_mode_silences_notifications_and_calls_while_sharing_or_on() {
+    let mut values = Values::default();
+    set(&mut values, GLOBAL, settings::NOTIFY_REACTIONS, "direct");
+
+    let idle = moment();
+    let sharing = Moment { in_call: true, sharing: true, ..moment() };
+    let obs = Moment { obs_running: true, ..moment() };
+
+    // Default mode is "while_sharing": normal notifications fire when idle, silenced while sharing.
+    assert!(posts(&values, &dm(), &message("Ines", "hi"), &idle));
+    assert!(decide_reaction(&values, &dm(), true, &idle).is_some());
+    assert!(decide_ring_in(&values, &dm().key, &idle, true).is_some());
+
+    assert!(!posts(&values, &dm(), &message("Ines", "hi"), &sharing));
+    assert!(decide_reaction(&values, &dm(), true, &sharing).is_none());
+    assert!(decide_ring_in(&values, &dm().key, &sharing, true).is_none());
+
+    // OBS detection is opt-in: off by default, silences notifications once enabled.
+    assert!(posts(&values, &dm(), &message("Ines", "hi"), &obs));
+    set(&mut values, GLOBAL, settings::STREAMER_DETECT_OBS, "on");
+    assert!(!posts(&values, &dm(), &message("Ines", "hi"), &obs));
+    assert!(decide_ring_in(&values, &dm().key, &obs, true).is_none());
+
+    // Explicit "on" silences even when idle; explicit "off" lets notifications through even while sharing.
+    set(&mut values, GLOBAL, settings::STREAMER_MODE, "on");
+    assert!(!posts(&values, &dm(), &message("Ines", "hi"), &idle));
+    assert!(decide_reaction(&values, &dm(), true, &idle).is_none());
+    assert!(decide_ring_in(&values, &dm().key, &idle, true).is_none());
+
+    set(&mut values, GLOBAL, settings::STREAMER_MODE, "off");
+    assert!(posts(&values, &dm(), &message("Ines", "hi"), &sharing));
+    assert!(decide_reaction(&values, &dm(), true, &sharing).is_some());
+    assert!(decide_ring_in(&values, &dm().key, &sharing, true).is_some());
+}

@@ -5,11 +5,61 @@ use super::draw;
 use super::facts::{self, MembersShown, NotifyControl};
 use crate::gui::components::{button, button_with_icon, glyph, icon_button, pair, segment, segmented, tip, Avatar, ButtonKind, Shape as Plate};
 use crate::gui::people::card::Float;
-use crate::gui::people::info::{InfoPane, ManageKind};
+use crate::gui::people::info::{InfoPane, ManageKind, PendingMod};
 use crate::gui::people::presence::{self, Ring, Shape};
 use crate::gui::theme::{self, Type};
 use gpui::{div, prelude::*, px, Context, Div, MouseButton, Window};
-use protocol::{CallSupport, Conversation, ConversationKind, Key, Network, Notify, Presence, Request};
+use protocol::{CallSupport, Conversation, ConversationKind, Key, MeetingResponse, Network, Notify, Presence, Request};
+
+/// A Telegram channel's boost level, and a confirmed Boost for a Premium account.
+fn boost_row(pane: &InfoPane, row: &Conversation, cx: &mut Context<InfoPane>) -> Option<Div> {
+    if row.key.network != Network::Telegram || row.kind != ConversationKind::Channel {
+        return None;
+    }
+    if pane.boosts_waiting(&row.key) {
+        return Some(div().type_small().text_color(theme::text_faint()).child("Loading boosts…"));
+    }
+    let status = pane.channel_boosts(&row.key)?;
+    let mut line = div().flex().flex_col().gap(px(6.)).child(div().type_ui().text_color(theme::text()).child(format!("Boosts: level {}", status.level)));
+    let progress = match status.next_level_boosts {
+        Some(next) => format!("{} of {next} boosts", status.boosts),
+        None => format!("{} boosts", status.boosts),
+    };
+    line = line.child(div().type_small().text_color(theme::text_soft()).child(progress));
+    if pane.boost_confirming(&row.key) {
+        line = line.child(
+            div()
+                .p(px(8.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(theme::raised())
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(div().type_small().child("Give this channel one of your boosts?"))
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(6.))
+                        .child(button("boost-cancel", ButtonKind::Ghost, "Cancel").h(px(24.)).px(px(8.)).type_small().on_click(cx.listener(|pane, _, _, cx| pane.cancel_boost(cx))))
+                        .child(button("boost-confirm", ButtonKind::Primary, "Boost").h(px(24.)).px(px(10.)).type_small().on_click(cx.listener(|pane, _, _, cx| pane.confirm_boost(cx)))),
+                ),
+        );
+        return Some(line);
+    }
+    if status.my_boost {
+        line = line.child(div().type_small().text_color(theme::text_soft()).child("You boosted this channel."));
+    } else if status.can_boost && !status.slots.is_empty() {
+        line = line.child(
+            button("details-boost", ButtonKind::Secondary, "Boost")
+                .h(px(26.))
+                .px(px(8.))
+                .type_small()
+                .on_click(cx.listener(|pane, _, _, cx| pane.ask_boost_confirm(cx))),
+        );
+    }
+    Some(line)
+}
 
 /// S6: this conversation's own notification sound, kept here only (the network never sees it),
 /// over its account's and the global one. Picking one plays it.
@@ -84,12 +134,17 @@ fn disappearing_row(
         };
         choices = choices.child(seg);
     }
+    let heading = if row.key.network == Network::Telegram {
+        format!("Auto-delete: {}", protocol::format_disappearing(active))
+    } else {
+        format!("Disappearing messages: {}", protocol::format_disappearing(active))
+    };
     Some(
         div()
             .flex()
             .flex_col()
             .gap(px(6.))
-            .child(div().type_ui().child("Disappearing messages"))
+            .child(div().type_ui().child(heading))
             .child(div().flex().flex_wrap().gap(px(4.)).child(choices))
             .child(div().type_small().text_color(theme::text_faint()).child("Auto-deletes on the network (separate from local retention).")),
     )
@@ -197,6 +252,13 @@ fn head_picture(pane: &InfoPane, row: &Conversation, cx: &mut Context<InfoPane>)
     }
 }
 
+fn open_https_link(pane: &InfoPane, url: &str, window: &mut Window, cx: &mut Context<InfoPane>) {
+    pane.shell_do(cx, |shell, cx| {
+        let conv = shell.pane(cx);
+        conv.update(cx, |conv, cx| conv.open_external_link(url, window, cx));
+    });
+}
+
 /// A conversation's Details.
 pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &mut Context<InfoPane>) -> Div {
     let network = row.key.network;
@@ -265,11 +327,20 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
         top = top.child(div().type_small().text_color(theme::text_faint()).child("Kept on this device."));
     }
     top = top.child(sound_row(row, cx).mt(px(8.)));
+    if let Some(boosts) = boost_row(pane, row, cx) {
+        top = top.child(boosts.mt(px(8.)));
+    }
     if let Some(timer_row) = disappearing_row(pane, row, info, cx) {
         top = top.child(timer_row.mt(px(8.)));
     }
-    if facts::can_rename(row) || facts::can_edit_topic(row) || facts::can_edit_picture(row) || facts::can_add_members(row) {
-        let mut manage_bar = div().mt(px(10.)).flex().flex_wrap().gap(px(6.));
+    let show_manage = facts::can_rename(row)
+        || facts::can_edit_topic(row)
+        || facts::can_add_members(row)
+        || facts::can_edit_picture(row)
+        || facts::can_manage_settings(row)
+        || facts::can_view_admin_log(row);
+    if show_manage {
+        let mut manage_bar = div().mt(px(10.)).flex().flex_wrap().items_center().gap(px(6.));
         if facts::can_rename(row) {
             let key = row.key.clone();
             let current = row.title.clone();
@@ -343,7 +414,131 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                     })),
             );
         }
+        if facts::can_edit_picture(row) {
+            let key = row.key.clone();
+            manage_bar = manage_bar.child(
+                button("details-picture", ButtonKind::Secondary, "Change photo")
+                    .h(px(26.))
+                    .px(px(8.))
+                    .type_small()
+                    .on_click(cx.listener(move |pane, _, _, cx| pane.pick_picture(key.clone(), cx))),
+            );
+        }
+        if facts::can_manage_settings(row) {
+            let protect = row.key.clone();
+            let allow = row.key.clone();
+            let approve = row.key.clone();
+            let open = row.key.clone();
+            manage_bar = manage_bar.child(
+                button("details-protect", ButtonKind::Secondary, "Protect content")
+                    .h(px(26.))
+                    .px(px(8.))
+                    .type_small()
+                    .on_click(cx.listener(move |pane, _, _, cx| {
+                        pane.update_chat_settings(
+                            protect.clone(),
+                            protocol::ChatSettings { no_forwards: Some(true), ..protocol::ChatSettings::default() },
+                            cx,
+                        );
+                    })),
+            );
+            manage_bar = manage_bar.child(
+                button("details-forward", ButtonKind::Secondary, "Allow forwarding")
+                    .h(px(26.))
+                    .px(px(8.))
+                    .type_small()
+                    .on_click(cx.listener(move |pane, _, _, cx| {
+                        pane.update_chat_settings(
+                            allow.clone(),
+                            protocol::ChatSettings { no_forwards: Some(false), ..protocol::ChatSettings::default() },
+                            cx,
+                        );
+                    })),
+            );
+            manage_bar = manage_bar.child(
+                button("details-approve", ButtonKind::Secondary, "Require approval")
+                    .h(px(26.))
+                    .px(px(8.))
+                    .type_small()
+                    .on_click(cx.listener(move |pane, _, _, cx| {
+                        pane.update_chat_settings(
+                            approve.clone(),
+                            protocol::ChatSettings { join_request: Some(true), ..protocol::ChatSettings::default() },
+                            cx,
+                        );
+                    })),
+            );
+            manage_bar = manage_bar.child(
+                button("details-open", ButtonKind::Secondary, "Open joining")
+                    .h(px(26.))
+                    .px(px(8.))
+                    .type_small()
+                    .on_click(cx.listener(move |pane, _, _, cx| {
+                        pane.update_chat_settings(
+                            open.clone(),
+                            protocol::ChatSettings { join_request: Some(false), ..protocol::ChatSettings::default() },
+                            cx,
+                        );
+                    })),
+            );
+        }
+        if facts::can_view_admin_log(row) {
+            let key = row.key.clone();
+            let label = if pane.admin_log_for(&row.key).is_some() { "Hide actions" } else { "Recent actions" };
+            manage_bar = manage_bar.child(
+                button("details-admin-log", ButtonKind::Secondary, label)
+                    .h(px(26.))
+                    .px(px(8.))
+                    .type_small()
+                    .on_click(cx.listener(move |pane, _, _, cx| pane.load_admin_log(key.clone(), cx))),
+            );
+        }
         top = top.child(manage_bar);
+        if facts::can_manage_settings(row) {
+            let key = row.key.clone();
+            let speeds = [(0u32, "Off"), (10, "10s"), (30, "30s"), (60, "1m"), (300, "5m"), (900, "15m"), (3_600, "1h")];
+            let mut chips = div().flex().flex_wrap().gap(px(4.));
+            for (ix, &(secs, label)) in speeds.iter().enumerate() {
+                let key = key.clone();
+                chips = chips.child(segment(("details-slow", ix), label, false).on_click(cx.listener(move |pane, _, _, cx| {
+                    pane.update_chat_settings(
+                        key.clone(),
+                        protocol::ChatSettings { slowmode_seconds: Some(secs), ..protocol::ChatSettings::default() },
+                        cx,
+                    );
+                })));
+            }
+            top = top.child(
+                div()
+                    .mt(px(8.))
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(div().type_small().text_color(theme::text_soft()).child("Slow mode"))
+                    .child(chips),
+            );
+        }
+        if facts::can_view_admin_log(row) {
+            if let Some(entries) = pane.admin_log_for(&row.key) {
+                let mut list = div().mt(px(8.)).flex().flex_col().gap(px(4.));
+                if entries.is_empty() {
+                    list = list.child(div().type_small().text_color(theme::text_faint()).child("No recent actions."));
+                } else {
+                    for entry in entries.iter().take(20) {
+                        let line = if entry.actor.is_empty() {
+                            entry.summary.clone()
+                        } else {
+                            format!("{} · {}", entry.actor, entry.summary)
+                        };
+                        list = list.child(div().type_small().text_color(theme::text_soft()).child(line));
+                    }
+                }
+                top = top.child(list);
+            } else if pane.admin_log_loading() {
+                top = top.child(div().mt(px(8.)).type_small().text_color(theme::text_faint()).child("Loading recent actions…"));
+            }
+        }
     }
     if network == Network::Discord
         && row.rights.manage_permissions
@@ -367,6 +562,15 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
     if let Some((mkey, mkind, input)) = pane.managing() {
         if mkey == &row.key {
             let discord_friends_hint = *mkind == ManageKind::AddMembers && row.key.network == Network::Discord;
+            let show_history = *mkind == ManageKind::AddMembers
+                && row.key.network == Network::Teams
+                && row.kind == ConversationKind::Group;
+            let history_label = match pane.share_history() {
+                protocol::HistoryShare::None => "History: None",
+                protocol::HistoryShare::Days { days: 7 } => "History: 7 days",
+                protocol::HistoryShare::Days { .. } => "History: Recent",
+                protocol::HistoryShare::All => "History: All",
+            };
             top = top.child(
                 div()
                     .mt(px(8.))
@@ -385,6 +589,17 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                         )
                     })
                     .child(input.clone())
+                    .when(show_history, |box_| {
+                        box_.child(
+                            div().flex().items_center().justify_between().child(
+                                button("manage-history", ButtonKind::Secondary, history_label)
+                                    .h(px(24.))
+                                    .px(px(8.))
+                                    .type_small()
+                                    .on_click(cx.listener(|pane, _, _, cx| pane.cycle_share_history(cx))),
+                            ),
+                        )
+                    })
                     .child(
                         div()
                             .flex()
@@ -428,6 +643,52 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
             );
         }
     }
+    if let Some(action) = pane.pending_mod().filter(|action| action.conversation() == &row.key) {
+        let (prompt, field, confirm, kind) = match action {
+            PendingMod::Ban { person_name, .. } => (
+                format!("Ban {person_name} from {}? They cannot rejoin until an admin unbans them.", row.title),
+                None,
+                "Ban",
+                ButtonKind::Danger,
+            ),
+            PendingMod::Promote { person_name, rank, .. } => (
+                format!("Make {person_name} an admin of {}?", row.title),
+                Some(rank.clone()),
+                "Promote",
+                ButtonKind::Primary,
+            ),
+            PendingMod::TransferOwner { person_name, password, .. } => (
+                format!("Transfer ownership of {} to {person_name}?", row.title),
+                Some(password.clone()),
+                "Transfer",
+                ButtonKind::Danger,
+            ),
+        };
+        top = top.child(
+            div()
+                .mt(px(8.))
+                .p(px(8.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(theme::raised())
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(div().type_small().child(prompt))
+                .children(field)
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(6.))
+                        .child(button("mod-cancel", ButtonKind::Ghost, "Cancel").h(px(24.)).px(px(8.)).type_small().on_click(
+                            cx.listener(|pane, _, _, cx| pane.cancel_mod(cx)),
+                        ))
+                        .child(button("mod-confirm", kind, confirm).h(px(24.)).px(px(10.)).type_small().on_click(
+                            cx.listener(|pane, _, _, cx| pane.confirm_mod(cx)),
+                        )),
+                ),
+        );
+    }
     if !online {
         let words = facts::heads_up_words(&facts::HeadsUp::Offline, &row.title, network, crate::view::now());
         top = top.child(draw::heads_up_banner(&words, None).mt(px(12.)));
@@ -440,6 +701,47 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
     if !about.is_empty() {
         any = true;
         sections = sections.child(draw::label("About", true)).child(div().type_ui().line_clamp(6).child(about));
+    }
+    if network == Network::Telegram && row.kind != ConversationKind::Direct {
+        if let Some(url) = link.as_ref().filter(|url| protocol::link::telegram_invite_hash(url).is_some()) {
+            let first = !any;
+            any = true;
+            let shown = url.clone();
+            let copy = url.clone();
+            sections = sections.child(draw::label("Invite link", first)).child(
+                div()
+                    .min_h(px(theme::ROW_ONE))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(shown))
+                    .child(
+                        button("details-invite-copy", ButtonKind::Secondary, "Copy")
+                            .h(px(26.))
+                            .px(px(8.))
+                            .type_small()
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.clone()));
+                            })),
+                    ),
+            );
+        }
+        if let Some(count) = info.map(|info| info.pending_requests).filter(|count| *count > 0) {
+            let first = !any;
+            any = true;
+            sections = sections.child(
+                div()
+                    .h(px(theme::ROW_ONE))
+                    .mt(px(if first { 0. } else { 8. }))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .type_ui()
+                    .text_color(theme::text())
+                    .child(glyph("icons/users.svg", 16., theme::text_soft()))
+                    .child(format!("Requests ({count})")),
+            );
+        }
     }
     match facts::members_shown(row, info) {
         MembersShown::Inline => {
@@ -454,6 +756,7 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                 sections = sections.child(draw::label("Members", !any));
                 any = true;
                 let ring = Ring::on(theme::sidebar());
+                let mods = facts::member_mod_actions(row);
                 for (ix, person) in members.iter().enumerate() {
                     let shown = match hub.presence_of(&person.key) {
                         Presence::Unknown => person.presence,
@@ -510,6 +813,54 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                                         })),
                                 )
                             })
+                            .when(mods.ban && person.title != "Owner", |item| {
+                                let conv = row.key.clone();
+                                let id = person.key.id.clone();
+                                let name = person.name.clone();
+                                item.child(
+                                    button(("details-member-ban", ix), ButtonKind::Ghost, "Ban")
+                                        .h(px(22.))
+                                        .px(px(6.))
+                                        .type_small()
+                                        .tooltip(tip("Ban from group", None))
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                        .on_click(cx.listener(move |pane, _, _, cx| {
+                                            pane.ask_ban_member(conv.clone(), id.clone(), name.clone(), cx);
+                                        })),
+                                )
+                            })
+                            .when(mods.promote && person.title != "Owner", |item| {
+                                let conv = row.key.clone();
+                                let id = person.key.id.clone();
+                                let name = person.name.clone();
+                                item.child(
+                                    button(("details-member-admin", ix), ButtonKind::Ghost, "Admin")
+                                        .h(px(22.))
+                                        .px(px(6.))
+                                        .type_small()
+                                        .tooltip(tip("Make admin", None))
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                        .on_click(cx.listener(move |pane, _, _, cx| {
+                                            pane.ask_promote_admin(conv.clone(), id.clone(), name.clone(), cx);
+                                        })),
+                                )
+                            })
+                            .when(mods.transfer && person.title != "Owner", |item| {
+                                let conv = row.key.clone();
+                                let id = person.key.id.clone();
+                                let name = person.name.clone();
+                                item.child(
+                                    button(("details-member-owner", ix), ButtonKind::Ghost, "Owner")
+                                        .h(px(22.))
+                                        .px(px(6.))
+                                        .type_small()
+                                        .tooltip(tip("Transfer ownership", None))
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                        .on_click(cx.listener(move |pane, _, _, cx| {
+                                            pane.ask_transfer_owner(conv.clone(), id.clone(), name.clone(), cx);
+                                        })),
+                                )
+                            })
                             .on_mouse_down(MouseButton::Left, cx.listener(move |pane, event: &gpui::MouseDownEvent, _, cx| {
                                 let (key, at) = (key.clone(), event.position);
                                 pane.shell_do(cx, move |shell, cx| shell.open_profile(key, at, cx));
@@ -563,6 +914,7 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                 format!("{} {}", bm.emoji, bm.title)
             };
             let url = bm.link.clone();
+            let valid_url = url.starts_with("https://") || url.starts_with("http://");
             let chip = div()
                 .id(("details-bookmark", ix))
                 .px(px(8.))
@@ -571,7 +923,7 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                 .bg(theme::raised())
                 .type_small()
                 .text_color(theme::text())
-                .when(!url.is_empty(), |d| {
+                .when(valid_url, |d| {
                     d.cursor_pointer()
                         .hover(|s| s.bg(theme::hover()))
                         .on_click(move |_, _, cx| cx.open_url(&url))
@@ -588,6 +940,99 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                 .gap(px(8.))
                 .child(div().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child("Bookmarks"))
                 .child(chips),
+        );
+    }
+    if let Some(meeting) = info.and_then(|info| info.meeting.clone()) {
+        let line = crate::gui::time::meeting_display(&meeting, crate::view::now());
+        let can_join = meeting.join_url.starts_with("https://");
+        let join = meeting.join_url.clone();
+        let show_rsvp = meeting.response != MeetingResponse::Organizer && !meeting.id.is_empty();
+        let mut actions = div().flex().flex_wrap().gap(px(6.));
+        if can_join {
+            actions = actions.child(button("details-meeting-join", ButtonKind::Secondary, "Join").on_click(cx.listener(move |pane, _, window, cx| {
+                open_https_link(pane, &join, window, cx);
+            })));
+        }
+        if show_rsvp {
+            let account = row.key.account();
+            let id = meeting.id.clone();
+            let propose_at = meeting.start + 15 * 60;
+            let choices = [
+                ("Accept", MeetingResponse::Accepted, None),
+                ("Tentative", MeetingResponse::Tentative, None),
+                ("Decline", MeetingResponse::Declined, None),
+                ("Propose 15 min later", MeetingResponse::Tentative, Some(propose_at)),
+            ];
+            for (slot, (label, response, propose)) in choices.into_iter().enumerate() {
+                let account = account.clone();
+                let id = id.clone();
+                actions = actions.child(button(("details-meeting-rsvp", slot), ButtonKind::Ghost, label).on_click(cx.listener(move |pane, _, _, cx| {
+                    pane.note_meeting_response(response);
+                    crate::gui::people::ask_later(cx, Request::MeetingRsvp { account: account.clone(), id: id.clone(), response, propose }, |_, _| {});
+                })));
+            }
+        }
+        body = body.child(draw::rule().mt(px(16.))).child(
+            div()
+                .px(px(theme::PANE_PAD))
+                .pt(px(12.))
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(div().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child("Meeting"))
+                .child(div().type_small().text_color(theme::text_soft()).child(line))
+                .child(actions),
+        );
+    }
+    if let Some(tabs) = info.map(|i| i.tabs.as_slice()).filter(|t| !t.is_empty()) {
+        let fallback_link = link.clone().unwrap_or_default();
+        let mut rows = div().flex().flex_col().gap(px(2.));
+        for (ix, tab) in tabs.iter().enumerate() {
+            let open_url = [&tab.web_url, &tab.content_url, &fallback_link]
+                .into_iter()
+                .find(|u| u.starts_with("https://"))
+                .cloned();
+            let icon = match tab.kind.as_str() {
+                "files" => "icons/folder-plus.svg",
+                "planner" => "icons/check.svg",
+                "website" => "icons/link.svg",
+                _ => "icons/external-link.svg",
+            };
+            let show_app = !tab.app.is_empty() && !tab.app.eq_ignore_ascii_case(&tab.name);
+            let mut row = div()
+                .id(("details-tab", ix))
+                .h(px(theme::ROW_ONE))
+                .mx(px(-8.))
+                .px(px(8.))
+                .rounded(px(theme::R_CONTROL))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .type_ui()
+                .child(glyph(icon, 15., theme::text_soft()))
+                .child(div().flex_1().min_w_0().truncate().text_color(theme::text()).child(tab.name.clone()));
+            if show_app {
+                row = row.child(div().flex_none().type_micro().text_color(theme::text_faint()).child(tab.app.clone()));
+            }
+            if let Some(url) = open_url {
+                row = row
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()))
+                    .child(glyph("icons/external-link.svg", 13., theme::text_faint()))
+                    .on_click(cx.listener(move |pane, _, window, cx| open_https_link(pane, &url, window, cx)));
+            }
+            rows = rows.child(row);
+        }
+        body = body.child(draw::rule().mt(px(16.))).child(
+            div()
+                .px(px(theme::PANE_PAD))
+                .pt(px(12.))
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(div().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child("Tabs"))
+                .child(div().type_micro().text_color(theme::text_faint()).child("Tabs open in your browser or Teams."))
+                .child(rows),
         );
     }
     if !waiting || late {
@@ -744,6 +1189,9 @@ pub fn space(pane: &InfoPane, key: &Key, cx: &mut Context<InfoPane>) -> Div {
             _ => None,
         },
         (Network::Teams, Some(info)) => info.members.map(|members| div().child(format!("Team · {} members", facts::thousands(members)))),
+        (Network::Slack, Some(info)) if !info.domain.is_empty() => {
+            Some(div().child(format!("{}.slack.com", info.domain)))
+        }
         _ => None,
     };
     let top = div()
@@ -1150,11 +1598,60 @@ pub fn space(pane: &InfoPane, key: &Key, cx: &mut Context<InfoPane>) -> Div {
     } else if waiting && late {
         body = body.child(draw::rule().mt(px(16.))).child(div().px(px(theme::PANE_PAD)).pt(px(16.)).child(draw::skeleton()));
     }
-    let link = facts::space_link(key);
-    body.child(
-        div()
+    let link = match (key.network, info.as_ref()) {
+        (Network::Slack, Some(info)) if !info.url.is_empty() => Some(info.url.clone()),
+        _ => info
+            .as_ref()
+            .map(|i| i.link.as_str())
+            .filter(|u| u.starts_with("https://") && protocol::link::Destination::parse(u).is_some())
+            .map(str::to_owned)
+            .or_else(|| facts::space_link(key)),
+    };
+    let domain_or_url = info
+        .as_ref()
+        .map(|i| if !i.url.is_empty() { i.url.as_str() } else { i.domain.as_str() })
+        .unwrap_or("");
+    let slack_links = (key.network == Network::Slack).then(|| {
+        let mut group = div()
             .px(px(theme::PANE_PAD))
-            .pt(px(16.))
-            .children(link.map(|url| draw::open_in("space-open", key.network).on_click(move |_, _, cx| cx.open_url(&url)))),
+            .pt(px(12.))
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(draw::label("Workspace settings · Opens in your browser", true));
+        for (ix, &(label, rel)) in facts::SLACK_WORKSPACE_LINKS.iter().enumerate() {
+            let url = facts::slack_workspace_url(domain_or_url, &key.id, rel);
+            let shell = pane.shell_weak();
+            group = group.child(
+                button_with_icon(("space-slack-link", ix), ButtonKind::Secondary, "icons/external-link.svg", label)
+                    .tooltip(tip(format!("{label} · Opens in your browser"), None))
+                    .on_click(move |_, window, cx| {
+                        let url = url.clone();
+                        let _ = shell.update(cx, |shell, cx| shell.open_external_link(&url, window, cx));
+                    }),
+            );
+        }
+        group
+    });
+    let shell = pane.shell_weak();
+    let label = if key.network == Network::Teams {
+        "Manage in Teams".to_owned()
+    } else {
+        format!("Open in {}", key.network.label())
+    };
+    let network = key.network;
+    body.children(slack_links).child(
+        div().px(px(theme::PANE_PAD)).pt(px(16.)).children(link.map(move |url| {
+            let shell = shell.clone();
+            draw::open_in_labeled("space-open", network, label.clone()).on_click(move |_, window, cx| {
+                if network == Network::Slack {
+                    let _ = shell.update(cx, |shell, cx| shell.open_external_link(&url, window, cx));
+                } else if url.starts_with("https://") {
+                    let _ = shell.update(cx, |shell, cx| shell.open_external_url(&url, window, cx));
+                } else {
+                    cx.open_url(&url);
+                }
+            })
+        })),
     )
 }

@@ -3,12 +3,12 @@
 //! state Teams keeps for all of it. Everything comes from one call, and the Activity stream is
 //! read once at connect for the mentions that came while tinyclient was closed.
 
-use super::{chain_id, escaped, id_of, millis, seconds, thread_of, Auth, Body, Fault, Teams, AGGREGATOR, TREE_FRESH};
-use crate::adapters::Command;
+use super::{chain_id, escaped, id_of, millis, now_ms, seconds, thread_of, Audience, Auth, Body, Fault, Teams, TREE_FRESH};
+use crate::adapters::{ActivityPage, BrowsedPage, Command};
 use crate::store::{ConversationRow, Filing, PreviewLine, SpaceRow};
-use protocol::{CallSupport, ConversationKind, Relation, Special};
-use serde_json::Value;
-use std::collections::HashMap;
+use protocol::{ActivityItem, ActivityItemKind, BrowsedChannel, CallSupport, ConversationKind, Mark, Relation, Special};
+use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 /// The Space an earlier build kept the chats in. Gone: chats belong to no Space.
@@ -16,7 +16,7 @@ const OLD_CHATS: &str = "chats";
 /// The user's own notes, Teams' "(You)" chat.
 const NOTES: &str = "48:notes";
 /// Teams' Activity stream: mentions, replies and reactions, as messages of a conversation.
-const ACTIVITY: &str = "48:notifications";
+pub(super) const ACTIVITY: &str = "48:notifications";
 /// The Activity stream's page read at connect, and maximum pages walked when all entries on a
 /// page are newer than the last run.
 const ACTIVITY_PAGE: u32 = 50;
@@ -40,6 +40,11 @@ fn taken(listed: &mut Value, name: &str) -> Vec<Value> {
 
 fn text<'a>(value: &'a Value, name: &str) -> &'a str {
     value[name].as_str().unwrap_or("")
+}
+
+/// Rejects query-delimiter or control characters in `syncState` cursors before building URLs.
+fn valid_sync_state(s: &str) -> bool {
+    !s.is_empty() && !s.chars().any(|c| c.is_control() || c.is_whitespace() || matches!(c, '&' | '#' | '?'))
 }
 
 pub(super) fn is_channel(id: &str) -> bool {
@@ -237,7 +242,7 @@ impl Teams {
     /// for its sidebar. Rows go to the store team by team and nothing is kept.
     fn list(&self, first: bool) -> Result<(), Fault> {
         let url = format!("{}/api/csa/api/v1/teams/users/me?isPrefetch=false&enableMembershipSummary=true", self.api);
-        let mut listed = self.call("GET", &url, Auth::Both(AGGREGATOR), Body::None, true)?.body;
+        let mut listed = self.call("GET", &url, Auth::Both(Audience::Aggregator), Body::None, true)?.body;
         let (teams, chats, shared_channels) = (
             taken(&mut listed, "teams"),
             taken(&mut listed, "chats"),
@@ -316,10 +321,14 @@ impl Teams {
                 });
             }
         }
+        self.state().spaces = spaces.clone();
         self.ctx.spaces(&spaces)?;
 
         for team in teams {
             let id = text(team, "id");
+            let can_create_channels = team["isArchived"] != true
+                && team["memberSettings"]["allowCreateUpdateChannels"] != false;
+            self.ctx.set_space_can_create_channels(id, can_create_channels)?;
             let team_tenant = text(team, "tenantId");
             // General first, then the order Teams lists them in. A channel the user hid is kept
             // apart (`opted_out`), behind the tree's "Show hidden". Unverified: that
@@ -337,18 +346,34 @@ impl Teams {
                     let chan_id = text(channel, "id");
                     let (private, shared, mark) = channel_flags(channel, team_tenant, &own_tenant);
                     let pin = pinned_channels.iter().position(|p| p == chan_id).map(|ix| ix as i32);
-                    ConversationRow {
+                    let read_only = team["isArchived"] == true || channel["isArchived"] == true;
+                    let is_general = channel["isGeneral"] == true;
+                    let mut row = ConversationRow {
                         space: Some(id.to_owned()),
                         position: position as i32,
-                        call: CallSupport::Handoff,
+                        call: super::channel_call(),
                         private,
                         shared,
                         mark,
-                        read_only: team["isArchived"] == true || channel["isArchived"] == true,
+                        read_only,
                         opted_out: hidden(channel),
+                        can_pin: !read_only,
                         filing: Some(Filing { pin, ..Filing::default() }),
                         ..ConversationRow::new(chan_id, ConversationKind::Channel, text(channel, "displayName"))
+                    };
+                    row.rights.pin = !read_only;
+                    if !read_only {
+                        if !is_general {
+                            row.rights.rename = true;
+                            row.rights.edit_topic = true;
+                        }
+                        if private || is_general {
+                            row.rights.add_members = true;
+                            row.rights.remove_members = true;
+                            row.rights.manage_members = true;
+                        }
                     }
+                    row
                 })
                 .collect();
             self.ctx.tree(id, &[], &rows)?;
@@ -404,6 +429,7 @@ impl Teams {
             if let Err(fault) = self.activity_feed() {
                 tracing::warn!("chatd: Teams: activity: {}", super::reason(fault));
             }
+            self.load_blocklist();
         }
         Ok(())
     }
@@ -456,6 +482,21 @@ impl Teams {
             let mut row = self.chat_row(id, &title_of(chat), &people, partner.map(String::as_str));
             row.position = position as i32;
             row.meeting = is_meeting(chat);
+            if let Some(event) = super::info::meeting_from_chat(self.cloud.endpoints().teams, chat) {
+                super::info::remember(&mut self.state().meetings, event);
+            }
+            let pending_req = is_pending_request(chat);
+            let chat_external = is_external_chat(chat, &people, &self.session.tenant)
+                || people.iter().any(|p| self.cached(p).is_some_and(|k| k.external) || super::people::is_consumer_mri(p));
+            if chat_external {
+                row.mark = Some(Mark::External);
+            } else if partner.is_some_and(|p| self.cached(p).is_some_and(|k| k.guest)) {
+                row.mark = Some(Mark::Guest);
+            }
+            if pending_req {
+                row.special = Special::Request;
+                row.mark.get_or_insert(Mark::External);
+            }
             let pin = pinned_order.iter().position(|pinned_id| pinned_id == id).map(|ix| ix as i32);
             row.filing = Some(Filing { hidden: chat["hidden"] == true, pin, ..Filing::default() });
             if row.title.is_empty() {
@@ -469,8 +510,10 @@ impl Teams {
                     _ => "Chat".to_owned(),
                 };
             }
-            if let Some(partner) = partner.filter(|partner| partner.starts_with("8:")) {
-                partners.insert(partner.clone(), id.to_owned());
+            if !pending_req {
+                if let Some(partner) = partner.filter(|partner| partner.starts_with("8:")) {
+                    partners.insert(partner.clone(), id.to_owned());
+                }
             }
             if counted.unread && warm.len() < WARMED {
                 warm.push(id.to_owned());
@@ -481,8 +524,15 @@ impl Teams {
                 self.ctx.preview(id, &line)?;
             }
         }
-        // The list the user owns on Teams: the people they have a chat with. Apps are not people.
-        let relations: Vec<(String, Relation)> = partners.keys().map(|person| (person.clone(), Relation::Contact)).collect();
+        // The list the user owns on Teams: the people they have a chat with, plus any blocked people.
+        // Apps are not people.
+        let blocked: HashSet<String> = self.state().blocked.clone();
+        let mut relations: Vec<(String, Relation)> = partners
+            .keys()
+            .filter(|person| !blocked.contains(*person))
+            .map(|person| (person.clone(), Relation::Contact))
+            .collect();
+        relations.extend(blocked.into_iter().map(|person| (person, Relation::Blocked)));
         self.ctx.relations(&relations)?;
         {
             let mut state = self.state();
@@ -521,14 +571,23 @@ impl Teams {
             true => self.picture(&me, &title),
             false => partner.and_then(|partner| self.picture(partner, &title)),
         };
-        ConversationRow {
+        let mut row = ConversationRow {
             avatar: avatar.map(|file| file.id),
             peer: partner.filter(|_| !bot).map(str::to_owned),
-            call: if bot || notes { CallSupport::None } else { CallSupport::Handoff },
+            call: super::chat_call(bot, notes),
             bot,
             special: if notes { Special::Saved } else { Special::None },
+            can_pin: !notes,
             ..ConversationRow::new(id, kind, title)
+        };
+        row.rights.pin = !notes;
+        if kind == ConversationKind::Group {
+            row.rights.rename = true;
+            row.rights.add_members = true;
+            row.rights.remove_members = true;
+            row.rights.manage_members = true;
         }
+        row
     }
 
     /// The Activity stream at connect: each mention of me newer than its conversation's read
@@ -582,6 +641,12 @@ impl Teams {
         if newest_seen_ms > last_seen_ms {
             self.ctx.set_note("activity_cursor", &newest_seen_ms.to_string());
         }
+        if newest_seen_ms > 0 {
+            let mut state = self.state();
+            if newest_seen_ms > state.activity_newest_ms {
+                state.activity_newest_ms = newest_seen_ms;
+            }
+        }
         for (place, messages) in found {
             let Some(row) = self.ctx.known(&place)?.or(self.ctx.known(thread_of(&place))?) else {
                 continue;
@@ -597,116 +662,183 @@ impl Teams {
         Ok(())
     }
 
-    /// Parses one `48:notifications` message into a [`protocol::ActivityItem`].
-    fn parse_activity_item(
+    /// Reads one paged slice of Teams' `48:notifications` Activity stream, optionally filtered by
+    /// [`ActivityItemKind`]. Each entry maps to an [`ActivityItem`] with target conversation,
+    /// message id, thread id, actor, emoji, snippet, timestamp, and read state.
+    pub(super) fn activity_feed_page(
         &self,
-        item: &Value,
-        read_horizon: i64,
-        read_ids: &std::collections::HashSet<String>,
-    ) -> Option<protocol::ActivityItem> {
-        let id = id_of(&item["id"]);
+        kind: Option<ActivityItemKind>,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<ActivityPage, Fault> {
+        let count = limit.clamp(1, ACTIVITY_PAGE);
+        let mut window = match cursor.filter(|c| !c.is_empty()) {
+            Some(sync_state) => {
+                if !valid_sync_state(sync_state) {
+                    return Err(Fault::Refused {
+                        status: 400,
+                        message: "Invalid activity cursor.".to_owned(),
+                    });
+                }
+                format!("startTime=1&syncState={sync_state}")
+            }
+            None => "startTime=1".to_owned(),
+        };
+        let (horizon_ms, read_ids) = {
+            let mut state = self.state();
+            if state.activity_read_horizon == 0 {
+                if let Some(saved) = self.ctx.note("activity_read_horizon").as_deref().map(millis) {
+                    state.activity_read_horizon = saved;
+                }
+            }
+            (state.activity_read_horizon, state.activity_read_ids.clone())
+        };
+        let mut items = Vec::new();
+        let mut targets = Vec::new();
+        let mut newest = 0i64;
+        let mut next_cursor: Option<String> = None;
+
+        for _ in 0..ACTIVITY_MAX_PAGES {
+            let (raws, older) = self.page(ACTIVITY, count, &window)?;
+            for raw in &raws {
+                let Some(item) = self.parse_activity_item(raw, horizon_ms, &read_ids) else {
+                    continue;
+                };
+                newest = newest.max(millis(&item.id));
+                targets.push((item.id.clone(), (thread_of(&item.conversation.id).to_owned(), item.message_id.clone())));
+                if kind.is_some_and(|want| item.kind != want) {
+                    continue;
+                }
+                items.push(item);
+            }
+            let valid_older = (!older.is_empty() && valid_sync_state(&older)).then_some(older);
+            next_cursor = valid_older.clone();
+            if kind.is_none() || !items.is_empty() || valid_older.is_none() {
+                break;
+            }
+            if let Some(sync_state) = valid_older {
+                window = format!("startTime=1&syncState={sync_state}");
+            }
+        }
+        {
+            let mut state = self.state();
+            if newest > state.activity_newest_ms {
+                state.activity_newest_ms = newest;
+            }
+            if state.activity_targets.len() + targets.len() > 2_000 {
+                state.activity_targets.clear();
+            }
+            for (id, target) in targets {
+                state.activity_targets.insert(id, target);
+            }
+        }
+        Ok(ActivityPage {
+            items,
+            cursor: next_cursor,
+        })
+    }
+
+    /// Parses one raw message from Teams' `48:notifications` stream into an [`ActivityItem`].
+    pub(super) fn parse_activity_item(
+        &self,
+        raw: &Value,
+        horizon_ms: i64,
+        read_ids: &HashSet<String>,
+    ) -> Option<ActivityItem> {
+        let activity = match &raw["properties"]["activity"] {
+            Value::String(text) => serde_json::from_str::<Value>(text).unwrap_or(Value::Null),
+            other => other.clone(),
+        };
+        let id = id_of(&raw["id"]);
         if id.is_empty() {
             return None;
         }
-        let activity = match &item["properties"]["activity"] {
-            Value::String(raw) => serde_json::from_str(raw).unwrap_or(Value::Null),
-            other => other.clone(),
-        };
+        let raw_type = text(&activity, "activityType");
+        let (kind, emoji) = classify_activity(raw_type, &activity);
         let thread = text(&activity, "sourceThreadId");
-        if thread.is_empty() {
+        let fallback_conv = raw["conversationid"]
+            .as_str()
+            .filter(|c| !c.is_empty() && *c != ACTIVITY)
+            .unwrap_or("");
+        let target_thread = if !thread.is_empty() { thread } else { fallback_conv };
+        if target_thread.is_empty() {
             return None;
         }
-        let raw_kind = text(&activity, "activityType").to_ascii_lowercase();
-        let kind = if raw_kind.contains("mention") {
-            protocol::ActivityItemKind::Mention
-        } else if raw_kind.contains("reply") || raw_kind.contains("thread") {
-            protocol::ActivityItemKind::ThreadReply
-        } else if raw_kind.contains("react") || raw_kind.contains("like") || raw_kind.contains("emotion") {
-            protocol::ActivityItemKind::Reaction
-        } else if raw_kind.contains("add") || raw_kind.contains("team") || raw_kind.contains("member") || raw_kind.contains("invite") {
-            protocol::ActivityItemKind::Invite
-        } else if raw_kind.contains("app") || raw_kind.contains("bot") || raw_kind.contains("card") {
-            protocol::ActivityItemKind::App
-        } else {
-            protocol::ActivityItemKind::Other
-        };
-        let message_id = {
-            let src = id_of(&activity["sourceMessageId"]);
-            if src.is_empty() { id.clone() } else { src }
-        };
+        let message_id = id_of(&activity["sourceMessageId"]);
         let chain = id_of(&activity["sourceReplyChainId"]);
-        let thread_id = (millis(&chain) > 0 && chain != message_id).then(|| chain_id(thread, &chain));
-        let actor_id = {
-            let src = text(&activity, "sourceUserId");
-            if !src.is_empty() {
-                src.to_owned()
-            } else {
-                text(item, "from").rsplit('/').next().unwrap_or("").to_owned()
-            }
-        };
-        let actor = {
-            let from_act = text(&activity, "sourceUserImDisplayName");
-            if !from_act.is_empty() {
-                from_act.to_owned()
-            } else {
-                let from_msg = text(item, "imdisplayname");
-                if !from_msg.is_empty() {
-                    from_msg.to_owned()
-                } else {
-                    self.name_of(&actor_id).unwrap_or_default()
-                }
-            }
-        };
-        let emoji = if kind == protocol::ActivityItemKind::Reaction {
-            let key = [&activity["reactionKey"], &activity["emoji"], &activity["activitySubtype"]]
-                .into_iter()
-                .filter_map(Value::as_str)
-                .find(|s| !s.is_empty())
-                .unwrap_or("");
-            if key.is_empty() { String::new() } else { super::emoji::emoji_of(key) }
-        } else {
-            String::new()
-        };
-        let snippet = [&activity["messagePreview"], &activity["activityTitle"]]
-            .into_iter()
-            .filter_map(Value::as_str)
-            .map(str::trim)
-            .find(|s| !s.is_empty())
-            .map(str::to_owned)
-            .or_else(|| {
-                let content = text(item, "content");
-                if content.is_empty() {
-                    None
-                } else {
-                    let parsed = super::html::parse(content, &super::people::Nobody, &self.me()).text;
-                    let cleaned = parsed.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ");
-                    (!cleaned.is_empty()).then_some(cleaned)
-                }
-            })
-            .unwrap_or_else(|| {
-                if raw_kind.contains("call") || raw_kind.contains("voicemail") {
-                    "Missed call".to_owned()
-                } else if kind == protocol::ActivityItemKind::Invite {
-                    "Added you to a team".to_owned()
-                } else {
-                    String::new()
-                }
-            });
+        let is_chain = millis(&chain) > 0 && !message_id.is_empty() && chain != message_id;
+        let thread_id = is_chain.then(|| chain_id(target_thread, &chain));
+        let place = thread_id.as_deref().unwrap_or(target_thread);
+
+        let from_raw = raw["from"].as_str().unwrap_or("");
+        let actor_id = [
+            activity["sourceUserId"].as_str(),
+            activity["activityActorId"].as_str(),
+            Some(from_raw.rsplit('/').next().unwrap_or(from_raw)),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|s| !s.is_empty())
+        .unwrap_or("")
+        .to_owned();
+        let actor = [
+            activity["sourceUserImDisplayName"].as_str(),
+            activity["activityActorName"].as_str(),
+            raw["imdisplayname"].as_str(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| (!actor_id.is_empty()).then(|| self.name_of(&actor_id)).flatten())
+        .unwrap_or_default();
+
+        let snippet = [
+            activity["messagePreview"].as_str(),
+            activity["activityDetails"].as_str(),
+            activity["summary"].as_str(),
+            activity["activitySubType"].as_str(),
+            raw["content"].as_str(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|s| super::html::parse(s, &super::people::Nobody, "").text)
+        .map(|s| s.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" "))
+        .find(|s| !s.is_empty())
+        .unwrap_or_default();
+
         let item_ms = millis(&id);
-        let time = match item_ms / 1000 {
-            0 => seconds(text(item, "composetime")),
-            ts => ts,
-        };
-        let prop_read = item["properties"]["isRead"] == true
-            || item["properties"]["isRead"].as_str().is_some_and(|v| v.eq_ignore_ascii_case("true"))
-            || activity["isRead"] == true
-            || activity["read"] == true;
-        let horizon_read = read_horizon > 0 && item_ms > 0 && item_ms <= read_horizon;
-        let unread = !(prop_read || horizon_read || read_ids.contains(&id));
-        Some(protocol::ActivityItem {
+        let time = [
+            activity["activityTimestamp"].as_str().map(seconds).filter(|&t| t > 0),
+            (item_ms > 0).then_some(item_ms / 1000),
+            raw["composetime"].as_str().map(seconds).filter(|&t| t > 0),
+        ]
+        .into_iter()
+        .flatten()
+        .next()
+        .unwrap_or(0);
+
+        let prop_read = raw["properties"]["isRead"] == true
+            || raw["properties"]["isRead"].as_str().is_some_and(|v| v.eq_ignore_ascii_case("true"))
+            || activity["isRead"] == true;
+        let conv_already_read = !message_id.is_empty()
+            && self
+                .ctx
+                .known(target_thread)
+                .ok()
+                .flatten()
+                .and_then(|row| row.last_read)
+                .is_some_and(|last_read| millis(&last_read) >= millis(&message_id) && millis(&message_id) > 0);
+        let unread = !(prop_read
+            || read_ids.contains(&id)
+            || (horizon_ms > 0 && item_ms > 0 && item_ms <= horizon_ms)
+            || conv_already_read);
+
+        Some(ActivityItem {
             id,
             kind,
-            conversation: self.ctx.key(thread),
+            conversation: self.ctx.key(place),
             message_id,
             thread_id,
             actor,
@@ -718,84 +850,162 @@ impl Teams {
         })
     }
 
-    /// Fetches a page of the Teams `48:notifications` activity feed for `Command::ActivityFeed`.
-    pub(super) fn fetch_activity_feed(
-        &self,
-        kind: Option<protocol::ActivityItemKind>,
-        cursor: Option<&str>,
-        limit: u32,
-    ) -> Result<crate::adapters::ActivityPage, Fault> {
-        let page_size = limit.clamp(1, ACTIVITY_PAGE);
-        let window = match cursor.filter(|c| !c.is_empty()) {
-            Some(sync) => format!("startTime=1&syncState={sync}"),
-            None => "startTime=1".to_owned(),
-        };
-        let (raw_items, older) = self.page(ACTIVITY, page_size, &window)?;
-        let read_horizon = self.ctx.note("activity_read_horizon").as_deref().map(millis).unwrap_or(0);
-        let read_ids = self.state().activity_read.clone();
-        let items = raw_items
-            .iter()
-            .filter_map(|raw| self.parse_activity_item(raw, read_horizon, &read_ids))
-            .filter(|item| kind.is_none_or(|wanted| item.kind == wanted))
-            .collect();
-        Ok(crate::adapters::ActivityPage {
-            items,
-            cursor: (!older.is_empty()).then_some(older),
-        })
-    }
-
-    /// Marks one activity item (`Some(id)`) or all items (`None`) read on `48:notifications`.
-    pub(super) fn mark_activity_read(&self, item_id: Option<&str>) -> Result<(), Fault> {
-        if let Some(id) = item_id.filter(|id| !id.is_empty()) {
-            let path = format!(
-                "/v1/users/ME/conversations/{}/messages/{}/properties?name=isRead",
-                escaped(ACTIVITY),
-                escaped(id)
-            );
-            self.chat("PUT", &path, Body::Json(&serde_json::json!({"isRead": "true"})), false)?;
-            self.state().activity_read.insert(id.to_owned());
-        } else {
-            let ts = super::now_ms();
-            let path = format!(
-                "/v1/users/ME/conversations/{}/properties?name=consumptionhorizon",
-                escaped(ACTIVITY)
-            );
-            let horizon = serde_json::json!({"consumptionhorizon": format!("{ts};{ts};{ts}")});
-            self.chat("PUT", &path, Body::Json(&horizon), false)?;
-            self.ctx.set_note("activity_read_horizon", &ts.to_string());
+    /// Marks one activity feed entry (`Some(id)`) or the entire feed (`None`) read and syncs
+    /// the read state to Teams' `48:notifications` stream.
+    pub(super) fn activity_mark_read(&self, item_id: Option<&str>) -> Result<(), Fault> {
+        let ts = now_ms();
+        match item_id.filter(|id| !id.is_empty()) {
+            Some(id) => {
+                let path = format!(
+                    "/v1/users/ME/conversations/{}/messages/{}/properties?name=isRead",
+                    escaped(ACTIVITY),
+                    escaped(id)
+                );
+                self.chat("PUT", &path, Body::Json(&json!({"isRead": "true"})), false)?;
+                self.state().activity_read_ids.insert(id.to_owned());
+            }
+            None => {
+                let marker = {
+                    let mut state = self.state();
+                    if state.activity_read_horizon == 0 {
+                        if let Some(saved) = self.ctx.note("activity_read_horizon").as_deref().map(millis) {
+                            state.activity_read_horizon = saved;
+                        }
+                    }
+                    let known = state.activity_newest_ms.max(state.activity_read_horizon);
+                    if known > 0 { known } else { ts }
+                };
+                let path = format!(
+                    "/v1/users/ME/conversations/{}/properties?name=consumptionhorizon",
+                    escaped(ACTIVITY)
+                );
+                let body = json!({"consumptionhorizon": format!("{marker};{ts};{marker}")});
+                self.chat("PUT", &path, Body::Json(&body), false)?;
+                let persisted = {
+                    let mut state = self.state();
+                    state.activity_read_horizon = state.activity_read_horizon.max(marker);
+                    state.activity_read_horizon
+                };
+                self.ctx.set_note("activity_read_horizon", &persisted.to_string());
+            }
         }
         Ok(())
     }
 
-    /// Handles a live push event arriving on `48:notifications`.
-    pub(super) fn handle_activity_push(&self, raw: &Value) -> Result<(), Fault> {
-        let item_ms = millis(&id_of(&raw["id"]));
-        if item_ms > 0 {
-            let prev = self.ctx.note("activity_cursor").as_deref().map(millis).unwrap_or(0);
-            if item_ms > prev {
-                self.ctx.set_note("activity_cursor", &item_ms.to_string());
-            }
+    /// Marks tracked activity items for this conversation message read on Teams.
+    /// An item is recorded only after its own `isRead` PUT succeeds. Items past the
+    /// batch stay unread. This does not write `48:notifications`' consumption horizon
+    /// from the chat-message time: that one clock marks every thread's older activities
+    /// read and moves other devices. A failed PUT records nothing and advances no horizon.
+    pub(super) fn mark_activity_for_conversation(&self, thread: &str, message_id: &str) {
+        const MAX_ACTIVITY_MARK_BATCH: usize = 10;
+        let read_ms = millis(message_id);
+        let mut matching: Vec<(i64, String)> = {
+            let state = self.state();
+            state
+                .activity_targets
+                .iter()
+                .filter(|(act_id, (t, mid))| {
+                    t == thread
+                        && !state.activity_read_ids.contains(*act_id)
+                        && (mid == message_id || (read_ms > 0 && millis(mid) > 0 && millis(mid) <= read_ms))
+                })
+                .map(|(act_id, (_, mid))| (millis(mid), act_id.clone()))
+                .collect()
+        };
+        matching.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        for (_, act_id) in matching.iter().take(MAX_ACTIVITY_MARK_BATCH) {
+            let _ = self.activity_mark_read(Some(act_id));
         }
-        let read_horizon = self.ctx.note("activity_read_horizon").as_deref().map(millis).unwrap_or(0);
-        let read_ids = self.state().activity_read.clone();
-        let Some(item) = self.parse_activity_item(raw, read_horizon, &read_ids) else {
+    }
+
+    /// Handles a live `NewMessage` / `MessageUpdate` pushed for `48:notifications` instead of
+    /// dropping it: updates mention/reply badges and raises notifications respecting muted state.
+    pub(super) fn heard_activity(&self, raw: &Value, new: bool) -> Result<(), Fault> {
+        let (horizon_ms, read_ids) = {
+            let mut state = self.state();
+            if state.activity_read_horizon == 0 {
+                if let Some(saved) = self.ctx.note("activity_read_horizon").as_deref().map(millis) {
+                    state.activity_read_horizon = saved;
+                }
+            }
+            (state.activity_read_horizon, state.activity_read_ids.clone())
+        };
+        let Some(item) = self.parse_activity_item(raw, horizon_ms, &read_ids) else {
             return Ok(());
         };
-        if item.kind == protocol::ActivityItemKind::Mention {
-            let place = item.thread_id.as_deref().unwrap_or(&item.conversation.id);
-            if let Some(row) = self.ctx.known(place)?.or(self.ctx.known(&item.conversation.id)?) {
-                let msg_ms = millis(&item.message_id);
-                let read = row.last_read.as_deref().map(millis).unwrap_or(0);
-                if msg_ms > read {
-                    let next_mentions = row.mentions.saturating_add(1);
-                    self.ctx.counts(
-                        &row.key.id,
-                        row.unread.max(next_mentions),
-                        next_mentions,
-                        row.last_read.as_deref(),
-                        item.time.max(row.updated),
-                    )?;
+        let activity = match &raw["properties"]["activity"] {
+            Value::String(text) => serde_json::from_str::<Value>(text).unwrap_or(Value::Null),
+            other => other.clone(),
+        };
+        let prop_read = raw["properties"]["isRead"] == true
+            || raw["properties"]["isRead"].as_str().is_some_and(|v| v.eq_ignore_ascii_case("true"))
+            || activity["isRead"] == true;
+        let item_ms = millis(&item.id);
+        let already_seen = {
+            let mut state = self.state();
+            if item_ms > state.activity_newest_ms {
+                state.activity_newest_ms = item_ms;
+            }
+            if prop_read {
+                state.activity_read_ids.insert(item.id.clone());
+            }
+            state
+                .activity_targets
+                .insert(
+                    item.id.clone(),
+                    (thread_of(&item.conversation.id).to_owned(), item.message_id.clone()),
+                )
+                .is_some()
+        };
+        if item_ms > 0 {
+            self.ctx.set_note("activity_cursor", &item_ms.to_string());
+        }
+        if !new || already_seen || prop_read || !item.unread {
+            return Ok(());
+        }
+        let target_thread = thread_of(&item.conversation.id);
+        if let Some(row) = self.ctx.known(&item.conversation.id)?.or(self.ctx.known(target_thread)?) {
+            match item.kind {
+                ActivityItemKind::Mention => {
+                    let read = row.last_read.as_deref().map(millis).unwrap_or(0);
+                    if millis(&item.message_id) == 0 || millis(&item.message_id) > read {
+                        let next_mentions = row.mentions.saturating_add(1);
+                        let next_unread = row.unread.max(next_mentions);
+                        self.ctx.counts(
+                            &row.key.id,
+                            next_unread,
+                            next_mentions,
+                            row.last_read.as_deref(),
+                            item.time.max(row.updated),
+                        )?;
+                    }
                 }
+                ActivityItemKind::ThreadReply | ActivityItemKind::MissedCall => {
+                    if !row.muted {
+                        self.ctx.mark_unread(&row.key.id)?;
+                    }
+                }
+                ActivityItemKind::Reaction => {
+                    // Reactions can be noisy; only notify when the conversation is set to All
+                    // notifications (not muted or mentions-only).
+                    let level = self
+                        .state()
+                        .notify
+                        .get(target_thread)
+                        .copied()
+                        .unwrap_or(if row.muted { protocol::Notify::Nothing } else { protocol::Notify::All });
+                    if level == protocol::Notify::All && !item.emoji.is_empty() {
+                        self.ctx.hub.notify(crate::notify::Event::Reaction {
+                            conversation: row.key.clone(),
+                            emoji: item.emoji.clone(),
+                            reactor: (!item.actor.is_empty()).then(|| item.actor.clone()),
+                            snippet: item.text.clone(),
+                            outgoing_target: true,
+                        });
+                    }
+                }
+                ActivityItemKind::App | ActivityItemKind::Invite | ActivityItemKind::Other => {}
             }
         }
         Ok(())
@@ -828,13 +1038,27 @@ impl Teams {
         let mut row = self.chat_row(thread, text(properties, "topic"), &people, partner);
         row.meeting = thread.starts_with("19:meeting_");
         row.position = LAST;
+        let pending_req = is_pending_request(&described);
+        let chat_external = is_external_chat(&described, &people, &self.session.tenant)
+            || people.iter().any(|p| self.cached(p).is_some_and(|k| k.external) || super::people::is_consumer_mri(p));
+        if chat_external {
+            row.mark = Some(Mark::External);
+        } else if partner.is_some_and(|p| self.cached(p).is_some_and(|k| k.guest)) {
+            row.mark = Some(Mark::Guest);
+        }
+        if pending_req {
+            row.special = Special::Request;
+            row.mark.get_or_insert(Mark::External);
+        }
         if row.title.is_empty() {
             row.title = if people.len() > 1 { format!("Group chat ({})", people.len() + 1) } else { "Chat".to_owned() };
         }
         self.ctx.conversation(&row)?;
-        if let Some(partner) = partner.filter(|partner| partner.starts_with("8:")) {
-            self.state().partners.insert(partner.to_owned(), thread.to_owned());
-            self.ctx.relation(partner, Relation::Contact)?;
+        if !pending_req {
+            if let Some(partner) = partner.filter(|partner| partner.starts_with("8:")) {
+                self.state().partners.insert(partner.to_owned(), thread.to_owned());
+                self.ctx.relation(partner, Relation::Contact)?;
+            }
         }
         Ok(true)
     }
@@ -898,6 +1122,447 @@ impl Teams {
             _ => chat(),
         }
     }
+
+    /// Leaves a Teams team (`DELETE /v1/threads/{space_id}/members/{me}`) and drops it and its
+    /// channels from the Spaces list.
+    pub(super) fn leave_team(&self, space_id: &str) -> Result<(), Fault> {
+        let path = format!("/v1/threads/{}/members/{}", escaped(space_id), escaped(&self.me()));
+        self.chat("DELETE", &path, Body::None, false).map_err(|fault| match fault {
+            Fault::Refused { status: 403 | 400, .. } => Fault::Refused {
+                status: 403,
+                message: "You cannot leave this team (you may be its last owner — manage ownership in Teams first).".to_owned(),
+            },
+            other => other,
+        })?;
+        let remaining = {
+            let mut state = self.state();
+            state.spaces.retain(|space| space.id != space_id);
+            state.spaces.clone()
+        };
+        self.ctx.spaces(&remaining)?;
+        Ok(())
+    }
+
+    /// Browses channels of a team (`space_id` non-empty, including hidden channels so they can
+    /// be shown) or public teams in the organization (`space_id` empty), filtered by `query` and
+    /// paged with a numeric offset cursor.
+    pub(super) fn browse_channels(
+        &self,
+        space_id: &str,
+        query: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<BrowsedPage, Fault> {
+        let needle = query.trim().to_ascii_lowercase();
+        let offset = cursor.and_then(|c| c.parse::<usize>().ok()).unwrap_or(0);
+        let count = limit.clamp(1, 100) as usize;
+
+        let mut all = Vec::new();
+        if space_id.trim().is_empty() {
+            let joined_spaces: HashSet<String> = self.state().spaces.iter().map(|s| s.id.clone()).collect();
+            let url = format!("{}/beta/teams/public", self.place()?.middle);
+            let answer = self.call("GET", &url, Auth::Both(Audience::Spaces), Body::None, true)?.body;
+            let entries = [
+                answer["teams"].as_array(),
+                answer["value"].as_array(),
+                answer.as_array(),
+            ]
+            .into_iter()
+            .flatten()
+            .next()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+            for team in entries {
+                if team["isDeleted"] == true {
+                    continue;
+                }
+                let id = text(team, "id");
+                let name = text(team, "displayName").trim();
+                if id.is_empty() || name.is_empty() {
+                    continue;
+                }
+                let topic = team["description"].as_str().unwrap_or("").trim().to_owned();
+                if !needle.is_empty()
+                    && !name.to_ascii_lowercase().contains(&needle)
+                    && !topic.to_ascii_lowercase().contains(&needle)
+                {
+                    continue;
+                }
+                let members = team["memberCount"]
+                    .as_u64()
+                    .or_else(|| team["membershipSummary"]["totalMemberCount"].as_u64())
+                    .unwrap_or(0) as u32;
+                all.push(BrowsedChannel {
+                    key: self.ctx.key(id),
+                    name: name.to_owned(),
+                    topic,
+                    members,
+                    joined: joined_spaces.contains(id) || team["isMember"] == true,
+                    private: false,
+                    archived: team["isArchived"] == true,
+                });
+            }
+        } else {
+            let url = format!("{}/api/csa/api/v1/teams/{}/channels", self.api, escaped(space_id));
+            let answer = self.call("GET", &url, Auth::Both(Audience::Aggregator), Body::None, true)?.body;
+            let entries = [
+                answer["channels"].as_array(),
+                answer["value"].as_array(),
+                answer.as_array(),
+            ]
+            .into_iter()
+            .flatten()
+            .next()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+            for ch in entries {
+                if ch["isDeleted"] == true {
+                    continue;
+                }
+                let id = text(ch, "id");
+                let name = text(ch, "displayName").trim();
+                if id.is_empty() || name.is_empty() {
+                    continue;
+                }
+                let topic = ch["description"].as_str().unwrap_or("").trim().to_owned();
+                if !needle.is_empty()
+                    && !name.to_ascii_lowercase().contains(&needle)
+                    && !topic.to_ascii_lowercase().contains(&needle)
+                {
+                    continue;
+                }
+                let is_general = ch["isGeneral"] == true;
+                let shown_in_sidebar = ch["isMember"] != false
+                    && (is_general || ch["isFavorite"] != false || ch["isPinned"] == true);
+                all.push(BrowsedChannel {
+                    key: self.ctx.key(id),
+                    name: name.to_owned(),
+                    topic,
+                    members: ch["memberCount"].as_u64().unwrap_or(0) as u32,
+                    joined: shown_in_sidebar,
+                    private: ch["channelType"].as_u64().is_some_and(|k| k != 0),
+                    archived: ch["isArchived"] == true,
+                });
+            }
+        }
+
+        let total = all.len();
+        let page: Vec<BrowsedChannel> = all.into_iter().skip(offset).take(count).collect();
+        let next = (offset + page.len() < total).then(|| (offset + page.len()).to_string());
+        Ok(BrowsedPage { channels: page, cursor: next })
+    }
+
+    /// Previews a hidden or unjoined Teams channel: stores it as read-only (`joined: false`) and
+    /// fetches one page of history so the user can inspect it before showing or joining.
+    pub(super) fn preview_channel(&self, conversation_id: &str) -> Result<(), Fault> {
+        const PREVIEW_REASON: &str = "Show or join this channel to post messages.";
+        let thread = thread_of(conversation_id);
+        let existing = self.ctx.known(thread)?;
+        let described = self
+            .chat("GET", &format!("/v1/threads/{}?view=msnp24Equivalent", escaped(thread)), Body::None, true)
+            .map(|a| a.body)
+            .unwrap_or(Value::Null);
+        let title = described["properties"]["topic"]
+            .as_str()
+            .or_else(|| described["properties"]["displayName"].as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| existing.as_ref().map(|r| r.title.clone()))
+            .unwrap_or_else(|| "Channel".to_owned());
+        let archived = described["properties"]["isArchived"] == true
+            || described["properties"]["isArchived"]
+                .as_str()
+                .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+            || existing
+                .as_ref()
+                .is_some_and(|r| r.read_only && r.read_only_reason != PREVIEW_REASON);
+        let mut row = ConversationRow {
+            space: existing.as_ref().and_then(|r| r.space.clone()),
+            position: existing.as_ref().map_or(LAST, |r| r.position),
+            call: CallSupport::Handoff,
+            private: existing.as_ref().is_some_and(|r| r.private),
+            read_only: true,
+            read_only_reason: if archived {
+                "This channel is archived.".to_owned()
+            } else {
+                PREVIEW_REASON.to_owned()
+            },
+            opted_out: existing.as_ref().is_some_and(|r| r.opted_out),
+            joined: false,
+            ..ConversationRow::new(thread, ConversationKind::Channel, title)
+        };
+        if let Some(prev) = existing {
+            row.topic = prev.topic;
+            row.rights = prev.rights;
+            row.can_pin = prev.can_pin;
+        }
+        self.ctx.conversation(&row)?;
+        if let Ok((raws, _)) = self.page(thread, 30, "startTime=1") {
+            let messages: Vec<protocol::Message> = raws.iter().filter_map(|raw| self.read_message(thread, raw)).collect();
+            if !messages.is_empty() {
+                self.ctx.history(thread, &messages)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Shows a hidden channel of a team we are in (`isFavorite = true`), or joins an unjoined
+    /// channel / public team (`PUT /v1/threads/{id}/members/{me}`).
+    pub(super) fn join_channel_or_team(&self, conversation_id: &str) -> Result<(), Fault> {
+        const PREVIEW_REASON: &str = "Show or join this channel to post messages.";
+        let thread = thread_of(conversation_id);
+        let existing = self.ctx.known(thread)?;
+        let is_hidden_channel = existing
+            .as_ref()
+            .is_some_and(|r| r.space.is_some() && r.opted_out);
+        if is_hidden_channel {
+            let path = format!("/v1/users/ME/conversations/{}/properties?name=isFavorite", escaped(thread));
+            self.chat("PUT", &path, Body::Json(&json!({"isFavorite": "true"})), false)?;
+            if let Some(known) = existing {
+                let archived = known.read_only && known.read_only_reason != PREVIEW_REASON;
+                let mut rights = known.rights;
+                if !archived {
+                    let is_general = known.title.eq_ignore_ascii_case("general")
+                        || known.space.as_deref() == Some(thread);
+                    rights.pin = true;
+                    if !is_general {
+                        rights.rename = true;
+                        rights.edit_topic = true;
+                        if known.private {
+                            rights.add_members = true;
+                            rights.remove_members = true;
+                            rights.manage_members = true;
+                        }
+                    }
+                }
+                let row = ConversationRow {
+                    space: known.space,
+                    group: known.group,
+                    position: known.position,
+                    avatar: known.avatar.map(|a| a.id),
+                    peer: known.peer,
+                    call: known.call,
+                    call_video: known.call_video,
+                    limit: known.limit,
+                    topic: known.topic,
+                    parent: known.parent,
+                    root: known.root,
+                    read_only: archived,
+                    read_only_reason: if archived { known.read_only_reason } else { String::new() },
+                    private: known.private,
+                    encryption: known.encryption,
+                    bot: known.bot,
+                    meeting: known.meeting,
+                    special: known.special,
+                    mark: known.mark,
+                    opted_out: false,
+                    rights,
+                    can_pin: !archived,
+                    moderate: known.moderate,
+                    joined: true,
+                    ..ConversationRow::new(&known.key.id, known.kind, &known.title)
+                };
+                self.ctx.conversation(&row)?;
+            }
+            return Ok(());
+        }
+        let path = format!("/v1/threads/{}/members/{}", escaped(thread), escaped(&self.me()));
+        self.chat("PUT", &path, Body::Json(&json!({"role": "User"})), false).map_err(|fault| match fault {
+            Fault::Refused { status: 403, .. } => Fault::Refused {
+                status: 403,
+                message: "Your organization's policy or team settings do not allow joining this team or channel.".to_owned(),
+            },
+            other => other,
+        })?;
+        // Refresh teams/channels so a newly joined public team and its channels appear immediately.
+        self.list(false)?;
+        Ok(())
+    }
+
+    /// Creates a standard or private channel inside a team where members are allowed to.
+    pub(super) fn create_channel(&self, space_id: &str, name: &str, private: bool) -> Result<String, Fault> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(Fault::Refused {
+                status: 400,
+                message: "Channel name cannot be empty.".to_owned(),
+            });
+        }
+        let url = format!("{}/beta/teams/{}/channels", self.place()?.middle, escaped(space_id));
+        let body = json!({
+            "displayName": trimmed,
+            "membershipType": if private { "private" } else { "standard" },
+        });
+        let answer = self
+            .call("POST", &url, Auth::Both(Audience::Spaces), Body::Json(&body), false)
+            .map_err(|fault| match fault {
+                Fault::Refused { status: 403, .. } => Fault::Refused {
+                    status: 403,
+                    message: "Your organization's policy or team settings do not allow creating channels here.".to_owned(),
+                },
+                other => other,
+            })?;
+        let id = [
+            answer.body["id"].as_str(),
+            answer.body["channelId"].as_str(),
+            answer.body["threadId"].as_str(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            answer
+                .location
+                .rsplit('/')
+                .next()
+                .and_then(|s| s.split('?').next())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.replace("%3A", ":").replace("%3a", ":").replace("%40", "@"))
+        })
+        .ok_or_else(|| Fault::Net("Teams created the channel without returning its id.".to_owned()))?;
+        let display = answer.body["displayName"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(trimmed);
+        let mut row = ConversationRow {
+            space: Some(space_id.to_owned()),
+            position: LAST,
+            call: CallSupport::Handoff,
+            private,
+            can_pin: true,
+            ..ConversationRow::new(&id, ConversationKind::Channel, display)
+        };
+        row.rights.pin = true;
+        row.rights.rename = true;
+        row.rights.edit_topic = true;
+        if private {
+            row.rights.add_members = true;
+            row.rights.remove_members = true;
+            row.rights.manage_members = true;
+        }
+        self.ctx.conversation(&row)?;
+        Ok(id)
+    }
+
+    /// Previews a Teams join code (`GET {middle}/beta/teams/joinCode/{code}`).
+    pub(super) fn invite_preview(&self, raw: &str) -> Result<protocol::InvitePreview, Fault> {
+        let code = parse_teams_join_code(raw).map_err(|message| Fault::Refused { status: 400, message })?;
+        let url = format!("{}/beta/teams/joinCode/{}", self.place()?.middle, escaped(&code));
+        let body = self
+            .call("GET", &url, Auth::Both(Audience::Spaces), Body::None, true)
+            .map_err(|fault| match fault {
+                Fault::Refused { status: 404, .. } => Fault::Refused {
+                    status: 400,
+                    message: "That Teams join code was not found or has expired.".to_owned(),
+                },
+                Fault::Refused { status: 403, .. } => Fault::Refused {
+                    status: 403,
+                    message: "Your organization's policy does not allow joining this team by code.".to_owned(),
+                },
+                other => other,
+            })?
+            .body;
+        let team = if body["team"].is_object() { &body["team"] } else { &body };
+        let space_id = team["id"]
+            .as_str()
+            .or_else(|| team["teamId"].as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let name = team["displayName"]
+            .as_str()
+            .or_else(|| team["name"].as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&code)
+            .to_owned();
+        let description = team["description"].as_str().unwrap_or("").trim().to_owned();
+        let members = team["memberCount"]
+            .as_u64()
+            .or_else(|| team["membershipSummary"]["totalMemberCount"].as_u64())
+            .map(|n| n as u32);
+        Ok(protocol::InvitePreview {
+            event: None,
+            joined: false,
+            code,
+            name,
+            description,
+            request_needed: false,
+            icon: None,
+            members,
+            online: None,
+            space_id: space_id.clone(),
+            channel_id: space_id,
+        })
+    }
+
+    /// Joins a Teams team by join code (`POST {middle}/beta/teams/joinByCode`), never retrying
+    /// automatically, then refreshes the Spaces list.
+    pub(super) fn invite_join(&self, raw: &str) -> Result<(Option<String>, Option<String>), Fault> {
+        let code = parse_teams_join_code(raw).map_err(|message| Fault::Refused { status: 400, message })?;
+        let url = format!("{}/beta/teams/joinByCode", self.place()?.middle);
+        let body = self
+            .call("POST", &url, Auth::Both(Audience::Spaces), Body::Json(&json!({"joinCode": code})), false)
+            .map_err(|fault| match fault {
+                Fault::Refused { status: 404, .. } => Fault::Refused {
+                    status: 400,
+                    message: "That Teams join code was not found or has expired.".to_owned(),
+                },
+                Fault::Refused { status: 403, .. } => Fault::Refused {
+                    status: 403,
+                    message: "Your organization's policy does not allow joining this team by code.".to_owned(),
+                },
+                other => other,
+            })?
+            .body;
+        let team = if body["team"].is_object() { &body["team"] } else { &body };
+        let space_id = team["id"]
+            .as_str()
+            .or_else(|| team["teamId"].as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let channel_id = team["generalChannelId"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| space_id.clone());
+        self.list(false)?;
+        Ok((space_id, channel_id))
+    }
+}
+
+/// Extracts a Teams join code from either a bare code (e.g. `ab12cd3`) or a Teams URL containing
+/// a `code=` / `joinCode=` query parameter.
+pub(super) fn parse_teams_join_code(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("Enter a Teams join code.".to_owned());
+    }
+    let candidate = if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+        let query = trimmed.split_once('?').map(|(_, q)| q).unwrap_or("");
+        query
+            .split('&')
+            .find_map(|pair| {
+                let (k, v) = pair.split_once('=')?;
+                if k.eq_ignore_ascii_case("code") || k.eq_ignore_ascii_case("joincode") {
+                    Some(v.split('#').next().unwrap_or(v).trim())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or("")
+    } else {
+        trimmed
+    };
+    if candidate.len() < 4
+        || candidate.len() > 64
+        || !candidate.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("Enter a valid Teams join code (letters and digits).".to_owned());
+    }
+    Ok(candidate.to_owned())
 }
 
 /// A chat's own title: its topic, or a meeting's subject.
@@ -909,6 +1574,43 @@ fn title_of(chat: &Value) -> String {
 /// A meeting's chat: by its id, or by what the list says it is (unverified field).
 fn is_meeting(chat: &Value) -> bool {
     text(chat, "id").starts_with("19:meeting_") || chat["chatType"] == "meeting" || chat["meetingInformation"].is_object()
+}
+
+/// True when a Teams chat object or thread description indicates a pending external/federated
+/// chat request awaiting Accept or Block.
+pub(super) fn is_pending_request(chat: &Value) -> bool {
+    let flag = |v: &Value| *v == Value::Bool(true) || v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("true"));
+    let word = |v: &Value| v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("pending"));
+    let props = &chat["properties"];
+    flag(&chat["isPending"])
+        || flag(&chat["isExternalChatPending"])
+        || flag(&props["isPendingExternal"])
+        || flag(&props["isExternalChatPending"])
+        || word(&chat["chatState"])
+        || word(&chat["acceptanceStatus"])
+        || word(&props["externalChatState"])
+        || word(&props["chatState"])
+}
+
+/// True when a Teams chat or thread description involves someone outside our tenant.
+pub(super) fn is_external_chat(chat: &Value, people: &[String], home_tenant: &str) -> bool {
+    let flag = |v: &Value| *v == Value::Bool(true) || v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("true"));
+    let props = &chat["properties"];
+    if flag(&chat["isExternal"])
+        || flag(&chat["isFederated"])
+        || flag(&props["isExternal"])
+        || flag(&props["isFederated"])
+        || flag(&props["isExternalThread"])
+    {
+        return true;
+    }
+    if people.iter().any(|p| super::people::is_consumer_mri(p)) {
+        return true;
+    }
+    chat["members"].as_array().into_iter().flatten().any(|m| {
+        let tid = m["tenantId"].as_str().unwrap_or("");
+        !tid.is_empty() && !home_tenant.is_empty() && !tid.eq_ignore_ascii_case(home_tenant)
+    })
 }
 
 /// The chat list's `lastMessage` as the row's preview line, its markup read for words alone.
@@ -933,6 +1635,48 @@ fn preview_of(chat: &Value, me: &str) -> Option<PreviewLine> {
         sent: millis(&id) / 1000,
         expires_at: None,
     })
+}
+
+/// Classifies a Teams `properties.activity.activityType` into [`ActivityItemKind`] and optional emoji.
+pub(super) fn classify_activity(raw_type: &str, activity: &Value) -> (ActivityItemKind, String) {
+    let lower = raw_type.trim().to_ascii_lowercase();
+    if lower.contains("mention") {
+        return (ActivityItemKind::Mention, String::new());
+    }
+    if lower.contains("reply") || lower.contains("thread") {
+        return (ActivityItemKind::ThreadReply, String::new());
+    }
+    if lower.contains("missed") || lower.contains("voicemail") || lower == "call" || lower.contains("callmissed") {
+        return (ActivityItemKind::MissedCall, String::new());
+    }
+    if lower.contains("reaction") || matches!(lower.as_str(), "like" | "heart" | "laugh" | "surprised" | "sad" | "angry") {
+        let key = [
+            activity["reactionKey"].as_str(),
+            activity["reactionType"].as_str(),
+            activity["activitySubType"].as_str(),
+            activity["activitySubtype"].as_str(),
+            activity["emoji"].as_str(),
+            (!lower.contains("reaction")).then_some(raw_type),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .unwrap_or("");
+        let emoji = if key.is_empty() {
+            String::new()
+        } else {
+            super::emoji::emoji_of(key)
+        };
+        return (ActivityItemKind::Reaction, emoji);
+    }
+    if lower.contains("team") || lower.contains("member") || lower.contains("invite") || lower.contains("added") {
+        return (ActivityItemKind::Invite, String::new());
+    }
+    if lower.contains("app") || lower.contains("bot") || lower.contains("workflow") {
+        return (ActivityItemKind::App, String::new());
+    }
+    (ActivityItemKind::Other, String::new())
 }
 
 /// A reply chain's title from its post's text: the subject line, else its first words.
@@ -1006,5 +1750,37 @@ mod tests {
         let chats = listed["chats"].as_array().unwrap();
         let pins = pinned_chat_order(&listed, chats);
         assert_eq!(pins, vec!["19:grp2@thread.v2", "19:grp1@thread.v2", "19:grp3@thread.v2"]);
+    }
+
+    #[test]
+    fn classify_activity_maps_all_teams_notification_kinds() {
+        assert_eq!(classify_activity("mention", &json!({})), (ActivityItemKind::Mention, String::new()));
+        assert_eq!(classify_activity("channelMention", &json!({})), (ActivityItemKind::Mention, String::new()));
+        assert_eq!(classify_activity("reply", &json!({})), (ActivityItemKind::ThreadReply, String::new()));
+        assert_eq!(
+            classify_activity("reaction", &json!({"reactionType": "heart"})),
+            (ActivityItemKind::Reaction, "❤️".to_owned())
+        );
+        assert_eq!(classify_activity("like", &json!({})), (ActivityItemKind::Reaction, "👍".to_owned()));
+        assert_eq!(classify_activity("missedCall", &json!({})), (ActivityItemKind::MissedCall, String::new()));
+        assert_eq!(classify_activity("addedToTeam", &json!({})), (ActivityItemKind::Invite, String::new()));
+        assert_eq!(classify_activity("appNotification", &json!({})), (ActivityItemKind::App, String::new()));
+    }
+
+    #[test]
+    fn parse_teams_join_code_accepts_bare_code_and_url_and_rejects_garbage() {
+        assert_eq!(parse_teams_join_code("TEAM42").unwrap(), "TEAM42");
+        assert_eq!(
+            parse_teams_join_code("https://teams.microsoft.com/l/team/join?code=ab12cd3").unwrap(),
+            "ab12cd3"
+        );
+        assert_eq!(
+            parse_teams_join_code("https://teams.microsoft.com/?joinCode=xy_99-z#frag").unwrap(),
+            "xy_99-z"
+        );
+        assert!(parse_teams_join_code("").is_err());
+        assert!(parse_teams_join_code("ab").is_err());
+        assert!(parse_teams_join_code("bad code!").is_err());
+        assert!(parse_teams_join_code("https://teams.microsoft.com/l/team/nocode").is_err());
     }
 }

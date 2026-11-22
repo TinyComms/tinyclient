@@ -96,6 +96,8 @@ pub struct CreateChannelModal {
     pub space: Key,
     pub group: Option<String>,
     pub name: gpui::Entity<crate::gui::input::TextInput>,
+    pub description: gpui::Entity<crate::gui::input::TextInput>,
+    pub username: gpui::Entity<crate::gui::input::TextInput>,
     pub kind: ConversationKind,
     pub private: bool,
 }
@@ -141,6 +143,8 @@ pub struct State {
     pub(super) activity_items: Vec<protocol::ActivityItem>,
     pub(super) activity_cursor: Option<(AccountKey, String)>,
     pub(super) activity_loading: bool,
+    /// Activity rows whose invite or sign-in code the user chose to reveal in Streamer mode.
+    activity_revealed: HashSet<String>,
     activity_epoch: u64,
     /// Recent mentions fetched from the network on demand (`Request::Mentions`, Discord).
     pub(super) mentions_items: Vec<protocol::MentionHit>,
@@ -427,6 +431,7 @@ impl State {
             activity_items: Vec::new(),
             activity_cursor: None,
             activity_loading: false,
+            activity_revealed: HashSet::new(),
             activity_epoch: 0,
             mentions_items: Vec::new(),
             mentions_more: Vec::new(),
@@ -660,6 +665,8 @@ impl Shell {
             if let Some(snapshot) = &mut self.snapshot {
                 snapshot.open = None;
             }
+            // The open conversation may already be a window with no composer.
+            self.sync_popout_composers(cx);
         }
         if self.sidebar_state.mode == mode {
             let state = &mut self.sidebar_state;
@@ -764,6 +771,7 @@ impl Shell {
                 if let Some(snapshot) = &mut self.snapshot {
                     snapshot.open = None;
                 }
+                self.sync_popout_composers(cx);
             }
             self.tiny_pick_channel(there.tiny_channel, cx);
         }
@@ -861,9 +869,10 @@ impl Shell {
             Mode::Space(space) => flat(space, 0),
             Mode::Network(Network::Slack) => match self.slack_space() {
                 Some(space) => {
+                    let unreads = self.unreads_row(&space);
                     let threads = self.threads_row(&space);
                     let drafts = self.drafts_row(&space);
-                    threads.into_iter().chain(drafts).chain(flat(&space, 0)).collect()
+                    unreads.into_iter().chain(threads).chain(drafts).chain(flat(&space, 0)).collect()
                 }
                 None => Vec::new(),
             },
@@ -1464,6 +1473,7 @@ impl Shell {
         match row {
             Row::Conversation { conversation, .. } => self.pick_row(&conversation, cx),
             Row::Group { space, id, collapsed, .. } => self.collapse(space, id, !collapsed, cx),
+            Row::Unreads { space, .. } => self.drill(home::Drill::Unreads(Some(space)), cx),
             Row::Threads { space, .. } => self.drill(home::Drill::Threads(space), cx),
             Row::Drafts { space, .. } => self.drill(home::Drill::Drafts(space), cx),
             Row::Fold { reveal, .. } => {
@@ -1583,14 +1593,14 @@ impl Shell {
     }
 
     /// Return on the cursor's row.
-    pub(super) fn open_cursor(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn open_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.sidebar_state.cursor else {
             return;
         };
         let state = &self.sidebar_state;
         match state.mode {
             Mode::Inbox => self.activate_inbox(ix, cx),
-            _ if state.listed() => self.activate_home(ix, cx),
+            _ if state.listed() => self.activate_home(ix, window, cx),
             _ => self.activate(ix, cx),
         }
     }
@@ -1626,11 +1636,11 @@ impl Shell {
         row: Stateful<Div>,
         token: u64,
         menu: Option<Rc<Conversation>>,
-        act: impl Fn(&mut Shell, &mut Context<Shell>) + 'static,
+        act: impl Fn(&mut Shell, &mut Window, &mut Context<Shell>) + 'static,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         if !super::phone::active() {
-            return row.on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| act(this, cx)));
+            return row.on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| act(this, window, cx)));
         }
         // A finger's long press: the timer below never starts for one, as its mouse-down only
         // comes when it lifts.
@@ -1649,9 +1659,9 @@ impl Shell {
         )
         .on_mouse_up(
             MouseButton::Left,
-            cx.listener(move |this, event: &gpui::MouseUpEvent, _, cx| {
+            cx.listener(move |this, event: &gpui::MouseUpEvent, window, cx| {
                 if this.phone_state.press_up(token, super::phone::at(event.position)) {
-                    act(this, cx);
+                    act(this, window, cx);
                 }
             }),
         )
@@ -1878,6 +1888,15 @@ impl Shell {
                 let bar = div().h(px(8.)).w(gpui::relative(widths[ix % widths.len()])).rounded(px(theme::R_CHIP)).bg(theme::raised());
                 list_row(("loading", ix), height, false, false, div().children(indent(*depth, 8.)).gap(px(8.)).child(skeleton(20., 20.)).child(bar)).cursor_default()
             }
+            Row::Unreads { count, mention, .. } => {
+                let trailing = match (*count, *mention) {
+                    (0, _) => None,
+                    (count, true) => Some(badge_mention(count)),
+                    (count, false) => Some(super::components::badge_count_unread(count)),
+                };
+                self.action_row(("unreads", ix), Some("icons/inbox.svg"), "Unreads".into(), *count > 0, trailing, focused)
+                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, _, cx| this.activate(ix, cx), cx))
+            }
             Row::Threads { count, mention, .. } => {
                 let trailing = match (*count, *mention) {
                     (0, _) => None,
@@ -1885,12 +1904,12 @@ impl Shell {
                     (count, false) => Some(super::components::badge_count_unread(count)),
                 };
                 self.action_row(("threads", ix), Some("icons/messages-square.svg"), "Threads".into(), *count > 0, trailing, focused)
-                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, cx| this.activate(ix, cx), cx))
+                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, _, cx| this.activate(ix, cx), cx))
             }
             Row::Drafts { count, .. } => {
                 let trailing = (*count > 0).then(|| super::components::badge_count_unread(*count));
                 self.action_row(("drafts", ix), Some("icons/pencil.svg"), "Drafts & sent".into(), false, trailing, focused)
-                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, cx| this.activate(ix, cx), cx))
+                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, _, cx| this.activate(ix, cx), cx))
             }
             Row::Fold { words, depth, .. } => {
                 let content = div()
@@ -1899,7 +1918,7 @@ impl Shell {
                     .child(div().size(px(20.)).flex_none().flex().items_center().justify_center().child(glyph("icons/ellipsis.svg", 14., theme::text_faint())))
                     .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text_faint()).child(words.clone()));
                 list_row(("fold", ix), height, false, focused, content)
-                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, cx| this.activate(ix, cx), cx))
+                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, _, cx| this.activate(ix, cx), cx))
             }
             Row::More { words, depth } => {
                 let content = div().children(indent(*depth, 0.)).child(div().pl(px(28.)).type_small().text_color(theme::text_faint()).child(words.clone()));
@@ -1926,7 +1945,7 @@ impl Shell {
                     .when(occupant.server_deafened, |row| row.child(glyph("icons/headphone-off.svg", 14., theme::danger())))
                     .when(!occupant.server_deafened && occupant.deafened, |row| row.child(glyph("icons/headphone-off.svg", 14., theme::text_faint())));
                 list_row(row_id("occupant", &occupant.person), height, false, false, content)
-                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, cx| this.activate(ix, cx), cx))
+                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, _, cx| this.activate(ix, cx), cx))
             }
             Row::Group { space, id, name, collapsed, muted, rollup, depth, .. } => {
                 let lit = *collapsed && (rollup.attention > 0 || rollup.unread);
@@ -1969,7 +1988,7 @@ impl Shell {
                     .children(add_btn)
                     .children(dot);
                 list_row((gpui::ElementId::from("group"), id.clone()), height, false, focused, content)
-                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, cx| this.activate(ix, cx), cx))
+                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, _, cx| this.activate(ix, cx), cx))
                     .when(space.network == Network::Discord, |row| {
                         row.on_mouse_down(
                             MouseButton::Right,
@@ -2114,7 +2133,7 @@ impl Shell {
                         row,
                         token,
                         menu,
-                        move |this, cx| {
+                        move |this, _, cx| {
                             if voice && ours {
                                 this.call_phone_restore(cx);
                             } else if join {
@@ -2130,6 +2149,14 @@ impl Shell {
                     MouseButton::Left,
                     // A voice row joins on a double-click; a single click only opens its chat.
                     cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                        if crate::gui::conversation::modifier_click(event.click_count, event.modifiers) {
+                            this.pop_out_conversation(picked.key.clone(), cx);
+                            return;
+                        }
+                        // The first press of that double-click must not open the row.
+                        if !crate::gui::conversation::press_opens_row(crate::gui::conversation::modifier_held(event.modifiers)) {
+                            return;
+                        }
                         if join && event.click_count == 2 {
                             this.call_start(picked.key.clone(), cx);
                         } else {
@@ -2195,6 +2222,15 @@ impl Shell {
                 Tone::Danger => banner(tone, words).child(
                     banner_action("sign-in-again", "Sign in").on_click(cx.listener(move |this, _, _, cx| this.sign_in(network, cx))),
                 ),
+                Tone::Attention if slack_can_continue(network, &words) => {
+                    let id = account.account.clone();
+                    banner(tone, words).child(
+                        banner_action("continue-slack", "Continue in tinyclient").on_click(cx.listener(move |this, _, _, cx| {
+                            this.continue_slack(id.clone(), cx);
+                        })),
+                    )
+                }
+                Tone::Attention if network == Network::Slack => banner(tone, words),
                 Tone::Attention => banner(tone, words).child(
                     banner_action("open-network", format!("Open {}", network.label())).on_click(cx.listener(move |this, _, _, cx| {
                         if network == Network::Tiny { this.tiny_reconnect(account.clone(), cx); }
@@ -2257,6 +2293,7 @@ impl Shell {
                 _ => None,
             };
             let title = match drill {
+                home::Drill::Unreads(_) => "All unreads".to_owned(),
                 home::Drill::Threads(_) => "Threads".to_owned(),
                 home::Drill::Drafts(_) => "Drafts & sent".to_owned(),
                 home::Drill::Archive => "Archive".to_owned(),
@@ -2267,7 +2304,9 @@ impl Shell {
             };
             let field = matches!(drill, home::Drill::Discover).then(|| self.sidebar_state.discover_input.clone()).flatten();
             let place = match drill {
-                home::Drill::Threads(space) | home::Drill::Drafts(space) => self.spaces.iter().find(|s| &s.key == space).map(|s| s.name.clone()),
+                home::Drill::Unreads(Some(space)) | home::Drill::Threads(space) | home::Drill::Drafts(space) => {
+                    self.spaces.iter().find(|s| &s.key == space).map(|s| s.name.clone())
+                }
                 _ => None,
             };
             return strip
@@ -2514,7 +2553,60 @@ impl Shell {
             menu = menu.child(super::components::menu_separator());
         }
         let account = current.as_ref().map(Key::account);
-        let name = current.as_ref().and_then(|key| self.spaces.iter().find(|s| &s.key == key)).map_or_else(String::new, |s| s.name.clone());
+        let is_grid = account.as_ref().is_some_and(|a| a.account.starts_with('E'));
+        if is_grid {
+            if let Some(org_id) = account.as_ref().map(|a| a.account.clone()) {
+                let browse_url = format!("https://app.slack.com/client/{org_id}");
+                menu = menu.child(
+                    super::components::menu_item("slack-browse-workspaces", None, "Browse workspaces", None).on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.sidebar_state.slack_menu = false;
+                            cx.open_url(&browse_url);
+                            cx.notify();
+                        }),
+                    ),
+                );
+            }
+        }
+        let name = if is_grid {
+            account
+                .as_ref()
+                .and_then(|acc| snapshot.accounts.iter().find(|a| a.key == *acc))
+                .map(|a| a.name.clone())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| "Slack".to_owned())
+        } else {
+            current
+                .as_ref()
+                .and_then(|key| self.spaces.iter().find(|s| &s.key == key))
+                .map_or_else(String::new, |s| s.name.clone())
+        };
+        if let Some(space_key) = current.clone() {
+            let team_id = space_key.id.clone();
+            let info_key = space_key.clone();
+            menu = menu.child(
+                super::components::menu_item("slack-workspace-info", Some("icons/info.svg"), "Workspace info", None).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        this.sidebar_state.slack_menu = false;
+                        this.details_space(info_key.clone(), cx);
+                    }),
+                ),
+            );
+            menu = menu.child(super::components::menu_separator());
+            menu = menu.child(super::components::menu_label("Workspace settings · Opens in your browser"));
+            for (ix, &(label, rel)) in super::people::SLACK_WORKSPACE_LINKS.iter().enumerate() {
+                let url = super::people::slack_workspace_url("", &team_id, rel);
+                menu = menu.child(
+                    super::components::menu_item(("slack-admin-link", ix), Some("icons/external-link.svg"), label, None)
+                        .tooltip(tip(format!("{label} · Opens in your browser"), None))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.sidebar_state.slack_menu = false;
+                            this.open_external_link(&url, window, cx);
+                        })),
+                );
+            }
+            menu = menu.child(super::components::menu_separator());
+        }
         menu = menu.child(super::components::menu_item_danger("slack-sign-out", Some("icons/log-out.svg"), format!("Sign out of {name}")).on_click(cx.listener(move |this, _, _, cx| {
             this.sidebar_state.slack_menu = false;
             if let Some(account) = account.clone() {
@@ -2546,6 +2638,32 @@ impl Shell {
             cx.notify();
         }
         was
+    }
+
+    /// Moves a Slack conversation into another sidebar section (`Request::SectionMoveChannel`).
+    pub(in crate::gui) fn move_to_section(
+        &mut self,
+        space: Key,
+        conversation: Key,
+        from_section: Option<String>,
+        to_section: String,
+        cx: &mut Context<Self>,
+    ) {
+        let request = Request::SectionMoveChannel {
+            space,
+            conversation,
+            from_section,
+            to_section,
+        };
+        self.off_thread(
+            cx,
+            move || crate::client::ask(&request),
+            |this, answer, cx| {
+                if let Some(why) = refused(&answer) {
+                    this.toast(None, why, cx);
+                }
+            },
+        );
     }
 
     /// The Slack header's menu on a phone: the same rows as a bottom sheet over the screen.
@@ -2988,7 +3106,14 @@ impl Shell {
     }
 
     pub(in crate::gui) fn leave_space_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
-        let (_, name) = self.sidebar_state.leave_space.as_ref()?;
+        let (space, name) = self.sidebar_state.leave_space.as_ref()?;
+        let is_teams = space.network == Network::Teams;
+        let leave_btn = if is_teams { "Leave team" } else { "Leave server" };
+        let body_copy = if is_teams {
+            "You will lose access to this team's channels unless you rejoin or are added again."
+        } else {
+            "You will lose access to its channels and need a new invite to rejoin."
+        };
         let card = div()
             .id("leave-space-card")
             .w(px(360.))
@@ -3007,7 +3132,7 @@ impl Shell {
                 div()
                     .type_small()
                     .text_color(theme::text_soft())
-                    .child("You will lose access to its channels and need a new invite to rejoin."),
+                    .child(body_copy),
             )
             .child(
                 div()
@@ -3019,7 +3144,7 @@ impl Shell {
                         this.sidebar_state.leave_space = None;
                         cx.notify();
                     })))
-                    .child(button("leave-space-confirm", ButtonKind::Danger, "Leave server").on_click(
+                    .child(button("leave-space-confirm", ButtonKind::Danger, leave_btn).on_click(
                         cx.listener(|this, _, _, cx| this.confirm_leave_space(cx)),
                     )),
             );
@@ -3065,7 +3190,7 @@ impl Shell {
         modal.sent.clear();
         let epoch = modal.epoch;
         let req = match &modal.target {
-            CreateInviteTarget::Channel(key, _) => Request::CreateInvite {
+            CreateInviteTarget::Channel(key, _) => Request::CreateInviteLink {
                 conversation: Some(key.clone()),
                 space: None,
                 account: None,
@@ -3073,7 +3198,7 @@ impl Shell {
                 max_uses: modal.max_uses,
                 temporary: modal.temporary,
             },
-            CreateInviteTarget::Space(key, _) => Request::CreateInvite {
+            CreateInviteTarget::Space(key, _) => Request::CreateInviteLink {
                 conversation: None,
                 space: Some(key.clone()),
                 account: None,
@@ -3081,7 +3206,7 @@ impl Shell {
                 max_uses: modal.max_uses,
                 temporary: modal.temporary,
             },
-            CreateInviteTarget::Friend(account) => Request::CreateInvite {
+            CreateInviteTarget::Friend(account) => Request::CreateInviteLink {
                 conversation: None,
                 space: None,
                 account: Some(account.clone()),
@@ -3444,7 +3569,25 @@ impl Shell {
     }
 
     pub(super) fn open_join_server(&mut self, account: AccountKey, cx: &mut Context<Self>) {
-        let input = cx.new(|cx| crate::gui::input::TextInput::new("discord.gg/… or invite code", cx));
+        self.open_join_invite(account, None, cx);
+    }
+
+    pub(in crate::gui) fn open_join_invite(&mut self, account: AccountKey, link: Option<String>, cx: &mut Context<Self>) {
+        let placeholder = if account.network == Network::Telegram {
+            "t.me/+… or invite link"
+        } else if account.network == Network::Teams {
+            "Team join code or link"
+        } else {
+            "discord.gg/… or invite code"
+        };
+        let prefill = link.clone();
+        let input = cx.new(|cx| {
+            let mut field = crate::gui::input::TextInput::new(placeholder, cx);
+            if let Some(ref text) = prefill {
+                field.set_text(text, cx);
+            }
+            field
+        });
         self.sidebar_state.join_server = Some(JoinServerModal {
             account,
             input,
@@ -3452,7 +3595,41 @@ impl Shell {
             error: None,
             busy: false,
         });
-        cx.notify();
+        if link.is_some() {
+            self.preview_join_server(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Opens the Telegram invite join sheet for a clicked `t.me/+…` or `t.me/joinchat/…` link.
+    /// Returns `true` if a connected Telegram account was found to preview the invite.
+    pub(in crate::gui) fn open_telegram_invite(
+        &mut self,
+        preferred: Option<AccountKey>,
+        url: String,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let account = preferred
+            .filter(|k| {
+                self.snapshot
+                    .as_ref()
+                    .and_then(|s| s.account(k))
+                    .is_some_and(|a| a.link == Link::Connected)
+            })
+            .or_else(|| {
+                self.snapshot.as_ref().and_then(|s| {
+                    s.accounts
+                        .iter()
+                        .find(|a| a.key.network == Network::Telegram && a.link == Link::Connected)
+                        .map(|a| a.key.clone())
+                })
+            });
+        let Some(account) = account else {
+            return false;
+        };
+        self.open_join_invite(account, Some(url), cx);
+        true
     }
 
     fn preview_join_server(&mut self, cx: &mut Context<Self>) {
@@ -3514,16 +3691,29 @@ impl Shell {
         modal.error = None;
         let account = modal.account.clone();
         cx.notify();
+        let is_teams = account.network == Network::Teams;
+        let noun = if is_teams { "team" } else { "server" };
         let req = Request::InviteJoin { account, code };
         cx.spawn(async move |shell, cx| {
             let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
             let _ = shell.update(cx, |this, cx| match answer {
-                Ok(Response::InviteJoined { space, .. }) => {
+                Ok(Response::InviteJoined { space, conversation, pending }) => {
                     this.sidebar_state.join_server = None;
-                    if let Some(space) = space {
+                    if pending {
+                        this.toast(
+                            Some(("icons/check.svg", theme::text_soft())),
+                            "Join request sent — waiting for admin approval",
+                            cx,
+                        );
+                    } else if let Some(conv) = conversation {
+                        this.open_now(conv, "", cx);
+                        this.toast(Some(("icons/check.svg", theme::text_soft())), "Joined chat", cx);
+                    } else if let Some(space) = space {
                         this.go(Mode::Space(space), cx);
+                        this.toast(Some(("icons/check.svg", theme::text_soft())), format!("Joined {noun}"), cx);
+                    } else {
+                        this.toast(Some(("icons/check.svg", theme::text_soft())), "Joined", cx);
                     }
-                    this.toast(Some(("icons/check.svg", theme::text_soft())), "Joined server", cx);
                     cx.notify();
                 }
                 Ok(Response::Error { detail, .. }) => {
@@ -3536,7 +3726,7 @@ impl Shell {
                 Ok(_) => {
                     if let Some(modal) = this.sidebar_state.join_server.as_mut() {
                         modal.busy = false;
-                        modal.error = Some("Could not join server.".to_owned());
+                        modal.error = Some(format!("Could not join {noun}."));
                     }
                     cx.notify();
                 }
@@ -3554,6 +3744,8 @@ impl Shell {
 
     pub(in crate::gui) fn join_server_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let modal = self.sidebar_state.join_server.as_ref()?;
+        let is_teams = modal.account.network == Network::Teams;
+        let modal_title = if is_teams { "Join a team" } else { "Join a server" };
         let ready = !modal.input.read(cx).text().trim().is_empty() && !modal.busy;
         let preview_box = modal.preview.as_ref().map(|p| {
             let mut meta = Vec::new();
@@ -3580,6 +3772,16 @@ impl Shell {
                     box_el.child(div().type_small().text_color(theme::text_soft()).child(meta.join(" · ")))
                 })
         });
+        let is_telegram = modal.account.network == Network::Telegram;
+        let request_needed = modal.preview.as_ref().is_some_and(|p| p.request_needed);
+        let title = if is_telegram { "Join Telegram chat" } else { modal_title };
+        let join_label = if modal.busy {
+            if request_needed { "Requesting…" } else { "Joining…" }
+        } else if request_needed {
+            "Request to join"
+        } else {
+            "Join"
+        };
         let card = div()
             .id("join-server-card")
             .w(px(380.))
@@ -3593,7 +3795,7 @@ impl Shell {
             .flex_col()
             .gap(px(10.))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(div().type_title().text_color(theme::text()).child("Join a server"))
+            .child(div().type_title().text_color(theme::text()).child(title))
             .child(
                 div()
                     .px(px(8.))
@@ -3626,7 +3828,7 @@ impl Shell {
                         button(
                             "join-server-submit",
                             ButtonKind::Primary,
-                            if modal.busy { "Joining…" } else { "Join" },
+                            join_label,
                         )
                         .when(ready, |b| {
                             b.on_click(cx.listener(|this, _, _, cx| this.submit_join_server(cx)))
@@ -4603,11 +4805,16 @@ impl Shell {
     }
 
     pub(super) fn open_create_channel(&mut self, space: Key, group: Option<String>, cx: &mut Context<Self>) {
-        let name = cx.new(|cx| crate::gui::input::TextInput::new("channel-name", cx));
+        let placeholder = if space.network == Network::Telegram { "Channel name" } else { "channel-name" };
+        let name = cx.new(|cx| crate::gui::input::TextInput::new(placeholder, cx));
+        let description = cx.new(|cx| crate::gui::input::TextInput::new("Description (optional)", cx));
+        let username = cx.new(|cx| crate::gui::input::TextInput::new("@public_link (optional)", cx));
         self.sidebar_state.create_channel = Some(CreateChannelModal {
             space,
             group,
             name,
+            description,
+            username,
             kind: ConversationKind::Channel,
             private: false,
         });
@@ -4623,6 +4830,16 @@ impl Shell {
             self.sidebar_state.create_channel = Some(modal);
             return;
         }
+        let description = {
+            let d = modal.description.read(cx).text().trim().to_owned();
+            (!d.is_empty()).then_some(d)
+        };
+        let username = if modal.private {
+            None
+        } else {
+            let u = modal.username.read(cx).text().trim().to_owned();
+            (!u.is_empty()).then_some(u)
+        };
         cx.notify();
         let req = Request::CreateChannel {
             space: modal.space,
@@ -4630,6 +4847,8 @@ impl Shell {
             kind: modal.kind,
             private: modal.private,
             group: modal.group,
+            description,
+            username,
         };
         cx.spawn(async move |shell, cx| {
             let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
@@ -4824,7 +5043,20 @@ impl Shell {
             ConversationKind::Forum => "Kind: Forum",
             _ => "Kind: Text",
         };
+        let is_telegram = modal.space.network == Network::Telegram;
         let is_private = modal.private;
+        let field_wrap = |input: Entity<crate::gui::input::TextInput>| {
+            div()
+                .px(px(8.))
+                .py(px(6.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(theme::canvas())
+                .border_1()
+                .border_color(theme::border())
+                .type_ui()
+                .child(input)
+        };
+        let is_teams = modal.space.network == Network::Teams;
         let card = div()
             .id("create-channel-card")
             .w(px(360.))
@@ -4838,24 +5070,16 @@ impl Shell {
             .flex_col()
             .gap(px(10.))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(div().type_title().text_color(theme::text()).child("Create channel"))
-            .child(
-                div()
-                    .px(px(8.))
-                    .py(px(6.))
-                    .rounded(px(theme::R_CONTROL))
-                    .bg(theme::canvas())
-                    .border_1()
-                    .border_color(theme::border())
-                    .type_ui()
-                    .child(modal.name.clone()),
-            )
+            .child(div().type_title().text_color(theme::text()).child(if is_telegram { "New channel" } else { "Create channel" }))
+            .child(field_wrap(modal.name.clone()))
+            .when(is_telegram, |card| card.child(field_wrap(modal.description.clone())))
+            .when(is_telegram && !is_private, |card| card.child(field_wrap(modal.username.clone())))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(12.))
-                    .when(modal.space.network != Network::Slack, |row| {
+                    .when(modal.space.network != Network::Slack && !is_telegram && !is_teams, |row| {
                         row.child(
                             div()
                                 .id("create-chan-kind")
@@ -4899,6 +5123,14 @@ impl Shell {
                             .child(if is_private { "☑ Private channel" } else { "☐ Private channel" }),
                     ),
             )
+            .when(is_teams, |card| {
+                card.child(
+                    div()
+                        .type_micro()
+                        .text_color(theme::text_faint())
+                        .child("Creates a channel in this Microsoft Teams team under your account; your organization's policy may restrict this."),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -6141,6 +6373,11 @@ fn urgency(tone: Tone) -> u8 {
     }
 }
 
+/// A Slack demand can be finished here. A workspace that blocks this browser is words only.
+fn slack_can_continue(network: Network, words: &str) -> bool {
+    network == Network::Slack && !words.contains("from this browser")
+}
+
 /// Where the network's own app is, for what only it can do (verify an account, solve a captcha).
 fn network_app(network: Network) -> &'static str {
     match network {
@@ -6219,6 +6456,14 @@ fn inbox_strip_fit(width: f32, phone: bool, text_scale: f32, has_unread: bool) -
 pub(crate) mod tests {
     use super::*;
     use protocol::{AccountKey, AccountStatus, Presence};
+
+    #[test]
+    fn a_slack_demand_can_continue_and_a_blocked_browser_cannot() {
+        let demand = "Slack wants two-factor authentication set up. Continue in tinyclient for this workspace.";
+        assert!(slack_can_continue(Network::Slack, demand));
+        assert!(!slack_can_continue(Network::Slack, "This workspace does not allow signing in from this browser."));
+        assert!(!slack_can_continue(Network::Discord, demand));
+    }
 
     #[cfg(feature = "gui-shot")]
     #[gpui::test]

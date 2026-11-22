@@ -128,7 +128,13 @@ impl Backend {
     /// the first frame's, not the opener's.
     fn open_h264(bps: u32, fps: f32, screen: bool) -> Result<Backend, String> {
         let api = load_api()?;
-        let threads = if screen { std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 8) as u16 } else { 1 };
+        let threads = if screen {
+            std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 8) as u16
+        } else if fps > 15. {
+            std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 4) as u16
+        } else {
+            1
+        };
         let config = EncoderConfig::new()
             .bitrate(BitRate::from_bps(bps))
             .rate_control_mode(RateControlMode::Bitrate)
@@ -349,12 +355,20 @@ struct Selfie {
 impl Selfie {
     /// Paints this grab, unless the last was painted less than [`super::SELF_VIEW_EVERY`] ago.
     fn shoot(&mut self, grabbed: &Rgba) {
+        self.shoot_mirrored(grabbed, false);
+    }
+
+    /// Paints this grab, optionally mirrored horizontally (for the local camera self-view only).
+    fn shoot_mirrored(&mut self, grabbed: &Rgba, mirror: bool) {
         if self.at.is_some_and(|at| at.elapsed() < super::SELF_VIEW_EVERY) {
             return;
         }
         self.at = Some(Instant::now());
         let (width, height) = fit(grabbed.width, grabbed.height, super::SELF_VIEW.0, super::SELF_VIEW.1);
-        let rgb = super::screens::shrink(grabbed, width, height);
+        let mut rgb = super::screens::shrink(grabbed, width, height);
+        if mirror {
+            super::mirror_rgb_horizontal(&mut rgb, width, height);
+        }
         self.generation = self.generation.wrapping_add(1);
         if let Some(painted) = self.canvas.paint(&rgb, width, height, self.generation) {
             self.painted = Some(painted);
@@ -466,23 +480,27 @@ impl Outgoing {
     /// The camera's two layers, high then low, or why the camera could not be read. A layer with
     /// no `Ask` is stopped: nothing is spent on it and it comes back empty.
     pub fn camera(&mut self, high: Option<Ask>, low: Option<Ask>) -> Result<(Encoded, Encoded), String> {
-        if (self.high.is_none() || self.low.is_none()) && needs_openh264() {
+        if (high.is_some() || low.is_some()) && (self.high.is_none() || self.low.is_none()) && needs_openh264() {
             load_api()?;
         }
         let began = Instant::now();
-        let grabbed = self.camera.frame()?;
+        let mut grabbed = self.camera.frame()?;
         self.camera_cost.note(began.elapsed(), (grabbed.width, grabbed.height));
-        self.selfie.shoot(&grabbed);
-        let layer = |slot: &mut Option<Coded>, ask: Option<Ask>, most: (u32, u32), nominal: u32| match ask {
+        if super::camera_blur() {
+            super::apply_background_blur(&mut grabbed);
+        }
+        self.selfie.shoot_mirrored(&grabbed, super::camera_mirror());
+        let profile = super::camera_profile();
+        let layer = |slot: &mut Option<Coded>, ask: Option<Ask>, most: (u32, u32), nominal: u32, fps: f32| match ask {
             Some(ask) => {
                 let (width, height) = fit(grabbed.width, grabbed.height, most.0, most.1);
                 let planes = i420(&grabbed.pixels, grabbed.width, grabbed.height, width, height, grabbed.bgra);
-                coded(slot, width, height, nominal, FULL_FPS, false)?.encode(&planes, &ask)
+                coded(slot, width, height, nominal, fps, false)?.encode(&planes, &ask)
             }
             None => Ok(Encoded::default()),
         };
-        let high = layer(&mut self.high, high, CAMERA_HIGH, CAMERA_HIGH_BPS)?;
-        let low = layer(&mut self.low, low, CAMERA_LOW, CAMERA_LOW_BPS)?;
+        let high = layer(&mut self.high, high, profile.max, profile.bps, profile.fps as f32)?;
+        let low = layer(&mut self.low, low, CAMERA_LOW, CAMERA_LOW_BPS, FULL_FPS)?;
         Ok((high, low))
     }
 
@@ -536,7 +554,13 @@ impl Incoming {
         let mut colors = vec![0u8; width * height * 3];
         // This honours the decoder's strides, which are wider than the picture.
         decoded.write_rgb8(&mut colors);
-        self.painters.paint(colors, width as u32, height as u32, tag);
+        let (mut w, mut h) = (width as u32, height as u32);
+        if tag.small && (w > SMALL_TILE.0 || h > SMALL_TILE.1) {
+            let (tw, th) = fit(w, h, SMALL_TILE.0, SMALL_TILE.1);
+            colors = scale_rgb(&colors, w, h, tw, th);
+            (w, h) = (tw, th);
+        }
+        self.painters.paint(colors, w, h, tag);
         Ok(())
     }
 
@@ -1087,6 +1111,12 @@ fn start_download(path: PathBuf) {
 /// Cisco's OpenH264 2.6.0 for this machine. A download in progress is [`CODEC_LATER`], not a
 /// failure, and this never blocks on the network. A failed download says its words, and the
 /// next share or camera that is turned on starts a new download.
+/// The OpenH264 decoder a round video message plays through. The same library a call loads.
+pub(crate) fn open_h264() -> Result<Decoder, String> {
+    let api = load_api()?;
+    Decoder::with_api_config(api, DecoderConfig::new()).map_err(|err| err.to_string())
+}
+
 fn load_api() -> Result<OpenH264API, String> {
     let path = library_path()?;
     if let Some(api) = open_cached(&path) {
@@ -1461,7 +1491,7 @@ mod tests {
                 bytes_low += encoded.bytes.len();
             }
             if !encoded.bytes.is_empty() {
-                let tag = (n == 0).then(|| Tag { user: "ada".into(), kind: protocol::PictureKind::Share });
+                let tag = (n == 0).then(|| Tag { user: "ada".into(), kind: protocol::PictureKind::Share, small: false });
                 incoming.decode(&encoded.bytes, tag).expect("every frame decodes");
                 let deadline = std::time::Instant::now() + Duration::from_secs(5);
                 let mut painted = incoming.painted();
@@ -1476,4 +1506,74 @@ mod tests {
         assert!(key);
         assert!(bytes_low * 45 / 35 < bytes_high, "the rate moved: {bytes_high} then {bytes_low}");
     }
+}
+
+/// The camera a round video message records from. Dropped when the take ends, which stops
+/// the stream.
+pub(crate) struct RoundCam {
+    camera: nokhwa::Camera,
+    name: String,
+}
+
+impl RoundCam {
+    pub(crate) fn open(choice: Option<&str>) -> Result<Self, String> {
+        let (index, name) = chosen_camera(choice)?;
+        let mut camera = open_camera(index)?;
+        camera.open_stream().map_err(|err| err.to_string())?;
+        Ok(Self { camera, name })
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn grab(&mut self) -> Result<Rgba, String> {
+        let frame = self.camera.frame().map_err(|err| err.to_string())?;
+        rgba_of(&frame)
+    }
+}
+
+impl Drop for RoundCam {
+    fn drop(&mut self) {
+        let _ = self.camera.stop_stream();
+    }
+}
+
+/// H.264 for a round video message: baseline, level 3.1, camera use, a few hundred kb/s.
+/// The same opener a call uses. Annex B out.
+pub(crate) struct RoundEncoder {
+    backend: Backend,
+}
+
+impl RoundEncoder {
+    pub(crate) fn open() -> Result<Self, String> {
+        Ok(Self { backend: Backend::open_h264(400_000, protocol::ROUND_FPS as f32, false)? })
+    }
+
+    pub(crate) fn encode(&mut self, planes: &Planes, at: Duration, key: bool) -> Result<Encoded, String> {
+        let ask = Ask { key, bps: 400_000, at, fps: protocol::ROUND_FPS as f32 };
+        self.backend.encode(planes, &ask)
+    }
+}
+
+fn chosen_camera(choice: Option<&str>) -> Result<(nokhwa::utils::CameraIndex, String), String> {
+    use nokhwa::utils::{ApiBackend, CameraIndex};
+    let listed = nokhwa::query(ApiBackend::Auto).map_err(|err| err.to_string())?;
+    if listed.is_empty() {
+        return Err("No camera was found.".to_owned());
+    }
+    let (name, id) = match choice.and_then(|choice| choice.split_once('\t')) {
+        Some((name, id)) => (name, Some(id)),
+        None => (choice.unwrap_or_default(), None),
+    };
+    let found = listed
+        .iter()
+        .find(|info| id.is_some_and(|id| camera_id(info) == id))
+        .or_else(|| listed.iter().find(|info| !name.is_empty() && info.human_name() == name))
+        .unwrap_or(&listed[0]);
+    let index = match found.index() {
+        CameraIndex::Index(n) => CameraIndex::Index(*n),
+        CameraIndex::String(s) => CameraIndex::String(s.clone()),
+    };
+    Ok((index, found.human_name()))
 }

@@ -3,7 +3,7 @@
 use super::chat::{row_time, Look};
 use super::inbox::{self, Item};
 use super::{on_screen, respliced, Mode};
-use crate::gui::components::{badge_dot, badge_mention, button, empty_state, empty_state_with, glyph, ButtonKind, list_row, section_header, skeleton, Avatar, Shape};
+use crate::gui::components::{badge_dot, badge_mention, button, empty_state, empty_state_with, glyph, list_row, list_row_fit, section_header, sensitive_cover, skeleton, Avatar, ButtonKind, Shape};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use crate::view::now;
@@ -65,6 +65,7 @@ impl Shell {
         if applied && inbox::attention_moved(&before, self.sidebar_state.inbox.all()) {
             self.load_spaces_soon(cx);
         }
+        self.restore_conversation_windows(cx);
     }
 
     /// The order waiting behind the pill goes in.
@@ -124,7 +125,7 @@ impl Shell {
             Item::App(app) => self.app_row(ix, &app, look.mark, focused, cx).into_any_element(),
             Item::AppsMore(more) => self
                 .action_row(("apps-more", ix), Some("icons/chevron-down.svg"), format!("Show {more} more").into(), false, None, focused)
-                .map(|row| self.tap(row, crate::gui::phone::token(&["inbox-item", &ix.to_string()]), None, move |this, cx| this.activate_inbox(ix, cx), cx))
+                .map(|row| self.tap(row, crate::gui::phone::token(&["inbox-item", &ix.to_string()]), None, move |this, _, cx| this.activate_inbox(ix, cx), cx))
                 .into_any_element(),
             Item::End => self.end_line(cx).into_any_element(),
         }
@@ -178,7 +179,7 @@ impl Shell {
                     ),
             );
         list_row(("apps", ix), theme::row_height(theme::ROW_TWO), false, focused, content)
-            .map(|row| self.tap(row, crate::gui::phone::token(&["inbox-item", &ix.to_string()]), None, move |this, cx| this.activate_inbox(ix, cx), cx))
+            .map(|row| self.tap(row, crate::gui::phone::token(&["inbox-item", &ix.to_string()]), None, move |this, _, cx| this.activate_inbox(ix, cx), cx))
     }
 
     /// An app under the open Apps row, 28: its square, name, last line, time and dot.
@@ -198,7 +199,7 @@ impl Shell {
             .children(super::super::components::row_badge(app));
         let picked = app.clone();
         list_row(("app", ix), theme::row_height(theme::ROW_ONE), selected, focused, content)
-            .map(|row| self.tap(row, crate::gui::phone::token(&["row", picked.key.network.label(), &picked.key.account, &picked.key.id]), Some(picked.clone()), move |this, cx| this.pick_row(&picked, cx), cx))
+            .map(|row| self.tap(row, crate::gui::phone::token(&["row", picked.key.network.label(), &picked.key.account, &picked.key.id]), Some(picked.clone()), move |this, _, cx| this.pick_row(&picked, cx), cx))
     }
 
     /// "Older conversations are in Discord · Slack": each opens that network's home.
@@ -484,11 +485,12 @@ impl Shell {
         use protocol::ActivityItemKind;
         let state = &self.sidebar_state;
         let current = state.activity_filter;
-        let chips: [(&str, Option<ActivityItemKind>); 5] = [
+        let chips: [(&str, Option<ActivityItemKind>); 6] = [
             ("All", None),
             ("Mentions", Some(ActivityItemKind::Mention)),
             ("Threads", Some(ActivityItemKind::ThreadReply)),
             ("Reactions", Some(ActivityItemKind::Reaction)),
+            ("Calls", Some(ActivityItemKind::MissedCall)),
             ("Apps", Some(ActivityItemKind::App)),
         ];
         let mut bar = div().flex_none().px(px(12.)).py(px(6.)).flex().flex_wrap().items_center().gap(px(6.));
@@ -512,10 +514,22 @@ impl Shell {
 
         let body: AnyElement = if state.activity_loading && state.activity_items.is_empty() {
             div().pt(px(4.)).children((0..5).map(Self::inbox_placeholder)).into_any_element()
-        } else if state.activity_items.is_empty() {
+        } else if state.activity_items.is_empty() && state.activity_cursor.is_none() {
             self.inbox_empty(cx)
         } else {
+            let revealed = state.activity_revealed.clone();
             let mut list_box = div().id("activity-feed-list").size_full().overflow_y_scroll().flex().flex_col();
+            if state.activity_items.is_empty() {
+                list_box = list_box.child(
+                    div()
+                        .px(px(16.))
+                        .pt(px(16.))
+                        .pb(px(4.))
+                        .type_small()
+                        .text_color(theme::text_soft())
+                        .child("No matching activity on this page."),
+                );
+            }
             for (ix, item) in state.activity_items.iter().enumerate() {
                 let kind_word = match item.kind {
                     ActivityItemKind::Mention => "mentioned you".to_owned(),
@@ -527,12 +541,16 @@ impl Shell {
                             format!("reacted {}", item.emoji)
                         }
                     }
+                    ActivityItemKind::MissedCall => "missed call".to_owned(),
                     ActivityItemKind::App => "app notification".to_owned(),
                     ActivityItemKind::Invite => "invited you".to_owned(),
                     ActivityItemKind::Other => "activity".to_owned(),
                 };
                 let who = if item.actor.is_empty() { kind_word } else { format!("{} {kind_word}", item.actor) };
                 let snippet = super::chat::one_line(&item.text).into_owned();
+                let hide = crate::gui::streamer::is_active()
+                    && crate::gui::streamer::contains_sensitive(&item.text)
+                    && !revealed.contains(&item.id);
                 let picked = item.clone();
                 let content = div()
                     .flex_1()
@@ -558,7 +576,21 @@ impl Shell {
                             .child(div().type_micro().text_color(theme::text_faint()).child(row_time(now(), item.time)))
                             .children(item.unread.then(|| badge_dot(7., theme::accent()))),
                     )
-                    .when(!snippet.is_empty(), |col| {
+                    .when(hide, |col| {
+                        let id = item.id.clone();
+                        col.child(
+                            sensitive_cover(
+                                gpui::SharedString::from(format!("reveal-activity-{}", item.id)),
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.sidebar_state.activity_revealed.insert(id.clone());
+                                    cx.notify();
+                                }),
+                            )
+                            .w_full(),
+                        )
+                    })
+                    .when(!hide && !snippet.is_empty(), |col| {
                         col.child(
                             div()
                                 .truncate()
@@ -567,9 +599,14 @@ impl Shell {
                                 .child(snippet),
                         )
                     });
+                let height = theme::row_height(theme::ROW_TWO);
+                let row = if hide {
+                    list_row_fit(("activity-row", ix), height, false, false, content)
+                } else {
+                    list_row(("activity-row", ix), height, false, false, content)
+                };
                 list_box = list_box.child(
-                    list_row(("activity-row", ix), theme::row_height(theme::ROW_TWO), false, false, content)
-                        .on_click(cx.listener(move |this, _, _, cx| this.open_activity_item(picked.clone(), cx))),
+                    row.on_click(cx.listener(move |this, _, _, cx| this.open_activity_item(picked.clone(), cx))),
                 );
             }
             if state.activity_cursor.is_some() {

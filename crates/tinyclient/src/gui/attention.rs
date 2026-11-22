@@ -48,7 +48,12 @@ pub fn flashes(before: Option<u32>, now: u32, active: bool, flash: bool) -> bool
 impl Shell {
     /// The window gained or lost focus.
     pub(super) fn focus_changed(&mut self, focused: bool, cx: &mut Context<Self>) {
-        self.people_state.hub().watch_focus(focused, cx);
+        // The main window coming forward means no conversation window is the focused one.
+        // Losing the main window must not clear a conversation window that just came forward.
+        if focused {
+            self.conversation_state.windows.clear_focus();
+        }
+        self.sync_watch(cx);
     }
 
     /// A notification was clicked: forward, on its conversation.

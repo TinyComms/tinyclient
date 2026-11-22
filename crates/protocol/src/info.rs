@@ -5,7 +5,7 @@
 //! Every field here is optional on the wire and every list has a cap, as in the rest of the
 //! contract.
 
-use crate::{is_false, is_zero, is_zero64, Conversation, Key, MediaFile, Network, Space};
+use crate::{is_false, is_zero, is_zero64, Conversation, Key, MediaFile, Message, Network, Space};
 use serde::{Deserialize, Serialize};
 
 /// Most folders an account lists. Telegram allows 30 with Premium; Discord's server folders are
@@ -61,6 +61,10 @@ pub const CATALOG_LIMIT: usize = 200;
 pub const PINNED_LIMIT: usize = 50;
 /// Most people each section of `Around` lists.
 pub const AROUND_LIMIT: usize = 100;
+/// Most channel or chat tabs listed in [`ConversationInfo::tabs`].
+pub const TABS_LIMIT: usize = 32;
+/// Most meetings one `Meetings` answer carries. Today's list, soonest first.
+pub const MEETINGS_LIMIT: usize = 32;
 
 fn is_true(value: &bool) -> bool {
     *value
@@ -125,6 +129,14 @@ pub enum PrivacyKey {
     PhoneCall,
     PhoneP2p,
     VoiceMessages,
+    /// Who can see when this account was last online (`inputPrivacyKeyStatusTimestamp`).
+    LastSeen,
+    /// Who can see this account's phone number (`inputPrivacyKeyPhoneNumber`).
+    PhoneNumber,
+    /// Who can see this account's profile photo (`inputPrivacyKeyProfilePhoto`).
+    ProfilePhoto,
+    /// Who can add this account to groups and channels (`inputPrivacyKeyChatInvite`).
+    ChatInvite,
 }
 
 /// Base audience for a network privacy rule.
@@ -224,6 +236,121 @@ pub struct PrivacyPolicy {
     /// True when changing this key requires a paid tier (e.g. Telegram Premium for VoiceMessages).
     #[serde(default, skip_serializing_if = "is_false")]
     pub premium_only: bool,
+}
+
+fn disabled_preset() -> bool {
+    true
+}
+
+/// One connection class of Telegram's `autoDownloadSettings` (roaming, mobile, or Wi-Fi).
+/// A missing preset is off, so an older frame never starts fetching full files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoDownloadPreset {
+    #[serde(default = "disabled_preset")]
+    pub disabled: bool,
+    #[serde(default)]
+    pub photo_size_max: i64,
+    #[serde(default)]
+    pub video_size_max: i64,
+    #[serde(default)]
+    pub file_size_max: i64,
+}
+
+impl Default for AutoDownloadPreset {
+    fn default() -> Self {
+        Self { disabled: true, photo_size_max: 0, video_size_max: 0, file_size_max: 0 }
+    }
+}
+
+/// Telegram's three auto-download presets, plus the local chat-kind gates this app keeps.
+/// Size limits are Telegram's (`account.getAutoDownloadSettings`). Which chats may use them
+/// is local and stays off until the account turns a kind on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoDownload {
+    #[serde(default)]
+    pub roaming: AutoDownloadPreset,
+    #[serde(default)]
+    pub mobile: AutoDownloadPreset,
+    #[serde(default)]
+    pub wifi: AutoDownloadPreset,
+    /// Fetch a photo's full size when the active preset's photo cap allows it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fetch_full_photos: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub private_chats: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub groups: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub channels: bool,
+}
+
+impl Default for AutoDownload {
+    fn default() -> Self {
+        Self {
+            roaming: AutoDownloadPreset::default(),
+            mobile: AutoDownloadPreset::default(),
+            wifi: AutoDownloadPreset::default(),
+            fetch_full_photos: false,
+            private_chats: false,
+            groups: false,
+            channels: false,
+        }
+    }
+}
+
+/// A channel's boost level, from `premium.getBoostsStatus`.
+/// `slots` are the free boosts this Premium account can still give.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelBoosts {
+    #[serde(default)]
+    pub level: i32,
+    #[serde(default)]
+    pub boosts: i32,
+    #[serde(default)]
+    pub current_level_boosts: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_level_boosts: Option<i32>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub my_boost: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slots: Vec<i32>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub boost_url: String,
+    /// The signed-in account is Telegram Premium, so it may give a boost.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_boost: bool,
+}
+
+/// One command a bot lists for `/` completion.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotCommand {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub command: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
+
+/// A bot's description, commands, and menu button, from `users.getFullUser`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotMenu {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<BotCommand>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub menu_label: String,
+    /// An `http` or `https` menu button. Anything else is left empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub menu_url: String,
+}
+
+/// Cached files one conversation is using, when those files can be attributed to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatCache {
+    pub conversation: Key,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    pub bytes: u64,
 }
 
 /// Which list of a network's home `Home` reads.
@@ -412,6 +539,51 @@ pub struct MutualSpace {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub nickname: String,
 }
+/// Specification for creating or editing a chat folder (Telegram `dialogFilter`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderSpec {
+    /// Existing folder id when editing; `None` creates a new folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Folder title (max 12 characters on Telegram).
+    pub name: String,
+    /// Optional icon / emoticon label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emoticon: Option<String>,
+    /// Explicit chat IDs always included in the folder.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<String>,
+    /// Explicit chat IDs excluded from the folder.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
+    /// Pinned chat IDs in this folder, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pinned: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub contacts: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub non_contacts: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub groups: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub broadcasts: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bots: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub exclude_muted: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub exclude_read: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub exclude_archived: bool,
+}
+
+/// A suggested chat folder offered by the network (Telegram `messages.getSuggestedDialogFilters`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SuggestedFolder {
+    pub spec: FolderSpec,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+}
 
 /// How a phone number or address on a profile is drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -537,6 +709,80 @@ pub struct ConversationInfo {
     /// Channel bookmarks (links, canvases, folders; Slack `bookmarks.list`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bookmarks: Vec<Bookmark>,
+    /// Pending join requests awaiting admin approval (Telegram groups/channels).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pending_requests: u32,
+    /// Pinned channel/chat tabs and apps (Teams: Files, Notes, Planner, websites, apps).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tabs: Vec<ConversationTab>,
+    /// The meeting this chat is for, when Teams gave a start time. Join is a link until calls
+    /// exist here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meeting: Option<MeetingEvent>,
+}
+
+/// One tab or pinned app on a channel or chat (`ConversationInfo::tabs`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationTab {
+    pub id: String,
+    pub name: String,
+    /// App display name when distinct from `name` (e.g. "Planner", "OneNote", "Website").
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub app: String,
+    /// Normalized kind: `"files"`, `"notes"`, `"planner"`, `"website"`, or `"app"`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+    /// Direct web URL (`https://` or `http://`) to open the tab externally, or Teams deep link.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub web_url: String,
+    /// Underlying content URL when provided by the tab configuration.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub content_url: String,
+}
+
+/// How I answered a calendar event.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingResponse {
+    #[default]
+    None,
+    Accepted,
+    Tentative,
+    Declined,
+    Organizer,
+}
+
+impl MeetingResponse {
+    /// The word Details and Upcoming show beside the time.
+    pub fn label(self) -> &'static str {
+        match self {
+            MeetingResponse::None => "",
+            MeetingResponse::Accepted => "Accepted",
+            MeetingResponse::Tentative => "Tentative",
+            MeetingResponse::Declined => "Declined",
+            MeetingResponse::Organizer => "Organizer",
+        }
+    }
+}
+
+/// One calendar event: today's meetings, and the meeting a chat is for.
+///
+/// `start` and `end` are Unix seconds. `join_url` is `https://` or `http://` only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeetingEvent {
+    pub id: String,
+    pub title: String,
+    pub start: i64,
+    pub end: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub organizer: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub join_url: String,
+    #[serde(default)]
+    pub response: MeetingResponse,
+    /// Teams thread id when the meeting has a chat (`19:meeting_…`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub conversation: String,
 }
 
 /// Kind of a channel bookmark.
@@ -646,6 +892,15 @@ pub struct SpaceInfo {
     /// Whether invites are currently paused (`INVITES_DISABLED` feature).
     #[serde(default, skip_serializing_if = "is_false")]
     pub invites_disabled: bool,
+    /// Optional `https://` hand-off link to open or manage this Space in the network's app.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub link: String,
+    /// Workspace subdomain (e.g. `acme` for `acme.slack.com`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub domain: String,
+    /// Canonical HTTPS workspace URL (e.g. `https://acme.slack.com`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
 }
 
 /// Fields to update on a Space's overview (`Request::EditSpace`).
@@ -842,6 +1097,111 @@ pub struct SpaceEvent {
     pub cover: Option<MediaFile>,
 }
 
+/// One workspace user group (e.g. Slack `@oncall`, `@design`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserGroup {
+    pub id: String,
+    pub name: String,
+    pub handle: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub member_count: u32,
+}
+
+/// One slash command exposed by a Slack app (shown in its About tab).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppSlashCommand {
+    pub command: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub usage: String,
+}
+
+/// One validated external link on a Slack app's About tab.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppLink {
+    pub label: String,
+    pub url: String,
+}
+
+/// A Slack app's About metadata, fetched on demand when its conversation opens.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppProfile {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub app_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bot_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<AppSlashCommand>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<AppLink>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub installed_by: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub open_url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub directory_url: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub home_enabled: bool,
+}
+
+/// A Slack app's published Home tab (Block Kit view), fetched on demand.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppHome {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub app_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub view_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spans: Vec<crate::Span>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cards: Vec<crate::Card>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub controls: Vec<crate::MessageControl>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub empty_reason: String,
+}
+
+/// Combined About + optional Home view for a Slack app conversation (`Request::AppView`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppView {
+    pub profile: AppProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<AppHome>,
+}
+
+/// One slash command available in a workspace (`Request::SlashCommands`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlashCommand {
+    pub command: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub usage: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub builtin: bool,
+}
+
+/// One conversation's unread messages in the All Unreads view (`Request::AllUnreads`, #606).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnreadGroup {
+    pub conversation: Conversation,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<Message>,
+    /// Exact unread count known after fetching messages past `last_read`.
+    #[serde(default)]
+    pub total_unread: u32,
+}
+
 /// Which of a custom emoji set this account may send.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -941,6 +1301,28 @@ pub struct ConversationRights {
     /// May edit this channel's permission overwrites (`Request::SetOverwrite`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub manage_permissions: bool,
+    /// May create, edit, close, pin, or delete topics in a forum (`Request::TopicCreate`, `Request::TopicUpdate`, `Request::TopicDelete`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_topics: bool,
+    /// May ban, unban, or restrict members (`Request::ModerateMember`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ban_members: bool,
+    /// May promote or demote admins and set admin custom titles (`Request::SetAdmin`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub promote_admins: bool,
+    /// May edit group/channel settings: default permissions, slow mode, join requests, forum,
+    /// pre-history visibility, signatures, protected content (`Request::UpdateChatSettings`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_settings: bool,
+    /// May read the recent-actions admin log (`Request::AdminLog`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub view_admin_log: bool,
+    /// Owner/creator: may transfer ownership with a 2FA password (`Request::TransferOwnership`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub transfer_owner: bool,
+    /// Admin posts anonymously as the group/channel (`anonymous` admin right).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub anonymous: bool,
 }
 
 impl ConversationRights {
@@ -964,6 +1346,13 @@ impl ConversationRights {
     const MANAGE_WEBHOOKS: i64 = 1 << 14;
     const DELETE_CHANNEL: i64 = 1 << 8;
     const MANAGE_PERMISSIONS: i64 = 1 << 9;
+    const BAN_MEMBERS: i64 = 1 << 8;
+    const PROMOTE_ADMINS: i64 = 1 << 9;
+    const MANAGE_SETTINGS: i64 = 1 << 10;
+    const VIEW_ADMIN_LOG: i64 = 1 << 11;
+    const TRANSFER_OWNER: i64 = 1 << 12;
+    const ANONYMOUS: i64 = 1 << 13;
+    const MANAGE_TOPICS: i64 = 1 << 14;
 
     pub fn is_none(&self) -> bool {
         *self == ConversationRights::default()
@@ -1026,6 +1415,27 @@ impl ConversationRights {
         if self.manage_permissions {
             bits |= Self::MANAGE_PERMISSIONS;
         }
+        if self.manage_topics {
+            bits |= Self::MANAGE_TOPICS;
+        }
+        if self.ban_members {
+            bits |= Self::BAN_MEMBERS;
+        }
+        if self.promote_admins {
+            bits |= Self::PROMOTE_ADMINS;
+        }
+        if self.manage_settings {
+            bits |= Self::MANAGE_SETTINGS;
+        }
+        if self.view_admin_log {
+            bits |= Self::VIEW_ADMIN_LOG;
+        }
+        if self.transfer_owner {
+            bits |= Self::TRANSFER_OWNER;
+        }
+        if self.anonymous {
+            bits |= Self::ANONYMOUS;
+        }
         bits
     }
 
@@ -1048,6 +1458,13 @@ impl ConversationRights {
             manage_webhooks: (bits & Self::MANAGE_WEBHOOKS) != 0,
             delete_channel: (bits & Self::DELETE_CHANNEL) != 0,
             manage_permissions: (bits & Self::MANAGE_PERMISSIONS) != 0,
+            manage_topics: (bits & Self::MANAGE_TOPICS) != 0,
+            ban_members: (bits & Self::BAN_MEMBERS) != 0,
+            promote_admins: (bits & Self::PROMOTE_ADMINS) != 0,
+            manage_settings: (bits & Self::MANAGE_SETTINGS) != 0,
+            view_admin_log: (bits & Self::VIEW_ADMIN_LOG) != 0,
+            transfer_owner: (bits & Self::TRANSFER_OWNER) != 0,
+            anonymous: (bits & Self::ANONYMOUS) != 0,
         }
     }
 }
@@ -1063,6 +1480,95 @@ pub struct ChannelPosition {
     /// When moving under a category, sync overwrites with the new category's permissions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lock_permissions: Option<bool>,
+}
+/// Moderation action against one member of a group or channel (`Request::ModerateMember`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum MemberModeration {
+    /// Remove from the group/channel without permanently banning.
+    Kick,
+    /// Ban from the group/channel (`until`: Unix seconds, `None` = permanent).
+    Ban {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<i64>,
+    },
+    /// Lift an existing ban or restriction.
+    Unban,
+    /// Restrict specific send permissions (`until`: Unix seconds, `None` = permanent).
+    Restrict {
+        rules: SendRules,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<i64>,
+    },
+}
+
+/// Admin permissions and custom title assigned via `Request::SetAdmin`. All booleans false demotes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminRights {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub change_info: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub post_messages: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub edit_messages: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub delete_messages: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ban_users: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub invite_users: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pin_messages: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub add_admins: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub anonymous: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_call: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_topics: bool,
+    /// Custom admin title / rank (e.g. "Moderator"). Empty leaves unset.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rank: String,
+}
+
+/// Partial update to group or channel settings (`Request::UpdateChatSettings`). Unset fields stay.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatSettings {
+    /// Group-wide default member send permissions (`messages.editChatDefaultBannedRights`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_send_rules: Option<SendRules>,
+    /// Slow-mode interval in seconds (`0` disables slow mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slowmode_seconds: Option<u32>,
+    /// Require admin approval for join requests (`channels.toggleJoinRequest`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_request: Option<bool>,
+    /// Enable or disable forum topics (`channels.toggleForum`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forum: Option<bool>,
+    /// Hide prior chat history for new members (`channels.togglePreHistoryHidden`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_history_hidden: Option<bool>,
+    /// Sign channel posts with the posting admin's name (`channels.toggleSignatures`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signatures: Option<bool>,
+    /// Protected content: forbid forwarding and saving media (`messages.toggleNoForwards`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_forwards: Option<bool>,
+}
+
+/// One read-only entry in a channel/supergroup's recent-actions log (`Request::AdminLog`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminLogEntry {
+    pub id: String,
+    /// Unix seconds when the action occurred.
+    pub date: i64,
+    /// Display name of the admin or user who performed the action.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub actor: String,
+    /// Plain-text summary of what changed.
+    pub summary: String,
 }
 
 /// What an account may send and do on messages, as the session says (the plan, the workspace's
@@ -1127,6 +1633,9 @@ pub struct Capabilities {
     /// This network takes a file sent as a recorded voice note (`Outgoing::voice`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub voice_notes: bool,
+    /// This network takes a round video message (`Outgoing::video`). Telegram only.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub video_notes: bool,
     /// Seconds after sending that an edit is still allowed. 0: no limit.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub edit_window: u32,
@@ -1158,6 +1667,9 @@ pub struct Capabilities {
     /// This account supports editing own messages.
     #[serde(default, skip_serializing_if = "is_false")]
     pub edit: bool,
+    /// This account supports replacing the photo or file of an already-sent message (`Request::EditMedia`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub edit_media: bool,
     /// This account supports deleting messages.
     #[serde(default, skip_serializing_if = "is_false")]
     pub delete: bool,
@@ -1198,6 +1710,10 @@ pub struct Capabilities {
     pub profile_pronouns: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub profile_avatar: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub profile_username: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub profile_birthday: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub profile_nickname: bool,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -1305,6 +1821,12 @@ pub struct Capabilities {
     /// This account supports reading and writing private notes on people (`Request::SetNote`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub person_notes: bool,
+    /// This account supports on-demand server transcription of voice and round video messages (`Request::Transcribe`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub transcribe: bool,
+    /// This account supports on-demand in-place message translation (`Request::Translate`, Teams).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub translate: bool,
     /// This account supports reading and setting out-of-office / automatic replies (`Request::GetOutOfOffice`, `Request::SetOutOfOffice`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub out_of_office: bool,
@@ -1314,6 +1836,10 @@ pub struct Capabilities {
     /// This account supports reordering Spaces and creating/renaming/colouring Space folders (`MoveSpace`, `SetFolder`, Discord).
     #[serde(default, skip_serializing_if = "is_false")]
     pub manage_space_folders: bool,
+    /// This account supports creating, renaming, deleting, reordering, and moving channels
+    /// between custom sidebar sections (Slack paid plans).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sidebar_sections: bool,
     /// This account supports muting a conversation for a chosen duration (`SetMute` with `until`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub timed_mute: bool,
@@ -1551,6 +2077,44 @@ pub struct InvitePreview {
     /// Optional scheduled event attached to this invite (`?event=<id>`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event: Option<crate::ScheduledEvent>,
+    /// True when joining via this invite submits a join request for admin approval (Telegram).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub request_needed: bool,
+}
+
+/// One exported invite link for a group or channel (Telegram `ChatInviteExported`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatInviteLink {
+    pub link: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub permanent: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub revoked: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub request_needed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expire_date: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub usage: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pending_requests: u32,
+}
+
+/// One person who requested to join a chat via an approval-gated invite link (Telegram `ChatInviteImporter`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinRequest {
+    pub user_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub handle: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub about: String,
+    #[serde(default)]
+    pub date: i64,
 }
 
 /// One public channel returned by [`crate::Request::BrowseChannels`].
@@ -1569,6 +2133,9 @@ pub struct BrowsedChannel {
     #[serde(default, skip_serializing_if = "is_false")]
     pub archived: bool,
 }
+
+/// Telegram sentinel `schedule_date` value meaning "send when the recipient comes online".
+pub const SCHEDULE_WHEN_ONLINE: i64 = 0x7FFF_FFFE;
 
 /// One pending scheduled message returned by [`crate::Request::ScheduledMessages`] or
 /// [`crate::Request::RescheduleMessage`].
@@ -1590,8 +2157,10 @@ pub enum ActivityItemKind {
     Mention,
     ThreadReply,
     Reaction,
+    MissedCall,
     App,
     Invite,
+    #[serde(other)]
     Other,
 }
 
@@ -1669,6 +2238,16 @@ pub fn format_disappearing(seconds: u32) -> String {
     }
 }
 
+/// How much prior chat history a newly added member receives (Teams group chats).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum HistoryShare {
+    #[default]
+    None,
+    Days { days: u32 },
+    All,
+}
+
 /// Content-type filter for network message search (`SearchFilters::has`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1683,14 +2262,14 @@ pub enum SearchHas {
     Polls,
 }
 
-/// Sort order for network message search (`SearchFilters::sort`).
+/// Sort order for network search (`SearchFilters::sort`, `Request::SearchFiles`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchSort {
     #[default]
     Newest,
     Oldest,
-    Relevant,
+    Relevance,
 }
 
 impl SearchSort {
@@ -1724,6 +2303,16 @@ pub struct SearchFilters {
     pub sort: SearchSort,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub offset: u32,
+}
+
+/// One calendar day with matching messages (`Request::SearchCalendar` / Telegram `messages.getSearchResultsCalendar`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchCalendarDay {
+    /// Unix timestamp for the day.
+    pub date: i64,
+    pub min_message_id: String,
+    pub max_message_id: String,
+    pub count: u32,
 }
 
 impl SearchFilters {
@@ -1783,6 +2372,9 @@ impl Capabilities {
             || self.profile_accent
             || self.profile_banner
             || self.profile_server
+            || self.profile_username
+            || self.profile_birthday
+            || self.rich_status
     }
 }
 
@@ -1862,6 +2454,20 @@ pub struct VoiceNote {
     pub waveform: Vec<u8>,
 }
 
+/// A round video message: a square picture, at most a minute. `sound` is set only when the
+/// file has an AAC track. This build's recorder writes video only, so `sound` stays off and
+/// the upload says `nosound`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoNote {
+    /// Milliseconds of picture, as the recorder finished the file.
+    pub duration: u32,
+    /// Square side in pixels.
+    pub side: u32,
+    /// The file has an AAC sound track. False: picture only.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sound: bool,
+}
+
 /// A poll the user is starting. Signal: a question of 1 to 100 characters and 2 to 10 choices,
 /// each at most 100 characters. `multiple` lets a person pick more than one.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1894,6 +2500,97 @@ pub struct SendAs {
     pub detail: String,
 }
 
+/// What this account may send in one conversation right now: per-chat media restrictions,
+/// slow mode, timed mute expiry, and paid-message star price (`Request::SendRules`).
+///
+/// Every permission defaults to `true`, so an empty JSON object or an adapter that does not
+/// report per-chat rules leaves sending up to account [`Capabilities`] and the network.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendRules {
+    /// May send messages at all (`false` when muted/banned or read-only).
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_messages: bool,
+    /// May send plain text messages.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_plain: bool,
+    /// May send media/attachments in general.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_media: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_photos: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_videos: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_round_videos: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_audios: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_voices: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_files: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_stickers: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_gifs: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub embed_links: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_polls: bool,
+    /// Slow-mode interval in seconds (`0` means slow mode is off).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub slowmode_seconds: u32,
+    /// Unix seconds when the next message may be sent under slow mode (`None` when ready now).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slowmode_next_send: Option<i64>,
+    /// Unix seconds when a timed mute / send ban expires (`None` if permanent or not muted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ban_until: Option<i64>,
+    /// Telegram Stars charged per message (`send_paid_messages_stars`). `None` or `Some(0)` is free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paid_stars: Option<u64>,
+}
+
+impl Default for SendRules {
+    fn default() -> SendRules {
+        SendRules {
+            send_messages: true,
+            send_plain: true,
+            send_media: true,
+            send_photos: true,
+            send_videos: true,
+            send_round_videos: true,
+            send_audios: true,
+            send_voices: true,
+            send_files: true,
+            send_stickers: true,
+            send_gifs: true,
+            embed_links: true,
+            send_polls: true,
+            slowmode_seconds: 0,
+            slowmode_next_send: None,
+            ban_until: None,
+            paid_stars: None,
+        }
+    }
+}
+
+impl SendRules {
+    /// True when at least one file/media attachment category is allowed.
+    pub fn allows_any_attachment(&self) -> bool {
+        self.send_media && (self.send_photos || self.send_videos || self.send_audios || self.send_files)
+    }
+
+    /// Whole seconds remaining before slow mode allows another send at unix timestamp `now`.
+    pub fn slowmode_remaining(&self, now: i64) -> u32 {
+        self.slowmode_next_send
+            .map_or(0, |until| until.saturating_sub(now).max(0).min(i64::from(u32::MAX)) as u32)
+    }
+
+    pub fn is_default(&self) -> bool {
+        *self == SendRules::default()
+    }
+}
+
 /// What a `Send` carries besides its text. All of it is off by default, and a plain text
 /// message leaves it off the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1916,6 +2613,9 @@ pub struct Outgoing {
     /// `files` of one). The facts name it what it is without a second look at the file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice: Option<VoiceNote>,
+    /// The last file is a round video message (`files` of one). Not a voice note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<VideoNote>,
     /// Unix seconds: the network sends it then (Slack, Telegram). tinyclient never runs a timer
     /// that sends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1951,6 +2651,10 @@ pub struct Outgoing {
     /// Optional one-line subject for a new channel post (Teams).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
+    /// Explicit consent to pay up to this many Telegram Stars for a paid message. Never set
+    /// without the user confirming the price first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_paid_stars: Option<u64>,
 }
 
 impl Default for Outgoing {
@@ -1963,6 +2667,7 @@ impl Default for Outgoing {
             pick: None,
             schedule: None,
             voice: None,
+            video: None,
             spans: Vec::new(),
             poll: None,
             importance: Importance::Normal,
@@ -1972,6 +2677,7 @@ impl Default for Outgoing {
             send_as: None,
             snippet_type: None,
             subject: None,
+            allow_paid_stars: None,
         }
     }
 }
@@ -2383,6 +3089,7 @@ mod tests {
                 pronouns: Some("she/her".into()),
                 emoji: None,
                 username: None,
+                birthday: None,
                 photo: false,
                 accent: Some(0x5865F2),
                 banner: None,
@@ -2644,7 +3351,7 @@ mod tests {
         let space = Key::new(&account, "4000");
         let reqs = [
             Request::SpaceInvites { space: space.clone() },
-            Request::RevokeInvite { space: space.clone(), code: "abc123".into() },
+            Request::RevokeSpaceInvite { space: space.clone(), code: "abc123".into() },
             Request::SetInvitesPaused { space: space.clone(), paused: true },
         ];
         for req in reqs {
@@ -2941,5 +3648,123 @@ mod tests {
         assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&set).unwrap()).unwrap(), set);
         let bare = format!(r#"{{"op":"set_activity","account":{}}}"#, serde_json::to_string(&account).unwrap());
         assert!(matches!(serde_json::from_str::<Request>(&bare).unwrap(), Request::SetActivity { name, .. } if name.is_empty()));
+    }
+
+    #[test]
+    fn send_rules_defaults_to_all_allowed_and_round_trips() {
+        let default: SendRules = serde_json::from_str("{}").unwrap();
+        assert_eq!(default, SendRules::default());
+        assert!(default.is_default());
+        assert!(default.allows_any_attachment());
+        assert_eq!(default.slowmode_remaining(1_000), 0);
+        assert_eq!(serde_json::to_string(&default).unwrap(), "{}");
+
+        let restricted = SendRules {
+            send_media: false,
+            send_stickers: false,
+            send_gifs: false,
+            slowmode_seconds: 30,
+            slowmode_next_send: Some(1_025),
+            ban_until: Some(2_000),
+            paid_stars: Some(50),
+            ..SendRules::default()
+        };
+        assert!(!restricted.allows_any_attachment());
+        assert_eq!(restricted.slowmode_remaining(1_000), 25);
+        assert_eq!(restricted.slowmode_remaining(1_030), 0);
+        let wire = serde_json::to_string(&restricted).unwrap();
+        let back: SendRules = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, restricted);
+
+        let paid = Outgoing { allow_paid_stars: Some(50), ..Outgoing::default() };
+        assert!(!paid.is_plain());
+        let back_paid: Outgoing = serde_json::from_str(&serde_json::to_string(&paid).unwrap()).unwrap();
+        assert_eq!(back_paid, paid);
+    }
+
+    #[test]
+    fn activity_item_kind_missed_call_round_trips() {
+        let wire = serde_json::to_string(&ActivityItemKind::MissedCall).unwrap();
+        assert_eq!(wire, "\"missed_call\"");
+        let back: ActivityItemKind = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, ActivityItemKind::MissedCall);
+        let unknown: ActivityItemKind = serde_json::from_str("\"future_activity_kind\"").unwrap();
+        assert_eq!(unknown, ActivityItemKind::Other);
+    }
+
+    #[test]
+    fn history_share_round_trips_and_stays_backward_compatible() {
+        for mode in [HistoryShare::None, HistoryShare::Days { days: 7 }, HistoryShare::All] {
+            let wire = serde_json::to_string(&mode).unwrap();
+            let back: HistoryShare = serde_json::from_str(&wire).unwrap();
+            assert_eq!(back, mode);
+        }
+        let legacy = json_members_add_without_share();
+        let req: Request = serde_json::from_str(&legacy).unwrap();
+        assert!(matches!(req, Request::MembersAdd { share_history: None, .. }));
+    }
+
+    fn json_members_add_without_share() -> String {
+        r#"{"op":"members_add","conversation":{"network":"teams","account":"t1","id":"19:g@thread.v2"},"people":["8:orgid:a"]}"#.to_owned()
+    }
+
+    #[test]
+    fn space_info_link_round_trips_and_defaults_empty() {
+        let space = Space {
+            key: Key { network: Network::Teams, account: "t1".into(), id: "19:g@thread.tacv2".into() },
+            name: "Platform".into(),
+            icon: None,
+            position: 0,
+            attention: 0,
+            unread: false,
+            folder: None,
+            muted: false,
+            hide_muted: false,
+            can_create_channels: true,
+            can_manage_webhooks: false,
+            can_manage_guild: false,
+            can_manage_expressions: false,
+            can_create_invites: false,
+            opt_in_channels: false,
+            rights: crate::SpaceRights::default(),
+        };
+        let info = SpaceInfo {
+            space,
+            description: "Core".into(),
+            members: Some(4),
+            online: None,
+            nickname: String::new(),
+            roles: vec!["Owner".into()],
+            notify: Notify::All,
+            tags: Vec::new(),
+            suppress_everyone: false,
+            suppress_roles: false,
+            highlights: true,
+            events: true,
+            mobile_push: true,
+            channel_overrides: Vec::new(),
+            privacy: None,
+            can_change_nickname: false,
+            banner: None,
+            boost_level: 0,
+            boosts: 0,
+            mark: None,
+            system_channel_id: None,
+            afk_channel_id: None,
+            afk_timeout: 0,
+            default_notify: None,
+            vanity_url: None,
+            invites_disabled: false,
+            domain: String::new(),
+            url: String::new(),
+            link: "https://teams.microsoft.com/l/team/19%3Ag/conversations?groupId=g1&tenantId=t1".into(),
+        };
+        let wire = serde_json::to_string(&info).unwrap();
+        let back: SpaceInfo = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, info);
+
+        let without_link = wire.replace(&format!(r#","link":"{}""#, info.link), "");
+        let legacy: SpaceInfo = serde_json::from_str(&without_link).unwrap();
+        assert!(legacy.link.is_empty());
     }
 }

@@ -640,6 +640,16 @@ const CATALOG: &[Spec] = &[
         true,
     ),
     spec(
+        "popout-call",
+        "Pop out call video",
+        &["secondary-shift-o"],
+        "⇧⌘O",
+        None,
+        None,
+        false,
+        true,
+    ),
+    spec(
         "msg-edit",
         "Edit",
         &["e"],

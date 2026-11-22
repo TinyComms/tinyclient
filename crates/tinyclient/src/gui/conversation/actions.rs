@@ -185,6 +185,8 @@ pub struct Can {
     pub report: bool,
     /// Moderator may remove reactions from this message (`rights.delete_others` and non-empty reactions).
     pub clear_reactions: bool,
+    /// May translate this message inline on demand (`Capabilities::translate`, non-E2EE, non-empty text).
+    pub translate: bool,
 }
 
 /// What the menu and the toolbar call this message's thread.
@@ -214,7 +216,21 @@ pub(super) fn starts_thread(message: &Message, caps: &Capabilities, kind: Conver
 }
 
 /// Whether `message` is still within `caps.edit_window` at unix second `now`.
-fn within_edit_window(message: &Message, caps: &Capabilities, now: i64) -> bool {
+/// Telegram's 48-hour edit window does not apply to Saved Messages or own channel posts.
+fn within_edit_window(
+    message: &Message,
+    network: Network,
+    kind: ConversationKind,
+    special: protocol::Special,
+    caps: &Capabilities,
+    now: i64,
+) -> bool {
+    if network == Network::Telegram
+        && (special == protocol::Special::Saved
+            || matches!(kind, ConversationKind::Channel | ConversationKind::Announcement))
+    {
+        return true;
+    }
     caps.edit_window == 0
         || now <= 0
         || message.sent <= 0
@@ -309,6 +325,21 @@ pub fn can_with_network_topic(
     topic: &str,
     now: i64,
 ) -> Can {
+    can_with_network_context(message, network, caps, rights, kind, protocol::Special::None, in_thread, topic, now)
+}
+
+/// Full capability + network + rights + topic + special-role check used by the conversation pane.
+pub fn can_with_network_context(
+    message: &Message,
+    network: Network,
+    caps: &Capabilities,
+    rights: ConversationRights,
+    kind: ConversationKind,
+    special: protocol::Special,
+    in_thread: bool,
+    topic: &str,
+    now: i64,
+) -> Can {
     let sent = message.state == SendState::Sent;
     let said = matches!(message.kind, MessageKind::Normal | MessageKind::Unsupported { .. }) && !message.deleted;
     let act = sent && said;
@@ -319,7 +350,7 @@ pub fn can_with_network_topic(
         && !message.saved_history
         && match message.can_edit {
             Some(allowed) => allowed,
-            None => own && caps.edit && messages_rcs && within_edit_window(message, caps, now),
+            None => own && caps.edit && messages_rcs && within_edit_window(message, network, kind, special, caps, now),
         };
     let delete_everyone = !message.deleted
         && sent
@@ -358,6 +389,7 @@ pub fn can_with_network_topic(
         unsent,
         report: act && network == Network::Tiny && !message.outgoing && caps.abuse_reports,
         clear_reactions: act && network == Network::Discord && caps.reactions && rights.delete_others && !message.reactions.is_empty(),
+        translate: act && caps.translate && network != Network::Signal && !message.text.trim().is_empty(),
     }
 }
 
@@ -428,8 +460,12 @@ enum MenuAct {
     Report,
     /// Moderator: remove all reactions from a message.
     ClearReactions,
+    /// Translate this message inline, or hide its translation.
+    Translate,
     /// A sent message: ask, unless the click held Shift.
     Delete,
+    /// The messages loaded in this chat, one request. Not the live Premium bar.
+    TranslateChat,
 }
 
 /// Maximum number of messages that can be selected at once (matches Telegram's 100-message cap).
@@ -552,6 +588,11 @@ pub fn deletable_selected<'a>(
         .collect()
 }
 
+/// A Telegram secret chat: `e` and digits. `Who` does not parse that prefix.
+fn secret_id(id: &str) -> bool {
+    id.strip_prefix('e').is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 /// What the menu offers, in the order it is drawn and the order Up and Down move.
 /// `quick` is how many quick reactions the menu shows. An unsent message ignores the rest.
 fn menu_acts(
@@ -565,6 +606,7 @@ fn menu_acts(
     can_save: bool,
     can_save_gif: bool,
     favourite_gif: bool,
+    translate_chat: bool,
 ) -> Vec<MenuAct> {
     if can.unsent {
         let mut acts = Vec::new();
@@ -602,6 +644,12 @@ fn menu_acts(
     }
     if has_text {
         acts.push(MenuAct::Copy);
+    }
+    if can.translate {
+        acts.push(MenuAct::Translate);
+    }
+    if translate_chat {
+        acts.push(MenuAct::TranslateChat);
     }
     if has_link {
         acts.push(MenuAct::Link);
@@ -658,16 +706,21 @@ impl Pane {
                 if open.can_pin {
                     rights.pin = true;
                 }
-                can_with_network_topic(
+                let mut allowed = can_with_network_context(
                     message,
                     open.key.network,
                     &open.can,
                     rights,
                     open.kind,
+                    open.special,
                     self.is_thread(),
                     &open.topic,
                     now,
-                )
+                );
+                if open.encrypted {
+                    allowed.translate = false;
+                }
+                allowed
             }
             None => can_with_network(
                 message,
@@ -1409,6 +1462,7 @@ impl Pane {
             self.saveable_file(message).is_some(),
             self.saveable_gif(message).is_some(),
             self.favourite_gif_page(message).is_some(),
+            self.can_translate_chat(cx),
         );
         let cursor = if acts.is_empty() {
             0
@@ -1543,7 +1597,9 @@ impl Pane {
                 }
             }
             MenuAct::ClearReactions => self.clear_reactions(&message.id, None, None, cx),
+            MenuAct::Translate => self.translate_message(&message, cx),
             MenuAct::Delete => self.delete(&message, at_once, window, cx),
+            MenuAct::TranslateChat => self.translate_chat(cx),
         }
     }
 
@@ -1584,6 +1640,134 @@ impl Pane {
                 Ok(Response::Error { detail, .. }) => this.say(detail, cx),
                 Err(err) => this.say(crate::client::trouble_words("remove reactions", &err), cx),
                 _ => {}
+            });
+        })
+        .detach();
+    }
+    /// Telegram, and not a sealed or secret chat. Missing the open row counts as sealed: nothing is sent.
+    fn translation_blocked(&self, cx: &Context<Self>) -> bool {
+        let Some(open) = self.open.as_ref() else {
+            return true;
+        };
+        if open.key.network != Network::Telegram || secret_id(&open.key.id) {
+            return true;
+        }
+        let Some(shell) = self.shell.upgrade() else {
+            return true;
+        };
+        let shell = shell.read(cx);
+        match shell.snapshot.as_ref().and_then(|snap| snap.open.as_ref()) {
+            Some(row) if row.key == open.key => row.encryption.is_sealed(),
+            _ => true,
+        }
+    }
+
+    fn can_translate_chat(&self, cx: &Context<Self>) -> bool {
+        !self.translation_blocked(cx)
+            && self.items.iter().filter_map(Item::message).any(|message| !message.deleted && !message.text.trim().is_empty())
+    }
+
+    /// shortcut: one request of the messages on screen, not Telegram's Premium live bar (`togglePeerTranslations`).
+    fn translate_chat(&mut self, cx: &mut Context<Self>) {
+        let mut ids: Vec<String> = self
+            .items
+            .iter()
+            .filter_map(Item::message)
+            .filter(|message| !message.deleted && !message.text.trim().is_empty())
+            .map(|message| message.id.clone())
+            .collect();
+        if ids.len() > 100 {
+            ids.drain(0..ids.len() - 100);
+        }
+        self.translate_ids(ids, cx);
+    }
+
+    fn translate_ids(&mut self, message_ids: Vec<String>, cx: &mut Context<Self>) {
+        if self.translation_blocked(cx) {
+            self.say("A sealed or secret chat is not translated.".into(), cx);
+            return;
+        }
+        if message_ids.is_empty() {
+            self.say("Choose a message to translate.".into(), cx);
+            return;
+        }
+        let Some(conversation) = self.key().cloned() else {
+            return;
+        };
+        // The language Settings chose, the same one a single message is translated into.
+        let to = crate::gui::app::prefs::values().translate_target();
+        let target_lang = to.clone();
+        let watched = conversation.clone();
+        let request = Request::TranslateMessages { conversation, message_ids, to };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| {
+                // The chat changed while Telegram answered. Those ids belong to the chat that asked.
+                if this.key() != Some(&watched) {
+                    return;
+                }
+                match answer {
+                    Ok(Response::TranslatedMessages { items }) => {
+                        for item in items {
+                            if !item.text.is_empty() {
+                                let translation = protocol::Translation { text: item.text, source_lang: None, target_lang: target_lang.clone() };
+                                this.translations.insert(item.message_id, translation);
+                            }
+                        }
+                        cx.notify();
+                    }
+                    Ok(Response::Error { detail, .. }) => this.say(detail, cx),
+                    Err(err) => this.say(crate::client::trouble_words("translate", &err), cx),
+                    _ => {}
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Translates one message inline on demand, or clears its translation when already shown.
+    /// Never runs on end-to-end encrypted conversations (Signal or sealed Tiny rooms).
+    pub(super) fn translate_message(&mut self, message: &Message, cx: &mut Context<Self>) {
+        if self.translations.remove(&message.id).is_some() {
+            self.translating.remove(&message.id);
+            cx.notify();
+            return;
+        }
+        if self.translating.contains(&message.id) {
+            return;
+        }
+        let Some(open) = self.open.as_ref() else {
+            return;
+        };
+        if open.encrypted || open.key.network == Network::Signal || !open.can.translate || message.text.trim().is_empty() {
+            return;
+        }
+        let conversation = open.key.clone();
+        let message_id = message.id.clone();
+        let to = crate::gui::app::prefs::values().translate_target();
+        self.translating.insert(message_id.clone());
+        cx.notify();
+        let request = Request::Translate {
+            conversation: conversation.clone(),
+            message_id: message_id.clone(),
+            to,
+        };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.key() != Some(&conversation) {
+                    return;
+                }
+                this.translating.remove(&message_id);
+                match answer {
+                    Ok(Response::Translated { translation, .. }) => {
+                        this.translations.insert(message_id, translation);
+                    }
+                    Ok(Response::Error { detail, .. }) => this.say(detail, cx),
+                    Err(err) => this.say(crate::client::trouble_words("translate", &err), cx),
+                    _ => {}
+                }
+                cx.notify();
             });
         })
         .detach();
@@ -1789,6 +1973,17 @@ impl Pane {
             }
             if !message.text.is_empty() {
                 rows.push(row("sheet-copy", "icons/copy.svg", "Copy text".into(), false).on_click(then(|this, message, _, cx| this.copy_text(message, cx))).into_any_element());
+            }
+            if can.translate {
+                let label = if self.translations.contains_key(&message.id) { "Show original" } else { "Translate" };
+                rows.push(
+                    row("sheet-translate", "icons/arrow-right-left.svg", label.into(), false)
+                        .on_click(then(|this, message, _, cx| this.translate_message(message, cx)))
+                        .into_any_element(),
+                );
+            }
+            if self.can_translate_chat(cx) {
+                rows.push(row("sheet-translate-chat", "icons/messages-square.svg", "Translate chat".into(), false).on_click(then(|this, _, _, cx| this.translate_chat(cx))).into_any_element());
             }
             if let Some(link) = self.link_of(message, cx) {
                 let open = link.clone();
@@ -2211,6 +2406,21 @@ impl Pane {
                     .child(menu_item("copy", Some("icons/copy.svg"), copy, Some("⌘C")).when(lit(MenuAct::Copy), |row| row.bg(theme::selected()))
                         .on_click(go(MenuAct::Copy)));
             }
+            if can.translate {
+                let label = if self.translations.contains_key(&message.id) { "Show original" } else { "Translate" };
+                items = items.child(
+                    menu_item("translate", Some("icons/arrow-right-left.svg"), label, None)
+                        .when(lit(MenuAct::Translate), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::Translate)),
+                );
+            }
+            if self.can_translate_chat(cx) {
+                items = items.child(
+                    menu_item("translate-chat", Some("icons/messages-square.svg"), "Translate chat", None)
+                        .when(lit(MenuAct::TranslateChat), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::TranslateChat)),
+                );
+            }
             if self.link_of(&message, cx).is_some() {
                 items = items
                     .child(menu_item("link", Some("icons/link.svg"), "Copy link", None).when(lit(MenuAct::Link), |row| row.bg(theme::selected()))
@@ -2502,8 +2712,10 @@ impl Pane {
         let picker = cx.new(|cx| Picker::new(custom, rules, account, space, window, cx));
         let listening = cx.subscribe_in(&picker, window, |this, _, event: &PickerEvent, window, cx| {
             let picked = this.picker.as_ref().map(|picking| (picking.message.clone(), picking.burst));
-            if let (PickerEvent::Picked(emoji), Some((target, burst))) = (event, picked) {
-                this.react_toggle_kind(&target, emoji, burst, cx);
+            match (event, picked) {
+                (PickerEvent::Picked(emoji), Some((target, burst))) => this.react_toggle_kind(&target, emoji, burst, cx),
+                (PickerEvent::OpenUrl(url), _) => this.open_external_link(url, window, cx),
+                _ => {}
             }
             this.close_picker(cx);
             window.focus(&this.focus, cx);
@@ -3196,7 +3408,7 @@ impl Pane {
                     }
                 }));
             } else {
-                row = row.on_click(cx.listener(move |this, _, _, cx| {
+                row = row.on_click(cx.listener(move |this, _, window, cx| {
                     this.trigger_control(
                         conversation.clone(),
                         msg_id.clone(),
@@ -3206,6 +3418,7 @@ impl Pane {
                         val.clone(),
                         vec![val.clone()],
                         confirm.clone(),
+                        window,
                         cx,
                     );
                 }));
@@ -3237,7 +3450,7 @@ impl Pane {
                         )
                         .when(!can_submit, |b| b.opacity(0.5))
                         .when(can_submit, |b| {
-                            b.on_click(cx.listener(move |this, _, _, cx| {
+                            b.on_click(cx.listener(move |this, _, window, cx| {
                                 let first = values.first().cloned().unwrap_or_default();
                                 this.trigger_control(
                                     conversation.clone(),
@@ -3248,6 +3461,7 @@ impl Pane {
                                     first,
                                     values.clone(),
                                     confirm.clone(),
+                                    window,
                                     cx,
                                 );
                             }))
@@ -3380,7 +3594,11 @@ impl Pane {
                         this.action_confirm = None;
                         if let Some(url) = &to_run.open_url {
                             if this.key() == Some(&to_run.conversation) {
-                                this.open_external_link(url, window, cx);
+                                if super::links::telegram_app_link(url) {
+                                    cx.open_url(url);
+                                } else {
+                                    this.open_external_link(url, window, cx);
+                                }
                             }
                             cx.notify();
                         } else {
@@ -3392,6 +3610,7 @@ impl Pane {
                                 to_run.element_type.clone(),
                                 to_run.value.clone(),
                                 to_run.values.clone(),
+                                window,
                                 cx,
                             );
                         }
@@ -3507,6 +3726,96 @@ impl Pane {
         Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
     }
 
+    fn action_result_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let result = self.action_result.as_ref()?;
+        let title = if result.title.is_empty() { "Details".to_owned() } else { result.title.clone() };
+        let body = result.text.clone();
+        let fields = result.fields.clone();
+        let url = result.url.clone();
+        let url_label = if result.url_label.is_empty() { "Open".to_owned() } else { result.url_label.clone() };
+        let follow = (!result.follow_action.is_empty()).then(|| (result.follow_action.clone(), result.follow_value.clone()));
+        let origin = self.action_origin.clone();
+        let room = f32::from(window.viewport_size().width) - 32.;
+        let field_rows = (!fields.is_empty()).then(|| {
+            div().mt(px(8.)).flex().flex_col().gap(px(4.)).children(fields.into_iter().map(|(label, value)| {
+                div()
+                    .flex()
+                    .gap(px(8.))
+                    .child(div().w(px(96.)).flex_none().type_small().text_color(theme::text_faint()).child(label))
+                    .child(div().flex_1().min_w_0().type_small().text_color(theme::text()).child(value))
+            }))
+        });
+        let open = url.clone();
+        let panel = modal(title)
+            .w(px(if crate::gui::phone::active() { room.min(400.) } else { 400. }))
+            .when(!body.is_empty(), |m| m.child(modal_body(body)))
+            .children(field_rows)
+            .child(
+                modal_buttons()
+                    .child(button("action-result-close", ButtonKind::Secondary, "Close").on_click(cx.listener(|this, _, _, cx| {
+                        this.action_result = None;
+                        this.action_origin = None;
+                        cx.notify();
+                    })))
+                    .when(follow.is_some() && origin.is_some(), |row| {
+                        let Some((action_id, value)) = follow.clone() else {
+                            return row;
+                        };
+                        let Some((conversation, message_id)) = origin.clone() else {
+                            return row;
+                        };
+                        row.child(button("action-result-allow", ButtonKind::Primary, "Allow").on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.action_result = None;
+                                this.action_origin = None;
+                                this.execute_control(
+                                    conversation.clone(),
+                                    message_id.clone(),
+                                    String::new(),
+                                    action_id.clone(),
+                                    "telegram_login".to_owned(),
+                                    value.clone(),
+                                    Vec::new(),
+                                    window,
+                                    cx,
+                                );
+                            },
+                        )))
+                    })
+                    .when(open.is_some() && follow.is_none(), |row| {
+                        let target = open.clone().unwrap_or_default();
+                        row.child(button("action-result-open", ButtonKind::Primary, url_label.clone()).on_click(
+                            cx.listener(move |this, _, window, cx| {
+                                this.action_result = None;
+                                this.action_origin = None;
+                                this.open_external_link(&target, window, cx);
+                            }),
+                        ))
+                    }),
+            )
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        let size = window.viewport_size();
+        let scrim = div()
+            .id("action-result-scrim")
+            .w(size.width)
+            .h(size.height)
+            .bg(theme::scrim())
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.action_result = None;
+                    this.action_origin = None;
+                    cx.notify();
+                }),
+            )
+            .child(fade_in("action-result-panel", 160, panel));
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
+    }
+
     pub(super) fn action_layers(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         if crate::gui::phone::active() {
             return [
@@ -3518,6 +3827,7 @@ impl Pane {
                 self.paid_react_layer(window, cx),
                 self.action_confirm_layer(window, cx),
                 self.interaction_modal_layer(window, cx),
+                self.action_result_layer(window, cx),
                 self.bulk_confirm_layer(window, cx),
                 self.forward_layer(window, cx),
                 self.follow_layer(window, cx),
@@ -3536,6 +3846,7 @@ impl Pane {
             self.paid_react_layer(window, cx),
             self.action_confirm_layer(window, cx),
             self.interaction_modal_layer(window, cx),
+            self.action_result_layer(window, cx),
             self.bulk_confirm_layer(window, cx),
             self.forward_layer(window, cx),
             self.follow_layer(window, cx),
@@ -3605,14 +3916,28 @@ impl Pane {
         if targets.is_empty() {
             return;
         }
-        // Send deletes paced off-thread so we never burst the network.
+        // Batch deletes by scope so networks like Telegram delete all selected messages in one RPC.
+        let mut everyone: Vec<String> = Vec::new();
+        let mut me_only: Vec<String> = Vec::new();
+        for (message_id, scope) in targets {
+            match scope {
+                protocol::DeleteScope::Everyone => everyone.push(message_id),
+                protocol::DeleteScope::Me => me_only.push(message_id),
+            }
+        }
         cx.spawn(async move |_, cx| {
-            for (ix, (message_id, scope)) in targets.into_iter().enumerate() {
-                if ix > 0 {
-                    cx.background_executor().timer(std::time::Duration::from_millis(120)).await;
+            for (scope, ids) in [(protocol::DeleteScope::Everyone, everyone), (protocol::DeleteScope::Me, me_only)] {
+                if ids.is_empty() {
+                    continue;
                 }
-                let req = Request::Delete { conversation: conversation.clone(), message_id, scope };
-                let _ = cx.background_executor().spawn(async move { crate::client::ask(&req) }).await;
+                for chunk in ids.chunks(100) {
+                    let req = Request::DeleteMany {
+                        conversation: conversation.clone(),
+                        message_ids: chunk.to_vec(),
+                        scope,
+                    };
+                    let _ = cx.background_executor().spawn(async move { crate::client::ask(&req) }).await;
+                }
             }
         })
         .detach();
@@ -3996,7 +4321,7 @@ mod tests {
         let said = Message::plain("1", "Mara", "hello", 1, false);
         let on = can(&said, &discord_caps(), rights, channel, false, 10);
         assert_eq!(
-            menu_acts(on, false, 2, true, true, true, true, false, false, false),
+            menu_acts(on, false, 2, true, true, true, true, false, false, false, false),
             vec![
                 MenuAct::Quick(0),
                 MenuAct::Quick(1),
@@ -4012,7 +4337,7 @@ mod tests {
             ]
         );
         // Tiny has Copy link without Open in Tiny.
-        let tiny_acts = menu_acts(on, false, 0, true, false, true, false, false, false, false);
+        let tiny_acts = menu_acts(on, false, 0, true, false, true, false, false, false, false, false);
         assert!(tiny_acts.contains(&MenuAct::Link) && !tiny_acts.contains(&MenuAct::Open));
         let mut mine = Message::plain("2", "Robin", "on it", 2, true);
         mine.state = SendState::Failed {
@@ -4020,13 +4345,45 @@ mod tests {
         };
         let failed = can(&mine, &discord_caps(), rights, channel, false, 10);
         assert_eq!(
-            menu_acts(failed, true, 3, true, true, false, false, true, false, false),
+            menu_acts(failed, true, 3, true, true, false, false, true, false, false, false),
             vec![MenuAct::Retry, MenuAct::Copy, MenuAct::Drop]);
         assert_eq!(
-            menu_acts(on, false, 0, false, false, false, false, true, false, false),
+            menu_acts(on, false, 0, false, false, false, false, true, false, false, false),
             vec![MenuAct::Reply, MenuAct::Thread, MenuAct::Forward, MenuAct::SaveAs, MenuAct::Unread, MenuAct::Select],
         );
-        assert!(menu_acts(on, false, 0, false, false, false, false, false, false, true).contains(&MenuAct::FavouriteGif));
+        assert!(menu_acts(on, false, 0, false, false, false, false, false, false, true, false).contains(&MenuAct::FavouriteGif));
+        let translated = menu_acts(Can { translate: true, ..on }, false, 0, false, true, true, true, false, false, true, false);
+        let copy = translated.iter().position(|act| *act == MenuAct::Copy).unwrap();
+        let link = translated.iter().position(|act| *act == MenuAct::Link).unwrap();
+        assert!(copy + 1 < link);
+        assert_eq!(translated[copy + 1], MenuAct::Translate);
+        assert_eq!(translated[copy + 2], MenuAct::TranslateChat);
+        // Translate appears only when the account supports it and the message has text.
+        let mut t_caps = discord_caps();
+        t_caps.translate = true;
+        let translatable = can(&said, &t_caps, rights, channel, false, 10);
+        assert!(translatable.translate);
+        assert!(menu_acts(translatable, false, 0, false, true, false, false, false, false, false, false).contains(&MenuAct::Translate));
+        let empty = Message::plain("3", "Mara", "   ", 3, false);
+        assert!(!can(&empty, &t_caps, rights, channel, false, 10).translate);
+    }
+
+    #[test]
+    fn translate_is_offered_for_telegram_and_never_for_signal() {
+        let said = Message::plain("1", "Mara", "hola", 1, false);
+        let mut caps = telegram_caps();
+        caps.translate = true;
+        let rights = ConversationRights::default();
+        let offered = can_with_network(&said, Network::Telegram, &caps, rights, ConversationKind::Direct, false, 10);
+        assert!(offered.translate);
+        let acts = menu_acts(offered, false, 0, true, true, false, false, false, false, false, false);
+        let copy = acts.iter().position(|act| *act == MenuAct::Copy).unwrap();
+        assert_eq!(acts.get(copy + 1), Some(&MenuAct::Translate));
+        let signal = can_with_network(&said, Network::Signal, &caps, rights, ConversationKind::Direct, false, 10);
+        assert!(!signal.translate);
+        assert!(!menu_acts(signal, false, 0, true, true, false, false, false, false, false, false).contains(&MenuAct::Translate));
+        let blank = Message::plain("2", "Mara", "  ", 1, false);
+        assert!(!can_with_network(&blank, Network::Telegram, &caps, rights, ConversationKind::Direct, false, 10).translate);
     }
 
     #[test]
@@ -4106,10 +4463,27 @@ mod tests {
         let overridden = can(&mine_sms, &messages_caps(), none, ConversationKind::Direct, false, 1_100);
         assert!(overridden.edit && overridden.delete);
 
-        // Telegram edit_window (48h): edit offered inside window, hidden past window.
+        // Telegram edit_window (48h): edit offered inside window, hidden past window in DMs/groups,
+        // but Saved Messages and own channel posts stay editable indefinitely.
         let mine_tg = Message::plain("t1", "Me", "hi", 1_000, true);
-        assert!(can(&mine_tg, &telegram_caps(), none, ConversationKind::Direct, false, 1_000 + 3_600).edit);
-        assert!(!can(&mine_tg, &telegram_caps(), none, ConversationKind::Direct, false, 1_000 + 48 * 3_600 + 1).edit);
+        let past_48h = 1_000 + 48 * 3_600 + 1;
+        assert!(can_with_network(&mine_tg, Network::Telegram, &telegram_caps(), none, ConversationKind::Direct, false, 1_000 + 3_600).edit);
+        assert!(!can_with_network(&mine_tg, Network::Telegram, &telegram_caps(), none, ConversationKind::Direct, false, past_48h).edit);
+        assert!(can_with_network(&mine_tg, Network::Telegram, &telegram_caps(), none, ConversationKind::Channel, false, past_48h).edit);
+        assert!(
+            can_with_network_context(
+                &mine_tg,
+                Network::Telegram,
+                &telegram_caps(),
+                none,
+                ConversationKind::Direct,
+                protocol::Special::Saved,
+                false,
+                "",
+                past_48h,
+            )
+            .edit
+        );
 
         let mut mine = Message::plain("2", "Robin", "on it", 2, true);
         let own = can(&mine, &discord_caps(), none, channel, false, 100);
@@ -4266,7 +4640,7 @@ mod tests {
         // Own unpublished message in an announcement channel can be published.
         let mine_ann = can(&mine, &caps, plain, ConversationKind::Announcement, false, 20);
         assert!(mine_ann.publish);
-        assert!(menu_acts(mine_ann, false, 0, false, true, false, false, false, false, false).contains(&MenuAct::Publish));
+        assert!(menu_acts(mine_ann, false, 0, false, true, false, false, false, false, false, false).contains(&MenuAct::Publish));
 
         // Not offered in a regular text channel.
         assert!(!can(&mine, &caps, plain, ConversationKind::Channel, false, 20).publish);

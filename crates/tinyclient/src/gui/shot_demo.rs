@@ -890,7 +890,7 @@ fn premier() -> protocol::TinyCommunity {
         online: vec![ME.into(), "halvard".into()],
         media: "up".into(),
         // It speaks end-to-end encrypted text, so Encryption is one of its settings' pages.
-        capabilities: protocol::TinyCapabilities { version: String::new(), features: vec![protocol::TINY_FEATURE_E2EE_TEXT.into()] },
+        capabilities: protocol::TinyCapabilities { version: String::new(), features: vec![protocol::TINY_FEATURE_E2EE_TEXT.into()], multi_video: None },
         access: None,
         me: ME.into(),
         server: None,
@@ -984,11 +984,16 @@ fn demo_call(conversation: &protocol::Key) -> protocol::Call {
         output_level: None,
         inputs: Vec::new(),
         outputs: Vec::new(),
+        cameras: Vec::new(),
+        camera_id: String::new(),
         security: None,
         picture: None,
+        pictures: Vec::new(),
+        watch_refused: Vec::new(),
         self_view: None,
         share_view: None,
         picture_source: None,
+        video_allowed: true,
     }
 }
 
@@ -1148,6 +1153,7 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
             Response::MessageHits { hits: hits(query, conversation.as_ref()).into_iter().take(*limit as usize).collect(), cursor: None, not_searched: Vec::new(), total: None }
         }
         Request::SearchNetwork { conversation, query, .. } => Response::MessageHits { hits: hits(query, conversation.as_ref()), cursor: None, not_searched: Vec::new(), total: None },
+        Request::SearchCalendar { .. } => Response::SearchCalendar { days: Vec::new() },
         Request::Messages { conversation, page: at, limit } => page(conversation, at, *limit),
         Request::Pinned { conversation } => Response::Pinned {
             conversation: conversation.clone(),
@@ -1158,8 +1164,45 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
             conversation: conversation.clone(),
             rules: serde_json::from_value(serde_json::json!({})).expect("the default rules"),
         },
+        Request::SendRules { conversation } => Response::SendRules {
+            conversation: conversation.clone(),
+            rules: protocol::SendRules::default(),
+        },
+        Request::ModerateMember { .. }
+        | Request::SetAdmin { .. }
+        | Request::TransferOwnership { .. }
+        | Request::UpdateChatSettings { .. }
+        | Request::SetDefaultSendAs { .. } => Response::Ok,
+        Request::AdminLog { conversation, .. } => Response::AdminLog {
+            conversation: conversation.clone(),
+            entries: Vec::new(),
+        },
+        Request::SendAsOptions { conversation } => Response::SendAsOptions {
+            conversation: conversation.clone(),
+            peers: Vec::new(),
+            default: None,
+        },
         Request::Catalog { .. } => Response::Catalog { items: Vec::new(), cursor: None },
         Request::SaveGif { .. } | Request::StickerSet { .. } | Request::FaveSticker { .. } => Response::Ok,
+        Request::Transcribe { .. } => Response::Transcription { transcription: protocol::Transcription::default() },
+        Request::RateTranscript { .. } => Response::Ok,
+        Request::Translate { conversation, message_id, to } => {
+            let target_lang = protocol::normalize_language_tag(to);
+            let original = messages_of(conversation)
+                .iter()
+                .find(|m| m.id == *message_id)
+                .map(|m| m.text.as_str())
+                .unwrap_or("");
+            Response::Translated {
+                conversation: conversation.clone(),
+                message_id: message_id.clone(),
+                translation: protocol::Translation {
+                    text: format!("[{target_lang}] {original}"),
+                    source_lang: Some("auto".to_owned()),
+                    target_lang,
+                },
+            }
+        }
         Request::Watch(watching) => {
             let people = watching
                 .people
@@ -1221,6 +1264,9 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
                     link: String::new(),
                     disappearing: row.disappearing,
                     bookmarks: Vec::new(),
+                    pending_requests: 0,
+                    tabs: Vec::new(),
+                    meeting: None,
                 }),
             },
             None => Response::Error { code: protocol::ErrorCode::NotFound, detail: "Not in the demo.".into() },
@@ -1254,6 +1300,9 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
                     mobile_push: true,
                     channel_overrides: Vec::new(),
                     privacy: Some(protocol::SpacePrivacy::default()),
+                    link: String::new(),
+                    domain: String::new(),
+                    url: String::new(),
                 }),
             },
             None => Response::Error { code: protocol::ErrorCode::NotFound, detail: "Not in the demo.".into() },
@@ -1264,7 +1313,10 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
         Request::SetSpacePrivacy { .. } => Response::Ok,
         Request::Fetch { .. } | Request::FetchPreview { .. } => Response::Media { files: Vec::new() },
         Request::Settings => Response::Settings { values: Vec::new() },
-        Request::Storage => Response::Storage { messages: 48_213, files: 734_003_200 },
+        Request::GetDefaultDisappearing { .. } => Response::DefaultDisappearing { seconds: 0 },
+        Request::SuggestedFolders { .. } => Response::SuggestedFolders { folders: Vec::new() },
+        Request::TopicIcons { .. } => Response::Catalog { items: Vec::new(), cursor: None },
+        Request::Storage => Response::Storage { messages: 48_213, files: 734_003_200, chats: Vec::new() },
         Request::Prunable { .. } => Response::Prunable { messages: 0, bytes: 0 },
         Request::SignIn { .. } => Response::Error { code: protocol::ErrorCode::SignIn, detail: "The sign-in window was closed.".into() },
         Request::TinyCommunity { .. } => Response::TinyCommunity { community: premier() },

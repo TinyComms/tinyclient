@@ -71,6 +71,26 @@ pub(super) fn message_limit(premium: u8) -> usize {
     if premium == 2 { 2 * LONGEST } else { LONGEST }
 }
 
+/// What a Nitro account may send. Lower plans are the same constructor with a smaller file cap.
+pub(crate) fn capability_ceiling() -> protocol::Capabilities {
+    Discord::account_capabilities(2)
+}
+
+/// A direct or group DM is called here. Discord's own system account is not.
+pub(crate) fn private_call(system: bool) -> protocol::CallSupport {
+    if system { protocol::CallSupport::None } else { protocol::CallSupport::Native }
+}
+
+/// A voice channel is joined here.
+pub(crate) fn voice_channel_call() -> protocol::CallSupport {
+    voice::support(model::VOICE)
+}
+
+/// A stage opens in Discord.
+pub(crate) fn stage_channel_call() -> protocol::CallSupport {
+    voice::support(model::STAGE)
+}
+
 fn too_long(premium: u8, text: &str) -> Option<String> {
     let limit = message_limit(premium);
     (text.chars().count() > limit).then(|| format!("Message too long: Discord allows {limit} characters."))
@@ -2060,6 +2080,7 @@ impl Discord {
             online: parsed.get("approximate_presence_count").and_then(Value::as_u64).map(|n| n as u32),
             space_id,
             channel_id,
+            request_needed: false,
             joined,
             event,
         };
@@ -2069,7 +2090,7 @@ impl Discord {
 
     /// Joins a Discord server from an invite code (`POST /invites/{code}`). Never retries on
     /// captcha or refusal; `GUILD_CREATE` on the gateway plants the server tree.
-    fn invite_join(&self, raw: &str) -> Result<(Option<String>, Option<String>), Refusal> {
+    fn invite_join(&self, raw: &str) -> Result<(Option<String>, Option<String>, bool), Refusal> {
         let code = parse_discord_invite_code(raw).map_err(Refusal::Refused)?;
         let context = base64::engine::general_purpose::STANDARD.encode(json!({"location": "Join Guild"}).to_string());
         let path = format!("/invites/{}", escaped(&code));
@@ -2098,7 +2119,7 @@ impl Discord {
                 }
             }
         }
-        Ok((space_id, channel_id))
+        Ok((space_id, channel_id, false))
     }
 
     /// Creates a `discord.gg` invite link for a channel (`POST /channels/{id}/invites`), a
@@ -2380,7 +2401,7 @@ impl Discord {
         match self.rest.call_once_with("PUT", &path, Some(json!({})), &[]) {
             Ok(_) => Ok((Some(guild_id.to_owned()), None)),
             Err(err) => match vanity {
-                Some(code) => self.invite_join(&code),
+                Some(code) => self.invite_join(&code).map(|(space, channel, _)| (space, channel)),
                 None => Err(refusal(err)),
             },
         }
@@ -3864,7 +3885,7 @@ impl Discord {
             Command::SetPresence { presence, status, status_emoji, clear_at, reply } => {
                 answer(reply, self.set_presence(presence, status, status_emoji, clear_at))
             }
-            Command::SetProfile { name, about, pronouns, accent, banner, space_id, reply } => {
+            Command::SetProfile { name, about, pronouns, accent, banner, space_id, reply, .. } => {
                 answer(reply, self.set_profile(name, about, pronouns, accent, banner, space_id))
             }
             Command::SetAvatar { path, reply } => answer(reply, self.set_avatar(&path)),
@@ -3904,7 +3925,7 @@ impl Discord {
                 answer(reply, self.invite_preview(&code, event_id.as_deref()))
             }
             Command::InviteJoin { code, reply } => answer(reply, self.invite_join(&code)),
-            Command::CreateInvite { conversation_id, space_id, max_age, max_uses, temporary, reply } => {
+            Command::CreateInviteLink { conversation_id, space_id, max_age, max_uses, temporary, reply } => {
                 answer(reply, self.create_invite(conversation_id.as_deref(), space_id.as_deref(), max_age, max_uses, temporary))
             }
             Command::EventPreview { space_id, event_id, reply } => {
@@ -3940,7 +3961,7 @@ impl Discord {
                 answer(reply, self.delete_event(&space_id, &event_id))
             }
             Command::SpaceInvites { space_id, reply } => answer(reply, self.space_invites(&space_id)),
-            Command::RevokeInvite { space_id, code, reply } => answer(reply, self.revoke_invite(&space_id, &code)),
+            Command::RevokeSpaceInvite { space_id, code, reply } => answer(reply, self.revoke_invite(&space_id, &code)),
             Command::SetInvitesPaused { space_id, paused, reply } => {
                 answer(reply, self.set_invites_paused(&space_id, paused))
             }
@@ -3964,7 +3985,7 @@ impl Discord {
             Command::BrowseChannels { space_id, query, cursor: _, limit, reply } => {
                 answer(reply, self.browse_channels(&space_id, &query, limit))
             }
-            Command::CreateChannel { space_id, name, kind, private, group, reply } => {
+            Command::CreateChannel { space_id, name, kind, private, group, reply, .. } => {
                 answer(reply, self.create_channel(&space_id, &name, kind, private, group.as_deref()))
             }
             Command::CreateCategory { space_id, name, reply } => {
@@ -4124,7 +4145,7 @@ impl Discord {
             Command::ConversationPicture { conversation_id, path, reply } => {
                 answer(reply, self.set_group_icon(&conversation_id, &path))
             }
-            Command::MembersAdd { conversation_id, people, reply } => {
+            Command::MembersAdd { conversation_id, people, reply, .. } => {
                 // A thread takes thread members; anything else Discord lets us add to is a group DM.
                 let added = match self.add_members(&conversation_id, &people) {
                     Err(Refusal::Unsupported) => self.add_to_group(&conversation_id, &people),
@@ -4208,7 +4229,7 @@ impl Discord {
                     &element_type,
                     &value,
                     values,
-                ),
+                ).map(|()| None),
             ),
             Command::Commands { conversation_id, query, kind, reply } => {
                 answer(reply, self.commands(&conversation_id, &query, kind))

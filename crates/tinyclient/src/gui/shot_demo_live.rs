@@ -106,11 +106,16 @@ fn bare(conversation: Key, state: CallState, participants: Vec<Participant>) -> 
         device_stuck: false,
         inputs: Vec::new(),
         outputs: Vec::new(),
+        cameras: Vec::new(),
+        camera_id: String::new(),
         security: None,
         picture: None,
+        pictures: Vec::new(),
+        watch_refused: Vec::new(),
         self_view: None,
         share_view: None,
         picture_source: None,
+        video_allowed: true,
     }
 }
 

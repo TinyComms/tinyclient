@@ -130,7 +130,7 @@ fn build_search_path(
             params.push("sort_by=timestamp".into());
             params.push("sort_order=asc".into());
         }
-        SearchSort::Relevant => {
+        SearchSort::Relevance => {
             params.push("sort_by=relevance".into());
             params.push("sort_order=desc".into());
         }
@@ -450,8 +450,20 @@ pub(super) fn shared_items(message: &Message, kind: SharedKind) -> Vec<SharedIte
     };
     let pictured = |kind: MediaKind| matches!(kind, MediaKind::Image | MediaKind::Video | MediaKind::Gif);
     match kind {
-        SharedKind::Media | SharedKind::Files => {
-            let wanted = message.attachments.iter().filter(|attachment| !attachment.sticker && pictured(attachment.file.kind) == (kind == SharedKind::Media));
+        SharedKind::Media | SharedKind::Files | SharedKind::Music | SharedKind::Voice | SharedKind::Gifs => {
+            let wanted = message.attachments.iter().filter(|attachment| {
+                !attachment.sticker && match kind {
+                    SharedKind::Media => pictured(attachment.file.kind),
+                    SharedKind::Gifs => attachment.file.kind == MediaKind::Gif,
+                    SharedKind::Voice => attachment.round || !attachment.waveform.is_empty(),
+                    SharedKind::Music => {
+                        attachment.file.kind == MediaKind::Audio
+                            && attachment.waveform.is_empty()
+                            && !attachment.round
+                    }
+                    _ => !pictured(attachment.file.kind),
+                }
+            });
             wanted.map(|attachment| item(Some(attachment.clone()), "", "")).collect()
         }
         SharedKind::Links => {
@@ -3059,7 +3071,8 @@ impl Discord {
         let guild = self.guild_of(&known);
         let has = match kind {
             SharedKind::Media => "has=image&has=video",
-            SharedKind::Files => "has=file",
+            SharedKind::Files | SharedKind::Music | SharedKind::Voice => "has=file",
+            SharedKind::Gifs => "has=image",
             SharedKind::Links => "has=link",
         };
         let wanted = limit.clamp(1, SEARCH_PAGE);
@@ -3102,7 +3115,7 @@ impl Discord {
     ) {
         let searching = discord.clone();
         let run = move || {
-            let _ = reply.send(searching.search_messages(&query, &scope, &filters, cursor.as_deref(), at));
+            let _ = reply.send(searching.search_messages(&query, &scope, &filters, cursor.as_deref(), at).map(Into::into));
         };
         if let Err(err) = std::thread::Builder::new().name("discord-search".into()).spawn(run) {
             tracing::warn!("chatd: Discord: no thread for a search: {err}");
@@ -3496,7 +3509,7 @@ mod tests {
         // Cursor overrides filters.offset, mentions_me maps to own user id, and Relevant maps to relevance.
         let rel = SearchFilters {
             mentions_me: true,
-            sort: SearchSort::Relevant,
+            sort: SearchSort::Relevance,
             has: Some(SearchHas::Polls),
             author_type: Some("invalid".into()),
             ..SearchFilters::default()

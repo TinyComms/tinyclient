@@ -20,6 +20,7 @@ mod rich;
 mod rows;
 #[cfg(feature = "gui-shot")]
 mod shot;
+mod popout;
 mod side;
 mod text;
 mod text_preview;
@@ -31,6 +32,7 @@ mod wiki;
 use protocol::highlight;
 
 pub(in crate::gui) use player::glyph as player_glyph;
+pub(in crate::gui) use popout::{modifier_click, modifier_held, press_opens_row};
 
 
 use super::components::{button, empty_state, glyph, ButtonKind};
@@ -68,39 +70,10 @@ pub struct State {
     listening: OnceCell<Subscription>,
     following: OnceCell<Subscription>,
     side: side::Side,
+    /// Conversations the user opened in their own windows.
+    pub(in crate::gui) windows: popout::Windows,
     /// Age-restricted channels the user clicked Continue on during this session.
     passed_age_gate: HashSet<Key>,
-}
-
-impl Shell {
-    /// Opens an external `http://` or `https://` URL through the conversation pane's link
-    /// confirmation flow (falling back to validated `cx.open_url` if the pane isn't mounted).
-    pub(in crate::gui) fn open_external_url(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(dest) = protocol::link::Destination::parse(url) else {
-            return;
-        };
-        if let Some(pane) = self.conversation_state.pane.get().cloned() {
-            pane.update(cx, |pane, cx| pane.open_external_link(url, window, cx));
-        } else {
-            let strip = super::app::prefs::choices().strip_tracking;
-            cx.open_url(&dest.target(strip));
-        }
-    }
-}
-
-impl Shell {
-    /// Opens an external `http://`/`https://` link through the conversation pane's link-safety
-    /// confirmation flow, or validates via `Destination::parse` before opening if no pane exists.
-    pub(in crate::gui) fn open_external_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(pane) = self.conversation_state.pane.get().cloned() {
-            pane.update(cx, |pane, cx| pane.open_external_link(url, window, cx));
-            return;
-        }
-        if let Some(dest) = protocol::link::Destination::parse(url) {
-            let target = dest.target(crate::gui::app::prefs::choices().strip_tracking);
-            cx.open_url(&target);
-        }
-    }
 }
 
 impl State {
@@ -211,8 +184,22 @@ pub(super) struct Open {
     age_restricted: bool,
     /// Waiting behind the session age-gate warning until the user clicks Continue.
     gated: bool,
+    /// Special conversation role (e.g. Telegram Saved Messages, exempt from the 48h edit window).
+    special: protocol::Special,
+    /// True when this conversation is with a bot/app (enables Home / Messages / About tabs on Slack).
+    bot: bool,
+    /// True when the conversation is end-to-end encrypted (`Encryption::is_sealed()`).
+    encrypted: bool,
     #[cfg_attr(not(feature = "gui-shot"), allow(dead_code))]
     started: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum AppTab {
+    Home,
+    #[default]
+    Messages,
+    About,
 }
 
 #[derive(Default)]
@@ -429,6 +416,8 @@ pub struct Pane {
     expanded: HashSet<(String, usize)>,
     /// Blocked channel messages explicitly revealed by clicking "Show".
     revealed_blocked: HashSet<String>,
+    /// Sensitive messages (invite links / sign-in codes) revealed while Streamer mode is active.
+    revealed_sensitive: HashSet<String>,
     /// Coloured code, by message and block, so a scroll does not colour the same block again.
     code_colors: HashMap<(String, usize), (u64, Rc<highlight::Lit>)>,
     /// Blocks whose colouring is already running off this thread.
@@ -485,6 +474,10 @@ pub struct Pane {
     pending_actions: HashMap<(String, String), Instant>,
     /// Pending confirmation dialog for a Block Kit control.
     action_confirm: Option<PendingControlAction>,
+    /// Details modal returned by an interactive control (giveaway status, game high scores, alerts).
+    action_result: Option<protocol::ActionResult>,
+    /// Conversation and message that modal came from, so its Allow button can send a follow-up.
+    action_origin: Option<(Key, String)>,
     /// Currently open select/overflow/date/time picker popover for a Block Kit / Discord control.
     open_select: Option<OpenSelect>,
     /// Active interaction modal form opened by a bot/app.
@@ -518,6 +511,11 @@ pub struct Pane {
     unread_jumps_for: Option<Key>,
     unread_mention_ids: Vec<String>,
     unread_reaction_ids: Vec<String>,
+    /// On-demand inline translations for messages in the open conversation, keyed by `message_id`.
+    /// Never written to stored message history; cleared when switching conversations.
+    translations: HashMap<String, protocol::Translation>,
+    /// Messages currently waiting for an inline translation response.
+    translating: HashSet<String>,
     /// After an older page: the message that was on screen and how far below the top of the
     /// viewport it was, to put it back there once the rows above it can be measured.
     hold: Option<(String, f32)>,
@@ -546,6 +544,29 @@ pub struct Pane {
     scrub_bounds: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
     /// A file the user pressed play on before it was on disk: file, message, attachment, from.
     play_after: Option<(String, String, usize, Option<u32>)>,
+    /// Transcripts currently collapsed by the user, keyed by `(message_id, attachment_index)`.
+    transcript_collapsed: HashSet<(String, usize)>,
+    /// Transcriptions currently awaiting the initial RPC reply, keyed by `(message_id, attachment_index)`.
+    transcribing: HashSet<(String, usize)>,
+    /// That press was a round video message, so it plays in the circle when the file lands.
+    round_after: bool,
+    /// The round note muted autoplay started, stopped once it leaves the screen.
+    round_auto: Option<String>,
+    /// The round tile under the pointer, for hover autoplay.
+    round_hover: Option<String>,
+    /// The JPEG currently drawn in a round note, so the one before it can be dropped.
+    round_frame: Option<(String, String)>,
+    /// Bumped at each draw. A round tile sets [`Self::round_mark`] to it while it is laid out.
+    round_stamp: u64,
+    round_mark: u64,
+    /// Draws in a row that did not lay the round tile out. A few of them and muted autoplay stops.
+    round_miss: u8,
+    /// Clip attachment file ids whose full transcript panel is expanded.
+    transcript_open: HashSet<String>,
+    /// Lazily parsed WebVTT lines keyed by VTT `MediaFile::id`.
+    transcripts: HashMap<String, Vec<protocol::TranscriptLine>>,
+    /// Video clip attachment file ids with inline captions toggled on.
+    captions_on: HashSet<String>,
 
     /// How wide the list was when last drawn; 0 before the first draw.
     width: f32,
@@ -558,6 +579,15 @@ pub struct Pane {
     /// Coarse 60-second timer that redraws relative (`<t:unix:R>`) timestamp chips only while
     /// at least one is visible on screen. Dropped as soon as none are visible.
     relative_timer: Option<gpui::Task<()>>,
+    /// Active tab for Slack app conversations (`Home`, `Messages`, `About`).
+    app_tab: AppTab,
+    /// Loaded About + Home tab view for the open Slack app conversation (fetched on demand only).
+    app_view: Option<(Key, protocol::AppView)>,
+    app_loading: bool,
+    app_error: Option<String>,
+    /// Ephemeral messages ("Only visible to you") for the currently open conversation; kept in
+    /// memory only and cleared on conversation switch or dismissal.
+    ephemeral: Vec<Rc<Message>>,
     #[cfg(feature = "gui-shot")]
     script: shot::Script,
 }
@@ -605,6 +635,7 @@ impl Pane {
             revealed_contacts: HashSet::new(),
             expanded: HashSet::new(),
             revealed_blocked: HashSet::new(),
+            revealed_sensitive: HashSet::new(),
             code_colors: HashMap::new(),
             code_coloring: HashSet::new(),
             copied: None,
@@ -635,6 +666,8 @@ impl Pane {
             tag_popover: None,
             pending_actions: HashMap::new(),
             action_confirm: None,
+            action_result: None,
+            action_origin: None,
             open_select: None,
             interaction_modal: None,
             fetched_reactors: HashMap::new(),
@@ -646,6 +679,8 @@ impl Pane {
             invite_handoff: HashSet::new(),
             event_toggling: HashSet::new(),
             invite_resolve_times: VecDeque::new(),
+            translations: HashMap::new(),
+            translating: HashSet::new(),
             hold: None,
             land: false,
             places: crate::gui::pane::Memory::default(),
@@ -658,10 +693,27 @@ impl Pane {
             scrub: None,
             scrub_bounds: Rc::default(),
             play_after: None,
+            transcript_collapsed: HashSet::new(),
+            transcribing: HashSet::new(),
+            round_after: false,
+            round_auto: None,
+            round_hover: None,
+            round_frame: None,
+            round_stamp: 0,
+            round_mark: 0,
+            round_miss: 0,
+            transcript_open: HashSet::new(),
+            transcripts: HashMap::new(),
+            captions_on: HashSet::new(),
             width: 0.,
             opening: false,
             seen: Rc::default(),
             relative_timer: None,
+            app_tab: AppTab::Messages,
+            app_view: None,
+            app_loading: false,
+            app_error: None,
+            ephemeral: Vec::new(),
             saved_loaded_for: None,
             saved_dialogs: Vec::new(),
             saved_tags: Vec::new(),
@@ -691,6 +743,134 @@ impl Pane {
             self.revealed_contacts.insert(key);
         }
         cx.notify();
+    }
+
+    pub(super) fn toggle_transcription(&mut self, message_id: String, index: usize, cx: &mut Context<Self>) {
+        let key = (message_id, index);
+        if !self.transcript_collapsed.remove(&key) {
+            self.transcript_collapsed.insert(key);
+        }
+        cx.notify();
+    }
+
+    /// Requests server-side transcription for one voice or round video message (explicit user action only).
+    pub(super) fn transcribe(&mut self, message_id: String, index: usize, cx: &mut Context<Self>) {
+        if SCREENSHOTS {
+            return;
+        }
+        let Some(conversation) = self.open.as_ref().map(|open| open.key.clone()) else {
+            return;
+        };
+        let slot = (message_id.clone(), index);
+        self.transcript_collapsed.remove(&slot);
+        if !self.transcribing.insert(slot.clone()) {
+            return;
+        }
+        cx.notify();
+        cx.spawn(async move |pane, cx| {
+            let answer = cx
+                .background_executor()
+                .spawn(async move { ask(&Request::Transcribe { conversation, message_id }) })
+                .await;
+            let _ = pane.update(cx, |this, cx| {
+                this.transcribing.remove(&slot);
+                if let Ok(Response::Error { detail, .. }) = answer {
+                    let shell = this.shell.clone();
+                    cx.defer(move |cx| {
+                        let _ = shell.update(cx, |shell, cx| shell.toast(None, detail, cx));
+                    });
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Sends thumbs-up / thumbs-down feedback for a completed transcription.
+    pub(super) fn rate_transcript(&mut self, message_id: String, transcription_id: i64, good: bool, cx: &mut Context<Self>) {
+        if SCREENSHOTS || transcription_id == 0 {
+            return;
+        }
+        let Some(conversation) = self.open.as_ref().map(|open| open.key.clone()) else {
+            return;
+        };
+        cx.spawn(async move |pane, cx| {
+            let answer = cx
+                .background_executor()
+                .spawn(async move {
+                    ask(&Request::RateTranscript {
+                        conversation,
+                        message_id,
+                        transcription_id,
+                        good,
+                    })
+                })
+                .await;
+            let _ = pane.update(cx, |this, cx| {
+                if let Ok(Response::Error { detail, .. }) = answer {
+                    let shell = this.shell.clone();
+                    cx.defer(move |cx| {
+                        let _ = shell.update(cx, |shell, cx| shell.toast(None, detail, cx));
+                    });
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn load_transcript_file(&mut self, vtt_id: &str, path: &str) {
+        const MAX_VTT_BYTES: u64 = 512 * 1024;
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.len() > MAX_VTT_BYTES {
+                return;
+            }
+        }
+        if let Ok(raw) = std::fs::read_to_string(path) {
+            self.transcripts.insert(vtt_id.to_owned(), protocol::parse_webvtt(&raw));
+        }
+    }
+
+    fn ensure_transcript_loaded(&mut self, vtt: Option<MediaFile>, cx: &mut Context<Self>) {
+        let Some(vtt) = vtt else {
+            return;
+        };
+        if self.transcripts.contains_key(&vtt.id) {
+            return;
+        }
+        if let Some(path) = vtt.path.clone().or_else(|| self.known.get(&vtt.id).cloned()) {
+            self.load_transcript_file(&vtt.id, &path);
+        } else {
+            self.fetch(vec![vtt.id.clone()], None, vtt.failed.is_some(), cx);
+        }
+    }
+
+    pub(super) fn toggle_transcript(&mut self, clip_id: String, vtt: Option<MediaFile>, cx: &mut Context<Self>) {
+        if !self.transcript_open.remove(&clip_id) {
+            self.transcript_open.insert(clip_id);
+            self.ensure_transcript_loaded(vtt, cx);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn toggle_captions(&mut self, clip_id: String, vtt: Option<MediaFile>, cx: &mut Context<Self>) {
+        if !self.captions_on.remove(&clip_id) {
+            self.captions_on.insert(clip_id);
+            self.ensure_transcript_loaded(vtt, cx);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn transcript_lines<'a>(&'a self, transcript: &'a protocol::Transcript) -> &'a [protocol::TranscriptLine] {
+        if !transcript.lines.is_empty() {
+            return &transcript.lines;
+        }
+        if let Some(vtt) = &transcript.file {
+            if let Some(lines) = self.transcripts.get(&vtt.id) {
+                return lines;
+            }
+        }
+        &[]
     }
 
     pub(super) fn vote_poll(&mut self, message_id: String, votes: Option<Vec<u32>>, cx: &mut Context<Self>) {
@@ -732,6 +912,7 @@ impl Pane {
         cx: &mut Context<Self>,
     ) {
         let receipt = conversation.receipt();
+        let encrypted = conversation.encryption.is_sealed();
         if let Some(open) = self.open.as_mut().filter(|open| open.key == conversation.key) {
             let unlocked = open.gated && !gated;
             if open.title != conversation.title
@@ -745,6 +926,9 @@ impl Pane {
                 || open.topic != conversation.topic
                 || open.age_restricted != conversation.age_restricted
                 || open.gated != gated
+                || open.special != conversation.special
+                || open.bot != conversation.bot
+                || open.encrypted != encrypted
             {
                 open.title.clone_from(&conversation.title);
                 open.picture = picture;
@@ -757,6 +941,9 @@ impl Pane {
                 open.topic.clone_from(&conversation.topic);
                 open.age_restricted = conversation.age_restricted;
                 open.gated = gated;
+                open.special = conversation.special;
+                open.bot = conversation.bot;
+                open.encrypted = encrypted;
                 if unlocked {
                     let (landing, back, around) = self.gated_open.take().unwrap_or((None, None, None));
                     self.load_opened(landing, back, around, cx);
@@ -792,6 +979,9 @@ impl Pane {
             open.can_pin = conversation.can_pin;
             open.call = conversation.call;
             open.topic.clone_from(&conversation.topic);
+            open.special = conversation.special;
+            open.bot = conversation.bot;
+            open.encrypted = encrypted;
         }
     }
 
@@ -830,8 +1020,11 @@ impl Pane {
         let around = self.around.take();
         self.revisions = None;
         self.relative_timer = None;
+        self.translations.clear();
         self.fetched_reactors.clear();
         self.reactors_loading = None;
+        self.translations.clear();
+        self.translating.clear();
         // Where the one being left was, for coming back to it.
         if let Some((left, place)) = self.key().cloned().zip(self.place()) {
             self.places.put(left, place);
@@ -856,8 +1049,16 @@ impl Pane {
             topic: String::new(),
             age_restricted,
             gated,
+            special: protocol::Special::None,
+            bot: false,
+            encrypted: false,
             started: Instant::now(),
         });
+        self.app_tab = AppTab::Messages;
+        self.app_view = None;
+        self.app_loading = false;
+        self.app_error = None;
+        self.ephemeral.clear();
         self.window = pages::Window::default();
         self.items = Vec::new();
         self.list.reset(0);
@@ -882,6 +1083,10 @@ impl Pane {
         self.shown.clear();
         self.expanded.clear();
         self.revealed_blocked.clear();
+        self.transcript_open.clear();
+        self.transcripts.clear();
+        self.captions_on.clear();
+        self.revealed_sensitive.clear();
         self.code_colors.clear();
         self.multi_select.clear();
         self.code_coloring.clear();
@@ -902,6 +1107,8 @@ impl Pane {
         self.confirm = None;
         self.paid_react = None;
         self.action_confirm = None;
+        self.action_result = None;
+        self.action_origin = None;
         self.open_select = None;
         self.interaction_modal = None;
         self.pending_actions.clear();
@@ -1435,6 +1642,13 @@ impl Pane {
         };
         match change {
             Change::Messages { conversation } if conversation == key => self.refresh(cx),
+            Change::Ephemeral { conversation, message } if conversation == key => {
+                if self.ephemeral.len() >= 10 {
+                    self.ephemeral.remove(0);
+                }
+                self.ephemeral.push(Rc::new((**message).clone()));
+                cx.notify();
+            }
             Change::Upload { conversation, client_id, sent, total } if conversation == key => {
                 self.uploads.insert(client_id.clone(), (*sent, *total));
                 cx.notify();
@@ -1494,6 +1708,9 @@ impl Pane {
                 self.replaced.push(path.clone());
             }
             self.known.insert(file.id.clone(), path.clone());
+            if file.id.ends_with(":vtt") {
+                self.load_transcript_file(&file.id, path);
+            }
             if let Some((then, name)) = self.then.remove(&file.id) {
                 draw::open_file(path, &name, then, cx);
             }
@@ -1747,7 +1964,37 @@ impl Pane {
         }
     }
 
+    /// Muted autoplay stops once the round note has not been laid out for a few draws.
+    /// Sound keeps going: the now-playing bar is the circle that stays.
+    fn settle_round(&mut self, cx: &mut Context<Self>) {
+        let Some(file) = self.round_auto.clone() else {
+            return;
+        };
+        if self.round_mark == self.round_stamp {
+            self.round_miss = 0;
+            return;
+        }
+        self.round_miss = self.round_miss.saturating_add(1);
+        if self.round_miss < 8 {
+            return;
+        }
+        let account = self.key().map(protocol::Key::account);
+        let muted = account.as_ref().is_some_and(|account| {
+            self.shell.upgrade().is_some_and(|shell| {
+                shell.read(cx).playing_state.of(account, &file).is_some_and(|playback| {
+                    playback.muted && matches!(playback.state, protocol::PlayState::Playing | protocol::PlayState::Loading)
+                })
+            })
+        });
+        if muted {
+            let _ = self.shell.update(cx, |shell, cx| shell.play_stop(cx));
+        }
+        self.round_auto = None;
+        self.round_miss = 0;
+    }
+
     fn after_layout(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settle_round(cx);
         self.images.sweep(window, cx);
         let scale = window.scale_factor();
         if scale != self.scale {
@@ -2316,6 +2563,7 @@ impl Pane {
         value: String,
         values: Vec<String>,
         confirm: Option<protocol::ConfirmDialog>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.open_select = None;
@@ -2337,7 +2585,7 @@ impl Pane {
             cx.notify();
             return;
         }
-        self.execute_control(conversation, message_id, block_id, action_id, element_type, value, values, cx);
+        self.execute_control(conversation, message_id, block_id, action_id, element_type, value, values, window, cx);
     }
 
     /// Triggers a Block Kit link button, showing its confirmation dialog first if required.
@@ -2369,10 +2617,16 @@ impl Pane {
             cx.notify();
             return;
         }
+        // A mini app is handed to Telegram's own app. Every other tg:// link stays closed:
+        // a login token must not be opened from a message.
+        if links::telegram_app_link(&url) {
+            cx.open_url(&url);
+            return;
+        }
         self.open_external_link(&url, window, cx);
     }
 
-    /// Sends `Request::MessageAction` off-thread, tracking pending state and toasting any refusal.
+    /// Sends `Request::MessageAction` off-thread, tracking pending state and handling alerts/links/toasts.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn execute_control(
         &mut self,
@@ -2383,6 +2637,7 @@ impl Pane {
         element_type: String,
         value: String,
         values: Vec<String>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.key() != Some(&conversation) {
@@ -2391,6 +2646,7 @@ impl Pane {
         let key = (message_id.clone(), action_id.clone());
         self.pending_actions.insert(key.clone(), Instant::now());
         cx.notify();
+        let origin = (conversation.clone(), message_id.clone());
         let request = Request::MessageAction {
             conversation,
             message_id,
@@ -2400,12 +2656,24 @@ impl Pane {
             value,
             values,
         };
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
-            let _ = this.update(cx, |this, cx| {
+            let _ = this.update_in(cx, |this, window, cx| {
                 this.pending_actions.remove(&key);
                 match answer {
                     Ok(Response::Ok) => {}
+                    Ok(Response::ActionResult { result }) => {
+                        if !result.alert && result.title.is_empty() && result.fields.is_empty() && result.follow_action.is_empty() {
+                            if let Some(url) = &result.url {
+                                this.open_external_link(url, window, cx);
+                            } else if !result.text.is_empty() {
+                                this.say(result.text, cx);
+                            }
+                        } else {
+                            this.action_origin = Some(origin);
+                            this.action_result = Some(result);
+                        }
+                    }
                     Ok(Response::Error { detail, .. }) => this.say(detail, cx),
                     Err(err) => this.say(crate::client::trouble_words("run action", &err), cx),
                     _ => {}
@@ -2955,6 +3223,296 @@ impl Pane {
                 ),
         )
     }
+    fn is_slack_app(&self) -> bool {
+        !self.thread
+            && self
+                .open
+                .as_ref()
+                .is_some_and(|open| open.key.network == protocol::Network::Slack && open.bot)
+    }
+
+    fn select_app_tab(&mut self, tab: AppTab, cx: &mut Context<Self>) {
+        self.app_tab = tab;
+        if tab != AppTab::Messages {
+            self.load_app_view(tab == AppTab::Home, cx);
+        }
+        cx.notify();
+    }
+
+    fn load_app_view(&mut self, include_home: bool, cx: &mut Context<Self>) {
+        let Some(conversation) = self.key().cloned() else {
+            return;
+        };
+        let have = self
+            .app_view
+            .as_ref()
+            .is_some_and(|(k, v)| k == &conversation && (!include_home || v.home.is_some()));
+        if have || self.app_loading {
+            return;
+        }
+        self.app_loading = true;
+        self.app_error = None;
+        let expected = conversation.clone();
+        cx.spawn(async move |pane, cx| {
+            let answer = cx
+                .background_executor()
+                .spawn(async move {
+                    ask(&Request::AppView {
+                        conversation,
+                        include_home,
+                    })
+                })
+                .await;
+            let _ = pane.update(cx, |this, cx| {
+                if this.key() != Some(&expected) {
+                    return;
+                }
+                this.app_loading = false;
+                match answer {
+                    Ok(Response::AppView { view }) => {
+                        this.app_view = Some((expected, *view));
+                        this.app_error = None;
+                    }
+                    Ok(Response::Error { detail, .. }) => {
+                        this.app_error = Some(detail);
+                    }
+                    Ok(_) => {
+                        this.app_error = Some(crate::client::OTHER_ANSWER.to_owned());
+                    }
+                    Err(err) => {
+                        this.app_error = Some(crate::client::trouble_words("load app", &err));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn app_tabs_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if !self.is_slack_app() {
+            return None;
+        }
+        let open = self.open.as_ref()?;
+        let team_id = open.key.account.clone();
+        let channel_id = open.key.id.clone();
+        let open_url = self
+            .app_view
+            .as_ref()
+            .filter(|(k, _)| k == &open.key)
+            .map(|(_, v)| v.profile.open_url.clone())
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| format!("https://app.slack.com/client/{team_id}/{channel_id}"));
+        let dir_url = self
+            .app_view
+            .as_ref()
+            .filter(|(k, _)| k == &open.key)
+            .map(|(_, v)| v.profile.directory_url.clone())
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| format!("https://app.slack.com/apps/{team_id}"));
+        let tabs = [
+            (AppTab::Home, "Home"),
+            (AppTab::Messages, "Messages"),
+            (AppTab::About, "About"),
+        ];
+        let mut bar = super::components::segmented();
+        for (ix, (tab, label)) in tabs.into_iter().enumerate() {
+            bar = bar.child(
+                super::components::segment(("slack-app-tab", ix), label, self.app_tab == tab)
+                    .px(px(10.))
+                    .on_click(cx.listener(move |this, _, _, cx| this.select_app_tab(tab, cx))),
+            );
+        }
+        Some(
+            div()
+                .flex_none()
+                .px(px(theme::PANE_PAD))
+                .py(px(6.))
+                .border_b_1()
+                .border_color(theme::hairline())
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.))
+                .child(bar)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(
+                            super::components::button_with_icon(
+                                "slack-app-open",
+                                super::components::ButtonKind::Secondary,
+                                "icons/external-link.svg",
+                                "Open app in Slack",
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_external_link(&open_url, window, cx);
+                            })),
+                        )
+                        .child(
+                            super::components::button_with_icon(
+                                "slack-app-directory",
+                                super::components::ButtonKind::Secondary,
+                                "icons/plus.svg",
+                                "Add apps",
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_external_link(&dir_url, window, cx);
+                            })),
+                        ),
+                ),
+        )
+    }
+
+    fn app_tab_body(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let mut body = div()
+            .id("slack-app-tab-body")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .p(px(theme::PANE_PAD))
+            .flex()
+            .flex_col()
+            .gap(px(12.));
+        if self.app_loading {
+            return body
+                .child(div().type_ui().text_color(theme::text_soft()).child("Loading app…"))
+                .into_any_element();
+        }
+        if let Some(err) = &self.app_error {
+            return body
+                .child(div().type_ui().text_color(theme::danger()).child(err.clone()))
+                .into_any_element();
+        }
+        let Some((conv_key, view)) = self.app_view.as_ref().filter(|(k, _)| Some(k) == self.key()) else {
+            return body
+                .child(div().type_ui().text_color(theme::text_soft()).child("No app details loaded yet."))
+                .into_any_element();
+        };
+        match self.app_tab {
+            AppTab::Home => {
+                if let Some(home) = &view.home {
+                    if !home.text.trim().is_empty() {
+                        body = body.child(div().type_body().text_color(theme::text()).child(home.text.clone()));
+                    } else if !home.empty_reason.is_empty() {
+                        body = body.child(div().type_ui().text_color(theme::text_soft()).child(home.empty_reason.clone()));
+                    }
+                    if !home.controls.is_empty() {
+                        let mut row = div().flex().flex_wrap().gap(px(8.));
+                        for (ix, ctrl) in home.controls.iter().enumerate() {
+                            if let protocol::ControlKind::Button { url, style } = &ctrl.kind {
+                                let btn_kind = match style {
+                                    protocol::ControlStyle::Primary => super::components::ButtonKind::Primary,
+                                    protocol::ControlStyle::Danger => super::components::ButtonKind::Danger,
+                                    protocol::ControlStyle::Success => super::components::ButtonKind::Primary,
+                                    protocol::ControlStyle::Default => super::components::ButtonKind::Secondary,
+                                };
+                                let label = if ctrl.label.is_empty() { "Action".to_owned() } else { ctrl.label.clone() };
+                                if !url.is_empty() {
+                                    let link = url.clone();
+                                    row = row.child(
+                                        super::components::button_with_icon(
+                                            ("app-home-btn", ix),
+                                            btn_kind,
+                                            "icons/external-link.svg",
+                                            label,
+                                        )
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.open_external_link(&link, window, cx);
+                                        })),
+                                    );
+                                } else {
+                                    let conv = conv_key.clone();
+                                    let msg_id = format!("view:{}", home.view_id);
+                                    let block_id = ctrl.block_id.clone();
+                                    let action_id = ctrl.action_id.clone();
+                                    let value = ctrl.value.clone();
+                                    row = row.child(
+                                        super::components::button(("app-home-btn", ix), btn_kind, label).on_click(
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.execute_control(
+                                                    conv.clone(),
+                                                    msg_id.clone(),
+                                                    block_id.clone(),
+                                                    action_id.clone(),
+                                                    "button".to_owned(),
+                                                    value.clone(),
+                                                    Vec::new(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            }),
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                        body = body.child(row);
+                    }
+                } else {
+                    body = body.child(div().type_ui().text_color(theme::text_soft()).child("No Home view published."));
+                }
+            }
+            AppTab::About => {
+                let p = &view.profile;
+                body = body.child(div().type_title().text_color(theme::text()).child(p.name.clone()));
+                if !p.description.is_empty() {
+                    body = body.child(div().type_ui().text_color(theme::text_soft()).child(p.description.clone()));
+                }
+                if !p.installed_by.is_empty() {
+                    body = body.child(
+                        div()
+                            .type_small()
+                            .text_color(theme::text_faint())
+                            .child(format!("Installed by {}", p.installed_by)),
+                    );
+                }
+                if !p.commands.is_empty() {
+                    body = body.child(div().type_micro().text_color(theme::text_faint()).child("SLASH COMMANDS"));
+                    for cmd in &p.commands {
+                        let line = if cmd.usage.is_empty() {
+                            cmd.command.clone()
+                        } else {
+                            format!("{} {}", cmd.command, cmd.usage)
+                        };
+                        body = body.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(line))
+                                .when(!cmd.description.is_empty(), |el| {
+                                    el.child(div().type_small().text_color(theme::text_soft()).child(cmd.description.clone()))
+                                }),
+                        );
+                    }
+                }
+                if !p.links.is_empty() {
+                    body = body.child(div().type_micro().text_color(theme::text_faint()).child("LINKS"));
+                    let mut links_row = div().flex().flex_wrap().gap(px(6.));
+                    for (ix, link) in p.links.iter().enumerate() {
+                        let url = link.url.clone();
+                        links_row = links_row.child(
+                            super::components::button_with_icon(
+                                ("app-about-link", ix),
+                                super::components::ButtonKind::Secondary,
+                                "icons/external-link.svg",
+                                link.label.clone(),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_external_link(&url, window, cx);
+                            })),
+                        );
+                    }
+                    body = body.child(links_row);
+                }
+            }
+            AppTab::Messages => {}
+        }
+        body.into_any_element()
+    }
 }
 
 impl Render for Pane {
@@ -2986,6 +3544,7 @@ impl Render for Pane {
         if self.is_gated() {
             return self.age_gate_view(cx);
         }
+        self.round_stamp = self.round_stamp.wrapping_add(1);
         self.seen.borrow_mut().clear();
         let this = cx.entity();
         let rows = gpui::list(self.list.clone(), cx.processor(|this: &mut Pane, ix: usize, window, cx| this.row(ix, window, cx)))
@@ -3006,9 +3565,68 @@ impl Render for Pane {
         )
         .absolute()
         .size_0();
+        let app_bar = self.app_tabs_bar(cx);
+        let showing_app_tab = self.is_slack_app() && self.app_tab != AppTab::Messages;
+        let ephemeral_strip = (!self.ephemeral.is_empty() && !showing_app_tab).then(|| {
+            let mut list = div()
+                .flex_none()
+                .px(px(theme::PANE_PAD))
+                .py(px(6.))
+                .border_t_1()
+                .border_color(theme::hairline())
+                .bg(theme::raised())
+                .flex()
+                .flex_col()
+                .gap(px(6.));
+            for (ix, msg) in self.ephemeral.iter().enumerate() {
+                let id = msg.id.clone();
+                let who = if msg.sender.name.is_empty() { "Slackbot".to_owned() } else { msg.sender.name.clone() };
+                list = list.child(
+                    div()
+                        .id(("ephemeral-msg", ix))
+                        .flex()
+                        .items_start()
+                        .justify_between()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .child(div().type_small().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(who))
+                                        .child(div().type_micro().text_color(theme::text_faint()).child("Only visible to you")),
+                                )
+                                .child(div().type_ui().text_color(theme::text_soft()).child(msg.text.clone())),
+                        )
+                        .child(
+                            div()
+                                .id(("ephemeral-dismiss", ix))
+                                .type_micro()
+                                .text_color(theme::text_faint())
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(theme::text()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.ephemeral.retain(|m| m.id != id);
+                                    cx.notify();
+                                }))
+                                .child("Dismiss"),
+                        ),
+                );
+            }
+            list
+        });
         div()
             .id("messages")
             .size_full()
+            .flex()
+            .flex_col()
             // A phone leaves 11 pt under the last row so it never touches the composer and the
             // last message's words sit 12–20 pt above the card.
             .when(self.metrics == Metrics::PHONE, |body| body.pb(px(11.)))
@@ -3047,18 +3665,69 @@ impl Render for Pane {
                     this.point_at(window.mouse_position(), cx);
                 }
             }))
-            .child(crate::gui::components::scroll_frame("message-scroll-frame", self.list.clone(), rows).keyboard(false))
-            .child(after)
-            .children(self.saved_filter_bar(cx))
-            .children(self.live_call_row(cx))
-            .children(self.history_banner(cx))
-            .children(self.unread_jump_buttons(cx))
-            .children(self.away.then(|| self.jump_button(cx)))
-            .children(self.selection_bar(cx))
+            .children(app_bar)
+            .child(if showing_app_tab {
+                self.app_tab_body(cx)
+            } else {
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(crate::gui::components::scroll_frame("message-scroll-frame", self.list.clone(), rows).keyboard(false))
+                    .child(after)
+                    .children(self.saved_filter_bar(cx))
+                    .children(self.live_call_row(cx))
+                    .children(self.history_banner(cx))
+                    .children(self.unread_jump_buttons(cx))
+                    .children(self.away.then(|| self.jump_button(cx)))
+                    .children(self.selection_bar(cx))
+                    .into_any_element()
+            })
             .children(self.tag_popover_layer(cx))
             .children(self.action_layers(window, cx))
+            .children(ephemeral_strip)
             .children(self.viewer_layer(window, cx))
             .children(self.text_viewer_layer(window, cx))
+    }
+}
+
+impl Pane {
+    /// The latest reply keyboard while `key` is the open conversation.
+    /// A selective one stays hidden unless it mentions the reader or answers one of theirs,
+    /// and an older keyboard is not used in its place.
+    /// An empty keyboard is a hide: it clears what is showing. A message with no reply
+    /// markup is skipped, so the keyboard before it stays. A selective hide that is not
+    /// for the reader is skipped the same way.
+    pub(super) fn reply_keyboard(&self, key: &Key) -> Option<(String, protocol::ReplyKeyboard)> {
+        let open = self.open.as_ref()?;
+        if &open.key != key {
+            return None;
+        }
+        for message in self.window.messages.iter().rev() {
+            let Some(board) = message.keyboard.as_ref() else {
+                continue;
+            };
+            let answers_me = message.reply_to.as_ref().is_some_and(|reply| {
+                self.window.messages.iter().any(|held| held.id == reply.id && held.outgoing)
+            });
+            let for_me = message.mentions_me || answers_me;
+            if board.rows.is_empty() {
+                if board.selective && !for_me {
+                    continue;
+                }
+                return None;
+            }
+            if board.selective && !for_me {
+                return None;
+            }
+            return Some((message.id.clone(), board.clone()));
+        }
+        None
+    }
+
+    /// Start belongs on an empty bot chat. A thread, or a window that still has older history, has none.
+    pub(super) fn bot_can_start(&self, key: &Key) -> bool {
+        self.open.as_ref().is_some_and(|open| &open.key == key) && self.window.messages.is_empty() && !self.window.older && !self.thread
     }
 }
 
@@ -3091,6 +3760,29 @@ impl Shell {
                 cx.new(|cx| forum::Board::new(shell, cx))
             })
             .clone()
+    }
+    /// The reply keyboard under the composer, from the open pane.
+    pub(in crate::gui) fn bot_reply_keyboard(&self, key: &Key, cx: &gpui::App) -> Option<(String, protocol::ReplyKeyboard)> {
+        self.conversation_state.pane.get()?.read(cx).reply_keyboard(key)
+    }
+
+    /// Whether the open pane should offer Start for this bot chat.
+    pub(in crate::gui) fn bot_can_start(&self, key: &Key, cx: &gpui::App) -> bool {
+        self.conversation_state.pane.get().is_some_and(|pane| pane.read(cx).bot_can_start(key))
+    }
+
+    /// `messages.startBot`. An empty `start_param` is the Start button; a deep link passes its payload.
+    pub(in crate::gui) fn start_bot(&mut self, conversation: Key, start_param: String, cx: &mut Context<Self>) {
+        super::people::ask_later(cx, Request::StartBot { conversation, start_param }, |_, _| {});
+    }
+
+    /// A bot menu or keyboard URL, through the pane's link confirm.
+    pub(in crate::gui) fn open_pane_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pane) = self.conversation_state.pane.get().cloned() else {
+            return;
+        };
+        let url = url.to_owned();
+        pane.update(cx, |pane, cx| pane.open_external_link(&url, window, cx));
     }
 
     /// My own id on the account a conversation belongs to.
@@ -3164,6 +3856,20 @@ impl Shell {
         }
     }
 
+    /// Routes external HTTP/HTTPS link opens through `Pane::open_external_link` (which validates
+    /// via `Destination::parse`, enforces http/https only, strips tracking, and honors link
+    /// confirmation preferences).
+    pub(in crate::gui) fn open_external_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(pane) = self.conversation_state.pane.get().cloned() {
+            pane.update(cx, |pane, cx| pane.open_external_link(url, window, cx));
+            return;
+        }
+        if let Some(dest) = protocol::link::Destination::parse(url) {
+            let strip = crate::gui::app::prefs::choices().strip_tracking;
+            cx.open_url(&dest.target(strip));
+        }
+    }
+
     /// Back on a phone: what a pane of messages has over it (the viewer, a message's sheet, the
     /// picker, the delete question) closes first, the thread's before the conversation's.
     pub(in crate::gui) fn panes_back(&mut self, cx: &mut Context<Self>) -> bool {
@@ -3172,11 +3878,18 @@ impl Shell {
         thread.into_iter().chain(main).any(|pane| pane.update(cx, |pane, cx| pane.phone_back(cx)))
     }
 
+    /// The main pane, its thread, and any conversation window. Not the phone's back stack.
+    fn message_panes(&self) -> Vec<Entity<Pane>> {
+        let state = &self.conversation_state;
+        let mut panes: Vec<_> = state.pane.get().cloned().into_iter().chain(state.thread.borrow().clone()).collect();
+        panes.extend(state.windows.panes());
+        panes
+    }
+
     /// Draws the panes again: a player in them moved on. Only marks them, so it is safe from
     /// inside a pane's own handler, where the pane cannot be updated.
     pub(super) fn conversation_redraw(&mut self, cx: &mut Context<Self>) {
-        let state = &self.conversation_state;
-        let panes: Vec<gpui::EntityId> = state.pane.get().into_iter().chain(state.thread.borrow().as_ref()).map(Entity::entity_id).collect();
+        let panes: Vec<gpui::EntityId> = self.message_panes().iter().map(Entity::entity_id).collect();
         let app: &mut gpui::App = cx;
         for pane in panes {
             app.notify(pane);
@@ -3186,11 +3899,10 @@ impl Shell {
 
     /// Offered every change chatd reports, after `Shell` has applied its own part.
     pub(super) fn conversation_changed(&mut self, change: &Change, cx: &mut Context<Self>) {
-        let state = &self.conversation_state;
-        for pane in state.pane.get().into_iter().chain(state.thread.borrow().as_ref()) {
+        for pane in self.message_panes() {
             pane.update(cx, |pane, cx| pane.changed(change, cx));
         }
-        if let Some(board) = state.forum.get() {
+        if let Some(board) = self.conversation_state.forum.get().cloned() {
             board.update(cx, |board, cx| board.media_changed(change, cx));
         }
     }
@@ -3198,8 +3910,7 @@ impl Shell {
     /// chatd no longer knows what changed: everything held is read again.
     #[allow(dead_code)]
     pub(super) fn conversation_reset(&mut self, cx: &mut Context<Self>) {
-        let state = &self.conversation_state;
-        for pane in state.pane.get().into_iter().chain(state.thread.borrow().as_ref()) {
+        for pane in self.message_panes() {
             pane.update(cx, |pane, cx| pane.refresh(cx));
         }
     }

@@ -635,6 +635,8 @@ mod tests {
             level: None,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            cameras: Vec::new(),
+            camera_id: String::new(),
             output_level: None,
             input_id: String::new(),
             output_id: String::new(),
@@ -642,9 +644,12 @@ mod tests {
             device_stuck: false,
             security: Some(security),
             picture: None,
+            pictures: Vec::new(),
+            watch_refused: Vec::new(),
             self_view: None,
             share_view: None,
             picture_source: None,
+            video_allowed: true,
         }
     }
 

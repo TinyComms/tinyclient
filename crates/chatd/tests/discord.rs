@@ -4744,7 +4744,7 @@ fn search_maps_all_filters_sort_paging_and_all_dms_route() {
         query: "hello".into(),
         filters: protocol::SearchFilters {
             mentions_me: true,
-            sort: protocol::SearchSort::Relevant,
+            sort: protocol::SearchSort::Relevance,
             ..Default::default()
         },
         cursor: None,
@@ -4890,7 +4890,7 @@ fn discovery_lists_public_servers_and_refuses_a_url_join() {
     world.discord.script("/guilds/5002/members/@me", 403, json!({"message": "Missing Access", "code": 50001}));
     world.discord.script("/invites/moss-hang", 200, json!({"guild": {"id": "5002"}, "channel": {"id": "5102"}}));
     match world.ask(Request::JoinDiscovered { account: account.clone(), guild_id: "5002".into() }) {
-        Response::InviteJoined { space, conversation } => {
+        Response::InviteJoined { space, conversation, .. } => {
             assert_eq!(space, Some(world.key("5002")));
             assert_eq!(conversation, Some(world.key("5102")));
         }
@@ -6335,7 +6335,7 @@ fn invite_preview_join_and_error_translation() {
         account: account.clone(),
         code: "https://discord.com/invite/rustlang".into(),
     }) {
-        Response::InviteJoined { space, conversation } => {
+        Response::InviteJoined { space, conversation, .. } => {
             assert_eq!(space.map(|k| k.id), Some("9900".into()));
             assert_eq!(conversation.map(|k| k.id), Some("9901".into()));
         }
@@ -7543,6 +7543,7 @@ fn edit_own_profile_avatar_banner_and_server_nickname() {
             accent: Some(0x5865F2),
             banner: None,
             space: None,
+            birthday: None,
         }),
         Response::Ok
     );
@@ -7582,6 +7583,7 @@ fn edit_own_profile_avatar_banner_and_server_nickname() {
         accent: None,
         banner: Some(png.to_string_lossy().into_owned()),
         space: None,
+        birthday: None,
     }) {
         Response::Error { detail, .. } => assert!(detail.contains("Nitro"), "got {detail}"),
         other => panic!("expected Nitro refusal for banner, got {other:?}"),
@@ -7597,6 +7599,7 @@ fn edit_own_profile_avatar_banner_and_server_nickname() {
         accent: None,
         banner: None,
         space: Some(world.key("4000")),
+        birthday: None,
     }) {
         Response::Error { detail, .. } => assert!(detail.contains("Nitro"), "got {detail}"),
         other => panic!("expected Nitro refusal for server profile, got {other:?}"),
@@ -7658,6 +7661,7 @@ fn edit_own_profile_avatar_banner_and_server_nickname() {
             accent: None,
             banner: None,
             space: Some(nitro.key("4000")),
+            birthday: None,
         }),
         Response::Ok
     );
@@ -8584,6 +8588,7 @@ fn standalone_public_private_and_announcement_threads_with_first_message_and_inv
         world.ask(Request::MembersAdd {
             conversation: priv_thread.key.clone(),
             people: vec!["2001".into(), "2002".into()],
+            share_history: None,
         }),
         Response::Ok
     );
@@ -8922,6 +8927,7 @@ fn group_dm_start_add_friend_filter_limit_and_1to1_escalation() {
         world.ask(Request::MembersAdd {
             conversation: world.key("3003"),
             people: vec!["2003".into()],
+            share_history: None,
         }),
         Response::Ok
     );
@@ -8941,6 +8947,7 @@ fn group_dm_start_add_friend_filter_limit_and_1to1_escalation() {
     match world.ask(Request::MembersAdd {
         conversation: world.key("3003"),
         people: vec!["2006".into()],
+        share_history: None,
     }) {
         Response::Error { code: ErrorCode::Refused, detail } => {
             assert!(detail.contains("friends"), "expected friends error, got: {detail}");
@@ -8968,6 +8975,7 @@ fn group_dm_start_add_friend_filter_limit_and_1to1_escalation() {
         world.ask(Request::MembersAdd {
             conversation: world.key("3001"),
             people: vec!["2002".into()],
+            share_history: None,
         }),
         Response::Ok
     );
@@ -9002,6 +9010,7 @@ fn group_dm_start_add_friend_filter_limit_and_1to1_escalation() {
     match world.ask(Request::MembersAdd {
         conversation: world.key("3003"),
         people: extras,
+        share_history: None,
     }) {
         Response::Error { code: ErrorCode::Refused, detail } => {
             assert!(detail.contains("10"), "expected 10-person limit error, got: {detail}");
@@ -9036,7 +9045,7 @@ fn create_invite_checks_permissions_picks_first_channel_and_supports_friend_invi
     assert!(!world.conversation("4101").rights.create_invite);
 
     // Channel and server invite creation are refused locally with zero HTTP calls.
-    match world.ask(Request::CreateInvite {
+    match world.ask(Request::CreateInviteLink {
         conversation: Some(world.key("4101")),
         space: None,
         account: None,
@@ -9047,7 +9056,7 @@ fn create_invite_checks_permissions_picks_first_channel_and_supports_friend_invi
         Response::Error { code: ErrorCode::Refused, .. } => {}
         other => panic!("expected Refused for channel without CREATE_INSTANT_INVITE, got {other:?}"),
     }
-    match world.ask(Request::CreateInvite {
+    match world.ask(Request::CreateInviteLink {
         conversation: None,
         space: Some(world.key("4000")),
         account: None,
@@ -9062,7 +9071,7 @@ fn create_invite_checks_permissions_picks_first_channel_and_supports_friend_invi
 
     // Friend invite hits POST /users/@me/invites and returns a discord.gg link.
     world.discord.script("/users/@me/invites", 200, json!({"code": "fr1end"}));
-    match world.ask(Request::CreateInvite {
+    match world.ask(Request::CreateInviteLink {
         conversation: None,
         space: None,
         account: Some(account.clone()),
@@ -9079,7 +9088,7 @@ fn create_invite_checks_permissions_picks_first_channel_and_supports_friend_invi
 
     // A code that is not a single path token is refused and never turned into a link.
     world.discord.script("/users/@me/invites", 200, json!({"code": "../evil"}));
-    match world.ask(Request::CreateInvite {
+    match world.ask(Request::CreateInviteLink {
         conversation: None,
         space: None,
         account: Some(account.clone()),
@@ -9118,7 +9127,7 @@ fn create_invite_checks_permissions_picks_first_channel_and_supports_friend_invi
     assert!(world.conversation("4102").rights.create_invite);
 
     // Denied channel 4105 refuses locally.
-    match world.ask(Request::CreateInvite {
+    match world.ask(Request::CreateInviteLink {
         conversation: Some(world.key("4105")),
         space: None,
         account: None,
@@ -9133,7 +9142,7 @@ fn create_invite_checks_permissions_picks_first_channel_and_supports_friend_invi
 
     // Explicit channel invite on 4102 sends max_age, max_uses, temporary, flags: 0.
     world.discord.script("/channels/4102/invites", 200, json!({"code": "chan4102"}));
-    match world.ask(Request::CreateInvite {
+    match world.ask(Request::CreateInviteLink {
         conversation: Some(world.key("4102")),
         space: None,
         account: None,
@@ -9153,7 +9162,7 @@ fn create_invite_checks_permissions_picks_first_channel_and_supports_friend_invi
 
     // Server-level invite on 4000 skips denied 4105 and picks first allowed channel 4101 (#general).
     world.discord.script("/channels/4101/invites", 200, json!({"code": "srv4000"}));
-    match world.ask(Request::CreateInvite {
+    match world.ask(Request::CreateInviteLink {
         conversation: None,
         space: Some(world.key("4000")),
         account: None,
@@ -11003,13 +11012,13 @@ fn space_invites_list_vanity_revoke_pause_and_permission_guards() {
     }
 
     // 3. Revoking vanity code is refused locally; revoking normal invite sends DELETE /invites/k9x2ab.
-    match world.ask(Request::RevokeInvite { space: world.key("4888"), code: "rustclub".into() }) {
+    match world.ask(Request::RevokeSpaceInvite { space: world.key("4888"), code: "rustclub".into() }) {
         Response::Error { detail, .. } => assert!(detail.contains("vanity URL"), "got: {detail}"),
         other => panic!("expected vanity refusal, got {other:?}"),
     }
     world.discord.script("/invites/k9x2ab", 200, json!({"code": "k9x2ab"}));
     assert_eq!(
-        world.ask(Request::RevokeInvite { space: world.key("4888"), code: "k9x2ab".into() }),
+        world.ask(Request::RevokeSpaceInvite { space: world.key("4888"), code: "k9x2ab".into() }),
         Response::Ok
     );
     assert_eq!(world.discord.requests_to("DELETE", "/invites/k9x2ab").len(), 1);
@@ -11505,6 +11514,7 @@ fn channel_and_category_create_edit_move_delete_and_permissions() {
             kind: ConversationKind::Channel,
             private: false,
             group: None,
+            description: None, username: None,
         },
         Request::CreateCategory { space: world.key("4888"), name: "Nope".into() },
         Request::EditChannel {
@@ -11554,6 +11564,7 @@ fn channel_and_category_create_edit_move_delete_and_permissions() {
         kind: ConversationKind::Forum,
         private: true,
         group: Some(cat_id.clone()),
+        description: None, username: None,
     }) {
         Response::Conversation { conversation } => {
             assert_eq!(conversation.kind, ConversationKind::Forum);

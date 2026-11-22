@@ -7,6 +7,10 @@ fn main() -> io::Result<()> {
         println!("chatd {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    if std::env::args().nth(1).as_deref() == Some("--capabilities") {
+        print!("{}", chatd::adapters::parity::markdown());
+        return Ok(());
+    }
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("tiny-reauth-history") {
         if let Err(err) = chatd::adapters::tiny::prove_reauthenticated_history() {
             eprintln!("tiny-reauth-history: {err}");
@@ -665,6 +669,51 @@ fn main() -> io::Result<()> {
             std::process::exit(1);
         }
         eprintln!("prove-telegram-invoices:0");
+        return Ok(());
+    }
+    // The lab's telegram-giveaways driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-giveaways") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_giveaways() {
+            eprintln!("telegram-giveaways: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-giveaways:0");
+        return Ok(());
+    }
+    // The lab's telegram-games driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-games") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_games() {
+            eprintln!("telegram-games: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-games:0");
+        return Ok(());
+    }
+    // The lab's telegram-webapps driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-webapps") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_webapps() {
+            eprintln!("telegram-webapps: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-webapps:0");
+        return Ok(());
+    }
+    // The lab's telegram-round-video driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-round-video") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_round() {
+            eprintln!("telegram-round-video: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-round-video:0");
+        return Ok(());
+    }
+    // The lab's telegram-round-record driver. A build without this stays up and the driver fails.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("telegram-round-record") {
+        if let Err(err) = chatd::adapters::telegram::prove_telegram_round_record() {
+            eprintln!("telegram-round-record: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-telegram-round-record:0");
         return Ok(());
     }
     // The lab's telegram-location driver. A build without this stays up and the driver fails.

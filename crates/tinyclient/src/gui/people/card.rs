@@ -9,7 +9,7 @@ use super::{existing_direct, in_call, only_draws, person_avatar, shown_presence,
 use crate::gui::components::place::{placed, Layer, Place};
 use crate::gui::components::{
     button, button_with_icon, fade_in, menu, menu_item, menu_item_danger, menu_item_more, menu_label, menu_separator,
-    modal_body, modal_buttons, network_icon, scrim, search_field, Avatar, ButtonKind, Shape as Plate,
+    modal_body, modal_buttons, network_icon, scrim, search_field, sensitive_cover, Avatar, ButtonKind, Shape as Plate,
 };
 use crate::gui::input::{InputEvent, TextInput};
 use crate::gui::state::Shell;
@@ -163,6 +163,8 @@ pub struct Floating {
     apps: bool,
     apps_anchor: Rc<Cell<Option<Bounds<Pixels>>>>,
     apps_menu: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The open card's bio was revealed in Streamer mode. A new card hides it again.
+    bio_revealed: bool,
 }
 
 impl Floating {
@@ -192,6 +194,7 @@ impl Floating {
             apps: false,
             apps_anchor: Rc::default(),
             apps_menu: Rc::default(),
+            bio_revealed: false,
         }
     }
 
@@ -232,6 +235,7 @@ impl Floating {
         self.apps = false;
         self.apps_anchor.set(None);
         self.apps_menu.set(None);
+        self.bio_revealed = false;
         self.open = Some((float, anchor));
         self.opened += 1;
         cx.notify();
@@ -465,6 +469,7 @@ impl Floating {
         };
         self.release_note(next, cx);
         let anchor = self.open.as_ref().map(|(_, anchor)| *anchor).unwrap_or_default();
+        self.bio_revealed = false;
         self.open = Some((float, anchor));
         self.opened += 1;
         cx.notify();
@@ -652,7 +657,18 @@ impl Floating {
                 Some(CardBody::Role(_)) => {}
                 Some(CardBody::About(bio)) => {
                     any = true;
-                    body = body.child(div().type_ui().line_clamp(2).child(bio));
+                    let hide = crate::gui::streamer::is_active()
+                        && crate::gui::streamer::contains_sensitive(&bio)
+                        && !self.bio_revealed;
+                    body = if hide {
+                        body.child(sensitive_cover("card-reveal-bio", cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.bio_revealed = true;
+                            cx.notify();
+                        })))
+                    } else {
+                        body.child(div().type_ui().line_clamp(2).child(bio))
+                    };
                 }
                 None => {}
             }

@@ -29,6 +29,16 @@ pub struct Inline {
     pub runs: Vec<Run>,
 }
 
+/// Interactive action attached to an inline text run (Telegram hashtags, bot commands,
+/// `@username` mentions, and copyable phone/card numbers).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunAction {
+    Hashtag,
+    Command,
+    Username(String),
+    Copyable,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Run {
     /// Bytes of [`Inline::text`].
@@ -39,6 +49,7 @@ pub struct Run {
     pub strike: bool,
     pub code: bool,
     pub link: Option<String>,
+    pub action: Option<RunAction>,
     pub mention: Option<(MentionKind, String)>,
     /// Which spoiler this is part of: the span's start, which names it within the message.
     pub spoiler: Option<u32>,
@@ -137,6 +148,10 @@ fn inline(text: &str, spans: &[Span], range: Range<usize>, now: i64) -> Inline {
                 Style::Code => run.code = true,
                 Style::Spoiler => run.spoiler = Some(span.start),
                 Style::Link { url } => run.link = Some(url.clone()),
+                Style::Hashtag => run.action = Some(RunAction::Hashtag),
+                Style::Command => run.action = Some(RunAction::Command),
+                Style::Username { username } => run.action = Some(RunAction::Username(username.clone())),
+                Style::Copyable => run.action = Some(RunAction::Copyable),
                 Style::Mention { kind, id } => run.mention = Some((*kind, id.clone())),
                 Style::Emoji { file } => {
                     if file.path.is_some() {
@@ -756,5 +771,31 @@ mod tests {
         assert_eq!(later.plain(0..later.text.len()), "Starts 3 minutes ago sharp");
         assert_ne!(earlier.text, later.text);
         assert!(earlier.runs.iter().any(|r| r.time == Some((target_unix, 'R'))));
+    }
+
+    #[test]
+    fn clickable_telegram_spans_build_action_runs_and_copy_as_plain_text() {
+        let text = "check #rust /start @wren +15550100777";
+        let spans = [
+            span(text, "#rust", Style::Hashtag),
+            span(text, "/start", Style::Command),
+            span(text, "@wren", Style::Username { username: "wren".into() }),
+            span(text, "+15550100777", Style::Copyable),
+        ];
+        let inline = only(text, &spans);
+        let actions: Vec<(&str, &RunAction)> = inline
+            .ranges()
+            .filter_map(|(range, run)| run.action.as_ref().map(|act| (&inline.text[range], act)))
+            .collect();
+        assert_eq!(
+            actions,
+            vec![
+                ("#rust", &RunAction::Hashtag),
+                ("/start", &RunAction::Command),
+                ("@wren", &RunAction::Username("wren".into())),
+                ("+15550100777", &RunAction::Copyable),
+            ]
+        );
+        assert_eq!(inline.plain(0..inline.text.len()), text);
     }
 }

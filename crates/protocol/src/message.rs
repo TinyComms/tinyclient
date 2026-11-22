@@ -26,6 +26,8 @@ pub const MESSAGE_CONTROLS_LIMIT: usize = 32;
 pub const CONTROL_OPTIONS_LIMIT: usize = 100;
 /// Most invite or event cards attached to one message.
 pub const MESSAGE_INVITES_LIMIT: usize = 3;
+/// Most timed cues kept from a clip transcript (WebVTT).
+pub const TRANSCRIPT_LINES_LIMIT: usize = 2_000;
 
 /// Cuts text from a network to at most `chars` characters, so no frame grows with what a
 /// stranger typed.
@@ -144,6 +146,16 @@ pub enum Style {
     Emoji {
         file: MediaFile,
     },
+    /// A clickable hashtag or cashtag (`#rust`, `$BTC`): clicking searches for it in the chat.
+    Hashtag,
+    /// A clickable bot command (`/start`, `/help@bot`): clicking sends it in the open chat.
+    Command,
+    /// A clickable `@username` without a known user id: clicking resolves and opens in-app.
+    Username {
+        username: String,
+    },
+    /// A clickable phone number or bank card number: clicking copies it to the clipboard.
+    Copyable,
     /// A timestamp token (e.g. Discord `<t:unix:form>`). The underlying text carries neutral
     /// fallback words for search snippets and notifications; the shell formats `unix` in the
     /// user's locale and ticks relative (`'R'`) timestamps while on screen.
@@ -165,6 +177,222 @@ pub struct Span {
     pub start: u32,
     pub end: u32,
     pub style: Style,
+}
+
+/// Server-side transcription of a voice or round video message (Telegram).
+/// Stored inside [`Attachment::transcription`] so it survives restarts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Transcription {
+    /// Network transcription id (used for rating feedback).
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub id: i64,
+    /// Transcribed text so far (may stream in chunks while `pending` is true).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    /// True while the network is still generating the transcription.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pending: bool,
+    /// Plain-words failure or quota message (e.g. Premium required when trial is used up).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed: Option<String>,
+    /// Free trial transcriptions remaining this period (non-Premium), when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_remains: Option<u32>,
+    /// Unix seconds when the free trial resets, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_resets_at: Option<i64>,
+    /// User's rating (`Some(true)` = good, `Some(false)` = bad).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rated: Option<bool>,
+}
+
+/// One timed cue in a clip's transcript or caption track (parsed from WebVTT).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptLine {
+    /// Milliseconds from the start of the clip.
+    pub start_ms: u32,
+    /// Milliseconds at the end of the cue (0 when unknown).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub end_ms: u32,
+    pub text: String,
+}
+
+/// Optional transcript and captions metadata carried on an audio or video clip [`Attachment`].
+/// The full WebVTT track (`file`) is fetched lazily via `Request::Fetch` only when opened, never
+/// downloaded or stored for unopened clips.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Transcript {
+    /// Short preview snippet supplied inline by the network (e.g. Slack `transcription.preview`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub preview: String,
+    /// Network transcription state (`"complete"`, `"processing"`, `"failed"`, etc.) when reported.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
+    /// Registered caption track file (WebVTT), fetched on demand with the session's headers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<MediaFile>,
+    /// Timed lines when supplied inline or populated on demand.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lines: Vec<TranscriptLine>,
+}
+
+impl Transcript {
+    pub fn is_empty(&self) -> bool {
+        self.preview.is_empty() && self.status.is_empty() && self.file.is_none() && self.lines.is_empty()
+    }
+
+    /// Returns the cue active at playback position `at_ms`.
+    pub fn active_caption(&self, at_ms: u32) -> Option<&TranscriptLine> {
+        active_caption(&self.lines, at_ms)
+    }
+
+    pub fn bound(&mut self) {
+        clip(&mut self.preview, 1_000);
+        clip(&mut self.status, 64);
+        self.lines.truncate(TRANSCRIPT_LINES_LIMIT);
+        for line in &mut self.lines {
+            clip(&mut line.text, 500);
+        }
+    }
+}
+
+/// Returns the caption cue active at `at_ms`, preferring cues with an explicit `[start_ms, end_ms)`
+/// range and falling back to the latest open-ended cue (`end_ms == 0`) at or before `at_ms`.
+pub fn active_caption(lines: &[TranscriptLine], at_ms: u32) -> Option<&TranscriptLine> {
+    if let Some(hit) = lines
+        .iter()
+        .find(|line| line.end_ms > line.start_ms && at_ms >= line.start_ms && at_ms < line.end_ms)
+    {
+        return Some(hit);
+    }
+    lines
+        .iter()
+        .rev()
+        .find(|line| line.end_ms == 0 && at_ms >= line.start_ms)
+}
+
+/// Parses a WebVTT (or SRT-formatted) caption track into bounded timed [`TranscriptLine`]s.
+pub fn parse_webvtt(vtt: &str) -> Vec<TranscriptLine> {
+    let normalized = vtt.trim_start_matches('\u{feff}').replace("\r\n", "\n").replace('\r', "\n");
+    let mut out = Vec::new();
+    let mut block: Vec<&str> = Vec::new();
+    for line in normalized.split('\n').chain(std::iter::once("")) {
+        if line.trim().is_empty() {
+            if !block.is_empty() {
+                parse_vtt_block(&block, &mut out);
+                block.clear();
+                if out.len() >= TRANSCRIPT_LINES_LIMIT {
+                    break;
+                }
+            }
+        } else {
+            block.push(line);
+        }
+    }
+    out
+}
+
+fn parse_vtt_block(block: &[&str], out: &mut Vec<TranscriptLine>) {
+    let first = block[0].trim();
+    if first.starts_with("WEBVTT")
+        || first.starts_with("NOTE")
+        || first.starts_with("STYLE")
+        || first.starts_with("REGION")
+    {
+        return;
+    }
+    let Some(timing_idx) = block.iter().position(|line| line.contains("-->")) else {
+        return;
+    };
+    let Some((left, right)) = block[timing_idx].split_once("-->") else {
+        return;
+    };
+    let Some(start_ms) = parse_vtt_timestamp(left.trim()) else {
+        return;
+    };
+    let end_ms = right
+        .split_whitespace()
+        .next()
+        .and_then(parse_vtt_timestamp)
+        .unwrap_or(0);
+    let mut text = String::new();
+    for payload in &block[timing_idx + 1..] {
+        let cleaned = clean_vtt_text(payload);
+        let trimmed = cleaned.trim();
+        if !trimmed.is_empty() {
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            text.push_str(trimmed);
+        }
+    }
+    if !text.is_empty() {
+        clip(&mut text, 500);
+        out.push(TranscriptLine { start_ms, end_ms, text });
+    }
+}
+
+fn parse_vtt_timestamp(raw: &str) -> Option<u32> {
+    let parts: Vec<&str> = raw.split(':').collect();
+    let (hours, mins, sec_str) = match parts.as_slice() {
+        [h, m, s] => (h.parse::<u64>().ok()?, m.parse::<u64>().ok()?, *s),
+        [m, s] => (0u64, m.parse::<u64>().ok()?, *s),
+        _ => return None,
+    };
+    let (secs, ms) = match sec_str.split_once(['.', ',']) {
+        Some((s, frac)) => {
+            let secs = s.parse::<u64>().ok()?;
+            let digits: String = frac.chars().take_while(char::is_ascii_digit).take(3).collect();
+            let ms = match digits.len() {
+                0 => 0,
+                1 => digits.parse::<u64>().ok()? * 100,
+                2 => digits.parse::<u64>().ok()? * 10,
+                _ => digits.parse::<u64>().ok()?,
+            };
+            (secs, ms)
+        }
+        None => (sec_str.parse::<u64>().ok()?, 0),
+    };
+    let total = hours
+        .saturating_mul(3_600_000)
+        .saturating_add(mins.saturating_mul(60_000))
+        .saturating_add(secs.saturating_mul(1_000))
+        .saturating_add(ms);
+    Some(total.min(u64::from(u32::MAX)) as u32)
+}
+
+fn clean_vtt_text(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(lt) = rest.find('<') {
+        out.push_str(&rest[..lt]);
+        let after = &rest[lt + 1..];
+        let Some(gt) = after.find('>') else {
+            out.push('<');
+            rest = after;
+            break;
+        };
+        let tag = &after[..gt];
+        if let Some(tail) = tag.strip_prefix('v') {
+            if tail.starts_with([' ', '.']) {
+                if let Some((_, speaker)) = tail.split_once(' ') {
+                    let speaker = speaker.trim();
+                    if !speaker.is_empty() && out.is_empty() {
+                        out.push_str(speaker);
+                        out.push_str(": ");
+                    }
+                }
+            }
+        }
+        rest = &after[gt + 1..];
+    }
+    out.push_str(rest);
+    out.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&nbsp;", " ")
+        .replace("&apos;", "'")
+        .replace("&quot;", "\"")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,6 +438,12 @@ pub struct Attachment {
     /// Favouriting a GIF someone else posted uses this, not the file's name.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub page: String,
+    /// Server-side speech-to-text transcription for a voice or round video message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcription: Option<Transcription>,
+    /// Optional clip transcript preview and lazy caption track (Slack clips).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<Transcript>,
 }
 
 impl Attachment {
@@ -229,6 +463,8 @@ impl Attachment {
             view_once: false,
             sticker_set: String::new(),
             page: String::new(),
+            transcription: None,
+            transcript: None,
         }
     }
 }
@@ -740,7 +976,52 @@ pub enum ControlKind {
     },
 }
 
-/// One interactive control attached to a bot/app message (button, menu, picker, etc.).
+/// What a Telegram reply-keyboard button does. Text is the default and stays off the wire.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BotKeyKind {
+    #[default]
+    Text,
+    Url,
+    Phone,
+    Location,
+    Peer,
+}
+
+fn is_text_key(kind: &BotKeyKind) -> bool {
+    matches!(kind, BotKeyKind::Text)
+}
+
+/// One button on a Telegram reply keyboard. Inline callback buttons stay unmapped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotKey {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "is_text_key")]
+    pub kind: BotKeyKind,
+}
+
+/// A bot's reply keyboard, drawn under the composer. `selective` hides it unless the
+/// message mentions the reader or answers one of theirs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyKeyboard {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rows: Vec<Vec<BotKey>>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub resize: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub single_use: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub selective: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub persistent: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+}
+
+/// One interactive Block Kit or bot keyboard control attached to a message (button, menu, picker, etc.).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageControl {
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -1006,6 +1287,68 @@ pub struct ButtonAnswer {
     pub url: Option<String>,
 }
 
+/// What an interactive message control answered when it has details to display or a link to open
+/// (Telegram giveaway status, bot game launch / high scores, callback answers).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionResult {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    /// Label/value rows shown in a details modal (e.g. giveaway status, high scores).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<(String, String)>,
+    /// Validated `https://` or `http://` link to open (or offer as a button when `alert` is true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Label for the `url` action button inside a details modal (defaults to `"Open"` when empty).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url_label: String,
+    /// True when the answer should open a modal dialog rather than a brief toast or immediate open.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub alert: bool,
+    /// When set, the modal's primary button sends this action in the same conversation.
+    /// Empty means the button opens `url`, or the modal only closes.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub follow_action: String,
+    /// The value sent with [`ActionResult::follow_action`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub follow_value: String,
+}
+
+fn is_http_url(url: &str) -> bool {
+    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"));
+    rest.is_some_and(|rest| !rest.is_empty() && !url.chars().any(|c| c.is_control() || c.is_whitespace()))
+}
+
+impl ActionResult {
+    pub fn bound(&mut self) {
+        clip(&mut self.title, 256);
+        clip(&mut self.text, 4_000);
+        clip(&mut self.url_label, 120);
+        if let Some(url) = &mut self.url {
+            clip(url, 2_000);
+        }
+        if !self.url.as_deref().is_some_and(is_http_url) {
+            self.url = None;
+            self.url_label.clear();
+        }
+        self.fields.truncate(24);
+        for (label, value) in &mut self.fields {
+            clip(label, 256);
+            clip(value, 1_000);
+        }
+        clip(&mut self.follow_action, 64);
+        clip(&mut self.follow_value, 64);
+        let follow_ok = !self.follow_action.is_empty()
+            && self.follow_action.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-'));
+        if !follow_ok {
+            self.follow_action.clear();
+            self.follow_value.clear();
+        }
+    }
+}
+
 /// One message. Which conversation it is in comes from the answer that carries it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
@@ -1116,7 +1459,7 @@ pub struct Message {
     /// Why a read list is empty. "Read receipts are off" when this account does not share them.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub receipt_note: String,
-    /// Structured metadata for a call transcript row (`MessageKind::System`).
+    /// Structured metadata for a call transcription row (`MessageKind::System`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call: Option<CallNote>,
     /// Per-message edit override when the network decides per message. `None`: derived from
@@ -1152,6 +1495,10 @@ pub struct Message {
     /// Server invite or scheduled-event cards detected in the message text (resolved lazily on screen).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub invites: Vec<MessageInvite>,
+    /// Ephemeral message only visible to the current user (e.g. Slack slash-command replies).
+    /// Never stored in persistent channel history.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ephemeral: bool,
     /// Inline keyboard button rows under a bot message (Telegram `replyInlineMarkup`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub buttons: Vec<Vec<InlineButton>>,
@@ -1167,15 +1514,20 @@ pub struct Message {
     /// Who ran the command this message answers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via: Option<Via>,
-    /// Only this account can see it. Dropped at the end of the session.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub ephemeral: bool,
     /// Sent without a notification (`@silent`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub silent: bool,
     /// The app is still writing this reply.
     #[serde(default, skip_serializing_if = "is_false")]
     pub loading: bool,
+    /// Voice or round video message has not been listened to / played yet (Telegram `media_unread`).
+    /// On incoming messages, cleared once played here or on another device; on outgoing messages,
+    /// stays set until the recipient plays it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub media_unread: bool,
+    /// Telegram reply keyboard for this message. Inline keyboards are not carried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyboard: Option<ReplyKeyboard>,
 }
 
 /// How a direct or group call ended, or that it is live.
@@ -1286,14 +1638,16 @@ impl Message {
             permalink: String::new(),
             controls: Vec::new(),
             invites: Vec::new(),
+            ephemeral: false,
             buttons: Vec::new(),
             jump: None,
             published: false,
             crosspost_source: String::new(),
             via: None,
-            ephemeral: false,
             silent: false,
             loading: false,
+            media_unread: false,
+            keyboard: None,
         }
     }
 
@@ -1311,6 +1665,11 @@ impl Message {
     pub fn bound(&mut self) {
         for attachment in &mut self.attachments {
             attachment.waveform.truncate(WAVEFORM_LIMIT);
+        }
+        for attachment in &mut self.attachments {
+            if let Some(transcript) = &mut attachment.transcript {
+                transcript.bound();
+            }
         }
         if let Some(thread) = &mut self.thread {
             thread.participants.truncate(THREAD_FACES);
@@ -1383,6 +1742,21 @@ impl Message {
             clip(&mut via.command, 100);
         }
         self.controls.truncate(MESSAGE_CONTROLS_LIMIT);
+        if let Some(keyboard) = &mut self.keyboard {
+            keyboard.rows.truncate(8);
+            for row in &mut keyboard.rows {
+                row.truncate(8);
+                for key in row.iter_mut() {
+                    clip(&mut key.text, 64);
+                    if let Some(url) = &mut key.url {
+                        clip(url, 2_000);
+                    }
+                }
+            }
+            if let Some(hint) = &mut keyboard.placeholder {
+                clip(hint, 64);
+            }
+        }
         for control in &mut self.controls {
             clip(&mut control.block_id, 255);
             clip(&mut control.action_id, 255);
@@ -1489,6 +1863,7 @@ impl Message {
         self.invites.clear();
         self.buttons.clear();
         self.jump = None;
+        self.keyboard = None;
         self.poll = None;
         self.deliveries.clear();
         self.receipt_note.clear();
@@ -1496,15 +1871,18 @@ impl Message {
         self.published = false;
         self.crosspost_source.clear();
         self.mentions_me = false;
+        self.media_unread = false;
         self.deleted = true;
     }
 
     /// Every file the message refers to, for registering and for fetching what is on screen.
     pub fn files(&self) -> impl Iterator<Item = &MediaFile> {
-        let attached = self
-            .attachments
-            .iter()
-            .flat_map(|attachment| std::iter::once(&attachment.file).chain(&attachment.thumb).chain(&attachment.preview));
+        let attached = self.attachments.iter().flat_map(|attachment| {
+            std::iter::once(&attachment.file)
+                .chain(&attachment.thumb)
+                .chain(&attachment.preview)
+                .chain(attachment.transcript.as_ref().and_then(|t| t.file.as_ref()))
+        });
         let emoji = self.spans.iter().filter_map(|span| match &span.style {
             Style::Emoji { file } => Some(file),
             _ => None,
@@ -1524,10 +1902,12 @@ impl Message {
 
     /// The same, to fill in paths.
     pub fn files_mut(&mut self) -> impl Iterator<Item = &mut MediaFile> {
-        let attached = self
-            .attachments
-            .iter_mut()
-            .flat_map(|attachment| std::iter::once(&mut attachment.file).chain(&mut attachment.thumb).chain(&mut attachment.preview));
+        let attached = self.attachments.iter_mut().flat_map(|attachment| {
+            std::iter::once(&mut attachment.file)
+                .chain(&mut attachment.thumb)
+                .chain(&mut attachment.preview)
+                .chain(attachment.transcript.as_mut().and_then(|t| t.file.as_mut()))
+        });
         let emoji = self.spans.iter_mut().filter_map(|span| match &mut span.style {
             Style::Emoji { file } => Some(file),
             _ => None,
@@ -1814,6 +2194,35 @@ mod tests {
     }
 
     #[test]
+    fn webvtt_parses_timed_lines_active_caption_and_transcript_round_trips() {
+        let vtt = "\u{feff}WEBVTT\r\n\r\nNOTE generated by Slack\r\n\r\n1\r\n00:00:00.500 --> 00:00:03.200 align:start\r\n<v Ana>Hello &amp; welcome!</v>\r\n\r\n00:03.500 --> 00:07.000\r\n<i>Canary</i> is green.\r\nSecond line.\r\n\r\n01:02:03,45 --> 01:02:05,000\r\nLate cue\r\n";
+        let lines = parse_webvtt(vtt);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], TranscriptLine { start_ms: 500, end_ms: 3_200, text: "Ana: Hello & welcome!".into() });
+        assert_eq!(lines[1], TranscriptLine { start_ms: 3_500, end_ms: 7_000, text: "Canary is green. Second line.".into() });
+        assert_eq!(lines[2], TranscriptLine { start_ms: 3_723_450, end_ms: 3_725_000, text: "Late cue".into() });
+
+        assert_eq!(active_caption(&lines, 400), None);
+        assert_eq!(active_caption(&lines, 1_000), Some(&lines[0]));
+        assert_eq!(active_caption(&lines, 3_300), None);
+        assert_eq!(active_caption(&lines, 3_500), Some(&lines[1]));
+
+        let mut att = Attachment::new("clip.ogg", MediaFile::new("F0CLIP", MediaKind::Audio));
+        let plain_wire = serde_json::to_string(&att).unwrap();
+        assert!(!plain_wire.contains("transcript"), "empty transcript stays off wire");
+        assert_eq!(serde_json::from_str::<Attachment>(&plain_wire).unwrap().transcript, None);
+
+        att.transcript = Some(Transcript {
+            preview: "Hello & welcome!".into(),
+            status: "complete".into(),
+            file: Some(MediaFile::new("F0CLIP:vtt", MediaKind::File)),
+            lines: lines.clone(),
+        });
+        let rich_wire = serde_json::to_string(&att).unwrap();
+        assert_eq!(serde_json::from_str::<Attachment>(&rich_wire).unwrap(), att);
+    }
+
+    #[test]
     fn style_time_round_trips_and_defaults_form() {
         let span = Span { start: 0, end: 10, style: Style::Time { unix: 1_618_953_630, form: 'R' } };
         let wire = serde_json::to_string(&span).unwrap();
@@ -1902,5 +2311,32 @@ mod tests {
             let wire = serde_json::to_string(&span).unwrap();
             assert_eq!(serde_json::from_str::<Span>(&wire).unwrap(), span);
         }
+    }
+
+    #[test]
+    fn clickable_telegram_span_styles_round_trip() {
+        let styles = vec![
+            Style::Hashtag,
+            Style::Command,
+            Style::Username { username: "forest_wren".into() },
+            Style::Copyable,
+        ];
+        for style in styles {
+            let span = Span { start: 0, end: 5, style };
+            let wire = serde_json::to_string(&span).unwrap();
+            assert_eq!(serde_json::from_str::<Span>(&wire).unwrap(), span);
+        }
+    }
+
+    #[test]
+    fn media_unread_stays_off_wire_when_false_and_round_trips() {
+        let mut msg = Message::plain("m4", "Odalys", "", 1_700_000_000, false);
+        assert!(!serde_json::to_string(&msg).unwrap().contains("media_unread"));
+        msg.media_unread = true;
+        let wire = serde_json::to_string(&msg).unwrap();
+        assert!(wire.contains(r#""media_unread":true"#), "{wire}");
+        assert!(serde_json::from_str::<Message>(&wire).unwrap().media_unread);
+        msg.tombstone();
+        assert!(!msg.media_unread);
     }
 }

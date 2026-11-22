@@ -472,3 +472,242 @@ pub(super) fn prove() -> Result<(), String> {
     }
     Ok(())
 }
+
+/// Extracts the created group or channel peer from the `Updates` returned by
+/// `messages.createChat` or `channels.createChannel`.
+fn created_peer(updates: &tl::enums::Updates) -> Option<Who> {
+    let chats = match updates {
+        tl::enums::Updates::Updates(u) => u.chats.as_slice(),
+        tl::enums::Updates::Combined(u) => u.chats.as_slice(),
+        _ => &[],
+    };
+    chats.iter().find_map(|chat| match chat {
+        tl::enums::Chat::Chat(c) => Some(Who::Group(c.id)),
+        tl::enums::Chat::Channel(c) => Some(Who::Channel(c.id)),
+        _ => None,
+    })
+}
+
+/// Formats a user-facing note for people Telegram could not add directly (`missing_invitees`).
+pub(super) fn missing_invitee_words(names: &[String]) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
+    let who = names.join(", ");
+    Some(format!(
+        "Couldn't add {who} due to their privacy settings. Share an invite link instead."
+    ))
+}
+
+fn resolve_input_users(account: &Account, people: &[String]) -> Result<Vec<(Who, tl::enums::InputUser)>, Fault> {
+    let mut out = Vec::with_capacity(people.len());
+    for raw in people {
+        let Some((who @ Who::User(_), None)) = Who::parse(raw) else {
+            return Err(Fault::Refused(format!("Unknown Telegram person: {raw}")));
+        };
+        account.input(who)?;
+        let input = account
+            .dir()
+            .input_user(who)
+            .ok_or_else(|| Fault::Rpc { code: 400, name: "USER_ID_INVALID".to_owned(), value: None })?;
+        out.push((who, input));
+    }
+    Ok(out)
+}
+
+fn names_of_missing(account: &Account, missing: &[tl::enums::MissingInvitee]) -> Vec<String> {
+    let dir = account.dir();
+    missing
+        .iter()
+        .map(|m| {
+            let tl::enums::MissingInvitee::Invitee(m) = m;
+            let name = dir.name(Who::User(m.user_id));
+            if name.is_empty() {
+                format!("user {}", m.user_id)
+            } else {
+                name
+            }
+        })
+        .collect()
+}
+
+/// Creates a Telegram basic group (`messages.createChat`), records its row, and posts a note
+/// if Telegram returned any `missing_invitees`.
+pub(super) fn start_group(account: &Account, people: &[String], title: Option<&str>) -> Result<String, Fault> {
+    let resolved = resolve_input_users(account, people)?;
+    if resolved.is_empty() {
+        return Err(Fault::Refused("Pick at least one person for the group.".to_owned()));
+    }
+    let title = match title.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) => t.to_owned(),
+        None => {
+            let dir = account.dir();
+            let names: Vec<String> = resolved
+                .iter()
+                .take(4)
+                .map(|(who, _)| {
+                    let full = dir.name(*who);
+                    full.split_whitespace().next().unwrap_or(&full).to_owned()
+                })
+                .filter(|n| !n.is_empty())
+                .collect();
+            if names.is_empty() { "New group".to_owned() } else { names.join(", ") }
+        }
+    };
+    let users: Vec<tl::enums::InputUser> = resolved.into_iter().map(|(_, u)| u).collect();
+    let tl::enums::messages::InvitedUsers::Users(invited) = account.ask(&tl::functions::messages::CreateChat {
+        users,
+        title,
+        ttl_period: None,
+    })?;
+    super::learn_updates(account, &invited.updates);
+    let who = created_peer(&invited.updates)
+        .ok_or_else(|| Fault::Net("Telegram created the group but did not name it.".to_owned()))?;
+    super::sync::ensure_row(account, who, None);
+    // After the row: the creation line is kept only for a chat that is stored.
+    super::live::answered(account, &invited.updates);
+    let id = who.text();
+    let missing_names = names_of_missing(account, &invited.missing_invitees);
+    if let Some(note) = missing_invitee_words(&missing_names) {
+        let now = crate::hub::now();
+        let mut msg = protocol::Message::plain(format!("tg-missing-{now}"), String::new(), note, now, false);
+        msg.kind = protocol::MessageKind::System;
+        let _ = account.ctx.message(&id, &msg);
+    }
+    Ok(id)
+}
+
+/// Creates a Telegram broadcast channel or supergroup (`channels.createChannel`), optionally
+/// claiming a public `@username` (`channels.checkUsername` + `channels.updateUsername`).
+pub(super) fn create_channel(
+    account: &Account,
+    name: &str,
+    kind: protocol::ConversationKind,
+    private: bool,
+    description: Option<&str>,
+    username: Option<&str>,
+) -> Result<String, Fault> {
+    let broadcast = !matches!(kind, protocol::ConversationKind::Group | protocol::ConversationKind::Forum);
+    let megagroup = !broadcast;
+    let forum = kind == protocol::ConversationKind::Forum;
+    let answer = account.ask(&tl::functions::channels::CreateChannel {
+        broadcast,
+        megagroup,
+        for_import: false,
+        forum,
+        title: name.to_owned(),
+        about: description.unwrap_or("").trim().to_owned(),
+        geo_point: None,
+        address: None,
+        ttl_period: None,
+    })?;
+    super::learn_updates(account, &answer);
+    super::live::answered(account, &answer);
+    let who = created_peer(&answer)
+        .ok_or_else(|| Fault::Net("Telegram created the channel but did not name it.".to_owned()))?;
+    if !private {
+        if let Some(raw_user) = username.map(|u| u.trim().trim_start_matches('@')).filter(|u| !u.is_empty()) {
+            let valid = (5..=32).contains(&raw_user.len())
+                && raw_user.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_');
+            if !valid {
+                return Err(Fault::Refused(
+                    "Telegram channel usernames must be 5–32 letters, digits, or underscores.".to_owned(),
+                ));
+            }
+            let input_channel = account.input_channel(who)?;
+            let available = account.ask(&tl::functions::channels::CheckUsername {
+                channel: input_channel.clone(),
+                username: raw_user.to_owned(),
+            })?;
+            if !available {
+                return Err(Fault::Refused(format!("@{raw_user} is already taken or unavailable.")));
+            }
+            account.ask(&tl::functions::channels::UpdateUsername {
+                channel: input_channel.clone(),
+                username: raw_user.to_owned(),
+            })?;
+            if let Ok(found) = account.ask(&tl::functions::channels::GetChannels { id: vec![input_channel] }) {
+                account.learn(&[], &found.chats());
+            }
+        }
+    }
+    super::sync::ensure_row(account, who, None);
+    Ok(who.text())
+}
+
+/// Adds people to an existing Telegram basic group (`messages.addChatUser`) or channel/supergroup
+/// (`channels.inviteToChannel`). Surfaces privacy / `missing_invitees` / `PEER_FLOOD` refusals.
+pub(super) fn add_members(account: &Account, conversation: &str, people: &[String]) -> Result<(), Fault> {
+    let (who, _) = Who::parse(conversation).ok_or_else(invalid)?;
+    let resolved = resolve_input_users(account, people)?;
+    if resolved.is_empty() {
+        return Err(Fault::Refused("Pick at least one person to add.".to_owned()));
+    }
+    let mut missing_names: Vec<String> = Vec::new();
+    match who {
+        Who::Group(chat_id) => {
+            for (person_who, user_id) in resolved {
+                match account.ask(&tl::functions::messages::AddChatUser {
+                    chat_id,
+                    user_id,
+                    fwd_limit: 50,
+                }) {
+                    Ok(tl::enums::messages::InvitedUsers::Users(invited)) => {
+                        super::learn_updates(account, &invited.updates);
+                        super::live::answered(account, &invited.updates);
+                        missing_names.extend(names_of_missing(account, &invited.missing_invitees));
+                    }
+                    Err(fault) if fault.is("USER_PRIVACY_RESTRICTED") || fault.is("USER_NOT_MUTUAL_CONTACT") => {
+                        let name = account.dir().name(person_who);
+                        missing_names.push(if name.is_empty() { person_who.text() } else { name });
+                    }
+                    Err(fault) if fault.is("PEER_FLOOD") => {
+                        return Err(Fault::Refused(
+                            "Telegram rate-limited adding people. Share an invite link instead.".to_owned(),
+                        ));
+                    }
+                    Err(fault) => return Err(fault),
+                }
+            }
+        }
+        Who::Channel(_) => {
+            let channel = account.input_channel(who)?;
+            let users: Vec<tl::enums::InputUser> = resolved.into_iter().map(|(_, u)| u).collect();
+            match account.ask(&tl::functions::channels::InviteToChannel { channel, users }) {
+                Ok(tl::enums::messages::InvitedUsers::Users(invited)) => {
+                    super::learn_updates(account, &invited.updates);
+                    super::live::answered(account, &invited.updates);
+                    missing_names.extend(names_of_missing(account, &invited.missing_invitees));
+                }
+                Err(fault) if fault.is("PEER_FLOOD") => {
+                    return Err(Fault::Refused(
+                        "Telegram rate-limited adding people. Share an invite link instead.".to_owned(),
+                    ));
+                }
+                Err(fault) => return Err(fault),
+            }
+        }
+        Who::User(_) => {
+            return Err(Fault::Refused("Direct chats cannot add more members. Create a group instead.".to_owned()));
+        }
+    }
+    account.live().roster = None;
+    let _ = account.ctx.members_changed(conversation);
+    if let Some(note) = missing_invitee_words(&missing_names) {
+        return Err(Fault::Refused(note));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_invitee_words_formats_privacy_refusal() {
+        assert_eq!(missing_invitee_words(&[]), None);
+        let note = missing_invitee_words(&["Tobin Reyes".into(), "Nia Pell".into()]).unwrap();
+        assert!(note.contains("Tobin Reyes, Nia Pell"));
+        assert!(note.contains("invite link"));
+    }
+}

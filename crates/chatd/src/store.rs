@@ -115,6 +115,8 @@ const TABLES: &str = "
         kind      TEXT NOT NULL DEFAULT 'section',
         muted     INTEGER NOT NULL DEFAULT 0,
         unread_only INTEGER NOT NULL DEFAULT 0,
+        emoji     TEXT NOT NULL DEFAULT '',
+        sort      TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (network, account, space, id)
     ) WITHOUT ROWID;
     CREATE TABLE conversation (
@@ -203,6 +205,7 @@ const TABLES: &str = "
         slowmode_seconds INTEGER NOT NULL DEFAULT 0,
         locked INTEGER NOT NULL DEFAULT 0,
         age_restricted INTEGER NOT NULL DEFAULT 0,
+        voice_notes_forbidden TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (network, account, id)
     ) WITHOUT ROWID;
     CREATE INDEX conversation_threads ON conversation (network, account, parent) WHERE parent != '';
@@ -324,7 +327,7 @@ const CONVERSATION: &str = "
                                          AND f.conversation = c.id AND f.id = c.preview_id AND f.pending = 1)),
            c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason, c.spam, c.rights, c.disappearing, c.moderate, c.can_pin, c.joined, c.call_video,
            c.tags, c.message_count, c.total_message_sent, c.reaction, c.owner, c.shared, c.unread_reactions,
-           th.id, th.kind, th.width, th.height, th.bytes, th.path, th.failed, c.slowmode_seconds, c.locked, c.age_restricted
+           th.id, th.kind, th.width, th.height, th.bytes, th.path, th.failed, c.slowmode_seconds, c.locked, c.age_restricted, c.voice_notes_forbidden
     FROM conversation c
     LEFT JOIN media m ON m.network = c.network AND m.account = c.account AND m.id = c.avatar
     LEFT JOIN media th ON th.network = c.network AND th.account = c.account AND th.id = c.thumbnail AND c.thumbnail != ''
@@ -440,6 +443,8 @@ pub struct ConversationRow {
     pub slowmode_seconds: u32,
     /// Thread is locked by a moderator (Discord `thread_metadata.locked`).
     pub locked: bool,
+    /// Why voice and round video messages are not allowed here (empty when allowed).
+    pub voice_notes_forbidden: String,
     /// How the network files it. `None` leaves what is stored, so a tree that does not know
     /// (a Slack tree reload) never undoes a pin or a follow; `Some` replaces it.
     pub filing: Option<Filing>,
@@ -559,6 +564,7 @@ impl ConversationRow {
             joined: true,
             slowmode_seconds: 0,
             locked: false,
+            voice_notes_forbidden: String::new(),
         }
     }
 }
@@ -813,6 +819,7 @@ fn conversation_from(row: &Row) -> rusqlite::Result<Conversation> {
         slowmode_until: None,
         locked: row.get(75)?,
         age_restricted: row.get(76)?,
+        voice_notes_forbidden: row.get(77)?,
     })
 }
 
@@ -982,9 +989,9 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
         "INSERT INTO conversation
              (network, account, id, kind, title, space, section, position, avatar, peer, call, listed,
               topic, parent, root, read_only, private, bot, meeting, special, mark, opted_out,
-              folders, archived, pin, hidden, followed, voice_limit, encryption, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin, joined, call_video, shared, slowmode_seconds, locked, age_restricted)
+              folders, archived, pin, hidden, followed, voice_limit, encryption, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin, joined, call_video, shared, slowmode_seconds, locked, age_restricted, voice_notes_forbidden)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44)
+                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45)
          ON CONFLICT (network, account, id) DO UPDATE SET
              kind = excluded.kind, title = excluded.title, space = excluded.space,
              section = excluded.section, position = excluded.position, avatar = excluded.avatar,
@@ -1008,6 +1015,7 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
              slowmode_seconds = excluded.slowmode_seconds,
              locked = excluded.locked,
              age_restricted = excluded.age_restricted,
+             voice_notes_forbidden = excluded.voice_notes_forbidden,
              folders = CASE WHEN ?23 THEN excluded.folders ELSE folders END,
              archived = CASE WHEN ?23 THEN excluded.archived ELSE archived END,
              pin = CASE WHEN ?23 THEN excluded.pin ELSE pin END,
@@ -1058,6 +1066,7 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
             row.slowmode_seconds,
             row.locked,
             row.age_restricted,
+            row.voice_notes_forbidden,
         ],
     )?;
     Ok(())
@@ -1160,6 +1169,9 @@ fn keep_added_columns(db: &Connection, version: i32) -> rusqlite::Result<bool> {
     }
     if !column(db, "conversation", "age_restricted")? {
         db.execute_batch("ALTER TABLE conversation ADD COLUMN age_restricted INTEGER NOT NULL DEFAULT 0")?;
+    }
+    if !column(db, "conversation", "voice_notes_forbidden")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN voice_notes_forbidden TEXT NOT NULL DEFAULT ''")?;
     }
     Ok(true)
 }
@@ -1275,6 +1287,9 @@ impl Store {
         if !column(&store.db, "conversation", "age_restricted")? {
             store.db.execute_batch("ALTER TABLE conversation ADD COLUMN age_restricted INTEGER NOT NULL DEFAULT 0")?;
         }
+        if !column(&store.db, "conversation", "voice_notes_forbidden")? {
+            store.db.execute_batch("ALTER TABLE conversation ADD COLUMN voice_notes_forbidden TEXT NOT NULL DEFAULT ''")?;
+        }
         if !column(&store.db, "space", "can_create_channels")? {
             store.db.execute_batch("ALTER TABLE space ADD COLUMN can_create_channels INTEGER NOT NULL DEFAULT 0")?;
         }
@@ -1295,6 +1310,12 @@ impl Store {
         }
         if !column(&store.db, "space", "can_manage_expressions")? {
             store.db.execute_batch("ALTER TABLE space ADD COLUMN can_manage_expressions INTEGER NOT NULL DEFAULT 0")?;
+        }
+        if !column(&store.db, "section", "emoji")? {
+            store.db.execute_batch("ALTER TABLE section ADD COLUMN emoji TEXT NOT NULL DEFAULT ''")?;
+        }
+        if !column(&store.db, "section", "sort")? {
+            store.db.execute_batch("ALTER TABLE section ADD COLUMN sort TEXT NOT NULL DEFAULT ''")?;
         }
         Ok(store)
     }
@@ -1332,6 +1353,46 @@ impl Store {
     /// convert: the table is new.
     fn migrate_reminders(&mut self) -> rusqlite::Result<()> {
         self.db.execute_batch(REMINDERS_TABLE)
+    }
+
+    /// On-disk media attributed to a conversation through its cached messages.
+    /// A chat with nothing on disk is omitted. The same file in one chat counts once.
+    pub fn chat_cache(&self, limit: u32) -> rusqlite::Result<Vec<protocol::ChatCache>> {
+        let mut query = self.db.prepare(
+            "SELECT network, account, conversation, MAX(title), SUM(bytes) FROM (
+                SELECT DISTINCT r.network AS network, r.account AS account, r.conversation AS conversation,
+                       c.title AS title, r.fid AS fid, media.bytes AS bytes
+                  FROM (
+                    SELECT network, account, conversation, json_extract(j.value, '$.file.id') AS fid
+                      FROM message, json_each(message.body, '$.attachments') j
+                     WHERE json_extract(j.value, '$.file.id') IS NOT NULL
+                    UNION
+                    SELECT network, account, conversation, json_extract(j.value, '$.thumb.id')
+                      FROM message, json_each(message.body, '$.attachments') j
+                     WHERE json_extract(j.value, '$.thumb.id') IS NOT NULL
+                    UNION
+                    SELECT network, account, conversation, json_extract(j.value, '$.preview.id')
+                      FROM message, json_each(message.body, '$.attachments') j
+                     WHERE json_extract(j.value, '$.preview.id') IS NOT NULL
+                  ) r
+                  JOIN media ON media.network = r.network AND media.account = r.account AND media.id = r.fid
+                   AND media.path IS NOT NULL
+                  JOIN conversation c ON c.network = r.network AND c.account = r.account AND c.id = r.conversation
+             )
+             GROUP BY network, account, conversation
+             HAVING SUM(bytes) > 0
+             ORDER BY SUM(bytes) DESC
+             LIMIT ?1",
+        )?;
+        let rows = query.query_map(params![limit], |row| {
+            let bytes: i64 = row.get(4)?;
+            Ok(protocol::ChatCache {
+                conversation: Key { network: from_word(row.get(0)?)?, account: row.get(1)?, id: row.get(2)? },
+                title: row.get(3)?,
+                bytes: bytes.max(0) as u64,
+            })
+        })?;
+        rows.collect()
     }
 
     /// Every stored setting, the version row included.
@@ -1583,8 +1644,8 @@ impl Store {
             let is_collapsed = existing.get(&group.id).copied().unwrap_or(group.collapsed);
             tx.execute(
                 "INSERT OR REPLACE INTO section
-                     (network, account, space, id, name, position, collapsed, kind, muted, unread_only)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     (network, account, space, id, name, position, collapsed, kind, muted, unread_only, emoji, sort)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     word(&space.network),
                     space.account,
@@ -1596,6 +1657,8 @@ impl Store {
                     word(&group.kind),
                     group.muted,
                     group.unread_only,
+                    group.emoji,
+                    group.sort,
                 ],
             )?;
         }
@@ -1606,11 +1669,12 @@ impl Store {
     /// collapsed it is kept.
     pub fn upsert_group(&mut self, space: &Key, group: &Group) -> rusqlite::Result<()> {
         self.db.execute(
-            "INSERT INTO section (network, account, space, id, name, position, kind, muted, unread_only)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO section (network, account, space, id, name, position, kind, muted, unread_only, emoji, sort)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT (network, account, space, id) DO UPDATE SET
                  name = excluded.name, position = excluded.position, kind = excluded.kind,
-                 muted = excluded.muted, unread_only = excluded.unread_only",
+                 muted = excluded.muted, unread_only = excluded.unread_only,
+                 emoji = excluded.emoji, sort = excluded.sort",
             params![
                 word(&space.network),
                 space.account,
@@ -1620,10 +1684,35 @@ impl Store {
                 group.position,
                 word(&group.kind),
                 group.muted,
-                group.unread_only
+                group.unread_only,
+                group.emoji,
+                group.sort,
             ],
         )?;
         Ok(())
+    }
+
+    /// Moves one conversation into `group` (a section id in its Space).
+    pub fn set_conversation_group(&mut self, key: &Key, group: &str) -> rusqlite::Result<bool> {
+        let changed = self.db.execute(
+            "UPDATE conversation SET section = ?4
+              WHERE network = ?1 AND account = ?2 AND id = ?3",
+            params![word(&key.network), key.account, key.id, group],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Updates the positions of sections in `space` to match `section_ids` order.
+    pub fn reorder_groups(&mut self, space: &Key, section_ids: &[String]) -> rusqlite::Result<()> {
+        let tx = self.db.transaction()?;
+        for (pos, id) in section_ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE section SET position = ?5
+                  WHERE network = ?1 AND account = ?2 AND space = ?3 AND id = ?4",
+                params![word(&space.network), space.account, space.id, id, pos as i32],
+            )?;
+        }
+        tx.commit()
     }
 
     /// True if it was there. Its conversations stay, under no group.
@@ -1667,7 +1756,7 @@ impl Store {
                         (SELECT COUNT(*) FROM conversation c
                           WHERE c.network = g.network AND c.account = g.account
                             AND c.space = g.space AND c.section = g.id),
-                        g.muted, g.unread_only
+                        g.muted, g.unread_only, g.emoji, g.sort
                    FROM section g
                   WHERE g.network = ?1 AND g.account = ?2 AND g.space = ?3 ORDER BY g.position, g.id",
             )?
@@ -1681,6 +1770,8 @@ impl Store {
                     count: row.get(5)?,
                     muted: row.get(6)?,
                     unread_only: row.get(7)?,
+                    emoji: row.get(8)?,
+                    sort: row.get(9)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -1735,6 +1826,53 @@ impl Store {
         tx.commit()
     }
 
+    /// Drops all cached messages sent by `sender_id` in `conversation` (and any of its forum topic
+    /// child conversations) and returns the affected conversation IDs.
+    pub fn clear_sender_messages(&mut self, conversation: &Key, sender_id: &str) -> rusqlite::Result<Vec<String>> {
+        let tx = self.db.transaction()?;
+        let net = word(&conversation.network);
+        let escaped = conversation.id.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let prefix = format!("{escaped}\\_%");
+        let mut stmt = tx.prepare(
+            "SELECT conversation, id, text, body FROM message
+              WHERE network = ?1 AND account = ?2 AND (conversation = ?3 OR conversation LIKE ?4 ESCAPE '\\')",
+        )?;
+        let mut to_delete: Vec<(String, String)> = Vec::new();
+        for row in stmt.query_map(params![net, conversation.account, conversation.id, prefix], |row| {
+            let conv: String = row.get(0)?;
+            let id: String = row.get(1)?;
+            let text: String = row.get(2)?;
+            let body: String = row.get(3)?;
+            Ok((conv, id, text, body))
+        })? {
+            let (conv, id, text, body) = row?;
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
+                let matches_sender = parsed
+                    .get("sender")
+                    .and_then(|s| s.get("id"))
+                    .and_then(|s| s.as_str())
+                    == Some(sender_id);
+                let _ = text;
+                if matches_sender {
+                    to_delete.push((conv, id));
+                }
+            }
+        }
+        drop(stmt);
+        let mut affected: Vec<String> = Vec::new();
+        for (conv, id) in to_delete {
+            tx.execute(
+                "DELETE FROM message WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4",
+                params![net, conversation.account, conv, id],
+            )?;
+            if !affected.contains(&conv) {
+                affected.push(conv);
+            }
+        }
+        tx.commit()?;
+        Ok(affected)
+    }
+
     /// Drops the stored messages of a conversation while keeping its row in the list.
     pub fn clear_messages(&mut self, conversation: &Key) -> rusqlite::Result<bool> {
         let tx = self.db.transaction()?;
@@ -1769,6 +1907,86 @@ impl Store {
             conversation_from,
         )?;
         rows.collect()
+    }
+    /// Unread conversations for the All Unreads view (#606): unmuted (or mentioning me), not hidden,
+    /// not archived, not threads; ordered by mentions first, then newest activity.
+    pub fn unread_conversations(
+        &self,
+        network: Option<Network>,
+        space: Option<&Key>,
+        account: Option<&AccountKey>,
+        limit: u32,
+    ) -> rusqlite::Result<Vec<Conversation>> {
+        let mut clauses = vec![
+            "c.unread > 0".to_owned(),
+            "c.hidden = 0".to_owned(),
+            "c.archived = 0".to_owned(),
+            "c.kind != 'thread'".to_owned(),
+            "(c.muted = 0 OR c.mentions > 0)".to_owned(),
+        ];
+        let mut values: Vec<Value> = Vec::new();
+        if let Some(net) = network {
+            values.push(Value::Text(word(&net)));
+            clauses.push(format!("c.network = ?{}", values.len()));
+        }
+        if let Some(sp) = space {
+            values.push(Value::Text(word(&sp.network)));
+            let n_idx = values.len();
+            values.push(Value::Text(sp.account.clone()));
+            let a_idx = values.len();
+            values.push(Value::Text(sp.id.clone()));
+            let s_idx = values.len();
+            clauses.push(format!("c.network = ?{n_idx} AND c.account = ?{a_idx} AND c.space = ?{s_idx}"));
+        }
+        if let Some(acct) = account {
+            values.push(Value::Text(word(&acct.network)));
+            let n_idx = values.len();
+            values.push(Value::Text(acct.account.clone()));
+            let a_idx = values.len();
+            clauses.push(format!("c.network = ?{n_idx} AND c.account = ?{a_idx}"));
+        }
+        values.push(Value::Integer(i64::from(limit.clamp(1, 100))));
+        let limit_idx = values.len();
+        let sql = format!(
+            "{CONVERSATION} WHERE {} ORDER BY (c.mentions > 0) DESC, c.updated DESC, c.id LIMIT ?{limit_idx}",
+            clauses.join(" AND ")
+        );
+        let mut stmt = self.db.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(values), conversation_from)?;
+        rows.collect()
+    }
+
+    /// Cached unread messages for a conversation (oldest first), used by All Unreads for networks
+    /// without a live per-channel fetch or while offline (#606).
+    pub fn unread_messages(
+        &self,
+        conversation: &Key,
+        last_read: &str,
+        limit: u32,
+        now: i64,
+    ) -> rusqlite::Result<Vec<Message>> {
+        let cap = limit.clamp(1, 100);
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT id, text, body FROM message
+              WHERE network = ?1 AND account = ?2 AND conversation = ?3
+                AND (expires IS NULL OR expires > ?4)
+              {NEWEST_FIRST} LIMIT ?5"
+        ))?;
+        let mut messages: Vec<Message> = stmt
+            .query_map(
+                params![word(&conversation.network), conversation.account, conversation.id, now, cap],
+                message_from,
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        messages.reverse();
+        if !last_read.is_empty() {
+            if let Some(pos) = messages.iter().position(|m| m.id == last_read) {
+                messages = messages.split_off(pos + 1);
+            } else if last_read.contains('.') && last_read.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+                messages.retain(|m| m.id.as_str() > last_read);
+            }
+        }
+        Ok(messages)
     }
 
     /// Lists cached conversations matching `scope` for local export. Never touches any network
@@ -1993,7 +2211,7 @@ impl Store {
         let mut stmt = self.db.prepare(
             "SELECT id, kind, title, space, section, position, avatar, peer, call, voice_limit,
                     listed, topic, read_only, private, encryption, bot, meeting, special, mark,
-                    opted_out, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin, joined, call_video, shared, slowmode_seconds, locked, age_restricted
+                    opted_out, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin, joined, call_video, shared, slowmode_seconds, locked, age_restricted, voice_notes_forbidden
                FROM conversation
               WHERE network = ?1 AND account = ?2 AND space = ?3 AND parent = ''
               ORDER BY position, id",
@@ -2050,6 +2268,7 @@ impl Store {
                         slowmode_seconds: row.get(31)?,
                         locked: row.get(32)?,
                         age_restricted: row.get(33)?,
+                        voice_notes_forbidden: row.get(31)?,
                     },
                 ))
             })?
@@ -2235,6 +2454,31 @@ impl Store {
                  ORDER BY coalesce(c.pin, 2147483647), c.updated DESC, c.id LIMIT ?4 OFFSET ?5"
             ))?
             .query_map(params![word(&forum.network), forum.account, forum.id, limit, offset], conversation_from)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok((rows, total))
+    }
+
+    /// A forum's topics whose title matches `query` (case-insensitive substring).
+    pub fn topics_matching(&self, forum: &Key, query: &str, offset: u32, limit: u32) -> rusqlite::Result<(Vec<Conversation>, u32)> {
+        let escaped = query
+            .to_lowercase()
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let belongs = "c.network = ?1 AND c.account = ?2 AND c.parent = ?3 AND NOT c.hidden AND lower(c.title) LIKE ?4 ESCAPE '\\'";
+        let total = self.db.query_row(
+            &format!("SELECT COUNT(*) FROM conversation c WHERE {belongs}"),
+            params![word(&forum.network), forum.account, forum.id, pattern],
+            |row| row.get(0),
+        )?;
+        let rows = self
+            .db
+            .prepare(&format!(
+                "{CONVERSATION} WHERE {belongs}
+                 ORDER BY coalesce(c.pin, 2147483647), c.updated DESC, c.id LIMIT ?5 OFFSET ?6"
+            ))?
+            .query_map(params![word(&forum.network), forum.account, forum.id, pattern, limit, offset], conversation_from)?
             .collect::<rusqlite::Result<_>>()?;
         Ok((rows, total))
     }
@@ -3567,7 +3811,7 @@ impl Store {
         Ok(outcome)
     }
 
-    /// A transcript line that is not a message. The conversation must already exist. A row
+    /// A transcription line that is not a message. The conversation must already exist. A row
     /// with this id is left alone, so a replay does not count twice. `bump_unread` adds one
     /// to the unread count and changes nothing else on the conversation: not the preview,
     /// not when it was updated, not whether it is hidden.
@@ -3870,6 +4114,30 @@ impl Store {
         }
         Ok(conversations)
     }
+    /// Clears a stored message's `media_unread` flag in place. Returns true if the message existed
+    /// and its flag changed from true to false.
+    pub fn clear_media_unread(&mut self, conversation: &Key, id: &str) -> rusqlite::Result<bool> {
+        let Some(mut message) = self.message(conversation, id)? else {
+            return Ok(false);
+        };
+        if !message.media_unread {
+            return Ok(false);
+        }
+        message.media_unread = false;
+        self.ingest(conversation, &message, false)?;
+        Ok(true)
+    }
+
+    /// Decrements a conversation's unread mention count by one when an individual message's
+    /// mention is consumed (e.g., Telegram's `readMessageContents`).
+    pub fn consume_mention(&mut self, conversation: &Key) -> rusqlite::Result<bool> {
+        let changed = self.db.execute(
+            "UPDATE conversation SET mentions = max(0, mentions - 1)
+              WHERE network = ?1 AND account = ?2 AND id = ?3 AND mentions > 0",
+            params![word(&conversation.network), conversation.account, conversation.id],
+        )?;
+        Ok(changed == 1)
+    }
 
     pub fn delete_message(&mut self, conversation: &Key, id: &str) -> rusqlite::Result<bool> {
         let Some(mut message) = self.message(conversation, id)? else {
@@ -4068,7 +4336,9 @@ impl Store {
         }
         // The body is the protocol's JSON, so a message that holds one says so in these words.
         let holds = match kind {
-            SharedKind::Media | SharedKind::Files => "instr(body, '\"attachments\"') > 0",
+            SharedKind::Media | SharedKind::Files | SharedKind::Music | SharedKind::Voice | SharedKind::Gifs => {
+                "instr(body, '\"attachments\"') > 0"
+            }
             SharedKind::Links => "(instr(body, '\"previews\"') > 0 OR instr(body, '\"style\":\"link\"') > 0)",
         };
         let below = match before {
@@ -4109,6 +4379,28 @@ impl Store {
                     let wanted = message.attachments.iter().filter(|attachment| {
                         !attachment.sticker && pictured(attachment.file.kind) == (kind == SharedKind::Media)
                     });
+                    items.extend(wanted.map(|attachment| item(Some(attachment.clone()), "", "")));
+                }
+                SharedKind::Music => {
+                    let wanted = message.attachments.iter().filter(|attachment| {
+                        !attachment.sticker
+                            && attachment.file.kind == protocol::MediaKind::Audio
+                            && attachment.waveform.is_empty()
+                            && !attachment.round
+                    });
+                    items.extend(wanted.map(|attachment| item(Some(attachment.clone()), "", "")));
+                }
+                SharedKind::Voice => {
+                    let wanted = message.attachments.iter().filter(|attachment| {
+                        attachment.round || !attachment.waveform.is_empty()
+                    });
+                    items.extend(wanted.map(|attachment| item(Some(attachment.clone()), "", "")));
+                }
+                SharedKind::Gifs => {
+                    let wanted = message
+                        .attachments
+                        .iter()
+                        .filter(|attachment| !attachment.sticker && attachment.file.kind == protocol::MediaKind::Gif);
                     items.extend(wanted.map(|attachment| item(Some(attachment.clone()), "", "")));
                 }
                 SharedKind::Links => {
@@ -4998,6 +5290,32 @@ mod tests {
         let page = store.messages(&key, &Page::Newest, 10, NOW).unwrap().unwrap();
         assert!(page.messages[0].deleted);
         assert!(page.messages[0].attachments.is_empty());
+    }
+
+    #[test]
+    fn chat_cache_counts_only_files_on_disk_and_only_the_chat_that_shows_them() {
+        let (mut store, key) = store();
+        let mut message = said("1", "ridge", NOW);
+        let mut file = MediaFile::new("ridge-full", protocol::MediaKind::Image);
+        file.bytes = 9_000;
+        message.attachments.push(protocol::Attachment::new("ridge.jpg", file));
+        store.ingest(&key, &message, false).unwrap();
+        store.db.execute(
+            "INSERT INTO media (network, account, id, kind, bytes, path, used) VALUES ('discord', 'me', 'ridge-full', 'image', 4096, 'ridge.jpg', 1)",
+            [],
+        ).unwrap();
+        store.db.execute(
+            "INSERT INTO media (network, account, id, kind, bytes, used) VALUES ('discord', 'me', 'missing', 'image', 100, 1)",
+            [],
+        ).unwrap();
+        let mut other = said("2", "not on disk", NOW + 1);
+        other.attachments.push(protocol::Attachment::new("gone.jpg", MediaFile::new("missing", protocol::MediaKind::Image)));
+        store.ingest(&key, &other, false).unwrap();
+        let rows = store.chat_cache(40).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].conversation, key);
+        assert_eq!(rows[0].title, "#general");
+        assert_eq!(rows[0].bytes, 4096);
     }
 
     #[test]

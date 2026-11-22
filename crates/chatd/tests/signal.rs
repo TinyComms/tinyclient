@@ -826,6 +826,7 @@ fn my_own_profile_shows_and_an_edit_reaches_the_wire() {
             pronouns: None,
             emoji: None,
             username: None,
+            birthday: None,
             photo: false,
             accent: None,
             banner: None,
@@ -853,6 +854,7 @@ fn my_own_profile_shows_and_an_edit_reaches_the_wire() {
         pronouns: None,
         emoji: None,
         username: Some("nope".into()),
+        birthday: None,
         photo: false,
         accent: None,
         banner: None,
@@ -869,6 +871,7 @@ fn my_own_profile_shows_and_an_edit_reaches_the_wire() {
         pronouns: None,
         emoji: None,
         username: None,
+        birthday: None,
         photo: true,
         accent: None,
         banner: None,
@@ -1801,7 +1804,7 @@ fn adding_and_removing_group_members_respects_permissions() {
 
     let dave = "d4d4d4d4-0000-4000-8000-000000000004";
     assert_eq!(
-        world.ask(Request::MembersAdd { conversation: key(CLUB), people: vec![dave.into()] }),
+        world.ask(Request::MembersAdd { conversation: key(CLUB), people: vec![dave.into()], share_history: None }),
         Response::Ok
     );
     world.heard(&format!("group-add {CLUB} {dave}"));
@@ -1855,7 +1858,7 @@ fn adding_and_removing_group_members_respects_permissions() {
         let row = world.conversation(CLUB)?;
         (!row.rights.add_members && !row.rights.remove_members).then_some(())
     });
-    let add_err = world.ask(Request::MembersAdd { conversation: key(CLUB), people: vec![ALAN.into()] });
+    let add_err = world.ask(Request::MembersAdd { conversation: key(CLUB), people: vec![ALAN.into()], share_history: None });
     assert!(matches!(add_err, Response::Error { code: ErrorCode::Refused, .. }), "expected Refused, got {add_err:?}");
     let rem_err = world.ask(Request::MembersRemove { conversation: key(CLUB), person: GRACE.into() });
     assert!(matches!(rem_err, Response::Error { code: ErrorCode::Refused, .. }), "expected Refused, got {rem_err:?}");
@@ -3035,6 +3038,9 @@ fn voice_messages_download_populate_waveform_send_viewed_receipt_and_can_be_sent
         title: "Voice message".into(),
         at: Some(0),
         rate: 100,
+        round: false,
+        muted: false,
+        looped: false,
         output: None,
     }));
     assert_eq!(play_resp, Response::Ok);
@@ -3069,6 +3075,9 @@ fn voice_messages_download_populate_waveform_send_viewed_receipt_and_can_be_sent
             title: "Voice message".into(),
             at: Some(0),
             rate: 100,
+            round: false,
+            muted: false,
+            looped: false,
             output: None,
         })),
         Response::Ok
@@ -3156,6 +3165,9 @@ fn voice_note_with_a_bad_digest_fails_and_sends_no_viewed_receipt() {
         title: "Voice message".into(),
         at: Some(0),
         rate: 100,
+        round: false,
+        muted: false,
+        looped: false,
         output: None,
     }));
     assert!(

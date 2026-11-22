@@ -458,9 +458,7 @@ pub(super) fn file(
         let Some(folder_str) = target else {
             continue;
         };
-        let folder_id: i32 = folder_str
-            .parse()
-            .map_err(|_| Fault::Rpc { code: 400, name: "FILTER_ID_INVALID".to_owned(), value: None })?;
+        let folder_id = parse_folder_id(folder_str)?;
         let tl::enums::messages::DialogFilters::Filters(found) = account.ask(&tl::functions::messages::GetDialogFilters {})?;
         let mut updated = None;
         for filter in found.filters {
@@ -508,6 +506,207 @@ pub(super) fn file(
     }
 
     Ok(())
+}
+
+fn resolve_peers(account: &Account, ids: &[String]) -> Result<Vec<tl::enums::InputPeer>, Fault> {
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        let Some((who, None)) = Who::parse(id) else {
+            return Err(Fault::Rpc { code: 400, name: "PEER_ID_INVALID".to_owned(), value: None });
+        };
+        out.push(account.input(who)?);
+    }
+    Ok(out)
+}
+
+fn spec_from_filter(filter: &tl::enums::DialogFilter, me: i64) -> Option<protocol::FolderSpec> {
+    let ids = |peers: &[tl::enums::InputPeer]| {
+        peers.iter().filter_map(|p| input_who(p, me).map(Who::text)).collect::<Vec<String>>()
+    };
+    match filter {
+        tl::enums::DialogFilter::Filter(f) => Some(protocol::FolderSpec {
+            id: Some(f.id.to_string()),
+            name: title(&f.title),
+            emoticon: f.emoticon.clone(),
+            include: ids(&f.include_peers),
+            exclude: ids(&f.exclude_peers),
+            pinned: ids(&f.pinned_peers),
+            contacts: f.contacts,
+            non_contacts: f.non_contacts,
+            groups: f.groups,
+            broadcasts: f.broadcasts,
+            bots: f.bots,
+            exclude_muted: f.exclude_muted,
+            exclude_read: f.exclude_read,
+            exclude_archived: f.exclude_archived,
+        }),
+        tl::enums::DialogFilter::Chatlist(c) => Some(protocol::FolderSpec {
+            id: Some(c.id.to_string()),
+            name: title(&c.title),
+            emoticon: c.emoticon.clone(),
+            include: ids(&c.include_peers),
+            pinned: ids(&c.pinned_peers),
+            ..protocol::FolderSpec::default()
+        }),
+        tl::enums::DialogFilter::Default => None,
+    }
+}
+
+fn parse_folder_id(raw: &str) -> Result<i32, Fault> {
+    let id = raw
+        .parse::<i32>()
+        .map_err(|_| Fault::Rpc { code: 400, name: "FILTER_ID_INVALID".to_owned(), value: None })?;
+    if !(2..=255).contains(&id) {
+        return Err(Fault::Rpc { code: 400, name: "FILTER_ID_INVALID".to_owned(), value: None });
+    }
+    Ok(id)
+}
+
+/// Creates or edits a Telegram chat folder (`messages.updateDialogFilter`).
+pub(super) fn save_folder(account: &Account, spec: &protocol::FolderSpec) -> Result<protocol::Folder, Fault> {
+    let name = spec.name.trim().to_owned();
+    if name.is_empty() {
+        return Err(Fault::Rpc { code: 400, name: "FILTER_TITLE_EMPTY".to_owned(), value: None });
+    }
+    if name.chars().count() > 12 {
+        return Err(Fault::Rpc { code: 400, name: "FILTER_TITLE_TOO_LONG".to_owned(), value: None });
+    }
+    let any_kind = spec.contacts || spec.non_contacts || spec.groups || spec.broadcasts || spec.bots;
+    let any_peer = !spec.include.is_empty() || !spec.pinned.is_empty();
+    if !any_kind && !any_peer {
+        return Err(Fault::Rpc { code: 400, name: "FILTER_INCLUDE_EMPTY".to_owned(), value: None });
+    }
+    let editing = spec.id.is_some();
+    let premium = account.dir().get(Who::User(account.me)).is_some_and(|known| known.premium);
+    let id = match &spec.id {
+        Some(raw) => parse_folder_id(raw)?,
+        None => {
+            let live = account.live();
+            let cap = if premium { 30 } else { 10 };
+            if live.filed.rules.len() >= cap {
+                return Err(Fault::Rpc { code: 400, name: "FILTERS_TOO_MUCH".to_owned(), value: None });
+            }
+            let used: HashSet<i32> = live.filed.rules.iter().map(|r| r.id).collect();
+            (2..=255)
+                .find(|cand| !used.contains(cand))
+                .ok_or_else(|| Fault::Rpc { code: 400, name: "FILTERS_TOO_MUCH".to_owned(), value: None })?
+        }
+    };
+    let include_peers = resolve_peers(account, &spec.include)?;
+    let exclude_peers = resolve_peers(account, &spec.exclude)?;
+    let pinned_peers = resolve_peers(account, &spec.pinned)?;
+    let title_entities = tl::enums::TextWithEntities::Entities(tl::types::TextWithEntities {
+        text: name.clone(),
+        entities: Vec::new(),
+    });
+    // Preserve shared Chatlist metadata when editing an existing DialogFilterChatlist.
+    let existing_chatlist = if editing {
+        match account.ask(&tl::functions::messages::GetDialogFilters {}) {
+            Ok(tl::enums::messages::DialogFilters::Filters(found)) => found.filters.into_iter().find_map(|f| match f {
+                tl::enums::DialogFilter::Chatlist(c) if c.id == id => Some(c),
+                _ => None,
+            }),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let filter = if let Some(mut chatlist) = existing_chatlist {
+        chatlist.title = title_entities;
+        chatlist.emoticon = spec.emoticon.clone();
+        chatlist.pinned_peers = pinned_peers;
+        chatlist.include_peers = include_peers;
+        tl::enums::DialogFilter::Chatlist(chatlist)
+    } else {
+        tl::enums::DialogFilter::Filter(tl::types::DialogFilter {
+            contacts: spec.contacts,
+            non_contacts: spec.non_contacts,
+            groups: spec.groups,
+            broadcasts: spec.broadcasts,
+            bots: spec.bots,
+            exclude_muted: spec.exclude_muted,
+            exclude_read: spec.exclude_read,
+            exclude_archived: spec.exclude_archived,
+            title_noanimate: false,
+            id,
+            title: title_entities,
+            emoticon: spec.emoticon.clone(),
+            color: None,
+            pinned_peers,
+            include_peers,
+            exclude_peers,
+        })
+    };
+    account.ask(&tl::functions::messages::UpdateDialogFilter { id, filter: Some(filter.clone()) })?;
+    let position = {
+        let mut live = account.live();
+        if let Some(new_rule) = rule(&filter, account.me) {
+            if let Some(pos) = live.filed.rules.iter().position(|r| r.id == id) {
+                live.filed.rules[pos] = new_rule;
+                pos as i32
+            } else {
+                live.filed.rules.push(new_rule);
+                (live.filed.rules.len() - 1) as i32
+            }
+        } else {
+            0
+        }
+    };
+    report(account);
+    refile(account, everyone(account));
+    Ok(protocol::Folder {
+        key: protocol::Key::new(&account.ctx.account, id.to_string()),
+        name,
+        position,
+        color: None,
+        spaces: Vec::new(),
+        unread: 0,
+        mentions: 0,
+    })
+}
+
+/// Deletes a Telegram chat folder (`messages.updateDialogFilter` with `filter: None`).
+pub(super) fn delete_folder(account: &Account, folder_id: &str) -> Result<(), Fault> {
+    let id = parse_folder_id(folder_id)?;
+    account.ask(&tl::functions::messages::UpdateDialogFilter { id, filter: None })?;
+    {
+        let mut live = account.live();
+        live.filed.rules.retain(|r| r.id != id);
+    }
+    report(account);
+    refile(account, everyone(account));
+    Ok(())
+}
+
+/// Reorders Telegram chat folders (`messages.updateDialogFiltersOrder`).
+pub(super) fn reorder_folders(account: &Account, order: &[String]) -> Result<(), Fault> {
+    let mut ids = Vec::with_capacity(order.len());
+    for raw in order {
+        ids.push(parse_folder_id(raw)?);
+    }
+    account.ask(&tl::functions::messages::UpdateDialogFiltersOrder { order: ids.clone() })?;
+    {
+        let mut live = account.live();
+        live.filed
+            .rules
+            .sort_by_key(|rule| ids.iter().position(|id| *id == rule.id).unwrap_or(usize::MAX));
+    }
+    report(account);
+    Ok(())
+}
+
+/// Fetches Telegram's suggested chat folders (`messages.getSuggestedDialogFilters`).
+pub(super) fn suggested_folders(account: &Account) -> Result<Vec<protocol::SuggestedFolder>, Fault> {
+    let found = account.ask(&tl::functions::messages::GetSuggestedDialogFilters {})?;
+    let mut out = Vec::new();
+    for item in found {
+        let tl::enums::DialogFilterSuggested::Suggested(suggested) = item;
+        if let Some(mut spec) = spec_from_filter(&suggested.filter, account.me) {
+            spec.id = None;
+            out.push(protocol::SuggestedFolder { spec, description: suggested.description });
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

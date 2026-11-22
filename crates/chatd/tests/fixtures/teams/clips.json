@@ -1,0 +1,58 @@
+{
+ "voice": {
+  "id": "1760000840001",
+  "sequenceId": 841,
+  "clientmessageid": "840001",
+  "version": "1760000840001",
+  "conversationid": "19:00000000-0000-4000-8000-0000000000a1_00000000-0000-4000-8000-0000000000aa@unq.gbl.spaces",
+  "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:00000000-0000-4000-8000-0000000000a1_00000000-0000-4000-8000-0000000000aa@unq.gbl.spaces",
+  "type": "Message",
+  "messagetype": "RichText/Media_AudioMsg",
+  "contenttype": "text",
+  "content": "<URIObject uri=\"https://eu-api.asm.skype.com/v1/objects/0-weu-d1-voice1\" type=\"Audio.1\" doc_id=\"0-weu-d1-voice1\"><Title></Title><Description></Description><OriginalName v=\"voice-note.m4a\"/><FileSize v=\"32100\"/><Duration v=\"0:00:12\"/></URIObject>",
+  "amsreferences": ["0-weu-d1-voice1"],
+  "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000a1",
+  "imdisplayname": "Ana Ruiz",
+  "composetime": "2026-10-09T09:14:00.0010000Z",
+  "originalarrivaltime": "2026-10-09T09:14:00.0010000Z",
+  "properties": {
+   "waveform": "[5, 18, 29, 12]"
+  }
+ },
+ "video": {
+  "id": "1760000840002",
+  "sequenceId": 842,
+  "clientmessageid": "840002",
+  "version": "1760000840002",
+  "conversationid": "19:00000000-0000-4000-8000-0000000000a1_00000000-0000-4000-8000-0000000000aa@unq.gbl.spaces",
+  "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:00000000-0000-4000-8000-0000000000a1_00000000-0000-4000-8000-0000000000aa@unq.gbl.spaces",
+  "type": "Message",
+  "messagetype": "RichText/Media_VideoClip",
+  "contenttype": "text",
+  "content": "<URIObject uri=\"https://eu-api.asm.skype.com/v1/objects/0-weu-d1-video1\" url_thumbnail=\"https://eu-api.asm.skype.com/v1/objects/0-weu-d1-video1/views/video_imgt1\" type=\"Video.2/Media.1\" width=\"640\" height=\"360\"><OriginalName v=\"standup.mp4\"/><FileSize v=\"98765\"/><Duration v=\"0:00:25\"/></URIObject>",
+  "amsreferences": ["0-weu-d1-video1"],
+  "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000a1",
+  "imdisplayname": "Ana Ruiz",
+  "composetime": "2026-10-09T09:14:00.0020000Z",
+  "originalarrivaltime": "2026-10-09T09:14:00.0020000Z",
+  "properties": {}
+ },
+ "unhosted_voice": {
+  "id": "1760000840003",
+  "sequenceId": 843,
+  "clientmessageid": "840003",
+  "version": "1760000840003",
+  "conversationid": "19:00000000-0000-4000-8000-0000000000a1_00000000-0000-4000-8000-0000000000aa@unq.gbl.spaces",
+  "conversationLink": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations/19:00000000-0000-4000-8000-0000000000a1_00000000-0000-4000-8000-0000000000aa@unq.gbl.spaces",
+  "type": "Message",
+  "messagetype": "RichText/Media_AudioMsg",
+  "contenttype": "text",
+  "content": "<URIObject uri=\"https://untrusted.example/objects/bad\" type=\"Audio.1\"><OriginalName v=\"evil.ogg\"/></URIObject>",
+  "amsreferences": [],
+  "from": "https://emea.ng.msg.teams.microsoft.com/v1/users/ME/contacts/8:orgid:00000000-0000-4000-8000-0000000000a1",
+  "imdisplayname": "Ana Ruiz",
+  "composetime": "2026-10-09T09:14:00.0030000Z",
+  "originalarrivaltime": "2026-10-09T09:14:00.0030000Z",
+  "properties": {}
+ }
+}

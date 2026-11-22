@@ -165,8 +165,23 @@ fn windows_clock() -> Style {
         }
         Some(String::from_utf16_lossy(&buf[..count as usize - 1]))
     }
-    // 0x5c LOCALE_SNAME, 0x23 LOCALE_ITIME, 0x21 LOCALE_IDATE.
-    style_from_locale(&info(0x5c).unwrap_or_default(), info(0x23).as_deref(), info(0x21).as_deref())
+    // 0x23 LOCALE_ITIME, 0x21 LOCALE_IDATE. The name is `user_locale_name` (0x5c LOCALE_SNAME).
+    style_from_locale(&user_locale_name(), info(0x23).as_deref(), info(0x21).as_deref())
+}
+
+#[cfg(windows)]
+fn user_locale_name() -> String {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLocaleInfoW(locale: u32, kind: u32, buf: *mut u16, size: i32) -> i32;
+    }
+    let mut buf = [0u16; 85];
+    // SAFETY: the buffer is writable and its length is passed. 0x400 is LOCALE_USER_DEFAULT, 0x5c is LOCALE_SNAME.
+    let count = unsafe { GetLocaleInfoW(0x400, 0x5c, buf.as_mut_ptr(), buf.len() as i32) };
+    if count <= 1 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buf[..count as usize - 1])
 }
 
 fn clock_in(t: Local, style: Style) -> String {
@@ -180,6 +195,34 @@ fn clock_in(t: Local, style: Style) -> String {
         _ => (t.hour - 12, "PM"),
     };
     format!("{hour}:{:02} {half}", t.minute)
+}
+
+/// The language a translation asks for: the system locale's primary tag, or `en`.
+pub fn system_language() -> String {
+    language_tag(&system_locale())
+}
+
+fn system_locale() -> String {
+    #[cfg(windows)]
+    {
+        return user_locale_name();
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("LC_ALL").or_else(|_| std::env::var("LC_MESSAGES")).or_else(|_| std::env::var("LANG")).unwrap_or_default()
+    }
+}
+
+/// `en-US`, `pt_BR.UTF-8`, and `C` become `en`, `pt`, and `en`.
+fn language_tag(raw: &str) -> String {
+    let primary = raw.trim().split(['-', '_', '.']).next().unwrap_or("");
+    let tag: String = primary.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+    let tag = tag.to_ascii_lowercase();
+    if (2..=3).contains(&tag.len()) {
+        tag
+    } else {
+        "en".to_owned()
+    }
 }
 
 /// `10:37 PM` or `22:37`: a message's time, whatever its age.
@@ -388,6 +431,46 @@ pub fn duration(seconds: u64) -> String {
     }
 }
 
+/// `Today 14:00–14:30`. `end_clock` empty means the end is the start.
+pub fn meeting_words(day: &str, start_clock: &str, end_clock: &str) -> String {
+    if end_clock.is_empty() {
+        format!("{day} {start_clock}")
+    } else {
+        format!("{day} {start_clock}–{end_clock}")
+    }
+}
+
+/// [`meeting_words`] plus the RSVP word, when there is one.
+pub fn meeting_line(day: &str, start_clock: &str, end_clock: &str, response_label: &str) -> String {
+    let words = meeting_words(day, start_clock, end_clock);
+    if response_label.is_empty() { words } else { format!("{words} · {response_label}") }
+}
+
+/// True from fifteen minutes before the start until it starts, and only while it has not ended.
+pub fn meeting_starts_soon(now: i64, start: i64, end: i64) -> bool {
+    end > now && start > now && start - now <= 15 * 60
+}
+
+/// True from the start until the end.
+pub fn meeting_live(now: i64, start: i64, end: i64) -> bool {
+    now >= start && now < end
+}
+
+/// The line Upcoming, the header, and Details show. `Now` and `Starting soon` lead when they apply.
+pub fn meeting_display(event: &protocol::MeetingEvent, now: i64) -> String {
+    let day = if same_day(event.start, now) { "Today" } else { "Later" };
+    let start = clock(event.start);
+    let end = if event.end > event.start { clock(event.end) } else { String::new() };
+    let line = meeting_line(day, &start, &end, event.response.label());
+    if meeting_live(now, event.start, event.end) {
+        format!("Now · {line}")
+    } else if meeting_starts_soon(now, event.start, event.end) {
+        format!("Starting soon · {line}")
+    } else {
+        line
+    }
+}
+
 /// Seconds from `now` to the next local midnight: when day labels roll over.
 #[allow(dead_code)]
 pub fn until_midnight(now: i64) -> u64 {
@@ -418,6 +501,15 @@ mod tests {
         assert_eq!(style_from_locale("en-US", Some("0"), Some("0")), US);
         assert_eq!(style_from_locale("en-US", Some("1"), Some("0")), Style { hour24: true, month_first: true });
         assert_eq!(style_from_locale("en-GB", None, None), UK);
+    }
+
+    #[test]
+    fn a_language_tag_is_the_primary_subtag() {
+        assert_eq!(language_tag("en-US"), "en");
+        assert_eq!(language_tag("pt_BR.UTF-8"), "pt");
+        assert_eq!(language_tag("EN"), "en");
+        assert_eq!(language_tag("C"), "en");
+        assert_eq!(language_tag(""), "en");
     }
 
     #[test]
@@ -464,6 +556,23 @@ mod tests {
         assert_eq!(style(), UK);
         set_style(US);
         assert_eq!(style(), US);
+    }
+
+    #[test]
+    fn a_meeting_line_says_the_day_then_the_clocks_and_soon_is_fifteen_minutes() {
+        assert_eq!(meeting_words("Today", "14:00", "14:30"), "Today 14:00–14:30");
+        assert_eq!(meeting_line("Today", "14:00", "14:30", "Accepted"), "Today 14:00–14:30 · Accepted");
+        assert_eq!(meeting_line("Later", "09:00", "09:30", ""), "Later 09:00–09:30");
+        assert_eq!(meeting_words("Today", "14:00", ""), "Today 14:00");
+        let start = 1_700_000_000;
+        assert!(meeting_starts_soon(start - 15 * 60, start, start + 1800));
+        assert!(meeting_starts_soon(start - 60, start, start + 1800));
+        assert!(!meeting_starts_soon(start - 15 * 60 - 1, start, start + 1800));
+        assert!(!meeting_starts_soon(start, start, start + 1800));
+        assert!(meeting_live(start, start, start + 1800));
+        assert!(meeting_live(start + 1799, start, start + 1800));
+        assert!(!meeting_live(start + 1800, start, start + 1800));
+        assert!(!meeting_starts_soon(start + 10, start, start + 1800));
     }
 
     #[test]

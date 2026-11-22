@@ -96,6 +96,8 @@ pub enum PickerEvent {
     Send(Pick),
     /// One of the above chosen with Shift-Return: the picker stays open.
     Kept(Box<PickerEvent>),
+    /// Open an external HTTPS link (e.g. Slack custom emoji management).
+    OpenUrl(String),
     Closed,
 }
 
@@ -1223,7 +1225,35 @@ impl Picker {
                     false => div().flex_1(),
                 };
                 let tones = self.tones();
-                footer.child(preview.unwrap_or_else(idle)).when(tones, |footer| footer.child(tone)).into_any_element()
+                let add_emoji = (self.setup.network == Some(Network::Slack))
+                    .then(|| self.setup.account.as_ref().map(|a| a.account.clone()))
+                    .flatten()
+                    .map(|team| {
+                        let url = crate::gui::people::slack_workspace_url("", &team, "customize/emoji");
+                        div()
+                            .id("picker-add-emoji")
+                            .flex_none()
+                            .h(px(24.))
+                            .px(px(8.))
+                            .rounded(px(theme::R_CONTROL))
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .cursor_pointer()
+                            .type_small()
+                            .text_color(theme::text_soft())
+                            .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(PickerEvent::OpenUrl(url.clone()));
+                            }))
+                            .child(glyph("icons/plus.svg", 12., theme::text_soft()))
+                            .child("Add emoji")
+                    });
+                footer
+                    .child(preview.unwrap_or_else(idle))
+                    .children(add_emoji)
+                    .when(tones, |footer| footer.child(tone))
+                    .into_any_element()
             }
             Tab::Gifs => {
                 let network = self.setup.network.map_or("the network", |network| network.label());

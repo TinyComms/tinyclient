@@ -67,6 +67,10 @@ pub struct Moment {
     pub dnd: bool,
     /// I am in a call (joined, connecting or reconnecting).
     pub in_call: bool,
+    /// I am actively sharing my screen in a joined call.
+    pub sharing: bool,
+    /// A supported broadcast app (OBS / Streamlabs) is running.
+    pub obs_running: bool,
     /// What the window shows, and whether it has focus.
     pub watching: Watching,
     pub locked: bool,
@@ -100,6 +104,11 @@ pub fn in_window(from: u32, to: u32, minute: u32) -> bool {
 fn hushed(values: &Values, moment: &Moment) -> bool {
     let quiet = values.on(settings::QUIET_HOURS) && in_window(values.minute(settings::QUIET_FROM), values.minute(settings::QUIET_TO), moment.minute);
     quiet || values.paused(moment.now).is_some()
+}
+
+/// Streamer mode suppresses notification banners and sounds while leaving unread counts alone.
+fn streamer_silenced(values: &Values, moment: &Moment) -> bool {
+    values.streamer_active(moment.sharing, moment.obs_running)
 }
 
 /// The level that applies to a conversation: its own, else its account's, else the global one.
@@ -171,7 +180,7 @@ pub fn decide(values: &Values, conversation: &Conversation, message: &Message, m
     if !wanted || !kind_on || !tiny_on {
         return None;
     }
-    if hushed(values, moment) || moment.dnd {
+    if hushed(values, moment) || moment.dnd || streamer_silenced(values, moment) {
         return None;
     }
     let in_call = values.word(GLOBAL, settings::IN_CALL);
@@ -225,7 +234,7 @@ pub fn decide_reaction(
     if !allowed {
         return None;
     }
-    if hushed(values, moment) || moment.dnd {
+    if hushed(values, moment) || moment.dnd || streamer_silenced(values, moment) {
         return None;
     }
     let in_call = values.word(GLOBAL, settings::IN_CALL);
@@ -266,7 +275,7 @@ pub fn decide_ring_in(
     } else {
         level(values, conversation) == "off"
     };
-    if calls == "off" || silenced || moment.dnd {
+    if calls == "off" || silenced || moment.dnd || streamer_silenced(values, moment) {
         return None;
     }
     if conversation.network == Network::Tiny && !direct && !values.on(settings::NOTIFY_TINY) {
@@ -862,15 +871,28 @@ fn dnd(hub: &Hub, conversation: &Key) -> bool {
 
 /// What is true now. Do Not Disturb is left out: it reads every account, so it is asked only of a
 /// message that would otherwise notify.
-fn moment(hub: &Hub, conversation: &Key, notes: &Notes, at: Instant) -> Moment {
+fn moment(hub: &Hub, conversation: &Key, notes: &Notes, values: &Values, at: Instant) -> Moment {
     let now = now();
     let (sounded_here, sounded_any) = notes.quiet(conversation, at);
-    let in_call = hub.calls.describe().0.is_some_and(|call| matches!(call.state, CallState::Joined | CallState::Connecting | CallState::Reconnecting));
+    let call = hub.calls.describe().0;
+    let in_call = call
+        .as_ref()
+        .is_some_and(|call| matches!(call.state, CallState::Joined | CallState::Connecting | CallState::Reconnecting));
+    let sharing = call.as_ref().is_some_and(|call| {
+        call.state == CallState::Joined
+            && call
+                .video
+                .iter()
+                .any(|v| v.direction == protocol::Direction::Encode && v.content == protocol::Content::Share)
+    });
+    let obs_running = values.on(settings::STREAMER_DETECT_OBS) && protocol::streamer::obs_running();
     Moment {
         now,
         minute: local_minute(now),
         dnd: false,
         in_call,
+        sharing,
+        obs_running,
         watching: (*hub.watching()).clone(),
         locked: notifier::screen_locked(),
         sounded_here,
@@ -981,7 +1003,7 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
                     }
                 }
                 let at = Instant::now();
-                let mut moment = moment(hub, &conversation, &notes, at);
+                let mut moment = moment(hub, &conversation, &notes, &values, at);
                 if decide(&values, &row, &message, &moment).is_none() {
                     continue;
                 }
@@ -1004,7 +1026,7 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
                     continue;
                 };
                 let at = Instant::now();
-                let mut moment = moment(hub, &conversation, &notes, at);
+                let mut moment = moment(hub, &conversation, &notes, &values, at);
                 if decide_reaction(&values, &row, outgoing_target, &moment).is_none() {
                     continue;
                 }
@@ -1063,7 +1085,7 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
                             .unwrap_or_default();
                         let moment = Moment {
                             dnd: dnd(hub, key),
-                            ..moment(hub, key, &notes, Instant::now())
+                            ..moment(hub, key, &notes, &values, Instant::now())
                         };
                         let verdict = if blocked_peer {
                             None
@@ -1119,7 +1141,7 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
                     .unwrap_or_default();
                 let moment = Moment {
                     dnd: dnd(hub, &conversation),
-                    ..moment(hub, &conversation, &notes, Instant::now())
+                    ..moment(hub, &conversation, &notes, &values, Instant::now())
                 };
                 let verdict = decide_ring_in(&values, &conversation, &moment, direct);
                 let network = conversation.network.label();
@@ -1153,7 +1175,7 @@ fn run(hub: &Arc<Hub>, chat: &Weak<Chat>, mut notes: Notes, told: &Receiver<Even
                 name,
                 place,
             } => {
-                let mut m = moment(hub, &space, &notes, Instant::now());
+                let mut m = moment(hub, &space, &notes, &values, Instant::now());
                 m.dnd = dnd(hub, &space);
                 if let Some(word) = notes.scheduled_event(&values, &m, &space, &space_name, &event_id, &name, &place) {
                     playing.extend(play(&word, volume, None, 0));
@@ -1186,7 +1208,9 @@ fn due(hub: &Arc<Hub>, notes: &mut Notes, values: &Values) {
         return;
     };
     for (conversation, message_id, text) in waiting {
-        if hushed(values, &moment(hub, &conversation, notes, Instant::now())) {
+        let moment = moment(hub, &conversation, notes, values, Instant::now());
+        // A pause, quiet hours, or Streamer mode holds the reminder: it stays stored.
+        if hushed(values, &moment) || streamer_silenced(values, &moment) {
             return;
         }
         let (title, subtitle) = match hub.store().conversation(&conversation) {

@@ -168,6 +168,19 @@ mod tests {
     }
 
     #[test]
+    fn half_speed_is_twice_as_long_at_the_same_pitch() {
+        let input = tone(440., 48_000 * 2);
+        let output = stretched(50, &input);
+        let length = output.len() as f32 / 2. / 48_000.;
+        assert!((3.85..=4.05).contains(&length), "50%: {length} s");
+        let heard = pitch(&output[2 * WINDOW..]);
+        assert!((430. ..450.).contains(&heard), "50%: {heard} Hz");
+        let left: Vec<f32> = output[2 * WINDOW..].chunks_exact(2).map(|frame| frame[0]).collect();
+        let jump = left.windows(2).map(|pair| (pair[1] - pair[0]).abs()).fold(0., f32::max);
+        assert!(jump < 0.05, "50% seam jump of {jump}");
+    }
+
+    #[test]
     fn normal_speed_is_untouched_and_a_reset_loses_nothing() {
         let input = tone(440., 4_800);
         assert_eq!(stretched(100, &input), input);

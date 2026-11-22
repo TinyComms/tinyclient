@@ -841,6 +841,7 @@ mod tests {
         community.capabilities = TinyCapabilities {
             version: "1".into(),
             features: ["server", "roles", "categories", "bans", "timeouts", "invite_options", "audit_query", "voice_moderation"].into_iter().map(str::to_owned).collect(),
+            multi_video: None,
         };
         community.roles = vec![role("admin", "Admin", 3, true), role("mod", "Moderator", 2, true), role("crew", "Crew", 1, false), role("every", "@everyone", 0, false)];
         community.members = vec![

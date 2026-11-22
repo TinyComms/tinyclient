@@ -491,8 +491,12 @@ pub fn rule() -> Div {
     div().h(px(1.)).bg(theme::hairline())
 }
 
-/// "Open in Discord" with the network's icon and an arrow out.
+/// "Open in Discord" (or a custom label like "Manage in Teams") with the network's icon and an arrow out.
 pub fn open_in(id: impl Into<ElementId>, network: Network) -> Stateful<Div> {
+    open_in_labeled(id, network, format!("Open in {}", network.label()))
+}
+
+pub fn open_in_labeled(id: impl Into<ElementId>, network: Network, label: impl Into<SharedString>) -> Stateful<Div> {
     div()
         .id(id)
         .h(px(theme::ROW_ONE))
@@ -506,7 +510,7 @@ pub fn open_in(id: impl Into<ElementId>, network: Network) -> Stateful<Div> {
         .cursor_pointer()
         .hover(|row| row.bg(theme::hover()))
         .child(crate::gui::components::network_icon(network, 16.))
-        .child(format!("Open in {}", network.label()))
+        .child(label.into())
         .child(glyph("icons/external-link.svg", 14., theme::text_soft()))
 }
 

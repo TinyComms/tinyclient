@@ -3,7 +3,8 @@
 //! The decision is `protocol::link::Destination` (host, registrable domain, punycode, lookalike
 //! check, tracking strip). This file is only the question and what the answer does. The browser
 //! is started with the system's own opener (`cx.open_url`): it is handed the address alone, so no
-//! page is the referrer and no `Referer` is sent. Only http and https ever get that far.
+//! page is the referrer and no `Referer` is sent. Web links are http or https. A `tg://` link
+//! is handed to the system as it is, and `http://t.me` or `http://telegram.me` is opened as https.
 
 use super::Pane;
 use crate::gui::app::prefs;
@@ -13,19 +14,19 @@ use gpui::{anchored, deferred, div, point, prelude::*, px, AnyElement, App, Clip
 use protocol::link::{Destination, Risk};
 
 /// The question on screen: the link, and whether "Don't ask again" is ticked.
-pub(super) struct LinkAsk {
+pub(in crate::gui) struct LinkAsk {
     pub dest: Destination,
     pub remember: bool,
 }
 
 impl LinkAsk {
     /// What the browser is given, with the tracking strip applied if the person turned it on.
-    fn target(&self) -> String {
+    pub(in crate::gui) fn target(&self) -> String {
         self.dest.target(prefs::choices().strip_tracking)
     }
 
     /// A domain this device may stop asking about. Never one that looks like a lookalike.
-    fn can_remember(&self) -> bool {
+    pub(in crate::gui) fn can_remember(&self) -> bool {
         self.dest.risk != Risk::Lookalike && !self.dest.has_userinfo
     }
 }
@@ -82,16 +83,46 @@ pub(super) fn message_link_for(
     message_link(key, open.space.as_deref(), message)
 }
 
+/// `http://t.me` and `http://telegram.me` are the same sites as their https links.
+fn https_telegram_web(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") {
+        return None;
+    }
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host.eq_ignore_ascii_case("t.me") || host.eq_ignore_ascii_case("telegram.me") {
+        Some(format!("https://{rest}"))
+    } else {
+        None
+    }
+}
+
 /// A `mailto:` link, which other networks put on an address. It opens the mail app as it is:
-/// no question, no tracking strip. Every other scheme that is not http or https stays refused.
-pub(super) fn is_mailto(url: &str) -> bool {
+/// no question, no tracking strip.
+pub(in crate::gui) fn is_mailto(url: &str) -> bool {
     url.get(..7).is_some_and(|scheme| scheme.eq_ignore_ascii_case("mailto:"))
         && url.len() <= 2048
         && !url.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"')
 }
 
+/// A Telegram mini app handed to Telegram's own app: `tg://resolve?domain=<bot>&appname=<app>`.
+/// Anything else, including a login token, is not one.
+pub(super) fn telegram_app_link(url: &str) -> bool {
+    let Some(query) = url.strip_prefix("tg://resolve?") else {
+        return false;
+    };
+    // Exactly `domain=…&appname=…`, in that order: anything reordered or added is not handed over.
+    let mut pairs = query.split('&');
+    let (Some(domain), Some(app), None) =
+        (pairs.next().and_then(|pair| pair.strip_prefix("domain=")), pairs.next().and_then(|pair| pair.strip_prefix("appname=")), pairs.next())
+    else {
+        return false;
+    };
+    [domain, app].iter().all(|value| !value.is_empty() && value.len() <= 128 && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
+}
+
 /// Whether a link to `dest` opens without a question, given what the person chose.
-pub(super) fn opens_at_once(dest: &Destination, confirm: bool, trusted: bool) -> bool {
+pub(in crate::gui) fn opens_at_once(dest: &Destination, confirm: bool, trusted: bool) -> bool {
     // A lookalike or a "user@" address is always asked about: that is what the question is for.
     let suspicious = dest.risk == Risk::Lookalike || dest.has_userinfo;
     !suspicious && (!confirm || trusted)
@@ -146,6 +177,17 @@ impl Pane {
             cx.open_url(url);
             return;
         }
+        // `tg://` is not http. Destination refuses it, so the click used to do nothing.
+        let trimmed = url.trim();
+        if trimmed.len() <= protocol::link::LINK_LIMIT
+            && trimmed.to_ascii_lowercase().starts_with("tg:")
+            && !trimmed.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"')
+        {
+            cx.open_url(trimmed);
+            return;
+        }
+        let upgraded = https_telegram_web(trimmed);
+        let url = upgraded.as_deref().unwrap_or(trimmed);
         let Some(dest) = Destination::parse(url) else {
             return;
         };
@@ -172,16 +214,44 @@ impl Pane {
                 });
                 return;
             }
+            if protocol::link::telegram_invite_hash(url).is_some() {
+                let preferred = self
+                    .key()
+                    .filter(|k| k.network == protocol::Network::Telegram)
+                    .map(|k| k.account());
+                let owned = url.to_owned();
+                let opened = self
+                    .shell
+                    .update(cx, |shell, cx| shell.open_telegram_invite(preferred, owned, cx))
+                    .unwrap_or(false);
+                if opened {
+                    return;
+                }
+            }
         }
-        if !external && protocol::link::parse_network_link(url).is_some() {
+        // Only t.me and telegram.me open in the app. telegram.dog, tg://, a traversal, or a pack
+        // is still a Telegram address, so it must not fall through to the wider parser.
+        let in_app = protocol::link::telegram_app_link(url).is_some()
+            || (!protocol::link::telegram_family(url) && protocol::link::parse_network_link(url).is_some());
+        if !external && in_app {
             let owned = url.to_owned();
             let request = protocol::Request::Resolve { url: owned.clone() };
             let window_handle = window.window_handle();
             cx.spawn(async move |this, cx| {
                 let answer = cx.background_executor().spawn(async move { crate::client::ask(&request) }).await;
                 if let Ok(protocol::Response::Resolved { conversation: Some(key), message_id, title }) = answer {
+                    let parsed = protocol::link::parse_network_link(&owned);
+                    let boost = parsed.as_ref().is_some_and(|link| link.space.as_deref() == Some("boost"));
+                    let start = parsed.and_then(|link| (link.space.as_deref() == Some("start")).then(|| link.thread_id.unwrap_or_default()));
                     let _ = this.update(cx, |this, cx| {
-                        let _ = this.shell.update(cx, |shell, cx| shell.open_resolved_link(key, message_id, &title, cx));
+                        let _ = this.shell.update(cx, |shell, cx| {
+                            shell.open_resolved_link(key.clone(), message_id, &title, cx);
+                            if boost {
+                                shell.details_conversation(key, cx);
+                            } else if let Some(param) = start {
+                                shell.start_bot(key, param, cx);
+                            }
+                        });
                     });
                     return;
                 }
@@ -429,6 +499,22 @@ mod tests {
         ] {
             assert!(!is_mailto(bad), "{bad:?}");
             assert!(Destination::parse(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_mini_app_link_is_handed_to_telegram_and_a_token_is_not() {
+        assert!(telegram_app_link("tg://resolve?domain=trail_bot&appname=ridge"));
+        assert!(Destination::parse("tg://resolve?domain=trail_bot&appname=ridge").is_none());
+        for bad in [
+            "tg://resolve?domain=trail_bot",
+            "tg://resolve?domain=trail_bot&appname=ridge&hash=secret-token-9",
+            "tg://login?token=secret-token-9",
+            "tg://resolve?appname=ridge&domain=trail_bot",
+            "https://t.me/trail_bot/ridge",
+            "tg://resolve?domain=trail_bot&appname=../ridge",
+        ] {
+            assert!(!telegram_app_link(bad), "{bad}");
         }
     }
 

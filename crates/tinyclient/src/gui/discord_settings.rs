@@ -246,7 +246,7 @@ impl Shell {
         open.error = None;
         open.notice = None;
         cx.notify();
-        let req = Request::RevokeInvite {
+        let req = Request::RevokeSpaceInvite {
             space: space.clone(),
             code: code.clone(),
         };

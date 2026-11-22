@@ -168,6 +168,7 @@ impl SettingsWindow {
                 }
                 if network == Network::Telegram && account.link == Link::Connected {
                     group = group.child(self.telegram_call_privacy_rows(account, ix, cx));
+                    group = group.child(self.telegram_download_rows(account, ix, cx));
                 }
                 if network == Network::Discord && account.link == Link::Connected {
                     group = group.child(self.discord_privacy_rows(account, ix, cx));
@@ -553,6 +554,10 @@ impl SettingsWindow {
             protocol::PrivacyKey::PhoneCall,
             protocol::PrivacyKey::PhoneP2p,
             protocol::PrivacyKey::VoiceMessages,
+            protocol::PrivacyKey::LastSeen,
+            protocol::PrivacyKey::PhoneNumber,
+            protocol::PrivacyKey::ProfilePhoto,
+            protocol::PrivacyKey::ChatInvite,
         ];
         cx.spawn(async move |this, cx| {
             let acc = account.clone();
@@ -616,17 +621,74 @@ impl SettingsWindow {
         .detach();
     }
 
+    fn load_telegram_default_ttl(&mut self, account: protocol::AccountKey, cx: &mut Context<Self>) {
+        if !self.tg_default_ttl_requested.insert(account.clone()) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let acc = account.clone();
+            let loaded = cx
+                .background_executor()
+                .spawn(async move {
+                    match crate::client::ask(&protocol::Request::GetDefaultDisappearing { account: acc }) {
+                        Ok(protocol::Response::DefaultDisappearing { seconds }) => Some(seconds),
+                        _ => None,
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(seconds) = loaded {
+                    this.tg_default_ttl.insert(account, seconds);
+                    cx.notify();
+                } else {
+                    this.tg_default_ttl_requested.remove(&account);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn set_telegram_default_ttl(&mut self, account: protocol::AccountKey, seconds: u32, cx: &mut Context<Self>) {
+        if self.tg_default_ttl.get(&account).copied() == Some(seconds) {
+            return;
+        }
+        self.tg_default_ttl.insert(account.clone(), seconds);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let acc = account.clone();
+            let answer = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::client::ask(&protocol::Request::SetDefaultDisappearing { account: acc, seconds })
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if answer.is_err() || matches!(answer, Ok(protocol::Response::Error { .. })) {
+                    this.tg_default_ttl_requested.remove(&account);
+                    this.load_telegram_default_ttl(account, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn telegram_call_privacy_rows(&mut self, account: &AccountStatus, ix: usize, cx: &mut Context<Self>) -> Div {
         self.load_telegram_privacy(account.key.clone(), cx);
+        self.load_telegram_default_ttl(account.key.clone(), cx);
         let scope = protocol::settings::account_scope(&account.key);
         let always_relay = crate::gui::app::prefs::values()
             .stored(&scope, protocol::settings::TELEGRAM_ALWAYS_RELAY)
             == Some("on");
         let mut box_div = div().flex().flex_col();
-        let rows: [(&str, &str, protocol::PrivacyKey); 3] = [
+        let rows: [(&str, &str, protocol::PrivacyKey); 7] = [
             ("Who can call me", "Controls who can place voice or video calls to you on Telegram.", protocol::PrivacyKey::PhoneCall),
             ("Peer-to-Peer", "Controls when Telegram may share your IP address directly during a call.", protocol::PrivacyKey::PhoneP2p),
             ("Voice & video messages", "Controls who may send you voice and round video messages.", protocol::PrivacyKey::VoiceMessages),
+            ("Who can see my last seen", "Controls who can see when you were last online.", protocol::PrivacyKey::LastSeen),
+            ("Who can see my phone number", "Controls who can see the phone number on this account.", protocol::PrivacyKey::PhoneNumber),
+            ("Who can see my photo", "Controls who can see your profile photo.", protocol::PrivacyKey::ProfilePhoto),
+            ("Who can add me", "Controls who can add you to groups and channels.", protocol::PrivacyKey::ChatInvite),
         ];
         for (row_ix, (title, sub, pkey)) in rows.into_iter().enumerate() {
             let policy = self.tg_privacy.get(&(account.key.clone(), pkey)).cloned();
@@ -720,6 +782,48 @@ impl SettingsWindow {
                     })),
                 ),
         );
+        // Account-wide default auto-delete timer for new Telegram chats.
+        let default_ttl = self.tg_default_ttl.get(&account.key).copied();
+        let ttl_control = if let Some(active) = default_ttl {
+            let mut seg = div().flex().flex_wrap().items_center().gap(px(4.));
+            for (c_ix, &secs) in protocol::disappearing_presets(Network::Telegram).iter().enumerate() {
+                let acc_key = account.key.clone();
+                seg = seg.child(
+                    button(
+                        ("tg-default-ttl", ix * 100 + c_ix),
+                        if active == secs { ButtonKind::Primary } else { ButtonKind::Secondary },
+                        protocol::format_disappearing(secs),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_telegram_default_ttl(acc_key.clone(), secs, cx);
+                    })),
+                );
+            }
+            seg.into_any_element()
+        } else {
+            div().type_small().text_color(theme::text_faint()).child("Loading…").into_any_element()
+        };
+        box_div = box_div.child(rule()).child(
+            div()
+                .px(px(12.))
+                .py(px(8.))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(12.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(div().type_ui().text_color(theme::text()).child("Default auto-delete timer"))
+                        .child(div().type_small().text_color(theme::text_soft()).child("Automatically delete messages in new Telegram chats after this period.")),
+                )
+                .child(ttl_control),
+        );
+        box_div = box_div.child(self.telegram_folders_rows(account, ix, cx));
         box_div
     }
 
@@ -924,6 +1028,321 @@ impl SettingsWindow {
         box_div
     }
 
+    fn load_telegram_folders(&mut self, account: protocol::AccountKey, cx: &mut Context<Self>) {
+        if !self.tg_folders_requested.insert(account.clone()) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let acc = account.clone();
+            let loaded = cx
+                .background_executor()
+                .spawn(async move {
+                    match crate::client::ask(&protocol::Request::Folders { network: Network::Telegram }) {
+                        Ok(protocol::Response::Folders { folders }) => {
+                            let mut mine: Vec<_> = folders.into_iter().filter(|f| f.key.account() == acc).collect();
+                            mine.sort_by_key(|f| f.position);
+                            Some(mine)
+                        }
+                        _ => None,
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(folders) = loaded {
+                    this.tg_folders.insert(account, folders);
+                    cx.notify();
+                } else {
+                    this.tg_folders_requested.remove(&account);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn telegram_folders_rows(&mut self, account: &AccountStatus, ix: usize, cx: &mut Context<Self>) -> Div {
+        self.load_telegram_folders(account.key.clone(), cx);
+        let folders = self.tg_folders.get(&account.key).cloned().unwrap_or_default();
+        let mut list = div().flex().flex_col().gap(px(6.));
+        for (f_ix, folder) in folders.iter().enumerate() {
+            let acc_up = account.key.clone();
+            let acc_down = account.key.clone();
+            let acc_del = account.key.clone();
+            let fid = folder.key.id.clone();
+            let order_ids: Vec<String> = folders.iter().map(|f| f.key.id.clone()).collect();
+            let up_btn = (f_ix > 0).then(|| {
+                let mut next = order_ids.clone();
+                next.swap(f_ix - 1, f_ix);
+                button(("tg-folder-up", ix * 100 + f_ix), ButtonKind::Ghost, "↑").on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        let req = protocol::Request::FoldersReorder { account: acc_up.clone(), order: next.clone() };
+                        let acc = acc_up.clone();
+                        this.off_thread(cx, move || crate::client::ask(&req), move |this, _, cx| {
+                            this.tg_folders_requested.remove(&acc);
+                            this.load_telegram_folders(acc, cx);
+                        });
+                    },
+                ))
+            });
+            let down_btn = (f_ix + 1 < folders.len()).then(|| {
+                let mut next = order_ids.clone();
+                next.swap(f_ix, f_ix + 1);
+                button(("tg-folder-down", ix * 100 + f_ix), ButtonKind::Ghost, "↓").on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        let req = protocol::Request::FoldersReorder { account: acc_down.clone(), order: next.clone() };
+                        let acc = acc_down.clone();
+                        this.off_thread(cx, move || crate::client::ask(&req), move |this, _, cx| {
+                            this.tg_folders_requested.remove(&acc);
+                            this.load_telegram_folders(acc, cx);
+                        });
+                    },
+                ))
+            });
+            let del_btn = button(("tg-folder-del", ix * 100 + f_ix), ButtonKind::Ghost, "Delete").on_click(cx.listener(
+                move |this, _, _, cx| {
+                    let req = protocol::Request::FolderDelete { account: acc_del.clone(), folder_id: fid.clone() };
+                    let acc = acc_del.clone();
+                    this.off_thread(cx, move || crate::client::ask(&req), move |this, _, cx| {
+                        this.tg_folders_requested.remove(&acc);
+                        this.load_telegram_folders(acc, cx);
+                    });
+                },
+            ));
+            list = list.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(6.))
+                    .child(div().type_ui().text_color(theme::text()).truncate().child(folder.name.clone()))
+                    .child(div().flex().items_center().gap(px(4.)).children(up_btn).children(down_btn).child(del_btn)),
+            );
+        }
+        let acc_create = account.key.clone();
+        let name_input = self
+            .tg_folder_name
+            .entry(account.key.clone())
+            .or_insert_with(|| cx.new(|cx| crate::gui::input::TextInput::new("New folder name", cx)))
+            .clone();
+        let create_row = div()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .child(
+                div()
+                    .flex_1()
+                    .h(px(28.))
+                    .px(px(8.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::field())
+                    .border_1()
+                    .border_color(theme::border())
+                    .flex()
+                    .items_center()
+                    .child(name_input.clone()),
+            )
+            .child(button(("tg-folder-add", ix), ButtonKind::Secondary, "Create folder").on_click(cx.listener(
+                move |this, _, _, cx| {
+                    let name = this
+                        .tg_folder_name
+                        .get(&acc_create)
+                        .map(|input| input.read(cx).text().trim().to_owned())
+                        .unwrap_or_default();
+                    if name.is_empty() {
+                        this.tg_folder_error.insert(acc_create.clone(), "Give the folder a name.".to_owned());
+                        cx.notify();
+                        return;
+                    }
+                    this.tg_folder_error.remove(&acc_create);
+                    let spec = protocol::FolderSpec {
+                        name,
+                        contacts: true,
+                        groups: true,
+                        ..protocol::FolderSpec::default()
+                    };
+                    let req = protocol::Request::FolderSave { account: acc_create.clone(), folder: spec };
+                    let acc = acc_create.clone();
+                    this.off_thread(cx, move || crate::client::ask(&req), move |this, answer, cx| {
+                        match answer {
+                            Ok(protocol::Response::Error { detail, .. }) => {
+                                this.tg_folder_error.insert(acc, detail);
+                            }
+                            Ok(_) => {
+                                if let Some(input) = this.tg_folder_name.get(&acc).cloned() {
+                                    input.update(cx, |input, cx| input.clear(cx));
+                                }
+                                this.tg_folders_requested.remove(&acc);
+                                this.load_telegram_folders(acc, cx);
+                            }
+                            Err(err) => {
+                                this.tg_folder_error.insert(acc, err.to_string());
+                            }
+                        }
+                        cx.notify();
+                    });
+                },
+            )));
+        div().child(rule()).child(
+            div()
+                .px(px(12.))
+                .py(px(8.))
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(div().type_ui().text_color(theme::text()).child("Chat folders"))
+                .child(list)
+                .child(create_row)
+                .children(self.tg_folder_error.get(&account.key).map(|err| div().type_small().text_color(theme::danger()).child(err.clone()))),
+        )
+    }
+
+    fn load_telegram_download(&mut self, account: protocol::AccountKey, cx: &mut Context<Self>) {
+        if !self.tg_download_requested.insert(account.clone()) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let acc = account.clone();
+            let loaded = cx
+                .background_executor()
+                .spawn(async move { crate::client::ask(&protocol::Request::GetAutoDownload { account: acc }) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Ok(protocol::Response::AutoDownload { settings }) = loaded {
+                    this.tg_download.insert(account, settings);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn set_telegram_download(&mut self, account: protocol::AccountKey, settings: protocol::AutoDownload, cx: &mut Context<Self>) {
+        let Some(previous) = self.tg_download.get(&account).cloned() else {
+            return;
+        };
+        self.tg_download.insert(account.clone(), settings.clone());
+        cx.notify();
+        let restore = previous.clone();
+        cx.spawn(async move |this, cx| {
+            let acc = account.clone();
+            let sent = settings.clone();
+            let answer = cx
+                .background_executor()
+                .spawn(async move { crate::client::ask(&protocol::Request::SetAutoDownload { account: acc, settings: sent }) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match answer {
+                    Ok(protocol::Response::AutoDownload { settings }) => {
+                        this.tg_download.insert(account, settings);
+                    }
+                    _ => {
+                        this.tg_download.insert(account, restore.clone());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn telegram_download_rows(&mut self, account: &AccountStatus, ix: usize, cx: &mut Context<Self>) -> Div {
+        self.load_telegram_download(account.key.clone(), cx);
+        let Some(settings) = self.tg_download.get(&account.key).cloned() else {
+            return div().px(px(12.)).py(px(8.)).type_small().text_color(theme::text_faint()).child("Loading automatic downloads…");
+        };
+        let caps: [(&str, i64); 4] = [("Off", 0), ("1 MB", 1 << 20), ("10 MB", 10 << 20), ("100 MB", 100 << 20)];
+        let networks: [(&str, usize); 3] = [("Roaming", 0), ("Mobile", 1), ("Wi-Fi", 2)];
+        let mut box_div = div().flex().flex_col().child(rule()).child(
+            div()
+                .px(px(12.))
+                .pt(px(10.))
+                .pb(px(4.))
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(div().type_ui().text_color(theme::text()).child("Automatic downloads"))
+                .child(div().type_small().text_color(theme::text_soft()).child("Full photos, videos and files stay on Telegram until you open them, unless a chat kind is on and the file is under that network's limit. This device follows the Wi-Fi limit.")),
+        );
+        let switches: [(&str, bool); 4] = [
+            ("Fetch full photos", settings.fetch_full_photos),
+            ("Private chats", settings.private_chats),
+            ("Groups", settings.groups),
+            ("Channels", settings.channels),
+        ];
+        for (switch_ix, (label, on)) in switches.into_iter().enumerate() {
+            let base = settings.clone();
+            let acc = account.key.clone();
+            box_div = box_div.child(rule()).child(
+                div()
+                    .px(px(12.))
+                    .py(px(8.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .child(div().type_ui().text_color(theme::text()).child(label))
+                    .child(super::controls::switch(("tg-dl-sw", ix * 10 + switch_ix), label, on).on_click(cx.listener(move |this, _, _, cx| {
+                        let mut next = base.clone();
+                        match switch_ix {
+                            0 => next.fetch_full_photos = !on,
+                            1 => next.private_chats = !on,
+                            2 => next.groups = !on,
+                            _ => next.channels = !on,
+                        }
+                        this.set_telegram_download(acc.clone(), next, cx);
+                    }))),
+            );
+        }
+        for (net_ix, (name, slot)) in networks.into_iter().enumerate() {
+            let preset = match slot {
+                0 => &settings.roaming,
+                1 => &settings.mobile,
+                _ => &settings.wifi,
+            };
+            let mut seg = div().flex().items_center().gap(px(4.));
+            for (cap_ix, (label, bytes)) in caps.into_iter().enumerate() {
+                let active = if bytes == 0 {
+                    preset.disabled || preset.photo_size_max <= 0
+                } else {
+                    !preset.disabled && preset.photo_size_max == bytes
+                };
+                let acc = account.key.clone();
+                let base = settings.clone();
+                seg = seg.child(
+                    button(("tg-dl-cap", ix * 100 + net_ix * 10 + cap_ix), if active { ButtonKind::Primary } else { ButtonKind::Secondary }, label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let mut next = base.clone();
+                            let preset = match slot {
+                                0 => &mut next.roaming,
+                                1 => &mut next.mobile,
+                                _ => &mut next.wifi,
+                            };
+                            if bytes <= 0 {
+                                *preset = protocol::AutoDownloadPreset::default();
+                            } else {
+                                preset.disabled = false;
+                                preset.photo_size_max = bytes;
+                                preset.video_size_max = bytes.saturating_mul(10);
+                                preset.file_size_max = bytes;
+                            }
+                            this.set_telegram_download(acc.clone(), next, cx);
+                        })),
+                );
+            }
+            box_div = box_div.child(rule()).child(
+                div()
+                    .px(px(12.))
+                    .py(px(8.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .child(div().type_ui().text_color(theme::text()).child(name))
+                    .child(seg),
+            );
+        }
+        box_div
+    }
+
     pub(super) fn sign_out(&mut self, account: protocol::AccountKey, cx: &mut Context<Self>) {
         let _ = self.shell.update(cx, |shell, cx| shell.sign_out(account, false, cx));
         cx.notify();
@@ -998,36 +1417,70 @@ impl SettingsWindow {
                     .child(div().type_small().text_color(theme::text_faint()).child("Hex, like 5865F2. Leave blank to keep the current colour.")),
             );
         }
+        if can.profile_username {
+            fields = fields.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(field_box("Username", self.profile_username.clone()))
+                    .child(
+                        div()
+                            .type_small()
+                            .text_color(theme::text_faint())
+                            .child("Changing or clearing your @username releases your old link immediately."),
+                    ),
+            );
+        }
+        if can.profile_birthday {
+            fields = fields.child(field_box("Birthday", self.profile_birthday.clone()));
+        }
+        if can.rich_status && key.network == Network::Telegram {
+            fields = fields.child(field_box("Emoji status (Premium)", self.profile_emoji_status.clone()));
+        }
         if can.profile_avatar {
             let avatar_key = key.clone();
+            let clear_key = key.clone();
             fields = fields.child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
                     .child(div().type_small().text_color(theme::text_soft()).child("Profile picture"))
-                    .child(button("profile-pick-avatar", ButtonKind::Secondary, "Choose picture…").on_click(cx.listener(
-                        move |this, _, _, cx| {
-                            let avatar_key = avatar_key.clone();
-                            let asked = cx.prompt_for_paths(gpui::PathPromptOptions {
-                                files: true,
-                                directories: false,
-                                multiple: false,
-                                prompt: Some("Choose profile picture".into()),
-                            });
-                            cx.spawn(async move |this, cx| {
-                                if let Ok(Ok(Some(paths))) = asked.await {
-                                    if let Some(path) = paths.into_iter().next() {
-                                        let path_str = path.to_string_lossy().into_owned();
-                                        let req = protocol::Request::SetAvatar { account: avatar_key, path: path_str };
-                                        let _ = cx.background_executor().spawn(async move { crate::client::ask(&req) }).await;
-                                        let _ = this.update(cx, |_, cx| cx.notify());
-                                    }
-                                }
-                            })
-                            .detach();
-                        },
-                    ))),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(button("profile-pick-avatar", ButtonKind::Secondary, "Choose picture…").on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    let avatar_key = avatar_key.clone();
+                                    let asked = cx.prompt_for_paths(gpui::PathPromptOptions {
+                                        files: true,
+                                        directories: false,
+                                        multiple: false,
+                                        prompt: Some("Choose profile picture".into()),
+                                    });
+                                    cx.spawn(async move |this, cx| {
+                                        if let Ok(Ok(Some(paths))) = asked.await {
+                                            if let Some(path) = paths.into_iter().next() {
+                                                let path_str = path.to_string_lossy().into_owned();
+                                                let req = protocol::Request::SetAvatar { account: avatar_key, path: path_str };
+                                                let _ = cx.background_executor().spawn(async move { crate::client::ask(&req) }).await;
+                                                let _ = this.update(cx, |_, cx| cx.notify());
+                                            }
+                                        }
+                                    })
+                                    .detach();
+                                },
+                            )))
+                            .child(button("profile-clear-avatar", ButtonKind::Ghost, "Remove").on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    let req = protocol::Request::SetAvatar { account: clear_key.clone(), path: String::new() };
+                                    this.off_thread(cx, move || crate::client::ask(&req), |_, _, cx| cx.notify());
+                                },
+                            ))),
+                    ),
             );
         }
         if can.profile_banner {
@@ -1062,6 +1515,7 @@ impl SettingsWindow {
                                             accent: None,
                                             banner: Some(path_str),
                                             space: None,
+                                            birthday: None,
                                         };
                                         let _ = cx.background_executor().spawn(async move { crate::client::ask(&req) }).await;
                                         let _ = this.update(cx, |_, cx| cx.notify());
@@ -1160,6 +1614,7 @@ impl SettingsWindow {
                                                     accent: None,
                                                     banner: Some(path.to_string_lossy().into_owned()),
                                                     space: Some(space),
+                                                    birthday: None,
                                                 };
                                                 let _ = cx.background_executor().spawn(async move { crate::client::ask(&req) }).await;
                                                 let _ = this.update(cx, |_, cx| cx.notify());
@@ -1192,6 +1647,7 @@ impl SettingsWindow {
                                 accent,
                                 banner: None,
                                 space: Some(save_space.clone()),
+                                birthday: None,
                             };
                             this.off_thread(cx, move || crate::client::ask(&req), |_, _, cx| cx.notify());
                         })),
@@ -1221,13 +1677,25 @@ impl SettingsWindow {
             let about = can.profile_about.then(|| this.profile_about.read(cx).text().trim().to_owned());
             let pronouns = can.profile_pronouns.then(|| this.profile_pronouns.read(cx).text().trim().to_owned());
             let accent = can.profile_accent.then(|| accent_u32(&this.profile_accent.read(cx).text())).flatten();
+            let username = can
+                .profile_username
+                .then(|| this.profile_username.read(cx).text().trim().to_owned())
+                .filter(|s| !s.is_empty());
+            let birthday = can
+                .profile_birthday
+                .then(|| this.profile_birthday.read(cx).text().trim().to_owned())
+                .filter(|s| !s.is_empty());
+            let emoji = (can.rich_status && save_key.network == Network::Telegram)
+                .then(|| this.profile_emoji_status.read(cx).text().trim().to_owned())
+                .filter(|s| !s.is_empty());
             let req = protocol::Request::SetProfile {
                 account: save_key.clone(),
                 name,
                 about,
                 pronouns,
-                emoji: None,
-                username: None,
+                emoji,
+                username,
+                birthday,
                 photo: false,
                 accent,
                 banner: None,

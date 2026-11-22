@@ -221,12 +221,14 @@ pub fn source(message: &Message) -> (String, Vec<Token>) {
             }
             Style::Bold => "**",
             Style::Italic => "_",
+            Style::Underline => "__",
             Style::Strike => "~~",
             Style::Code => "`",
             Style::Time { unix, form } => {
                 times.push((start, end, format!("<t:{unix}:{form}>")));
                 continue;
             }
+            Style::Spoiler => "||",
             Style::Mention { kind, id } => {
                 // Skip message-link chips that also carry a Style::Link on the same range.
                 if message.spans.iter().any(|other| {
@@ -583,5 +585,17 @@ mod tests {
         let (text, tokens) = source(&msg);
         assert_eq!(text, "meet **<t:1618953630:R>** with @Dev");
         assert_eq!(wire(&text, &tokens, MentionFormat::Discord), "meet **<t:1618953630:R>** with <@8>");
+    }
+
+    #[test]
+    fn caption_formatting_preserves_underline_and_spoiler_in_source() {
+        let mut msg = Message::plain("c1", "me", "bold under secret", 0, true);
+        msg.spans = vec![
+            Span { start: 0, end: 4, style: Style::Bold },
+            Span { start: 5, end: 10, style: Style::Underline },
+            Span { start: 11, end: 17, style: Style::Spoiler },
+        ];
+        let (text, _) = source(&msg);
+        assert_eq!(text, "**bold** __under__ ||secret||");
     }
 }

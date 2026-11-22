@@ -11,12 +11,12 @@ pub(in crate::gui) mod profile;
 use super::card::Float;
 use super::presence::Ring;
 use super::{existing_direct, in_call, only_draws, person_avatar, shown_presence, Hub, Scene};
-use crate::gui::components::{button, glyph, icon_button, search_field, tip, ButtonKind};
+use crate::gui::components::{button, glyph, icon_button, search_field, sensitive_cover, tip, ButtonKind};
 use crate::gui::input::{InputEvent, TextInput};
 use crate::gui::layout::{RightKind, RightPane};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
-use gpui::{div, prelude::*, px, AnyElement, App, ClipboardItem, Context, Div, Entity, Focusable, MouseButton, WeakEntity, Window};
+use gpui::{div, prelude::*, px, AnyElement, App, ClipboardItem, Context, Div, Entity, Focusable, MouseButton, SharedString, WeakEntity, Window};
 use profile::draw;
 use profile::facts::{self, Act, Call, Seen, Surface};
 use profile::shared::{self, Shared};
@@ -24,6 +24,7 @@ use protocol::{
     AccountKey, Contact, ContactKind, Conversation, ConversationInfo, Key, Link, Network, Notify, Person, Profile, RelateAction,
     Request, Response, Space, SpaceInfo,
 };
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 /// What the pane is about.
@@ -63,6 +64,38 @@ pub(in crate::gui) enum ManageKind {
     Nickname,
 }
 
+/// Pending destructive moderation / management confirmation in Details.
+#[derive(Clone)]
+pub(in crate::gui) enum PendingMod {
+    Ban {
+        conversation: Key,
+        person_id: String,
+        person_name: String,
+    },
+    Promote {
+        conversation: Key,
+        person_id: String,
+        person_name: String,
+        rank: Entity<crate::gui::input::TextInput>,
+    },
+    TransferOwner {
+        conversation: Key,
+        person_id: String,
+        person_name: String,
+        password: Entity<crate::gui::input::TextInput>,
+    },
+}
+
+impl PendingMod {
+    pub fn conversation(&self) -> &Key {
+        match self {
+            PendingMod::Ban { conversation, .. }
+            | PendingMod::Promote { conversation, .. }
+            | PendingMod::TransferOwner { conversation, .. } => conversation,
+        }
+    }
+}
+
 pub struct InfoPane {
     shell: WeakEntity<Shell>,
     hub: Hub,
@@ -84,14 +117,27 @@ pub struct InfoPane {
     about_open: bool,
     /// Mutual friends list expanded in the "In common" section.
     friends_open: bool,
+    /// Bio, note, and other contacts the user chose to reveal in Streamer mode.
+    revealed_sensitive: HashSet<String>,
     /// What the user set here, drawn before the row says so.
     notify_set: Option<(Key, Notify)>,
     /// What the user set for a Space's notifications, drawn before SpaceInfo reloads.
     space_notify_set: Option<(Key, Notify)>,
     /// Inline conversation management input (rename, topic, add people).
     manage: Option<(Key, ManageKind, Entity<crate::gui::input::TextInput>)>,
+    /// History sharing mode when adding people to a Teams group chat.
+    share_history: protocol::HistoryShare,
     /// Pending confirmation to remove a member: (conversation, person_id, person_name).
     pending_remove: Option<(Key, String, String)>,
+    /// Pending confirmation for ban, admin promotion, or ownership transfer.
+    pending_mod: Option<PendingMod>,
+    /// Read-only recent admin actions fetched on demand (`Request::AdminLog`).
+    admin_log: Option<(Key, Vec<protocol::AdminLogEntry>)>,
+    admin_log_loading: bool,
+    /// A Telegram channel's boost level, loaded when its Details open.
+    boosts: Option<(Key, Answer<protocol::ChannelBoosts>)>,
+    /// The Boost button is waiting for a yes.
+    boost_confirm: bool,
     /// The content width, from the pane's.
     width: f32,
     /// The shell's Spaces, for In common and Details' icons.
@@ -150,10 +196,17 @@ impl InfoPane {
             phones_shown: false,
             about_open: false,
             friends_open: false,
+            revealed_sensitive: HashSet::new(),
             notify_set: None,
             space_notify_set: None,
             manage: None,
+            share_history: protocol::HistoryShare::None,
             pending_remove: None,
+            pending_mod: None,
+            admin_log: None,
+            admin_log_loading: false,
+            boosts: None,
+            boost_confirm: false,
             width: 268.,
             spaces: Vec::new(),
             note_input: None,
@@ -243,6 +296,7 @@ impl InfoPane {
             self.phones_shown = false;
             self.about_open = false;
             self.friends_open = false;
+            self.revealed_sensitive.clear();
         }
         let entity = cx.entity();
         self.shared.show(self.row.as_ref().map(|row| row.key.clone()), &entity, cx, |pane: &mut InfoPane| &mut pane.shared);
@@ -440,6 +494,10 @@ impl InfoPane {
         self.hub.watch("info", [], cx);
         let same = self.subject.as_ref() == Some(&Subject::Conversation(key.clone()));
         self.subject = Some(Subject::Conversation(key.clone()));
+        if !same {
+            self.boosts = None;
+            self.boost_confirm = false;
+        }
         self.row = row.or_else(|| self.row.clone().filter(|_| same));
         let gated = self.row.as_ref().is_some_and(|r| r.age_restricted) && !self.age_gate_passed;
         let entity = cx.entity();
@@ -468,6 +526,7 @@ impl InfoPane {
                         if small {
                             this.ask_members(key.clone(), asked, cx);
                         }
+                        this.load_boosts(key.clone(), cx);
                         Answer::Got(*info)
                     }
                     _ => Answer::Failed,
@@ -1219,37 +1278,60 @@ impl InfoPane {
 
     fn about(&self, profile: &Profile, show_note: bool, cx: &mut Context<Self>) -> Div {
         let bio = profile.bio.trim().to_owned();
+        let note = profile.note.trim().to_owned();
+        let streamer = crate::gui::streamer::is_active();
+        let hide_bio = streamer && crate::gui::streamer::contains_sensitive(&bio) && !self.revealed_sensitive.contains("bio");
+        let hide_note = streamer && crate::gui::streamer::contains_sensitive(&note) && !self.revealed_sensitive.contains("note");
         let long = bio.chars().count() > 180 || bio.lines().count() > 4;
         let folded = long && !self.about_open;
         div()
             .flex()
             .flex_col()
             .when(!bio.is_empty(), |about| {
-                about.child(div().type_ui().when(folded, |text| text.line_clamp(4)).child(bio)).when(long, |about| {
-                    about.child(
-                        div()
-                            .id("info-more-bio")
-                            .type_ui()
-                            .text_color(theme::accent_text())
-                            .cursor_pointer()
-                            .child(if folded { "more" } else { "less" })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.about_open = !this.about_open;
-                                cx.notify();
-                            })),
-                    )
-                })
+                if hide_bio {
+                    about.child(sensitive_cover("info-reveal-bio", cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.revealed_sensitive.insert("bio".into());
+                        cx.notify();
+                    })))
+                } else {
+                    about.child(div().type_ui().when(folded, |text| text.line_clamp(4)).child(bio)).when(long, |about| {
+                        about.child(
+                            div()
+                                .id("info-more-bio")
+                                .type_ui()
+                                .text_color(theme::accent_text())
+                                .cursor_pointer()
+                                .child(if folded { "more" } else { "less" })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.about_open = !this.about_open;
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                }
             })
-            .when(show_note && !profile.note.trim().is_empty(), |about| {
+            .when(show_note && !note.is_empty(), |about| {
                 about
                     .child(div().mt(px(8.)).type_micro().text_color(theme::text_faint()).child("Note · only you see this"))
-                    .child(div().type_ui().text_color(theme::text_soft()).child(profile.note.trim().to_owned()))
+                    .child(if hide_note {
+                        sensitive_cover("info-reveal-note", cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.revealed_sensitive.insert("note".into());
+                            cx.notify();
+                        }))
+                        .into_any_element()
+                    } else {
+                        div().type_ui().text_color(theme::text_soft()).child(note).into_any_element()
+                    })
             })
     }
 
     fn contact_row(&self, ix: usize, contact: Contact, cx: &mut Context<Self>) -> impl IntoElement {
+        let streamer = crate::gui::streamer::is_active();
         let phone = contact.kind == ContactKind::Phone || contact.masked;
-        let masked = phone && !self.phones_shown;
+        let streamer_locked = streamer && (phone || contact.kind == ContactKind::Email);
+        let masked = streamer_locked || (phone && !self.phones_shown);
         let icon = match contact.kind {
             ContactKind::Email => "icons/mail.svg",
             ContactKind::Phone => "icons/phone.svg",
@@ -1260,11 +1342,17 @@ impl InfoPane {
             ContactKind::Phone => "Phone number",
             ContactKind::Other => "Contact",
         };
-        let words = facts::contact_words(&contact, self.phones_shown);
+        let words = facts::contact_words_for(&contact, self.phones_shown, streamer);
+        let other_key = format!("other:{}", contact.value);
+        let hide_other = streamer
+            && contact.kind == ContactKind::Other
+            && crate::gui::streamer::contains_sensitive(&contact.value)
+            && !self.revealed_sensitive.contains(&other_key);
         let value = contact.value.clone();
         div()
             .id(("info-contact", ix))
-            .h(px(theme::ROW_ONE))
+            .when(!hide_other, |row| row.h(px(theme::ROW_ONE)))
+            .when(hide_other, |row| row.min_h(px(theme::ROW_ONE)).py(px(4.)))
             .mx(px(-8.))
             .px(px(8.))
             .rounded(px(theme::R_CONTROL))
@@ -1272,11 +1360,23 @@ impl InfoPane {
             .items_center()
             .gap(px(8.))
             .type_ui()
-            .cursor_pointer()
-            .hover(|row| row.bg(theme::hover()))
+            .when(!streamer_locked, |row| row.cursor_pointer().hover(|row| row.bg(theme::hover())))
             .child(glyph(icon, 16., theme::text_soft()))
-            .child(div().flex_1().min_w_0().truncate().child(words))
-            .when(masked, |row| {
+            .child(if hide_other {
+                let key = other_key;
+                sensitive_cover(
+                    SharedString::from(format!("info-reveal-other-{ix}")),
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.revealed_sensitive.insert(key.clone());
+                        cx.notify();
+                    }),
+                )
+                .into_any_element()
+            } else {
+                div().flex_1().min_w_0().truncate().child(words).into_any_element()
+            })
+            .when(masked && !streamer_locked, |row| {
                 row.child(
                     button(("info-show", ix), ButtonKind::Ghost, "Show").h(px(24.)).px(px(6.)).type_small().on_click(cx.listener(
                         |this, _, _, cx| {
@@ -1288,7 +1388,11 @@ impl InfoPane {
                 )
             })
             // A masked number is not copied: the click that shows it is the one that reveals it.
+            // In Streamer mode, phone numbers and emails stay masked and cannot be revealed or copied.
             .on_click(cx.listener(move |this, _, _, cx| {
+                if streamer_locked || hide_other {
+                    return;
+                }
                 if masked {
                     this.phones_shown = true;
                     cx.notify();
@@ -1571,6 +1675,15 @@ impl InfoPane {
         (&self.hub, &self.scene, self.info.got(), self.space_info.got(), self.space.as_ref(), &self.members)
     }
 
+    /// Draws the new RSVP before the next info read. The request itself is fire-and-forget.
+    pub(in crate::gui) fn note_meeting_response(&mut self, response: protocol::MeetingResponse) {
+        if let Answer::Got(info) = &mut self.info {
+            if let Some(meeting) = info.meeting.as_mut() {
+                meeting.response = response;
+            }
+        }
+    }
+
     pub(in crate::gui) fn waiting(&self) -> (bool, bool, bool) {
         let waiting = match self.subject {
             Some(Subject::Space(_)) => matches!(self.space_info, Answer::Waiting),
@@ -1666,6 +1779,89 @@ impl InfoPane {
         self.manage.as_ref()
     }
 
+    pub(in crate::gui) fn channel_boosts(&self, key: &Key) -> Option<&protocol::ChannelBoosts> {
+        match self.boosts.as_ref() {
+            Some((held, Answer::Got(status))) if held == key => Some(status),
+            _ => None,
+        }
+    }
+
+    pub(in crate::gui) fn boosts_waiting(&self, key: &Key) -> bool {
+        matches!(&self.boosts, Some((held, Answer::Waiting)) if held == key)
+    }
+
+    pub(in crate::gui) fn boost_confirming(&self, key: &Key) -> bool {
+        self.boost_confirm && self.boosts.as_ref().is_some_and(|(held, _)| held == key)
+    }
+
+    pub(in crate::gui) fn ask_boost_confirm(&mut self, cx: &mut Context<Self>) {
+        self.boost_confirm = true;
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn cancel_boost(&mut self, cx: &mut Context<Self>) {
+        self.boost_confirm = false;
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn confirm_boost(&mut self, cx: &mut Context<Self>) {
+        let Some(key) = self.boosts.as_ref().map(|(key, _)| key.clone()) else {
+            return;
+        };
+        self.boost_confirm = false;
+        let this = cx.weak_entity();
+        super::ask_later(cx, Request::ApplyBoost { conversation: key.clone() }, move |answer, cx| {
+            let _ = this.update(cx, |this, cx| {
+                if let Ok(Response::Boosts { status, conversation }) = answer {
+                    if this.boosts.as_ref().is_some_and(|(held, _)| held == &conversation) {
+                        this.boosts = Some((key, Answer::Got(status)));
+                    }
+                }
+                cx.notify();
+            });
+        });
+    }
+
+    fn load_boosts(&mut self, key: Key, cx: &mut Context<Self>) {
+        let channel = self.row.as_ref().is_some_and(|row| row.key == key && row.key.network == Network::Telegram && row.kind == protocol::ConversationKind::Channel);
+        if !channel {
+            return;
+        }
+        if self.boosts.as_ref().is_some_and(|(held, answer)| held == &key && !matches!(answer, Answer::Failed)) {
+            return;
+        }
+        self.boosts = Some((key.clone(), Answer::Waiting));
+        let this = cx.weak_entity();
+        super::ask_later(cx, Request::GetBoosts { conversation: key.clone() }, move |answer, cx| {
+            let _ = this.update(cx, |this, cx| {
+                let Some((held, slot)) = this.boosts.as_mut() else {
+                    return;
+                };
+                if held != &key {
+                    return;
+                }
+                *slot = match answer {
+                    Ok(Response::Boosts { status, .. }) => Answer::Got(status),
+                    _ => Answer::Failed,
+                };
+                cx.notify();
+            });
+        });
+    }
+
+    pub(in crate::gui) fn share_history(&self) -> protocol::HistoryShare {
+        self.share_history
+    }
+
+    pub(in crate::gui) fn cycle_share_history(&mut self, cx: &mut Context<Self>) {
+        self.share_history = match self.share_history {
+            protocol::HistoryShare::None => protocol::HistoryShare::Days { days: 7 },
+            protocol::HistoryShare::Days { .. } => protocol::HistoryShare::All,
+            protocol::HistoryShare::All => protocol::HistoryShare::None,
+        };
+        cx.notify();
+    }
+
     pub(in crate::gui) fn pending_remove(&self) -> Option<&(Key, String, String)> {
         self.pending_remove.as_ref()
     }
@@ -1686,12 +1882,14 @@ impl InfoPane {
             }
             field
         });
+        self.share_history = protocol::HistoryShare::None;
         self.manage = Some((conversation, kind, input));
         cx.notify();
     }
 
     pub(in crate::gui) fn cancel_manage(&mut self, cx: &mut Context<Self>) {
         self.manage = None;
+        self.share_history = protocol::HistoryShare::None;
         cx.notify();
     }
 
@@ -1699,6 +1897,8 @@ impl InfoPane {
         let Some((conversation, kind, input)) = self.manage.take() else {
             return;
         };
+        let chosen_history = self.share_history;
+        self.share_history = protocol::HistoryShare::None;
         let value = input.read(cx).text().trim().to_owned();
         let request = match kind {
             ManageKind::Rename if !value.is_empty() => Request::ConversationUpdate {
@@ -1764,7 +1964,10 @@ impl InfoPane {
                     cx.notify();
                     return;
                 }
-                Request::MembersAdd { conversation, people }
+                let share_history = (conversation.network == Network::Teams
+                    && self.row.as_ref().is_some_and(|r| r.kind == protocol::ConversationKind::Group))
+                .then_some(chosen_history);
+                Request::MembersAdd { conversation, people, share_history }
             }
             ManageKind::Nickname => {
                 let space = conversation.clone();
@@ -1876,6 +2079,168 @@ impl InfoPane {
                     shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
                 });
             }
+        });
+    }
+
+    pub(in crate::gui) fn pending_mod(&self) -> Option<&PendingMod> {
+        self.pending_mod.as_ref()
+    }
+
+    pub(in crate::gui) fn admin_log_for(&self, key: &Key) -> Option<&[protocol::AdminLogEntry]> {
+        self.admin_log.as_ref().filter(|(k, _)| k == key).map(|(_, entries)| entries.as_slice())
+    }
+
+    pub(in crate::gui) fn admin_log_loading(&self) -> bool {
+        self.admin_log_loading
+    }
+
+    pub(in crate::gui) fn ask_ban_member(&mut self, conversation: Key, person_id: String, person_name: String, cx: &mut Context<Self>) {
+        self.pending_mod = Some(PendingMod::Ban { conversation, person_id, person_name });
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn ask_promote_admin(&mut self, conversation: Key, person_id: String, person_name: String, cx: &mut Context<Self>) {
+        let rank = cx.new(|cx| crate::gui::input::TextInput::new("Custom title (optional)", cx));
+        self.pending_mod = Some(PendingMod::Promote { conversation, person_id, person_name, rank });
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn ask_transfer_owner(&mut self, conversation: Key, person_id: String, person_name: String, cx: &mut Context<Self>) {
+        let password = cx.new(|cx| crate::gui::input::TextInput::secret("Two-step verification password", cx));
+        self.pending_mod = Some(PendingMod::TransferOwner { conversation, person_id, person_name, password });
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn cancel_mod(&mut self, cx: &mut Context<Self>) {
+        self.pending_mod = None;
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn confirm_mod(&mut self, cx: &mut Context<Self>) {
+        if let Some(PendingMod::TransferOwner { password, .. }) = self.pending_mod.as_ref() {
+            if password.read(cx).text().is_empty() {
+                cx.notify();
+                return;
+            }
+        }
+        let Some(action) = self.pending_mod.take() else {
+            return;
+        };
+        let request = match action {
+            PendingMod::Ban { conversation, person_id, .. } => Request::ModerateMember {
+                conversation,
+                person: person_id,
+                action: protocol::MemberModeration::Ban { until: None },
+            },
+            PendingMod::Promote { conversation, person_id, rank, .. } => {
+                let rank = rank.read(cx).text().trim().to_owned();
+                Request::SetAdmin {
+                    conversation,
+                    person: person_id,
+                    rights: protocol::AdminRights {
+                        change_info: true,
+                        delete_messages: true,
+                        ban_users: true,
+                        invite_users: true,
+                        pin_messages: true,
+                        rank,
+                        ..protocol::AdminRights::default()
+                    },
+                }
+            }
+            PendingMod::TransferOwner { conversation, person_id, password, .. } => {
+                let password = password.read(cx).text().to_owned();
+                Request::TransferOwnership { conversation, person: person_id, password }
+            }
+        };
+        let shell = self.shell.clone();
+        super::ask_later(cx, request, move |answer, cx| {
+            if let Ok(Response::Error { detail, .. }) = answer {
+                let _ = shell.update(cx, |shell, cx| {
+                    shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                });
+            }
+        });
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn pick_picture(&mut self, conversation: Key, cx: &mut Context<Self>) {
+        if only_draws() {
+            return;
+        }
+        let asked = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose photo".into()),
+        });
+        let shell = self.shell.clone();
+        cx.spawn(async move |_, cx| {
+            let Ok(Ok(Some(paths))) = asked.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let path = path.to_string_lossy().into_owned();
+            let _ = cx.update(|cx| {
+                super::ask_later(cx, Request::ConversationPicture { conversation, path }, move |answer, cx| {
+                    if let Ok(Response::Error { detail, .. }) = answer {
+                        let _ = shell.update(cx, |shell, cx| {
+                            shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                        });
+                    }
+                });
+            });
+        })
+        .detach();
+    }
+
+    pub(in crate::gui) fn update_chat_settings(&mut self, conversation: Key, settings: protocol::ChatSettings, cx: &mut Context<Self>) {
+        if only_draws() {
+            return;
+        }
+        let shell = self.shell.clone();
+        super::ask_later(cx, Request::UpdateChatSettings { conversation, settings }, move |answer, cx| {
+            if let Ok(Response::Error { detail, .. }) = answer {
+                let _ = shell.update(cx, |shell, cx| {
+                    shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                });
+            }
+        });
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn load_admin_log(&mut self, conversation: Key, cx: &mut Context<Self>) {
+        if self.admin_log.as_ref().is_some_and(|(k, _)| k == &conversation) {
+            self.admin_log = None;
+            cx.notify();
+            return;
+        }
+        self.admin_log_loading = true;
+        cx.notify();
+        if only_draws() {
+            self.admin_log_loading = false;
+            return;
+        }
+        let this = cx.weak_entity();
+        let shell = self.shell.clone();
+        super::ask_later(cx, Request::AdminLog { conversation: conversation.clone(), limit: 50 }, move |answer, cx| {
+            let _ = this.update(cx, |this, cx| {
+                this.admin_log_loading = false;
+                match answer {
+                    Ok(Response::AdminLog { conversation, entries }) => {
+                        this.admin_log = Some((conversation, entries));
+                    }
+                    Ok(Response::Error { detail, .. }) => {
+                        let _ = shell.update(cx, |shell, cx| {
+                            shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                        });
+                    }
+                    _ => {}
+                }
+                cx.notify();
+            });
         });
     }
 }

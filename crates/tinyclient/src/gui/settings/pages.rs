@@ -15,17 +15,22 @@ use crate::gui::theme::{self, Type};
 use gpui::{canvas, div, img, prelude::*, px, AnyElement, ClipboardItem, Context, Div, MouseButton, ObjectFit, SharedString, Window};
 use crate::gui::hotkeys::{self, Action, Reach};
 use protocol::settings::{
-    self as keys, account_scope, DeviceChoice, Values, AUTO_GAIN, CACHE_MB, CAMERA, CACHE_MB_CHOICES, CUE_CONNECTION, CUE_JOINS, CUE_MINE, CUE_VOLUME,
-    ECHO_CANCELLATION, GLOBAL, INPUT, INPUT_VOLUME, JOIN_MUTED, KEEP_DAYS, KEEP_DAYS_CHOICES, KEEP_RUNNING, NOISE_CHOICES, NOISE_SUPPRESSION, OUTPUT,
-    PTT_RELEASE_CHOICES, PTT_RELEASE_MS, PUSH_TO_TALK, PRESENCE_ACTIVITY, QUALITY_CHOICES, RECEIPTS, REQUIRE_CALL_E2EE, SENSITIVITY, SOUNDS, TYPING, VOICE_QUALITY,
-    VOICE_VOLUME,
+    self as keys, account_scope, DeviceChoice, Values, AUTO_GAIN, AUTO_WATCH_SHARE, CACHE_MB, CAMERA, CAMERA_BLUR, CAMERA_MIRROR, CAMERA_QUALITY, CAMERA_QUALITY_CHOICES,
+    CACHE_MB_CHOICES, CUE_CONNECTION, CUE_JOINS, CUE_MINE, CUE_VOLUME, ECHO_CANCELLATION, GLOBAL, INPUT, INPUT_VOLUME, JOIN_MUTED, KEEP_DAYS,
+    KEEP_DAYS_CHOICES, KEEP_RUNNING, NOISE_CHOICES, NOISE_SUPPRESSION, OUTPUT, PTT_RELEASE_CHOICES, PTT_RELEASE_MS, PUSH_TO_TALK, PRESENCE_ACTIVITY, QUALITY_CHOICES,
+    RECEIPTS, REQUIRE_CALL_E2EE, SENSITIVITY, SOUNDS, STREAMER_DETECT_OBS, STREAMER_HIDE_WINDOW, STREAMER_MODE, STREAMER_MODE_CHOICES, TRANSLATE_TO, TRANSLATE_TO_CHOICES, TYPING, VOICE_QUALITY, VOICE_VOLUME,
 };
 use protocol::{AccountStatus, Link, Network, Request, Response};
 use std::rc::Rc;
 
+/// Labels for [`TRANSLATE_TO_CHOICES`], in the same order. `"auto"` is the system language.
+const TRANSLATE_LABELS: [&str; 13] = [
+    "System default", "English", "Spanish", "French", "German", "Italian", "Portuguese", "Russian", "Japanese", "Korean", "Chinese", "Arabic", "Hindi",
+];
+
 /// Choice sets whose pills do not fit beside their label. Short pairs stay pills.
 pub(super) fn menu_choice(id: &str) -> bool {
-    matches!(id, "S2" | "S3" | "S4" | "N2" | "N4" | "NL" | "N6" | "M5" | "P4" | "D2" | "V8" | "V11" | "V21")
+    matches!(id, "S2" | "S3" | "S4" | "N2" | "N4" | "NL" | "N6" | "M5" | "M8" | "P4" | "PS1" | "D2" | "V8" | "V11" | "V21" | "V23")
 }
 
 /// `--settings-choice` names one of these.
@@ -40,11 +45,14 @@ pub(super) fn choice_id(name: &str) -> Option<&'static str> {
         "N6" => "N6",
         "N7" => "N7",
         "M5" => "M5",
+        "M8" => "M8",
         "P4" => "P4",
+        "PS1" => "PS1",
         "D2" => "D2",
         "V8" => "V8",
         "V11" => "V11",
         "V21" => "V21",
+        "V23" => "V23",
         _ => return None,
     })
 }
@@ -61,11 +69,14 @@ fn choice_slot(id: &str) -> usize {
         "N6" => 16,
         "N7" => 17,
         "M5" => 25,
+        "M8" => 52,
         "P4" => 34,
+        "PS1" => 51,
         "D2" => 42,
         "V8" => 48,
         "V11" => 49,
         "V21" => 50,
+        "V23" => 53,
         _ => 0,
     }
 }
@@ -95,6 +106,21 @@ fn choice_list(id: &str) -> Option<(Vec<(String, String)>, usize, usize)> {
             let at = KEEP_DAYS_CHOICES.iter().position(|d| *d == days).unwrap_or(2);
             (pairs(&["7 days", "30 days", "90 days"]), at, 2)
         }
+        "PS1" => {
+            let at = STREAMER_MODE_CHOICES
+                .iter()
+                .position(|w| *w == values.word(GLOBAL, STREAMER_MODE))
+                .unwrap_or(2);
+            (
+                STREAMER_MODE_CHOICES
+                    .iter()
+                    .zip(["Off", "On", "While sharing"])
+                    .map(|(w, l)| ((*w).to_owned(), (*l).to_owned()))
+                    .collect(),
+                at,
+                2,
+            )
+        }
         "D2" => {
             let cap = values.number(CACHE_MB);
             let at = CACHE_MB_CHOICES.iter().position(|mb| *mb == cap).unwrap_or(1);
@@ -108,6 +134,14 @@ fn choice_list(id: &str) -> Option<(Vec<(String, String)>, usize, usize)> {
         "V21" => {
             let at = QUALITY_CHOICES.iter().position(|w| *w == values.word(GLOBAL, VOICE_QUALITY)).unwrap_or(1);
             (QUALITY_CHOICES.iter().zip(["Data saver", "Standard", "High"]).map(|(w, l)| ((*w).to_owned(), (*l).to_owned())).collect(), at, 1)
+        }
+        "V23" => {
+            let at = CAMERA_QUALITY_CHOICES.iter().position(|w| *w == values.word(GLOBAL, CAMERA_QUALITY)).unwrap_or(0);
+            (CAMERA_QUALITY_CHOICES.iter().zip(["Auto", "HD (720p)", "Standard (360p)", "Data saver"]).map(|(w, l)| ((*w).to_owned(), (*l).to_owned())).collect(), at, 0)
+        }
+        "M8" => {
+            let at = TRANSLATE_TO_CHOICES.iter().position(|w| *w == values.word(GLOBAL, TRANSLATE_TO)).unwrap_or(0);
+            (TRANSLATE_TO_CHOICES.iter().zip(TRANSLATE_LABELS).map(|(w, l)| ((*w).to_owned(), (*l).to_owned())).collect(), at, 0)
         }
         "N7" => (pairs(&["1 hour", "Until tomorrow", "Until I resume"]), 0, 0),
         _ => return None,
@@ -387,7 +421,7 @@ impl SettingsWindow {
                     .when(!phone::active(), |group| group.child(caption(crate::host::APPEARANCE_CAPTION))),
             ],
             // A phone has no Return key to choose: its keyboard's own key sends.
-            Section::Messages => vec![self.group(if phone::active() { &["M2", "M3", "M4", "M5", "M6", "M7"] } else { &["M1", "M2", "M3", "M4", "M5", "M6", "M7"] }, None, window, cx)],
+            Section::Messages => vec![self.group(if phone::active() { &["M2", "M3", "M4", "M5", "M6", "M7", "M8"] } else { &["M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8"] }, None, window, cx)],
             Section::Privacy => {
                 let lock_rows: &[&str] = if cfg!(target_os = "linux") { &["LK", "LS", "LP"] } else { &["LK", "LS"] };
                 let mut groups = vec![self.group(lock_rows, Some("Lock"), window, cx).child(caption(crate::gui::lock::CAPTION))];
@@ -407,14 +441,20 @@ impl SettingsWindow {
                         "When a server turns a call's encryption off, the call stops until you choose to carry on unencrypted. With this on you can't: you leave instead, and a Tiny server that cannot encrypt calls is not joined. Always the case on Incognito servers and in rooms that require it. Takes effect the next time you join.",
                     )),
                 );
+                groups.push(
+                    self.group(&["PS1", "PS2", "PS3"], Some("Streamer mode"), window, cx).child(caption(
+                        "While it is on, notification banners and their sounds stay quiet, phone numbers and emails stay hidden, and invite links and sign-in codes in messages stay hidden until you reveal them. Unread counts stay.",
+                    )),
+                );
                 groups
             }
             Section::Audio => vec![
                 self.group(&["V1"], Some("Microphone"), window, cx).child(caption("How your microphone opens, its level and its processing are in Voice.")),
                 self.group(&["V2", "V5"], Some("Speaker"), window, cx)
                     .child(caption("Picking a device in a call's menu changes that call only. These are the defaults.")),
-                self.group(&["V22"], Some("Camera"), window, cx).child(self.camera_preview(cx)),
-                self.group(&["V4"], Some("Joining"), window, cx),
+                self.group(&["V22", "V23", "V24", "V25"], Some("Camera"), window, cx).child(self.camera_preview(cx)),
+                self.group(&["V4", "V26"], Some("Joining"), window, cx),
+                self.group(&["V27"], Some("Screen sharing"), window, cx),
             ],
             Section::Voice => {
                 let values = prefs::values();
@@ -766,6 +806,11 @@ impl SettingsWindow {
                 let second = "Tiny fetches the page from this device before sending.".to_owned();
                 self.switch_row(id, choices.send_link_previews, true, Some(second), |this, on, cx| this.choose(|c| c.send_link_previews = on, cx), cx)
             }
+            "M8" => {
+                let at = TRANSLATE_TO_CHOICES.iter().position(|w| *w == values.word(GLOBAL, TRANSLATE_TO)).unwrap_or(0);
+                let second = Some("On demand, for one message. End-to-end encrypted chats are never sent out to be translated.".to_owned());
+                self.menu_choice_row(id, &TRANSLATE_LABELS, at, 0, second, None, cx)
+            }
             // A finger never hovers: a phone plays them or it does not.
             "M5" if phone::active() => {
                 let at = usize::from(anim::autoplay() != Autoplay::Always);
@@ -853,6 +898,24 @@ impl SettingsWindow {
                 let on = values.on(REQUIRE_CALL_E2EE);
                 self.switch_row(id, on, false, None, move |this, on, cx| this.set_switch(id, REQUIRE_CALL_E2EE, on, false, cx), cx)
             }
+            "PS1" => {
+                let at = STREAMER_MODE_CHOICES.iter().position(|word| *word == values.word(GLOBAL, STREAMER_MODE)).unwrap_or(2);
+                let second = Some(match values.word(GLOBAL, STREAMER_MODE) {
+                    "on" => "Notifications stay quiet, and private details stay hidden.".to_owned(),
+                    "off" => "Notifications and private details show as usual.".to_owned(),
+                    _ => "On while you share your screen. Also while OBS or Streamlabs is running, when that switch is on.".to_owned(),
+                });
+                self.menu_choice_row(id, &["Off", "On", "While sharing"], at, 2, second, None, cx)
+            }
+            "PS2" => {
+                let on = values.on(STREAMER_HIDE_WINDOW);
+                let second = Some("The window is black in other apps' captures, including a share of the whole screen.".to_owned());
+                self.switch_row(id, on, false, second, move |this, on, cx| this.set_switch(id, STREAMER_HIDE_WINDOW, on, false, cx), cx)
+            }
+            "PS3" => {
+                let on = values.on(STREAMER_DETECT_OBS);
+                self.switch_row(id, on, false, None, move |this, on, cx| this.set_switch(id, STREAMER_DETECT_OBS, on, false, cx), cx)
+            }
             "P4" => {
                 let days = values.number(KEEP_DAYS);
                 let at = KEEP_DAYS_CHOICES.iter().position(|d| *d == days).unwrap_or(2);
@@ -861,6 +924,21 @@ impl SettingsWindow {
             "P1" | "P2" => return self.per_account_rows(id, cx).unwrap_or_else(div),
             "V1" | "V2" => self.device_row(id, cx),
             "V22" => self.camera_row(cx),
+            "V23" => {
+                let at = CAMERA_QUALITY_CHOICES.iter().position(|w| *w == values.word(GLOBAL, CAMERA_QUALITY)).unwrap_or(0);
+                let second = Some("Auto sends 720p at 30 fps with a hardware encoder and adapts down on busy links. Data saver caps at 360p / 350 kb/s.".to_owned());
+                self.menu_choice_row(id, &["Auto", "HD (720p)", "Standard (360p)", "Data saver"], at, 0, second, None, cx)
+            }
+            "V24" => {
+                let on = values.on(CAMERA_MIRROR);
+                let second = Some("Flips your own camera preview only. Others always see you unmirrored.".to_owned());
+                self.switch_row(id, on, true, second, move |this, on, cx| this.set_switch(id, CAMERA_MIRROR, on, true, cx), cx)
+            }
+            "V25" => {
+                let on = values.on(CAMERA_BLUR);
+                let second = Some("Softens your background on this device before sending. No model is downloaded.".to_owned());
+                self.switch_row(id, on, false, second, move |this, on, cx| this.set_switch(id, CAMERA_BLUR, on, false, cx), cx)
+            }
             "V3" => self.meter_row(cx),
             "V8" => {
                 let push = values.on(PUSH_TO_TALK);
@@ -910,6 +988,14 @@ impl SettingsWindow {
             "V4" => {
                 let on = values.on(JOIN_MUTED);
                 self.switch_row(id, on, false, None, move |this, on, cx| this.set_switch(id, JOIN_MUTED, on, false, cx), cx)
+            }
+            "V27" => {
+                let on = values.on(AUTO_WATCH_SHARE);
+                self.switch_row(id, on, false, None, move |this, on, cx| this.set_switch(id, AUTO_WATCH_SHARE, on, false, cx), cx)
+            }
+            "V26" => {
+                let second = Some("Automatically opens the always-on-top call video window when you switch to another app while watching a screen share.".to_owned());
+                self.switch_row(id, choices.auto_popout_call, false, second, |this, on, cx| this.choose(|c| c.auto_popout_call = on, cx), cx)
             }
             "D1" => self.usage(cx),
             "D2" => {
@@ -1226,6 +1312,13 @@ impl SettingsWindow {
         match id {
             "M5" => self.set_autoplay([Autoplay::Always, Autoplay::Hover, Autoplay::Never][ix], cx),
             "P4" => self.pick_retention(KEEP_DAYS_CHOICES[ix], cx),
+            "PS1" => {
+                let word = STREAMER_MODE_CHOICES[ix.min(STREAMER_MODE_CHOICES.len() - 1)];
+                let defaults = Values::default();
+                let default = defaults.word(GLOBAL, STREAMER_MODE);
+                let stored = (word != default).then(|| word.to_owned());
+                self.set(id, GLOBAL.into(), STREAMER_MODE, stored, cx);
+            }
             "D2" => {
                 let mb = CACHE_MB_CHOICES[ix];
                 let stored = (mb != Values::default_number(CACHE_MB)).then(|| mb.to_string());
@@ -1245,6 +1338,16 @@ impl SettingsWindow {
                 let word = QUALITY_CHOICES[ix.min(QUALITY_CHOICES.len() - 1)];
                 let stored = (word != "standard").then(|| word.to_owned());
                 self.set(id, GLOBAL.into(), VOICE_QUALITY, stored, cx);
+            }
+            "V23" => {
+                let word = CAMERA_QUALITY_CHOICES[ix.min(CAMERA_QUALITY_CHOICES.len() - 1)];
+                let stored = (word != "auto").then(|| word.to_owned());
+                self.set(id, GLOBAL.into(), CAMERA_QUALITY, stored, cx);
+            }
+            "M8" => {
+                let word = TRANSLATE_TO_CHOICES[ix.min(TRANSLATE_TO_CHOICES.len() - 1)];
+                let stored = (word != "auto").then(|| word.to_owned());
+                self.set(id, GLOBAL.into(), TRANSLATE_TO, stored, cx);
             }
             "N7" => {
                 let now = crate::view::now();
@@ -1502,7 +1605,8 @@ impl SettingsWindow {
             let network = account.key.network;
             // Fixed rows say what the network decides; Discord and Slack have no receipts.
             let (fixed, reason): (Option<&str>, Option<&str>) = match (id, network) {
-                ("P1", Network::Telegram) | ("P2", Network::Telegram) => (Some("Always on"), Some("Telegram does not let an app turn this off.")),
+                ("P1", Network::Telegram) => (Some("Always on"), Some("Telegram always shares typing and recording status and does not let an app turn this off.")),
+                ("P2", Network::Telegram) => (Some("Always on"), Some("Telegram does not let an app turn this off.")),
                 ("P1", Network::Messages) => (Some("Sent to the phone"), Some("Messages shows typing on your other devices.")),
                 ("P2", Network::Messages) => (Some("On your devices"), Some("Messages does not let tinyclient change read receipts.")),
                 ("P2", Network::Discord | Network::Slack) => continue,
@@ -2007,7 +2111,7 @@ impl SettingsWindow {
 
     /// D1: what tinyclient keeps on this Mac, as a two-part bar.
     fn usage(&mut self, cx: &mut Context<Self>) -> Div {
-        let Some((messages, files)) = self.storage else {
+        let Some((messages, files, chats)) = self.storage.clone() else {
             return row("Storage used", None, div().type_ui().text_color(theme::text_soft()).child("Counting…"));
         };
         let (message_words, file_words, total_words) = usage_words(messages, files);
@@ -2062,6 +2166,26 @@ impl SettingsWindow {
                     .child(legend(theme::accent(), format!("Messages {message_words}")))
                     .child(legend(theme::positive(), format!("Images and files {file_words}"))),
             )
+            .children((!chats.is_empty()).then(|| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .pt(px(4.))
+                    .child(div().type_small().text_color(theme::text_faint()).child("By chat"))
+                    .children(chats.iter().take(12).map(|chat| {
+                        let name = if chat.title.is_empty() { chat.conversation.id.clone() } else { chat.title.clone() };
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(12.))
+                            .type_small()
+                            .text_color(theme::text_soft())
+                            .child(div().flex_1().min_w_0().child(name))
+                            .child(megabytes(chat.bytes))
+                    }))
+            }))
     }
 
     /// P4: a longer time applies at once; a shorter one asks first, with what it deletes.
@@ -2572,9 +2696,10 @@ mod tests {
 
     #[test]
     fn long_choice_sets_are_menus_and_the_button_stays_in_the_column() {
-        for id in ["S2", "S3", "S4", "N2", "N4", "NL", "N6", "M5", "P4", "D2", "V8", "V11", "V21"] {
+        for id in ["S2", "S3", "S4", "N2", "N4", "NL", "N6", "M5", "M8", "P4", "PS1", "D2", "V8", "V11", "V21", "V23"] {
             assert!(menu_choice(id), "{id}");
         }
+        assert_eq!(TRANSLATE_LABELS.len(), TRANSLATE_TO_CHOICES.len());
         for id in ["A3", "M1", "M2", "N5", "N7"] {
             assert!(!menu_choice(id), "{id}");
         }

@@ -610,6 +610,8 @@ fn attachment(rich: &mut Rich, attached: &Attached, blur_explicit: bool) -> Atta
         view_once: false,
         sticker_set: String::new(),
         page: String::new(),
+        transcription: None,
+        transcript: None,
     }
 }
 
@@ -646,6 +648,8 @@ fn sticker(rich: &mut Rich, sticker: &model::Sticker) -> Attachment {
         view_once: false,
         sticker_set: String::new(),
         page: String::new(),
+        transcription: None,
+        transcript: None,
     }
 }
 
@@ -1398,6 +1402,8 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         invites,
         buttons: Vec::new(),
         jump,
+        media_unread: false,
+        keyboard: None,
     };
     (message, rich.files)
 }
@@ -1697,6 +1703,8 @@ fn component_media_attachment(
         view_once: false,
         sticker_set: String::new(),
         page: String::new(),
+        transcript: None,
+        transcription: None,
     })
 }
 

@@ -1,6 +1,6 @@
 //! The composer: the draft, sending it, editing and replying, the typing row above it, and what
 //! replaces it when nothing can be sent. One `Composer` per place a message is written: the
-//! conversation, and the thread pane.
+//! conversation, the thread pane, and a conversation window when that window owns the draft.
 //!
 //! The card holds only what the account can do (`controls`): attach, the field, GIF, emoji and
 //! send. Files come in by ⌘U, by pasting a screenshot or Finder files, or by a drop anywhere on
@@ -47,12 +47,12 @@ pub(in crate::gui) mod picker;
 mod tray;
 mod typing;
 
-pub use typing::preview as typing_preview;
+pub use typing::preview_for as typing_preview_for;
 
 use super::components::place::{max_height, placed, Layer, Place};
 use super::components::{button, glyph, menu, menu_item, menu_item_disabled, menu_label, menu_separator, tip, ButtonKind};
 use super::input::{InputEvent, InputKey, InputList, InputPaste, PickEmoji, PickGifs, SubmitSilently, TextInput};
-use super::people::{ask_later, Hub};
+use super::people::{ask_later, rough_last_seen, Hub};
 use super::playing;
 use super::state::Shell;
 use super::theme::{self, Type};
@@ -71,8 +71,10 @@ use picker::emoji::Custom;
 use picker::images::Images;
 use picker::{Picker, PickerEvent, Setup, Tab};
 use protocol::{
-    AccountKey, Capabilities, CatalogKind, Change, Conversation, ConversationKind, ConversationRights, EmojiScope, ErrorCode, Key, Link,
-    Message, MessageKind, Network, OutgoingFile, Page, Person, Pick, RecordRequest, RecordState, Request, Response, SendState, DRAFT_LIMIT,
+    AccountKey, BotCommand, BotKey, BotKeyKind, Capabilities, CatalogKind, Change, Conversation, ConversationKind, ConversationRights, EmojiScope, ErrorCode, Key,
+    Link,
+    Message, MessageKind, Network, OutgoingFile, Page, Person, Pick, RecordRequest, RecordState, ReplyKeyboard, Request, Response,
+    SendState, DRAFT_LIMIT,
 };
 use std::cell::{Cell, OnceCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -130,6 +132,8 @@ type Rec = protocol::Recording;
 pub struct State {
     main: OnceCell<Entity<Composer>>,
     thread: OnceCell<Entity<Composer>>,
+    /// Composers of conversation windows. The main window keeps `main` and `thread`.
+    extra: Vec<Entity<Composer>>,
     hold: Hold,
     flight: Flight,
     /// The one timer of the hold: it exists only while a message waits, and ends at the
@@ -230,6 +234,11 @@ fn placeholder_for(target: &Target, thread: bool, replying: bool) -> String {
     }
 }
 
+/// A bot menu button opens only an http or https address.
+fn http_menu(url: &str) -> Option<&str> {
+    (url.starts_with("https://") || url.starts_with("http://")).then_some(url)
+}
+
 /// Slack has no reply outside a thread, so its composer has no reply mode.
 fn replies_inline(network: Network) -> bool {
     network != Network::Slack
@@ -306,6 +315,24 @@ fn slowmode_words(seconds: u32, until: Option<i64>, now: i64) -> Option<String> 
         None
     }
 }
+/// Formats a slow-mode countdown in seconds as `m:ss` (or `h:mm:ss` for >= 1 hour).
+pub(crate) fn format_countdown(seconds: u32) -> String {
+    if seconds >= 3600 {
+        format!("{}:{:02}:{:02}", seconds / 3600, (seconds % 3600) / 60, seconds % 60)
+    } else {
+        format!("{}:{:02}", seconds / 60, seconds % 60)
+    }
+}
+
+/// Formats a timed mute expiry (`ban_until`) as a human-readable local time sentence.
+pub(crate) fn format_ban_until(until: i64, now: i64) -> String {
+    let at = crate::gui::time::local(until);
+    if until - now >= 24 * 3600 {
+        format!("You can send messages again on {:04}-{:02}-{:02} at {:02}:{:02}.", at.year, at.month, at.day, at.hour, at.minute)
+    } else {
+        format!("You can send messages again at {:02}:{:02}.", at.hour, at.minute)
+    }
+}
 
 /// Where the composer writes to.
 #[derive(Clone, PartialEq)]
@@ -320,10 +347,16 @@ struct Target {
     peer: Option<String>,
     read_only: bool,
     read_only_reason: String,
+    /// Why voice and round video messages are not allowed in this conversation. Empty when allowed.
+    voice_notes_forbidden: String,
     joined: bool,
     /// When this direct conversation's peer is blocked, the composer is replaced by an unblock bar.
     blocked_peer: Option<protocol::Person>,
     special: protocol::Special,
+    /// A Telegram bot, so `/` lists its commands and an empty chat can Start.
+    bot: bool,
+    /// The direct peer hides an exact last-seen time (Telegram's rough "last seen …" words).
+    hidden_last_seen: bool,
     /// What the account may send.
     can: Capabilities,
     /// Selectable sending identities or lines (e.g. dual-SIM cards on Messages).
@@ -397,6 +430,14 @@ impl Draft {
             self.reply = None;
         }
     }
+}
+
+/// What the field shows when a composer is aimed here. A draft handed over
+/// from the composer that just owned the conversation wins, including an
+/// empty one. What this composer remembered when it left is next. The row
+/// is only the fallback.
+fn draft_on_open(handed: Option<Draft>, remembered: Option<Draft>, stored: &str) -> Draft {
+    handed.or(remembered).unwrap_or_else(|| Draft { text: stored.to_owned(), ..Draft::default() })
 }
 
 /// The parked text is still the message that went. A follow-up typed before the
@@ -519,6 +560,9 @@ struct Editing {
     original_attachments: Vec<(String, String)>,
     /// Remaining attachments kept by the user during this edit.
     attachments: Vec<(String, String)>,
+    /// The message being edited carries media (photo/file), so an empty caption is allowed
+    /// and networks with `Capabilities::edit_media` may replace the attachment.
+    has_media: bool,
     /// What was in the field before, and the reply it was for. Back on save or cancel.
     stash: Draft,
     reply: Option<Reply>,
@@ -550,6 +594,8 @@ struct Outgoing {
     made: Vec<PathBuf>,
     /// The send carried a voice note, so its facts and file can leave with it.
     note: bool,
+    /// Recorded voice note & chip kept until chatd confirms the send succeeded (so a refusal keeps the note in the tray).
+    voice_chip: Option<(Rec, Staged)>,
 }
 
 /// A drag of files over the window, while it is over this composer's conversation.
@@ -590,6 +636,9 @@ pub struct Composer {
     thread: bool,
     target: Option<Target>,
     drafts: HashMap<Key, Draft>,
+    /// A draft handed over by the composer that owned this conversation. The
+    /// next aim at that key shows it, ahead of what this composer remembered.
+    incoming: Option<(Key, Draft)>,
     draft_order: VecDeque<Key>,
     /// The draft chatd holds for this conversation, as far as this window knows.
     saved: String,
@@ -607,6 +656,12 @@ pub struct Composer {
     /// One line under the card, until the text changes: why something did not happen.
     caption: Option<(String, Tone)>,
     sending: bool,
+    /// A join is already on its way. Another click does not send a second one.
+    joining: bool,
+    /// Which click `joining` belongs to. A late answer for an older click does not clear a newer one.
+    join_epoch: u64,
+    /// The conversation just joined, until the user leaves it or undoes the join.
+    undo_join: Option<Key>,
     /// The conversation the network was last told we are typing in, and when.
     told_typing: Option<(Key, Instant)>,
     list: Option<List>,
@@ -646,6 +701,8 @@ pub struct Composer {
     anchors: Rc<Anchors>,
     /// The recording of this conversation, as chatd said it (`Change::Recording`).
     recording: Option<Rec>,
+    /// The mic records a round video message instead of a voice note. Telegram only.
+    video_note: bool,
     /// The mic held down (push-to-talk), and the conversation the hold began in: the next
     /// release stops that one's recording after the grace, wherever the composer has gone since.
     holding: Option<Key>,
@@ -658,6 +715,8 @@ pub struct Composer {
     /// The facts of the note that arrived (`Recorded`): a send is sent with them, and this
     /// composer answers a removed chip with them.
     note: Option<Rec>,
+    /// Voice note send waiting on network settlement: restored to the tray if Telegram refuses it.
+    held_voice: Option<(Key, String, Rec, Staged)>,
     /// Tiny file sends whose chips stay until the upload and the message have both settled.
     /// One hold per client id, so a second channel does not discard the first.
     held_files: crate::tiny_attach::Holds<Outgoing>,
@@ -687,13 +746,132 @@ pub struct Composer {
     space_tags: HashMap<Key, Vec<protocol::TeamTag>>,
     space_tags_asked: HashSet<Key>,
     /// One-second ticker while a slowmode countdown is active; never auto-sends.
-    slowmode_timer: Option<Task<()>>,
+    discord_slowmode_timer: Option<Task<()>>,
     /// Slash command completion popover (`/` at start of composer) and cached commands per conversation.
-    slash: Option<slash::List>,
-    slash_commands: HashMap<Key, Vec<protocol::AppCommand>>,
+    app_slash: Option<slash::List>,
+    app_commands: HashMap<Key, Vec<protocol::AppCommand>>,
     slash_loaded: HashSet<Key>,
-    slash_dismissed: bool,
+    app_slash_dismissed: bool,
     slash_lookup: Option<Task<()>>,
+    /// Per-conversation send rules (slow mode, media bans, timed mute, paid Stars) keyed by conversation.
+    send_rules: HashMap<Key, protocol::SendRules>,
+    /// 1-second ticker while the current conversation has an active slow-mode countdown.
+    slowmode_timer: Option<Task<()>>,
+    /// Explicit confirmation for a paid-message Stars send (`(conversation, field text)`).
+    paid_confirmed: Option<(Key, String)>,
+    /// Bot commands for `/` completion, loaded when a bot chat is opened.
+    commands: Vec<BotCommand>,
+    menu_label: String,
+    menu_url: String,
+    /// Escape closed the slash list for this query. A different query shows it again.
+    slash_closed: Option<String>,
+    slash_at: usize,
+    /// Message id of a single-use reply keyboard already pressed in this chat.
+    used_keyboard: Option<(Key, String)>,
+    /// Phone, location, or chat share waiting on an explicit confirm.
+    bot_confirm: Option<BotAsk>,
+    /// Reply-keyboard placeholder last applied, so a frame does not reset it.
+    keyboard_hint: Option<String>,
+    /// Slack `/` slash-command completion state and cached workspace commands (#602).
+    slash: Option<SlashList>,
+    slash_dismissed: bool,
+    slash_commands: HashMap<AccountKey, Vec<protocol::SlashCommand>>,
+    slash_asked: HashSet<AccountKey>,
+}
+
+/// A reply-keyboard button that shares something, held until the person confirms.
+struct BotAsk {
+    kind: BotKeyKind,
+    message_id: String,
+    single_use: bool,
+}
+
+struct SlashList {
+    rows: Vec<protocol::SlashCommand>,
+    selected: usize,
+}
+
+impl SlashList {
+    fn step(&mut self, down: bool) {
+        if self.rows.is_empty() {
+            return;
+        }
+        self.selected = if down {
+            (self.selected + 1) % self.rows.len()
+        } else {
+            (self.selected + self.rows.len() - 1) % self.rows.len()
+        };
+    }
+}
+
+/// Built-in Slack slash commands supported directly by chatd (used immediately before `commands.list` loads).
+const SLACK_BUILTIN_COMMANDS: &[(&str, &str, &str)] = &[
+    ("/me", "Send an italicized action", "[action]"),
+    ("/shrug", "Append ¯\\_(ツ)_/¯ to a message", "[message]"),
+    ("/topic", "Set the channel topic", "[topic]"),
+    ("/invite", "Invite a member to this channel", "@user"),
+    ("/kick", "Remove a member from this channel", "@user"),
+    ("/remove", "Remove a member from this channel", "@user"),
+    ("/leave", "Leave this channel", ""),
+    ("/join", "Join a channel", "#channel"),
+    ("/archive", "Archive this channel", ""),
+    ("/mute", "Mute this channel", ""),
+    ("/away", "Set yourself as away", ""),
+    ("/active", "Set yourself as active", ""),
+    ("/status", "Set or clear your status", "[text]"),
+    ("/dnd", "Pause notifications", "[minutes | off]"),
+    ("/remind", "Set a reminder", "[text]"),
+];
+
+fn default_slack_slash_commands() -> Vec<protocol::SlashCommand> {
+    SLACK_BUILTIN_COMMANDS
+        .iter()
+        .map(|(command, description, usage)| protocol::SlashCommand {
+            command: (*command).to_owned(),
+            description: (*description).to_owned(),
+            usage: (*usage).to_owned(),
+            builtin: true,
+        })
+        .collect()
+}
+
+fn slack_slash_trigger(text: &str, caret: usize) -> Option<&str> {
+    if !text.starts_with('/') || caret == 0 || caret > text.len() || !text.is_char_boundary(caret) {
+        return None;
+    }
+    let prefix = &text[..caret];
+    if prefix.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(prefix)
+}
+
+fn slack_unknown_slash_command(text: &str) -> Option<String> {
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    let first = trimmed.split_whitespace().next()?;
+    if first.len() <= 1 {
+        return None;
+    }
+    let cmd = first.to_ascii_lowercase();
+    let is_builtin = SLACK_BUILTIN_COMMANDS.iter().any(|(name, _, _)| *name == cmd);
+    if is_builtin {
+        return None;
+    }
+    let has_space = trimmed.len() > first.len();
+    let matches_builtin_prefix = SLACK_BUILTIN_COMMANDS.iter().any(|(name, _, _)| name.starts_with(&cmd));
+    if has_space || !matches_builtin_prefix {
+        Some(cmd)
+    } else {
+        None
+    }
+}
+
+fn slack_channel_app_url(team: &str, channel: &str) -> Option<String> {
+    let ok = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    (ok(team) && ok(channel)).then(|| format!("https://app.slack.com/client/{team}/{channel}"))
 }
 
 impl Composer {
@@ -750,6 +928,7 @@ impl Composer {
             thread,
             target: None,
             drafts: HashMap::new(),
+            incoming: None,
             draft_order: VecDeque::new(),
             saved: String::new(),
             offered: String::new(),
@@ -761,6 +940,9 @@ impl Composer {
             editing: None,
             caption: None,
             sending: false,
+            joining: false,
+            join_epoch: 0,
+            undo_join: None,
             told_typing: None,
             list: None,
             dismissed: None,
@@ -787,10 +969,12 @@ impl Composer {
             schedule_at: None,
             anchors: Rc::new(Anchors::default()),
             recording: None,
+            video_note: false,
             holding: None,
             release: None,
             owed_stop: None,
             note: None,
+            held_voice: None,
             held_files: crate::tiny_attach::Holds::default(),
             pending_file: None,
             poll_composer: None,
@@ -805,12 +989,27 @@ impl Composer {
             peer_away_gen: HashMap::new(),
             space_tags: HashMap::new(),
             space_tags_asked: HashSet::new(),
-            slowmode_timer: None,
-            slash: None,
-            slash_commands: HashMap::new(),
+            discord_slowmode_timer: None,
+            app_slash: None,
+            app_commands: HashMap::new(),
             slash_loaded: HashSet::new(),
-            slash_dismissed: false,
+            app_slash_dismissed: false,
             slash_lookup: None,
+            send_rules: HashMap::new(),
+            slowmode_timer: None,
+            paid_confirmed: None,
+            commands: Vec::new(),
+            menu_label: String::new(),
+            menu_url: String::new(),
+            slash_closed: None,
+            slash_at: 0,
+            used_keyboard: None,
+            bot_confirm: None,
+            keyboard_hint: None,
+            slash: None,
+            slash_dismissed: false,
+            slash_commands: HashMap::new(),
+            slash_asked: HashSet::new(),
         }
     }
 
@@ -823,9 +1022,73 @@ impl Composer {
         });
     }
 
+    fn current_send_rules(&self) -> Option<&protocol::SendRules> {
+        self.target.as_ref().and_then(|target| self.send_rules.get(&target.key))
+    }
+
+    fn slowmode_wait(&self) -> u32 {
+        if self.editing.is_some() {
+            return 0;
+        }
+        self.current_send_rules().map_or(0, |rules| rules.slowmode_remaining(now()))
+    }
+
+    fn locked_for(&self, target: &Target) -> Option<Locked> {
+        let rules = self.send_rules.get(&target.key);
+        let timed_mute = rules.and_then(|r| {
+            let until = r.ban_until?;
+            let current = now();
+            (!r.send_messages && until > current).then(|| format_ban_until(until, current))
+        });
+        match target.locked() {
+            Some(Locked::ReadOnly(_)) if timed_mute.is_some() => Some(Locked::ReadOnly(timed_mute.unwrap())),
+            Some(locked) => Some(locked),
+            None => timed_mute.map(Locked::ReadOnly).or_else(|| {
+                rules.filter(|r| !r.send_messages).map(|_| {
+                    Locked::ReadOnly(format!("You can read {} but not post in it.", target.title))
+                })
+            }),
+        }
+    }
+
+    fn ensure_slowmode_timer(&mut self, cx: &mut Context<Self>) {
+        if self.slowmode_wait() == 0 {
+            self.slowmode_timer = None;
+            return;
+        }
+        if self.slowmode_timer.is_some() {
+            return;
+        }
+        self.slowmode_timer = Some(cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            let keep = this.update(cx, |this, cx| {
+                let remaining = this.slowmode_wait();
+                cx.notify();
+                if remaining == 0 {
+                    this.slowmode_timer = None;
+                    false
+                } else {
+                    true
+                }
+            });
+            if !matches!(keep, Ok(true)) {
+                return;
+            }
+        }));
+    }
+
     fn controls(&self) -> Controls {
         match &self.target {
-            Some(target) => controls(&target.can, self.editing.is_some()),
+            Some(target) => {
+                let mut c = controls(&target.can, self.editing.is_some());
+                if target.can.edit_media && target.can.max_file_bytes > 0 && self.editing.as_ref().is_some_and(|e| e.has_media) {
+                    c.attach = true;
+                }
+                match self.send_rules.get(&target.key) {
+                    Some(rules) => c.apply_rules(rules),
+                    None => c,
+                }
+            }
             None => Controls::default(),
         }
     }
@@ -843,7 +1106,10 @@ impl Composer {
         let renamed = self.target.as_ref().map(|old| &old.title) != Some(&target.title);
         if moved {
             self.leave(cx);
-            let draft = self.drafts.get(&target.key).cloned().unwrap_or_else(|| Draft { text: stored.to_owned(), ..Draft::default() });
+            // Typing in the composer that just owned this conversation wins.
+            // What this one parked when it left is the fallback, then the row.
+            let handed = self.take_incoming(&target.key);
+            let draft = draft_on_open(handed, self.drafts.get(&target.key).cloned(), stored);
             self.saved = draft_text(&draft.text);
             self.set_field(&draft, cx);
             let note = draft.note.clone();
@@ -853,11 +1119,36 @@ impl Composer {
             self.reply = draft.reply;
             self.caption = self.scan_caption_for(&target.key).or(note);
             self.sending = false;
+            self.joining = false;
+            self.undo_join = None;
             self.no_preview = false;
             self.broadcast = false;
             self.armed = None;
+            self.paid_confirmed = None;
+            self.slowmode_timer = None;
+            self.commands.clear();
+            self.menu_label.clear();
+            self.menu_url.clear();
+            self.slash_closed = None;
+            self.slash_at = 0;
+            self.bot_confirm = None;
+            self.keyboard_hint = None;
+            self.used_keyboard = None;
             self.focus_next = true;
             picker::emoji::set_account(Some(&target.key.account()));
+            if live() && target.link == Link::Connected {
+                let key = target.key.clone();
+                let this = cx.weak_entity();
+                ask_later(cx, Request::SendRules { conversation: key.clone() }, move |answer, cx| {
+                    if let Ok(Response::SendRules { conversation, rules }) = answer {
+                        let _ = this.update(cx, |this, cx| {
+                            this.send_rules.insert(conversation, rules);
+                            this.ensure_slowmode_timer(cx);
+                            cx.notify();
+                        });
+                    }
+                });
+            }
         } else if self.offered != stored {
             // The row was read after the conversation opened: its draft is still wanted if
             // nothing has been typed in the meantime.
@@ -883,6 +1174,10 @@ impl Composer {
         self.maybe_fetch_peer_away(&target, cx);
         self.target = Some(target);
         self.schedule_slowmode_tick(cx);
+        if moved {
+            self.ensure_slowmode_timer(cx);
+            self.load_bot_menu(cx);
+        }
         cx.notify();
     }
 
@@ -977,20 +1272,20 @@ impl Composer {
     /// Runs a 1-second repaint ticker only while a slowmode countdown is active. Never auto-sends.
     fn schedule_slowmode_tick(&mut self, cx: &mut Context<Self>) {
         if self.slowmode_left() == 0 {
-            self.slowmode_timer = None;
+            self.discord_slowmode_timer = None;
             return;
         }
-        if self.slowmode_timer.is_some() {
+        if self.discord_slowmode_timer.is_some() {
             return;
         }
-        self.slowmode_timer = Some(cx.spawn(async move |this, cx| loop {
+        self.discord_slowmode_timer = Some(cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_secs(1)).await;
             let keep = this.update(cx, |this, cx| {
                 let left = this.slowmode_left();
                 let _ = this.shell.update(cx, |_, cx| cx.notify());
                 cx.notify();
                 if left == 0 {
-                    this.slowmode_timer = None;
+                    this.discord_slowmode_timer = None;
                     false
                 } else {
                     true
@@ -1000,6 +1295,275 @@ impl Composer {
                 return;
             }
         }));
+    }
+
+    fn load_bot_menu(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.target.clone() else {
+            return;
+        };
+        if !target.bot || target.key.network != Network::Telegram {
+            return;
+        }
+        let key = target.key.clone();
+        let this = cx.weak_entity();
+        ask_later(cx, Request::GetBotMenu { conversation: key }, move |answer, cx| {
+            let _ = this.update(cx, |this, cx| {
+                let Ok(Response::BotMenu { conversation, menu }) = answer else {
+                    return;
+                };
+                if this.target.as_ref().is_some_and(|target| target.key == conversation) {
+                    this.commands = menu.commands;
+                    this.menu_label = menu.menu_label;
+                    this.menu_url = menu.menu_url;
+                    this.sync_slash_keys(cx);
+                    cx.notify();
+                }
+            });
+        });
+    }
+
+    fn slash_query(&self, cx: &App) -> Option<String> {
+        let rest = self.input.read(cx).text().strip_prefix('/')?;
+        if rest.chars().any(char::is_whitespace) {
+            return None;
+        }
+        Some(rest.to_owned())
+    }
+
+    fn slash_rows(&self, query: &str) -> Vec<BotCommand> {
+        let query = query.trim_start_matches('/').to_ascii_lowercase();
+        self.commands
+            .iter()
+            .filter(|cmd| query.is_empty() || cmd.command.to_ascii_lowercase().starts_with(&query))
+            .take(8)
+            .cloned()
+            .collect()
+    }
+
+    fn slash_open(&self, cx: &App) -> bool {
+        if self.editing.is_some() {
+            return false;
+        }
+        let Some(query) = self.slash_query(cx) else {
+            return false;
+        };
+        self.slash_closed.as_deref() != Some(query.as_str()) && !self.slash_rows(&query).is_empty()
+    }
+
+    /// Return and the arrows belong to the command list while it has a row.
+    fn sync_slash_keys(&mut self, cx: &mut Context<Self>) {
+        if self.list.is_some() || self.colon.is_some() {
+            return;
+        }
+        let open = self.slash_open(cx);
+        if open {
+            let n = self.slash_rows(&self.slash_query(cx).unwrap_or_default()).len();
+            if n == 0 || self.slash_at >= n {
+                self.slash_at = 0;
+            }
+        }
+        self.input.update(cx, |input, _| input.set_list_open(open));
+    }
+
+    fn highlighted_slash(&self, cx: &App) -> Option<String> {
+        if !self.slash_open(cx) {
+            return None;
+        }
+        let query = self.slash_query(cx)?;
+        self.slash_rows(&query).get(self.slash_at).map(|cmd| cmd.command.clone())
+    }
+
+    fn accept_slash(&mut self, command: String, cx: &mut Context<Self>) {
+        self.slash_closed = Some(command.clone());
+        let text = format!("/{command}");
+        self.input.update(cx, |input, cx| input.set_text(&text, cx));
+        self.input.update(cx, |input, _| input.set_list_open(false));
+        self.follow_text(cx);
+        self.send(false, cx);
+    }
+
+    fn open_bot_url(&self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            return;
+        }
+        let url = url.to_owned();
+        let _ = self.shell.update(cx, |shell, cx| shell.open_pane_link(&url, window, cx));
+    }
+
+    fn note_keyboard_hint(&mut self, hint: Option<String>, cx: &mut Context<Self>) {
+        if self.keyboard_hint == hint {
+            return;
+        }
+        self.keyboard_hint = hint.clone();
+        let target = self.target.clone();
+        let thread = self.thread;
+        let replying = self.reply.is_some();
+        let this = cx.weak_entity();
+        cx.defer(move |cx| {
+            let _ = this.update(cx, |this, cx| {
+                let shown = hint.filter(|hint| !hint.is_empty()).unwrap_or_else(|| {
+                    target.as_ref().map(|target| placeholder_for(target, thread, replying)).unwrap_or_default()
+                });
+                this.input.update(cx, |input, cx| {
+                    input.set_placeholder(shown);
+                    cx.notify();
+                });
+            });
+        });
+    }
+
+    fn shown_keyboard(&self, cx: &App) -> Option<(String, ReplyKeyboard)> {
+        let target = self.target.as_ref()?;
+        if target.key.network != Network::Telegram {
+            return None;
+        }
+        let shell = self.shell.upgrade()?;
+        let found = shell.read(cx).bot_reply_keyboard(&target.key, cx)?;
+        if self.used_keyboard.as_ref().is_some_and(|(key, id)| key == &target.key && id == &found.0) {
+            return None;
+        }
+        Some(found)
+    }
+
+    fn press_bot_key(&mut self, key: BotKey, message_id: String, single_use: bool, window: &mut Window, cx: &mut Context<Self>) {
+        match key.kind {
+            BotKeyKind::Url => {
+                if let Some(url) = key.url.clone() {
+                    self.open_bot_url(&url, window, cx);
+                }
+                if single_use {
+                    self.mark_keyboard(message_id);
+                }
+            }
+            BotKeyKind::Phone | BotKeyKind::Location | BotKeyKind::Peer => {
+                self.bot_confirm = Some(BotAsk { kind: key.kind, message_id, single_use });
+                cx.notify();
+            }
+            BotKeyKind::Text => {
+                self.mark_keyboard_if(message_id, single_use);
+                self.input.update(cx, |input, cx| input.set_text(&key.text, cx));
+                self.follow_text(cx);
+                self.send(false, cx);
+            }
+        }
+    }
+
+    fn mark_keyboard_if(&mut self, message_id: String, single_use: bool) {
+        if single_use {
+            self.mark_keyboard(message_id);
+        }
+    }
+
+    fn mark_keyboard(&mut self, message_id: String) {
+        if let Some(key) = self.target.as_ref().map(|target| target.key.clone()) {
+            self.used_keyboard = Some((key, message_id));
+        }
+    }
+
+    fn confirm_bot_share(&mut self, cx: &mut Context<Self>) {
+        let Some(ask) = self.bot_confirm.take() else {
+            return;
+        };
+        let Some(target) = self.target.clone() else {
+            return;
+        };
+        self.mark_keyboard_if(ask.message_id, ask.single_use);
+        match ask.kind {
+            BotKeyKind::Phone => {
+                let this = cx.weak_entity();
+                ask_later(cx, Request::SharePhone { conversation: target.key }, move |answer, cx| {
+                    let _ = this.update(cx, |this, cx| {
+                        let detail = match answer {
+                            Ok(Response::Error { detail, .. }) => Some(detail),
+                            Err(err) => Some(err.to_string()),
+                            _ => None,
+                        };
+                        if let Some(detail) = detail {
+                            this.caption = Some((detail, Tone::Refused));
+                            cx.notify();
+                        }
+                    });
+                });
+            }
+            BotKeyKind::Location => {
+                self.caption = Some(("This app has no location to share.".to_owned(), Tone::Note));
+            }
+            BotKeyKind::Peer => {
+                self.caption = Some(("This app cannot pick a chat to share.".to_owned(), Tone::Note));
+            }
+            BotKeyKind::Text | BotKeyKind::Url => {}
+        }
+        cx.notify();
+    }
+
+    fn bot_strip(&mut self, target: &Target, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if target.key.network != Network::Telegram {
+            return None;
+        }
+        if let Some(ask) = self.bot_confirm.as_ref() {
+            let words = match ask.kind {
+                BotKeyKind::Phone => "Share your phone number with this bot?",
+                BotKeyKind::Location => "Share your location with this bot?",
+                BotKeyKind::Peer => "Share a chat with this bot?",
+                BotKeyKind::Text | BotKeyKind::Url => "Send this?",
+            };
+            let row = div()
+                .mt(px(8.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(div().flex_1().min_w_0().type_small().child(words))
+                .child(button("bot-share", ButtonKind::Primary, "Share").on_click(cx.listener(|this, _, _, cx| this.confirm_bot_share(cx))))
+                .child(button("bot-share-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                    this.bot_confirm = None;
+                    cx.notify();
+                })));
+            return Some(row.into_any_element());
+        }
+        let mut column = div().flex().flex_col().gap(px(6.));
+        let mut any = false;
+        if target.bot && self.shell.upgrade().is_some_and(|shell| shell.read(cx).bot_can_start(&target.key, cx)) {
+            any = true;
+            column = column.child(
+                button("bot-start", ButtonKind::Primary, "Start").on_click(cx.listener(|this, _, _, cx| {
+                    let Some(key) = this.target.as_ref().map(|target| target.key.clone()) else {
+                        return;
+                    };
+                    let _ = this.shell.update(cx, |shell, cx| shell.start_bot(key, String::new(), cx));
+                })),
+            );
+        }
+        if let Some(url) = http_menu(&self.menu_url) {
+            any = true;
+            let label: gpui::SharedString = if self.menu_label.is_empty() { "Menu".into() } else { self.menu_label.clone().into() };
+            let url = url.to_owned();
+            column = column.child(button("bot-menu", ButtonKind::Secondary, label).on_click(cx.listener(move |this, _, window, cx| {
+                let url = url.clone();
+                this.open_bot_url(&url, window, cx);
+            })));
+        }
+        if let Some((message_id, board)) = self.shown_keyboard(cx) {
+            any = true;
+            let hint = board.placeholder.clone().filter(|hint| self.input.read(cx).text().is_empty());
+            self.note_keyboard_hint(hint, cx);
+            let single_use = board.single_use;
+            let mut keys = div().flex().gap(px(6.)).when(board.resize, |row| row.flex_wrap());
+            for (row_ix, row) in board.rows.iter().enumerate() {
+                for (col, key) in row.iter().enumerate() {
+                    let pressed = key.clone();
+                    let id = message_id.clone();
+                    keys = keys.child(button(("bot-key", row_ix * 8 + col), ButtonKind::Secondary, key.text.clone()).on_click(cx.listener(
+                        move |this, _, window, cx| {
+                            this.press_bot_key(pressed.clone(), id.clone(), single_use, window, cx);
+                        },
+                    )));
+                }
+            }
+            column = column.child(keys);
+        } else if self.keyboard_hint.is_some() {
+            self.note_keyboard_hint(None, cx);
+        }
+        any.then(|| column.mt(px(8.)).into_any_element())
     }
 
     /// Leaving a conversation: an edit ends, and the draft is saved and kept for the way back,
@@ -1022,6 +1586,85 @@ impl Composer {
         let draft = Draft { text: draft_text(self.input.read(cx).text()), subject: self.subject.read(cx).text().trim().to_owned(), tokens: self.tokens.clone(), files,
             note: self.caption.clone(), reply: self.reply.take(), };
         self.remember(old, draft);
+    }
+
+    /// The draft this composer holds for `key`. The field, when it is aimed
+    /// there, including keystrokes the quiet timer has not saved yet.
+    fn held_draft(&self, key: &Key, cx: &App) -> Option<Draft> {
+        if self.target.as_ref().is_some_and(|target| target.key == *key) {
+            if let Some(editing) = &self.editing {
+                return Some(editing.stash.clone());
+            }
+            return Some(Draft {
+                text: draft_text(self.input.read(cx).text()),
+                subject: self.subject.read(cx).text().trim().to_owned(),
+                tokens: self.tokens.clone(),
+                files: self.tray.clone(),
+                note: self.caption.clone(),
+                reply: self.reply.clone(),
+            });
+        }
+        self.drafts.get(key).cloned()
+    }
+
+    fn aimed_at(&self, key: &Key) -> bool {
+        self.target.as_ref().is_some_and(|target| target.key == *key)
+    }
+
+    /// Writes the field to chatd when this composer is aimed at `key`, and
+    /// drops the quiet timer so a later drop cannot cancel the save.
+    fn flush_aimed(&mut self, key: &Key, cx: &mut Context<Self>) {
+        if self.editing.is_some() || self.target.as_ref().is_none_or(|target| target.key != *key) {
+            return;
+        }
+        self.save_draft(cx);
+        self.draft_timer = None;
+    }
+
+    fn take_incoming(&mut self, key: &Key) -> Option<Draft> {
+        match self.incoming.take() {
+            Some((incoming, draft)) if incoming == *key => Some(draft),
+            other => {
+                self.incoming = other;
+                None
+            }
+        }
+    }
+
+    /// Parks `draft` as what the next aim shows. A draft this composer
+    /// remembered when it left loses.
+    fn offer_draft(&mut self, key: Key, draft: Draft) {
+        self.remember(key.clone(), draft.clone());
+        self.incoming = Some((key, draft));
+    }
+
+    /// The composer that owns `key` now shows `draft`, in the field when it
+    /// is already aimed there.
+    fn accept_draft(&mut self, key: Key, draft: Draft, cx: &mut Context<Self>) {
+        let showing = self.editing.is_none() && self.target.as_ref().is_some_and(|target| target.key == key);
+        if !showing {
+            self.offer_draft(key, draft);
+            return;
+        }
+        self.remember(key, draft.clone());
+        self.incoming = None;
+        self.saved = draft_text(&draft.text);
+        self.offered = self.saved.clone();
+        self.set_field(&draft, cx);
+        self.tray = draft.files;
+        self.reply = draft.reply;
+        self.caption = draft.note;
+        self.touched = true;
+        self.draft_timer = None;
+        cx.notify();
+    }
+
+    /// Saves the field and returns the draft, files and reply included, so
+    /// another composer can show it after this one is dropped.
+    fn release_draft(&mut self, cx: &mut Context<Self>) -> Option<(Key, Draft)> {
+        let key = self.target.as_ref().map(|target| target.key.clone())?;
+        self.leave(cx);
+        self.drafts.get(&key).cloned().map(|draft| (key, draft))
     }
 
     fn remember(&mut self, key: Key, draft: Draft) {
@@ -1094,9 +1737,11 @@ impl Composer {
         self.follow_text(cx);
         self.touched = true;
         self.caption = None;
-        // Any edit disarms the large-ping confirm.
+        // Any edit disarms the large-ping confirm and paid-message confirm.
         self.armed = None;
+        self.paid_confirmed = None;
         self.look_up(cx);
+        self.sync_slash_keys(cx);
         cx.notify();
         let Some(target) = &self.target else {
             return;
@@ -1126,18 +1771,27 @@ impl Composer {
 
     /// Escape: the first that applies. It never clears what was typed.
     fn escape(&mut self, cx: &mut Context<Self>) {
+        let app_slash = self.app_slash.take();
+        if self.slash_open(cx) {
+            self.slash_closed = self.slash_query(cx);
+            self.input.update(cx, |input, _| input.set_list_open(false));
+            cx.notify();
+            return;
+        }
         let slash = self.slash.take();
         let list = self.list.take();
         let colon = self.colon.take();
         self.close_list(cx);
         // A list with no row was never on screen, so Escape is not spent on it.
-        if slash.is_some_and(|s| !s.is_empty()) {
+        if app_slash.is_some_and(|s| !s.is_empty()) {
+            self.app_slash_dismissed = true;
+        } else if slash.is_some_and(|slash| !slash.rows.is_empty()) {
             self.slash_dismissed = true;
         } else if let Some(list) = list.filter(|list| !list.rows.is_empty()) {
             self.dismissed = Some(list.trigger.start);
         } else if let Some(colon) = colon.filter(|colon| !colon.cells.is_empty()) {
             self.colon_dismissed = Some(colon.trigger.start);
-        } else if self.armed.take().is_some() {
+        } else if self.armed.take().is_some() || self.paid_confirmed.take().is_some() {
             self.caption = None;
             self.schedule_at = None;
         } else if self.chip_menu.take().is_some() || self.send_menu {
@@ -1169,6 +1823,15 @@ impl Composer {
     /// stored by chatd. A refusal (signed out, or a file) stays here: text is held for a
     /// minute, and files wait in the tray.
     pub fn send(&mut self, silent: bool, cx: &mut Context<Self>) {
+        // Return on an open command list sends that command. The list is closed first, so this
+        // does not ask the list again.
+        if let Some(command) = self.highlighted_slash(cx) {
+            self.slash_closed = Some(command.clone());
+            let text = format!("/{command}");
+            self.input.update(cx, |input, cx| input.set_text(&text, cx));
+            self.input.update(cx, |input, _| input.set_list_open(false));
+            self.follow_text(cx);
+        }
         let Some(target) = self.target.clone() else {
             self.schedule_at = None;
             return;
@@ -1177,7 +1840,7 @@ impl Composer {
         if self.sending {
             return;
         }
-        if self.scan_blocks(&target.key) || target.locked().is_some() {
+        if self.scan_blocks(&target.key) || self.locked_for(&target).is_some() {
             self.schedule_at = None;
             return;
         }
@@ -1191,6 +1854,15 @@ impl Composer {
             self.schedule_slowmode_tick(cx);
             cx.notify();
             return;
+        }
+        if self.schedule_at.is_none() {
+            let wait = self.slowmode_wait();
+            if wait > 0 {
+                self.caption = Some((format!("Slow mode is on. You can send again in {}.", format_countdown(wait)), Tone::Note));
+                self.ensure_slowmode_timer(cx);
+                cx.notify();
+                return;
+            }
         }
         self.follow_text(cx);
         self.send_menu = false;
@@ -1215,7 +1887,7 @@ impl Composer {
         }
         if field.trim_start().starts_with('/') {
             let matched = self
-                .slash_commands
+                .app_commands
                 .get(&target.key)
                 .and_then(|cmds| slash::parse_invocation(&field, cmds))
                 .map(|(cmd, args)| (cmd.clone(), args));
@@ -1255,11 +1927,50 @@ impl Composer {
             }
         }
         self.armed = None;
+        let paid_stars = self
+            .current_send_rules()
+            .and_then(|rules| rules.paid_stars)
+            .filter(|&stars| stars > 0);
+        let allow_paid_stars = if let Some(stars) = paid_stars {
+            let paid_ok = self.paid_confirmed.as_ref().is_some_and(|(k, text)| *k == target.key && *text == field);
+            if !paid_ok {
+                self.paid_confirmed = Some((target.key.clone(), field));
+                self.caption = Some((
+                    format!("Sending here costs {stars} Telegram Stars. Press Send again to confirm."),
+                    Tone::Warning,
+                ));
+                cx.notify();
+                return;
+            }
+            self.paid_confirmed = None;
+            Some(stars)
+        } else {
+            self.paid_confirmed = None;
+            None
+        };
         let controls = self.controls();
         let hosts = niceties::link_hosts(&field);
         let reply_to = self.reply.as_ref().map(|reply| reply.id.clone());
-        let files: Vec<OutgoingFile> = self.tray.iter().filter_map(Staged::outgoing).collect();
+        let mut files: Vec<OutgoingFile> = self.tray.iter().filter_map(Staged::outgoing).collect();
         let voice = rec::sent_as(&self.note, &files);
+        let voice_chip = voice.as_ref().and_then(|_| {
+            let rec = self.note.clone()?;
+            let chip = self.tray.iter().find(|chip| rec::holds_the_note(&self.note, chip)).cloned()?;
+            Some((rec, chip))
+        });
+        let video = rec::sent_video(&self.note, &files);
+        if let Some(note) = &video {
+            if let Some(file) = files.first_mut() {
+                file.as_file = false;
+                file.media = Some(protocol::OutgoingMedia {
+                    duration_ms: Some(note.duration),
+                    width: Some(note.side),
+                    height: Some(note.side),
+                    thumb: self.note.as_ref().and_then(|recording| recording.frame.clone()),
+                    ..protocol::OutgoingMedia::default()
+                });
+            }
+        }
         let chosen = self.schedule_at.take();
         let schedule = match schedule::for_send(controls.schedule, chosen, now()) {
             Ok(at) => at,
@@ -1277,6 +1988,7 @@ impl Composer {
         let with = protocol::Outgoing {
             files,
             voice: voice.clone(),
+            video: video.clone(),
             silent: silent && controls.silent,
             suppress_embeds: tiny_previews_off || (self.no_preview && controls.link_chip && !hosts.is_empty()),
             ping: reply_to.is_none() || !controls.ping || !self.ping_off.contains(&target.key.account()),
@@ -1291,6 +2003,7 @@ impl Composer {
             send_as: self.send_as.get(&target.key).cloned(),
             snippet_type: None,
             subject,
+            allow_paid_stars,
         };
         self.importance = protocol::Importance::Normal;
         self.broadcast = false;
@@ -1314,7 +2027,8 @@ impl Composer {
             reply: self.reply.clone(),
             chips: self.tray.iter().map(|chip| chip.id).collect(),
             made: self.tray.iter().flat_map(Staged::made).collect(),
-            note: voice.is_some(),
+            note: voice.is_some() || video.is_some(),
+            voice_chip,
         };
         self.dispatch(out, with, cx);
     }
@@ -1349,10 +2063,25 @@ impl Composer {
     /// A GIF or a sticker from the picker: sent at once, with the reply target; what is typed
     /// stays.
     fn send_pick(&mut self, pick: Pick, cx: &mut Context<Self>) {
-        let Some(target) = self.target.clone().filter(|target| target.locked().is_none()) else {
+        let Some(target) = self.target.clone().filter(|target| self.locked_for(target).is_none()) else {
             return;
         };
         if self.sending || self.slowmode_blocks() || !live() {
+            return;
+        }
+        let wait = self.slowmode_wait();
+        if wait > 0 {
+            self.caption = Some((format!("Slow mode is on. You can send again in {}.", format_countdown(wait)), Tone::Note));
+            self.ensure_slowmode_timer(cx);
+            cx.notify();
+            return;
+        }
+        if let Some(stars) = self.current_send_rules().and_then(|r| r.paid_stars).filter(|&s| s > 0) {
+            self.caption = Some((
+                format!("Sending here costs {stars} Telegram Stars. Send a text message to confirm payment."),
+                Tone::Warning,
+            ));
+            cx.notify();
             return;
         }
         let reply_to = self.reply.as_ref().map(|reply| reply.id.clone());
@@ -1369,6 +2098,7 @@ impl Composer {
             chips: Vec::new(),
             made: Vec::new(),
             note: false,
+            voice_chip: None,
         };
         self.dispatch(out, protocol::Outgoing { pick: Some(pick), ping, ..protocol::Outgoing::default() }, cx);
     }
@@ -1468,8 +2198,12 @@ impl Composer {
         let refused = match answer {
             Ok(Response::Sent { .. }) => {
                 let (key, client_id, made) = (out.key.clone(), out.client_id.clone(), out.made.clone());
-                // The note went out with the send: chatd's facts and file go with it.
-                if out.note {
+                // Hold the recorded note until the network accepts it so a refusal (e.g. Telegram's
+                // VOICE_MESSAGES_FORBIDDEN) can restore it to the tray without losing the audio.
+                if let Some((rec, chip)) = out.voice_chip.clone() {
+                    self.held_voice = Some((out.key.clone(), out.client_id.clone(), rec, chip));
+                    self.note = None;
+                } else if out.note {
                     self.note = None;
                     ask_later(cx, Request::Record(RecordRequest::Forget), |_, _| {});
                 }
@@ -1507,6 +2241,54 @@ impl Composer {
             Some(words) => self.tell(&out.key, (words, Tone::Refused), cx),
             None if scan => self.hold_tiny_files(out, cx),
             None => self.went(&out, cx),
+        }
+        cx.notify();
+    }
+
+    /// A voice note send settled on the network. When refused (e.g. `VOICE_MESSAGES_FORBIDDEN`),
+    /// restore the recorded note to the tray with the refusal words so it is not lost.
+    fn voice_settled(&mut self, key: &Key, client_id: &str, outcome: Result<(), String>, cx: &mut Context<Self>) {
+        let matches = self
+            .held_voice
+            .as_ref()
+            .is_some_and(|(held_key, held_id, _, _)| held_key == key && held_id == client_id);
+        if !matches {
+            return;
+        }
+        let Some((held_key, held_id, rec, chip)) = self.held_voice.take() else {
+            return;
+        };
+        match outcome {
+            Ok(()) => {
+                ask_later(cx, Request::Record(RecordRequest::Forget), |_, _| {});
+            }
+            Err(reason) => {
+                self.note = Some(rec);
+                let here = self.target.as_ref().is_some_and(|now| now.key == held_key);
+                if here {
+                    if !self.tray.iter().any(|existing| existing.path == chip.path) {
+                        self.tray.push(chip);
+                    }
+                } else if let Some(draft) = self.drafts.get_mut(&held_key) {
+                    if !draft.files.iter().any(|existing| existing.path == chip.path) {
+                        draft.files.push(chip);
+                    }
+                } else {
+                    self.remember(
+                        held_key.clone(),
+                        Draft {
+                            files: vec![chip],
+                            ..Draft::default()
+                        },
+                    );
+                }
+                self.tell(&held_key, (reason, Tone::Refused), cx);
+                ask_later(
+                    cx,
+                    Request::Discard { conversation: held_key, client_id: held_id },
+                    |_, _| {},
+                );
+            }
         }
         cx.notify();
     }
@@ -1607,7 +2389,15 @@ impl Composer {
     /// The message is chatd's or the hold's now: the field empties, the chips that went leave
     /// the tray, and the draft is forgotten.
     fn went(&mut self, out: &Outgoing, cx: &mut Context<Self>) {
+        if let Some(rules) = self.send_rules.get_mut(&out.key) {
+            if rules.slowmode_seconds > 0 {
+                rules.slowmode_next_send = Some(now() + i64::from(rules.slowmode_seconds));
+            }
+        }
         let here = self.target.as_ref().is_some_and(|now| now.key == out.key);
+        if here {
+            self.ensure_slowmode_timer(cx);
+        }
         if !here {
             if let Some(draft) = self.drafts.get_mut(&out.key) {
                 draft.reply_went(out.reply_to.as_deref());
@@ -1730,8 +2520,16 @@ impl Composer {
         if paths.is_empty() {
             return;
         }
-        if !controls(&target.can, false).attach {
-            let why = format!("{} can't take files here.", target.key.network.label());
+        let allowed = match self.send_rules.get(&target.key) {
+            Some(rules) => controls(&target.can, false).apply_rules(rules).attach,
+            None => controls(&target.can, false).attach,
+        };
+        if !allowed {
+            let why = if self.send_rules.get(&target.key).is_some_and(|r| !r.allows_any_attachment()) {
+                "Admins don't allow media in this chat.".to_owned()
+            } else {
+                format!("{} can't take files here.", target.key.network.label())
+            };
             self.tell(&target.key, (why, Tone::Note), cx);
             if owned {
                 delete_later(paths);
@@ -1774,9 +2572,19 @@ impl Composer {
                 chip
             })
             .collect();
+        let editing_media = here && self.editing.as_ref().is_some_and(|e| e.has_media) && can.edit_media;
+        let incoming: Vec<Staged> = if editing_media {
+            incoming.into_iter().take(1).collect()
+        } else {
+            incoming
+        };
         let converting: Vec<(u64, PathBuf)> = incoming.iter().filter(|chip| chip.converting).map(|chip| (chip.id, chip.path.clone())).collect();
         let kept: Vec<u64> = incoming.iter().map(|chip| chip.id).collect();
         let turned_away: Vec<PathBuf> = incoming.iter().skip(attach::most(&can).saturating_sub(room)).filter(|chip| chip.owned).map(|chip| chip.path.clone()).collect();
+        if editing_media && !incoming.is_empty() {
+            let replaced: Vec<PathBuf> = self.tray.drain(..).filter(|chip| chip.owned).map(|chip| chip.path).collect();
+            delete_later(replaced);
+        }
         let destination = if here {
             &mut self.tray
         } else {
@@ -2803,6 +3611,10 @@ impl Composer {
                 PickerEvent::Picked(text) => this.insert_text(text, cx),
                 PickerEvent::Custom { name, id, animated } => this.insert_custom(name, id, *animated, cx),
                 PickerEvent::Send(pick) => this.send_pick(pick.clone(), cx),
+                PickerEvent::OpenUrl(url) => {
+                    let url = url.clone();
+                    let _ = this.shell.update(cx, |shell, cx| shell.open_external_link(&url, window, cx));
+                }
                 PickerEvent::Kept(_) | PickerEvent::Closed => {}
             }
             if !keep {
@@ -2911,6 +3723,7 @@ impl Composer {
             }
         };
         let (text, tokens) = mention::source(message);
+        let has_media = !message.attachments.is_empty();
         let removable: Vec<(String, String)> = message
             .attachments
             .iter()
@@ -2925,6 +3738,7 @@ impl Composer {
             original: text.clone(),
             original_attachments: removable.clone(),
             attachments: removable,
+            has_media,
             stash,
             reply,
         });
@@ -2967,7 +3781,8 @@ impl Composer {
             return;
         };
         self.set_field(&editing.stash, cx);
-        self.tray = editing.stash.files;
+        let replaced = std::mem::replace(&mut self.tray, editing.stash.files);
+        delete_later(replaced.into_iter().filter(|chip| chip.owned).map(|chip| chip.path).collect());
         self.reply = editing.reply;
         self.refresh_placeholder(cx);
         self.caption = None;
@@ -3003,20 +3818,23 @@ impl Composer {
     }
 
     fn save_edit(&mut self, target: &Target, cx: &mut Context<Self>) {
-        let Some((id, original, attachments_changed, kept_ids)) = self.editing.as_ref().map(|editing| {
+        let Some((id, original, attachments_changed, kept_ids, has_media)) = self.editing.as_ref().map(|editing| {
             let changed = editing.attachments != editing.original_attachments;
             let ids: Vec<String> = editing.attachments.iter().map(|(id, _)| id.clone()).collect();
-            (editing.id.clone(), editing.original.clone(), changed, ids)
+            // Media this pane cannot take off the message still keeps it from being empty.
+            let has_media = editing.has_media && editing.original_attachments.is_empty();
+            (editing.id.clone(), editing.original.clone(), changed, ids, has_media)
         }) else {
             return;
         };
         self.follow_text(cx);
         let field = self.input.read(cx).text().to_owned();
-        if field.trim() == original.trim() && !attachments_changed {
+        let replacement = self.tray.iter().filter_map(Staged::outgoing).next();
+        if replacement.is_none() && field.trim() == original.trim() && !attachments_changed {
             self.end_edit(cx);
             return;
         }
-        if field.trim().is_empty() && kept_ids.is_empty() {
+        if replacement.is_none() && !has_media && field.trim().is_empty() && kept_ids.is_empty() {
             // Nothing left in the message: leave edit mode and offer Delete confirmation.
             let delete_id = id.clone();
             self.end_edit(cx);
@@ -3028,18 +3846,29 @@ impl Composer {
         }
         let key = target.key.clone();
         let (wire, spans) = length::wire_with_spans(&field, &self.tokens, &target.can, false);
-        if let Some(words) = length::edit_refusal(wire.chars().count(), target.can.text_limit) {
+        let limit = if has_media || replacement.is_some() { target.can.caption_limit } else { target.can.text_limit };
+        if let Some(words) = length::edit_refusal(wire.chars().count(), limit) {
             self.caption = Some((words, Tone::Refused));
             cx.notify();
             return;
         }
-        let request = Request::Edit {
-            conversation: key.clone(),
-            message_id: id.clone(),
-            text: wire,
-            spans,
-            suppress_embeds: false,
-            keep_attachments: attachments_changed.then_some(kept_ids),
+        let request = match replacement {
+            Some(file) => Request::EditMedia {
+                conversation: key.clone(),
+                message_id: id.clone(),
+                file,
+                text: wire,
+                spans,
+                invert_media: false,
+            },
+            None => Request::Edit {
+                conversation: key.clone(),
+                message_id: id.clone(),
+                text: wire,
+                spans,
+                suppress_embeds: false,
+                keep_attachments: attachments_changed.then_some(kept_ids),
+            },
         };
         self.sending = true;
         cx.notify();
@@ -3070,6 +3899,7 @@ impl Composer {
     fn close_list(&mut self, cx: &mut Context<Self>) {
         self.list = None;
         self.colon = None;
+        self.app_slash = None;
         self.slash = None;
         self.lookup = None;
         self.slash_lookup = None;
@@ -3081,6 +3911,7 @@ impl Composer {
         let open = !list.rows.is_empty();
         self.list = Some(list);
         self.colon = None;
+        self.app_slash = None;
         self.slash = None;
         self.input.update(cx, |input, _| input.set_list_open(open));
     }
@@ -3107,7 +3938,7 @@ impl Composer {
         };
         self.sending = true;
         self.close_list(cx);
-        self.slash_dismissed = false;
+        self.app_slash_dismissed = false;
         cx.notify();
         let this = cx.weak_entity();
         ask_later(cx, request, move |answer, cx| {
@@ -3160,7 +3991,7 @@ impl Composer {
                 return;
             };
             let _ = this.update(cx, |this, cx| {
-                this.slash_commands.insert(key.clone(), commands);
+                this.app_commands.insert(key.clone(), commands);
                 if this.target.as_ref().is_some_and(|t| t.key == key) {
                     this.look_up(cx);
                 }
@@ -3176,7 +4007,7 @@ impl Composer {
             return;
         }
         let filled = format!("/{name} ");
-        self.slash_dismissed = false;
+        self.app_slash_dismissed = false;
         self.input.update(cx, |input, cx| input.set_text(&filled, cx));
         self.follow_text(cx);
         self.look_up(cx);
@@ -3185,17 +4016,17 @@ impl Composer {
 
     fn look_up_slash(&mut self, target: &Target, text: &str, caret: usize, cx: &mut Context<Self>) -> bool {
         if self.editing.is_some() || !text.starts_with('/') {
-            self.slash_dismissed = false;
-            self.slash = None;
+            self.app_slash_dismissed = false;
+            self.app_slash = None;
             self.slash_lookup = None;
             return false;
         }
         self.ask_slash_commands(&target.key, cx);
-        if self.slash_dismissed {
+        if self.app_slash_dismissed {
             self.close_list(cx);
             return true;
         }
-        let commands = self.slash_commands.get(&target.key).cloned().unwrap_or_default();
+        let commands = self.app_commands.get(&target.key).cloned().unwrap_or_default();
         if let Some(query) = slash::command_trigger(text, caret) {
             let matched = slash::filter(&commands, query);
             let open = !matched.is_empty();
@@ -3203,7 +4034,7 @@ impl Composer {
             self.colon = None;
             self.lookup = None;
             self.slash_lookup = None;
-            self.slash = open.then_some(slash::List { mode: slash::Mode::Commands(matched), selected: 0 });
+            self.app_slash = open.then_some(slash::List { mode: slash::Mode::Commands(matched), selected: 0 });
             self.input.update(cx, |input, _| input.set_list_open(open));
             return true;
         }
@@ -3215,7 +4046,7 @@ impl Composer {
                 self.colon = None;
                 self.lookup = None;
                 self.slash_lookup = None;
-                self.slash = open.then_some(slash::List {
+                self.app_slash = open.then_some(slash::List {
                     mode: slash::Mode::Choices {
                         command: active.command,
                         option: active.option.name,
@@ -3260,7 +4091,7 @@ impl Composer {
                         }
                         if let Ok(Response::CommandChoices { choices }) = answer {
                             let open = !choices.is_empty();
-                            this.slash = open.then_some(slash::List {
+                            this.app_slash = open.then_some(slash::List {
                                 mode: slash::Mode::Choices {
                                     command,
                                     option: option_name,
@@ -3277,13 +4108,13 @@ impl Composer {
                 return true;
             }
         }
-        self.slash = None;
+        self.app_slash = None;
         self.slash_lookup = None;
         false
     }
 
-    fn complete_slash(&mut self, row: usize, cx: &mut Context<Self>) {
-        let Some(list) = self.slash.take() else {
+    fn complete_app_slash(&mut self, row: usize, cx: &mut Context<Self>) {
+        let Some(list) = self.app_slash.take() else {
             return;
         };
         self.close_list(cx);
@@ -3345,6 +4176,35 @@ impl Composer {
         if self.look_up_slash(&target, &text, caret, cx) {
             return;
         }
+        if target.key.network == Network::Slack && self.editing.is_none() {
+            if let Some(prefix) = slack_slash_trigger(&text, caret) {
+                if self.slash_dismissed {
+                    self.close_list(cx);
+                    return;
+                }
+                self.ask_slash(&target, cx);
+                let needle = prefix.to_ascii_lowercase();
+                let source = self
+                    .slash_commands
+                    .get(&target.key.account())
+                    .cloned()
+                    .unwrap_or_else(default_slack_slash_commands);
+                let rows: Vec<protocol::SlashCommand> = source
+                    .into_iter()
+                    .filter(|cmd| cmd.command.to_ascii_lowercase().starts_with(&needle))
+                    .take(8)
+                    .collect();
+                let open = !rows.is_empty();
+                self.list = None;
+                self.colon = None;
+                self.lookup = None;
+                self.slash = Some(SlashList { rows, selected: 0 });
+                self.input.update(cx, |input, _| input.set_list_open(open));
+                return;
+            }
+        }
+        self.slash = None;
+        self.slash_dismissed = false;
         if let Some(found) = colon::trigger(&text, caret) {
             if self.colon_dismissed == Some(found.start) {
                 self.close_list(cx);
@@ -3406,6 +4266,26 @@ impl Composer {
             let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
             let _ = this.update(cx, |this, cx| this.looked_up(&target, &trigger, answer, cx));
         }));
+    }
+
+    /// The Slack workspace's slash commands (built-ins + cached `commands.list`), asked once per account.
+    fn ask_slash(&mut self, target: &Target, cx: &mut Context<Self>) {
+        let account = target.key.account();
+        if self.slash_asked.contains(&account) || !live() {
+            return;
+        }
+        self.slash_asked.insert(account.clone());
+        let this = cx.weak_entity();
+        ask_later(cx, Request::SlashCommands { account: account.clone() }, move |answer, cx| {
+            let Ok(Response::SlashCommands { commands }) = answer else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.slash_commands.insert(account, commands);
+                this.look_up(cx);
+                cx.notify();
+            });
+        });
     }
 
     /// The account's own emoji for `:`, asked the first time a colon list opens on it.
@@ -3533,7 +4413,17 @@ impl Composer {
     }
 
     fn step(&mut self, down: bool, cx: &mut Context<Self>) {
-        if let Some(slash) = &mut self.slash {
+        if self.slash_open(cx) {
+            let n = self.slash_rows(&self.slash_query(cx).unwrap_or_default()).len();
+            if n > 0 {
+                self.slash_at = if down { (self.slash_at + 1) % n } else { (self.slash_at + n - 1) % n };
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(commands) = &mut self.app_slash {
+            commands.step(down);
+        } else if let Some(slash) = &mut self.slash {
             slash.step(down);
         } else if let Some(colon) = &mut self.colon {
             colon.step(down);
@@ -3544,7 +4434,13 @@ impl Composer {
     }
 
     fn complete_selected(&mut self, cx: &mut Context<Self>) {
-        if let Some(selected) = self.slash.as_ref().map(|slash| slash.selected) {
+        if let Some(command) = self.highlighted_slash(cx) {
+            self.accept_slash(command, cx);
+            return;
+        }
+        if let Some(selected) = self.app_slash.as_ref().map(|commands| commands.selected) {
+            self.complete_app_slash(selected, cx);
+        } else if let Some(selected) = self.slash.as_ref().map(|slash| slash.selected) {
             self.complete_slash(selected, cx);
         } else if let Some(selected) = self.colon.as_ref().map(|colon| colon.selected) {
             self.complete_colon(selected, cx);
@@ -3552,6 +4448,24 @@ impl Composer {
             let selected = self.list.as_ref().map_or(0, |list| list.selected);
             self.complete(selected, cx);
         }
+    }
+
+    fn complete_slash(&mut self, row: usize, cx: &mut Context<Self>) {
+        let Some(list) = self.slash.take() else {
+            return;
+        };
+        self.close_list(cx);
+        self.follow_text(cx);
+        let (caret, text_len) = {
+            let input = self.input.read(cx);
+            (input.cursor(), input.text().len())
+        };
+        let Some(cmd) = list.rows.get(row).filter(|_| caret <= text_len) else {
+            return;
+        };
+        self.input.update(cx, |input, cx| input.replace(0..caret, &format!("{} ", cmd.command), cx));
+        self.follow_text(cx);
+        cx.notify();
     }
 
     /// Tab, Return or a click: the row's name takes the place of what was typed to find it,
@@ -3620,11 +4534,68 @@ impl Composer {
         let _ = self.shell.update(cx, |shell, cx| shell.sign_in(network, cx));
     }
 
+    /// Subscribe on a Telegram channel. Join on a Telegram group. Other networks keep the old label.
+    fn join_label(network: Network, kind: ConversationKind) -> &'static str {
+        match (network, kind) {
+            (Network::Telegram, ConversationKind::Channel | ConversationKind::Announcement) => "Subscribe",
+            (Network::Telegram, _) => "Join",
+            _ => "Join channel",
+        }
+    }
+
+    /// A join finished. Success offers one Undo, which leaves. A refusal stays on the preview.
+    fn note_join(&mut self, conversation: Key, answer: std::io::Result<Response>, cx: &mut Context<Self>) {
+        if self.target.as_ref().is_none_or(|target| target.key != conversation) {
+            return;
+        }
+        match answer {
+            Ok(Response::Ok | Response::Conversation { .. }) => self.undo_join = Some(conversation),
+            Ok(Response::Error { detail, .. }) => self.caption = Some((detail, Tone::Refused)),
+            _ => self.caption = Some(("Telegram did not confirm the join.".to_owned(), Tone::Refused)),
+        }
+        cx.notify();
+    }
+
+    /// One click undoes a join that just succeeded. Moving to another conversation clears it.
+    fn undo_join_bar(&self, target: &Target, cx: &mut Context<Self>) -> Option<Div> {
+        let key = self.undo_join.clone().filter(|key| key == &target.key)?;
+        let word = match target.kind {
+            ConversationKind::Channel | ConversationKind::Announcement => "Subscribed",
+            _ => "Joined",
+        };
+        Some(
+            div()
+                .h(px(28.))
+                .mb(px(6.))
+                .px(px(12.))
+                .rounded(px(theme::R_FLOAT))
+                .border_1()
+                .border_color(theme::border())
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .type_ui()
+                .text_color(theme::text_soft())
+                .child(div().flex_1().child(word))
+                .child(button("undo-join", ButtonKind::Secondary, "Undo").on_click(cx.listener(move |this, _, _, cx| {
+                    if this.undo_join.as_ref() != Some(&key) {
+                        return;
+                    }
+                    this.undo_join = None;
+                    let conversation = key.clone();
+                    ask_later(cx, Request::Leave { conversation, silent: false }, |_, _| {});
+                    cx.notify();
+                }))),
+        )
+    }
+
     /// The 40 pt bar that stands where the card would be.
     fn bar(&self, locked: Locked, network: Network, cx: &mut Context<Self>) -> Div {
         if matches!(locked, Locked::NotJoined) {
             let key = self.target.as_ref().map(|t| t.key.clone());
+            let kind = self.target.as_ref().map(|t| t.kind).unwrap_or(ConversationKind::Channel);
             let title = self.target.as_ref().map(|t| t.title.clone()).unwrap_or_else(|| "this channel".to_owned());
+            let label = Self::join_label(network, kind);
             return div()
                 .h(px(card_height()))
                 .pl(px(12.))
@@ -3640,10 +4611,26 @@ impl Composer {
                 .child(glyph("icons/hash.svg", 16., theme::text_faint()))
                 .child(div().flex_1().min_w_0().truncate().child(format!("Previewing {title}")))
                 .child(
-                    button("join-channel", ButtonKind::Primary, "Join channel").on_click(cx.listener(move |_, _, _, cx| {
-                        if let Some(conversation) = key.clone() {
-                            ask_later(cx, Request::Join { conversation }, |_, _| {});
+                    button("join-channel", ButtonKind::Primary, label).on_click(cx.listener(move |this, _, _, cx| {
+                        if this.joining {
+                            return;
                         }
+                        let Some(conversation) = key.clone() else { return };
+                        this.join_epoch = this.join_epoch.wrapping_add(1);
+                        let epoch = this.join_epoch;
+                        this.joining = true;
+                        let joined = conversation.clone();
+                        let entity = cx.weak_entity();
+                        ask_later(cx, Request::Join { conversation }, move |answer, cx| {
+                            let _ = entity.update(cx, |this, cx| {
+                                // A newer click, or a click after this one was superseded, owns the guard.
+                                if this.join_epoch != epoch {
+                                    return;
+                                }
+                                this.joining = false;
+                                this.note_join(joined, answer, cx);
+                            });
+                        });
                     })),
                 );
         }
@@ -3893,10 +4880,30 @@ impl Composer {
                 cx.notify();
             }))
             .child(glyph("icons/x.svg", 14., theme::text_soft()));
-        if self.editing.is_some() {
+        if let Some(editing) = &self.editing {
+            let can_replace = editing.has_media && self.target.as_ref().is_some_and(|t| t.can.edit_media && t.can.max_file_bytes > 0);
+            let replace_btn = can_replace.then(|| {
+                div()
+                    .id("edit-replace-file")
+                    .flex_none()
+                    .h(px(if phone { 32. } else { 22. }))
+                    .px(px(6.))
+                    .rounded(px(theme::R_CONTROL))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::hover()))
+                    .font_weight(theme::MEDIUM)
+                    .text_color(theme::accent_text())
+                    .child("Replace file")
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|this, _, _, cx| this.attach_files(cx)))
+            });
             return Some(
                 bar.child(glyph("icons/pencil.svg", 14., theme::accent_text()))
                     .child(strong("Editing message".to_owned()))
+                    .children(replace_btn)
                     .child(div().flex_1())
                     // A phone's keyboard has no Esc, and its Return is the send button.
                     .when(!phone, |bar| bar.child(div().flex_none().text_color(theme::text_faint()).child("Return to save · Esc to cancel")))
@@ -3953,16 +4960,40 @@ impl Composer {
         if !on {
             return None;
         }
+        if let Some(reason) = self
+            .target
+            .as_ref()
+            .and_then(|target| rec::blocked_reason(&target.voice_notes_forbidden))
+        {
+            let size = if crate::gui::phone::active() { 18. } else { 16. };
+            return Some(
+                div()
+                    .id("mic")
+                    .relative()
+                    .flex_none()
+                    .size(px(card_control()))
+                    .rounded(px(theme::R_CONTROL))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .opacity(0.4)
+                    .tooltip(tip(reason.to_owned(), None))
+                    .child(glyph("icons/mic.svg", size, theme::text_soft())),
+            );
+        }
         let hot = self
             .recording
             .as_ref()
             .is_some_and(|recording| Some(&recording.conversation) == self.target.as_ref().map(|target| &target.key) && matches!(recording.state, RecordState::Active));
         let push = crate::gui::app::prefs::values().on(protocol::settings::PUSH_TO_TALK);
-        let (icon, words) = match (hot, push) {
-            (true, true) => ("icons/square.svg", "Release to stop recording"),
-            (true, false) => ("icons/square.svg", "Stop recording"),
-            (false, true) => ("icons/mic.svg", "Hold to record"),
-            (false, false) => ("icons/mic.svg", "Record a voice message"),
+        let video = self.video_note && self.target.as_ref().is_some_and(|target| target.can.video_notes);
+        let (icon, words) = match (hot, push, video) {
+            (true, true, _) => ("icons/square.svg", "Release to stop recording"),
+            (true, false, _) => ("icons/square.svg", "Stop recording"),
+            (false, true, true) => ("icons/video.svg", "Hold to record a video message"),
+            (false, false, true) => ("icons/video.svg", "Record a video message"),
+            (false, true, false) => ("icons/mic.svg", "Hold to record"),
+            (false, false, false) => ("icons/mic.svg", "Record a voice message"),
         };
         let button = self
             .card_button("mic", Some(icon), false, None)
@@ -3991,11 +5022,63 @@ impl Composer {
         })
     }
 
+    /// The mic records a round video when the account offers one and the switch is on.
+    fn wants_video(&self) -> bool {
+        self.video_note && self.target.as_ref().is_some_and(|target| target.can.video_notes && rec::available(&target.can))
+    }
+
+    fn record_input(&self, video: bool) -> Option<String> {
+        let key = if video { protocol::settings::CAMERA } else { protocol::settings::INPUT };
+        crate::gui::app::prefs::values().device(key)
+    }
+
+    /// Switches the mic between a voice note and a round video message.
+    fn video_switch(&self, on: bool, cx: &mut Context<Self>) -> Option<gpui::Stateful<Div>> {
+        if !on {
+            return None;
+        }
+        let chosen = self.video_note;
+        let hot = self.recording.as_ref().is_some_and(|recording| matches!(recording.state, RecordState::Active));
+        Some(
+            self.card_button("video-note", Some(if chosen { "icons/mic.svg" } else { "icons/video.svg" }), chosen, None)
+                .tooltip(tip(if chosen { "Switch to a voice message" } else { "Switch to a video message" }, None))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if hot {
+                        return;
+                    }
+                    this.video_note = !this.video_note;
+                    cx.notify();
+                })),
+        )
+    }
+
+    /// A circular live preview while a round video message records.
+    fn round_live(&self) -> Option<Div> {
+        let recording = self.recording.as_ref()?;
+        if !recording.video || !matches!(recording.state, RecordState::Active) {
+            return None;
+        }
+        let target = self.target.as_ref()?;
+        if recording.conversation != target.key {
+            return None;
+        }
+        let path = recording.frame.clone()?;
+        Some(
+            div().flex().justify_center().py(px(8.)).child(
+                div()
+                    .size(px(96.))
+                    .rounded(px(48.))
+                    .overflow_hidden()
+                    .child(gpui::img(PathBuf::from(path)).size_full().object_fit(gpui::ObjectFit::Cover)),
+            ),
+        )
+    }
+
     /// The conversation a recording may start for now, if there is one.
     fn record_target(&self) -> Option<Key> {
         self.target
             .as_ref()
-            .filter(|target| target.locked().is_none())
+            .filter(|target| target.locked().is_none() && target.voice_notes_forbidden.is_empty())
             .filter(|_| live())
             .map(|target| target.key.clone())
     }
@@ -4007,8 +5090,9 @@ impl Composer {
         let Some(target) = self.record_target() else {
             return;
         };
-        let input = crate::gui::app::prefs::values().device(protocol::settings::INPUT);
-        ask_later(cx, Request::Record(rec::on_press(&self.recording, &target, input)), |_, _| {});
+        let video = self.wants_video();
+        let input = self.record_input(video);
+        ask_later(cx, Request::Record(rec::on_press(&self.recording, &target, input, video)), |_, _| {});
     }
 
     /// Push-to-talk, the press: record now. A press inside the previous release's grace drops
@@ -4019,8 +5103,9 @@ impl Composer {
         let Some(target) = self.record_target() else {
             return;
         };
-        let input = crate::gui::app::prefs::values().device(protocol::settings::INPUT);
-        ask_later(cx, Request::Record(rec::on_hold_down(&target, input)), |_, _| {});
+        let video = self.wants_video();
+        let input = self.record_input(video);
+        ask_later(cx, Request::Record(rec::on_hold_down(&target, input, video)), |_, _| {});
         self.holding = Some(target);
     }
 
@@ -4071,10 +5156,16 @@ impl Composer {
         let Some(recording) = on else { return };
         let RecordState::Recorded { path, .. } = &recording.state else { return };
         self.note = Some(recording.clone());
-        let target = self.target.clone().expect("the conversation matched");
+        let mut target = self.target.clone().expect("the conversation matched");
         let known = self.tray.iter().any(|chip| chip.path.to_string_lossy() == *path)
             || self.drafts.get(&target.key).is_some_and(|draft| draft.files.iter().any(|chip| chip.path.to_string_lossy() == *path));
         if !known {
+            // Voice-note-only accounts (e.g. Teams AMS audio) keep general file uploads disabled
+            // (`max_file_bytes == 0`), so lift the staging cap for the recorded note only.
+            if target.can.voice_notes && target.can.max_file_bytes == 0 {
+                target.can.max_file_bytes = 25 * 1024 * 1024;
+                target.can.max_files = target.can.max_files.max(1);
+            }
             self.stage_files_for(target, vec![PathBuf::from(path)], false, cx);
         }
     }
@@ -4183,17 +5274,24 @@ impl Composer {
 
     fn card(&mut self, focused: bool, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let controls = self.controls();
+        let editing_media = self.editing.as_ref().is_some_and(|e| e.has_media);
+        let slowmode_wait = self.slowmode_wait();
         let ready = !self.sending
+            && slowmode_wait == 0
             && !self.scan_blocks_current()
             && (self.editing.is_some() || !self.slowmode_blocks())
-            && (!self.input.read(cx).text().trim().is_empty() || !self.tray.is_empty() || self.editing.is_some());
+            && (editing_media || !self.input.read(cx).text().trim().is_empty() || !self.tray.is_empty() || self.editing.is_some());
         let focus = self.input.focus_handle(cx);
         let open_tab = self.picking.as_ref().map(|picking| picking.picker.read(cx).tab());
         let send_icon = if self.editing.is_some() { "icons/check.svg" } else { "icons/send-horizontal.svg" };
-        let send_tip = match (self.editing.is_some(), controls.silent) {
-            (true, _) => "Save  ↩",
-            (false, true) => "Send  ↩ · Silently  ⌥↩",
-            (false, false) => "Send  ↩",
+        let send_tip = if slowmode_wait > 0 {
+            format!("Slow mode: wait {}", format_countdown(slowmode_wait))
+        } else {
+            match (self.editing.is_some(), controls.silent) {
+                (true, _) => "Save  ↩".to_owned(),
+                (false, true) => "Send  ↩ · Silently  ⌥↩".to_owned(),
+                (false, false) => "Send  ↩".to_owned(),
+            }
         };
         let attach = controls.attach.then(|| {
             self.card_button("attach", Some("icons/paperclip.svg"), false, None)
@@ -4226,6 +5324,7 @@ impl Composer {
                 .on_click(cx.listener(|this, _, window, cx| this.toggle_picker(Tab::Emoji, window, cx)))
         });
         let mic = self.mic_button(controls.voice, cx);
+        let video_mode = self.video_switch(controls.voice && self.target.as_ref().is_some_and(|target| target.can.video_notes), cx);
         let sim_btn = self
             .target
             .as_ref()
@@ -4276,10 +5375,22 @@ impl Composer {
         let phone = crate::gui::phone::active();
         // A phone's send is the desktop's filled square drawn at 36 inside a 44 pt target, so a
         // ready one reads as a button and not as a slab beside the field.
+        let send_body: gpui::AnyElement = if slowmode_wait > 0 {
+            div()
+                .px(px(4.))
+                .type_small()
+                .font_weight(theme::SEMIBOLD)
+                .text_color(theme::text_soft())
+                .child(format_countdown(slowmode_wait))
+                .into_any_element()
+        } else {
+            glyph(send_icon, if crate::gui::phone::active() { 18. } else { 16. }, if ready { theme::on_accent() } else { theme::text_disabled() }).into_any_element()
+        };
         let send = div()
             .id("send")
             .relative()
-            .size(px(card_control()))
+            .h(px(card_control()))
+            .min_w(px(card_control()))
             .flex_none()
             .rounded(px(theme::R_CONTROL))
             .flex()
@@ -4314,7 +5425,7 @@ impl Composer {
                 }),
             )
             .on_click(cx.listener(|this, _, _, cx| this.send(false, cx)))
-            .child(glyph(send_icon, if crate::gui::phone::active() { 18. } else { 16. }, if ready { theme::on_accent() } else { theme::text_disabled() }))
+            .child(send_body)
             .child(canvas(move |bounds, _, _| anchors.send.set(Some(bounds)), |_, _, _, _| {}).absolute().top_0().left_0().size_full());
         // The field: 44 pt at its shortest, growing to five lines at any text size, and never
         // wider than the room the buttons leave it.
@@ -4334,9 +5445,9 @@ impl Composer {
             .text_color(theme::text())
             .child(self.input.clone());
         let row = if phone {
-            // A real flex row: 44 | field | 44 | 44. Every button keeps its size; only the field
-            // gives way, so nothing can overlap at 100% or at 200%. GIFs and stickers are inside
-            // the emoji picker's own tabs, so the row has no fifth button.
+            // A real flex row. Every button keeps its size; only the field gives way, so nothing
+            // can overlap at 100% or at 200%. GIFs and stickers stay in the emoji picker. A
+            // video-note account adds one switch before the mic.
             div()
                 .min_h(px(52.))
                 // Without the attach button (an edit), the words keep the desktop's 12 from the edge.
@@ -4349,6 +5460,7 @@ impl Composer {
                 .children(attach)
                 .child(field)
                 .children(sim_btn)
+                .children(video_mode)
                 .children(mic)
                 .children(smile)
                 .child(send)
@@ -4366,6 +5478,7 @@ impl Composer {
                 .child(field)
                 .children(sim_btn.map(|btn| btn.mr(px(4.))))
                 .children(gif.map(|gif| gif.mr(px(2.))))
+                .children(video_mode.map(|mode| mode.mr(px(2.))))
                 .children(mic.map(|mic| mic.mr(px(2.))))
                 .children(smile.map(|smile| smile.mr(px(4.))))
                 .child(send)
@@ -4390,6 +5503,7 @@ impl Composer {
             .children(self.edit_attachments_bar(cx))
             .children(self.subject_bar(cx))
             .children(self.tray(window, cx))
+            .children(self.round_live())
             .children(self.format_bar(cx))
             .child(row)
     }
@@ -4401,9 +5515,15 @@ impl Composer {
             let name = target.key.network.label();
             (format!("{name} is offline. A message sent now waits up to 60 seconds for it to come back."), Tone::Offline)
         };
-        let unlocked = target.locked().is_none();
+        let unlocked = self.locked_for(target).is_none();
         let text = self.input.read(cx).text().to_owned();
         let note = || attach::sending_note(target.key.network, &target.can, &self.tray, &text).map(|words| (words, Tone::Note));
+        let paid_note = || {
+            unlocked
+                .then(|| self.send_rules.get(&target.key).and_then(|r| r.paid_stars).filter(|&s| s > 0))
+                .flatten()
+                .map(|stars| (format!("Messages here cost {stars} Telegram Stars."), Tone::Note))
+        };
         let recording = rec::foot(&self.recording, &target.key, playing::now_ms(), crate::gui::app::prefs::values().on(protocol::settings::PUSH_TO_TALK));
         let length_note = || {
             // An edit cannot become a file, so the offer is only for a new message. Emoticons
@@ -4419,6 +5539,35 @@ impl Composer {
             let tone = if length::over(counted, target.can.text_limit) { Tone::Warning } else { Tone::Note };
             length::line(counted, target.can.text_limit).map(|words| (words, tone))
         };
+        let slack_handoff = (target.key.network == Network::Slack && self.editing.is_none())
+            .then(|| slack_unknown_slash_command(&text))
+            .flatten()
+            .map(|cmd| {
+                let url = slack_channel_app_url(&target.key.account, &target.key.id);
+                let shell = self.shell.clone();
+                div()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .text_color(theme::text_soft())
+                    .child(glyph("icons/info.svg", 12., theme::text_soft()))
+                    .child(div().min_w_0().truncate().child(format!("{cmd}: Commands run in the official app.")))
+                    .when_some(url, |row, url| {
+                        row.child(
+                            div()
+                                .id("slack-command-open")
+                                .flex_none()
+                                .cursor_pointer()
+                                .text_color(theme::accent_text())
+                                .hover(|s| s.underline())
+                                .child("Open in Slack")
+                                .on_click(move |_, window, cx| {
+                                    let _ = shell.update(cx, |shell, cx| shell.open_external_link(&url, window, cx));
+                                }),
+                        )
+                    })
+            });
         let slowmode_active = || {
             (unlocked && self.editing.is_none() && self.slowmode_blocks())
                 .then(|| slowmode_words(target.slowmode_seconds, target.slowmode_until, now()).map(|words| (words, Tone::Note)))
@@ -4440,6 +5589,7 @@ impl Composer {
             .or_else(length_note)
             .or_else(slowmode_active)
             .or_else(note)
+            .or_else(paid_note)
             .or_else(|| (unlocked && target.link == Link::Offline).then(offline))
             .or_else(archived_thread)
             .or_else(slowmode_quiet);
@@ -4479,7 +5629,7 @@ impl Composer {
                         })),
                 )
         });
-        if said.is_none() && chip.is_none() {
+        if said.is_none() && chip.is_none() && slack_handoff.is_none() {
             return None;
         }
         let said = said.map(|(words, tone)| {
@@ -4511,12 +5661,118 @@ impl Composer {
                 .gap(px(10.))
                 .type_small()
                 .children(chip)
+                .children(slack_handoff)
                 .children(said),
         )
     }
 
     /// The completion lists, 6 pt above the card and over the messages.
     fn popover(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if self.slash_open(cx) {
+            let query = self.slash_query(cx).unwrap_or_default();
+            let rows = self.slash_rows(&query);
+            let selected = if rows.is_empty() { 0 } else { self.slash_at.min(rows.len() - 1) };
+            let this = cx.weak_entity();
+            let mut list = menu().w(px(340.)).max_w(px(340.));
+            for (ix, cmd) in rows.iter().enumerate() {
+                let command = cmd.command.clone();
+                let description = cmd.description.clone();
+                let label = format!("/{command}");
+                let pick = this.clone();
+                list = list.child(
+                    div()
+                        .id(("slash", ix))
+                        .h(px(40.))
+                        .px(px(8.))
+                        .rounded(px(theme::R_CONTROL))
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .cursor_pointer()
+                        .when(ix == selected, |row| row.bg(theme::selected()))
+                        .when(ix != selected, |row| row.hover(|style| style.bg(theme::hover())))
+                        .on_mouse_down(gpui::MouseButton::Left, move |_: &gpui::MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            window.prevent_default();
+                            let command = command.clone();
+                            let _ = pick.update(cx, |this, cx| this.accept_slash(command, cx));
+                        })
+                        .child(div().flex_none().max_w(px(140.)).truncate().type_ui().font_weight(theme::SEMIBOLD).child(label))
+                        .child(div().flex_1().min_w_0().truncate().type_small().text_color(theme::text_faint()).child(description)),
+                );
+            }
+            return Some(deferred(div().absolute().left_0().bottom(relative(1.)).pb(px(6.)).child(list)).priority(1).into_any_element());
+        }
+        if let Some(slash) = self.slash.as_ref().filter(|slash| !slash.rows.is_empty()) {
+            let selected = slash.selected;
+            let mut panel = div()
+                .w(px(360.))
+                .max_w_full()
+                .p(px(4.))
+                .rounded(px(theme::R_FLOAT))
+                .bg(theme::overlay())
+                .border_1()
+                .border_color(theme::overlay_edge())
+                .shadow(theme::shadow_popover())
+                .flex()
+                .flex_col()
+                .gap(px(1.))
+                .occlude();
+            for (index, cmd) in slash.rows.iter().enumerate() {
+                let active = index == selected;
+                let hint = if cmd.usage.is_empty() { None } else { Some(cmd.usage.clone()) };
+                let desc = if cmd.description.is_empty() { None } else { Some(cmd.description.clone()) };
+                let official = !cmd.builtin;
+                panel = panel.child(
+                    div()
+                        .id(("slash-cmd", index))
+                        .px(px(8.))
+                        .py(px(5.))
+                        .rounded(px(theme::R_CONTROL))
+                        .when(active, |r| r.bg(theme::selected()))
+                        .hover(|s| s.bg(theme::hover()))
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.))
+                        .on_click(cx.listener(move |this, _, _, cx| this.complete_slash(index, cx)))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .type_small()
+                                        .child(div().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(cmd.command.clone()))
+                                        .when_some(hint, |r, hint| r.child(div().text_color(theme::text_faint()).child(hint))),
+                                )
+                                .when_some(desc, |r, desc| {
+                                    r.child(div().type_small().text_color(theme::text_soft()).truncate().child(desc))
+                                }),
+                        )
+                        .when(official, |r| {
+                            r.child(
+                                div()
+                                    .flex_none()
+                                    .px(px(5.))
+                                    .py(px(1.))
+                                    .rounded(px(theme::R_CHIP))
+                                    .bg(theme::hover())
+                                    .type_small()
+                                    .text_color(theme::text_faint())
+                                    .child("official app"),
+                            )
+                        }),
+                );
+            }
+            return Some(deferred(div().absolute().left_0().bottom(relative(1.)).pb(px(6.)).child(panel)).priority(1).into_any_element());
+        }
         if self.colon.as_ref().is_some_and(|colon| !colon.cells.is_empty()) {
             let this = cx.weak_entity();
             let pick = move |row: usize, _: &mut Window, cx: &mut App| {
@@ -4535,10 +5791,10 @@ impl Composer {
             let drawn = colon::draw(colon, customs, tone, image, pick);
             return Some(deferred(div().absolute().left_0().bottom(relative(1.)).pb(px(6.)).child(drawn)).priority(1).into_any_element());
         }
-        if let Some(slash) = self.slash.as_ref().filter(|slash| !slash.is_empty()) {
+        if let Some(slash) = self.app_slash.as_ref().filter(|slash| !slash.is_empty()) {
             let this = cx.weak_entity();
             let pick = move |row: usize, _: &mut Window, cx: &mut App| {
-                let _ = this.update(cx, |this, cx| this.complete_slash(row, cx));
+                let _ = this.update(cx, |this, cx| this.complete_app_slash(row, cx));
             };
             let drawn = slash::draw(slash, pick);
             return Some(deferred(div().absolute().left_0().bottom(relative(1.)).pb(px(6.)).child(drawn)).priority(1).into_any_element());
@@ -4650,6 +5906,21 @@ impl Composer {
                 }
                 if self.target.as_ref().is_some_and(|t| t.key.network == Network::Messages) {
                     items = items.child(menu_label("Sends while this computer is on and your phone is reachable."));
+                }
+                let can_when_online = self.target.as_ref().is_some_and(|t| {
+                    schedule::when_online_for(
+                        t.key.network,
+                        t.kind,
+                        t.special != protocol::Special::None || t.bot,
+                        t.hidden_last_seen,
+                    )
+                });
+                if can_when_online {
+                    items = items.child(
+                        menu_item("schedule-when-online", Some("icons/clock.svg"), "Send when online", None).on_click(
+                            cx.listener(|this, _, _, cx| this.choose_schedule(protocol::SCHEDULE_WHEN_ONLINE, cx)),
+                        ),
+                    );
                 }
                 for (index, moment) in presets.into_iter().enumerate() {
                     let at = moment.at;
@@ -4773,6 +6044,7 @@ impl Composer {
                 original: original.into(),
                 original_attachments: Vec::new(),
                 attachments: Vec::new(),
+                has_media: false,
                 stash: Draft::default(),
                 reply: None,
             });
@@ -4867,6 +6139,7 @@ impl Composer {
                     chips: Vec::new(),
                     made: Vec::new(),
                     note: false,
+                    voice_chip: None,
                 };
                 self.dispatch(out, with, cx);
             }
@@ -5103,7 +6376,8 @@ impl Render for Composer {
         let Some(target) = self.target.clone() else {
             return dock;
         };
-        let body = match target.locked() {
+        let undo = self.undo_join_bar(&target, cx);
+        let body = match self.locked_for(&target) {
             Some(locked) => self.bar(locked, target.key.network, cx),
             None => self.card(focus.is_focused(window), window, cx),
         };
@@ -5115,8 +6389,9 @@ impl Render for Composer {
             .children(self.poll_composer_panel(cx))
             .children(self.thread_composer_panel(cx))
             .children(self.thread_settings_panel(cx))
-            .child(div().relative().child(body).children(self.popover(cx)))
+            .child(div().relative().children(undo).child(body).children(self.popover(cx)))
             .children(self.caption_line(&target, cx))
+            .children(self.bot_strip(&target, window, cx))
             .children(self.picker_layer(window, cx))
             .children(self.send_menu_layer(window, cx))
             .children(self.drop_layer(cx))
@@ -5125,9 +6400,14 @@ impl Render for Composer {
 }
 
 impl Shell {
+    /// The main composer, the thread's, and each conversation window's.
+    fn composers(&self) -> Vec<Entity<Composer>> {
+        let state = &self.composer_state;
+        state.main.get().cloned().into_iter().chain(state.thread.get().cloned()).chain(state.extra.iter().cloned()).collect()
+    }
+
     pub(super) fn composer_playback_redraw(&self, cx: &mut Context<Self>) {
-        let ids: Vec<_> = [self.composer_state.main.get(), self.composer_state.thread.get()]
-            .into_iter().flatten().map(Entity::entity_id).collect();
+        let ids: Vec<_> = self.composers().iter().map(Entity::entity_id).collect();
         let app: &mut gpui::App = cx;
         for id in ids {
             app.notify(id);
@@ -5155,10 +6435,8 @@ impl Shell {
             .unwrap_or_default()
     }
 
-    /// The composer dock of the open conversation.
-    pub(super) fn composer(&self, open: &Conversation, link: Link, cx: &mut Context<Self>) -> Div {
-        self.people_state.attach(cx);
-        self.people_state.hub().watch_conversation(Some(&open.key), cx);
+    /// Where a conversation's composer writes. A screenshot run can lock the link and the kind.
+    fn target_of(&self, open: &Conversation, link: Link) -> Target {
         #[cfg(feature = "gui-shot")]
         let (link, kind) = super::people::shot::locked(link, open.kind);
         #[cfg(feature = "gui-shot")]
@@ -5177,7 +6455,15 @@ impl Shell {
                 (person.relation == protocol::Relation::Blocked).then_some(person)
             })
             .flatten();
-        let target = Target {
+        let hidden_last_seen = kind == ConversationKind::Direct
+            && open.peer.as_deref().is_some_and(|peer_id| {
+                let peer_key = Key::new(&open.key.account(), peer_id);
+                let hub = self.people_state.hub();
+                let live = hub.status_of(&peer_key);
+                let status = if live.is_empty() { hub.person(&peer_key).map(|person| person.status).unwrap_or_default() } else { live };
+                rough_last_seen(&status)
+            });
+        Target {
             key: open.key.clone(),
             title: open.title.clone(),
             kind,
@@ -5186,9 +6472,12 @@ impl Shell {
             peer: open.peer.clone(),
             read_only: open.read_only,
             read_only_reason: open.read_only_reason.clone(),
+            voice_notes_forbidden: open.voice_notes_forbidden.clone(),
             joined: open.joined,
             blocked_peer,
             special: open.special,
+            bot: open.bot,
+            hidden_last_seen,
             can,
             send_as: self.send_as_of(&open.key),
             slowmode_seconds: open.slowmode_seconds,
@@ -5196,7 +6485,15 @@ impl Shell {
             rights: open.rights,
             archived: open.archived,
             locked: open.locked,
-        };
+        }
+    }
+
+    /// The composer dock of the open conversation.
+    pub(super) fn composer(&self, open: &Conversation, link: Link, cx: &mut Context<Self>) -> Div {
+        self.people_state.attach(cx);
+        // The focused conversation window is the one Watch names. This dock must not replace it.
+        self.people_state.hub().watch_conversation(self.watched_conversation_key().as_ref(), cx);
+        let target = self.target_of(open, link);
         let composer = self.composer_in(false, cx);
         composer.update(cx, |composer, cx| composer.aim(target, &open.draft, cx));
         #[cfg(feature = "gui-shot")]
@@ -5235,9 +6532,12 @@ impl Shell {
             peer: None,
             read_only: held.as_ref().is_some_and(|row| row.read_only),
             read_only_reason: held.as_ref().map(|row| row.read_only_reason.clone()).unwrap_or_default(),
+            voice_notes_forbidden: String::new(),
             joined: held.as_ref().map(|row| row.joined).unwrap_or(true),
             blocked_peer: None,
             special: held.as_ref().map(|row| row.special).unwrap_or(protocol::Special::None),
+            bot: false,
+            hidden_last_seen: false,
             can,
             send_as: self.send_as_of(key),
             slowmode_seconds,
@@ -5250,6 +6550,133 @@ impl Shell {
         let composer = self.composer_in(true, cx);
         composer.update(cx, |composer, cx| composer.aim(target, draft, cx));
         div().flex_none().child(composer)
+    }
+
+    /// A composer for a conversation window. It opens on the live draft,
+    /// including keystrokes the quiet timer has not saved. `thread` is how it
+    /// posts. `from_side` reads the right-pane thread slot; otherwise the draft
+    /// comes from the main conversation composer. The caller has already
+    /// decided that this window owns the draft.
+    pub(in crate::gui) fn window_composer(
+        &mut self,
+        open: &Conversation,
+        thread: bool,
+        from_side: bool,
+        cx: &mut Context<Self>,
+    ) -> Entity<Composer> {
+        let (shell, hub) = (cx.weak_entity(), self.people_state.hub());
+        let composer = cx.new(|cx| Composer::new(shell, hub, thread, cx));
+        self.give_live_draft(&composer, &open.key, from_side, cx);
+        self.reaim_window_composer(&composer, open, thread, cx);
+        self.composer_state.extra.push(composer.clone());
+        composer
+    }
+
+    /// The main field is on `key`, the side field is, and the main dock
+    /// remembers a draft for it without showing that field.
+    pub(in crate::gui) fn draft_slot_flags(&self, key: &Key, cx: &App) -> (bool, bool, bool) {
+        let look = |slot_thread: bool| {
+            let Some(composer) = self.composer_made(slot_thread) else {
+                return (false, false);
+            };
+            let composer = composer.read(cx);
+            let aimed = composer.aimed_at(key);
+            let remembers = !aimed && composer.held_draft(key, cx).is_some();
+            (aimed, remembers)
+        };
+        let (main_aimed, main_remembers) = look(false);
+        let (side_aimed, _) = look(true);
+        (main_aimed, side_aimed, main_remembers)
+    }
+
+    /// Copies the draft held for `key` onto a window composer before that
+    /// window aims, so the row's older text does not win. `from_side` is the
+    /// right-pane slot; the main conversation composer is the other one.
+    fn give_live_draft(&mut self, composer: &Entity<Composer>, key: &Key, from_side: bool, cx: &mut Context<Self>) {
+        let Some(source) = self.composer_made(from_side) else {
+            return;
+        };
+        if source.entity_id() == composer.entity_id() {
+            return;
+        }
+        source.update(cx, |source, cx| source.flush_aimed(key, cx));
+        let Some(draft) = source.read(cx).held_draft(key, cx) else {
+            return;
+        };
+        composer.update(cx, |composer, _| composer.offer_draft(key.clone(), draft));
+    }
+
+    fn composer_made(&self, thread: bool) -> Option<Entity<Composer>> {
+        let slot = if thread { &self.composer_state.thread } else { &self.composer_state.main };
+        slot.get().cloned()
+    }
+
+    /// Saves the window composer's draft, gives it to the composer that should
+    /// show it, and drops the window composer. The quiet timer is cancelled by
+    /// the save. `to_side` is the right-pane thread slot. The main conversation
+    /// composer is the other one, including when the conversation is a thread
+    /// the main pane opened.
+    pub(in crate::gui) fn release_window_composer(
+        &mut self,
+        composer: Option<Entity<Composer>>,
+        to_side: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(composer) = composer else {
+            return;
+        };
+        // The dock's own composer is not a window composer.
+        let dock = self.composer_made(false).as_ref().map(Entity::entity_id) == Some(composer.entity_id())
+            || self.composer_made(true).as_ref().map(Entity::entity_id) == Some(composer.entity_id());
+        if dock {
+            self.drop_composers(&[composer]);
+            return;
+        }
+        let released = composer.update(cx, |composer, cx| composer.release_draft(cx));
+        if let Some((key, draft)) = released {
+            let dest = self.composer_in(to_side, cx);
+            if dest.entity_id() != composer.entity_id() {
+                dest.update(cx, |dest, cx| dest.accept_draft(key, draft, cx));
+            }
+        }
+        self.drop_composers(&[composer]);
+    }
+
+    pub(in crate::gui) fn reaim_window_composer(&mut self, composer: &Entity<Composer>, open: &Conversation, thread: bool, cx: &mut Context<Self>) {
+        let link = self.snapshot.as_ref().map(|snapshot| snapshot.account_link(&open.key)).unwrap_or(Link::SignedOut);
+        let target = if thread {
+            Target {
+                key: open.key.clone(),
+                title: open.title.clone(),
+                kind: ConversationKind::Thread,
+                link,
+                space: None,
+                read_only: open.read_only,
+                read_only_reason: open.read_only_reason.clone(),
+                joined: true,
+                peer: None,
+                blocked_peer: None,
+                special: protocol::Special::None,
+                bot: false,
+                hidden_last_seen: false,
+                voice_notes_forbidden: String::new(),
+                rights: open.rights,
+                slowmode_seconds: open.slowmode_seconds,
+                slowmode_until: open.slowmode_until,
+                archived: open.archived,
+                locked: open.locked,
+                can: self.can_of(&open.key),
+                send_as: self.send_as_of(&open.key),
+            }
+        } else {
+            self.target_of(open, link)
+        };
+        let draft = if thread { "" } else { open.draft.as_str() };
+        composer.update(cx, |composer, cx| composer.aim(target, draft, cx));
+    }
+
+    pub(in crate::gui) fn drop_composers(&mut self, gone: &[Entity<Composer>]) {
+        self.composer_state.extra.retain(|composer| !gone.iter().any(|drop| drop == composer));
     }
 
     // Hooks for the conversation and the window.
@@ -5363,8 +6790,14 @@ impl Shell {
     /// lost. Once this update is over: a hold can fail in the middle of that composer's own.
     fn hold_returns(&mut self, cx: &mut Context<Self>) {
         for held in self.composer_state.hold.take_failed() {
-            let slot = if held.typed.thread { &self.composer_state.thread } else { &self.composer_state.main };
-            if let Some(composer) = slot.get().cloned() {
+            let key = held.conversation.clone();
+            let thread = held.typed.thread;
+            let found = self.composers().into_iter().find(|composer| {
+                let composer = composer.read(cx);
+                composer.thread == thread && composer.target.as_ref().is_some_and(|target| target.key == key)
+            });
+            let slot = if thread { self.composer_state.thread.get().cloned() } else { self.composer_state.main.get().cloned() };
+            if let Some(composer) = found.or(slot) {
                 cx.defer(move |cx| composer.update(cx, |composer, cx| composer.held_back(held, cx)));
             }
         }
@@ -5458,7 +6891,7 @@ impl Shell {
     /// A Tiny file send reached a verdict. The composer that is holding it applies that; otherwise
     /// the verdict waits for the pending-row answer, which can arrive after the upload.
     fn finish_tiny_file(&mut self, client_id: String, outcome: Result<(), String>, cx: &mut Context<Self>) {
-        let composers: Vec<_> = [self.composer_state.main.get().cloned(), self.composer_state.thread.get().cloned()].into_iter().flatten().collect();
+        let composers = self.composers();
         let mut consumed = false;
         for composer in composers {
             let (id, outcome) = (client_id.clone(), outcome.clone());
@@ -5472,14 +6905,13 @@ impl Shell {
 
     /// Client ids of Tiny file scans still open in this conversation.
     fn scans_open_in(&self, key: &Key, cx: &mut Context<Self>) -> Vec<String> {
-        [self.composer_state.main.get(), self.composer_state.thread.get()].into_iter().flatten().flat_map(|composer| composer.read(cx).held_scan_ids(key)).collect()
+        self.composers().iter().flat_map(|composer| composer.read(cx).held_scan_ids(key)).collect()
     }
 
     /// Tiny file client ids whose send ack has not opened a hold yet.
     fn awaiting_tiny_files(&self, key: &Key, cx: &mut Context<Self>) -> Vec<String> {
-        [self.composer_state.main.get(), self.composer_state.thread.get()]
-            .into_iter()
-            .flatten()
+        self.composers()
+            .iter()
             .filter_map(|composer| composer.read(cx).pending_file.as_ref().filter(|(held, _)| held == key).map(|(_, id)| id.clone()))
             .collect()
     }
@@ -5520,7 +6952,7 @@ impl Shell {
                     shell.composer_state.ticking = false;
                     return false;
                 }
-                for composer in [shell.composer_state.main.get(), shell.composer_state.thread.get()].into_iter().flatten() {
+                for composer in shell.composers() {
                     composer.update(cx, |_, cx| cx.notify());
                 }
                 cx.notify();
@@ -5549,7 +6981,7 @@ impl Shell {
                 return;
             }
             Change::Media { file, .. } => {
-                for composer in [self.composer_state.main.get(), self.composer_state.thread.get()].into_iter().flatten() {
+                for composer in self.composers() {
                     let (composer, file) = (composer.clone(), file.clone());
                     // Its own update may be running: it hears of the file once that is over.
                     cx.defer(move |cx| composer.update(cx, |composer, cx| composer.media_landed(&file, cx)));
@@ -5558,7 +6990,7 @@ impl Shell {
             }
             Change::Recording { recording } => {
                 self.composer_state.recording = recording.clone();
-                for composer in [self.composer_state.main.get(), self.composer_state.thread.get()].into_iter().flatten() {
+                for composer in self.composers() {
                     let (composer, recording) = (composer.clone(), recording.clone());
                     cx.defer(move |cx| composer.update(cx, |composer, cx| composer.recording_changed(&recording, cx)));
                 }
@@ -5638,6 +7070,19 @@ impl Shell {
                 };
                 if changed {
                     cx.notify();
+                }
+                for id in &inflight {
+                    let voice_outcome = match found_state(id) {
+                        Some(SendState::Sent) => Some(Ok(())),
+                        Some(SendState::Failed { reason }) => Some(Err(reason)),
+                        _ => None,
+                    };
+                    if let Some(outcome) = voice_outcome {
+                        for composer in [shell.composer_state.main.get(), shell.composer_state.thread.get()].into_iter().flatten() {
+                            let (composer, key, id, outcome) = (composer.clone(), key.clone(), id.clone(), outcome.clone());
+                            cx.defer(move |cx| composer.update(cx, |composer, cx| composer.voice_settled(&key, &id, outcome, cx)));
+                        }
+                    }
                 }
                 if key.network != Network::Tiny {
                     return;
@@ -5853,6 +7298,20 @@ mod tests {
     }
 
     #[test]
+    fn a_handed_draft_wins_over_what_this_composer_remembered() {
+        let handed = Draft { text: "typed in the window".into(), reply: reply("m9"), ..Draft::default() };
+        let remembered = Draft { text: "typed before it left".into(), reply: reply("m1"), ..Draft::default() };
+        let won = draft_on_open(Some(handed), Some(remembered.clone()), "stored on the row");
+        assert_eq!(won.text, "typed in the window");
+        assert_eq!(won.reply.as_ref().map(|reply| reply.id.as_str()), Some("m9"));
+        // Clearing the window is a draft too: the old memory does not come back.
+        let cleared = draft_on_open(Some(Draft::default()), Some(remembered.clone()), "stored on the row");
+        assert!(cleared.text.is_empty());
+        assert_eq!(draft_on_open(None, Some(remembered), "stored on the row").text, "typed before it left");
+        assert_eq!(draft_on_open(None, None, "stored on the row").text, "stored on the row");
+    }
+
+    #[test]
     fn a_parked_draft_is_still_a_reply_until_that_reply_goes() {
         let parked = Draft { text: "On it".into(), reply: reply("m1"), ..Draft::default() };
         // Coming back takes a copy of what was parked: the message it answers comes with it.
@@ -5918,8 +7377,11 @@ mod tests {
             peer: None,
             read_only,
             read_only_reason: String::new(),
+            voice_notes_forbidden: String::new(),
             blocked_peer: None,
             special: protocol::Special::None,
+            bot: false,
+            hidden_last_seen: false,
             joined: true,
             can: Capabilities::default(),
             send_as: Vec::new(),
@@ -6065,5 +7527,36 @@ mod tests {
         assert!(!pasted.exists());
         let _ = std::fs::remove_file(&notes);
         let _ = std::fs::remove_file(&huge);
+    }
+
+    #[test]
+    fn slowmode_countdown_and_timed_mute_format_cleanly() {
+        assert_eq!(format_countdown(5), "0:05");
+        assert_eq!(format_countdown(30), "0:30");
+        assert_eq!(format_countdown(95), "1:35");
+        assert_eq!(format_countdown(3665), "1:01:05");
+        let soon = format_ban_until(1_700_003_600, 1_700_000_000);
+        assert!(soon.starts_with("You can send messages again at "), "{soon}");
+        let later = format_ban_until(1_700_200_000, 1_700_000_000);
+        assert!(later.starts_with("You can send messages again on "), "{later}");
+    }
+
+    #[test]
+    fn slack_slash_trigger_and_unknown_handoff() {
+        assert_eq!(slack_slash_trigger("/", 1), Some("/"));
+        assert_eq!(slack_slash_trigger("/to", 3), Some("/to"));
+        assert_eq!(slack_slash_trigger("/topic hello", 12), None);
+        assert_eq!(slack_slash_trigger("hello /me", 9), None);
+
+        assert_eq!(slack_unknown_slash_command("/me waves"), None);
+        assert_eq!(slack_unknown_slash_command("/to"), None);
+        assert_eq!(slack_unknown_slash_command("/deploy staging"), Some("/deploy".to_owned()));
+        assert_eq!(slack_unknown_slash_command("/giphy cats"), Some("/giphy".to_owned()));
+
+        assert_eq!(
+            slack_channel_app_url("T01ALPHA", "C0GEN").as_deref(),
+            Some("https://app.slack.com/client/T01ALPHA/C0GEN")
+        );
+        assert_eq!(slack_channel_app_url("T01/evil", "C0GEN"), None);
     }
 }

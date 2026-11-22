@@ -9,13 +9,13 @@
 use crate::hub::{lock, Hub};
 use crate::media::mediad_path;
 use protocol::{
-    read_frame, write_frame, AccountKey, Change, Key, PlayRequest, PlayState, Playback, PlayerEvent,
-    PlayerRequest, RATES,
+    read_frame, write_frame, AccountKey, Attachment, Change, Key, MediaFile, MediaKind, Message,
+    MessageKind, Page, PlayRequest, PlayState, Playback, PlayerEvent, PlayerRequest, RATES,
 };
 use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// What the shell shows when mediad could not be run, or died while playing.
@@ -25,21 +25,86 @@ fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
+/// First playable voice or round video attachment on `message`, excluding view-once media
+/// (which must never be auto-started).
+pub(crate) fn playable_attachment(message: &Message) -> Option<&Attachment> {
+    if message.deleted || message.kind != MessageKind::Normal {
+        return None;
+    }
+    message.attachments.iter().find(|attachment| {
+        !attachment.view_once
+            && ((attachment.file.kind == MediaKind::Audio
+                && (!attachment.waveform.is_empty()
+                    || attachment.name == "Voice message"
+                    || attachment.mime == "audio/ogg"))
+                || attachment.round)
+    })
+}
+
+/// Looks up the immediately adjacent message (`forward == true` for newer, `false` for older)
+/// in `conversation` and returns it only if it is a consecutive voice or round message.
+fn adjacent_playable(
+    hub: &Hub,
+    conversation: &Key,
+    message_id: &str,
+    forward: bool,
+) -> Option<(Message, Attachment)> {
+    if message_id.is_empty() {
+        return None;
+    }
+    let page = if forward {
+        Page::After { id: message_id.to_owned() }
+    } else {
+        Page::Before { id: message_id.to_owned() }
+    };
+    let found = hub.store().messages(conversation, &page, 1, crate::hub::now()).ok()??;
+    let candidate = found.messages.into_iter().next()?;
+    let attachment = playable_attachment(&candidate)?.clone();
+    Some((candidate, attachment))
+}
+
+struct WaitingFile {
+    hub: Weak<Hub>,
+    account: AccountKey,
+    file: String,
+    conversation: Key,
+    message: String,
+    title: String,
+    rate: u16,
+    output: Option<String>,
+    media_dir: PathBuf,
+    generation: u64,
+}
+
+#[derive(Default)]
+struct Hooks {
+    on_started: Option<Arc<dyn Fn(&Key, &str) + Send + Sync>>,
+    on_fetch: Option<Arc<dyn Fn(&AccountKey, &str) + Send + Sync>>,
+}
+
 #[derive(Default)]
 struct Slot {
     shown: Option<Playback>,
     /// The file's place on disk and the speaker asked for, to start again after a pause.
     path: PathBuf,
+    /// Media cache directory used for validating auto-play files.
+    media_dir: PathBuf,
     output: Option<String>,
+    /// A round video message: mediad decodes the picture too, and loops it.
+    round: bool,
+    looped: bool,
     /// The running mediad's stdin. Closing it is the pause.
     stdin: Option<Box<dyn Write + Send>>,
     /// Tells this start from the next, for the threads that read an earlier mediad.
     generation: u64,
+    /// Next/previous playable file being fetched before playback begins.
+    waiting: Option<WaitingFile>,
 }
 
 #[derive(Default)]
 pub struct Player {
     slot: Mutex<Slot>,
+    hooks: Mutex<Hooks>,
 }
 
 /// True when `path` is a file inside `media`, after following links.
@@ -51,6 +116,26 @@ pub fn inside(media: &Path, path: &Path) -> bool {
 }
 
 impl Player {
+    /// Registers a callback invoked whenever a message starts playing (used to mark listened).
+    pub fn on_started(&self, hook: impl Fn(&Key, &str) + Send + Sync + 'static) {
+        lock(&self.hooks).on_started = Some(Arc::new(hook));
+    }
+
+    /// Registers a callback invoked when auto-play or next/previous needs a file fetched first.
+    pub fn on_fetch(&self, hook: impl Fn(&AccountKey, &str) + Send + Sync + 'static) {
+        lock(&self.hooks).on_fetch = Some(Arc::new(hook));
+    }
+
+    fn notify_started(&self, conversation: &Key, message_id: &str) {
+        if message_id.is_empty() {
+            return;
+        }
+        let hook = lock(&self.hooks).on_started.clone();
+        if let Some(hook) = hook {
+            hook(conversation, message_id);
+        }
+    }
+
     /// What the shell shows now.
     pub fn shown(&self) -> Option<Playback> {
         lock(&self.slot).shown.clone()
@@ -63,7 +148,7 @@ impl Player {
     /// The shell's request. Errors are words for the user.
     pub fn request(&self, hub: &Arc<Hub>, media: &Path, request: PlayRequest) -> Result<(), String> {
         match request {
-            PlayRequest::Start { account, file, path, conversation, message, title, at, rate, output } => {
+            PlayRequest::Start { account, file, path, conversation, message, title, at, rate, output, round, muted, looped } => {
                 let path = PathBuf::from(path);
                 let preview = hub.recorder.shown().is_some_and(|recording| {
                     recording.conversation == conversation && recording.conversation.account() == account
@@ -73,20 +158,27 @@ impl Player {
                 if !inside(media, &path) && !preview {
                     return Err("That file is not in tinyclient's media cache.".to_owned());
                 }
-                self.start(hub, Start { account, file, path, conversation, message, title, at, rate, output });
+                self.start(hub, media.to_path_buf(), Start { account, file, path, conversation, message, title, at, rate, output, round, muted, looped });
             }
             PlayRequest::Pause => self.pause(hub),
             PlayRequest::Seek { at } => self.seek(hub, at),
             PlayRequest::Rate { rate } => self.rate(hub, rate),
+            PlayRequest::Next => self.step(hub, media, true),
+            PlayRequest::Previous => self.step(hub, media, false),
             PlayRequest::Stop => self.stop(hub),
         }
         Ok(())
     }
 
-    fn start(&self, hub: &Arc<Hub>, start: Start) {
+    fn start(&self, hub: &Arc<Hub>, media_dir: PathBuf, start: Start) {
+        let has_next = adjacent_playable(hub, &start.conversation, &start.message, true).is_some();
+        let has_previous = adjacent_playable(hub, &start.conversation, &start.message, false).is_some();
+        let started_conv = start.conversation.clone();
+        let started_msg = start.message.clone();
         let mut slot = lock(&self.slot);
         // Whatever was playing stops; its mediad exits on its own.
         slot.stdin = None;
+        slot.waiting = None;
         slot.generation += 1;
         let generation = slot.generation;
         let same = slot.shown.as_ref().filter(|shown| shown.is(&start.account, &start.file));
@@ -108,20 +200,196 @@ impl Player {
             since: now_ms(),
             duration,
             rate,
+            has_next,
+            has_previous,
+            muted: start.muted,
+            picture: None,
         });
         slot.path = start.path;
+        slot.media_dir = media_dir;
         slot.output = start.output;
-        match self.spawn(hub, &slot, generation) {
-            Ok(stdin) => slot.stdin = Some(stdin),
+        slot.round = start.round;
+        slot.looped = start.looped;
+        let ok = match self.spawn(hub, &slot, generation) {
+            Ok(stdin) => {
+                slot.stdin = Some(stdin);
+                true
+            }
             Err(err) => {
                 tracing::warn!("chatd: the player did not start: {err}");
                 if let Some(shown) = &mut slot.shown {
                     shown.state = PlayState::Failed { detail: NO_PLAYER.to_owned() };
                 }
+                false
             }
-        }
+        };
         drop(slot);
         self.tell(hub);
+        if ok {
+            self.notify_started(&started_conv, &started_msg);
+        }
+    }
+
+    /// Starts playing an adjacent playable message, or requests its file from the adapter first.
+    /// Returns `true` if playback started or is waiting on a fetch.
+    fn begin_message(
+        &self,
+        hub: &Arc<Hub>,
+        media_dir: &Path,
+        conversation: &Key,
+        message: Message,
+        attachment: Attachment,
+        rate: u16,
+        output: Option<String>,
+    ) -> bool {
+        let title = if !message.sender.name.is_empty() {
+            message.sender.name.clone()
+        } else {
+            attachment.name.clone()
+        };
+        if let Some(path) = attachment.file.path.as_deref() {
+            let path = PathBuf::from(path);
+            if inside(media_dir, &path) {
+                self.start(
+                    hub,
+                    media_dir.to_path_buf(),
+                    Start {
+                        account: conversation.account(),
+                        file: attachment.file.id,
+                        path,
+                        conversation: conversation.clone(),
+                        message: message.id,
+                        title,
+                        at: Some(0),
+                        rate,
+                        output,
+                        // Auto-advance plays the next note as sound only, as it did before round notes drew in their circle.
+                        round: false,
+                        muted: false,
+                        looped: false,
+                    },
+                );
+                return true;
+            }
+        }
+        let fetch = lock(&self.hooks).on_fetch.clone();
+        let Some(fetch) = fetch else {
+            return false;
+        };
+        let has_next = adjacent_playable(hub, conversation, &message.id, true).is_some();
+        let has_previous = adjacent_playable(hub, conversation, &message.id, false).is_some();
+        let account = conversation.account();
+        let file_id = attachment.file.id.clone();
+        let rate = if RATES.contains(&rate) { rate } else { 100 };
+        let mut slot = lock(&self.slot);
+        slot.stdin = None;
+        slot.generation += 1;
+        let generation = slot.generation;
+        slot.media_dir = media_dir.to_path_buf();
+        slot.output = output.clone();
+        slot.shown = Some(Playback {
+            account: account.clone(),
+            file: file_id.clone(),
+            conversation: conversation.clone(),
+            message: message.id.clone(),
+            title: title.clone(),
+            state: PlayState::Loading,
+            at: 0,
+            since: now_ms(),
+            duration: attachment.duration.saturating_mul(1_000),
+            rate,
+            has_next,
+            has_previous,
+            muted: false,
+            picture: None,
+        });
+        slot.waiting = Some(WaitingFile {
+            hub: Arc::downgrade(hub),
+            account: account.clone(),
+            file: file_id.clone(),
+            conversation: conversation.clone(),
+            message: message.id,
+            title,
+            rate,
+            output,
+            media_dir: media_dir.to_path_buf(),
+            generation,
+        });
+        drop(slot);
+        self.tell(hub);
+        fetch(&account, &file_id);
+        true
+    }
+
+    /// Called when a fetched media file lands on disk or fails; starts any waiting auto-play.
+    pub fn file_landed(&self, account: &AccountKey, file: &MediaFile) {
+        let waiting = {
+            let mut slot = lock(&self.slot);
+            let matches = slot.waiting.as_ref().is_some_and(|w| &w.account == account && w.file == file.id);
+            if !matches {
+                return;
+            }
+            slot.waiting.take()
+        };
+        let Some(waiting) = waiting else {
+            return;
+        };
+        let Some(hub) = waiting.hub.upgrade() else {
+            return;
+        };
+        if let Some(path) = file.path.as_deref() {
+            let path = PathBuf::from(path);
+            if inside(&waiting.media_dir, &path) {
+                let still_current = lock(&self.slot).generation == waiting.generation;
+                if still_current {
+                    self.start(
+                        &hub,
+                        waiting.media_dir,
+                        Start {
+                            account: waiting.account,
+                            file: waiting.file,
+                            path,
+                            conversation: waiting.conversation,
+                            message: waiting.message,
+                            title: waiting.title,
+                            at: Some(0),
+                            rate: waiting.rate,
+                            output: waiting.output,
+                            // Auto-advance plays the next note as sound only, as it did before round notes drew in their circle.
+                            round: false,
+                            muted: false,
+                            looped: false,
+                        },
+                    );
+                }
+                return;
+            }
+        }
+        if let Some(reason) = file.failed.as_ref() {
+            let mut slot = lock(&self.slot);
+            if slot.generation == waiting.generation {
+                if let Some(shown) = &mut slot.shown {
+                    shown.state = PlayState::Failed { detail: reason.clone() };
+                }
+                drop(slot);
+                self.tell(&hub);
+            }
+        }
+    }
+
+    fn step(&self, hub: &Arc<Hub>, media: &Path, forward: bool) {
+        let current = {
+            let slot = lock(&self.slot);
+            slot.shown.as_ref().map(|shown| {
+                (shown.conversation.clone(), shown.message.clone(), shown.rate, slot.output.clone())
+            })
+        };
+        let Some((conversation, message, rate, output)) = current else {
+            return;
+        };
+        if let Some((target, attachment)) = adjacent_playable(hub, &conversation, &message, forward) {
+            self.begin_message(hub, media, &conversation, target, attachment, rate, output);
+        }
     }
 
     /// Runs `mediad --play` for the slot's file, from the slot's place.
@@ -137,10 +405,14 @@ impl Player {
             at: shown.at,
             rate: shown.rate,
             output: slot.output.clone(),
+            round: slot.round,
+            muted: shown.muted,
+            looped: slot.looped,
         };
         write_frame(&mut stdin, &open)?;
         let hub = hub.clone();
-        std::thread::Builder::new().name("player".into()).stack_size(128 * 1024).spawn(move || {
+        // Auto-advance reads the next message from the store on this thread, which needs more than the 128 KiB it had.
+        std::thread::Builder::new().name("player".into()).stack_size(1024 * 1024).spawn(move || {
             // Ends when mediad exits, which it does when the file ends or its stdin closes.
             while let Ok(event) = read_frame::<PlayerEvent>(&mut stdout) {
                 hub.player.heard(&hub, generation, event);
@@ -152,7 +424,54 @@ impl Player {
     }
 
     /// What a mediad said, if it is still the one playing.
-    fn heard(&self, hub: &Hub, generation: u64, event: PlayerEvent) {
+    fn heard(&self, hub: &Arc<Hub>, generation: u64, event: PlayerEvent) {
+        if let PlayerEvent::Ended { duration } = event {
+            let advance = {
+                let slot = lock(&self.slot);
+                if slot.generation != generation {
+                    return;
+                }
+                let paused = slot.stdin.is_none();
+                let Some(shown) = &slot.shown else {
+                    return;
+                };
+                if paused {
+                    None
+                } else {
+                    Some((
+                        shown.conversation.clone(),
+                        shown.message.clone(),
+                        shown.rate,
+                        slot.output.clone(),
+                        slot.media_dir.clone(),
+                    ))
+                }
+            };
+            if let Some((conversation, message, rate, output, media_dir)) = advance {
+                if let Some((next_msg, attachment)) = adjacent_playable(hub, &conversation, &message, true) {
+                    let still_active = {
+                        let slot = lock(&self.slot);
+                        slot.generation == generation && slot.stdin.is_some()
+                    };
+                    if still_active && self.begin_message(hub, &media_dir, &conversation, next_msg, attachment, rate, output) {
+                        return;
+                    }
+                }
+            }
+            let mut slot = lock(&self.slot);
+            if slot.generation != generation {
+                return;
+            }
+            if let Some(shown) = &mut slot.shown {
+                shown.state = PlayState::Ended;
+                shown.duration = shown.duration.max(duration);
+                shown.at = shown.duration;
+                slot.stdin = None;
+            }
+            drop(slot);
+            self.tell(hub);
+            return;
+        }
         let mut slot = lock(&self.slot);
         if slot.generation != generation {
             return;
@@ -173,12 +492,10 @@ impl Player {
                     shown.duration = duration;
                 }
             }
-            PlayerEvent::Ended { duration } => {
-                shown.state = PlayState::Ended;
-                shown.duration = shown.duration.max(duration);
-                shown.at = shown.duration;
-                slot.stdin = None;
+            PlayerEvent::Frame { path, width, height, generation } => {
+                shown.picture = Some(protocol::PlayPicture { path, width, height, generation });
             }
+            PlayerEvent::Ended { .. } => unreachable!(),
             // Where a pause really left it, a moment after the shell was told the clock's guess.
             PlayerEvent::Stopped { at } => {
                 if shown.state == PlayState::Paused {
@@ -214,6 +531,7 @@ impl Player {
     fn pause(&self, hub: &Hub) {
         let mut slot = lock(&self.slot);
         slot.stdin = None;
+        slot.waiting = None;
         let Some(shown) = &mut slot.shown else {
             return;
         };
@@ -259,6 +577,9 @@ impl Player {
         shown.at = shown.position(now);
         shown.since = now;
         shown.rate = rate;
+        if let Some(waiting) = &mut slot.waiting {
+            waiting.rate = rate;
+        }
         if let Some(stdin) = &mut slot.stdin {
             if write_frame(stdin, &PlayerRequest::Rate { rate }).is_err() {
                 slot.stdin = None;
@@ -272,6 +593,7 @@ impl Player {
         let mut slot = lock(&self.slot);
         let had = slot.shown.take().is_some();
         slot.stdin = None;
+        slot.waiting = None;
         slot.generation += 1;
         drop(slot);
         if had {
@@ -306,6 +628,9 @@ struct Start {
     at: Option<u32>,
     rate: u16,
     output: Option<String>,
+    round: bool,
+    muted: bool,
+    looped: bool,
 }
 
 #[cfg(test)]

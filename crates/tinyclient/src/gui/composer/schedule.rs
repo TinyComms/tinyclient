@@ -34,6 +34,12 @@ pub fn send_menu_for(silent: bool, schedule: bool) -> bool {
     silent || schedule
 }
 
+/// Whether "Send when online" is offered in this conversation: Telegram 1:1 DMs only,
+/// not Saved Messages, and only when the recipient's last-seen time is visible.
+pub fn when_online_for(network: protocol::Network, kind: protocol::ConversationKind, is_self: bool, hidden_last_seen: bool) -> bool {
+    network == protocol::Network::Telegram && kind == protocol::ConversationKind::Direct && !is_self && !hidden_last_seen
+}
+
 /// The time `Outgoing::schedule` carries. `Ok(None)` is an ordinary send.
 /// A chosen time the network will not take, or one that has passed, is an error:
 /// the message stays in the field.
@@ -41,6 +47,7 @@ pub fn for_send(allowed: bool, at: Option<i64>, now: i64) -> Result<Option<i64>,
     match at {
         None => Ok(None),
         Some(_) if !allowed => Err("This network does not schedule messages."),
+        Some(at) if at == protocol::SCHEDULE_WHEN_ONLINE => Ok(Some(at)),
         Some(at) if at <= now => Err("That time has passed."),
         Some(at) => Ok(Some(at)),
     }
@@ -324,5 +331,15 @@ mod tests {
         assert_eq!(add_days(2025, 2, 28, 1), (2025, 3, 1));
         assert_eq!(add_days(2025, 12, 31, 1), (2026, 1, 1));
         assert_eq!(add_days(2026, 1, 15, 0), (2026, 1, 15));
+    }
+
+    #[test]
+    fn send_when_online_applies_only_to_visible_telegram_dms() {
+        assert!(when_online_for(protocol::Network::Telegram, protocol::ConversationKind::Direct, false, false));
+        assert!(!when_online_for(protocol::Network::Telegram, protocol::ConversationKind::Direct, true, false));
+        assert!(!when_online_for(protocol::Network::Telegram, protocol::ConversationKind::Direct, false, true));
+        assert!(!when_online_for(protocol::Network::Telegram, protocol::ConversationKind::Group, false, false));
+        assert!(!when_online_for(protocol::Network::Slack, protocol::ConversationKind::Direct, false, false));
+        assert_eq!(for_send(true, Some(protocol::SCHEDULE_WHEN_ONLINE), 1_700_000_000), Ok(Some(protocol::SCHEDULE_WHEN_ONLINE)));
     }
 }

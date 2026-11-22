@@ -1,0 +1,12 @@
+{
+  "id": "telegram-round-record",
+  "title": "A round video message is recorded and sent as a silent square note",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same video note is what a round recording sends.",
+    "ios": "The phone proof build does not run desktop chatd. The same video note is what a round recording sends."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

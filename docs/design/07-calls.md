@@ -2,9 +2,11 @@
 
 Mockups: `mockups/07-calls.html` (frame numbers below refer to it). Requirements: `../product/06-calls.md`.
 
-**One idea.** Every call state on every network lives in one place: the **call dock** at the bottom of the sidebar. Ringing out, ringing in, connecting, in a call and failed are five faces of the same 300 px card. A voice call is that card and nothing else; the 212 px "call surface" card in today's shell goes away. **A picture is a Tiny room (§6) or a Discord call (§6a).** Discord voice is joined from the server list.
+**One idea.** Every call state on every network lives in one place: the **call dock** at the bottom of the sidebar. Ringing out, ringing in, connecting, in a call and failed are five faces of the same 300 px card. The dock carries call *state* wherever you navigate; the **call view** is where a call is *looked at*: a Tiny room opens its stage in the main pane, while a joined direct call or Discord call shows its picture area above the conversation (and a compact preview tile above the dock while another chat is open), and any live video can pop out into its own always-on-top window. Discord voice is joined from the server list.
 
 **Why the dock is at the bottom of the sidebar, not the top of the conversation.** The conversation pane changes on every navigation and belongs to whatever is open; the sidebar does not. A call in Lounge has nothing to do with the Slack channel I am reading, so it should not sit in that channel's header. The dock is also directly under the voice-channel tree it came from, and it never pushes messages down. Cost: the conversation list loses 112 px while a call exists, and only then.
+
+**Why the call view is separate from the dock.** Keeping state in the dock lets you read any other chat while staying in control of mute, deafen and Leave. When you look at the call itself — a Tiny room stage or a direct/Discord call's picture — the main pane gives it room for participant tiles, a focused share, a self-view PiP, full screen, and pop-out without cramping the sidebar.
 
 ## States
 
@@ -21,7 +23,7 @@ in_call ──ring arrives──▶ in_call + incoming strip ──Accept──�
 failed ──Try again──▶ ringing_out / connecting      ──Dismiss / any new call──▶ idle
 ```
 
-`in_call` is shown only when chatd reports the network confirmed the join. `mediad` exists from `connecting` (after Accept, never during a ring) until `idle`. One call at a time, across all networks.
+`in_call` is shown only when chatd reports the network confirmed the join. `mediad` exists from `connecting` (after Accept, never during a ring) until `idle`. One call at a time, across all networks. The call view exists from `ringing_out` / `connecting` through `idle`: in a Tiny room, the stage shows the connecting/reconnecting/failure banner over the tiles; in a direct or Discord call, the conversation shows its live call state and reveals the picture area once joined with video.
 
 ## 1. Starting a call (frame 1)
 
@@ -42,8 +44,8 @@ The hand-off reads as deliberate because it is a different object: outlined, bra
 
 Dock: full sidebar width (316), 8 px padding, 1 px `hairline` top border, present only when a call state exists. Card: 300 wide, radius 12, `raised` fill, 1 px `hairline` border, 10 px padding, 8 px row gap. **Height 96** (dock 112). Optional 32 px strips stack on top inside the card.
 
-- **Row 1, 36 px, the title row.** 28 px avatar (person: round, in a 4 px speaking-ring slot; voice channel: 28 px square, radius 8, `positive_soft` fill, `volume` glyph in `positive`). Title 13 px semibold. Sub-line 11.5 px `text_soft`: network icon 11 px + context + state. Right side: the peer's `mic-off` glyph (DM), or an avatar stack (group, channel): up to three 20 px avatars overlapping 6 px, then "+N". Click the row: open that conversation ("Go to Lounge"). Click the stack: participant list.
-- **Row 2, the controls.** Joined controls share one row equally and wrap as a set: mute, deafen, share, camera, devices, Leave. Share and camera are included on a Tiny room that allows video, and on a joined Discord call. Each button grows to the same width. The place name wraps on the line under the title. The elapsed clock sits with the signal bars and the security slot, not beside the name. Controls a stage or a network cannot do are absent, not greyed: stage 2 shows mute, deafen, devices, Leave.
+- **Row 1, 36 px, the title row.** 28 px avatar (person: round, in a 4 px speaking-ring slot; voice channel: 28 px square, radius 8, `positive_soft` fill, `volume` glyph in `positive`). Title 13 px semibold. Sub-line 11.5 px `text_soft`: network icon 11 px + context + state. Right side: the peer's `mic-off` glyph (DM), or an avatar stack (group, channel): up to three 20 px avatars overlapping 6 px, then "+N". Click the card or title row: open the call (the Tiny room stage for a Tiny room, or the call's conversation for a direct or Discord call). Click the stack: participant list.
+- **Row 2, the controls.** Joined controls share one row equally and wrap as a set: mute, deafen, share, camera, devices, Leave. Share and camera are included on a Tiny room that allows video, on a Tiny direct call, and on a joined Discord call. On a Tiny server's own column, the dock collapses to the compact bar (signal bars, security slot, Leave) and share/camera live on the room's call bar. Each button grows to the same width. The place name wraps on the line under the title. The elapsed clock sits with the signal bars and the security slot, not beside the name. Controls a stage or a network cannot do are absent, not greyed: stage 2 shows mute, deafen, devices, Leave.
 
 Sub-line wording: `Ringing… 0:12` · `Connecting…` · `Discord · 12:04` (DM) · `tinyclient-dev · 4:31` (channel: server name) · `Reconnecting…` (`warning`) · `Call ended · 12:04`. A Tiny call does not count down time left. The sub-line's tooltip in a Discord call: "End-to-end encrypted by Discord". Discord DAVE seals the voice, and the picture when one is on. Left alone in a DM call: `Mara left · 12:40`; tinyclient does not hang up for me.
 
@@ -53,12 +55,12 @@ Sub-line wording: `Ringing… 0:12` · `Connecting…` · `Discord · 12:04` (DM
 | Deafen | `raised`, `headphones` | `danger_soft`, `headphone-off` in `danger`; mute shows on too; undeafen restores the earlier mute | "Deafen  ⌘⇧D" |
 | Share | `raised`, `monitor-up` | `accent_soft`, `accent` glyph | "Share your screen" / "Stop sharing" |
 | Camera | `raised`, `video` | `accent_soft`, `accent` glyph | "Turn camera on" / "Turn camera off" |
-| Devices | `raised`, `settings` | menu open: `selected` fill, `text` glyph | "Microphone and speaker" |
+| Devices | `raised`, `settings` | menu open: `selected` fill, `text` glyph | "Devices" |
 | Leave | `danger_soft`, `phone-off` in `danger`; hover: `danger` fill, `on_accent` glyph | | "Leave  ⌘⇧H" |
 
 Hover on any rest state: `selected` fill, `text` glyph. Disabled: 40 % opacity, no hover; used while reconnecting (all but Leave) and for a moderator's mute ("Muted by a moderator in Lounge"). Ringing and connecting show only mute and devices (both may be preset) and a text **Cancel** button (32 high, `danger_soft`).
 
-**Shortcuts** work in any tinyclient window: ⌘⇧M mute, ⌘⇧D deafen, ⌘⇧H leave or cancel, ⌘⇧A accept, ⌘⇧R decline, ⌘⇧J jump to the call's conversation. Mute can also be system-wide: off by default, a Settings switch ("Mute works while tinyclient is in the background"), registered only while a call exists. Layout and navigation arbitrates any clash with these.
+**Shortcuts** work in any tinyclient window: ⌘⇧M mute, ⌘⇧D deafen, ⌘⇧H leave or cancel, ⌘⇧A accept, ⌘⇧R decline, ⌘⇧J open the call (jumps to the Tiny room or the call's conversation). Mute can also be system-wide: off by default, a Settings switch ("Mute works while tinyclient is in the background"), registered only while a call exists. Layout and navigation arbitrates any clash with these.
 
 **On a Tiny server** the user panel sits under the dock (`10-tiny-server.md` §1). Over that server's column the dock is the compact bar: signal bars, `Voice connected`, the place (`Lounge / Night Shift`), the security slot, and Leave. Anywhere else the same call is the full card.
 
@@ -90,26 +92,36 @@ Ringing shows who, an elapsed counter and Cancel, in the dock; the header pill b
 
 ## 5. Participants (frames 5, 7)
 
-- **DM:** no list. The bar's avatar carries the peer's speaking ring; a `mic-off` after the name if they are muted.
-- **Voice channel, in the tree.** Channel row at the tree's row height (30 px assumed): `volume` 15 px, name 13.5 px, count at the right ("5", or "2/4" with a limit). The joined channel: glyph `positive`, name `text` semibold. Under it, one row per person: **28 px**, 38 px left indent, 20 px avatar in a 4 px ring slot, 10 px gap, name 12.5 px `text_soft`, then 13 px status glyphs at the right, 5 px apart: `mic-off`, `headphone-off` (`text_faint`), `monitor-up` (`accent`; clicking it is Watch), `video`. Speaking: the ring turns `positive` and the name turns `text`. Order: me first, then by name; it never reorders on speech. At most 12 rows per channel, then "+ 9 more", which opens the participant list. Rows exist only for channels with people in them.
+- **DM:** no participant list popover. The dock avatar carries the peer's speaking ring (with a `mic-off` after the name if they are muted), and while video is active the call view shows the peer's picture with a self-view corner PiP (or a compact preview tile above the dock when another conversation is open).
+- **Voice channel, in the tree.** Channel row at the tree's row height (30 px assumed): `volume` 15 px, name 13.5 px, count at the right ("5", or "2/4" with a limit). The joined channel: glyph `positive`, name `text` semibold. Under it, one row per person: **28 px**, 38 px left indent, 20 px avatar in a 4 px ring slot, 10 px gap, name 12.5 px `text_soft`, then 13 px status glyphs at the right, 5 px apart: `mic-off`, `headphone-off` (`text_faint`), `monitor-up` (`accent`; tooltip "Sharing their screen" — watching happens in the room stage or dock), `video`. Speaking: the ring turns `positive` and the name turns `text`. Order: me first, then by name; it never reorders on speech. At most 12 rows per channel, then "+ 9 more", which opens the participant list. Rows exist only for channels with people in them.
 - **Honest limit:** Discord reports speaking only on the voice connection I joined. Other channels show who is there and their mute, deafen, share and camera state, never a ring.
-- **Participant list** (popover from the avatar stack; the roster for group calls and whenever the tree is not on screen): 280 wide, 32 px rows, 22 px avatars, the same glyphs and ring, header "LOUNGE · 21 PEOPLE", ten rows visible then it scrolls as a virtual list.
+- **Participant list** (popover from the avatar stack; the roster for group calls and whenever the tree is not on screen): 280 wide, 32 px rows, 22 px avatars, the same glyphs and ring, header "LOUNGE · 21 PEOPLE", ten rows visible then a plain scrolling column.
 
-## 6. The picture in a Tiny channel
+## 6. The call view and pictures (frames 6, 10)
 
-**Video is a Tiny room or a Discord call.** Share and Camera appear on the dock, and on the channel's call bar, while a Tiny room that allows video is joined, and while a Discord call is joined. Any other joined call leaves them off. They are absent, not greyed.
+**Video is a Tiny room, a Tiny direct call, or a Discord call.** Share and Camera appear on the dock (when outside the Tiny server's compact column) and on a Tiny room's call bar while a Tiny room that allows video, a Tiny direct call, or a Discord call is joined. Any other joined call leaves them off. They are absent, not greyed.
 
-On a Tiny voice channel the stage is the grid of tiles in `10-tiny-server.md`. The call sends and receives one H.264 picture, drawn in that channel (the share, otherwise the active speaker's camera). It does not follow you into another network's conversation. The camera is the system's camera on Windows, macOS, and Linux, and the phone's camera on Android and iOS. Screen share is a screen or a window on Windows, the primary screen on macOS, the X11 root on an X11 Linux session, and the desktop portal's picker on Wayland. Android uses MediaProjection. iOS uses a broadcast extension for the whole screen, and the simulator shares this app.
+- **Tiny voice channel stage:** the stage holds a wrapping grid of participant tiles (`10-tiny-server.md` §2) plus stream tiles for anyone sharing their screen or camera. Clicking a tile focuses it; clicking a stream watches it and fills the stage, with participant tiles in a strip below, overlaid, or hidden, and a full-screen toggle (Esc leaves full screen or returns to the grid). The floating call bar sits at the bottom of the stage.
+- **Direct calls and Discord calls:** when the call's conversation is open, a picture box sits above the message list showing the watched peer's screen or camera (with a `LIVE` badge for shares, Stop watching / Stop controls, and a 112 × 64 corner self-view PiP when sending your own camera or screen). When another conversation is open, a compact 126 px picture tile appears above the dock card so you can keep watching without leaving your chat.
+- **Capture and codec:** the call sends and receives one H.264 picture (the share, otherwise the active speaker's camera). The camera is the system's camera on Windows, macOS, and Linux, and the phone's camera on Android and iOS; camera device selection lives in Settings › Audio & video (row V22). Screen share is a screen or a window on Windows, the primary screen on macOS, the X11 root on an X11 Linux session, and the desktop portal's picker on Wayland. Android uses MediaProjection. iOS uses a broadcast extension for the whole screen, and the simulator shares this app.
 
-Watch is opt-in for that picture. A share or camera never opens the picture by itself.
+### Getting to and from the call view
+
+- Clicking the dock card (or pressing ⌘⇧J) jumps to the Tiny room stage for a Tiny room, or opens the call's conversation for a direct or Discord call.
+- Back and forward navigation history records both conversations and Tiny channels, so returning to what you were reading takes one click or shortcut.
+- Pressing Esc exits full-screen stream mode first, then unfocuses a focused tile back to the grid.
+
+### When a share starts and auto-watch
+
+- **1:1 Tiny direct calls:** auto-watch starts decoding as soon as the peer turns on screen share or camera, and stops when they turn it off. Choosing **Stop watching** is respected until the peer stops and starts again.
+- **Tiny rooms:** Watch remains opt-in — a stream tile appears on the stage ("Watch stream") and clicking it begins decoding and focuses it.
+- **Discord calls:** active-speaker camera selection debounces switches by 800 ms (`MediaRequest::Speaker`), and Go Live shares are watched on demand via the Watch control.
 
 When the server offers `e2ee_calls`, the client seals Opus and the H.264 picture and leaves the one-byte NAL header clear. Discord DAVE does not use that lock.
 
-Settings has no camera device row (`09`).
-
 ## 6a. The picture on a Discord call
 
-A camera is one H.264 layer on the voice connection the call already has. Go Live is a second connection that sends the screen and does not open a microphone. Watching someone else's share is a third connection that only receives. The voice connection stays up. The same buttons as a Tiny room turn these on. A stage still opens in Discord and has no share or camera here.
+A camera is one H.264 layer on the voice connection the call already has. Go Live is a second connection that sends the screen and does not open a microphone. Watching someone else's share is a third connection that only receives. The voice connection stays up. The same Share and Camera buttons turn these on. On desktop, received Discord camera and Go Live frames draw in the call picture area above the conversation (or the compact dock tile when away), one decoded picture at a time. A stage still opens in Discord and has no share or camera here.
 
 DAVE seals the picture as well as the voice. The client offers H.264 and does not offer another video codec. There is no simulcast. The camera and the screen are the same captures a Tiny room uses.
 
@@ -148,14 +160,14 @@ Voice channels leave no rows. A failed call leaves its card in the dock, not a r
 
 ## GPUI notes
 
-- **What repaints.** The duration and ringing counters: one text element, once a second, stopped while the window is hidden. A speaking ring: one avatar's border color, on a flip only; mediad sends edges with a 250 ms hold so it cannot flicker, about 4 repaints a second per talker at worst. The level meter: 10 Hz, only while the device menu is open. The one H.264 picture: at the stream's frame rate, in its own element in the Tiny channel. Nothing else in a call animates; idle stays idle.
-- The ring slot (2 px gap + 2 px border) is always laid out with a transparent border, so a ring switching on moves nothing. Tree and participant list are uniform lists of fixed-height rows.
+- **What repaints.** The duration and ringing counters: one text element, once a second, stopped while the window is hidden. A speaking ring: one avatar's border color, on a flip only; mediad sends edges with a 250 ms hold so it cannot flicker, about 4 repaints a second per talker at worst. The level meter: 10 Hz, only while the device menu is open. The one H.264 picture: at the stream's frame rate, in its own element in the call view (Tiny room stage, direct/Discord conversation picture box, or compact dock preview). Nothing else in a call animates; idle stays idle.
+- The ring slot (2 px gap + 2 px border) is always laid out with a transparent border, so a ring switching on moves nothing. The participant list is a plain scrolling column of fixed-height rows.
 - The dock is a flex-none child at the end of the sidebar column; the list above it shrinks.
-- The one received picture is drawn in the Tiny channel (`10-tiny-server.md`), not as a card that follows the open conversation.
+- The one received picture is drawn in the Tiny room stage (`10-tiny-server.md`) or, for direct and Discord calls, in the conversation's call picture box (and a compact preview above the dock while another chat is open).
 - Strips, the incoming card and failures are the same card with different children: one component.
-- The share picker and both permission prompts are the system's; tinyclient draws none of them. Whether the system picker avoids the blanket Screen Recording permission is unverified.
+- On desktop, screen share uses tinyclient's own share picker (`gui/tiny/share.rs`) with screen/window thumbnails, quality selection (`Best`, `Balanced`, `Low`), and a pointer toggle; Wayland uses the desktop portal picker, and microphone/camera/screen permission prompts are the OS's own.
 - Notification action buttons show only when the user's style for tinyclient is Alerts; under Banners they sit behind "Options". First run should say so. Unverified on current macOS.
 
 ## Deliberately absent
 
-A gallery or grid outside a Tiny stage; a self-view; any control over the picture; a ringtone or call sounds of our own; a pulsing ring, waveform or animated meter; a full-window call screen; a card for voice-only calls; greyed-out buttons for things not built; a second simultaneous call; soundboard, recording, captions, reactions; a menu-bar item; a custom screen picker with thumbnails; auto-rejoin after a failure (a Tiny blip resumes three times in two minutes, §7a); auto-opening a share; any in-call state before the network confirms the join.
+A multi-stream video gallery (only one remote H.264 picture is decoded at a time); a pulsing ring, waveform or animated meter; greyed-out buttons for things not built; a second simultaneous call; soundboard, recording, captions, call reactions; a menu-bar call item; auto-rejoin after a failure (a Tiny blip resumes three times in two minutes, §7a); any in-call state before the network confirms the join.

@@ -62,6 +62,8 @@ pub enum Reveal {
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum Row {
+    /// A Slack workspace's All Unreads view: unread channels and DMs in one scrolling list (#606).
+    Unreads { space: Key, count: u32, mention: bool },
     /// A Slack workspace's Threads: followed threads with new replies.
     Threads { space: Key, count: u32, mention: bool },
     /// A Slack workspace's Drafts: conversations with unsent drafts.
@@ -202,11 +204,13 @@ pub fn flatten(space: &Key, groups: &[Group], conversations: &[Rc<Conversation>]
     for group in ordered {
         let mut members: Vec<&Rc<Conversation>> = listed.iter().copied().filter(|c| c.group.as_deref() == Some(&group.id)).collect();
         if slack {
-            apps.extend(members.iter().copied().filter(|c| c.bot));
-            members.retain(|c| !c.bot);
             if group.kind == GroupKind::Directs {
+                apps.extend(members.iter().copied().filter(|c| c.bot));
+                members.retain(|c| !c.bot);
                 // Direct messages by recency, the user's own first.
                 members.sort_by_key(|c| (c.special != Special::Saved, std::cmp::Reverse(c.updated)));
+            } else if group.sort == "recent" {
+                members.sort_by_key(|c| (c.muted, std::cmp::Reverse(c.updated)));
             } else {
                 // A to Z without the `#`, muted last (Slack's own order).
                 members.sort_by_cached_key(|c| (c.muted, c.kind.is_direct(), c.title.trim_start_matches('#').to_lowercase()));
@@ -238,10 +242,15 @@ pub fn flatten(space: &Key, groups: &[Group], conversations: &[Rc<Conversation>]
         } else {
             group.collapsed || starts_collapsed
         };
+        let display_name = if group.emoji.is_empty() {
+            group.name.clone()
+        } else {
+            format!("{} {}", group.emoji, group.name)
+        };
         rows.push(Row::Group {
             space: space.clone(),
             id: group.id.clone(),
-            name: group.name.clone(),
+            name: display_name,
             collapsed,
             muted: group.muted,
             rollup: if collapsed { rollup } else { Rollup::default() },

@@ -188,7 +188,7 @@ impl Composer {
                 Some(protocol::RecordState::Recorded { duration, .. }) => *duration,
                 _ => 0,
             };
-            super::rec::preview_caption(duration, playback.as_ref(), crate::gui::playing::now_ms())
+            super::rec::preview_caption(duration, playback.as_ref(), crate::gui::playing::now_ms(), self.note.as_ref().is_some_and(|note| note.video))
         } else {
             match (&refused, chip.converting) {
                 (Some(why), _) => why.clone(),
@@ -211,7 +211,16 @@ impl Composer {
                 Some(_) => {
                     let id = chip.id;
                     tile.cursor_pointer()
-                        .tooltip(tip(if playing { "Pause preview" } else { "Play voice message" }, None))
+                        .tooltip(tip(
+                            if playing {
+                                "Pause preview"
+                            } else if self.note.as_ref().is_some_and(|note| note.video) {
+                                "Play video message"
+                            } else {
+                                "Play voice message"
+                            },
+                            None,
+                        ))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_click(cx.listener(move |this, _, _, cx| this.preview_pressed(id, cx)))
                         .child(crate::gui::conversation::player_glyph(playing, 16., theme::accent_text()))
@@ -244,7 +253,11 @@ impl Composer {
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    .child(div().truncate().type_ui().text_color(theme::text()).child(if super::rec::holds_the_note(&self.note, chip) { "Voice message".to_owned() } else { middle(&chip.name, 24) }))
+                    .child(div().truncate().type_ui().text_color(theme::text()).child(if super::rec::holds_the_note(&self.note, chip) {
+                        if self.note.as_ref().is_some_and(|note| note.video) { "Video message".to_owned() } else { "Voice message".to_owned() }
+                    } else {
+                        middle(&chip.name, 24)
+                    }))
                     .child(div().truncate().type_small().text_color(if chip.refused.is_some() { theme::danger() } else { theme::text_soft() }).child(second)),
             )
             .when(!tags.is_empty(), |chip| chip.child(div().absolute().left(px(4.)).bottom(px(4.)).flex().gap(px(2.)).children(tags.into_iter().map(tag))))

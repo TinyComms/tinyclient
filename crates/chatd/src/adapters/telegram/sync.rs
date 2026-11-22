@@ -3,7 +3,7 @@
 
 use super::content::{self, Mapped, Want};
 use super::filing::{self, Cursor, Facts, Filed};
-use super::peers::{is_replies, thread_id, Known, Who};
+use super::peers::{is_replies, thread_id, CallFlags, Known, Who};
 use super::wire::{self, Fault};
 use super::{live, presence, Account, PAGE};
 use crate::store::{ConversationRow, Filing, PreviewLine, preview_text};
@@ -83,7 +83,11 @@ fn row(account: &Account, who: Who, known: &Known) -> ConversationRow {
     row.avatar = known.avatar();
     row.read_only = known.read_only;
     row.rights = if matches!(who, Who::User(_)) {
-        protocol::ConversationRights { pin: !known.read_only, ..protocol::ConversationRights::default() }
+        protocol::ConversationRights {
+            pin: !known.read_only,
+            delete_others: !known.read_only && who != Who::User(SERVICE),
+            ..protocol::ConversationRights::default()
+        }
     } else {
         known.rights
     };
@@ -97,6 +101,7 @@ fn row(account: &Account, who: Who, known: &Known) -> ConversationRow {
             row.title = "Replies".to_owned();
             row.read_only = true;
             row.bot = false;
+            row.call = other_call();
         }
         Who::User(id) if id == account.me => {
             // Saved Messages: the user's own notes, with no presence and no call.
@@ -113,25 +118,23 @@ fn row(account: &Account, who: Who, known: &Known) -> ConversationRow {
             row.peer = Some(who.text());
             // Calls are a later stage: until then a person's call opens in Telegram's own app,
             // gated by the full profile's call flags once fetched.
-            if !known.bot && !known.deleted {
-                match known.call_flags {
-                    None => {
-                        row.call = CallSupport::Handoff;
-                    }
-                    Some(flags) if flags.phone_private => {
-                        row.call = CallSupport::Restricted;
-                    }
-                    Some(flags) if !flags.phone_available => {
-                        row.call = CallSupport::None;
-                    }
-                    Some(flags) => {
-                        row.call = CallSupport::Handoff;
-                        row.call_video = flags.video_available;
-                    }
-                }
+            let call = user_call(known.bot, known.deleted, known.call_flags);
+            row.call = call.support;
+            row.call_video = call.video;
+            if known.voice_forbidden == Some(true) {
+                row.voice_notes_forbidden = if known.name.is_empty() {
+                    "This person doesn't accept voice and video messages.".to_owned()
+                } else {
+                    format!("{} doesn't accept voice and video messages.", known.name)
+                };
             }
         }
-        _ => {}
+        Who::Group(_) | Who::Channel(_) if !known.broadcast => {
+            if known.voice_banned {
+                row.voice_notes_forbidden = "Voice and video messages aren't allowed in this group.".to_owned();
+            }
+        }
+        _ => row.call = other_call(),
     }
     row
 }
@@ -185,6 +188,56 @@ pub(super) fn ensure_row(account: &Account, who: Who, topic: Option<i32>) -> boo
     account.ctx.conversation(&thread).is_ok()
 }
 
+/// Records a non-member public channel or group as a read-only preview row outside the sidebar.
+/// Never subscribes or joins. True once the row is in the store.
+pub(super) fn ensure_preview_row(account: &Account, who: Who) -> bool {
+    if member(account, who) {
+        return ensure_row(account, who, None);
+    }
+    if !matches!(who, Who::Channel(_)) {
+        return false;
+    }
+    let id = who.text();
+    if matches!(account.ctx.known(&id), Ok(Some(_))) {
+        return true;
+    }
+    if account.input(who).is_err() {
+        return false;
+    }
+    let Some(known) = account.dir().get(who).cloned() else {
+        return false;
+    };
+    let mut fresh = row(account, who, &known);
+    fresh.joined = false;
+    fresh.read_only = true;
+    fresh.listed = false;
+    account.ctx.conversation(&fresh).is_ok()
+}
+
+/// Records a public chat a `t.me` link named, without joining it. A row already stored is left
+/// as it is. A person is a normal chat. A group or channel we have not joined is a preview:
+/// readable, absent from the inbox, not a membership.
+pub(super) fn preview(account: &Account, who: Who) -> Result<Option<String>, Fault> {
+    let id = who.text();
+    if super::secret::is_row(&id) {
+        return Ok(None);
+    }
+    if let Some(stored) = account.ctx.known(&id).map_err(|err| Fault::Net(err.to_string()))? {
+        return Ok(Some(stored.title));
+    }
+    let Some(known) = account.dir().get(who).cloned() else {
+        return Ok(None);
+    };
+    let mut fresh = row(account, who, &known);
+    if !matches!(who, Who::User(_)) && known.member != Some(true) {
+        fresh.joined = false;
+        fresh.read_only = true;
+        fresh.listed = false;
+    }
+    account.ctx.conversation(&fresh).map_err(|err| Fault::Net(err.to_string()))?;
+    Ok(Some(fresh.title))
+}
+
 /// A group or channel was renamed, or its picture or our rights in it changed. Its filing is
 /// left as stored.
 pub(super) fn refresh_row(account: &Account, who: Who) {
@@ -192,6 +245,9 @@ pub(super) fn refresh_row(account: &Account, who: Who) {
         return;
     };
     if known.member == Some(false) {
+        if matches!(account.ctx.known(&who.text()), Ok(Some(stored)) if !stored.joined) {
+            return;
+        }
         remove_chat(account, who);
         return;
     }
@@ -327,6 +383,34 @@ pub(super) fn remove_chat(account: &Account, who: Who) {
     }
 }
 
+/// A person's call, once the row knows whether they are a bot and what the full profile said.
+pub(super) struct UserCall {
+    pub support: CallSupport,
+    pub video: bool,
+}
+
+pub(super) fn user_call(bot: bool, deleted: bool, flags: Option<CallFlags>) -> UserCall {
+    if bot || deleted {
+        return UserCall { support: CallSupport::None, video: false };
+    }
+    match flags {
+        None => UserCall { support: CallSupport::Handoff, video: false },
+        Some(flags) if flags.phone_private => UserCall { support: CallSupport::Restricted, video: false },
+        Some(flags) if !flags.phone_available => UserCall { support: CallSupport::None, video: false },
+        Some(flags) => UserCall { support: CallSupport::Handoff, video: flags.video_available },
+    }
+}
+
+/// A group, a channel, or Replies. None of them place a call here.
+pub(super) fn other_call() -> CallSupport {
+    CallSupport::None
+}
+
+/// Premium, at the documented limits. That is the ceiling the capability table prints.
+pub(super) fn capability_ceiling() -> Capabilities {
+    capabilities(true, &super::premium::Limits::default())
+}
+
 /// What this account may send, from what Telegram says of it. Premium raises the file size
 /// and the caption. Custom emoji are listed for every account; a send names the document
 /// only with Premium, or in Saved Messages (`prepared`). The numbers are `help.getAppConfig`
@@ -354,12 +438,14 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         allow_archives: false,
         abuse_reports: true,
         voice_notes: true,
+        video_notes: true,
         direct_calls: false,
         revisions: false,
         close_direct: false,
         clear_history: true,
         reply: true,
         edit: true,
+        edit_media: true,
         delete: true,
         threads: false,
         direct_threads: false,
@@ -371,19 +457,29 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         gif_file: false,
         mention_format: protocol::MentionFormat::Plain,
         mention_spans: true,
+        profile_name: true,
+        profile_about: true,
+        profile_avatar: true,
+        profile_username: true,
+        profile_birthday: true,
+        rich_status: premium,
         pin_chats: if premium { 10 } else { 5 },
         archive: true,
         folders_edit: true,
         disappearing: true,
+        groups: 200,
         effects: false,
         view_once: false,
         blocks: true,
+        join_space_by_invite: true,
         share_contact: true,
         save_gif: true,
         notify_defaults: true,
         saved_subdialogs: true,
         active_sessions: true,
         unread_jumps: true,
+        transcribe: true,
+        translate: true,
         ..Capabilities::default()
     }
 }
@@ -413,6 +509,9 @@ pub(super) fn sign_on(account: &Arc<Account>) -> Result<(), Fault> {
         let tl::enums::PeerNotifySettings::Settings(settings) = account.ask(&tl::functions::account::GetNotifySettings { peer })?;
         account.live().muted[index] = settings.mute_until.is_some_and(filing::mute_holds);
     }
+    // Before the dialog list maps its newest messages. The stored gates apply without
+    // the Accounts page, and the Wi-Fi caps come with them when Telegram answers.
+    super::info::load_remembered_download(account);
     dialogs(account)?;
     // An earlier build kept every chat in one invented Space. The rows read just now have left
     // it; what is left (chats past the newest 500) goes with it, and comes back on scroll.
@@ -810,7 +909,11 @@ fn record(account: &Account, list: usize, dialog: &tl::types::Dialog, newest: Op
     };
     let mut fresh = row(account, who, &known);
     fresh.filing = Some(filing);
+    fresh.disappearing = dialog.ttl_period.filter(|&s| s > 0).map(|s| s as u32);
     account.ctx.conversation(&fresh)?;
+    if dialog.ttl_period.is_some() {
+        account.ctx.disappearing(&id, fresh.disappearing)?;
+    }
     account.ctx.muted(&id, is_muted)?;
     let mut updated = 0;
     // The dialog list carries each chat's newest message: that is its preview, for free.
@@ -1044,17 +1147,14 @@ pub(super) fn avatar(account: &Account, who: Who) -> Option<Want> {
     })
 }
 
-/// A forum's topics, as `Thread` rows under it. Returns how many it has.
-fn topics(account: &Account, forum: Who) -> Result<usize, Fault> {
-    let request = tl::functions::messages::GetForumTopics {
-        peer: account.input(forum)?,
-        q: None,
-        offset_date: 0,
-        offset_id: 0,
-        offset_topic: 0,
-        limit: TOPICS,
-    };
-    let tl::enums::messages::ForumTopics::Topics(found) = account.ask(&request)?;
+/// Writes one page of forum topics into the store and returns `(written, last_cursor)` where
+/// `last_cursor` is `(offset_date, offset_id, offset_topic)` for the next `GetForumTopics` page.
+fn record_topics(
+    account: &Account,
+    forum: Who,
+    found: &tl::types::messages::ForumTopics,
+    base_index: i32,
+) -> (usize, Option<(i32, i32, i32)>) {
     account.learn(&found.users, &found.chats);
     let dates: HashMap<i32, i64> = found
         .messages
@@ -1066,6 +1166,7 @@ fn topics(account: &Account, forum: Who) -> Result<usize, Fault> {
         })
         .collect();
     let (mut count, mut pinned) = (0, 0);
+    let mut last_cursor = None;
     for (at, topic) in found.topics.iter().enumerate() {
         let tl::enums::ForumTopic::Topic(topic) = topic else {
             continue;
@@ -1081,26 +1182,317 @@ fn topics(account: &Account, forum: Who) -> Result<usize, Fault> {
         thread.parent = Some(forum.text());
         thread.root = Some(topic.id.to_string());
         // Pinned topics first, then as Telegram lists them: the most recently active first.
-        thread.position = at as i32 - if topic.pinned { TOPICS } else { 0 };
+        thread.position = base_index + at as i32 - if topic.pinned { TOPICS } else { 0 };
         thread.read_only = topic.closed && !topic.my;
         // The forum's own pins, in Telegram's order.
         let pin = topic.pinned.then(|| {
             pinned += 1;
             pinned - 1
         });
-        thread.filing = Some(Filing { pin, ..Filing::default() });
+        thread.filing = Some(Filing { pin, hidden: topic.hidden, ..Filing::default() });
+        let updated = dates.get(&topic.top_message).copied().unwrap_or(i64::from(topic.date));
+        last_cursor = Some((updated as i32, topic.top_message, topic.id));
         if account.ctx.conversation(&thread).is_err() {
             continue;
         }
         count += 1;
         let read = (topic.read_inbox_max_id > 0).then(|| topic.read_inbox_max_id.to_string());
-        let updated = dates.get(&topic.top_message).copied().unwrap_or(i64::from(topic.date));
         let _ = account.ctx.counts(&id, topic.unread_count.max(0) as u32, topic.unread_mentions_count.max(0) as u32, read.as_deref(), updated);
         let _ = account.ctx.unread_reactions(&id, topic.unread_reactions_count.max(0) as u32);
         let _ = account.ctx.muted(&id, muted(account, forum, &topic.notify_settings));
     }
     fetch_icons(account, forum, &found.topics);
+    (count, last_cursor)
+}
+
+/// A forum's first page of topics, as `Thread` rows under it. Returns how many it has.
+fn topics(account: &Account, forum: Who) -> Result<usize, Fault> {
+    let request = tl::functions::messages::GetForumTopics {
+        peer: account.input(forum)?,
+        q: None,
+        offset_date: 0,
+        offset_id: 0,
+        offset_topic: 0,
+        limit: TOPICS,
+    };
+    let tl::enums::messages::ForumTopics::Topics(found) = account.ask(&request)?;
+    let total = found.count.max(0) as u32;
+    let (count, last) = record_topics(account, forum, &found, 0);
+    let done = count == 0 || (count as i32) < TOPICS || (count as u32) >= total;
+    if let Some((d, mid, tid)) = last {
+        account.live().topic_pages.insert(forum, (d, mid, tid, count as u32, total, done));
+    } else {
+        account.live().topic_pages.insert(forum, (0, 0, 0, count as u32, total, true));
+    }
     Ok(count)
+}
+
+/// Loads additional pages or searches topics in a forum (`messages.getForumTopics`).
+/// Returns the network's total topic count for the forum/query.
+pub(super) fn load_topics(
+    account: &Account,
+    conversation_id: &str,
+    query: Option<&str>,
+    offset: u32,
+    limit: u32,
+) -> Result<u32, Fault> {
+    let Some((forum, None)) = Who::parse(conversation_id) else {
+        return Err(Fault::Rpc { code: 400, name: "PEER_ID_INVALID".to_owned(), value: None });
+    };
+    let peer = account.input(forum)?;
+    if let Some(q) = query.map(str::trim).filter(|q| !q.is_empty()) {
+        let request = tl::functions::messages::GetForumTopics {
+            peer,
+            q: Some(q.to_owned()),
+            offset_date: 0,
+            offset_id: 0,
+            offset_topic: 0,
+            limit: limit.clamp(1, 100) as i32,
+        };
+        let tl::enums::messages::ForumTopics::Topics(found) = account.ask(&request)?;
+        record_topics(account, forum, &found, 0);
+        return Ok(found.count.max(0) as u32);
+    }
+
+    let wanted = offset.saturating_add(limit);
+    loop {
+        let state = account.live().topic_pages.get(&forum).copied();
+        let (offset_date, offset_id, offset_topic, loaded, total, done) = match state {
+            Some(s) => s,
+            None => (0, 0, 0, 0, 0, false),
+        };
+        if done || (loaded >= wanted && loaded > 0) {
+            return Ok(total.max(loaded));
+        }
+        let page_size = TOPICS;
+        let request = tl::functions::messages::GetForumTopics {
+            peer: peer.clone(),
+            q: None,
+            offset_date,
+            offset_id,
+            offset_topic,
+            limit: page_size,
+        };
+        let tl::enums::messages::ForumTopics::Topics(found) = account.ask(&request)?;
+        let remote_total = found.count.max(0) as u32;
+        let (count, last) = record_topics(account, forum, &found, loaded as i32);
+        let new_loaded = loaded.saturating_add(count as u32);
+        let advanced = last.is_some_and(|(d, mid, tid)| (d, mid, tid) != (offset_date, offset_id, offset_topic));
+        let now_done = count == 0 || !advanced || (count as i32) < page_size || new_loaded >= remote_total;
+        let (nd, nmid, ntid) = last.unwrap_or((offset_date, offset_id, offset_topic));
+        account.live().topic_pages.insert(forum, (nd, nmid, ntid, new_loaded, remote_total, now_done));
+        if now_done || new_loaded >= wanted {
+            return Ok(remote_total.max(new_loaded));
+        }
+    }
+}
+
+fn parse_emoji_id(raw: Option<&str>) -> Option<i64> {
+    raw.and_then(|s| s.strip_prefix('e').unwrap_or(s).parse::<i64>().ok())
+}
+
+/// Creates a new forum topic (`messages.createForumTopic`). Returns its conversation id.
+pub(super) fn create_topic(
+    account: &Account,
+    forum_id: &str,
+    title: &str,
+    icon_color: Option<i32>,
+    icon_emoji_id: Option<&str>,
+) -> Result<String, Fault> {
+    let Some((forum, None)) = Who::parse(forum_id) else {
+        return Err(Fault::Rpc { code: 400, name: "PEER_ID_INVALID".to_owned(), value: None });
+    };
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return Err(Fault::Rpc { code: 400, name: "TOPIC_TITLE_EMPTY".to_owned(), value: None });
+    }
+    let peer = account.input(forum)?;
+    let emoji_id = parse_emoji_id(icon_emoji_id);
+    let random_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |d| d.as_nanos() as i64);
+    let answer = account.ask(&tl::functions::messages::CreateForumTopic {
+        title_missing: false,
+        peer,
+        title: trimmed.to_owned(),
+        icon_color,
+        icon_emoji_id: emoji_id,
+        random_id,
+        send_as: None,
+    })?;
+    let mut topic_id: Option<i32> = None;
+    let updates_list: &[tl::enums::Update] = match &answer {
+        tl::enums::Updates::Updates(all) => &all.updates,
+        tl::enums::Updates::Combined(all) => &all.updates,
+        _ => &[],
+    };
+    for upd in updates_list {
+        match upd {
+            tl::enums::Update::NewChannelMessage(new) => {
+                if let tl::enums::Message::Service(svc) = &new.message {
+                    if matches!(svc.action, tl::enums::MessageAction::TopicCreate(_)) {
+                        topic_id = Some(svc.id);
+                        break;
+                    }
+                }
+            }
+            tl::enums::Update::MessageId(named) if named.random_id == random_id => {
+                topic_id = Some(named.id);
+            }
+            _ => {}
+        }
+    }
+    let topic_id = topic_id.ok_or_else(|| Fault::Net("Telegram did not name the new topic.".to_owned()))?;
+    note_topic_create(account, forum, topic_id, trimmed, icon_color.unwrap_or(0x6FB9F0), emoji_id, now());
+    live::answered(account, &answer);
+    Ok(thread_id(forum, topic_id))
+}
+
+/// Closing, hiding, pinning, or deleting a topic needs the forum's `manage_topics` right.
+/// A title or icon edit does not.
+fn require_manage_topics(account: &Account, forum: Who) -> Result<(), Fault> {
+    let allowed = account.ctx.known(&forum.text()).ok().flatten().is_some_and(|row| row.rights.manage_topics);
+    if allowed {
+        Ok(())
+    } else {
+        Err(Fault::Rpc { code: 400, name: "CHAT_ADMIN_REQUIRED".to_owned(), value: None })
+    }
+}
+
+/// Edits a forum topic (title, icon, closed, hidden, pinned).
+pub(super) fn update_topic(
+    account: &Account,
+    topic_conv_id: &str,
+    title: Option<&str>,
+    icon_emoji_id: Option<&str>,
+    closed: Option<bool>,
+    hidden: Option<bool>,
+    pinned: Option<bool>,
+) -> Result<(), Fault> {
+    let Some((forum, Some(topic_id))) = Who::parse(topic_conv_id) else {
+        return Err(Fault::Rpc { code: 400, name: "TOPIC_ID_INVALID".to_owned(), value: None });
+    };
+    if closed.is_some() || hidden.is_some() || pinned.is_some() {
+        require_manage_topics(account, forum)?;
+    }
+    let peer = account.input(forum)?;
+    let emoji_id = parse_emoji_id(icon_emoji_id);
+    if title.is_some() || emoji_id.is_some() || closed.is_some() || hidden.is_some() {
+        let answer = account.ask(&tl::functions::messages::EditForumTopic {
+            peer: peer.clone(),
+            topic_id,
+            title: title.map(|t| t.trim().to_owned()),
+            icon_emoji_id: emoji_id,
+            closed,
+            hidden,
+        })?;
+        note_topic_edit(account, forum, topic_id, title.map(str::trim), emoji_id, closed, hidden);
+        live::answered(account, &answer);
+    }
+    if let Some(pin) = pinned {
+        if pin {
+            let pinned_now = account.ctx.pinned_topics(&forum.text()).unwrap_or_default();
+            let mine = thread_id(forum, topic_id);
+            if pinned_now.iter().filter(|row| row.key.id != mine).count() >= 5 {
+                return Err(Fault::Rpc { code: 400, name: "PINNED_TOO_MUCH".to_owned(), value: None });
+            }
+        }
+        let answer = account.ask(&tl::functions::messages::UpdatePinnedForumTopic {
+            peer,
+            topic_id,
+            pinned: pin,
+        })?;
+        note_topic_pin(account, forum, topic_id, pin);
+        live::answered(account, &answer);
+    }
+    Ok(())
+}
+
+/// Deletes a forum topic and all its messages (`messages.deleteTopicHistory`).
+pub(super) fn delete_topic(account: &Account, topic_conv_id: &str) -> Result<(), Fault> {
+    let Some((forum, Some(topic_id))) = Who::parse(topic_conv_id) else {
+        return Err(Fault::Rpc { code: 400, name: "TOPIC_ID_INVALID".to_owned(), value: None });
+    };
+    require_manage_topics(account, forum)?;
+    let peer = account.input(forum)?;
+    for _ in 0..200 {
+        let tl::enums::messages::AffectedHistory::History(affected) =
+            account.ask(&tl::functions::messages::DeleteTopicHistory { peer: peer.clone(), top_msg_id: topic_id })?;
+        if affected.offset == 0 {
+            break;
+        }
+    }
+    let _ = account.ctx.conversation_gone(topic_conv_id);
+    Ok(())
+}
+
+/// Applies a live or locally created `MessageAction::TopicCreate` into the store.
+pub(super) fn note_topic_create(
+    account: &Account,
+    forum: Who,
+    topic_id: i32,
+    title: &str,
+    icon_color: i32,
+    icon_emoji_id: Option<i64>,
+    updated: i64,
+) {
+    let id = thread_id(forum, topic_id);
+    let mut thread = ConversationRow::new(id.clone(), ConversationKind::Thread, title.to_owned());
+    thread.icon = Some(icon_color);
+    if let Some(icon) = icon_emoji_id {
+        thread.avatar = Some(format!("e{icon}"));
+    }
+    thread.parent = Some(forum.text());
+    thread.root = Some(topic_id.to_string());
+    let _ = account.ctx.conversation(&thread);
+    let _ = account.ctx.counts(&id, 0, 0, None, updated);
+}
+
+/// Applies a live or locally edited `MessageAction::TopicEdit` into the store.
+pub(super) fn note_topic_edit(
+    account: &Account,
+    forum: Who,
+    topic_id: i32,
+    title: Option<&str>,
+    icon_emoji_id: Option<i64>,
+    closed: Option<bool>,
+    hidden: Option<bool>,
+) {
+    let id = thread_id(forum, topic_id);
+    let existing = account.ctx.known(&id).ok().flatten();
+    let final_title = title
+        .map(str::to_owned)
+        .or_else(|| existing.as_ref().map(|c| c.title.clone()))
+        .unwrap_or_else(|| format!("Topic {topic_id}"));
+    let mut thread = ConversationRow::new(id.clone(), ConversationKind::Thread, final_title);
+    thread.parent = Some(forum.text());
+    thread.root = Some(topic_id.to_string());
+    thread.icon = existing.as_ref().and_then(|c| c.topic_icon);
+    thread.avatar = match icon_emoji_id {
+        Some(0) => None,
+        Some(icon) => Some(format!("e{icon}")),
+        None => existing.as_ref().and_then(|c| c.avatar.as_ref().map(|a| a.id.clone())),
+    };
+    thread.read_only = closed.unwrap_or_else(|| existing.as_ref().is_some_and(|c| c.read_only));
+    let _ = account.ctx.conversation(&thread);
+    if let Some(is_hidden) = hidden {
+        let pin = existing.as_ref().and_then(|c| c.pin);
+        let _ = account.ctx.filing(&id, &Filing { pin, hidden: is_hidden, ..Filing::default() });
+    }
+}
+
+/// Applies a topic pin/unpin update to the store.
+pub(super) fn note_topic_pin(account: &Account, forum: Who, topic_id: i32, pinned: bool) {
+    let id = thread_id(forum, topic_id);
+    let _ = account.ctx.filing(&id, &Filing { pin: pinned.then_some(0), ..Filing::default() });
+}
+
+/// Applies an ordered list of pinned topic ids (`Update::PinnedForumTopics`).
+pub(super) fn note_topic_pins(account: &Account, forum: Who, order: &[i32]) {
+    for (idx, &topic_id) in order.iter().enumerate() {
+        let id = thread_id(forum, topic_id);
+        let _ = account.ctx.filing(&id, &Filing { pin: Some(idx as i32), ..Filing::default() });
+    }
 }
 
 /// An emoji document asked whole: the animated file itself (its Lottie play), so the tile
@@ -1272,6 +1664,18 @@ pub(super) fn finish(account: &Account, conversation: &str, mapped: &mut Mapped,
     }
     // A pin names the message it points at. The words are filled once that message is known.
     content::quote_pin(&mut mapped.message);
+    // Preserve any previously saved speech-to-text transcripts across history refreshes.
+    if !mapped.message.attachments.is_empty() {
+        if let Ok(Some(stored)) = account.ctx.stored_message(conversation, &mapped.message.id) {
+            for att in &mut mapped.message.attachments {
+                if att.transcription.is_none() {
+                    if let Some(prev) = stored.attachments.iter().find(|old| old.file.id == att.file.id) {
+                        att.transcription = prev.transcription.clone();
+                    }
+                }
+            }
+        }
+    }
     account.place(mapped.peer, mapped.id, conversation);
     comment_thread(account, conversation, mapped);
     for want in &mapped.wants {

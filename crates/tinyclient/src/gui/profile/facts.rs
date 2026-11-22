@@ -403,6 +403,21 @@ pub fn mask(phone: &str) -> String {
         .collect()
 }
 
+/// `t•••@•••.com`: keeps the first character of the local part and the top-level suffix,
+/// masking the rest so an email address stays unreadable on stream.
+pub fn mask_email(email: &str) -> String {
+    let trimmed = email.trim();
+    let Some((local, domain)) = trimmed.split_once('@') else {
+        return "••••••".to_owned();
+    };
+    let head = local.chars().next().map(|ch| ch.to_string()).unwrap_or_default();
+    let domain_masked = match domain.rsplit_once('.') {
+        Some((_, tld)) if !tld.is_empty() && tld.len() <= 8 => format!("•••.{tld}"),
+        _ => "••••••".to_owned(),
+    };
+    format!("{head}•••@{domain_masked}")
+}
+
 /// The Contact section's lines. Never on Discord, which shares neither.
 pub fn contacts(person: &Person, profile: &Profile) -> Vec<Contact> {
     if person.key.network == Network::Discord || person.bot {
@@ -413,6 +428,20 @@ pub fn contacts(person: &Person, profile: &Profile) -> Vec<Contact> {
 
 /// What a contact line reads: masked phones until Show.
 pub fn contact_words(contact: &Contact, shown: bool) -> String {
+    contact_words_for(contact, shown, false)
+}
+
+/// What a contact line reads, respecting Streamer mode (where phones and emails stay masked
+/// even if Show was previously clicked).
+pub fn contact_words_for(contact: &Contact, shown: bool, streamer: bool) -> String {
+    if streamer {
+        return match contact.kind {
+            ContactKind::Email => mask_email(&contact.value),
+            ContactKind::Phone => mask(&contact.value),
+            ContactKind::Other if contact.masked => mask(&contact.value),
+            ContactKind::Other => contact.value.clone(),
+        };
+    }
     let masked = contact.kind == ContactKind::Phone || contact.masked;
     if masked && !shown {
         mask(&contact.value)
@@ -797,6 +826,66 @@ pub fn can_edit_picture(conversation: &Conversation) -> bool {
     conversation.kind != ConversationKind::Direct && conversation.rights.edit_picture
 }
 
+/// Whether this account may ban, unban, or restrict members of this group or channel.
+pub fn can_ban_members(conversation: &Conversation) -> bool {
+    conversation.kind != ConversationKind::Direct && conversation.rights.ban_members
+}
+
+/// Whether this account may promote or demote admins in this group or channel.
+pub fn can_promote_admins(conversation: &Conversation) -> bool {
+    conversation.kind != ConversationKind::Direct && conversation.rights.promote_admins
+}
+
+/// Whether this account may change group/channel settings (slow mode, defaults, toggles).
+pub fn can_manage_settings(conversation: &Conversation) -> bool {
+    conversation.kind != ConversationKind::Direct && conversation.rights.manage_settings
+}
+
+/// Whether this account may view the recent-actions admin log.
+pub fn can_view_admin_log(conversation: &Conversation) -> bool {
+    conversation.kind != ConversationKind::Direct && conversation.rights.view_admin_log
+}
+
+/// Whether this account is the owner and may transfer ownership.
+pub fn can_transfer_ownership(conversation: &Conversation) -> bool {
+    conversation.kind != ConversationKind::Direct && conversation.rights.transfer_owner
+}
+
+/// Whether the Details pane should show the "Manage" section at all. Non-admins always get `false`.
+pub fn can_manage_conversation(conversation: &Conversation) -> bool {
+    can_rename(conversation)
+        || can_edit_topic(conversation)
+        || can_edit_picture(conversation)
+        || can_add_members(conversation)
+        || can_manage_settings(conversation)
+        || can_view_admin_log(conversation)
+        || can_transfer_ownership(conversation)
+}
+
+/// Moderation actions offered in a member's menu for this conversation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemberModActions {
+    pub remove: bool,
+    pub ban: bool,
+    pub promote: bool,
+    pub transfer: bool,
+}
+
+impl MemberModActions {
+    pub fn any(self) -> bool {
+        self.remove || self.ban || self.promote || self.transfer
+    }
+}
+
+pub fn member_mod_actions(conversation: &Conversation) -> MemberModActions {
+    MemberModActions {
+        remove: can_remove_members(conversation),
+        ban: can_ban_members(conversation),
+        promote: can_promote_admins(conversation),
+        transfer: can_transfer_ownership(conversation),
+    }
+}
+
 /// Confirmation sentence for removing a member; names the person explicitly.
 pub fn remove_member_confirm_text(person_name: &str, group_title: &str) -> String {
     format!("Remove {person_name} from {group_title}? Others in the conversation may see this.")
@@ -857,7 +946,7 @@ pub fn conversation_link(conversation: &Conversation, info: Option<&Conversation
 pub fn space_link(space: &protocol::Key) -> Option<String> {
     match space.network {
         Network::Discord => Some(format!("https://discord.com/channels/{}", space.id)),
-        Network::Slack => Some(format!("slack://open?team={}", space.id)),
+        Network::Slack => Some(format!("https://app.slack.com/client/{}", space.id)),
         Network::Telegram | Network::Teams | Network::Signal | Network::Messages | Network::Tiny => None,
     }
 }
@@ -875,6 +964,51 @@ pub fn space_boost_line(boost_level: u8, boosts: u32) -> Option<String> {
         (level, count) => Some(format!("Level {level} · {} {noun}", thousands(count))),
     }
 }
+/// Validates a Slack workspace subdomain or base URL and builds an exact HTTPS workspace settings URL.
+/// Only allows `https://` with valid ASCII hostname labels (never arbitrary hosts or non-HTTP schemes).
+pub fn slack_workspace_url(domain_or_url: &str, team_id: &str, path: &str) -> String {
+    let clean_path = path.trim_start_matches('/');
+    let trimmed = domain_or_url.trim().trim_end_matches('/');
+    if trimmed.starts_with("https://") {
+        if let Some(dest) = protocol::link::Destination::parse(trimmed) {
+            if dest.host.ends_with(".slack.com") || dest.host == "slack.com" {
+                return if clean_path.is_empty() {
+                    trimmed.to_owned()
+                } else {
+                    format!("{trimmed}/{clean_path}")
+                };
+            }
+        }
+    }
+    if !trimmed.is_empty()
+        && trimmed.len() <= 63
+        && trimmed.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !trimmed.starts_with('-')
+        && !trimmed.ends_with('-')
+    {
+        return if clean_path.is_empty() {
+            format!("https://{trimmed}.slack.com")
+        } else {
+            format!("https://{trimmed}.slack.com/{clean_path}")
+        };
+    }
+    if clean_path.is_empty() {
+        format!("https://app.slack.com/client/{team_id}")
+    } else {
+        format!("https://app.slack.com/client/{team_id}/{clean_path}")
+    }
+}
+
+/// Exact Slack workspace settings browser links (label, relative path on the workspace host).
+pub const SLACK_WORKSPACE_LINKS: &[(&str, &str)] = &[
+    ("Invite people", "admin/invites"),
+    ("Members", "admin"),
+    ("Workspace settings", "admin/settings"),
+    ("Manage apps", "apps/manage"),
+    ("Customize emoji", "customize/emoji"),
+    ("Analytics", "admin/stats"),
+    ("Billing", "admin/billing"),
+];
 
 /// What the one confirm asks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -891,6 +1025,7 @@ pub fn confirm_words(act: Act, name: &str, network: Network) -> (String, String,
             format!("Block {name} on {net}?"),
             match network {
                 Network::Discord => "They won't be able to message you, and their messages in shared servers are hidden. You can unblock them from their profile or Blocked.".to_owned(),
+                Network::Teams => "They won't be able to message or call you on Teams. You can unblock them from their profile or Blocked.".to_owned(),
                 Network::Tiny => "They won't be able to message or call you, and their messages in channels are hidden. You can unblock them from their profile or Blocked.".to_owned(),
                 _ => format!("They won't be able to message or call you on {net}. You can unblock them in {net}."),
             },
@@ -903,7 +1038,10 @@ pub fn confirm_words(act: Act, name: &str, network: Network) -> (String, String,
         ),
         Act::Leave => (
             format!("Leave {name} on {net}?"),
-            "You'll stop getting its messages. To come back, someone in it has to add you.".to_owned(),
+            match network {
+                Network::Telegram => "You'll stop getting its messages. A public one can be found and joined again. A private one needs someone in it to add you.".to_owned(),
+                _ => "You'll stop getting its messages. To come back, someone in it has to add you.".to_owned(),
+            },
             "Leave",
         ),
     }
@@ -961,7 +1099,10 @@ pub fn conversation_line(conversation: &Conversation, info: Option<&Conversation
         },
         (Network::Telegram, kind) => {
             let link = info.map(|info| info.link.as_str()).unwrap_or("");
-            let handle = link.rsplit('/').next().filter(|_| link.contains("t.me/")).map(|name| format!("@{name}"));
+            // A private invite (`t.me/+…`, `t.me/joinchat/…`) is not a public @username.
+            let handle = link.rsplit('/').next().filter(|name| {
+                !name.is_empty() && protocol::link::telegram_invite_hash(link).is_none() && link.contains("t.me/")
+            }).map(|name| format!("@{name}"));
             let (noun, people) = match kind {
                 ConversationKind::Announcement => ("Channel", "subscribers"),
                 _ => ("Group", "members"),
@@ -1025,8 +1166,22 @@ pub fn conversation_tag(conversation: &Conversation, info: Option<&ConversationI
     if let Some(external) = info.map(|info| info.external.trim()).filter(|external| !external.is_empty()) {
         return Some(match conversation.key.network {
             Network::Slack => format!("External · {external}"),
+            Network::Teams if !external.eq_ignore_ascii_case("Shared channel") => {
+                if external.eq_ignore_ascii_case("External") {
+                    "External".to_owned()
+                } else {
+                    format!("External · {external}")
+                }
+            }
             _ => "Shared".to_owned(),
         });
+    }
+    if conversation.key.network == Network::Teams {
+        match conversation.mark {
+            Some(protocol::Mark::External) => return Some("External".to_owned()),
+            Some(protocol::Mark::Guest) => return Some("Guest".to_owned()),
+            _ => {}
+        }
     }
     // Signal marks every chat private because the chat is encrypted. That is not a private channel.
     if conversation.private && conversation.key.network != Network::Signal {
@@ -1115,6 +1270,7 @@ mod tests {
             thumbnail: None,
             reaction: String::new(),
             owner: String::new(),
+            voice_notes_forbidden: String::new(),
         }
     }
 
@@ -1346,6 +1502,42 @@ mod tests {
         dm_with_rights.rights = grp.rights;
         assert!(!can_add_members(&dm_with_rights) && !can_rename(&dm_with_rights), "direct chats are not managed as groups");
         assert!(remove_member_confirm_text("Mina", "Design").contains("Mina"));
+
+        // Non-admin in a Telegram group or channel sees no Manage section and no member mod actions.
+        let non_admin = row(Network::Telegram, ConversationKind::Channel);
+        assert!(!can_manage_conversation(&non_admin), "non-admin must see no Manage section");
+        assert!(!can_ban_members(&non_admin));
+        assert!(!can_promote_admins(&non_admin));
+        assert!(!can_manage_settings(&non_admin));
+        assert!(!can_view_admin_log(&non_admin));
+        assert!(!can_transfer_ownership(&non_admin));
+        assert!(!member_mod_actions(&non_admin).any());
+
+        // An admin with change_info + ban_users sees only those actions, not ownership transfer.
+        let mut admin = row(Network::Telegram, ConversationKind::Channel);
+        admin.rights = protocol::ConversationRights {
+            rename: true,
+            edit_topic: true,
+            edit_picture: true,
+            remove_members: true,
+            ban_members: true,
+            manage_settings: true,
+            view_admin_log: true,
+            ..Default::default()
+        };
+        assert!(can_manage_conversation(&admin));
+        assert!(can_ban_members(&admin) && can_manage_settings(&admin) && can_view_admin_log(&admin));
+        assert!(!can_promote_admins(&admin) && !can_transfer_ownership(&admin));
+        let acts = member_mod_actions(&admin);
+        assert!(acts.remove && acts.ban && !acts.promote && !acts.transfer);
+
+        // The creator sees ownership transfer as well.
+        let mut owner = admin;
+        owner.rights.promote_admins = true;
+        owner.rights.transfer_owner = true;
+        assert!(can_transfer_ownership(&owner));
+        let owner_acts = member_mod_actions(&owner);
+        assert!(owner_acts.remove && owner_acts.ban && owner_acts.promote && owner_acts.transfer);
     }
 
     #[test]
@@ -1363,9 +1555,15 @@ mod tests {
             link: "https://t.me/riverbend_news".into(),
             disappearing: None,
             bookmarks: Vec::new(),
+            pending_requests: 0,
+            tabs: Vec::new(),
+            meeting: None,
         };
         let channel = info.conversation.clone();
         assert_eq!(conversation_line(&channel, Some(&info)), "@riverbend_news · Channel · 12,408 subscribers");
+        info.link = "https://t.me/+alpine_invite".into();
+        assert_eq!(conversation_line(&channel, Some(&info)), "Channel · 12,408 subscribers");
+        info.link = "https://t.me/riverbend_news".into();
         assert_eq!(members_shown(&channel, Some(&info)), MembersShown::None);
         assert_eq!(notify_control(&channel), NotifyControl::Switch);
         let group = row(Network::Discord, ConversationKind::Group);
@@ -1401,6 +1599,14 @@ mod tests {
         assert_eq!(notify_control(&row(Network::Discord, ConversationKind::Thread)), NotifyControl::Segmented);
         info.external = "Northwind".into();
         assert_eq!(conversation_tag(&slack, Some(&info)).as_deref(), Some("External · Northwind"));
+        let teams_dm = row(Network::Teams, ConversationKind::Direct);
+        assert_eq!(conversation_tag(&teams_dm, Some(&info)).as_deref(), Some("External · Northwind"));
+        info.external = "Shared channel".into();
+        assert_eq!(conversation_tag(&teams_dm, Some(&info)).as_deref(), Some("Shared"));
+        info.external.clear();
+        let mut teams_marked = row(Network::Teams, ConversationKind::Direct);
+        teams_marked.mark = Some(protocol::Mark::External);
+        assert_eq!(conversation_tag(&teams_marked, None).as_deref(), Some("External"));
         info.creator = "Dev Patel".into();
         assert!(created_line(&info).is_empty() || created_line(&info) == "Created by Dev Patel");
         assert_eq!(thousands(1_204), "1,204");
@@ -1535,5 +1741,33 @@ mod tests {
         assert_eq!(space_boost_line(1, 0), Some("Level 1".into()));
         assert_eq!(space_boost_line(2, 14), Some("Level 2 · 14 boosts".into()));
         assert_eq!(space_boost_line(3, 1_250), Some("Level 3 · 1,250 boosts".into()));
+    }
+
+    #[test]
+    fn slack_workspace_url_validates_domains_and_rejects_non_slack_hosts() {
+        assert_eq!(slack_workspace_url("acme", "T01ALPHA", "admin/invites"), "https://acme.slack.com/admin/invites");
+        assert_eq!(slack_workspace_url("https://acme.slack.com/", "T01ALPHA", "/customize/emoji"), "https://acme.slack.com/customize/emoji");
+        assert_eq!(slack_workspace_url("", "T01ALPHA", "apps/manage"), "https://app.slack.com/client/T01ALPHA/apps/manage");
+        assert_eq!(slack_workspace_url("https://evil.example.com", "T01ALPHA", "admin"), "https://app.slack.com/client/T01ALPHA/admin");
+        assert_eq!(slack_workspace_url("javascript:alert(1)", "T01ALPHA", "admin"), "https://app.slack.com/client/T01ALPHA/admin");
+        assert_eq!(slack_workspace_url("-bad-", "T01ALPHA", "admin"), "https://app.slack.com/client/T01ALPHA/admin");
+    }
+
+    #[test]
+    fn streamer_mode_keeps_phones_and_emails_masked_even_when_shown() {
+        let phone = Contact { kind: ContactKind::Phone, value: "+44 7700 900142".into(), masked: true };
+        let email = Contact { kind: ContactKind::Email, value: "alice@example.org".into(), masked: false };
+        let other = Contact { kind: ContactKind::Other, value: "https://example.org".into(), masked: false };
+
+        assert_eq!(contact_words(&phone, true), "+44 7700 900142");
+        assert_eq!(contact_words(&email, false), "alice@example.org");
+
+        // In Streamer mode, phone & email stay masked regardless of `shown`.
+        let masked_phone = contact_words_for(&phone, true, true);
+        assert!(masked_phone.contains('•') && masked_phone.ends_with("42"), "{masked_phone}");
+        assert_eq!(contact_words_for(&email, true, true), "a•••@•••.org");
+        assert_eq!(contact_words_for(&email, false, true), "a•••@•••.org");
+        assert_eq!(contact_words_for(&other, false, true), "https://example.org");
+        assert_eq!(mask_email("not-an-email"), "••••••");
     }
 }

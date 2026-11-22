@@ -1900,11 +1900,42 @@ fn a_voice_recording_is_told_as_a_recording_and_heard_as_one() {
     world.steer("record-audio");
     let typists = world.until("a voice recording", || Some(watch()).filter(|typists| !typists.is_empty()));
     assert_eq!(typists[0].activity, protocol::Compose::RecordingVoice);
+
+    // Incoming round-video, upload-photo, sticker, and speaking-in-call activities map cleanly.
+    for (steer, expected) in [
+        ("record-round", protocol::Compose::RecordingVideo),
+        ("upload-photo", protocol::Compose::UploadingPhoto),
+        ("choose-sticker", protocol::Compose::ChoosingSticker),
+        ("speaking", protocol::Compose::Speaking),
+    ] {
+        world.steer(steer);
+        let got = world.until(steer, || {
+            let list = watch();
+            list.first().filter(|t| t.activity == expected).cloned()
+        });
+        assert_eq!(got.activity, expected);
+    }
+
+    // Outgoing: explicit Typing(RecordingVoice) is sent and paced, and Cancel clears it immediately.
     assert_eq!(
         world.ask(Request::Typing { conversation: key("u7003"), activity: protocol::Compose::RecordingVoice }),
         Response::Ok
     );
     world.until("the recording to be told", || (world.called("SetTyping u7003 record-audio") == 1).then_some(()));
+    assert_eq!(
+        world.ask(Request::Typing { conversation: key("u7003"), activity: protocol::Compose::Cancel }),
+        Response::Ok
+    );
+    world.until("the cancel to be told", || (world.called("SetTyping u7003 cancel") == 1).then_some(()));
+
+    // Starting the recorder sends record-audio for the Telegram chat, and discarding sends cancel.
+    assert_eq!(
+        world.ask(Request::Record(protocol::RecordRequest::Start { conversation: key("u7002"), input: None, video: false })),
+        Response::Ok
+    );
+    world.until("recorder start to send record-audio", || (world.called("SetTyping u7002 record-audio") >= 1).then_some(()));
+    assert_eq!(world.ask(Request::Record(protocol::RecordRequest::Forget)), Response::Ok);
+    world.until("recorder discard to send cancel", || (world.called("SetTyping u7002 cancel") >= 1).then_some(()));
 }
 
 #[test]
@@ -2917,6 +2948,7 @@ fn a_login_email_a_new_account_and_password_recovery_does_not_sign_in_and_a_pass
     assert!(!said.contains("secret-client-data"), "{said}");
 }
 
+#[test]
 fn conversation_search_asks_telegram_with_the_query_and_maps_its_hits() {
     let world = World::signed_in();
     world.connected();
@@ -3743,6 +3775,264 @@ fn privacy_settings_read_and_write_rules_with_user_and_chat_exceptions() {
 }
 
 #[test]
+fn privacy_last_seen_sets_contacts_with_one_exception_and_a_premium_refusal() {
+    use protocol::{ErrorCode, PrivacyAudience, PrivacyException, PrivacyKey, PrivacyPolicy};
+    let world = World::signed_in();
+    world.connected();
+
+    let Response::Privacy { policy: seen, .. } = world.ask(Request::GetPrivacy {
+        account: account(),
+        key: PrivacyKey::LastSeen,
+    }) else {
+        panic!("expected Privacy for LastSeen");
+    };
+    assert_eq!(seen.audience, PrivacyAudience::Everybody);
+    assert!(!seen.premium_only);
+
+    let Response::Privacy { policy: phone, .. } = world.ask(Request::GetPrivacy {
+        account: account(),
+        key: PrivacyKey::PhoneNumber,
+    }) else {
+        panic!("expected Privacy for PhoneNumber");
+    };
+    assert_eq!(phone.audience, PrivacyAudience::Contacts);
+
+    let Response::Privacy { policy: photo, .. } = world.ask(Request::GetPrivacy {
+        account: account(),
+        key: PrivacyKey::ProfilePhoto,
+    }) else {
+        panic!("expected Privacy for ProfilePhoto");
+    };
+    assert_eq!(photo.audience, PrivacyAudience::Everybody);
+
+    let Response::Privacy { policy: invite, .. } = world.ask(Request::GetPrivacy {
+        account: account(),
+        key: PrivacyKey::ChatInvite,
+    }) else {
+        panic!("expected Privacy for ChatInvite");
+    };
+    assert_eq!(invite.audience, PrivacyAudience::Everybody);
+
+    let updated = PrivacyPolicy {
+        audience: PrivacyAudience::Contacts,
+        always_allow: vec![PrivacyException { id: "u7002".into(), name: String::new(), chat: false }],
+        never_allow: Vec::new(),
+        premium_only: false,
+    };
+    let Response::Privacy { policy: saved, .. } = world.ask(Request::SetPrivacy {
+        account: account(),
+        key: PrivacyKey::LastSeen,
+        policy: updated,
+    }) else {
+        panic!("expected Privacy after SetPrivacy LastSeen");
+    };
+    assert_eq!(saved.audience, PrivacyAudience::Contacts);
+    assert!(saved.always_allow.iter().any(|e| e.id == "u7002" && !e.chat));
+    assert!(
+        world.calls().iter().any(|c| c.contains("account.setPrivacy status_timestamp")
+            && c.contains("allow_users:[7002]")
+            && c.contains("allow_contacts")),
+        "expected last-seen rules on the wire, got: {:#?}",
+        world.calls()
+    );
+
+    world.steer("privacy-refuse");
+    let refused = world.ask(Request::SetPrivacy {
+        account: account(),
+        key: PrivacyKey::LastSeen,
+        policy: PrivacyPolicy { audience: PrivacyAudience::Nobody, ..PrivacyPolicy::default() },
+    });
+    match refused {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("Telegram Premium"), "{detail}");
+        }
+        other => panic!("expected a premium refusal, got {other:?}"),
+    }
+    assert!(
+        world.calls().iter().any(|c| c.contains("account.setPrivacy status_timestamp refused")),
+        "expected the refused setPrivacy on the wire, got: {:#?}",
+        world.calls()
+    );
+}
+
+#[test]
+fn auto_download_reads_wifi_limits_and_refuses_a_save() {
+    use protocol::{AutoDownload, AutoDownloadPreset, ErrorCode};
+    let mut world = World::signed_in();
+    world.connected();
+
+    let Response::AutoDownload { settings } = world.ask(Request::GetAutoDownload { account: account() }) else {
+        panic!("expected AutoDownload");
+    };
+    assert!(settings.roaming.disabled);
+    assert_eq!(settings.wifi.photo_size_max, 1_048_576);
+    assert_eq!(settings.wifi.video_size_max, 10_485_760);
+    assert!(!settings.fetch_full_photos);
+    assert!(!settings.private_chats);
+    assert!(world.calls().iter().any(|c| c == "account.getAutoDownloadSettings"));
+
+    let mut next = settings;
+    next.fetch_full_photos = true;
+    next.private_chats = true;
+    next.wifi = AutoDownloadPreset { disabled: false, photo_size_max: 2_048, video_size_max: 8_192, file_size_max: 4_096 };
+    let Response::AutoDownload { settings: saved } = world.ask(Request::SetAutoDownload { account: account(), settings: next }) else {
+        panic!("expected AutoDownload after save");
+    };
+    assert!(saved.fetch_full_photos && saved.private_chats);
+    assert_eq!(saved.wifi.photo_size_max, 2_048);
+    assert!(
+        world.calls().iter().any(|c| c.contains("account.saveAutoDownloadSettings high photo=2048 video=8192 file=4096 preload=1 bitrate=64")),
+        "expected the wifi preset to keep the preload flag, got: {:#?}",
+        world.calls()
+    );
+    assert!(world.calls().iter().any(|c| c.contains("account.saveAutoDownloadSettings low ")));
+    assert!(world.calls().iter().any(|c| c.contains("account.saveAutoDownloadSettings medium ")));
+
+    let saves = world.called("account.saveAutoDownloadSettings");
+    world.steer("autodownload-unread");
+    match world.ask(Request::SetAutoDownload { account: account(), settings: AutoDownload::default() }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("CONNECTION_NOT_INITED"), "{detail}");
+        }
+        other => panic!("expected an unread preset to refuse the save, got {other:?}"),
+    }
+    assert_eq!(world.called("account.saveAutoDownloadSettings"), saves, "an unread preset is not overwritten: {:#?}", world.calls());
+
+    world.restart();
+    world.connected();
+    world.watch(Watching { conversation: Some(key("u7002")), ..Watching::default() });
+    world.steer("photo");
+    world.until("the saved private-chat gate to fetch the photo without opening settings", || {
+        (world.called("GetFile photo 6014 y") > 0).then_some(())
+    });
+
+    world.steer("autodownload-refuse");
+    let refused = world.ask(Request::SetAutoDownload {
+        account: account(),
+        settings: AutoDownload::default(),
+    });
+    match refused {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("Telegram Premium"), "{detail}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(world.calls().iter().any(|c| c.contains("account.saveAutoDownloadSettings refused")));
+}
+
+#[test]
+fn channel_boosts_read_the_level_and_applying_one_can_be_refused() {
+    use protocol::ErrorCode;
+    let world = World::signed_in();
+    world.connected();
+
+    let Response::Boosts { status, .. } = world.ask(Request::GetBoosts { conversation: key("c9001") }) else {
+        panic!("expected Boosts");
+    };
+    assert_eq!(status.level, 3);
+    assert_eq!(status.boosts, 12);
+    assert_eq!(status.next_level_boosts, Some(20));
+    assert!(!status.my_boost);
+    assert!(
+        world.calls().iter().any(|c| c == "premium.getBoostsStatus c9001"),
+        "expected getBoostsStatus on the wire, got: {:#?}",
+        world.calls()
+    );
+
+    world.steer("boost-refuse");
+    match world.ask(Request::ApplyBoost { conversation: key("c9001") }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("Telegram Premium"), "{detail}");
+        }
+        other => panic!("expected a premium refusal, got {other:?}"),
+    }
+    assert!(
+        world.calls().iter().any(|c| c.contains("premium.applyBoost refused")),
+        "expected the refused apply on the wire, got: {:#?}",
+        world.calls()
+    );
+
+    world.steer("boost-refuse 0");
+    let Response::Boosts { status, .. } = world.ask(Request::ApplyBoost { conversation: key("c9001") }) else {
+        panic!("expected Boosts after apply");
+    };
+    assert!(status.my_boost);
+    assert_eq!(status.level, 3);
+    assert_eq!(status.boosts, 13);
+    assert!(
+        world.calls().iter().any(|c| c.contains("premium.applyBoost c9001 slot=1")),
+        "expected applyBoost on the wire, got: {:#?}",
+        world.calls()
+    );
+}
+
+#[test]
+fn bot_commands_keyboard_and_start_can_be_refused() {
+    use protocol::BotKeyKind;
+    let world = World::signed_in();
+    world.connected();
+
+    let Response::BotMenu { menu, .. } = world.ask(Request::GetBotMenu { conversation: key("u7004") }) else {
+        panic!("expected BotMenu");
+    };
+    assert_eq!(menu.description, "Trail reports.");
+    assert_eq!(menu.menu_label, "Map");
+    assert_eq!(menu.menu_url, "https://t.me/trail_bot");
+    assert_eq!(
+        menu.commands.iter().map(|cmd| cmd.command.as_str()).collect::<Vec<_>>(),
+        ["start", "report", "closures"]
+    );
+
+    match world.ask(Request::GetBotMenu { conversation: key("u7003") }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("cannot be started"), "{detail}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+
+    let trail = world.arrived("u7004", "4");
+    let board = trail.keyboard.expect("reply keyboard");
+    assert!(board.resize);
+    assert_eq!(board.placeholder.as_deref(), Some("Ask the trail"));
+    assert_eq!(board.rows[0][0].text, "Ridge");
+    assert_eq!(board.rows[0][0].kind, BotKeyKind::Text);
+
+    world.send("u7004", "1", "Ridge", None);
+    world.until("the keyboard text on the wire", || world.calls().iter().any(|call| call.contains("SendMessage u7004 Ridge")).then_some(()));
+    assert!(
+        world.calls().iter().any(|call| call.contains("SendMessage u7004 Ridge")),
+        "expected the keyboard text on the wire, got: {:#?}",
+        world.calls()
+    );
+
+    assert!(matches!(
+        world.ask(Request::StartBot { conversation: key("u7004"), start_param: "ridge".into() }),
+        Response::Ok
+    ));
+    assert!(
+        world.calls().iter().any(|call| call.contains("messages.startBot u7004 ridge")),
+        "expected startBot on the wire, got: {:#?}",
+        world.calls()
+    );
+
+    world.steer("start-refuse");
+    match world.ask(Request::StartBot { conversation: key("u7004"), start_param: "ridge".into() }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("cannot be started"), "{detail}");
+        }
+        other => panic!("expected a start refusal, got {other:?}"),
+    }
+    assert!(world.calls().iter().any(|call| call.contains("messages.startBot refused")));
+
+    match world.ask(Request::SharePhone { conversation: key("u7004") }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.to_lowercase().contains("phone"), "{detail}");
+        }
+        other => panic!("expected a phone refusal, got {other:?}"),
+    }
+}
+
+#[test]
 fn shared_contact_send_and_receive() {
     let world = World::signed_in();
     world.connected();
@@ -4145,6 +4435,622 @@ fn paid_star_reactions_big_reaction_and_default_quick_reaction() {
 }
 
 #[test]
+fn auto_delete_timer_chat_and_default() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.disappearing, "Telegram must advertise disappearing capability");
+
+    // Set Odalys chat auto-delete to 1 week (604_800s).
+    assert_eq!(
+        world.ask(Request::SetDisappearing { conversation: key("u7002"), seconds: 604_800 }),
+        Response::Ok
+    );
+    assert!(
+        world.calls().iter().any(|c| c == "SetHistoryTtl u7002 604800"),
+        "expected SetHistoryTtl u7002 604800 on wire, got: {:#?}",
+        world.calls()
+    );
+    // Conversation row & ConversationInfo both report the active timer.
+    let row = world.until("conversation disappearing timer", || {
+        world.conversation("u7002").filter(|c| c.disappearing == Some(604_800))
+    });
+    assert_eq!(row.disappearing, Some(604_800));
+    match world.ask(Request::ConversationInfo { conversation: key("u7002") }) {
+        Response::ConversationInfo { info } => assert_eq!(info.disappearing, Some(604_800)),
+        other => panic!("expected ConversationInfo, got {other:?}"),
+    }
+    // Service message in the chat notes the auto-delete timer.
+    let service = world.until("auto-delete service line", || {
+        world.messages("u7002").into_iter().find(|m| m.text.contains("auto-delete after 1 week"))
+    });
+    assert_eq!(service.kind, protocol::MessageKind::System);
+
+    // Turn auto-delete off (0s).
+    assert_eq!(
+        world.ask(Request::SetDisappearing { conversation: key("u7002"), seconds: 0 }),
+        Response::Ok
+    );
+    world.until("conversation disappearing cleared", || {
+        world.conversation("u7002").filter(|c| c.disappearing.is_none())
+    });
+    match world.ask(Request::ConversationInfo { conversation: key("u7002") }) {
+        Response::ConversationInfo { info } => assert_eq!(info.disappearing, None),
+        other => panic!("expected ConversationInfo, got {other:?}"),
+    }
+
+    // Account-wide default auto-delete timer for new chats.
+    assert_eq!(
+        world.ask(Request::GetDefaultDisappearing { account: account() }),
+        Response::DefaultDisappearing { seconds: 0 }
+    );
+    assert_eq!(
+        world.ask(Request::SetDefaultDisappearing { account: account(), seconds: 86_400 }),
+        Response::Ok
+    );
+    assert_eq!(
+        world.ask(Request::GetDefaultDisappearing { account: account() }),
+        Response::DefaultDisappearing { seconds: 86_400 }
+    );
+    assert!(world.calls().iter().any(|c| c == "GetDefaultHistoryTtl"));
+    assert!(world.calls().iter().any(|c| c == "SetDefaultHistoryTtl 86400"));
+}
+
+#[test]
+fn chat_folders_create_edit_add_reorder_suggest_and_delete() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.folders_edit, "Telegram must advertise folders_edit capability");
+
+    // Create a new folder containing Odalys and Trail crew.
+    let created = match world.ask(Request::FolderSave {
+        account: account(),
+        folder: protocol::FolderSpec {
+            name: "Hiking".into(),
+            include: vec!["u7002".into(), "g8001".into()],
+            ..protocol::FolderSpec::default()
+        },
+    }) {
+        Response::Folder { folder } => folder,
+        other => panic!("expected Folder, got {other:?}"),
+    };
+    assert_eq!(created.name, "Hiking");
+    let fid = created.key.id.clone();
+    assert!(world.calls().iter().any(|c| c == &format!("UpdateDialogFilter {fid} Hiking")));
+
+    // Folders list includes it, and both chats report membership in Conversation::folders.
+    let folders = match world.ask(Request::Folders { network: Network::Telegram }) {
+        Response::Folders { folders } => folders,
+        other => panic!("expected Folders, got {other:?}"),
+    };
+    assert!(folders.iter().any(|f| f.key.id == fid && f.name == "Hiking"), "{folders:?}");
+    let odalys = world.until("Odalys in Hiking folder", || {
+        world.conversation("u7002").filter(|c| c.folders.contains(&fid))
+    });
+    assert!(odalys.folders.contains(&fid));
+    let crew = world.until("Crew in Hiking folder", || {
+        world.conversation("g8001").filter(|c| c.folders.contains(&fid))
+    });
+    assert!(crew.folders.contains(&fid));
+
+    // Edit/rename the folder.
+    match world.ask(Request::FolderSave {
+        account: account(),
+        folder: protocol::FolderSpec {
+            id: Some(fid.clone()),
+            name: "Trails".into(),
+            include: vec!["u7002".into(), "g8001".into()],
+            ..protocol::FolderSpec::default()
+        },
+    }) {
+        Response::Folder { folder } => assert_eq!((folder.key.id.as_str(), folder.name.as_str()), (fid.as_str(), "Trails")),
+        other => panic!("expected renamed Folder, got {other:?}"),
+    }
+
+    // Add Tobin to the folder via Request::File, then remove him.
+    assert_eq!(
+        world.ask(Request::File {
+            conversation: key("u7003"),
+            pinned: None,
+            archived: None,
+            folder_add: Some(fid.clone()),
+            folder_remove: None,
+        }),
+        Response::Ok
+    );
+    world.until("Tobin added to Trails", || {
+        world.conversation("u7003").filter(|c| c.folders.contains(&fid))
+    });
+    assert_eq!(
+        world.ask(Request::File {
+            conversation: key("u7003"),
+            pinned: None,
+            archived: None,
+            folder_add: None,
+            folder_remove: Some(fid.clone()),
+        }),
+        Response::Ok
+    );
+    world.until("Tobin removed from Trails", || {
+        world.conversation("u7003").filter(|c| !c.folders.contains(&fid))
+    });
+
+    // Reorder folders so the new folder is first.
+    let order = vec![fid.clone(), "3".into(), "2".into()];
+    assert_eq!(
+        world.ask(Request::FoldersReorder { account: account(), order: order.clone() }),
+        Response::Ok
+    );
+    assert!(world.calls().iter().any(|c| c == &format!("UpdateDialogFiltersOrder {fid},3,2")));
+    let reordered = match world.ask(Request::Folders { network: Network::Telegram }) {
+        Response::Folders { folders } => folders,
+        other => panic!("expected Folders, got {other:?}"),
+    };
+    assert_eq!(reordered.first().map(|f| f.key.id.as_str()), Some(fid.as_str()), "{reordered:?}");
+
+    // Suggested folders returns Telegram's suggestions.
+    match world.ask(Request::SuggestedFolders { account: account() }) {
+        Response::SuggestedFolders { folders } => {
+            assert!(folders.iter().any(|s| s.spec.name == "Unread"), "{folders:?}");
+        }
+        other => panic!("expected SuggestedFolders, got {other:?}"),
+    }
+
+    // Delete the folder and verify it disappears from Folders and from Odalys's row.
+    assert_eq!(
+        world.ask(Request::FolderDelete { account: account(), folder_id: fid.clone() }),
+        Response::Ok
+    );
+    assert!(world.calls().iter().any(|c| c == &format!("UpdateDialogFilter {fid} delete")));
+    world.until("Odalys left deleted folder", || {
+        world.conversation("u7002").filter(|c| !c.folders.contains(&fid))
+    });
+
+    // Free account folder limit (10 folders) gives a clear message mentioning limit / Premium.
+    for i in 0..8 {
+        assert!(matches!(
+            world.ask(Request::FolderSave {
+                account: account(),
+                folder: protocol::FolderSpec {
+                    name: format!("Extra {i}"),
+                    contacts: true,
+                    ..protocol::FolderSpec::default()
+                },
+            }),
+            Response::Folder { .. }
+        ));
+    }
+    match world.ask(Request::FolderSave {
+        account: account(),
+        folder: protocol::FolderSpec {
+            name: "Overflow".into(),
+            contacts: true,
+            ..protocol::FolderSpec::default()
+        },
+    }) {
+        Response::Error { detail, .. } => {
+            assert!(detail.contains("10-folder") || detail.contains("Premium"), "{detail}");
+        }
+        other => panic!("expected limit error, got {other:?}"),
+    }
+}
+
+#[test]
+fn forum_topics_crud_search_icons_and_paging_past_fifty() {
+    let world = World::with(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_TOPICS", "120")]);
+    world.connected();
+
+    // Workshop forum carries manage_topics right.
+    let forum = world.conversation("c9002").expect("Workshop forum row");
+    assert!(forum.rights.manage_topics, "expected manage_topics on Workshop: {:?}", forum.rights);
+
+    // Paging past 50 topics loads all 120 topics via GetForumTopics cursor paging.
+    let p1 = match world.ask(Request::Topics { forum: key("c9002"), offset: 0, limit: 50, landing: false, query: None, sort: protocol::TopicSort::Activity, tag: None }) {
+        Response::Conversations { conversations, total, .. } => {
+            assert_eq!(total, 120);
+            assert_eq!(conversations.len(), 50);
+            conversations
+        }
+        other => panic!("expected page 1 Conversations, got {other:?}"),
+    };
+    let p2 = match world.ask(Request::Topics { forum: key("c9002"), offset: 50, limit: 50, landing: false, query: None, sort: protocol::TopicSort::Activity, tag: None }) {
+        Response::Conversations { conversations, total, .. } => {
+            assert_eq!(total, 120);
+            assert_eq!(conversations.len(), 50);
+            conversations
+        }
+        other => panic!("expected page 2 Conversations, got {other:?}"),
+    };
+    let p3 = match world.ask(Request::Topics { forum: key("c9002"), offset: 100, limit: 50, landing: false, query: None, sort: protocol::TopicSort::Activity, tag: None }) {
+        Response::Conversations { conversations, total, .. } => {
+            assert_eq!(total, 120);
+            assert_eq!(conversations.len(), 20);
+            conversations
+        }
+        other => panic!("expected page 3 Conversations, got {other:?}"),
+    };
+    let unique: std::collections::HashSet<String> = p1
+        .into_iter()
+        .chain(p2)
+        .chain(p3)
+        .map(|c| c.key.id)
+        .collect();
+    assert_eq!(unique.len(), 120, "all 120 forum topics must be reachable past the first 50");
+
+    // Searching topics filters via GetForumTopics `q`.
+    match world.ask(Request::Topics {
+        forum: key("c9002"),
+        offset: 0,
+        limit: 20,
+        landing: false,
+        query: Some("Topic #115".into()),
+        sort: protocol::TopicSort::Activity, tag: None,
+    }) {
+        Response::Conversations { conversations, .. } => {
+            assert_eq!(conversations.len(), 1, "{conversations:?}");
+            assert_eq!(conversations[0].title, "Topic #115");
+        }
+        other => panic!("expected searched topics, got {other:?}"),
+    }
+
+    // Default topic icons catalog.
+    match world.ask(Request::TopicIcons { account: account() }) {
+        Response::Catalog { items, .. } => {
+            assert!(items.iter().any(|i| i.id == "e6501"), "{items:?}");
+        }
+        other => panic!("expected TopicIcons Catalog, got {other:?}"),
+    }
+
+    // Create a new topic.
+    let created = match world.ask(Request::TopicCreate {
+        forum: key("c9002"),
+        title: "Sharpening".into(),
+        icon_color: Some(0x6FB9F0),
+        icon_emoji_id: Some("e6501".into()),
+    }) {
+        Response::Conversation { conversation } => conversation,
+        other => panic!("expected created topic Conversation, got {other:?}"),
+    };
+    assert_eq!(created.title, "Sharpening");
+    assert_eq!(created.parent.as_deref(), Some("c9002"));
+    assert!(world.calls().iter().any(|c| c == "CreateForumTopic c9002 Sharpening"));
+
+    // Rename, close, and pin the topic.
+    assert_eq!(
+        world.ask(Request::TopicUpdate {
+            topic: created.key.clone(),
+            title: Some("Chisels".into()),
+            icon_emoji_id: None,
+            closed: Some(true),
+            hidden: None,
+            pinned: Some(true),
+        }),
+        Response::Ok
+    );
+    let updated = world.until("topic renamed, closed, and pinned", || {
+        world.conversation(&created.key.id).filter(|c| c.title == "Chisels" && c.read_only && c.pin.is_some())
+    });
+    assert_eq!(updated.title, "Chisels");
+    assert!(updated.read_only);
+    assert!(updated.pin.is_some());
+
+    // Delete the topic.
+    assert_eq!(world.ask(Request::TopicDelete { topic: created.key.clone() }), Response::Ok);
+    world.until("deleted topic gone", || world.conversation(&created.key.id).is_none().then_some(()));
+}
+
+#[test]
+fn scheduled_messages_list_reschedule_send_now_cancel_and_when_online() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.schedule, "Telegram must advertise schedule capability");
+
+    let future = 1_900_000_000i64;
+    // A scheduled send is still a send: the row is pending until Telegram names the placeholder.
+    let scheduled = world.ask(Request::Send {
+        conversation: key("u7002"),
+        client_id: "sched-1".into(),
+        text: "Morning check-in".into(),
+        reply_to: None,
+        with: protocol::Outgoing { schedule: Some(future), ..protocol::Outgoing::default() },
+    });
+    assert!(matches!(scheduled, Response::Sent { .. }), "expected Sent, got {scheduled:?}");
+    world.until("first scheduled placeholder", || {
+        world.messages("u7002").into_iter().find(|m| m.text == "Morning check-in")
+    });
+
+    // Schedule a "when online" message to Odalys (last seen visible).
+    let when_online = world.ask(Request::Send {
+        conversation: key("u7002"),
+        client_id: "sched-2".into(),
+        text: "Ping when you are online".into(),
+        reply_to: None,
+        with: protocol::Outgoing {
+            schedule: Some(protocol::SCHEDULE_WHEN_ONLINE),
+            ..protocol::Outgoing::default()
+        },
+    });
+    assert!(matches!(when_online, Response::Sent { .. }), "expected Sent, got {when_online:?}");
+    world.until("second scheduled placeholder", || {
+        world.messages("u7002").into_iter().find(|m| m.text == "Ping when you are online")
+    });
+
+    // "Send when online" to Tobin (hidden last seen) fails with a clear message.
+    let hidden = world.ask(Request::Send {
+        conversation: key("u7003"),
+        client_id: "sched-bad".into(),
+        text: "Hidden last seen".into(),
+        reply_to: None,
+        with: protocol::Outgoing {
+            schedule: Some(protocol::SCHEDULE_WHEN_ONLINE),
+            ..protocol::Outgoing::default()
+        },
+    });
+    assert!(matches!(hidden, Response::Sent { .. }), "expected Sent, got {hidden:?}");
+    let failed = world.until("when-online refused for hidden last seen", || {
+        world
+            .messages("u7003")
+            .into_iter()
+            .find(|m| m.text == "Hidden last seen" && matches!(m.state, SendState::Failed { .. }))
+    });
+    match failed.state {
+        SendState::Failed { reason } => assert!(reason.contains("last seen"), "{reason}"),
+        other => panic!("expected Failed, got {other:?}"),
+    }
+
+    // List scheduled messages for Odalys: both pending messages appear.
+    let listed = match world.ask(Request::ScheduledMessages { conversation: key("u7002") }) {
+        Response::ScheduledMessages { messages } => messages,
+        other => panic!("expected ScheduledMessages, got {other:?}"),
+    };
+    assert_eq!(listed.len(), 2, "{listed:?}");
+    let timed = listed.iter().find(|m| m.text == "Morning check-in").expect("timed message");
+    let online = listed.iter().find(|m| m.text == "Ping when you are online").expect("when-online message");
+    assert_eq!(online.post_at, protocol::SCHEDULE_WHEN_ONLINE);
+
+    // Reschedule & edit the timed message.
+    let new_time = future + 3_600;
+    match world.ask(Request::RescheduleMessage {
+        conversation: key("u7002"),
+        scheduled_id: timed.id.clone(),
+        text: Some("Updated check-in".into()),
+        post_at: new_time,
+    }) {
+        Response::ScheduledMessage { message } => {
+            assert_eq!(message.text, "Updated check-in");
+            assert_eq!(message.post_at, new_time);
+        }
+        other => panic!("expected ScheduledMessage, got {other:?}"),
+    }
+
+    // Send the rescheduled message immediately: it moves to real history and leaves scheduled queue.
+    assert_eq!(
+        world.ask(Request::SendScheduledNow { conversation: key("u7002"), scheduled_id: timed.id.clone() }),
+        Response::Ok
+    );
+    world.until("sent scheduled message in history", || {
+        world
+            .messages("u7002")
+            .into_iter()
+            .find(|m| m.id == timed.id && m.text == "Updated check-in")
+    });
+    assert!(world.calls().iter().any(|c| c.starts_with("SendScheduledMessages u7002")));
+
+    // Cancel the remaining scheduled message.
+    assert_eq!(
+        world.ask(Request::CancelScheduled { conversation: key("u7002"), scheduled_id: online.id.clone() }),
+        Response::Ok
+    );
+    assert!(world.calls().iter().any(|c| c.starts_with("DeleteScheduledMessages u7002")));
+    match world.ask(Request::ScheduledMessages { conversation: key("u7002") }) {
+        Response::ScheduledMessages { messages } => assert!(messages.is_empty(), "{messages:?}"),
+        other => panic!("expected empty ScheduledMessages, got {other:?}"),
+    }
+}
+
+#[test]
+fn chat_search_filters_paging_hashtags_jump_to_date_calendar_and_shared_tabs() {
+    let world = World::with(Some(SESSION), "30", &[("TINYCLIENT_TELEGRAM_SEARCH_BULK", "125")]);
+    world.connected();
+
+    // Hashtag search across 125 messages pages past 100 using cursor and reports total.
+    let (page1, cursor1, total1) = match world.ask(Request::SearchNetwork {
+        conversation: Some(key("g8001")),
+        space: None,
+        account: None,
+        network: None,
+        query: "#ridge".into(),
+        filters: protocol::SearchFilters::default(),
+        cursor: None,
+        home: false,
+    }) {
+        Response::MessageHits { hits, cursor, total, .. } => (hits, cursor, total),
+        other => panic!("expected MessageHits, got {other:?}"),
+    };
+    assert_eq!(total1, Some(125));
+    assert_eq!(page1.len(), 100);
+    assert!(cursor1.is_some(), "expected continuation cursor past 100 hits");
+
+    let (page2, cursor2) = match world.ask(Request::SearchNetwork {
+        conversation: Some(key("g8001")),
+        space: None,
+        account: None,
+        network: None,
+        query: "#ridge".into(),
+        filters: protocol::SearchFilters::default(),
+        cursor: cursor1,
+        home: false,
+    }) {
+        Response::MessageHits { hits, cursor, .. } => (hits, cursor),
+        other => panic!("expected page 2 MessageHits, got {other:?}"),
+    };
+    assert_eq!(page2.len(), 25);
+    assert!(cursor2.is_none());
+
+    // Filter by sender (Tobin u7003) + date range (last 10 days).
+    let base_t0 = 1_791_892_800i64;
+    let after = base_t0 - 10 * 86_400;
+    let before = base_t0;
+    let filtered = match world.ask(Request::SearchNetwork {
+        conversation: Some(key("g8001")),
+        space: None,
+        account: None,
+        network: None,
+        query: "#ridge".into(),
+        filters: protocol::SearchFilters {
+            from: Some(key("u7003")),
+            after: Some(after),
+            before: Some(before),
+            ..protocol::SearchFilters::default()
+        },
+        cursor: None,
+        home: false,
+    }) {
+        Response::MessageHits { hits, .. } => hits,
+        other => panic!("expected filtered MessageHits, got {other:?}"),
+    };
+    assert!(!filtered.is_empty() && filtered.len() <= 10, "got {} hits", filtered.len());
+    assert!(filtered.iter().all(|h| h.sender.contains("Tobin") && h.sent >= after && h.sent <= before), "{filtered:?}");
+
+    // Jump to date resolves the message closest to a target timestamp.
+    let target_date = base_t0 - 50 * 86_400;
+    match world.ask(Request::JumpToDate { conversation: key("g8001"), date: target_date }) {
+        Response::Resolved { conversation, message_id, title } => {
+            assert_eq!(conversation, Some(key("g8001")));
+            assert!(message_id.is_some(), "expected a resolved message id");
+            assert!(title.is_empty());
+        }
+        other => panic!("expected Resolved, got {other:?}"),
+    }
+    assert!(world.calls().iter().any(|c| c.contains("GetHistory g8001 date=")));
+
+    // Search calendar lists day buckets with counts.
+    match world.ask(Request::SearchCalendar { conversation: key("g8001"), kind: None, offset_date: 0 }) {
+        Response::SearchCalendar { days } => {
+            assert!(days.len() >= 100, "expected >= 100 calendar days, got {}", days.len());
+            assert!(days.iter().all(|d| d.count >= 1));
+        }
+        other => panic!("expected SearchCalendar, got {other:?}"),
+    }
+
+    // Extra Telegram shared tabs: Music, Voice, GIFs.
+    for kind in [protocol::SharedKind::Music, protocol::SharedKind::Voice, protocol::SharedKind::Gifs] {
+        match world.ask(Request::Shared {
+            conversation: key("u7002"),
+            kind,
+            before: None,
+            limit: 20,
+            search: true,
+        }) {
+            Response::Shared { items, total, .. } => {
+                assert_eq!(total, Some(1), "expected total=1 for {kind:?}");
+                assert_eq!(items.len(), 1, "expected 1 item for {kind:?}: {items:?}");
+            }
+            other => panic!("expected Shared for {kind:?}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn delete_modes_admin_batch_participant_history_and_report_spam() {
+    let world = World::with(
+        Some(SESSION),
+        "30",
+        &[("TINYCLIENT_TELEGRAM_ADMIN", "1"), ("TINYCLIENT_TELEGRAM_OLD_GROUP", "1")],
+    );
+    world.connected();
+    world.until("odalys history", || world.message("u7002", "11"));
+
+    // Private 1:1 chat allows deleting the other person's messages.
+    let odalys = world.conversation("u7002").expect("Odalys row");
+    assert!(odalys.rights.delete_others, "private chat must set delete_others: {:?}", odalys.rights);
+
+    // Delete for me only sends revoke=false.
+    assert_eq!(
+        world.ask(Request::Delete {
+            conversation: key("u7002"),
+            message_id: "11".into(),
+            scope: protocol::DeleteScope::Me,
+        }),
+        Response::Ok
+    );
+    assert!(world.calls().iter().any(|c| c == "DeleteMessages [11] revoke false"));
+    world.until("message 11 deleted locally", || world.message("u7002", "11").is_none().then_some(()));
+
+    // Batch DeleteMany sends a single DeleteMessages RPC with both IDs (including peer's messages).
+    assert_eq!(
+        world.ask(Request::DeleteMany {
+            conversation: key("u7002"),
+            message_ids: vec!["10".into(), "12".into()],
+            scope: protocol::DeleteScope::Everyone,
+        }),
+        Response::Ok
+    );
+    assert!(world.calls().iter().any(|c| c == "DeleteMessages [10, 12] revoke true"));
+    world.until("batch deleted locally", || {
+        (world.message("u7002", "10").is_none() && world.message("u7002", "12").is_none()).then_some(())
+    });
+
+    // Basic group past 48h revoke returns a clear error mentioning 48-hour limit.
+    match world.ask(Request::Delete {
+        conversation: key("g8001"),
+        message_id: "20".into(),
+        scope: protocol::DeleteScope::Everyone,
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("48-hour"), "{detail}"),
+        other => panic!("expected 48-hour error, got {other:?}"),
+    }
+
+    // Supergroup/forum with admin rights advertises delete_others, refuses DeleteScope::Me,
+    // and deletes another member's message via channels.deleteMessages.
+    // The topic's posts are not on the forum row. Open it so message 41 is stored before
+    // the delete is asked: a missing row is "no such message", and the channel rule never runs.
+    let workshop = world.conversation("c9002").expect("Workshop row");
+    assert!(workshop.rights.delete_others, "admin forum must set delete_others: {:?}", workshop.rights);
+    world.messages("c9002");
+    world.until("the tools topic", || world.conversation("c9002_31"));
+    world.until("the topic's history", || world.message("c9002_31", "41"));
+    match world.ask(Request::Delete {
+        conversation: key("c9002_31"),
+        message_id: "41".into(),
+        scope: protocol::DeleteScope::Me,
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("everyone"), "{detail}"),
+        other => panic!("expected channel delete-for-everyone error, got {other:?}"),
+    }
+    assert_eq!(
+        world.ask(Request::Delete {
+            conversation: key("c9002_31"),
+            message_id: "41".into(),
+            scope: protocol::DeleteScope::Everyone,
+        }),
+        Response::Ok
+    );
+    assert!(world.calls().iter().any(|c| c == "channels.DeleteMessages c9002 [41]"));
+
+    // Report spam and delete all messages from a participant in a supergroup.
+    assert_eq!(
+        world.ask(Request::ReportSpamMessages {
+            conversation: key("c9002"),
+            person: key("u7003"),
+            message_ids: vec!["55".into()],
+        }),
+        Response::Ok
+    );
+    assert!(world.calls().iter().any(|c| c == "channels.ReportSpam c9002 u7003 [55]"));
+    assert_eq!(
+        world.ask(Request::DeleteParticipantHistory {
+            conversation: key("c9002"),
+            person: key("u7003"),
+        }),
+        Response::Ok
+    );
+    assert!(world.calls().iter().any(|c| c == "channels.DeleteParticipantHistory c9002 u7003"));
+}
+
+#[test]
 fn bot_inline_buttons_render_and_fire_callback() {
     let world = World::signed_in();
     world.connected();
@@ -4476,8 +5382,8 @@ fn unread_mentions_jump_three_times_and_the_count_reaches_zero() {
     });
     assert!(matches!(ok, Response::Ok), "expected Ok marking the channel mention read, got {ok:?}");
     assert!(
-        world.calls().iter().any(|call| call == "channels.ReadMessageContents 5"),
-        "expected channels.ReadMessageContents 5 on wire, got: {:#?}",
+        world.calls().iter().any(|call| call == "channels.ReadMessageContents c9001 5"),
+        "expected channels.ReadMessageContents c9001 5 on wire, got: {:#?}",
         world.calls()
     );
 
@@ -4512,4 +5418,894 @@ fn unread_mentions_jump_three_times_and_the_count_reaches_zero() {
     });
     assert_eq!(cleared.unread_reactions, 0);
     assert_eq!(cleared.mentions, 0);
+}
+
+#[test]
+fn clicking_a_telegram_username_resolves_once_and_caches_result() {
+    let world = World::signed_in();
+    world.connected();
+
+    // Resolving an uncached @username calls contacts.resolveUsername once and creates the chat row.
+    let Response::Resolved { conversation, title, .. } = world.ask(Request::Resolve {
+        url: "https://t.me/forest_wren".into(),
+    }) else {
+        panic!("expected Resolved");
+    };
+    assert_eq!(conversation, Some(key("u7011")));
+    assert_eq!(title, "Robin Vale");
+    assert_eq!(world.called("ResolveUsername forest_wren"), 1);
+
+    // Clicking the same username again hits cache without repeating the flood-limited RPC.
+    let Response::Resolved { conversation: again, .. } = world.ask(Request::Resolve {
+        url: "https://t.me/forest_wren".into(),
+    }) else {
+        panic!("expected Resolved");
+    };
+    assert_eq!(again, Some(key("u7011")));
+    assert_eq!(world.called("ResolveUsername forest_wren"), 1);
+
+    // Unknown usernames cache the miss so repeated clicks do not hammer ResolveUsername.
+    let Response::Resolved { conversation: missing, .. } = world.ask(Request::Resolve {
+        url: "https://t.me/nobody_here_495".into(),
+    }) else {
+        panic!("expected Resolved");
+    };
+    assert_eq!(missing, None);
+    let Response::Resolved { conversation: missing_again, .. } = world.ask(Request::Resolve {
+        url: "https://t.me/nobody_here_495".into(),
+    }) else {
+        panic!("expected Resolved");
+    };
+    assert_eq!(missing_again, None);
+    assert_eq!(world.called("ResolveUsername nobody_here_495"), 1);
+}
+
+#[test]
+fn replace_media_and_edit_caption_formatting() {
+    let world = World::signed_in();
+    world.connected();
+
+    let dir = std::env::temp_dir().join(format!("tinyclient-tg-edit-media-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let photo_a = dir.join("first.jpg");
+    let photo_b = dir.join("second.jpg");
+    std::fs::write(&photo_a, vec![3u8; 4_096]).unwrap();
+    std::fs::write(&photo_b, vec![9u8; 8_192]).unwrap();
+
+    // Send a photo with a plain caption first.
+    let file_a = protocol::OutgoingFile {
+        path: photo_a.to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: key("u7002"),
+            client_id: "edit-media-1".into(),
+            text: "initial caption".into(),
+            reply_to: None,
+            with: protocol::Outgoing { files: vec![file_a], ..Default::default() },
+        }),
+        Response::Sent { .. }
+    ));
+    let sent = world.until("photo sent", || {
+        world
+            .messages("u7002")
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("edit-media-1") && m.state == SendState::Sent)
+    });
+    assert_eq!(sent.attachments.len(), 1);
+    let old_file_id = sent.attachments[0].file.id.clone();
+
+    // Edit only the caption's formatting (bold, italic, spoiler) via Request::Edit.
+    assert_eq!(
+        world.ask(Request::Edit {
+            conversation: key("u7002"),
+            message_id: sent.id.clone(),
+            text: "**bold** _italic_ ||secret||".into(),
+            spans: Vec::new(),
+            suppress_embeds: false, keep_attachments: None,
+        }),
+        Response::Ok
+    );
+    let formatted = world.until("caption formatted", || {
+        world
+            .messages("u7002")
+            .into_iter()
+            .find(|m| m.id == sent.id && m.text == "bold italic secret")
+    });
+    assert!(formatted.spans.iter().any(|s| s.style == protocol::Style::Bold), "{:?}", formatted.spans);
+    assert!(formatted.spans.iter().any(|s| s.style == protocol::Style::Italic), "{:?}", formatted.spans);
+    assert!(formatted.spans.iter().any(|s| s.style == protocol::Style::Spoiler), "{:?}", formatted.spans);
+
+    // Clearing the caption on a media message is allowed.
+    assert_eq!(
+        world.ask(Request::Edit {
+            conversation: key("u7002"),
+            message_id: sent.id.clone(),
+            text: String::new(),
+            spans: Vec::new(),
+            suppress_embeds: false, keep_attachments: None,
+        }),
+        Response::Ok
+    );
+    let cleared = world.until("caption cleared", || {
+        world.messages("u7002").into_iter().find(|m| m.id == sent.id && m.text.is_empty())
+    });
+    assert_eq!(cleared.attachments.len(), 1);
+
+    // Replace the photo with a new file + spoiler and a formatted caption via Request::EditMedia.
+    let file_b = protocol::OutgoingFile {
+        path: photo_b.to_string_lossy().into_owned(),
+        spoiler: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        world.ask(Request::EditMedia {
+            conversation: key("u7002"),
+            message_id: sent.id.clone(),
+            file: file_b,
+            text: "**new** photo".into(),
+            spans: Vec::new(),
+            invert_media: true,
+        }),
+        Response::Ok
+    );
+    let replaced = world.until("media replaced", || {
+        world
+            .messages("u7002")
+            .into_iter()
+            .find(|m| m.id == sent.id && m.text == "new photo")
+    });
+    assert_eq!(replaced.attachments.len(), 1);
+    assert_ne!(replaced.attachments[0].file.id, old_file_id);
+    assert!(replaced.attachments[0].spoiler);
+    assert!(replaced.spans.iter().any(|s| s.style == protocol::Style::Bold));
+    assert!(
+        world.calls().iter().any(|c| c.contains("EditMessage u7002") && c.contains("media=photo+spoiler") && c.contains("[invert]")),
+        "expected EditMessage with replacement media and invert_media on wire: {:#?}",
+        world.calls()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn edit_own_profile_name_bio_username_avatar_birthday_and_emoji_status() {
+    let world = World::signed_in();
+    world.connected();
+
+    let me = key("u7001");
+    let account = me.account();
+
+    // Update name, bio, username, and birthday in one SetProfile call.
+    assert_eq!(
+        world.ask(Request::SetProfile {
+            account: account.clone(),
+            name: Some("Mira Vance".into()),
+            about: Some("Alpine maps and trails".into()),
+            pronouns: None,
+            emoji: None,
+            username: Some("@mira_vance".into()),
+            birthday: Some("1994-03-14".into()),
+            photo: false,
+            accent: None, banner: None, space: None,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.called("UpdateProfile Mira Vance | Alpine maps and trails"), 1);
+    assert_eq!(world.called("CheckUsername mira_vance"), 1);
+    assert_eq!(world.called("UpdateUsername mira_vance"), 1);
+    assert_eq!(world.called("UpdateBirthday 1994-3-14"), 1);
+
+    // Own profile card reflects the updated name, bio, username, and birthday.
+    let Response::Profile { profile } = world.ask(Request::Profile { person: me.clone(), space: None }) else {
+        panic!("expected Profile");
+    };
+    assert_eq!(profile.person.name, "Mira Vance");
+    assert_eq!(profile.bio, "Alpine maps and trails");
+    // The typed profile carries the handle on the person, not as a field.
+    assert_eq!(profile.person.handle, "@mira_vance");
+    assert!(profile.fields.iter().any(|(k, v)| k == "Birthday" && v == "14 March 1994"), "{:?}", profile.fields);
+
+    // Taken username is checked and refused cleanly without calling UpdateUsername.
+    let taken = world.ask(Request::SetProfile {
+        account: account.clone(),
+        name: None,
+        about: None,
+        pronouns: None,
+        emoji: None,
+        username: Some("taken_name".into()),
+        birthday: None,
+        photo: false,
+        accent: None, banner: None, space: None,
+    });
+    assert!(matches!(taken, Response::Error { code: ErrorCode::Refused, .. }), "{taken:?}");
+    assert_eq!(world.called("UpdateUsername taken_name"), 0);
+
+    // Upload a new profile photo and then remove it via SetAvatar.
+    let dir = std::env::temp_dir().join(format!("tinyclient-tg-avatar-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let avatar = dir.join("me.jpg");
+    std::fs::write(&avatar, vec![5u8; 2_048]).unwrap();
+    assert_eq!(
+        world.ask(Request::SetAvatar {
+            account: account.clone(),
+            path: avatar.to_string_lossy().into_owned(),
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.called("UploadProfilePhoto"), 1);
+    assert_eq!(world.ask(Request::SetAvatar { account: account.clone(), path: String::new() }), Response::Ok);
+    assert_eq!(world.called("GetUserPhotos"), 1);
+    assert_eq!(world.called("DeletePhotos 1"), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Non-Premium account setting emoji status gets a clear Premium refusal and never sends UpdateStatus offline.
+    let emoji_err = world.ask(Request::SetPresence {
+        account: account.clone(),
+        presence: Presence::Online,
+        status: None,
+        status_emoji: Some("5002".into()),
+        clear_at: Some(1_800_000_000),
+    });
+    assert!(
+        matches!(emoji_err, Response::Error { code: ErrorCode::Refused, ref detail } if detail.contains("Premium")),
+        "{emoji_err:?}"
+    );
+    // Clearing emoji status succeeds cleanly.
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Online,
+            status: None,
+            status_emoji: Some(String::new()),
+            clear_at: None,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.called("UpdateEmojiStatus clear"), 1);
+    assert_eq!(world.called("UpdateStatus offline"), 0, "never send account.updateStatus offline from status edits");
+}
+
+#[test]
+fn create_group_channel_and_add_members_with_missing_invitees() {
+    let world = World::signed_in();
+    world.connected();
+
+    let account = key("u7001").account();
+
+    // 1. Create a basic group with two people via StartGroup.
+    let Response::Conversation { conversation: group } = world.ask(Request::StartGroup {
+        account: account.clone(),
+        people: vec![key("u7002"), key("u7003")],
+        title: Some("Summit Team".into()),
+    }) else {
+        panic!("expected Conversation from StartGroup");
+    };
+    assert_eq!(group.title, "Summit Team");
+    assert_eq!(group.kind, ConversationKind::Group);
+    assert!(group.rights.add_members);
+    assert_eq!(world.called("CreateChat Summit Team users=[7002, 7003]"), 1);
+    let group_msgs = world.messages(&group.key.id);
+    assert!(
+        group_msgs.iter().any(|m| m.kind == MessageKind::System),
+        "expected creation system message in new group: {group_msgs:?}"
+    );
+
+    // 2. Create a public broadcast channel with description and public @username.
+    let Response::Conversation { conversation: pub_chan } = world.ask(Request::CreateChannel {
+        space: Key::new(&account, ""),
+        name: "Trail Bulletins".into(),
+        kind: ConversationKind::Channel,
+        private: false,
+        group: None,
+        description: Some("Weekly snowpack updates".into()),
+        username: Some("@trail_bulletins".into()),
+    }) else {
+        panic!("expected Conversation from public CreateChannel");
+    };
+    assert_eq!(pub_chan.title, "Trail Bulletins");
+    assert_eq!(pub_chan.kind, ConversationKind::Channel);
+    assert!(pub_chan.rights.add_members);
+    assert_eq!(world.called("CreateChannel Trail Bulletins broadcast=true megagroup=false about=Weekly snowpack updates"), 1);
+    assert_eq!(world.called("ChannelCheckUsername trail_bulletins"), 1);
+    assert!(
+        world.calls().iter().any(|c| c.starts_with("ChannelUpdateUsername") && c.ends_with(" trail_bulletins")),
+        "{:#?}",
+        world.calls()
+    );
+
+    // 3. Create a private channel (must not claim a public username).
+    let Response::Conversation { conversation: priv_chan } = world.ask(Request::CreateChannel {
+        space: Key::new(&account, ""),
+        name: "Private Log".into(),
+        kind: ConversationKind::Channel,
+        private: true,
+        group: None,
+        description: None,
+        username: Some("should_be_ignored".into()),
+    }) else {
+        panic!("expected Conversation from private CreateChannel");
+    };
+    assert_eq!(priv_chan.title, "Private Log");
+    assert_eq!(world.called("ChannelCheckUsername should_be_ignored"), 0);
+
+    // 4. Add a member to a basic group and to the new channel.
+    assert_eq!(
+        world.ask(Request::MembersAdd {
+            conversation: key("g8001"),
+            people: vec!["u7002".into()],
+            share_history: None,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.called("AddChatUser g8001 u7002"), 1);
+
+    assert_eq!(
+        world.ask(Request::MembersAdd {
+            conversation: pub_chan.key.clone(),
+            people: vec!["u7002".into()],
+            share_history: None,
+        }),
+        Response::Ok
+    );
+    assert!(
+        world.calls().iter().any(|c| c.starts_with("InviteToChannel ") && c.contains("[7002]")),
+        "{:#?}",
+        world.calls()
+    );
+
+    // 5. Missing invitees (privacy-restricted person u7005) produce a clear refusal suggesting an invite link.
+    let privacy = world.ask(Request::MembersAdd {
+        conversation: pub_chan.key.clone(),
+        people: vec!["u7005".into()],
+        share_history: None,
+    });
+    assert!(
+        matches!(privacy, Response::Error { code: ErrorCode::Refused, ref detail } if detail.contains("invite link")),
+        "expected privacy refusal naming invite link, got {privacy:?}"
+    );
+}
+
+#[test]
+fn invite_links_join_preview_revoke_and_join_requests() {
+    let world = World::signed_in();
+    world.connected();
+
+    let account = key("u7001").account();
+
+    // 1. Preview a normal Telegram invite link without joining.
+    let Response::InvitePreview { preview } = world.ask(Request::InvitePreview {
+        account: account.clone(),
+        code: "https://t.me/+alpine_invite".into(),
+        event_id: None,
+    }) else {
+        panic!("expected InvitePreview");
+    };
+    assert_eq!(preview.name, "Alpine Club");
+    assert_eq!(preview.members, Some(128));
+    assert!(!preview.request_needed);
+    assert_eq!(world.called("CheckChatInvite alpine_invite"), 1);
+
+    // 2. Join via the invite link: calls ImportChatInvite and records the new channel row.
+    let Response::InviteJoined { space, conversation, pending } = world.ask(Request::InviteJoin {
+        account: account.clone(),
+        code: "https://t.me/+alpine_invite".into(),
+    }) else {
+        panic!("expected InviteJoined");
+    };
+    assert_eq!(space, None);
+    assert_eq!(conversation, Some(key("c9201")));
+    assert!(!pending);
+    assert_eq!(world.called("ImportChatInvite alpine_invite"), 1);
+    let joined_row = world.conversation("c9201").expect("joined channel row recorded");
+    assert_eq!(joined_row.title, "Alpine Club");
+
+    // 3. Approval-gated invite link: preview sets request_needed, join reports pending=true on INVITE_REQUEST_SENT.
+    let Response::InvitePreview { preview: gated } = world.ask(Request::InvitePreview {
+        account: account.clone(),
+        code: "https://t.me/joinchat/approval_invite".into(),
+        event_id: None,
+    }) else {
+        panic!("expected gated InvitePreview");
+    };
+    assert!(gated.request_needed);
+    let Response::InviteJoined { pending: req_sent, .. } = world.ask(Request::InviteJoin {
+        account: account.clone(),
+        code: "https://t.me/+approval_invite".into(),
+    }) else {
+        panic!("expected pending InviteJoined");
+    };
+    assert!(req_sent);
+
+    // 4. Expired invite returns a clear Refused error.
+    let expired = world.ask(Request::InvitePreview {
+        account: account.clone(),
+        code: "https://t.me/+expired_invite".into(),
+        event_id: None,
+    });
+    assert!(
+        matches!(expired, Response::Error { code: ErrorCode::Refused, ref detail } if detail.contains("expired")),
+        "{expired:?}"
+    );
+
+    // 5. Admin invite management: create, list active, revoke, list revoked.
+    let Response::ChatInvite { invite: created } = world.ask(Request::CreateInvite {
+        conversation: key("g8001"),
+        title: Some("Trail guests".into()),
+        expire_date: Some(1_900_000_000),
+        usage_limit: Some(10),
+        request_needed: false,
+    }) else {
+        panic!("expected ChatInvite from CreateInvite");
+    };
+    assert!(created.link.starts_with("https://t.me/+"));
+    assert!(!created.revoked);
+    assert_eq!(created.usage_limit, Some(10));
+
+    let Response::ChatInvites { invites: active, .. } = world.ask(Request::ChatInvites {
+        conversation: key("g8001"),
+        revoked: false,
+    }) else {
+        panic!("expected ChatInvites");
+    };
+    assert!(active.iter().any(|i| i.link == created.link), "{active:?}");
+
+    let Response::ChatInvite { invite: revoked } = world.ask(Request::RevokeInvite {
+        conversation: key("g8001"),
+        link: created.link.clone(),
+    }) else {
+        panic!("expected ChatInvite from RevokeInvite");
+    };
+    assert!(revoked.revoked);
+
+    // 6. Admin join request management: list requests, approve one, decline remaining.
+    let Response::JoinRequests { requests, .. } = world.ask(Request::JoinRequests {
+        conversation: key("g8001"),
+        link: None,
+        limit: 50,
+    }) else {
+        panic!("expected JoinRequests");
+    };
+    assert_eq!(requests.len(), 2, "{requests:?}");
+
+    assert_eq!(
+        world.ask(Request::HandleJoinRequest {
+            conversation: key("g8001"),
+            user_id: Some("u7002".into()),
+            approved: true,
+            link: None,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.called("HideChatJoinRequest g8001 u7002 approved=true"), 1);
+
+    assert_eq!(
+        world.ask(Request::HandleJoinRequest {
+            conversation: key("g8001"),
+            user_id: None,
+            approved: false,
+            link: None,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.called("HideAllChatJoinRequests g8001 approved=false"), 1);
+
+    let Response::JoinRequests { requests: after, .. } = world.ask(Request::JoinRequests {
+        conversation: key("g8001"),
+        link: None,
+        limit: 50,
+    }) else {
+        panic!("expected empty JoinRequests");
+    };
+    assert!(after.is_empty());
+}
+
+#[test]
+fn a_search_previews_a_public_channel_until_it_is_joined() {
+    let world = World::signed_in();
+    world.connected();
+
+    // A link is not a join target. The private-invite path is separate, and this must not subscribe.
+    let joins = world.called("JoinChannel");
+    let link = world.ask(Request::Join { conversation: key("https://t.me/larchpress") });
+    assert!(matches!(link, Response::Error { code: ErrorCode::Refused, .. }), "{link:?}");
+    assert_eq!(world.called("JoinChannel"), joins);
+
+    let search = |query: &str| Request::People {
+        network: Some(Network::Telegram), relation: None, query: Some(query.into()), offset: 0, limit: 20,
+    };
+    world.ask(search("larch"));
+    world.until("the channel search", || world.calls().contains(&"contacts.Search larch".to_owned()).then_some(()));
+    let larch = world.until("the channel preview", || {
+        world.conversation("c9010").filter(|row| row.title == "Larch Press" && !row.joined)
+    });
+    assert_eq!(larch.kind, ConversationKind::Channel);
+    let trail = world.until("the group preview", || {
+        world.conversation("c9014").filter(|row| row.title == "Larch Trail" && row.kind == ConversationKind::Group && !row.joined)
+    });
+    assert_eq!(trail.title, "Larch Trail");
+
+    let Response::Conversation { conversation: preview } = world.ask(Request::PreviewChannel { conversation: key("c9010") }) else {
+        panic!("expected a preview");
+    };
+    assert!(!preview.joined);
+    assert!(world.messages("c9010").iter().any(|message| message.text == "The ridge is clear."));
+    assert!(world.calls().iter().any(|call| call.starts_with("GetHistory c9010")));
+
+    let Response::Conversation { conversation: joined } = world.ask(Request::Join { conversation: key("c9010") }) else {
+        panic!("expected the joined channel");
+    };
+    assert!(joined.joined);
+    assert_eq!(joined.title, "Larch Press");
+    assert_eq!(world.called("JoinChannel c9010"), 1);
+    assert!(world.calls().iter().any(|call| call == "GetChannelRecommendations c9010"));
+    let similar = world.conversation("c9013").expect("a similar channel stays a preview");
+    assert_eq!((similar.title.as_str(), similar.joined), ("Similar Peaks", false));
+    assert!(!world.conversation("c9014").expect("the group was not joined").joined);
+
+    world.ask(search("shelf"));
+    world.until("the full channel search", || world.calls().contains(&"contacts.Search shelf".to_owned()).then_some(()));
+    world.until("the full channel preview", || world.conversation("c9012").filter(|row| row.title == "Full Shelf" && !row.joined).map(drop));
+    let full = world.ask(Request::Join { conversation: key("c9012") });
+    assert!(
+        matches!(full, Response::Error { code: ErrorCode::Refused, ref detail } if detail == "This account can't join any more channels."),
+        "{full:?}"
+    );
+    assert!(!world.conversation("c9012").expect("still a preview").joined);
+
+    world.ask(search("closed"));
+    world.until("the closed group search", || world.calls().contains(&"contacts.Search closed".to_owned()).then_some(()));
+    world.until("the closed group preview", || world.conversation("c9011").filter(|row| row.title == "Closed Ridge" && !row.joined).map(drop));
+    let closed = world.ask(Request::Join { conversation: key("c9011") });
+    assert!(
+        matches!(closed, Response::Error { code: ErrorCode::Refused, ref detail } if detail == "Request sent."),
+        "{closed:?}"
+    );
+    assert!(!world.conversation("c9011").expect("a request does not join").joined);
+}
+
+#[test]
+fn voice_and_round_video_messages_track_listened_state_and_send_read_contents() {
+    let world = World::signed_in();
+    world.connected();
+
+    // 1. Incoming voice message with media_unread arrives flagged unplayed.
+    world.steer("voice-unread");
+    let voice = world.arrived("u7002", "61");
+    assert!(voice.media_unread, "unplayed incoming voice message must carry media_unread");
+    assert!(!voice.outgoing);
+
+    // Playing it sends messages.readMessageContents once and clears media_unread.
+    assert!(matches!(
+        world.ask(Request::MarkPlayed { conversation: key("u7002"), message_id: "61".into() }),
+        Response::Ok
+    ));
+    world.until("media_unread cleared on voice 61", || {
+        world.message("u7002", "61").filter(|m| !m.media_unread)
+    });
+    assert_eq!(world.called("ReadMessageContents 61"), 1, "expected exactly one ReadMessageContents call");
+
+    // Asking MarkPlayed a second time sends nothing further.
+    assert!(matches!(
+        world.ask(Request::MarkPlayed { conversation: key("u7002"), message_id: "61".into() }),
+        Response::Ok
+    ));
+    assert_eq!(world.called("ReadMessageContents 61"), 1, "must not send ReadMessageContents twice");
+
+    // 2. Incoming round video message with media_unread arrives flagged and clears on MarkPlayed.
+    world.steer("round-unread");
+    let round = world.arrived("u7002", "65");
+    assert!(round.media_unread, "unplayed round video must carry media_unread");
+    assert!(round.attachments.first().is_some_and(|a| a.round));
+    assert!(matches!(
+        world.ask(Request::MarkPlayed { conversation: key("u7002"), message_id: "65".into() }),
+        Response::Ok
+    ));
+    world.until("media_unread cleared on round 65", || {
+        world.message("u7002", "65").filter(|m| !m.media_unread)
+    });
+    assert_eq!(world.called("ReadMessageContents 65"), 1);
+
+    // 3. Channel voice message sends channels.readMessageContents and clears on update too.
+    world.steer("channel-voice-unread");
+    let ch_voice = world.arrived("c9001", "64");
+    assert!(ch_voice.media_unread);
+    assert!(matches!(
+        world.ask(Request::MarkPlayed { conversation: key("c9001"), message_id: "64".into() }),
+        Response::Ok
+    ));
+    world.until("media_unread cleared on channel voice 64", || {
+        world.message("c9001", "64").filter(|m| !m.media_unread)
+    });
+    assert_eq!(world.called("channels.ReadMessageContents c9001 64"), 1);
+
+    // 4. Outgoing unplayed voice message: playing it locally does NOT send readMessageContents
+    //    or clear the dot; UpdateReadMessagesContents from the recipient clears it.
+    world.steer("voice-out-unread");
+    let mine = world.arrived("u7002", "63");
+    assert!(mine.outgoing && mine.media_unread);
+    assert!(matches!(
+        world.ask(Request::MarkPlayed { conversation: key("u7002"), message_id: "63".into() }),
+        Response::Ok
+    ));
+    assert_eq!(world.called("ReadMessageContents 63"), 0, "must not mark own outgoing message played");
+    assert!(world.message("u7002", "63").unwrap().media_unread);
+    world.steer("read-contents 63");
+    world.until("UpdateReadMessagesContents clears outgoing voice 63", || {
+        world.message("u7002", "63").filter(|m| !m.media_unread)
+    });
+
+    // 5. Unplayed voice message with a mention decrements the conversation's mention count once.
+    world.steer("voice-unread-mention");
+    let mentioned = world.arrived("g8001", "62");
+    assert!(mentioned.media_unread && mentioned.mentions_me);
+    let before_mentions = world.conversation("g8001").unwrap().mentions;
+    assert!(before_mentions >= 1, "expected mention count >= 1, got {before_mentions}");
+    assert!(matches!(
+        world.ask(Request::MarkPlayed { conversation: key("g8001"), message_id: "62".into() }),
+        Response::Ok
+    ));
+    world.until("mention count decremented after readMessageContents", || {
+        let now_mentions = world.conversation("g8001")?.mentions;
+        (now_mentions == before_mentions - 1).then_some(now_mentions)
+    });
+    // Echoed UpdateReadMessagesContents must not double-decrement mentions.
+    world.steer("read-contents 62");
+    assert_eq!(world.conversation("g8001").unwrap().mentions, before_mentions - 1);
+}
+
+#[test]
+fn send_rules_reflect_media_bans_slow_mode_and_paid_stars() {
+    let world = World::signed_in();
+    world.connected();
+    // The dialog list only previews the forum. Opening it lists the topic.
+    let _ = world.messages("c9002");
+    world.until("the tools topic", || world.conversation("c9002_31"));
+
+    // 1. Group with media banned + 30s slow mode reports those rules and starts countdown on send.
+    world.steer("ban-media");
+    world.steer("slowmode 30");
+    let Response::SendRules { rules, .. } = world.ask(Request::SendRules { conversation: key("c9002_31") }) else {
+        panic!("expected SendRules");
+    };
+    assert!(!rules.send_media && !rules.allows_any_attachment());
+    assert!(!rules.send_stickers && !rules.send_gifs && !rules.send_voices);
+    assert!(rules.send_messages && rules.send_plain);
+    assert_eq!(rules.slowmode_seconds, 30);
+    assert_eq!(rules.slowmode_next_send, None);
+
+    // Sending a message in the slow-mode chat sets the cached next-send timestamp.
+    world.send("c9002_31", "5351", "Checked the bearings", None);
+    let _ = world.until("slowmode message sent", || {
+        world.messages("c9002_31").into_iter().find(|m| m.text == "Checked the bearings" && m.state == SendState::Sent)
+    });
+    let Response::SendRules { rules: after_send, .. } = world.ask(Request::SendRules { conversation: key("c9002_31") }) else {
+        panic!("expected SendRules after send");
+    };
+    assert!(after_send.slowmode_next_send.is_some(), "slow mode cooldown must start after send");
+
+    // 2. Paid messages (send_paid_messages_stars): price is reported, silent send fails, explicit
+    //    allow_paid_stars succeeds and passes allow_paid_stars on the wire.
+    world.steer("paid-stars 25");
+    let Response::SendRules { rules: paid_rules, .. } = world.ask(Request::SendRules { conversation: key("u7003") }) else {
+        panic!("expected SendRules for paid user");
+    };
+    assert_eq!(paid_rules.paid_stars, Some(25));
+
+    // Sending without allow_paid_stars fails with a plain-English Stars error.
+    world.send("u7003", "5352", "unpaid hello", None);
+    let failed = world.until("unpaid send fails", || {
+        world.messages("u7003").into_iter().find(|m| {
+            m.text == "unpaid hello" && matches!(m.state, SendState::Failed { .. })
+        })
+    });
+    let SendState::Failed { reason } = failed.state else { unreachable!() };
+    assert!(reason.contains("25 Telegram Stars"), "{reason}");
+
+    // Sending with explicit allow_paid_stars succeeds and passes allow_paid_stars on the wire.
+    let res = world.ask(Request::Send {
+        conversation: key("u7003"),
+        client_id: "5353".into(),
+        text: "paid hello".into(),
+        reply_to: None,
+        with: protocol::Outgoing { allow_paid_stars: Some(25), ..protocol::Outgoing::default() },
+    });
+    assert!(matches!(res, Response::Sent { .. }), "{res:?}");
+    let _ = world.until("paid send succeeds", || {
+        world.messages("u7003").into_iter().find(|m| m.text == "paid hello" && m.state == SendState::Sent)
+    });
+    assert!(
+        world.calls().iter().any(|c| c.contains("SendMessage u7003 paid hello") && c.contains("[stars=25]")),
+        "{:#?}",
+        world.calls()
+    );
+}
+
+#[test]
+fn voice_messages_forbidden_disables_mic_and_refused_send_returns_plain_words() {
+    let world = World::signed_in();
+    world.connected();
+    world.until("history", || world.message("u7002", "12"));
+
+    // 1. Before full profile is known, Odalys forbids voice messages on the server: sending fails
+    //    with plain words and updates the conversation's `voice_notes_forbidden` field.
+    world.steer("voice-forbidden 7002 1");
+    let dir = std::path::absolute(format!("/tmp/tinyclient-tg-voice-forbid-{}", std::process::id())).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("voice-refused.opus");
+    std::fs::write(&path, vec![7u8; 1024]).unwrap();
+    let file = || protocol::OutgoingFile {
+        path: path.to_string_lossy().into_owned(),
+        name: String::new(),
+        spoiler: false,
+        as_file: false,
+        original: false,
+        view_once: false,
+        media: None,
+    };
+    let voice = || protocol::VoiceNote { duration: 4_000, waveform: vec![120, 60, 200, 30] };
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: key("u7002"),
+            client_id: "vf-1".into(),
+            text: String::new(),
+            reply_to: None,
+            with: protocol::Outgoing { files: vec![file()], voice: Some(voice()), ..Default::default() },
+        }),
+        Response::Sent { .. }
+    ));
+    let failed = world.until("voice send refused", || {
+        world.messages("u7002").into_iter().find(|m| m.client_id.as_deref() == Some("vf-1") && m.state != SendState::Pending)
+    });
+    match &failed.state {
+        SendState::Failed { reason } => {
+            assert!(
+                reason.contains("doesn't accept voice and video messages"),
+                "expected plain-words refusal, got: {reason}"
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    let updated = world.until("conversation marks voice_notes_forbidden", || {
+        world.conversation("u7002").filter(|c| !c.allows_voice_notes())
+    });
+    assert!(updated.voice_notes_forbidden.contains("Odalys Brandt"), "{}", updated.voice_notes_forbidden);
+
+    // 2. Fetching full profile for Tobin (u7003) with voice_messages_forbidden sets the flag proactively,
+    //    so chatd refuses a subsequent voice send before it reaches the wire.
+    world.steer("voice-forbidden 7003 1");
+    assert!(matches!(
+        world.ask(Request::ConversationInfo { conversation: key("u7003") }),
+        Response::ConversationInfo { .. }
+    ));
+    let tobin = world.until("tobin voice_notes_forbidden", || {
+        world.conversation("u7003").filter(|c| !c.allows_voice_notes())
+    });
+    assert!(tobin.voice_notes_forbidden.contains("Tobin Reyes"), "{}", tobin.voice_notes_forbidden);
+    let calls_before = world.called("SendMedia u7003");
+    let refused = world.ask(Request::Send {
+        conversation: key("u7003"),
+        client_id: "vf-2".into(),
+        text: String::new(),
+        reply_to: None,
+        with: protocol::Outgoing { files: vec![file()], voice: Some(voice()), ..Default::default() },
+    });
+    match refused {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("doesn't accept voice and video messages"), "{detail}");
+        }
+        other => panic!("expected immediate Refused, got {other:?}"),
+    }
+    assert_eq!(world.called("SendMedia u7003"), calls_before, "proactively blocked send must not hit Telegram");
+
+    // 3. Group with send_voices banned fails with plain group wording and records the restriction.
+    world.steer("voice-ban g8001 1");
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: key("g8001"),
+            client_id: "vf-3".into(),
+            text: String::new(),
+            reply_to: None,
+            with: protocol::Outgoing { files: vec![file()], voice: Some(voice()), ..Default::default() },
+        }),
+        Response::Sent { .. }
+    ));
+    let group_failed = world.until("group voice send refused", || {
+        world.messages("g8001").into_iter().find(|m| m.client_id.as_deref() == Some("vf-3") && m.state != SendState::Pending)
+    });
+    match &group_failed.state {
+        SendState::Failed { reason } => {
+            assert!(reason.contains("aren't allowed in this group"), "{reason}");
+        }
+        other => panic!("expected Failed for group, got {other:?}"),
+    }
+    let group_row = world.until("group marks voice_notes_forbidden", || {
+        world.conversation("g8001").filter(|c| !c.allows_voice_notes())
+    });
+    assert!(group_row.voice_notes_forbidden.contains("aren't allowed in this group"), "{}", group_row.voice_notes_forbidden);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn voice_transcription_streams_update_persists_across_restart_and_reports_trial_exhausted() {
+    let mut world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.transcribe, "Telegram must advertise transcribe capability");
+
+    // Incoming voice message (id 15 in u7002 via `steer("voice")`).
+    world.steer("voice");
+    let voice_msg = world.until("incoming voice message", || {
+        world.messages("u7002").into_iter().find(|m| m.attachments.iter().any(|a| !a.waveform.is_empty()))
+    });
+    assert!(voice_msg.attachments[0].transcription.is_none(), "never transcribe automatically");
+    assert_eq!(world.called("TranscribeAudio"), 0, "no automatic transcription call");
+
+    // 1. Pending transcription response followed by `updateTranscribedAudio` completing the text.
+    world.steer("transcribe-mode pending 2");
+    let resp = world.ask(Request::Transcribe {
+        conversation: key("u7002"),
+        message_id: voice_msg.id.clone(),
+    });
+    let pending = match resp {
+        Response::Transcription { transcription } => transcription,
+        other => panic!("expected Transcription, got {other:?}"),
+    };
+    assert!(pending.pending);
+    assert_eq!(pending.id, 901);
+    assert_eq!(pending.text, "Meet at the");
+    assert_eq!(pending.trial_remains, Some(1));
+    assert!(pending.trial_resets_at.is_some());
+    assert_eq!(world.called(&format!("TranscribeAudio u7002 {}", voice_msg.id)), 1);
+
+    // Final part arrives via updateTranscribedAudio.
+    world.steer(&format!("transcribe-update u7002 {} 0 Meet at the trailhead at seven.", voice_msg.id));
+    let completed = world.until("transcription completed by update", || {
+        let msg = world.message("u7002", &voice_msg.id)?;
+        let tr = msg.attachments.first()?.transcription.clone()?;
+        (!tr.pending && tr.text == "Meet at the trailhead at seven.").then_some(tr)
+    });
+    assert_eq!(completed.id, 901);
+    assert_eq!(completed.trial_remains, Some(1));
+
+    // Rate thumbs up via messages.rateTranscribedAudio.
+    assert_eq!(
+        world.ask(Request::RateTranscript {
+            conversation: key("u7002"),
+            message_id: voice_msg.id.clone(),
+            transcription_id: 901,
+            good: true,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.called(&format!("RateTranscribedAudio u7002 {} 901 true", voice_msg.id)), 1);
+
+    // Persisted in store across chatd restart.
+    world.restart();
+    world.connected();
+    let after_restart = world.until("transcription survives restart", || {
+        let msg = world.message("u7002", &voice_msg.id)?;
+        let tr = msg.attachments.first()?.transcription.clone()?;
+        (tr.text == "Meet at the trailhead at seven." && tr.rated == Some(true)).then_some(tr)
+    });
+    assert!(!after_restart.pending);
+
+    // 2. Trial exhausted (PREMIUM_ACCOUNT_REQUIRED) records the Premium explanation.
+    world.steer("transcribe-mode exhausted 0");
+    let resp = world.ask(Request::Transcribe {
+        conversation: key("u7002"),
+        message_id: voice_msg.id.clone(),
+    });
+    let exhausted = match resp {
+        Response::Transcription { transcription } => transcription,
+        other => panic!("expected Transcription on exhausted trial, got {other:?}"),
+    };
+    assert!(!exhausted.pending);
+    assert_eq!(exhausted.trial_remains, Some(0));
+    assert!(
+        exhausted.failed.as_deref().unwrap_or("").contains("Telegram Premium"),
+        "expected Premium explanation, got: {:?}",
+        exhausted.failed
+    );
 }

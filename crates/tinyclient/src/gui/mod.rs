@@ -41,6 +41,7 @@ mod shortcuts;
 #[cfg(any(feature = "gui-shot", feature = "demo"))]
 pub(crate) mod shot_demo;
 mod state;
+pub(in crate::gui) mod streamer;
 mod theme;
 mod tiny;
 mod time;
@@ -303,9 +304,9 @@ impl Shell {
                     this.move_cursor(false, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &ListOpen, _, cx| {
+            .on_action(cx.listener(|this, _: &ListOpen, window, cx| {
                 if !this.first_run_key("enter", cx) {
-                    this.open_cursor(cx);
+                    this.open_cursor(window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &ListFold, _, cx| this.fold_cursor(false, cx)))
@@ -461,6 +462,7 @@ pub(crate) fn dispatch_binding(id: &str, window: &mut gpui::Window, cx: &mut App
         "accept" => go!(call::Accept),
         "decline" => go!(call::Decline),
         "go-to-call" => go!(call::Jump),
+        "popout-call" => go!(call::TogglePopout),
         "about" => go!(About),
         "check-updates" => go!(CheckForUpdates),
         "add-account" => go!(AddAccount),

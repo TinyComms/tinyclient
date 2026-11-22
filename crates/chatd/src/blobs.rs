@@ -795,7 +795,7 @@ impl Cache {
                 // which the server sends with the adapter. `Blobs::new` taking a way to reach
                 // the adapters would let it come here too.
                 let url = self.hub.store().media(account, std::slice::from_ref(&avatar.id)).ok().and_then(|mut known| known.pop()).map(|(_, url)| url);
-                if url.is_none_or(|url| self.hosts.trust(account.network, &url) != Some(fetch::Trust::Open)) {
+                if url.is_none_or(|url| self.hosts.trust_for(Some(account), account.network, &url) != Some(fetch::Trust::Open)) {
                     continue;
                 }
                 if let Err(err) = self.request(account, &[avatar.id], None, None, None) {
@@ -1046,6 +1046,7 @@ impl Cache {
             }
             let cache_cap = self.cap.load(Ordering::Relaxed);
             let want = fetch::Want {
+                account: Some(account),
                 network: account.network,
                 file: &file,
                 url: &url,
@@ -1136,6 +1137,7 @@ impl Cache {
         }
         let part = dir.join(format!(".{}.span.part", name_of(id)));
         let want = fetch::Want {
+            account: None,
             network: account.network,
             file: &file,
             url: &url,

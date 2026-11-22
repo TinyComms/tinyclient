@@ -107,6 +107,9 @@ impl Call {
                 }
             }
             MediaRequest::Camera { on } => {
+                if on {
+                    self.controls.set_camera_preview(false);
+                }
                 if on && (self.voice.is_some() || self.tiny.is_some()) {
                     if let Err(words) = picture::probe_camera() {
                         return MediaResponse::Refused { detail: words };
@@ -117,6 +120,19 @@ impl Call {
                     self.controls.set_camera(on);
                 }
             }
+            MediaRequest::CameraPreview { on } => {
+                if on && (self.voice.is_some() || self.tiny.is_some()) {
+                    if let Err(words) = picture::probe_camera() {
+                        return MediaResponse::Refused { detail: words };
+                    }
+                }
+                self.controls.set_camera_preview(on);
+                return MediaResponse::Done;
+            }
+            MediaRequest::CameraSettings(settings) => {
+                picture::choose_camera_settings(settings);
+                return MediaResponse::Done;
+            }
             MediaRequest::ShareWatch { source } => {
                 match &source {
                     Some(user_id) => tracing::info!(user_id = %user_id, "watch on"),
@@ -125,6 +141,27 @@ impl Call {
                 self.video.share_decode = source.clone();
                 if self.voice.is_some() || self.tiny.is_some() {
                     self.controls.set_watch(source.is_some());
+                    self.controls.set_watch_sources(
+                        source
+                            .map(|user_id| protocol::WatchSource {
+                                user_id,
+                                kind: protocol::PictureKind::Share,
+                                size: protocol::WatchSize::Large,
+                            })
+                            .into_iter()
+                            .collect(),
+                    );
+                }
+            }
+            MediaRequest::Watch { sources } => {
+                let (max_large, max_small) = crate::video::default_budget();
+                let (accepted, refused) = crate::video::apply_watch_budget(&sources, max_large, max_small);
+                tracing::info!(accepted = accepted.len(), refused = refused.len(), "watch list");
+                self.video.share_decode = accepted.first().map(|s| s.user_id.clone());
+                if self.voice.is_some() || self.tiny.is_some() {
+                    self.controls.set_watch(!accepted.is_empty());
+                    self.controls.set_watch_sources(accepted);
+                    out::send(&MediaResponse::WatchRefused { refused });
                 }
             }
             // A Tiny room's SFU already follows the active speaker. The bookkeeping stays for a
@@ -283,6 +320,10 @@ impl Call {
                 self.controls.set_picture(picture);
                 return MediaResponse::Done;
             }
+            MediaRequest::TinyPictures { pictures } => {
+                self.controls.set_pictures(pictures);
+                return MediaResponse::Done;
+            }
             MediaRequest::TinyE2ee { frame } => {
                 let blocked = self.controls.e2ee(|e2ee| {
                     let before = e2ee.security().mode;
@@ -411,9 +452,18 @@ fn watch_devices(controls: &Controls) {
         let mut listing = audio::listing();
         listing.inputs.truncate(DEVICES_LIMIT);
         listing.outputs.truncate(DEVICES_LIMIT);
-        let now = (listing.inputs, listing.outputs);
+        // Only query camera names while the device menu or preview is open (never thumbnails,
+        // and never under the audio stand-in used by automated voice tests).
+        let cameras = if controls.metering() && std::env::var_os("TINYCLIENT_MEDIAD_AUDIO").is_none() {
+            let mut cams = picture::cameras(None);
+            cams.truncate(DEVICES_LIMIT);
+            cams
+        } else {
+            Vec::new()
+        };
+        let now = (listing.inputs, listing.outputs, cameras);
         if asked || told.as_ref() != Some(&now) {
-            out::send(&MediaResponse::DeviceList { inputs: now.0.clone(), outputs: now.1.clone() });
+            out::send(&MediaResponse::DeviceList { inputs: now.0.clone(), outputs: now.1.clone(), cameras: now.2.clone() });
             told = Some(now);
         }
         asked = controls.listing_due(DEVICES_EVERY);
@@ -509,6 +559,21 @@ pub fn run(args: &[String]) -> u8 {
                 .and_then(|_| args.get(3))
                 .cloned();
             return match crate::rec::run(path, input) {
+                Ok(()) => 0,
+                Err(err) => {
+                    tracing::warn!("mediad: {err}");
+                    1
+                }
+            };
+        }
+        // One round video message: camera, square H.264, video-only MP4, at most a minute.
+        Some("--rec-video") => {
+            let Some(path) = args.get(1).map(std::path::PathBuf::from) else {
+                tracing::warn!("mediad: --rec-video needs a file to record to");
+                return 2;
+            };
+            let input = args.get(2).filter(|flag| flag.as_str() == "--input").and_then(|_| args.get(3)).cloned();
+            return match crate::rec_video::run(path, input) {
                 Ok(()) => 0,
                 Err(err) => {
                     tracing::warn!("mediad: {err}");

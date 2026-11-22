@@ -53,11 +53,14 @@
 
 mod catalog;
 mod content;
+mod open_link;
+mod translate;
 mod fake;
 mod files;
 mod filing;
 mod info;
 mod live;
+mod manage;
 mod members;
 mod peers;
 mod premium;
@@ -67,6 +70,20 @@ mod secret;
 mod send;
 pub mod signin;
 mod sync;
+
+pub(crate) fn capability_ceiling() -> protocol::Capabilities {
+    sync::capability_ceiling()
+}
+
+/// A normal person's call before the full profile arrives: open it in Telegram.
+pub(crate) fn direct_call_ceiling() -> protocol::CallSupport {
+    sync::user_call(false, false, None).support
+}
+
+/// Groups and channels do not place a call here.
+pub(crate) fn other_call() -> protocol::CallSupport {
+    sync::other_call()
+}
 mod wire;
 
 use super::{keep_connected, serve_commands, Command, Context, Failure, Refusal, Signed};
@@ -234,7 +251,7 @@ struct Live {
     /// Messages we sent and the id the shell knows each by, until the echo has passed.
     sent: VecDeque<(i32, String)>,
     random: VecDeque<(i64, String)>,
-    typed: HashMap<String, Instant>,
+    typed: HashMap<String, (Instant, protocol::Compose)>,
     here: Option<Instant>,
     /// Whether people, groups and channels are muted when a chat has no setting of its own.
     muted: [bool; 3],
@@ -279,6 +296,17 @@ struct Live {
     /// Photo albums still arriving or open, so a later item, edit, reaction or deletion
     /// finds the row they share.
     albums: VecDeque<live::HeldAlbum>,
+    /// Forum topic paging cursors per forum: `(offset_date, offset_id, offset_topic, loaded, total, done)`.
+    topic_pages: HashMap<Who, (i32, i32, i32, u32, u32, bool)>,
+    /// Cached `contacts.resolveUsername` lookups (lowercased bare username -> peer or miss),
+    /// populated only on explicit clicks so repeated clicks never repeat flood-limited RPCs.
+    resolved_usernames: HashMap<String, Option<Who>>,
+    /// Live pending join-request counts reported by `updatePendingJoinRequests`.
+    pending_requests: HashMap<Who, u32>,
+    /// Voice/round messages we already sent `readMessageContents` for on this connection.
+    played_sent: VecDeque<(String, i32)>,
+    /// Messages whose `readMessageContents` mention consumption has already been accounted for.
+    contents_read: VecDeque<(String, i32)>,
 }
 
 /// Telegram's own send options, which Telegram carries out.
@@ -288,6 +316,10 @@ pub(super) struct Options {
     pub no_webpage: bool,
     /// Unix seconds: Telegram sends it then.
     pub schedule: Option<i32>,
+    /// Explicit consent to pay up to this many Stars for a paid message.
+    pub allow_paid_stars: Option<i64>,
+    /// Optional peer to post as (channel or anonymous admin, from `channels.getSendAs`).
+    pub send_as: Option<Who>,
 }
 
 /// One connection's worth of an account: what every thread of the adapter shares.
@@ -710,13 +742,31 @@ fn offline(ctx: &Context, command: Command) {
         | Command::SendPaidReaction { reply, .. }
         | Command::TogglePaidReactionPrivacy { reply, .. }
         | Command::SetDefaultReaction { reply, .. }
-        | Command::Edit { reply, .. }
-        | Command::Delete { reply, .. } => drop(reply.send(Err(down()))),
+        | Command::Edit { reply, .. } | Command::EditMedia { reply, .. }
+        | Command::Delete { reply, .. }
+        | Command::DeleteMany { reply, .. }
+        | Command::DeleteParticipantHistory { reply, .. }
+        | Command::ReportSpamMessages { reply, .. } => drop(reply.send(Err(down()))),
         Command::StarsBalance { reply } => drop(reply.send(Err(down()))),
         Command::Members { reply, .. } => drop(reply.send(Err(down()))),
         Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(down()))),
         Command::ConversationInfo { reply, .. } => drop(reply.send(Err(down()))),
-        Command::SetMute { reply, .. } | Command::Leave { reply, .. } | Command::ClearHistory { reply, .. } => drop(reply.send(Err(down()))),
+        Command::SetMute { reply, .. }
+        | Command::SetDisappearing { reply, .. }
+        | Command::SetDefaultDisappearing { reply, .. }
+        | Command::Leave { reply, .. }
+        | Command::ClearHistory { reply, .. } => drop(reply.send(Err(down()))),
+        Command::GetDefaultDisappearing { reply } => drop(reply.send(Err(down()))),
+        Command::FolderSave { reply, .. } => drop(reply.send(Err(down()))),
+        Command::FolderDelete { reply, .. } | Command::FoldersReorder { reply, .. } => drop(reply.send(Err(down()))),
+        Command::SuggestedFolders { reply } => drop(reply.send(Err(down()))),
+        Command::LoadTopics { reply, .. } => drop(reply.send(Err(down()))),
+        Command::TopicCreate { reply, .. } => drop(reply.send(Err(down()))),
+        Command::TopicUpdate { reply, .. } | Command::TopicDelete { reply, .. } => drop(reply.send(Err(down()))),
+        Command::TopicIcons { reply } => drop(reply.send(Err(down()))),
+        Command::ScheduledList { reply, .. } => drop(reply.send(Err(down()))),
+        Command::CancelScheduled { reply, .. } | Command::SendScheduledNow { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Reschedule { reply, .. } => drop(reply.send(Err(down()))),
         Command::Pinned { reply, .. } => drop(reply.send(Err(down()))),
         Command::Pin { reply, .. } => drop(reply.send(Err(down()))),
         Command::Forward { reply, .. } => drop(reply.send(Err(down()))),
@@ -726,8 +776,16 @@ fn offline(ctx: &Context, command: Command) {
         Command::CallHistory { reply, .. } => drop(reply.send(Err(down()))),
         Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(down()))),
         Command::GetPrivacy { reply, .. } | Command::SetPrivacy { reply, .. } => drop(reply.send(Err(down()))),
+        Command::GetAutoDownload { reply } | Command::SetAutoDownload { reply, .. } => drop(reply.send(Err(down()))),
+        Command::GetBoosts { reply, .. } | Command::ApplyBoost { reply, .. } => drop(reply.send(Err(down()))),
+        Command::GetBotMenu { reply, .. } => drop(reply.send(Err(down()))),
+        Command::StartBot { reply, .. } | Command::SharePhone { reply, .. } => drop(reply.send(Err(down()))),
         Command::Search { reply, .. } => drop(reply.send(Err(down()))),
+        Command::JumpToDate { reply, .. } => drop(reply.send(Err(down()))),
+        Command::SearchCalendar { reply, .. } => drop(reply.send(Err(down()))),
         Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
+        Command::OpenLink { reply, .. } => drop(reply.send(Err(down()))),
+        Command::TranslateMessages { reply, .. } => drop(reply.send(Err(down()))),
         Command::SaveGif { reply, .. } | Command::StickerSet { reply, .. } | Command::FaveSticker { reply, .. } => drop(reply.send(Err(down()))),
         Command::PressButton { reply, .. } => drop(reply.send(Err(down()))),
         Command::GetNotifyDefaults { reply }
@@ -739,9 +797,28 @@ fn offline(ctx: &Context, command: Command) {
         Command::EndSession { reply, .. } => drop(reply.send(Err(down()))),
         Command::UnreadItems { reply, .. } => drop(reply.send(Err(down()))),
         Command::MarkUnreadItemsRead { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Transcribe { reply, .. } => drop(reply.send(Err(down()))),
+        Command::RateTranscript { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Translate { reply, .. } => drop(reply.send(Err(down()))),
         Command::SendWith { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
-        Command::StartDirect { reply, .. } | Command::Handoff { reply, .. } => drop(reply.send(Err(down()))),
+        Command::StartDirect { reply, .. }
+        | Command::StartGroup { reply, .. }
+        | Command::CreateGroup { reply, .. }
+        | Command::CreateChannel { reply, .. }
+        | Command::Handoff { reply, .. } => drop(reply.send(Err(down()))),
+        Command::MembersAdd { reply, .. }
+        | Command::SetProfile { reply, .. }
+        | Command::SetAvatar { reply, .. }
+        | Command::SetPresence { reply, .. }
+        | Command::HandleJoinRequest { reply, .. } => drop(reply.send(Err(down()))),
+        Command::InvitePreview { reply, .. } => drop(reply.send(Err(down()))),
+        Command::InviteJoin { reply, .. } => drop(reply.send(Err(down()))),
+        Command::ChatInvites { reply, .. } => drop(reply.send(Err(down()))),
+        Command::CreateInvite { reply, .. } | Command::RevokeInvite { reply, .. } => drop(reply.send(Err(down()))),
+        Command::JoinRequests { reply, .. } => drop(reply.send(Err(down()))),
         Command::OpenForum { reply, .. } => drop(reply.send(Err(down()))),
+        Command::ResolveUsername { reply, .. } => drop(reply.send(Err(down()))),
+        Command::PreviewChannel { reply, .. } | Command::Join { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchPeople(query) => ctx.searched(&query),
         other => other.unsupported(ctx),
     }
@@ -768,6 +845,40 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::OpenForum { conversation_id, reply, .. } => {
             sync::backfill(account, &conversation_id);
             let _ = reply.send(Ok(None));
+        }
+        Command::LoadTopics { conversation_id, query, offset, limit, reply } => {
+            let _ = reply.send(sync::load_topics(account, &conversation_id, query.as_deref(), offset, limit).map_err(refused));
+        }
+        Command::TopicCreate { conversation_id, title, icon_color, icon_emoji_id, reply } => {
+            let _ = reply.send(
+                sync::create_topic(account, &conversation_id, &title, icon_color, icon_emoji_id.as_deref()).map_err(refused),
+            );
+        }
+        Command::TopicUpdate { conversation_id, title, icon_emoji_id, closed, hidden, pinned, reply } => {
+            let _ = reply.send(
+                sync::update_topic(account, &conversation_id, title.as_deref(), icon_emoji_id.as_deref(), closed, hidden, pinned)
+                    .map_err(refused),
+            );
+        }
+        Command::TopicDelete { conversation_id, reply } => {
+            let _ = reply.send(sync::delete_topic(account, &conversation_id).map_err(refused));
+        }
+        Command::TopicIcons { reply } => {
+            let _ = reply.send(catalog::topic_icons(account).map_err(refused));
+        }
+        Command::ScheduledList { conversation_id, reply } => {
+            let _ = reply.send(info::scheduled_list(account, &conversation_id).map_err(refused));
+        }
+        Command::CancelScheduled { conversation_id, scheduled_id, reply } => {
+            let _ = reply.send(info::cancel_scheduled(account, &conversation_id, &scheduled_id).map_err(refused));
+        }
+        Command::SendScheduledNow { conversation_id, scheduled_id, reply } => {
+            let _ = reply.send(info::send_scheduled_now(account, &conversation_id, &scheduled_id).map_err(refused));
+        }
+        Command::Reschedule { conversation_id, scheduled_id, text, post_at, reply } => {
+            let _ = reply.send(
+                info::reschedule(account, &conversation_id, &scheduled_id, text.as_deref(), post_at).map_err(refused),
+            );
         }
         Command::Wanted(ids) => drop(account.files.asked(&ids)),
         Command::Previews(ids) => sync::previews(account, &ids),
@@ -800,19 +911,39 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::SetDefaultReaction { emoji, reply } => {
             let _ = reply.send(react::set_default(account, &emoji).map_err(refused));
         }
+        Command::SendRules { conversation_id, reply } => {
+            let _ = reply.send(info::send_rules(account, &conversation_id).map_err(refused));
+        }
         Command::Edit { conversation_id, message_id, text, spans, suppress_embeds: _, keep_attachments: _, reply } => {
             let _ = reply.send(edit(account, &conversation_id, &message_id, &text, &spans).map_err(refused));
+        }
+        Command::EditMedia { conversation_id, message_id, file, text, spans, invert_media, reply } => {
+            let _ = reply.send(edit_media(account, &conversation_id, &message_id, &file, &text, &spans, invert_media).map_err(refused));
         }
         Command::Delete { conversation_id, message_id, scope, reply } => {
             let _ = reply.send(delete(account, &conversation_id, &message_id, scope).map_err(refused));
         }
+        Command::DeleteMany { conversation_id, message_ids, scope, reply } => {
+            let _ = reply.send(delete_many(account, &conversation_id, &message_ids, scope).map_err(refused));
+        }
+        Command::DeleteParticipantHistory { conversation_id, person_id, reply } => {
+            let _ = reply.send(info::delete_participant_history(account, &conversation_id, &person_id).map_err(refused));
+        }
+        Command::ReportSpamMessages { conversation_id, person_id, message_ids, reply } => {
+            let _ = reply.send(info::report_spam_messages(account, &conversation_id, &person_id, &message_ids).map_err(refused));
+        }
         Command::Typing { conversation_id, activity } => typing(account, &conversation_id, activity),
         Command::FollowLink { conversation_id, message_id } => sync::followed(account, &conversation_id, &message_id),
+        Command::MarkPlayed { conversation_id, message_id } => mark_played(account, &conversation_id, &message_id),
         Command::Draft { conversation_id, text } => save_draft(account, &conversation_id, &text),
         Command::SearchPeople(query) => {
-            let request = tl::functions::contacts::Search { broadcasts: false, bots: false, q: query.clone(), limit: 25 };
+            // `broadcasts` asks for public channels. Bots stay out: the shell hides them.
+            let request = tl::functions::contacts::Search { broadcasts: true, bots: false, q: query.clone(), limit: 25 };
             if let Ok(tl::enums::contacts::Found::Found(found)) = account.ask(&request) {
-                account.learn(&found.users, &[]);
+                account.learn(&found.users, &found.chats);
+                // Learn runs first. A non-member has no preview yet, so refresh drops it; the row is recorded after.
+                keep_found(account, &found.my_results);
+                keep_found(account, &found.results);
             }
             // Resolving is tightly flood-limited: only an explicit, complete @username asks
             // for it, after ranked search. Never hold queued sends up waiting out a flood.
@@ -822,15 +953,67 @@ fn serve(account: &Arc<Account>, command: Command) {
             }) {
                 let request = tl::functions::contacts::ResolveUsername { username: username.to_owned(), referer: None };
                 if let Ok(tl::enums::contacts::ResolvedPeer::Peer(found)) = wire::call(account.wire.as_ref(), &request) {
-                    account.learn(&found.users, &[]);
+                    account.learn(&found.users, &found.chats);
+                    keep_found(account, std::slice::from_ref(&found.peer));
                 }
             }
             // A channel on screen is searched too. The contact search above already stands.
             members::search_open(account, &query);
             ctx.searched(&query);
         }
+        Command::ResolveUsername { username, reply } => {
+            let _ = reply.send(resolve_username(account, &username).map_err(refused));
+        }
         Command::Members { conversation_id, offset, limit, reply } => {
             let _ = reply.send(members::list(account, &conversation_id, offset, limit).map_err(refused));
+        }
+        Command::MembersAdd { conversation_id, people, reply, .. } => {
+            let _ = reply.send(members::add_members(account, &conversation_id, &people).map_err(refused));
+        }
+        Command::StartGroup { people, title, reply } => {
+            let _ = reply.send(members::start_group(account, &people, title.as_deref()).map_err(refused));
+        }
+        Command::CreateGroup { members: people, name, reply } => {
+            let _ = reply.send(members::start_group(account, &people, name.as_deref()).map_err(refused));
+        }
+        Command::CreateChannel { name, kind, private, description, username, reply, .. } => {
+            let _ = reply.send(
+                members::create_channel(account, &name, kind, private, description.as_deref(), username.as_deref())
+                    .map_err(refused),
+            );
+        }
+        Command::MembersRemove { conversation_id, person, reply } => {
+            let _ = reply.send(manage::members_remove(account, &conversation_id, &person).map_err(refused));
+        }
+        Command::ConversationUpdate { conversation_id, title, topic, description, reply } => {
+            let _ = reply.send(
+                manage::update_conversation(account, &conversation_id, title.as_deref(), topic.as_deref(), description.as_deref())
+                    .map_err(refused),
+            );
+        }
+        Command::ConversationPicture { conversation_id, path, reply } => {
+            let _ = reply.send(manage::update_picture(account, &conversation_id, &path).map_err(refused));
+        }
+        Command::ModerateMember { conversation_id, person, action, reply } => {
+            let _ = reply.send(manage::moderate_member(account, &conversation_id, &person, &action).map_err(refused));
+        }
+        Command::SetAdmin { conversation_id, person, rights, reply } => {
+            let _ = reply.send(manage::set_admin(account, &conversation_id, &person, &rights).map_err(refused));
+        }
+        Command::TransferOwnership { conversation_id, person, password, reply } => {
+            let _ = reply.send(manage::transfer_ownership(account, &conversation_id, &person, &password).map_err(refused));
+        }
+        Command::UpdateChatSettings { conversation_id, settings, reply } => {
+            let _ = reply.send(manage::update_settings(account, &conversation_id, &settings).map_err(refused));
+        }
+        Command::AdminLog { conversation_id, limit, reply } => {
+            let _ = reply.send(manage::admin_log(account, &conversation_id, limit).map_err(refused));
+        }
+        Command::SendAsOptions { conversation_id, reply } => {
+            let _ = reply.send(manage::send_as_options(account, &conversation_id).map_err(refused));
+        }
+        Command::SetDefaultSendAs { conversation_id, peer, reply } => {
+            let _ = reply.send(manage::set_default_send_as(account, &conversation_id, &peer).map_err(refused));
         }
         Command::StartDirect { person_id, reply } => {
             // Nothing reaches the other person: the chat exists on Telegram once a message does.
@@ -846,14 +1029,68 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::ProfileIn { person_id, space_id, reply } => {
             let _ = reply.send(info::profile_in(account, &person_id, &space_id).map_err(refused));
         }
+        Command::SetProfile { name, about, pronouns: _, username, emoji, birthday, reply, .. } => {
+            let _ = reply.send(info::set_profile(account, name, about, username, emoji, birthday).map_err(refused));
+        }
+        Command::SetAvatar { path, reply } => {
+            let _ = reply.send(info::set_avatar(account, &path).map_err(refused));
+        }
+        Command::SetPresence { status_emoji, clear_at, reply, .. } => {
+            // Telegram has no manual offline/away switch (and must never send updateStatus offline);
+            // the status slot carries Telegram Premium emoji status with an optional expiry timer.
+            let outcome = match status_emoji {
+                Some(emoji) => info::set_emoji_status(account, &emoji, clear_at).map_err(refused),
+                None => Err(Refusal::Unsupported),
+            };
+            let _ = reply.send(outcome);
+        }
         Command::ConversationInfo { conversation_id, reply } => {
             let _ = reply.send(info::conversation(account, &conversation_id).map_err(refused));
+        }
+        Command::InvitePreview { code, reply, .. } => {
+            let _ = reply.send(info::invite_preview(account, &code).map_err(refused));
+        }
+        Command::InviteJoin { code, reply } => {
+            let _ = reply.send(info::invite_join(account, &code).map_err(refused));
+        }
+        Command::PreviewChannel { conversation_id, reply } => {
+            let _ = reply.send(info::preview_public(account, &conversation_id).map_err(refused));
+        }
+        Command::Join { conversation_id, reply } => {
+            let _ = reply.send(info::join_public(account, &conversation_id).map_err(refused));
+        }
+        Command::ChatInvites { conversation_id, revoked, reply } => {
+            let _ = reply.send(info::chat_invites(account, &conversation_id, revoked).map_err(refused));
+        }
+        Command::CreateInvite { conversation_id, title, expire_date, usage_limit, request_needed, reply } => {
+            let _ = reply.send(
+                info::create_invite(account, &conversation_id, title, expire_date, usage_limit, request_needed)
+                    .map_err(refused),
+            );
+        }
+        Command::RevokeInvite { conversation_id, link, reply } => {
+            let _ = reply.send(info::revoke_invite(account, &conversation_id, &link).map_err(refused));
+        }
+        Command::JoinRequests { conversation_id, link, limit, reply } => {
+            let _ = reply.send(info::join_requests(account, &conversation_id, link, limit).map_err(refused));
+        }
+        Command::HandleJoinRequest { conversation_id, user_id, approved, link, reply } => {
+            let _ = reply.send(
+                info::handle_join_request(account, &conversation_id, user_id.as_deref(), approved, link)
+                    .map_err(refused),
+            );
         }
         Command::SetMute { conversation_id, notify, until, reply } => {
             let _ = reply.send(info::set_mute(account, &conversation_id, notify, until).map_err(refused));
         }
         Command::SetDisappearing { conversation_id, seconds, reply } => {
             let _ = reply.send(info::set_disappearing(account, &conversation_id, seconds).map_err(refused));
+        }
+        Command::GetDefaultDisappearing { reply } => {
+            let _ = reply.send(info::get_default_disappearing(account).map_err(refused));
+        }
+        Command::SetDefaultDisappearing { seconds, reply } => {
+            let _ = reply.send(info::set_default_disappearing(account, seconds).map_err(refused));
         }
         Command::Leave { conversation_id, silent: _, reply } => {
             let _ = reply.send(info::leave(account, &conversation_id).map_err(refused));
@@ -866,6 +1103,18 @@ fn serve(account: &Arc<Account>, command: Command) {
                 filing::file(account, &conversation_id, pinned, archived, folder_add.as_deref(), folder_remove.as_deref())
                     .map_err(refused),
             );
+        }
+        Command::FolderSave { folder, reply } => {
+            let _ = reply.send(filing::save_folder(account, &folder).map_err(refused));
+        }
+        Command::FolderDelete { folder_id, reply } => {
+            let _ = reply.send(filing::delete_folder(account, &folder_id).map_err(refused));
+        }
+        Command::FoldersReorder { order, reply } => {
+            let _ = reply.send(filing::reorder_folders(account, &order).map_err(refused));
+        }
+        Command::SuggestedFolders { reply } => {
+            let _ = reply.send(filing::suggested_folders(account).map_err(refused));
         }
         Command::Pinned { conversation_id, reply } => {
             let _ = reply.send(info::pinned(account, &conversation_id).map_err(refused));
@@ -882,13 +1131,23 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::ReportReasons { reply, .. } => {
             let _ = reply.send(Ok(protocol::ReportReason::ALL.to_vec()));
         }
-        Command::Search { query, scope, cursor, reply, .. } => {
+        Command::Search { query, scope, filters, cursor, reply, .. } => {
             let result = match scope {
-                super::SearchScope::Conversation(id) => info::search_messages(account, &id, &query).map_err(refused),
-                super::SearchScope::Account => info::search_global(account, &query, cursor.as_deref()).map_err(refused),
+                super::SearchScope::Conversation(id) => {
+                    info::search_messages(account, &id, &query, &filters, cursor.as_deref()).map_err(refused)
+                }
+                super::SearchScope::Account => {
+                    info::search_global(account, &query, &filters, cursor.as_deref()).map_err(refused)
+                }
                 super::SearchScope::Space(_) | super::SearchScope::Home => Err(Refusal::Unsupported),
             };
             let _ = reply.send(result.map(super::SearchPage::from));
+        }
+        Command::JumpToDate { conversation_id, date, reply } => {
+            let _ = reply.send(info::jump_to_date(account, &conversation_id, date).map_err(refused));
+        }
+        Command::SearchCalendar { conversation_id, kind, offset_date, reply } => {
+            let _ = reply.send(info::search_calendar(account, &conversation_id, kind, offset_date).map_err(refused));
         }
         Command::SearchShared { conversation_id, kind, before, limit, reply } => {
             let _ = reply.send(info::shared(account, &conversation_id, kind, before.as_deref(), limit).map_err(refused));
@@ -905,8 +1164,67 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::SetPrivacy { key, policy, reply } => {
             let _ = reply.send(info::set_privacy(account, key, &policy).map_err(refused));
         }
+        Command::GetAutoDownload { reply } => {
+            let _ = reply.send(info::get_auto_download(account).map_err(refused));
+        }
+        Command::SetAutoDownload { settings, reply } => {
+            let _ = reply.send(info::set_auto_download(account, &settings).map_err(refused));
+        }
+        Command::GetBoosts { conversation_id, reply } => {
+            let _ = reply.send(info::get_boosts(account, &conversation_id).map_err(refused));
+        }
+        Command::ApplyBoost { conversation_id, reply } => {
+            let _ = reply.send(info::apply_boost(account, &conversation_id).map_err(refused));
+        }
+        Command::GetBotMenu { conversation_id, reply } => {
+            let _ = reply.send(info::bot_menu(account, &conversation_id).map_err(refused));
+        }
+        Command::StartBot { conversation_id, start_param, reply } => {
+            let _ = reply.send(info::start_bot(account, &conversation_id, &start_param).map_err(refused));
+        }
+        Command::SharePhone { conversation_id, reply } => {
+            let _ = reply.send(info::share_phone(account, &conversation_id).map_err(refused));
+        }
         Command::Catalog { kind, space_id, query, cursor, reply } => {
             let _ = reply.send(catalog::catalog(account, kind, space_id.as_deref(), &query, cursor.as_deref()).map_err(refused));
+        }
+        Command::OpenLink { url, reply } => {
+            let _ = reply.send(open_link::open(account, &url).map_err(refused));
+        }
+        Command::TranslateMessages { conversation_id, message_ids, to, reply } => {
+            let _ = reply.send(translate::translate(account, &conversation_id, &message_ids, &to).map_err(refused));
+        }
+        Command::MessageAction { conversation_id, message_id, block_id, action_id, value, reply, .. } => {
+            let action = action_id.as_str();
+            let answer = match action {
+                "tg:giveaway_info" => {
+                    let target_id = value.parse::<i32>().ok().or_else(|| message_id.parse::<i32>().ok()).unwrap_or(0);
+                    info::giveaway_info(account, &conversation_id, target_id).map(Some).map_err(refused)
+                }
+                "tg:game" => {
+                    let target_id = value.parse::<i32>().ok().or_else(|| message_id.parse::<i32>().ok()).unwrap_or(0);
+                    info::game_play(account, &conversation_id, target_id).map(Some).map_err(refused)
+                }
+                "tg:game_scores" => {
+                    let target_id = value.parse::<i32>().ok().or_else(|| message_id.parse::<i32>().ok()).unwrap_or(0);
+                    info::game_scores(account, &conversation_id, target_id).map(Some).map_err(refused)
+                }
+                "tg:webapp"
+                | "tg:webapp_simple"
+                | "tg:webapp_main"
+                | "tg:webapp_app"
+                | "tg:webapp_prolong"
+                | "tg:webapp_data"
+                | "tg:webapp_result"
+                | "tg:attach_menu"
+                | "tg:url_auth"
+                | "tg:url_auth_accept" => {
+                    let target_id = message_id.parse::<i32>().unwrap_or(0);
+                    info::webapp_action(account, &conversation_id, target_id, action, &block_id, &value).map(Some).map_err(refused)
+                }
+                _ => Err(Refusal::Unsupported),
+            };
+            let _ = reply.send(answer);
         }
         Command::SaveGif { id, unsave, reply } => {
             let _ = reply.send(catalog::save_gif(account, &id, unsave).map_err(refused));
@@ -956,6 +1274,15 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::MarkUnreadItemsRead { conversation_id, kind, message_ids, reply } => {
             let _ = reply.send(info::mark_unread_items_read(account, &conversation_id, kind, &message_ids).map_err(refused));
         }
+        Command::Transcribe { conversation_id, message_id, reply } => {
+            let _ = reply.send(info::transcribe(account, &conversation_id, &message_id).map_err(refused));
+        }
+        Command::RateTranscript { conversation_id, message_id, transcription_id, good, reply } => {
+            let _ = reply.send(info::rate_transcript(account, &conversation_id, &message_id, transcription_id, good).map_err(refused));
+        }
+        Command::Translate { conversation_id, message_id, to, reply } => {
+            let _ = reply.send(translate::one(account, &conversation_id, &message_id, &to).map_err(refused));
+        }
         Command::Handoff { conversation_id, reply } => {
             let link = Who::parse(&conversation_id).map(|(who, _)| {
                 let handle = account.dir().get(who).map(|known| known.handle.clone()).unwrap_or_default();
@@ -980,6 +1307,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             };
             let _ = reply.send(answer);
         }
+        Command::Played { conversation_id, message_id } => played(account, &conversation_id, &message_id),
         Command::SignOut(reply) => {
             // Ends the session on Telegram, so the device list no longer shows it. What the
             // link was down for belongs to this session and not the next.
@@ -993,6 +1321,94 @@ fn serve(account: &Arc<Account>, command: Command) {
         // (a full photo, a file, a video) cannot be fetched until the cache hands Telegram's
         // `Fetch`es to the adapter.
         other => other.unsupported(ctx),
+    }
+}
+
+const RESOLVED_CACHE: usize = 256;
+
+/// A chat named by search. A member is a normal row. Anyone else is a preview, and is not joined.
+fn keep_found(account: &Account, peers: &[tl::enums::Peer]) {
+    for peer in peers {
+        let who = Who::of(peer);
+        if matches!(who, Who::User(_)) {
+            continue;
+        }
+        if sync::member(account, who) {
+            sync::ensure_row(account, who, None);
+        } else {
+            sync::ensure_preview_row(account, who);
+        }
+    }
+}
+
+/// Resolves a public Telegram `@username` on click, checking the local directory and
+/// in-connection cache before issuing `contacts.resolveUsername`. Never joins a channel.
+fn resolve_username(account: &Account, username: &str) -> Result<Option<(String, String)>, Fault> {
+    let bare = username.trim().trim_start_matches('@');
+    if !(3..=32).contains(&bare.len()) || !bare.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') {
+        return Ok(None);
+    }
+    let lower = bare.to_ascii_lowercase();
+    let who = if let Some(known) = account.dir().find_by_handle(bare) {
+        Some(known)
+    } else if let Some(cached) = account.live().resolved_usernames.get(&lower).copied() {
+        cached
+    } else {
+        let request = tl::functions::contacts::ResolveUsername { username: bare.to_owned(), referer: None };
+        match wire::call(account.wire.as_ref(), &request) {
+            Ok(tl::enums::contacts::ResolvedPeer::Peer(found)) => {
+                account.learn(&found.users, &found.chats);
+                let peer = Who::of(&found.peer);
+                let mut live = account.live();
+                if live.resolved_usernames.len() >= RESOLVED_CACHE {
+                    live.resolved_usernames.clear();
+                }
+                live.resolved_usernames.insert(lower, Some(peer));
+                Some(peer)
+            }
+            Err(fault) if fault.is("USERNAME_NOT_OCCUPIED") || fault.is("USERNAME_INVALID") => {
+                let mut live = account.live();
+                if live.resolved_usernames.len() >= RESOLVED_CACHE {
+                    live.resolved_usernames.clear();
+                }
+                live.resolved_usernames.insert(lower, None);
+                None
+            }
+            Err(fault) => return Err(fault),
+        }
+    };
+    let Some(who) = who else {
+        return Ok(None);
+    };
+    let recorded = if matches!(who, Who::User(_)) || sync::member(account, who) {
+        sync::ensure_row(account, who, None)
+    } else {
+        sync::ensure_preview_row(account, who)
+    };
+    if !recorded {
+        return Ok(None);
+    }
+    Ok(Some((who.text(), account.dir().name(who))))
+}
+
+/// A round video message started. Telegram is told the contents were played, the same call
+/// the official apps send for a voice or video message. A channel uses the channel form.
+fn played(account: &Account, conversation: &str, message: &str) {
+    let (Some((who, _)), Ok(id)) = (Who::parse(conversation), message.parse::<i32>()) else {
+        return;
+    };
+    if id <= 0 {
+        return;
+    }
+    let told = match who {
+        Who::Channel(_) => match account.input_channel(who) {
+            Ok(channel) => account.ask(&tl::functions::channels::ReadMessageContents { channel, id: vec![id] }).map(drop),
+            Err(fault) => Err(fault),
+        },
+        _ => account.ask(&tl::functions::messages::ReadMessageContents { id: vec![id] }).map(drop),
+    };
+    if let Err(fault) = told {
+        tracing::warn!("chatd: Telegram: played: {fault}");
     }
 }
 
@@ -1025,6 +1441,50 @@ fn mark_read(account: &Account, conversation: &str, message: &str) {
     if let (true, who @ Who::Channel(_), Some(root)) = (read, who, topic) {
         if account.dir().get(who).is_some_and(|known| known.broadcast) {
             sync::comment_unread(account, who, root, 0);
+        }
+    }
+}
+
+/// Tells Telegram a voice or round video message's contents were listened to, once per message.
+/// Follows the same rule as `mark_read`: reported when playback starts, with no opt-out switch.
+fn mark_played(account: &Account, conversation: &str, message: &str) {
+    let (Some((who, _topic)), Ok(id)) = (Who::parse(conversation), message.parse::<i32>()) else {
+        return;
+    };
+    let Ok(Some(stored)) = account.ctx.stored_message(conversation, message) else {
+        return;
+    };
+    if stored.outgoing || !stored.media_unread || stored.attachments.iter().any(|a| a.view_once) {
+        return;
+    }
+    let key = (conversation.to_owned(), id);
+    {
+        let mut live = account.live();
+        if live.played_sent.contains(&key) {
+            return;
+        }
+        if live.played_sent.len() >= 512 {
+            live.played_sent.pop_front();
+        }
+        live.played_sent.push_back(key.clone());
+    }
+    let target = sync::comment_target(account, conversation)
+        .ok()
+        .flatten()
+        .map(|(group, _)| group)
+        .unwrap_or(who);
+    account.here();
+    let told = match target {
+        Who::Channel(_) => account
+            .input_channel(target)
+            .and_then(|channel| account.ask(&tl::functions::channels::ReadMessageContents { channel, id: vec![id] }).map(drop)),
+        _ => account.ask(&tl::functions::messages::ReadMessageContents { id: vec![id] }).map(drop),
+    };
+    match told {
+        Ok(()) => live::mark_contents_read(account, conversation, id),
+        Err(fault) => {
+            account.live().played_sent.retain(|entry| entry != &key);
+            tracing::warn!("chatd: Telegram: readMessageContents: {fault}");
         }
     }
 }
@@ -1089,9 +1549,28 @@ fn remember_random(account: &Account, random: i64, client_id: &str) {
     live.random.push_back((random, client_id.to_owned()));
 }
 
+fn check_schedule_target(account: &Account, who: Who, opts: Options) -> Result<(), Fault> {
+    if opts.schedule == Some(protocol::SCHEDULE_WHEN_ONLINE as i32) {
+        match who {
+            Who::User(uid) if uid != account.me => {
+                let dir = account.dir();
+                let known = dir.get(who);
+                if known.as_ref().is_some_and(|known| known.bot || !known.seen.is_empty()) {
+                    return Err(Fault::Rpc { code: 400, name: "SCHEDULE_STATUS_PRIVATE".to_owned(), value: None });
+                }
+            }
+            _ => {
+                return Err(Fault::Rpc { code: 400, name: "SCHEDULE_STATUS_PRIVATE".to_owned(), value: None });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn send_text(account: &Account, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, opts: Options, spans: &[protocol::Span]) -> Result<protocol::Message, Fault> {
     let invalid = || Fault::Rpc { code: 400, name: "PEER_ID_INVALID".to_owned(), value: None };
     let (who, topic) = Who::parse(conversation).ok_or_else(invalid)?;
+    check_schedule_target(account, who, opts)?;
     // The comments of a channel post are held in the discussion group behind it: the send
     // names that, under the echo of the post itself, where Telegram's own apps write them.
     let (who, topic) = sync::comment_target(account, conversation)?.map(|(group, echo)| (group, Some(echo))).unwrap_or((who, topic));
@@ -1117,10 +1596,10 @@ fn send_text(account: &Account, conversation: &str, client_id: &str, text: &str,
         entities,
         schedule_date: opts.schedule,
         schedule_repeat_period: None,
-        send_as: None,
+        send_as: opts.send_as.and_then(|who| account.input(who).ok()),
         quick_reply_shortcut: None,
         effect: None,
-        allow_paid_stars: None,
+        allow_paid_stars: opts.allow_paid_stars,
         suggested_post: None,
         rich_message: None,
     };
@@ -1168,9 +1647,73 @@ fn edit(account: &Account, conversation: &str, message: &str, text: &str, spans:
     Ok(())
 }
 
-fn delete(account: &Account, conversation: &str, message: &str, scope: protocol::DeleteScope) -> Result<(), Fault> {
+fn edit_media(
+    account: &Account,
+    conversation: &str,
+    message: &str,
+    file: &protocol::OutgoingFile,
+    text: &str,
+    spans: &[protocol::Span],
+    invert_media: bool,
+) -> Result<(), Fault> {
     let invalid = || Fault::Rpc { code: 400, name: "MESSAGE_ID_INVALID".to_owned(), value: None };
     let ((who, _), id) = (Who::parse(conversation).ok_or_else(invalid)?, message.parse::<i32>().map_err(|_| invalid())?);
+    let media = send::upload_single(account, conversation, &format!("edit-{message}"), file).map_err(Fault::Refused)?;
+    let (plain, mut entities) = content::outgoing(text);
+    if !plain.is_empty() && entities.is_none() {
+        if let Ok(Some(stored)) = account.ctx.stored_message(conversation, message) {
+            entities = content::with_stored(&plain, &stored.spans);
+        }
+    }
+    let (plain, entities) = if plain.is_empty() {
+        (String::new(), None)
+    } else if spans.is_empty() {
+        dress(account, conversation, plain, entities)
+    } else {
+        let dir = account.dir();
+        let next = content::apply_mention_spans(&plain, entities.unwrap_or_default(), spans, |uid| {
+            dir.get(Who::User(uid)).and_then(|known| known.hash)
+        });
+        (plain, (!next.is_empty()).then_some(next))
+    };
+    let request = tl::functions::messages::EditMessage {
+        no_webpage: false,
+        invert_media,
+        peer: account.input(who)?,
+        id,
+        message: Some(plain),
+        media: Some(media),
+        reply_markup: None,
+        entities,
+        schedule_date: None,
+        schedule_repeat_period: None,
+        quick_reply_shortcut_id: None,
+        rich_message: None,
+    };
+    let answer = account.ask(&request)?;
+    live::answered(account, &answer);
+    Ok(())
+}
+
+fn delete(account: &Account, conversation: &str, message: &str, scope: protocol::DeleteScope) -> Result<(), Fault> {
+    delete_many(account, conversation, &[message.to_owned()], scope)
+}
+
+fn delete_many(account: &Account, conversation: &str, message_ids: &[String], scope: protocol::DeleteScope) -> Result<(), Fault> {
+    let invalid = || Fault::Rpc { code: 400, name: "MESSAGE_ID_INVALID".to_owned(), value: None };
+    if message_ids.is_empty() {
+        return Err(invalid());
+    }
+    let (who, _) = Who::parse(conversation).ok_or_else(invalid)?;
+    let mut parsed: Vec<(String, i32)> = Vec::with_capacity(message_ids.len());
+    let mut seen = HashSet::new();
+    for raw in message_ids {
+        let id = raw.parse::<i32>().map_err(|_| invalid())?;
+        if !seen.insert(id) {
+            return Err(invalid());
+        }
+        parsed.push((raw.clone(), id));
+    }
     match who {
         Who::Channel(_) => {
             if scope == protocol::DeleteScope::Me {
@@ -1181,48 +1724,62 @@ fn delete(account: &Account, conversation: &str, message: &str, scope: protocol:
                 });
             }
             let channel = account.input_channel(who)?;
-            account.ask(&tl::functions::channels::DeleteMessages { channel, id: vec![id] })?;
+            for chunk in parsed.chunks(100) {
+                let ids: Vec<i32> = chunk.iter().map(|(_, id)| *id).collect();
+                account.ask(&tl::functions::channels::DeleteMessages { channel: channel.clone(), id: ids })?;
+            }
         }
         _ => {
             let revoke = scope == protocol::DeleteScope::Everyone;
-            account.ask(&tl::functions::messages::DeleteMessages { revoke, id: vec![id] })?;
+            for chunk in parsed.chunks(100) {
+                let ids: Vec<i32> = chunk.iter().map(|(_, id)| *id).collect();
+                account.ask(&tl::functions::messages::DeleteMessages { revoke, id: ids })?;
+            }
         }
     }
-    let _ = account.ctx.deleted(conversation, message);
     let noted = match who {
         Who::Channel(_) => Some(who),
         _ => None,
     };
-    account.forget_placed(noted, id);
+    for (raw, id) in parsed {
+        let _ = account.ctx.deleted(conversation, &raw);
+        account.forget_placed(noted, id);
+    }
     Ok(())
 }
 
 fn typing(account: &Account, conversation: &str, activity: protocol::Compose) {
-    // Keystrokes are paced. A recording or an upload is not: the other person should see it now.
-    deliver(account, conversation, activity_action(activity, 0), activity == protocol::Compose::Typing);
+    if activity == protocol::Compose::Cancel {
+        deliver_cancel(account, conversation);
+        return;
+    }
+    // Repeated signals for the same activity are paced at TYPING_EVERY (8 s); switching activities
+    // (e.g. typing -> recording a voice message) goes out right away.
+    deliver(account, conversation, activity_action(activity, 0), Some(activity));
 }
 
 /// An upload's progress, 0 to 100. Not paced: each new percent is one signal.
 pub(super) fn show_upload(account: &Account, conversation: &str, activity: protocol::Compose, progress: i32) {
-    deliver(account, conversation, activity_action(activity, progress), false);
+    deliver(account, conversation, activity_action(activity, progress), None);
 }
 
-/// The other person should see that an upload was abandoned.
+/// The other person should see that a recording or upload was abandoned.
 pub(super) fn deliver_cancel(account: &Account, conversation: &str) {
-    deliver(account, conversation, tl::enums::SendMessageAction::SendMessageCancelAction, false);
+    account.live().typed.remove(conversation);
+    deliver(account, conversation, tl::enums::SendMessageAction::SendMessageCancelAction, None);
 }
 
-fn deliver(account: &Account, conversation: &str, action: tl::enums::SendMessageAction, paced: bool) {
+fn deliver(account: &Account, conversation: &str, action: tl::enums::SendMessageAction, pace_as: Option<protocol::Compose>) {
     let Some((who, topic)) = Who::parse(conversation) else {
         return;
     };
-    if paced {
+    if let Some(activity) = pace_as {
         let mut live = account.live();
-        if live.typed.get(conversation).is_some_and(|told| told.elapsed() < TYPING_EVERY) {
+        if live.typed.get(conversation).is_some_and(|(told, prev)| *prev == activity && told.elapsed() < TYPING_EVERY) {
             return;
         }
-        live.typed.retain(|_, told| told.elapsed() < TYPING_EVERY);
-        live.typed.insert(conversation.to_owned(), Instant::now());
+        live.typed.retain(|_, (told, _)| told.elapsed() < TYPING_EVERY);
+        live.typed.insert(conversation.to_owned(), (Instant::now(), activity));
     }
     account.here();
     if let Ok(peer) = account.input(who) {
@@ -1238,13 +1795,15 @@ fn activity_action(activity: protocol::Compose, progress: i32) -> tl::enums::Sen
     match activity {
         protocol::Compose::Typing => SendMessageTypingAction,
         protocol::Compose::RecordingVoice => SendMessageRecordAudioAction,
-        protocol::Compose::RecordingVideo => SendMessageRecordVideoAction,
+        protocol::Compose::RecordingVideo => SendMessageRecordRoundAction,
         protocol::Compose::UploadingPhoto => SendMessageUploadPhotoAction(tl::types::SendMessageUploadPhotoAction { progress }),
         protocol::Compose::UploadingVideo => SendMessageUploadVideoAction(tl::types::SendMessageUploadVideoAction { progress }),
         protocol::Compose::UploadingAudio => SendMessageUploadAudioAction(tl::types::SendMessageUploadAudioAction { progress }),
         protocol::Compose::UploadingFile => SendMessageUploadDocumentAction(tl::types::SendMessageUploadDocumentAction { progress }),
         protocol::Compose::ChoosingSticker => SendMessageChooseStickerAction,
         protocol::Compose::PlayingGame => SendMessageGamePlayAction,
+        protocol::Compose::Speaking => SpeakingInGroupCallAction,
+        protocol::Compose::Cancel => SendMessageCancelAction,
     }
 }
 
@@ -1558,6 +2117,29 @@ pub fn prove_telegram_invoices() -> Result<(), String> {
     content::prove_invoices()
 }
 
+/// The lab's telegram-giveaways driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_giveaways() -> Result<(), String> {
+    content::prove_giveaways()
+}
+
+/// The lab's telegram-games driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_games() -> Result<(), String> {
+    content::prove_games()
+}
+
+/// The lab's telegram-webapps driver. A build without this stays up and the driver fails.
+pub fn prove_telegram_webapps() -> Result<(), String> {
+    content::prove_webapps()
+}
+
+pub fn prove_telegram_round() -> Result<(), String> {
+    protocol::prove_round_video()
+}
+
+pub fn prove_telegram_round_record() -> Result<(), String> {
+    protocol::prove_round_record()
+}
+
 /// The lab's telegram-location driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_location() -> Result<(), String> {
     content::prove_location()?;
@@ -1755,8 +2337,20 @@ pub fn prove_telegram_typing_activity() -> Result<(), String> {
     if live::noted(&SendMessageChooseStickerAction) != Some(protocol::Compose::ChoosingSticker) {
         return Err("choosing a sticker was read as typing".into());
     }
+    if live::noted(&SendMessageRecordRoundAction) != Some(protocol::Compose::RecordingVideo) {
+        return Err("recording a round video was read as typing".into());
+    }
+    if live::noted(&SpeakingInGroupCallAction) != Some(protocol::Compose::Speaking) {
+        return Err("speaking in a call was read as typing".into());
+    }
     if live::action_word(&activity_action(protocol::Compose::RecordingVoice, 0)) != "record-audio" {
         return Err("recording a voice note was not told as a recording".into());
+    }
+    if live::action_word(&activity_action(protocol::Compose::RecordingVideo, 0)) != "record-video" {
+        return Err("recording a video note was not told as a recording".into());
+    }
+    if live::action_word(&activity_action(protocol::Compose::Cancel, 0)) != "cancel" {
+        return Err("cancelling a recording was not told as cancel".into());
     }
     Ok(())
 }
