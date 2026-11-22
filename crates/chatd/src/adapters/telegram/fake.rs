@@ -630,6 +630,8 @@ struct World {
     /// The next `upload.GetFile` is refused with a flood wait of this many seconds, once.
     flood_file: Option<u32>,
     revoked: bool,
+    /// The account has as many pinned chats as Telegram allows (`pins-full`).
+    pins_full: bool,
     /// Tobin was added to the Family folder (`folder`).
     family_grew: bool,
     /// The Work folder now takes its chats by kind and leaves read ones out (`exclude-read`).
@@ -809,6 +811,7 @@ impl World {
             flood_send: None,
             flood_file: None,
             revoked: false,
+            pins_full: false,
             family_grew: false,
             lost_reads: false,
             unread_marks: HashMap::new(),
@@ -2882,6 +2885,10 @@ impl World {
             // Telegram's own apps pinned the group; then reordered the pins without saying how.
             "pin" => vec![update(tl::types::UpdateDialogPinned { pinned: true, folder_id: None, peer: tl::types::DialogPeer { peer: Who::Group(CREW).peer() }.into() }.into())],
             "pins" => vec![update(tl::types::UpdatePinnedDialogs { folder_id: None, order: None }.into())],
+            "pins-full" => {
+                self.pins_full = true;
+                Vec::new()
+            }
             // Someone pinned or unpinned a message of the group from another device:
             // `message-pin 20`, `message-unpin 20`.
             word @ ("message-pin" | "message-unpin") => {
@@ -3589,6 +3596,25 @@ impl World {
                 make(100, "Unread", false, true, "Only unread chats."),
                 make(101, "Personal", true, false, "Only private chats with contacts."),
             ]);
+        }
+        if let Some(request) = asked::<f::messages::ToggleDialogPin>(body) {
+            let tl::enums::InputDialogPeer::Peer(dialog) = &request.peer else {
+                return Err(rpc(400, "PEER_ID_INVALID", None));
+            };
+            let peer = input_who(&dialog.peer);
+            if request.pinned && self.pins_full {
+                self.log(&format!("ToggleDialogPin {} refused", peer.text()));
+                return Err(rpc(400, "PINNED_DIALOGS_TOO_MUCH", None));
+            }
+            self.log(&format!("ToggleDialogPin {} {}", peer.text(), request.pinned));
+            return answer(true);
+        }
+        if let Some(request) = asked::<f::folders::EditPeerFolders>(body) {
+            for moved in &request.folder_peers {
+                let tl::enums::InputFolderPeer::Peer(moved) = moved;
+                self.log(&format!("EditPeerFolders {} {}", input_who(&moved.peer).text(), moved.folder_id));
+            }
+            return answer(updates(Vec::new()));
         }
         if let Some(request) = asked::<f::messages::UpdatePinnedMessage>(body) {
             let peer = input_who(&request.peer);

@@ -4746,6 +4746,53 @@ fn forum_topics_crud_search_icons_and_paging_past_fifty() {
 }
 
 #[test]
+fn a_chat_is_pinned_unpinned_archived_and_unarchived_on_telegram() {
+    let world = World::signed_in();
+    world.connected();
+    let can = world.status().0.into_iter().find(|a| a.key == account()).unwrap().can;
+    assert!(can.pin_chats > 0 && can.archive, "the row menu offers both only where the account has them");
+    let file = |id: &str, pinned: Option<bool>, archived: Option<bool>| {
+        world.ask(Request::File { conversation: key(id), pinned, archived, folder_add: None, folder_remove: None })
+    };
+    let main = || world.home(None, Shelf::Main).into_iter().map(|row| row.key.id).collect::<Vec<_>>();
+    world.until("the group in the main list", || main().contains(&"g8001".to_owned()).then_some(()));
+    assert_eq!(world.conversation("g8001").unwrap().pin, None);
+
+    // Pinned: one request, and the row goes above the pin that was there, at once.
+    assert_eq!(file("g8001", Some(true), None), Response::Ok);
+    assert_eq!(world.called("ToggleDialogPin g8001 true"), 1, "{:?}", world.calls());
+    world.until("the group pinned first", || (world.conversation("g8001")?.pin == Some(0)).then_some(()));
+    assert_eq!(world.conversation("u7002").unwrap().pin, Some(1));
+    assert_eq!(main()[..2], ["g8001", "u7002"]);
+
+    // Unpinned: Odalys is the first pin again.
+    assert_eq!(file("g8001", Some(false), None), Response::Ok);
+    assert_eq!(world.called("ToggleDialogPin g8001 false"), 1);
+    world.until("the group unpinned", || world.conversation("g8001")?.pin.is_none().then_some(()));
+    assert_eq!(world.conversation("u7002").unwrap().pin, Some(0));
+
+    // Archived: folder 1, and it leaves the main list for the archive's shelf.
+    assert_eq!(file("g8001", None, Some(true)), Response::Ok);
+    assert_eq!(world.called("EditPeerFolders g8001 1"), 1);
+    world.until("the group archived", || world.conversation("g8001")?.archived.then_some(()));
+    assert!(!main().contains(&"g8001".to_owned()));
+    assert!(world.home(None, Shelf::Archive).iter().any(|row| row.key.id == "g8001"));
+
+    // Unarchived: folder 0, back in the main list.
+    assert_eq!(file("g8001", None, Some(false)), Response::Ok);
+    assert_eq!(world.called("EditPeerFolders g8001 0"), 1);
+    world.until("the group back in the main list", || main().contains(&"g8001".to_owned()).then_some(()));
+
+    // Telegram's pin limit is said in words, and the row stays unpinned.
+    world.steer("pins-full");
+    match file("g8001", Some(true), None) {
+        Response::Error { detail, .. } => assert_eq!(detail, "You've pinned as many chats as Telegram allows. Unpin one first."),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(world.conversation("g8001").unwrap().pin, None);
+}
+
+#[test]
 fn a_message_is_pinned_unpinned_and_follows_the_pins_made_elsewhere() {
     let world = World::signed_in();
     world.connected();
