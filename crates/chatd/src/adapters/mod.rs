@@ -1803,6 +1803,7 @@ pub enum Command {
         propose: Option<i64>,
         reply: Reply<()>,
     },
+    SetVoiceChannelStatus { conversation_id: String, status: Option<String>, reply: Reply<()> },
     /// mediad is up: join or ring on the network, then report through [`Context::voice`].
     CallJoin(String),
     /// Leave, cancel or decline on the network. Also sent when the call failed here (mediad
@@ -1995,6 +1996,7 @@ impl Command {
             | Command::UpdateChatSettings { reply, .. }
             | Command::SetDefaultSendAs { reply, .. }
             | Command::EditChannel { reply, .. }
+            | Command::SetVoiceChannelStatus { reply, .. }
             | Command::MoveChannels { reply, .. }
             | Command::DeleteChannel { reply, .. }
             | Command::SetOverwrite { reply, .. }
@@ -2492,6 +2494,14 @@ impl Context {
     /// is not announced: the row is told alone.
     pub fn occupants(&self, conversation_id: &str, people: Vec<Occupant>, total: u32) {
         self.hub.set_occupants(self.key(conversation_id), Occupants { people, total });
+    }
+
+    pub fn voice_status(&self, conversation_id: &str, status: Option<String>) {
+        self.hub.set_voice_status(self.key(conversation_id), status);
+    }
+
+    pub fn voice_status_channels(&self, guild_id: &str) -> Vec<Key> {
+        self.hub.voice_status_channels(&self.account, guild_id)
     }
 
     /// Records when this account may send again in a slowmode conversation (Unix seconds).

@@ -212,12 +212,8 @@ fn angle(rich: &mut Rich, text: &str, names: &dyn Names, guild: Option<&str>) ->
         if let Some(guild) = guild.filter(|g| digits(g)) {
             rich.span(start, Style::Link { url: format!("https://discord.com/channels/{guild}/{suffix}") });
         }
-    } else if let Some(emoji) = inner.strip_prefix("a:").or_else(|| inner.strip_prefix(':')) {
-        let (name, id) = emoji.split_once(':')?;
-        if !digits(id) || name.is_empty() {
-            return None;
-        }
-        let (file, url) = model::emoji(id, inner.starts_with("a:"));
+    } else if let Some((name, id, animated)) = protocol::discord_emoji_token(&text[..=end]) {
+        let (file, url) = model::emoji(id, animated);
         rich.text.push_str(&format!(":{name}:"));
         rich.span(start, Style::Emoji { file: file.clone() });
         rich.files.push((file, url));

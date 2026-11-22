@@ -127,6 +127,15 @@ impl Shell {
             let words = super::super::security::badge_words(super::super::security::badge(security, call.participants.is_empty()));
             row("call-phone-more-security", "icons/lock.svg", "Call security", Some(words.to_owned()), Some(chevron())).on_click(cx.listener(|this, _, _, cx| this.call_phone_open_sheet(Sheet::Security, cx)))
         });
+        let status = self.snapshot.as_ref().and_then(|snapshot| snapshot.open.as_ref())
+            .filter(|row| row.key == call.conversation).cloned()
+            .or_else(|| self.sidebar_state.find(&self.trees, &call.conversation))
+            .filter(|channel| crate::gui::sidebar::can_set_discord_voice_status(channel, call.state == protocol::CallState::Joined))
+            .map(|channel| row("call-phone-more-status", "icons/pencil.svg", "Set channel status", None, Some(chevron()))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.call_phone_close_sheet(cx);
+                    this.open_voice_status(&channel, cx);
+                })));
         div()
             .child(sheet_title(subject.title.clone()))
             .children(people)
@@ -135,6 +144,7 @@ impl Shell {
                     .on_click(cx.listener(|this, _, _, cx| this.call_phone_open_sheet(Sheet::Devices, cx))),
             )
             .children(security)
+            .children(status)
             .child(label("VOICE"))
             .child(
                 row("call-phone-more-ptt", "icons/hand.svg", "Push to talk", Some(if push { "Hold the button to talk".into() } else { "Your microphone opens when you speak".into() }), Some(switch(push)))

@@ -313,6 +313,11 @@ impl Discord {
             "GUILD_MEMBER_LIST_UPDATE" => self.member_list(from_str(data)?),
             "GUILD_MEMBERS_CHUNK" => self.members_chunk(from_str(data)?)?,
             "VOICE_STATE_UPDATE" => self.voice_state(from_str(data)?),
+            "VOICE_CHANNEL_STATUS_UPDATE" => {
+                let update: super::voice::ChannelStatus = from_str(data)?;
+                self.voice_channel_status(update);
+            }
+            "CHANNEL_STATUSES" => self.voice_channel_statuses(from_str(data)?),
             "GUILD_EMOJIS_UPDATE" | "GUILD_STICKERS_UPDATE" => self.pickables_changed(from_str(data)?),
             "VOICE_SERVER_UPDATE" => self.voice_server(from_str(data)?),
             "STREAM_CREATE" => self.stream_created(data)?,

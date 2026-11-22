@@ -70,6 +70,7 @@ pub const SEND_MESSAGES_IN_THREADS: u64 = 1 << 38;
 pub const MANAGE_WEBHOOKS: u64 = 1 << 29;
 pub const MANAGE_EVENTS: u64 = 1 << 33;
 pub const SEND_VOICE_MESSAGES: u64 = 1 << 46;
+pub const SET_VOICE_CHANNEL_STATUS: u64 = 1 << 48;
 pub const MANAGE_GUILD_EXPRESSIONS: u64 = 1 << 30;
 pub const CREATE_GUILD_EXPRESSIONS: u64 = 1 << 43;
 pub const PIN_MESSAGES: u64 = 1 << 51;

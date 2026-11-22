@@ -3177,6 +3177,11 @@ pub enum Request {
         network: Network,
     },
 
+    /// Sets or clears the ephemeral status of a voice channel.
+    SetVoiceChannelStatus {
+        conversation: Key,
+        status: Option<String>,
+    },
     /// Joins or rings. Starts mediad. One call at a time. Refused with `Unsupported`, and no
     /// mediad, unless the conversation's `call` is `Native`.
     CallStart {

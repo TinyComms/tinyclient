@@ -1467,6 +1467,16 @@ impl Shell {
                         }))
                         .into_any_element(),
                 );
+                let joined = self.snapshot.as_ref().and_then(|snapshot| snapshot.call.as_ref())
+                    .is_some_and(|call| call.conversation == conversation.key && call.state == protocol::CallState::Joined);
+                if super::sidebar::can_set_discord_voice_status(conversation, joined) {
+                    let row = conversation.clone();
+                    items.push(menu_item("set-voice-status", Some("icons/pencil.svg"), "Set channel status…", None)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            this.open_voice_status(&row, cx);
+                        })).into_any_element());
+                }
                 if conversation.key.network == Network::Discord
                     && !conversation.kind.is_direct()
                     && conversation.kind != protocol::ConversationKind::Thread
@@ -2219,6 +2229,7 @@ impl Render for Shell {
             .children(self.create_invite_modal(cx))
             .children(self.create_category_modal(cx))
             .children(self.edit_channel_modal(cx))
+            .children(self.voice_status_modal(cx))
             .children(self.move_channels_modal(cx))
             .children(self.delete_channel_modal(cx))
             .children(self.folder_edit_modal(cx))

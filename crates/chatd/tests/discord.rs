@@ -368,6 +368,10 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
         }
         ("PATCH", ["guilds", _guild, "channels"]) => (204, Value::Null),
         ("PUT", ["channels", _channel, "permissions", _target]) => (204, Value::Null),
+        ("PUT", ["channels", channel, "voice-status"]) => {
+            shared.push("VOICE_CHANNEL_STATUS_UPDATE", json!({"id": channel, "guild_id": "4000", "status": seen.body["status"]}));
+            (204, Value::Null)
+        }
         ("DELETE", ["channels", _channel, "permissions", _target]) => (204, Value::Null),
         ("PUT", ["channels", channel, "recipients", "@me"]) => (200, json!({"id": channel, "type": 1, "is_message_request": false})),
         // Pinning tells every session: the message says it is pinned, and the channel's pins changed.
@@ -3135,6 +3139,32 @@ fn a_move_to_another_voice_channel_is_followed() {
 }
 
 #[test]
+fn voice_channel_status_loads_on_open_and_clears_when_the_last_person_leaves() {
+    let world = World::start();
+    assert!(world.discord.frames_of(36).is_empty());
+    world.ask(Request::Tree { space: world.key("4000"), offset: 0, limit: 500, peek: false });
+    let request = wait("the status request", || world.discord.frames_of(36).pop());
+    assert_eq!(request["d"]["guild_id"], "4000");
+    world.discord.push("CHANNEL_STATUSES", json!({"guild_id": "4000", "channels": [{"id": "4201", "status": "Studying"}]}));
+    wait("the initial voice status", || (world.conversation("4201").topic == "Studying").then_some(()));
+    world.discord.push("VOICE_CHANNEL_STATUS_UPDATE", json!({"id": "4201", "guild_id": "4000", "status": "Two more"}));
+    wait("the changed voice status", || (world.conversation("4201").topic == "Two more").then_some(()));
+    let set = || world.ask(Request::SetVoiceChannelStatus { conversation: world.key("4201"), status: Some("é".repeat(510)) });
+    assert!(matches!(set(), Response::Error { .. }));
+    assert!(world.discord.requests_to("PUT", "/channels/4201/voice-status").is_empty());
+    world.discord.push("GUILD_ROLE_UPDATE", json!({
+        "guild_id": "4000", "role": {"id": "4000", "name": "@everyone", "permissions": ((1u64 << 48) | (1 << 20) | (1 << 10) | (1 << 4)).to_string()}
+    }));
+    wait("the channel status permission", || world.conversation("4201").rights.set_voice_status.then_some(()));
+    assert_eq!(set(), Response::Ok);
+    let put = world.discord.requests_to("PUT", "/channels/4201/voice-status").pop().unwrap();
+    assert_eq!(put.body["status"], "é".repeat(500));
+    wait("the status from the gateway", || (world.conversation("4201").topic == "é".repeat(500)).then_some(()));
+    world.discord.push("VOICE_STATE_UPDATE", json!({"guild_id": "4000", "channel_id": null, "user_id": "2002", "session_id": "voice-dev"}));
+    wait("the empty channel to clear its status", || world.conversation("4201").topic.is_empty().then_some(()));
+}
+
+#[test]
 fn a_voice_channel_lists_its_people_friends_first_then_by_name() {
     let world = World::start();
     let in_voice = || match world.ask(Request::InVoice { network: Some(Network::Discord) }) {
@@ -4130,6 +4160,7 @@ fn a_ready_of_real_size_connects_quickly_within_the_memory_budget_and_is_not_kep
     };
     assert_eq!(spaces.len(), 100);
     // 27 channels, three of them hidden from us.
+    assert!(world.discord.frames_of(36).is_empty(), "voice statuses are not fetched at READY");
     assert_eq!(world.tree("1000000").1.len(), 24);
     assert_eq!(world.people(Some(Relation::Friend), None).len(), 100, "a page of the thousand friends");
 
@@ -4161,8 +4192,9 @@ fn a_ready_of_real_size_connects_quickly_within_the_memory_budget_and_is_not_kep
     // A RESUME (op 6) is allowed here: on a loaded runner the client can miss a heartbeat ACK
     // while it is still parsing a READY this large, and then reconnects. The point of this
     // check is the single identify and the single server opened, so count those.
-    let sent: Vec<u64> = world.discord.frames.lock().unwrap().iter().filter_map(|frame| frame["op"].as_u64()).filter(|op| *op != 1 && *op != 6).collect();
-    assert_eq!(sent, [2, 37], "one identify, heartbeats, and the one server this test opened");
+    let mut sent: Vec<u64> = world.discord.frames.lock().unwrap().iter().filter_map(|frame| frame["op"].as_u64()).filter(|op| *op != 1 && *op != 6).collect();
+    sent.sort_unstable();
+    assert_eq!(sent, [2, 36, 37], "one identify, and statuses and subscription for the one server opened");
 }
 
 #[test]

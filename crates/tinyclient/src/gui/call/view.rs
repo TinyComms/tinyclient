@@ -287,6 +287,9 @@ impl Shell {
         } else {
             "icons/phone.svg"
         };
+        let voice_row = snapshot.open.as_ref().filter(|row| row.key == call.conversation).cloned()
+            .or_else(|| self.sidebar_state.find(&self.trees, &call.conversation));
+        let voice_status = voice_row.as_ref().and_then(crate::gui::sidebar::discord_voice_status);
         let title_row = div()
             .flex_1()
             .min_w_0()
@@ -309,6 +312,7 @@ impl Shell {
                     .child(subject.title.clone()),
             )
             .children(place_chip)
+            .children(voice_status.map(|status| self.voice_status_line(&call.conversation, &status, cx)))
             .child(chip(count_label, theme::text_soft(), theme::hover()))
             .children(self.call_security(&call, Place::TopBar, cx));
         let add_people = can_add_people.then(|| {

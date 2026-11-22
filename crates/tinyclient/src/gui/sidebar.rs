@@ -227,6 +227,7 @@ pub struct State {
     pub create_category: Option<CreateCategoryModal>,
     /// Discord "Edit channel" / "Rename category" modal.
     pub edit_channel: Option<EditChannelModal>,
+    voice_status: Option<VoiceStatusModal>,
     /// Discord bulk channel/category reorder modal.
     pub move_channels: Option<MoveChannelsModal>,
     /// Confirmation modal requiring typing the channel/category name before deleting.
@@ -238,6 +239,13 @@ pub struct CreateCategoryModal {
     pub name: Entity<crate::gui::input::TextInput>,
     pub busy: bool,
     pub error: Option<String>,
+}
+
+struct VoiceStatusModal {
+    target: Key,
+    input: Entity<crate::gui::input::TextInput>,
+    saving: bool,
+    error: Option<String>,
 }
 
 pub struct EditChannelModal {
@@ -485,6 +493,7 @@ impl State {
             browse_channels: None,
             create_category: None,
             edit_channel: None,
+            voice_status: None,
             move_channels: None,
             delete_channel: None,
             discover_input: None,
@@ -2097,19 +2106,16 @@ impl Shell {
                     && !matches!(call.state, protocol::CallState::Failed { .. })
             });
         let join = joins_from_list(c) && !ours;
+        let voice_status = discord_voice_status(c);
         let content = div()
             // 16 a level less the gap after it (none at the top), as the tree's other rows.
             .children((depth > 0).then(|| div().flex_none().w(px(16. * f32::from(depth) - 8.))))
             .gap(px(8.))
             .child(leading)
             .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .type_ui()
-                    .font_weight(tone.weight)
-                    .text_color(title_color)
-                    .child(tree_title(c)),
+                div().min_w_0().flex().flex_col()
+                    .child(div().truncate().type_ui().font_weight(tone.weight).text_color(title_color).child(tree_title(c)))
+                    .children(voice_status.as_ref().map(|status| self.voice_status_line(&c.key, status, cx))),
             )
             .children(status.map(|emoji| div().flex_none().type_small().child(emoji)))
             .children(chat::name_mark(c).filter(|_| c.kind.is_direct()))
@@ -2120,7 +2126,8 @@ impl Shell {
             .children(live.map(|line| div().flex_none().type_micro().text_color(theme::text_faint()).child(line)))
             .children(row_badge(c))
             .when(join, |row| row.group("voice"));
-        list_row(row_id("tree", &c.key), theme::row_height(theme::ROW_ONE), selected, focused, content)
+        let height = if voice_status.is_some() { theme::ROW_MID } else { theme::ROW_ONE };
+        list_row(row_id("tree", &c.key), theme::row_height(height), selected, focused, content)
             .map(|row| {
                 if super::phone::active() {
                     let token = super::phone::token(&["place", picked.key.network.label(), &picked.key.account, &picked.key.id]);
@@ -5297,6 +5304,92 @@ impl Shell {
         )
     }
 
+    pub(super) fn open_voice_status(&mut self, row: &Conversation, cx: &mut Context<Self>) {
+        let input = cx.new(|cx| {
+            let mut input = crate::gui::input::TextInput::new("Channel status", cx);
+            input.set_text(&row.topic, cx);
+            input
+        });
+        self.sidebar_state.voice_status = Some(VoiceStatusModal { target: row.key.clone(), input, saving: false, error: None });
+        cx.notify();
+    }
+
+    pub(super) fn voice_status_line(&self, channel: &Key, status: &str, cx: &mut Context<Self>) -> Div {
+        let mut line = div().min_w_0().overflow_hidden().flex().items_center().type_micro().text_color(theme::text_faint());
+        for fragment in status.split_inclusive('>') {
+            let token = fragment.rfind('<').and_then(|start| protocol::discord_emoji_token(&fragment[start..]).map(|emoji| (start, emoji)));
+            if let Some((start, (name, id, _))) = token {
+                let file = protocol::MediaFile::new(format!("emoji:{id}"), protocol::MediaKind::Emoji);
+                let image = self.people_state.hub().file(&channel.account(), &file, cx).path.map(std::path::PathBuf::from);
+                line = line.child(div().truncate().whitespace_nowrap().child(fragment[..start].to_owned()));
+                line = if let Some(image) = image {
+                    line.child(gpui::img(image).flex_none().size(px(14.)))
+                } else {
+                    line.child(div().flex_none().child(format!(":{name}:")))
+                };
+            } else {
+                line = line.child(div().truncate().whitespace_nowrap().child(fragment.to_owned()));
+            }
+        }
+        line
+    }
+
+    fn save_voice_status(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.sidebar_state.voice_status.as_mut().filter(|modal| !modal.saving) else {
+            return;
+        };
+        let text = modal.input.read(cx).text().trim().to_owned();
+        if text.chars().count() > 500 {
+            modal.error = Some("Use 500 characters or fewer.".into());
+            cx.notify();
+            return;
+        }
+        modal.saving = true;
+        modal.error = None;
+        let conversation = modal.target.clone();
+        let input = modal.input.clone();
+        let request = Request::SetVoiceChannelStatus { conversation, status: (!text.is_empty()).then_some(text) };
+        cx.notify();
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                let Some(modal) = this.sidebar_state.voice_status.as_mut().filter(|modal| modal.input == input) else {
+                    return;
+                };
+                match answer {
+                    Ok(Response::Ok) => this.sidebar_state.voice_status = None,
+                    Ok(Response::Error { detail, .. }) => {
+                        modal.saving = false;
+                        modal.error = Some(detail);
+                    }
+                    _ => {
+                        modal.saving = false;
+                        modal.error = Some("Could not set the channel status.".into());
+                    }
+                }
+                cx.notify();
+            });
+        }).detach();
+    }
+
+    pub(super) fn voice_status_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let modal = self.sidebar_state.voice_status.as_ref()?;
+        Some(div().id("voice-status-backdrop").absolute().inset_0().bg(theme::scrim())
+            .flex().items_center().justify_center()
+            .child(div().id("voice-status-card").p(px(16.)).w(px(380.)).max_w_full()
+                .bg(theme::overlay()).rounded(px(theme::R_FLOAT)).flex().flex_col().gap(px(8.))
+                .child(div().type_title().child("Set channel status"))
+                .child(div().p(px(8.)).bg(theme::canvas()).child(modal.input.clone()))
+                .children(modal.error.iter().map(|error| div().type_small().text_color(theme::danger()).child(error.clone())))
+                .child(div().flex().justify_end().gap(px(8.))
+                    .child(button("voice-status-cancel", ButtonKind::Ghost, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_state.voice_status = None;
+                        cx.notify();
+                    })))
+                    .child(button("voice-status-save", ButtonKind::Primary, if modal.saving { "Saving…" } else { "Save" })
+                        .when(!modal.saving, |button| button.on_click(cx.listener(|this, _, _, cx| this.save_voice_status(cx))))))))
+    }
+
     pub(super) fn open_edit_channel(&mut self, conversation: &Conversation, cx: &mut Context<Self>) {
         let space = match &conversation.space {
             Some(id) => Key { id: id.clone(), ..conversation.key.clone() },
@@ -6330,6 +6423,16 @@ fn voice_count(total: u32, limit: u32) -> Option<(String, bool)> {
 
 /// A stage channel's trailing words: only who is on stage counts, the audience does not.
 /// Nobody on stage reads as an empty channel, so nothing (`02` §4).
+pub(super) fn discord_voice_status(row: &Conversation) -> Option<String> {
+    (row.key.network == Network::Discord && row.kind == ConversationKind::Voice && !row.topic.is_empty())
+        .then(|| row.topic.clone())
+}
+
+pub(super) fn can_set_discord_voice_status(row: &Conversation, joined: bool) -> bool {
+    row.key.network == Network::Discord && row.kind == ConversationKind::Voice
+        && row.rights.set_voice_status && (joined || row.rights.rename)
+}
+
 fn stage_line(occupants: &Occupants) -> Option<String> {
     let speaking = occupants.people.iter().filter(|occupant| occupant.speaking).count();
     (speaking > 0).then(|| format!("Live · {speaking} speaking"))
@@ -6649,6 +6752,22 @@ pub(crate) mod tests {
         respliced(&list, &old, &old, |item| Some((*item).to_owned()), |_| 48.);
         let top = list.logical_scroll_top();
         assert_eq!((top.item_ix, top.offset_in_item, list.item_count()), (2, px(4.), 3));
+    }
+
+    #[test]
+    fn voice_status_actions_require_the_channel_bit_and_either_joining_or_management() {
+        let mut voice = row("lounge", ConversationKind::Voice);
+        voice.topic = "Studying".to_owned();
+        assert_eq!(discord_voice_status(&voice).as_deref(), Some("Studying"));
+        assert!(!can_set_discord_voice_status(&voice, true));
+        voice.rights.set_voice_status = true;
+        assert!(can_set_discord_voice_status(&voice, true));
+        assert!(!can_set_discord_voice_status(&voice, false));
+        voice.rights.rename = true;
+        assert!(can_set_discord_voice_status(&voice, false));
+        voice.kind = ConversationKind::Direct;
+        assert!(discord_voice_status(&voice).is_none());
+        assert!(!can_set_discord_voice_status(&voice, true));
     }
 
     #[test]

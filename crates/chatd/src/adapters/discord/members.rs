@@ -281,6 +281,7 @@ impl Discord {
             state.members.opened = Some(Instant::now());
         }
         self.sync_subscription();
+        self.tell(36, json!({"guild_id": guild}));
     }
 
     /// The shell's screen changed. The Space it names, or the server of the open conversation,

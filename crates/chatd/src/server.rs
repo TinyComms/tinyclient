@@ -854,6 +854,9 @@ impl Chat {
         if conversation.kind == ConversationKind::Voice || conversation.call == CallSupport::Native {
             conversation.occupants = self.hub.occupants(&conversation.key);
         }
+        if conversation.key.network == Network::Discord && conversation.kind == ConversationKind::Voice {
+            conversation.topic = self.hub.voice_status(&conversation.key).unwrap_or_default();
+        }
         conversation.slowmode_until = if conversation.slowmode_seconds == 0 || conversation.rights.slowmode_exempt {
             None
         } else {
@@ -6324,6 +6327,16 @@ impl Chat {
                 Err(err) => call_error(err),
             },
 
+            Request::SetVoiceChannelStatus { conversation, status } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::SetVoiceChannelStatus { conversation_id: conversation.id, status, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::CallStart { conversation } => self.call_start(conversation),
             Request::CallAccept => self.call_accept(),
             // A ring waiting beside a call is declined on its own. Ending the call does not

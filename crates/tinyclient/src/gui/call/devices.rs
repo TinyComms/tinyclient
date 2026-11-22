@@ -516,6 +516,18 @@ impl Shell {
     /// What the device menu holds: a notice when something is not as chosen, MICROPHONE with
     /// its level, SPEAKER with its level, then the speaker test and the settings.
     pub(super) fn call_devices_menu(&self, call: &Call, cx: &mut Context<Self>) -> Div {
+        let row = self.snapshot.as_ref().and_then(|snapshot| snapshot.open.as_ref())
+            .filter(|row| row.key == call.conversation).cloned()
+            .or_else(|| self.sidebar_state.find(&self.trees, &call.conversation));
+        let edit_status = row.filter(|row| {
+            super::super::sidebar::can_set_discord_voice_status(row, call.state == protocol::CallState::Joined)
+        }).map(|row| {
+            menu_item("call-set-voice-status", Some("icons/pencil.svg"), "Set channel status…", None)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.call_menu_close(cx);
+                    this.open_voice_status(&row, cx);
+                }))
+        });
         let test = menu_item("call-test-sound", Some("icons/volume-2.svg"), "Test speakers", None).on_click(cx.listener(|this, _, _, cx| {
             this.call_ask(Request::TestSound, cx);
         }));
@@ -553,6 +565,7 @@ impl Shell {
             .children(peer_volume)
             .child(menu_separator().mx(px(8.)))
             .child(test)
+            .children(edit_status)
             .child(settings)
     }
 }

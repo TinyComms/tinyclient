@@ -96,6 +96,17 @@ impl MediaFile {
     }
 }
 
+/// The name, snowflake and animation flag of a Discord custom emoji token.
+pub fn discord_emoji_token(token: &str) -> Option<(&str, &str, bool)> {
+    let inner = token.strip_prefix('<')?.strip_suffix('>')?;
+    let (marker, emoji) = inner.split_once(':')?;
+    let (name, id) = emoji.split_once(':')?;
+    if !matches!(marker, "" | "a") || name.is_empty() || id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some((name, id, marker == "a"))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MentionKind {

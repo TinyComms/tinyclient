@@ -4201,6 +4201,9 @@ impl Discord {
             }
             Command::Download { id, url, reply } => self.download(id, url, reply),
             Command::Handoff { conversation_id, reply } => drop(reply.send(self.handoff(&conversation_id))),
+            Command::SetVoiceChannelStatus { conversation_id, status, reply } => {
+                answer(reply, self.set_voice_status(&conversation_id, status))
+            }
             Command::CallJoin(conversation_id) => self.call_join(&conversation_id),
             Command::CallLeave(conversation_id) => self.call_leave(&conversation_id),
             Command::CallAudio { muted, deafened } => self.call_audio(muted, deafened),
