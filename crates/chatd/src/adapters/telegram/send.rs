@@ -29,6 +29,7 @@ fn options(with: &Outgoing) -> Options {
         schedule: with.schedule.and_then(|at| i32::try_from(at).ok()),
         allow_paid_stars: with.allow_paid_stars.and_then(|n| i64::try_from(n).ok()).filter(|&n| n > 0),
         send_as: with.send_as.as_deref().and_then(|id| Who::parse(id).map(|(who, _)| who)),
+        effect: with.effect.as_deref().and_then(|id| id.parse().ok()),
     }
 }
 
@@ -299,7 +300,7 @@ fn send_media(
         schedule_repeat_period: None,
         send_as: target.send_as.clone(),
         quick_reply_shortcut: None,
-        effect: None,
+        effect: opts.effect,
         allow_paid_stars: opts.allow_paid_stars,
         suggested_post: None,
     }
@@ -417,7 +418,7 @@ fn files(
                     schedule_date: opts.schedule,
                     send_as: opts.send_as.and_then(|who| account.input(who).ok()),
                     quick_reply_shortcut: None,
-                    effect: None,
+                    effect: opts.effect,
                     allow_paid_stars: opts.allow_paid_stars,
                 })
                 .map_err(words)?;

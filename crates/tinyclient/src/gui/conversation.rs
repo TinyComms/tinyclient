@@ -449,6 +449,8 @@ pub struct Pane {
     viewer: Option<viewer::Viewer>,
     /// Expanded full-screen text/code attachment viewer (#385).
     text_viewer: Option<viewer::TextViewer>,
+    /// Progressive/ranged media streaming progress by file id: `(path, loaded, total, complete)`.
+    pub(super) stream_progress: HashMap<String, (String, u64, u64, bool)>,
     /// Decoded inline text/code attachment previews by `file.id` (`None` = binary/unpreviewable).
     text_previews: HashMap<String, Option<Rc<text_preview::TextPreview>>>,
     /// Text attachment files currently being read/decoded off the UI thread.
@@ -513,6 +515,8 @@ pub struct Pane {
     event_toggling: HashSet<(String, String)>,
     /// Recent lazy on-screen invite/event resolve timestamps, paced to at most 4 per minute.
     invite_resolve_times: VecDeque<Instant>,
+    /// The pinned bar under the header (Telegram).
+    pin_bar: Option<PinBar>,
     /// Loaded Saved Messages sub-dialogs and reaction tags for the open Saved Messages chat.
     saved_loaded_for: Option<Key>,
     saved_dialogs: Vec<protocol::SavedDialog>,
@@ -705,6 +709,7 @@ impl Pane {
             gated_open: None,
             wants_focus: false,
             uploads: HashMap::new(),
+            stream_progress: HashMap::new(),
             pending_at: HashMap::new(),
             scrub: None,
             scrub_bounds: Rc::default(),
@@ -730,6 +735,7 @@ impl Pane {
             app_loading: false,
             app_error: None,
             ephemeral: Vec::new(),
+            pin_bar: None,
             saved_loaded_for: None,
             saved_dialogs: Vec::new(),
             saved_tags: Vec::new(),
@@ -1750,6 +1756,10 @@ impl Pane {
                 cx.notify();
             }
             Change::Media { account, file } if *account == key.account() => self.landed(file, true, cx),
+            Change::MediaProgress { account, id, path, loaded, total, complete } if *account == key.account() => {
+                self.stream_progress.insert(id.clone(), (path.clone(), *loaded, *total, *complete));
+                cx.notify();
+            }
             Change::InteractionModal { conversation, modal } if conversation == key => {
                 let inputs = modal
                     .fields
@@ -3071,6 +3081,105 @@ impl Pane {
         .detach();
     }
 
+    /// One line under the header: the pin on show, which of how many, and the way to the list.
+    /// A click jumps to the pin and puts the next older one on show.
+    fn pin_bar(&mut self, cx: &mut Context<Self>) -> Option<gpui::Stateful<Div>> {
+        let open = self.open.as_ref().filter(|_| !self.thread)?;
+        if open.key.network != Network::Telegram || !open.can.pins || self.window.messages.is_empty() {
+            return None;
+        }
+        let key = open.key.clone();
+        // The pins are asked again when the page held says a different set is pinned.
+        let seen = pins_seen(self.window.messages.iter().filter(|message| message.pinned).map(|message| message.id.as_str()));
+        if !self.pin_bar.as_ref().is_some_and(|bar| bar.key == key && bar.seen == seen) {
+            self.load_pin_bar(key.clone(), seen, cx);
+        }
+        let bar = self.pin_bar.as_ref().filter(|bar| !bar.pins.is_empty())?;
+        let at = bar.at.min(bar.pins.len() - 1);
+        let message = bar.pins[at].clone();
+        let said = if !message.text.is_empty() {
+            message.text.lines().next().unwrap_or_default().to_owned()
+        } else {
+            message.attachments.first().map_or_else(|| "Attachment".to_owned(), |file| file.name.clone())
+        };
+        Some(
+            div()
+                .id("pin-bar")
+                .flex_none()
+                .px(px(theme::PANE_PAD))
+                .py(px(6.))
+                .border_b_1()
+                .border_color(theme::hairline())
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .cursor_pointer()
+                .hover(|style| style.bg(theme::hover()))
+                .child(icons::icon(icons::Icon::Pin, 14., theme::accent()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(div().type_micro().text_color(theme::accent()).child(pin_bar_title(at, bar.pins.len())))
+                        .child(div().truncate().type_small().text_color(theme::text_soft()).child(said)),
+                )
+                .child(
+                    div()
+                        .id("pin-bar-list")
+                        .flex_none()
+                        .px(px(6.))
+                        .py(px(2.))
+                        .rounded(px(theme::R_CONTROL))
+                        .type_micro()
+                        .text_color(theme::text_soft())
+                        .hover(|style| style.bg(theme::pressed()).text_color(theme::text()))
+                        .child("All pins")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            let _ = this.shell.update(cx, |shell, cx| shell.open_pins(cx));
+                        })),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.jump_to(&message.id, cx);
+                    if let Some(bar) = this.pin_bar.as_mut() {
+                        bar.at = next_pin(at, bar.pins.len());
+                    }
+                    cx.notify();
+                })),
+        )
+    }
+
+    fn load_pin_bar(&mut self, key: Key, seen: u64, cx: &mut Context<Self>) {
+        // The pins on show stay until the answer lands, so the bar does not blink.
+        let kept = self.pin_bar.take().filter(|bar| bar.key == key);
+        let (pins, at) = kept.map_or((Vec::new(), 0), |bar| (bar.pins, bar.at));
+        self.pin_bar = Some(PinBar { key: key.clone(), seen, pins, at });
+        cx.spawn(async move |this, cx| {
+            let request = Request::Pinned { conversation: key.clone() };
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(bar) = this.pin_bar.as_mut().filter(|bar| bar.key == key) else {
+                    return;
+                };
+                if let Ok(Response::Pinned { messages, .. }) = answer {
+                    bar.pins = messages.into_iter().map(Rc::new).collect();
+                    bar.at = bar.at.min(bar.pins.len().saturating_sub(1));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// The pins changed from here (the menu or the pins pane): the bar asks again.
+    pub(in crate::gui) fn refresh_pin_bar(&mut self, cx: &mut Context<Self>) {
+        if let Some(bar) = self.pin_bar.as_ref() {
+            self.load_pin_bar(bar.key.clone(), bar.seen, cx);
+        }
+    }
+
     fn saved_filter_bar(&mut self, cx: &mut Context<Self>) -> Option<gpui::Div> {
         if self.thread {
             return None;
@@ -3673,6 +3782,7 @@ impl Render for Pane {
         .absolute()
         .size_0();
         let app_bar = self.app_tabs_bar(cx);
+        let pin_bar = self.pin_bar(cx);
         let showing_app_tab = self.is_slack_app() && self.app_tab != AppTab::Messages;
         let ephemeral_strip = (!self.ephemeral.is_empty() && !showing_app_tab).then(|| {
             let mut list = div()
@@ -3773,6 +3883,7 @@ impl Render for Pane {
                 }
             }))
             .children(app_bar)
+            .children(pin_bar)
             .child(if showing_app_tab {
                 self.app_tab_body(cx)
             } else {
@@ -4204,6 +4315,34 @@ fn replaces_window(purpose: &Purpose) -> bool {
     )
 }
 
+/// The pinned bar of one conversation: the pins newest first and the one on show.
+struct PinBar {
+    key: Key,
+    /// What the held page said was pinned when the pins were asked (`pins_seen`).
+    seen: u64,
+    pins: Vec<Rc<Message>>,
+    at: usize,
+}
+
+/// A number for the set of pinned ids a page holds: a different number means the pins changed.
+fn pins_seen<'a>(ids: impl Iterator<Item = &'a str>) -> u64 {
+    ids.fold(0xcbf2_9ce4_8422_2325u64, |hash, id| id.bytes().chain([0]).fold(hash, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)))
+}
+
+/// The bar's small line. `at` counts from the newest pin, which Telegram numbers highest.
+fn pin_bar_title(at: usize, total: usize) -> String {
+    if total <= 1 {
+        "Pinned message".to_owned()
+    } else {
+        format!("Pinned message #{} of {total}", total - at.min(total - 1))
+    }
+}
+
+/// The pin the bar shows after a click on the one at `at`: the next older, then round again.
+fn next_pin(at: usize, total: usize) -> usize {
+    if total == 0 { 0 } else { (at + 1) % total }
+}
+
 /// `asked` is the read's number. `newest` is the latest replacing read started since.
 /// A page asked earlier must not land over a later one. The current page still lands,
 /// including an empty newest page, so a store that is really empty still clears the pane.
@@ -4343,6 +4482,18 @@ pub(crate) fn prove_return_to_bottom() -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pin_bar_counts_from_the_newest_pin_and_goes_round() {
+        assert_eq!(pin_bar_title(0, 1), "Pinned message");
+        assert_eq!(pin_bar_title(0, 3), "Pinned message #3 of 3");
+        assert_eq!(pin_bar_title(2, 3), "Pinned message #1 of 3");
+        assert_eq!([next_pin(0, 3), next_pin(2, 3), next_pin(0, 1), next_pin(0, 0)], [1, 0, 0, 0]);
+        // A pin made or taken elsewhere changes what the page holds, and so the number.
+        assert_eq!(pins_seen(["12", "20"].into_iter()), pins_seen(["12", "20"].into_iter()));
+        assert_ne!(pins_seen(["12", "20"].into_iter()), pins_seen(["12"].into_iter()));
+        assert_ne!(pins_seen(["1", "22"].into_iter()), pins_seen(["12", "2"].into_iter()));
+    }
 
     /// The open read and the refill can both be in flight. The one asked earlier must not land
     /// last and put an empty or blank page over the rows the later read already showed. The

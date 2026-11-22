@@ -216,6 +216,81 @@ pub(super) fn react(account: &Account, conversation: &str, message: &str, emoji:
 }
 
 /// Fetches the current account's Telegram Stars balance via `payments.getStarsStatus`.
+/// Who reacted to a message with one emoji, a page at a time (`messages.getMessageReactionsList`).
+/// A broadcast channel only counts its reactions: nobody is listed there, and nothing is asked.
+pub(super) fn reactors(
+    account: &Account,
+    conversation: &str,
+    message: &str,
+    emoji: &str,
+    after: Option<String>,
+    limit: u32,
+) -> Result<crate::adapters::ReactorsPage, Fault> {
+    let invalid = || Fault::Rpc { code: 400, name: "MESSAGE_ID_INVALID".to_owned(), value: None };
+    let ((who, _), id) = (Who::parse(conversation).ok_or_else(invalid)?, message.parse::<i32>().map_err(|_| invalid())?);
+    if account.dir().get(who).is_some_and(|known| known.broadcast) {
+        return Ok(crate::adapters::ReactorsPage::default());
+    }
+    let reaction = match emoji.strip_prefix('e').and_then(|id| id.parse::<i64>().ok()) {
+        _ if is_paid(emoji) => tl::enums::Reaction::Paid,
+        Some(document_id) => tl::types::ReactionCustomEmoji { document_id }.into(),
+        None => tl::types::ReactionEmoji { emoticon: emoji.to_owned() }.into(),
+    };
+    let limit = if limit == 0 { 50 } else { limit.min(100) } as i32;
+    let peer = account.input(who)?;
+    let tl::enums::messages::MessageReactionsList::List(found) =
+        account.ask(&tl::functions::messages::GetMessageReactionsList { peer, id, reaction: Some(reaction), offset: after, limit })?;
+    account.learn(&found.users, &found.chats);
+    let dir = account.dir();
+    let reactors = found
+        .reactions
+        .iter()
+        .map(|tl::enums::MessagePeerReaction::Reaction(reacted)| {
+            let who = Who::of(&reacted.peer_id);
+            protocol::Reactor {
+                key: account.ctx.key(&who.text()),
+                name: dir.name(who),
+                avatar: dir.get(who).and_then(|known| known.avatar()).map(|id| protocol::MediaFile::new(id, protocol::MediaKind::Avatar)),
+            }
+        })
+        .collect();
+    Ok(crate::adapters::ReactorsPage { reactors, more: found.next_offset.is_some() })
+}
+
+/// Who has read one of my messages. In a private chat, when the other person read it
+/// (`messages.getOutboxReadDate`); in a small group, each member who did
+/// (`messages.getMessageReadParticipants`). Nobody yet is an empty list, not a refusal.
+pub(super) fn read_by(account: &Account, conversation: &str, message: &str) -> Result<Vec<protocol::ReadBy>, Fault> {
+    let invalid = || Fault::Rpc { code: 400, name: "MESSAGE_ID_INVALID".to_owned(), value: None };
+    let ((who, _), msg_id) = (Who::parse(conversation).ok_or_else(invalid)?, message.parse::<i32>().map_err(|_| invalid())?);
+    let peer = account.input(who)?;
+    let read: Vec<(i64, i32)> = match who {
+        Who::User(user) => match account.ask(&tl::functions::messages::GetOutboxReadDate { peer, msg_id }) {
+            Ok(tl::enums::OutboxReadDate::Date(read)) => vec![(user, read.date)],
+            Err(fault) if fault.is("MESSAGE_NOT_READ_YET") => Vec::new(),
+            Err(fault) => return Err(fault),
+        },
+        _ => account
+            .ask(&tl::functions::messages::GetMessageReadParticipants { peer, msg_id })?
+            .into_iter()
+            .map(|tl::enums::ReadParticipantDate::Date(read)| (read.user_id, read.date))
+            .collect(),
+    };
+    let dir = account.dir();
+    Ok(read
+        .into_iter()
+        .map(|(user, date)| {
+            let who = Who::User(user);
+            protocol::ReadBy {
+                person: account.ctx.key(&who.text()),
+                name: dir.name(who),
+                avatar: dir.get(who).and_then(|known| known.avatar()).map(|id| protocol::MediaFile::new(id, protocol::MediaKind::Avatar)),
+                at: i64::from(date),
+            }
+        })
+        .collect())
+}
+
 pub(super) fn stars_balance(account: &Account) -> Result<(i64, i32), Fault> {
     let tl::enums::payments::StarsStatus::Status(status) = account.ask(&tl::functions::payments::GetStarsStatus {
         ton: false,

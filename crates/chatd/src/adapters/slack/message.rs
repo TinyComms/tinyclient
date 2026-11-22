@@ -1489,6 +1489,7 @@ impl Slack {
             page: String::new(),
             transcription: None,
             transcript,
+            variants: Vec::new(),
         })
     }
 

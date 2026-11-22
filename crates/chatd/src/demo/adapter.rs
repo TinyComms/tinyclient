@@ -788,6 +788,10 @@ impl Demo {
                 let done = demo.ctx.pinned(&conversation_id, &message_id, pinned);
                 let _ = reply.send(done.map_err(|err| Refusal::Refused(err.to_string())));
             }
+            Command::UnpinAll { conversation_id, reply } => {
+                let done = demo.ctx.unpin_all(&conversation_id);
+                let _ = reply.send(done.map_err(|err| Refusal::Refused(err.to_string())));
+            }
             Command::Forward { from_conversation_id, message_ids, to_conversation_ids, note, reply } => {
                 let from_key = demo.key(&from_conversation_id);
                 let (from_title, from_space) = demo
@@ -1381,6 +1385,24 @@ impl Demo {
             Command::TopicUpdate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::TopicDelete { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::TopicIcons { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MessageEffects { reply } => {
+                let items = [("confetti", "\u{1F389}"), ("fire", "\u{1F525}"), ("hearts", "\u{2764}\u{FE0F}")]
+                    .into_iter()
+                    .map(|(id, emoji)| protocol::CatalogItem {
+                        id: id.to_owned(),
+                        name: emoji.to_owned(),
+                        file: None,
+                        pack: String::new(),
+                        animated: false,
+                        set: String::new(),
+                        locked: false,
+                    })
+                    .collect();
+                let _ = reply.send(Ok(crate::adapters::CatalogPage { items, cursor: None }));
+            }
+            Command::CallRate { reply, .. } => {
+                let _ = reply.send(Ok(()));
+            }
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CancelScheduled { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendScheduledNow { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1458,6 +1480,7 @@ impl Demo {
             | Command::Draft { .. }
             | Command::Watch(_)
             | Command::Wanted(_)
+            | Command::WantedSpan { .. }
             | Command::Played { .. }
             | Command::Stop => {}
         }

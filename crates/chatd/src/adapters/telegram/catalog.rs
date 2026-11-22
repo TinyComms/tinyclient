@@ -258,6 +258,50 @@ fn emojis(account: &Account, at: usize) -> Result<CatalogPage, Fault> {
     Ok(CatalogPage { items, cursor })
 }
 
+/// The message effects Telegram offers, asked once a connection and kept: each one's id is
+/// what a send names, and its emoji is what a message that carries it is shown with. A
+/// Premium effect is locked for an account without Premium.
+pub(super) fn effects(account: &Account) -> Result<Vec<CatalogItem>, Fault> {
+    if let Some(known) = account.live().effects.clone() {
+        return Ok(known);
+    }
+    let found = match account.ask(&tl::functions::messages::GetAvailableEffects { hash: 0 })? {
+        tl::enums::messages::AvailableEffects::Effects(found) => found.effects,
+        tl::enums::messages::AvailableEffects::NotModified => Vec::new(),
+    };
+    let premium = account_premium(account);
+    let items: Vec<CatalogItem> = found
+        .iter()
+        .take(protocol::CATALOG_LIMIT)
+        .map(|tl::enums::AvailableEffect::Effect(effect)| CatalogItem {
+            id: effect.id.to_string(),
+            name: effect.emoticon.clone(),
+            file: None,
+            pack: String::new(),
+            animated: false,
+            set: String::new(),
+            locked: effect.premium_required && !premium,
+        })
+        .collect();
+    account.dir().effects = items.iter().filter_map(|item| Some((item.id.parse().ok()?, item.name.clone()))).collect();
+    account.live().effects = Some(items.clone());
+    Ok(items)
+}
+
+/// Messages about to be mapped: the first one that carries an effect makes the effects be
+/// asked, once a connection, so it is shown by its emoji and not as a bare mark.
+pub(super) fn name_effects<'a>(account: &Account, mut raws: impl Iterator<Item = &'a tl::enums::Message>) {
+    if !raws.any(|raw| matches!(raw, tl::enums::Message::Message(message) if message.effect.is_some())) {
+        return;
+    }
+    if std::mem::replace(&mut account.live().effects_asked, true) {
+        return;
+    }
+    if let Err(fault) = effects(account) {
+        tracing::warn!("chatd: Telegram: effects: {fault}");
+    }
+}
+
 /// Lists Telegram's default forum topic icon set (`inputStickerSetEmojiDefaultTopicIcons`).
 pub(super) fn topic_icons(account: &Account) -> Result<CatalogPage, Fault> {
     let request = tl::functions::messages::GetStickerSet {

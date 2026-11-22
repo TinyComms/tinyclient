@@ -1878,6 +1878,12 @@ pub enum Request {
     TopicDelete {
         topic: Key,
     },
+    /// The message effects this account can send (`Capabilities::effects`): each item's `id` is
+    /// what `Outgoing::effect` names and its `name` the emoji it is shown as. A `locked` one
+    /// needs the network's paid plan. Answers `Response::Catalog`.
+    MessageEffects {
+        account: AccountKey,
+    },
     /// Lists the default forum topic icons offered by the network (`inputStickerSetEmojiDefaultTopicIcons`).
     TopicIcons {
         account: AccountKey,
@@ -2277,6 +2283,10 @@ pub enum Request {
         notify: bool,
         #[serde(default)]
         me_only: bool,
+    },
+    /// Unpins every message of a conversation (or of one forum topic) on the network.
+    UnpinAll {
+        conversation: Key,
     },
     /// The pictures, files or links said in a conversation, newest first, from what is cached:
     /// what the info pane lists under a person or a channel. `before` continues below a
@@ -3216,6 +3226,20 @@ pub enum Request {
     CallDecline,
     /// Leaves. Stops mediad.
     CallEnd,
+    /// Rates a finished call (1 to 5 stars, optional issue tags and comment).
+    /// `user_initiative` is `false` when answering `Change::CallRating` and `true` when
+    /// opened from a finished call's row.
+    CallRate {
+        account: AccountKey,
+        call_id: String,
+        rating: u8,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reasons: Vec<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        comment: String,
+        #[serde(default)]
+        user_initiative: bool,
+    },
     CallSet {
         muted: bool,
         deafened: bool,
@@ -4179,6 +4203,18 @@ pub enum Change {
     Pins { conversation: Key },
     /// A requested file is on disk (`path`), or could not be fetched (`failed` says why).
     Media { account: AccountKey, file: MediaFile },
+    /// Ephemeral. A streaming file is landing in a sparse cache file at `path`, with `loaded`
+    /// unique bytes written so far out of `total` (0 if unknown). `complete` is true once every
+    /// byte has landed.
+    MediaProgress {
+        account: AccountKey,
+        id: String,
+        path: String,
+        loaded: u64,
+        total: u64,
+        #[serde(default, skip_serializing_if = "is_false")]
+        complete: bool,
+    },
     /// Ephemeral. Who is in a voice channel now; no people and a total of 0 when it emptied.
     Occupants { conversation: Key, occupants: Occupants },
     /// Ephemeral. A network finished the search for `query`, whether or not it found anyone.
@@ -4209,6 +4245,10 @@ pub enum Change {
         call: Option<Call>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ring: Option<Call>,
+    },
+    /// Ephemeral. The network asked the user to rate a call that just ended.
+    CallRating {
+        prompt: CallRatingPrompt,
     },
     /// Ephemeral. A sign-in the shell is drawing moved on by itself: the code was scanned, or
     /// ran out and was replaced.
@@ -4252,6 +4292,7 @@ impl Change {
         match (self, other) {
             (Change::Status, Change::Status)
             | (Change::Call { .. }, Change::Call { .. })
+            | (Change::CallRating { .. }, Change::CallRating { .. })
             | (Change::Playback { .. }, Change::Playback { .. })
             | (Change::Recording { .. }, Change::Recording { .. })
             | (Change::Settings, Change::Settings)
@@ -4278,6 +4319,9 @@ impl Change {
             (Change::Media { account: a, file: x }, Change::Media { account: b, file: y }) => {
                 a == b && x.id == y.id
             }
+            (Change::MediaProgress { account: a, id: x, .. }, Change::MediaProgress { account: b, id: y, .. }) => {
+                a == b && x == y
+            }
             (Change::InteractionModal { conversation: a, modal: x }, Change::InteractionModal { conversation: b, modal: y }) => {
                 a == b && x.id == y.id
             }
@@ -4298,10 +4342,12 @@ impl Change {
                 | Change::Ephemeral { .. }
                 | Change::Presence { .. }
                 | Change::Call { .. }
+                | Change::CallRating { .. }
                 | Change::Occupants { .. }
                 | Change::Searched { .. }
                 | Change::SignIn { .. }
                 | Change::Upload { .. }
+                | Change::MediaProgress { .. }
                 | Change::Playback { .. }
                 | Change::Recording { .. }
                 | Change::Meter { .. }
@@ -6025,12 +6071,41 @@ mod sock_path_tests {
         assert_eq!(serde_json::from_str::<Change>(&serde_json::to_string(&modal_change).unwrap()).unwrap(), modal_change);
 
         let fail_change = Change::InteractionFailed {
-            conversation: conv,
+            conversation: conv.clone(),
             message_id: "msg1".into(),
             action_id: "btn1".into(),
             reason: "Interaction failed.".into(),
         };
         assert!(fail_change.is_ephemeral());
         assert_eq!(serde_json::from_str::<Change>(&serde_json::to_string(&fail_change).unwrap()).unwrap(), fail_change);
+
+        let rate_req = Request::CallRate {
+            account: AccountKey { network: Network::Telegram, account: "7001".into() },
+            call_id: "90001".into(),
+            rating: 3,
+            reasons: vec!["Echo".into(), "Noise".into()],
+            comment: "Crackled".into(),
+            user_initiative: false,
+        };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&rate_req).unwrap()).unwrap(), rate_req);
+
+        let rate_change = Change::CallRating {
+            prompt: CallRatingPrompt { conversation: conv, call_id: "90001".into(), video: false, seconds: Some(95) },
+        };
+        assert!(rate_change.is_ephemeral());
+        assert!(rate_change.same_scope(&rate_change));
+        assert_eq!(serde_json::from_str::<Change>(&serde_json::to_string(&rate_change).unwrap()).unwrap(), rate_change);
+
+        let progress = Change::MediaProgress {
+            account: AccountKey { network: Network::Telegram, account: "7001".into() },
+            id: "d9500".into(),
+            path: "/tmp/d9500.stream".into(),
+            loaded: 262_144,
+            total: 52_428_800,
+            complete: false,
+        };
+        assert!(progress.is_ephemeral());
+        assert!(progress.same_scope(&progress));
+        assert_eq!(serde_json::from_str::<Change>(&serde_json::to_string(&progress).unwrap()).unwrap(), progress);
     }
 }
