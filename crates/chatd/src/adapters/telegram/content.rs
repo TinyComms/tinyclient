@@ -2819,6 +2819,9 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
             message.edited_at = if raw.edit_hide { None } else { raw.edit_date.map(i64::from) };
             message.edited = message.edited_at.is_some();
             message.pinned = raw.pinned;
+            // A signed channel post names its author; an anonymous admin's message, their title.
+            message.signature = raw.post_author.clone().unwrap_or_default();
+            message.shares = raw.forwards.filter(|_| raw.post).map(|count| count.max(0) as u32);
             message.permalink = super::peers::permalink(peer, dir.get(peer), topic_of(raw.reply_to.as_ref()).0, raw.id);
             message.mentions_me = raw.mentioned;
             message.reactions = raw.reactions.as_ref().map(reactions).unwrap_or_default();

@@ -620,6 +620,13 @@ pub(super) fn apply(account: &Account, update: &Update) {
             read(account, &conversation, seen.max_id, seen.still_unread_count);
         }
         Update::ReadChannelInbox(seen) => read(account, &Who::Channel(seen.channel_id).text(), seen.max_id, seen.still_unread_count),
+        // A channel post's counts, told while the channel is open.
+        Update::ChannelMessageViews(seen) => {
+            let _ = account.ctx.post_counts(&Who::Channel(seen.channel_id).text(), &seen.id.to_string(), Some(seen.views.max(0) as u32), None);
+        }
+        Update::ChannelMessageForwards(shared) => {
+            let _ = account.ctx.post_counts(&Who::Channel(shared.channel_id).text(), &shared.id.to_string(), None, Some(shared.forwards.max(0) as u32));
+        }
         // A pin or an unpin made on another device, or by someone else in the chat.
         Update::PinnedMessages(p) => {
             let conversation = Who::of(&p.peer).text();

@@ -630,6 +630,8 @@ struct World {
     /// The next `upload.GetFile` is refused with a flood wait of this many seconds, once.
     flood_file: Option<u32>,
     revoked: bool,
+    /// How many times `getMessagesViews` was asked to count a view.
+    viewed_posts: i32,
     /// The account has as many pinned chats as Telegram allows (`pins-full`).
     pins_full: bool,
     /// Tobin was added to the Family folder (`folder`).
@@ -812,6 +814,7 @@ impl World {
             flood_file: None,
             revoked: false,
             pins_full: false,
+            viewed_posts: 0,
             family_grew: false,
             lost_reads: false,
             unread_marks: HashMap::new(),
@@ -2844,6 +2847,19 @@ impl World {
                     .into(),
                 )]
             }
+            // The channel's post is signed by its author, as an edit says it; then Telegram
+            // tells the post's new counts while the channel is open.
+            "signed" => {
+                let mut post = message(Who::Channel(NOTES), 5, 0, t0() - 7_200, "Snow line is at 1,900 m this week.");
+                post.post_author = Some("Mira K.".to_owned());
+                post.forwards = Some(31);
+                self.store(None, post.clone());
+                vec![update(tl::types::UpdateEditChannelMessage { message: post.into(), pts: 0, pts_count: 0 }.into())]
+            }
+            "post-counts" => vec![
+                update(tl::types::UpdateChannelMessageViews { channel_id: NOTES, id: 5, views: 13_000 }.into()),
+                update(tl::types::UpdateChannelMessageForwards { channel_id: NOTES, id: 5, forwards: 40 }.into()),
+            ],
             // The channel's post gains a section of comments: the post says its count and the
             // linked group it is answered in, and two comments stand in the thread. A number
             // after the word says how many of them the user has not read.
@@ -3837,10 +3853,21 @@ impl World {
         // was asked, in the order it was asked, and the post here has its count.
         if let Some(request) = asked::<f::messages::GetMessagesViews>(body) {
             let peer = input_who(&request.peer);
-            self.log(&format!("GetMessagesViews {} {}", peer.text(), request.id.iter().map(i32::to_string).collect::<Vec<_>>().join(" ")));
+            let ids = request.id.iter().map(i32::to_string).collect::<Vec<_>>().join(" ");
+            // A view counted is logged apart, so a test can tell the two asks from each other.
+            if request.increment {
+                self.viewed_posts += 1;
+                self.log(&format!("GetMessagesViews {} {ids} increment", peer.text()));
+            } else {
+                self.log(&format!("GetMessagesViews {} {ids}", peer.text()));
+            }
             let views: Vec<tl::enums::MessageViews> = request.id.iter().map(|id| {
-                let seen = (*id == 5 && peer == Who::Channel(NOTES)).then_some(12_400);
-                tl::enums::MessageViews::Views(tl::types::MessageViews { views: seen, forwards: None, replies: None })
+                let post = *id == 5 && peer == Who::Channel(NOTES);
+                tl::enums::MessageViews::Views(tl::types::MessageViews {
+                    views: post.then_some(12_400 + self.viewed_posts),
+                    forwards: post.then_some(31),
+                    replies: None,
+                })
             }).collect();
             let found = tl::types::messages::MessageViews { views, chats: chats(), users: users() };
             return answer(tl::enums::messages::MessageViews::Views(found));

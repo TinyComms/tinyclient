@@ -2853,6 +2853,15 @@ impl Context {
         Ok(())
     }
 
+    /// A channel post's views and shares as the network now counts them. `None` leaves one as it is.
+    pub fn post_counts(&self, conversation_id: &str, message_id: &str, views: Option<u32>, shares: Option<u32>) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().set_post_counts(&conversation, message_id, views, shares)? {
+            self.hub.changed(Change::Messages { conversation });
+        }
+        Ok(())
+    }
+
     /// Clears the pin on every stored message of a conversation.
     pub fn unpin_all(&self, conversation_id: &str) -> Stores {
         let conversation = self.key(conversation_id);

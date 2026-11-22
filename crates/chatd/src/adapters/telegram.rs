@@ -271,6 +271,8 @@ struct Live {
     ads: Vec<(String, Instant)>,
     /// Sponsored messages recorded: the channel, the ad's id, and whether it was told as viewed.
     shown: Vec<(String, Vec<u8>, bool)>,
+    /// The newest post of each broadcast channel told to Telegram as viewed (`sync::viewed`).
+    viewed: HashMap<Who, i32>,
     /// What the picker's items send.
     picks: VecDeque<(String, catalog::Pick)>,
     /// Sticker tab pages, from the first page: recent, favourites, featured, then installed packs.
@@ -1435,6 +1437,9 @@ fn mark_read(account: &Account, conversation: &str, message: &str) {
     let read = told.is_ok();
     if let Err(fault) = told {
         tracing::warn!("chatd: Telegram: read: {fault}");
+    }
+    if read && topic.is_none() {
+        sync::viewed(account, conversation, who, max_id);
     }
     // Reading does not clear a manual unread mark. Telegram's own apps send both.
     if topic.is_none() {

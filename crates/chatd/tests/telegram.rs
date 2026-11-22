@@ -1370,6 +1370,40 @@ fn a_channel_posts_views_ride_the_post_from_one_ask_for_the_page() {
 }
 
 #[test]
+fn a_channel_post_shows_its_signature_and_shares_and_is_counted_as_viewed_once_read() {
+    let world = World::signed_in();
+    world.connected();
+    // The page's one ask brings the shares with the views, and counts nothing.
+    let post = world.until("the post's counts", || world.message("c9001", "5").filter(|post| post.views.is_some()));
+    assert_eq!((post.views, post.shares, post.signature.as_str()), (Some(12_400), Some(31), ""));
+    assert_eq!(world.called("GetMessagesViews c9001 5 increment"), 0);
+    world.until("the channel to finish opening", || (world.called("GetSponsoredMessages c9001") >= 1).then_some(()));
+
+    // The author signs the post: the signature rides the message, and the counts stay.
+    world.steer("signed");
+    let signed = world.until("the signature", || world.message("c9001", "5").filter(|post| !post.signature.is_empty()));
+    assert_eq!((signed.signature.as_str(), signed.views, signed.shares), ("Mira K.", Some(12_400), Some(31)));
+
+    // Read on screen: Telegram is told to count the view, once, and its new count is written.
+    world.ask(Request::MarkRead { conversation: key("c9001"), message_id: "5".into() });
+    world.until("the view to be counted", || world.message("c9001", "5").filter(|post| post.views == Some(12_401)));
+    // Read again, then a private chat read after it: the adapter takes its commands in order,
+    // so once the chat's read is told the second read of the post has been handled too.
+    world.ask(Request::MarkRead { conversation: key("c9001"), message_id: "5".into() });
+    world.arrived("u7002", "12");
+    world.ask(Request::MarkRead { conversation: key("u7002"), message_id: "12".into() });
+    world.until("the chat's read to be told", || (world.called("ReadHistory u7002") >= 1).then_some(()));
+    assert_eq!(world.called("GetMessagesViews c9001 5 increment"), 1, "{:#?}", world.calls());
+    // A private chat's read counts no view.
+    assert_eq!(world.called("GetMessagesViews u7002"), 0);
+
+    // Telegram tells the post's new counts while the channel is open.
+    world.steer("post-counts");
+    let live = world.until("the live counts", || world.message("c9001", "5").filter(|post| post.shares == Some(40)));
+    assert_eq!((live.views, live.signature.as_str()), (Some(13_000), "Mira K."));
+}
+
+#[test]
 fn a_posts_unread_comments_ride_its_footer_until_they_are_read() {
     let world = World::signed_in();
     world.connected();

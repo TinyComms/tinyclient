@@ -4098,6 +4098,21 @@ impl Store {
         Ok(true)
     }
 
+    /// Writes a stored post's view and share counts. True if the message existed and one changed.
+    pub fn set_post_counts(&mut self, conversation: &Key, id: &str, views: Option<u32>, shares: Option<u32>) -> rusqlite::Result<bool> {
+        let Some(mut message) = self.message(conversation, id)? else {
+            return Ok(false);
+        };
+        let before = (message.views, message.shares);
+        message.views = views.or(message.views);
+        message.shares = shares.or(message.shares);
+        if before == (message.views, message.shares) {
+            return Ok(false);
+        }
+        self.ingest(conversation, &message, false)?;
+        Ok(true)
+    }
+
     /// Clears the pin on every stored message of a conversation. True when one was pinned.
     pub fn unpin_all(&mut self, conversation: &Key) -> rusqlite::Result<bool> {
         let ids: Vec<String> = self

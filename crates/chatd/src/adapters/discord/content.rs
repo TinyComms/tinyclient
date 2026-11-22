@@ -1393,6 +1393,8 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         effect: None,
         contacts: Vec::new(),
         sent_via: None,
+        shares: None,
+        signature: String::new(),
         permalink: link,
         controls,
         via: command_via(posted),

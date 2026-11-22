@@ -2046,36 +2046,78 @@ pub(super) fn history(account: &Account, conversation: &str, around: Around) -> 
     messages.into_iter().next()
 }
 
-/// The views of a channel's posts, in one ask for the page. Telegram counts a view when the
-/// app tells it to (`increment`), and reading a page is not the same as each post having been
-/// on screen, so nothing is added to the count here: what Telegram says stands.
+/// The views and shares of a channel's posts, in one ask for the page. Telegram counts a view
+/// when the app tells it to (`increment`), and reading a page is not the same as each post
+/// having been on screen, so nothing is added to the count here: what Telegram says stands.
+/// `viewed` adds the views, for the posts that were read on screen.
 fn views(account: &Account, channel: Who, messages: &mut [Message]) {
     let ids: Vec<i32> = messages.iter().filter_map(|message| message.id.parse().ok()).collect();
+    let counts = post_counts(account, channel, ids, false);
+    for message in messages {
+        if let Some((views, shares)) = message.id.parse().ok().and_then(|id| counts.get(&id)) {
+            message.views = views.or(message.views);
+            message.shares = shares.or(message.shares);
+        }
+    }
+}
+
+/// `messages.getMessagesViews` for these posts: each one's views and shares, where Telegram
+/// counts them. With `increment` Telegram counts this account as having seen each.
+fn post_counts(account: &Account, channel: Who, ids: Vec<i32>, increment: bool) -> HashMap<i32, (Option<u32>, Option<u32>)> {
     if ids.is_empty() {
-        return;
+        return HashMap::new();
     }
     let Ok(peer) = account.input(channel) else {
-        return;
+        return HashMap::new();
     };
-    let request = tl::functions::messages::GetMessagesViews { peer, id: ids, increment: false };
+    let request = tl::functions::messages::GetMessagesViews { peer, id: ids, increment };
     let Ok(tl::enums::messages::MessageViews::Views(found)) = account.ask(&request) else {
-        return;
+        return HashMap::new();
     };
     account.learn(&found.users, &found.chats);
     // Telegram answers in the order it was asked: no id comes back with a count.
-    let counts: HashMap<i32, u32> = request
+    let count = |count: Option<i32>| count.map(|count| count.max(0) as u32);
+    request
         .id
         .iter()
         .zip(found.views.iter())
-        .filter_map(|(id, one)| {
+        .map(|(id, one)| {
             let tl::enums::MessageViews::Views(counts) = one;
-            Some((*id, counts.views?.max(0) as u32))
+            (*id, (count(counts.views), count(counts.forwards)))
         })
-        .collect();
-    for message in messages {
-        if let Some(count) = message.id.parse().ok().and_then(|id| counts.get(&id)) {
-            message.views = Some(*count);
+        .collect()
+}
+
+/// The user read a broadcast channel up to `max_id` on screen: those posts are told to
+/// Telegram as viewed, once each, and their new counts are written.
+/// shortcut: only the posts read since the last telling count (the first telling counts the
+/// one post named), so a post scrolled back to is not counted; upgrade when the shell says
+/// which rows are on screen.
+pub(super) fn viewed(account: &Account, conversation: &str, channel: Who, max_id: i32) {
+    if !account.dir().get(channel).is_some_and(|known| known.broadcast) {
+        return;
+    }
+    let from = {
+        let mut live = account.live();
+        let before = live.viewed.insert(channel, max_id);
+        match before {
+            Some(before) if before >= max_id => {
+                live.viewed.insert(channel, before);
+                return;
+            }
+            Some(before) => before + 1,
+            None => max_id,
         }
+    };
+    let ids: Vec<i32> = account
+        .ctx
+        .stored_ids(conversation, &from.to_string(), &max_id.to_string(), 100)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|id| id.parse().ok())
+        .collect();
+    for (id, (views, shares)) in post_counts(account, channel, ids, true) {
+        let _ = account.ctx.post_counts(conversation, &id.to_string(), views, shares);
     }
 }
 
