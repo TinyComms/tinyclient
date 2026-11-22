@@ -126,13 +126,16 @@ pub enum Menu {
     Own,
     Network(Network),
     Space(Key),
-    /// A server folder's context menu, where the pointer was.
+    /// A server folder's context menu, where the pointer was. The key is that account's folder.
     Folder(Key, Point<Pixels>),
     /// A category header's context menu, where the pointer was.
     Group { space: Key, id: String, name: String, muted: bool, at: Point<Pixels> },
     /// A conversation row's context menu, where the pointer was.
     Row(Rc<Conversation>, Point<Pixels>),
 }
+
+/// Discord folder colours, `0xRRGGBB`.
+const FOLDER_COLOURS: [u32; 8] = [0x5865F2, 0x57F287, 0xFEE75C, 0xEB459E, 0xED4245, 0xE67E22, 0x3498DB, 0x99AAB5];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Edge {
@@ -770,10 +773,6 @@ impl Shell {
                 let items = menu().w(px(220.)).children(self.menu_items(open, snapshot, cx));
                 placed("menu-space-at", Place::Below(menu_anchor), Layer::Menu, window, fade_in("menu-space", 120, items))
             }
-            Menu::Folder(_, position) => {
-                let items = menu().w(px(200.)).children(self.menu_items(open, snapshot, cx));
-                placed("menu-folder-at", Place::Pointer(*position), Layer::Menu, window, fade_in("menu-folder", 120, items))
-            }
             Menu::Group { at, .. } => {
                 let items = menu().w(px(220.)).children(self.menu_items(open, snapshot, cx));
                 placed("menu-group-at", Place::Pointer(*at), Layer::Menu, window, fade_in("menu-group", 120, items))
@@ -781,6 +780,10 @@ impl Shell {
             Menu::Row(_, position) => {
                 let items = menu().w(px(220.)).children(self.menu_items(open, snapshot, cx));
                 placed("menu-row-at", Place::Pointer(*position), Layer::Menu, window, fade_in("menu-row", 120, items))
+            }
+            Menu::Folder(_, position) => {
+                let items = menu().w(px(240.)).children(self.menu_items(open, snapshot, cx));
+                placed("menu-folder-at", Place::Pointer(*position), Layer::Menu, window, fade_in("menu-folder", 120, items))
             }
         };
         Some(
@@ -1085,17 +1088,6 @@ impl Shell {
                             .into_any_element(),
                     );
                 }
-            }
-            Menu::Folder(folder, _) => {
-                let read = folder.clone();
-                items.push(
-                    menu_item("folder-read", Some("icons/check.svg"), "Mark as read", None)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.close_menu(cx);
-                            this.mark_folder_read(read.clone(), cx);
-                        }))
-                        .into_any_element(),
-                );
             }
             Menu::Group { space, id, name, muted, .. } => {
                 if space.network == Network::Discord {
@@ -1448,6 +1440,61 @@ impl Shell {
                             .into_any_element(),
                     );
                 }
+            }
+            Menu::Folder(folder, _) => {
+                let stored = self.sidebar_state.home.folders.iter().find(|known| &known.key == folder).cloned();
+                let can = self.manages_space_folders(&folder.account());
+                if can {
+                    let rename = folder.clone();
+                    items.push(
+                        menu_item("folder-rename", Some("icons/pencil.svg"), "Rename…", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.open_folder_rename(rename.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                    let mut swatches = div().px(px(8.)).py(px(4.)).flex().flex_wrap().items_center().gap(px(6.));
+                    for (ix, color) in FOLDER_COLOURS.iter().copied().enumerate() {
+                        let on = stored.as_ref().and_then(|known| known.color) == Some(color);
+                        let paint = folder.clone();
+                        swatches = swatches.child(
+                            div()
+                                .id(("folder-colour", ix))
+                                .size(px(18.))
+                                .rounded(px(9.))
+                                .bg(gpui::rgb(color))
+                                .when(on, |dot| dot.border_2().border_color(theme::text()))
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.set_discord_folder(paint.clone(), None, Some(Some(color)), cx);
+                                })),
+                        );
+                    }
+                    items.push(swatches.into_any_element());
+                    if stored.as_ref().is_some_and(|known| known.color.is_some()) {
+                        let clear = folder.clone();
+                        items.push(
+                            menu_item("folder-clear-colour", Some("icons/x.svg"), "Clear colour", None)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.set_discord_folder(clear.clone(), None, Some(None), cx);
+                                }))
+                                .into_any_element(),
+                        );
+                    }
+                    items.push(menu_separator().into_any_element());
+                }
+                let read = folder.clone();
+                items.push(
+                    menu_item("folder-read", Some("icons/check.svg"), "Mark folder as read", None)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            this.mark_folder_read(read.clone(), cx);
+                        }))
+                        .into_any_element(),
+                );
             }
         }
         items
@@ -2034,6 +2081,7 @@ impl Render for Shell {
             .children(self.edit_channel_modal(cx))
             .children(self.move_channels_modal(cx))
             .children(self.delete_channel_modal(cx))
+            .children(self.folder_edit_modal(cx))
             .children(self.join_server_modal(cx))
             .children(self.create_server_modal(cx))
             .children(self.events_modal(cx))

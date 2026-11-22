@@ -827,6 +827,9 @@ fn my_own_profile_shows_and_an_edit_reaches_the_wire() {
             emoji: None,
             username: None,
             photo: false,
+            accent: None,
+            banner: None,
+            space: None,
         }),
         Response::Ok
     );
@@ -851,6 +854,9 @@ fn my_own_profile_shows_and_an_edit_reaches_the_wire() {
         emoji: None,
         username: Some("nope".into()),
         photo: false,
+        accent: None,
+        banner: None,
+        space: None,
     });
     match username {
         Response::Error { code: ErrorCode::Refused, detail } if detail.to_lowercase().contains("phone") => {}
@@ -864,6 +870,9 @@ fn my_own_profile_shows_and_an_edit_reaches_the_wire() {
         emoji: None,
         username: None,
         photo: true,
+        accent: None,
+        banner: None,
+        space: None,
     });
     match photo {
         Response::Error { code: ErrorCode::Refused, detail } if detail.to_lowercase().contains("phone") => {}

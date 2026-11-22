@@ -795,18 +795,70 @@ pub fn space(pane: &InfoPane, key: &Key, cx: &mut Context<InfoPane>) -> Div {
             any = true;
             sections = sections.child(draw::label("About", true)).child(div().type_ui().line_clamp(6).child(info.description.trim().to_owned()));
         }
-        if !info.nickname.is_empty() || !info.roles.is_empty() {
+        let show_role = !info.nickname.is_empty() || !info.roles.is_empty() || info.can_change_nickname;
+        if show_role {
             sections = sections.child(draw::label("Role", !any));
             any = true;
-            let shown = info.roles.len().min(facts::ROLES_SHOWN);
-            let role = facts::Role::Place {
-                nickname: info.nickname.clone(),
-                place: name.clone(),
-                roles: info.roles[..shown].to_vec(),
-                more: info.roles.len() - shown,
-            };
-            let small = Avatar::new(key, &name, 16.).shape(Plate::Place).image(icon.as_ref()).build();
-            sections = sections.child(draw::role(&role, Some(small), None));
+            if !info.nickname.is_empty() || !info.roles.is_empty() {
+                let shown = info.roles.len().min(facts::ROLES_SHOWN);
+                let role = facts::Role::Place {
+                    nickname: info.nickname.clone(),
+                    place: name.clone(),
+                    roles: info.roles[..shown].to_vec(),
+                    more: info.roles.len() - shown,
+                };
+                let small = Avatar::new(key, &name, 16.).shape(Plate::Place).image(icon.as_ref()).build();
+                sections = sections.child(draw::role(&role, Some(small), None));
+            }
+            if info.can_change_nickname && pane.online_of(key.network) {
+                let editing_nick = pane
+                    .managing()
+                    .filter(|(k, kind, _)| k == key && *kind == ManageKind::Nickname)
+                    .map(|(_, _, input)| input.clone());
+                if let Some(input) = editing_nick {
+                    sections = sections.child(
+                        div()
+                            .mt(px(8.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .h(px(28.))
+                                    .px(px(8.))
+                                    .rounded(px(theme::R_CONTROL))
+                                    .bg(theme::field())
+                                    .border_1()
+                                    .border_color(theme::border())
+                                    .flex()
+                                    .items_center()
+                                    .child(input),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .child(button("space-nick-save", ButtonKind::Primary, "Save").h(px(24.)).px(px(8.)).type_small().on_click(cx.listener(|pane, _, _, cx| pane.submit_manage(cx))))
+                                    .child(button("space-nick-cancel", ButtonKind::Ghost, "Cancel").h(px(24.)).px(px(8.)).type_small().on_click(cx.listener(|pane, _, _, cx| pane.cancel_manage(cx)))),
+                            ),
+                    );
+                } else {
+                    let nick_key = key.clone();
+                    let current_nick = info.nickname.clone();
+                    sections = sections.child(
+                        div().mt(px(6.)).child(
+                            button("space-change-nick", ButtonKind::Secondary, "Change nickname")
+                                .h(px(26.))
+                                .px(px(8.))
+                                .type_small()
+                                .on_click(cx.listener(move |pane, _, _, cx| {
+                                    pane.start_manage(nick_key.clone(), ManageKind::Nickname, &current_nick, "Server nickname (empty to clear)", cx);
+                                })),
+                        ),
+                    );
+                }
+            }
         }
         if !info.tags.is_empty() {
             sections = sections.child(draw::label("Tags", !any));

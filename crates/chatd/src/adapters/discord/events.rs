@@ -693,7 +693,11 @@ impl Discord {
             return Ok(());
         }
         self.state.lock().unwrap().show_explicit_media = !proto::blur_explicit_media(&update.settings.proto);
+        if let Some(raw_block) = proto::guild_folders_settings(&update.settings.proto) {
+            self.state.lock().unwrap().guild_folders_settings = raw_block;
+        }
         if let Some(folders) = proto::guild_folders(&update.settings.proto) {
+            self.state.lock().unwrap().folders = folders.clone();
             self.record_folders(&folders)?;
         }
         let Some(order) = proto::guild_order(&update.settings.proto) else {

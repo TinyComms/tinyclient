@@ -2209,7 +2209,9 @@ fn the_space_on_screen_is_the_only_one_subscribed() {
             let sections: Vec<(&str, u32)> = sections.iter().map(|section| (section.name.as_str(), section.count)).collect();
             assert_eq!(sections, [("mods", 1), ("Online", 1), ("Offline", 1)]);
             let names: Vec<&str> = members.iter().map(|person| person.name.as_str()).collect();
-            assert_eq!(names, ["mara-mod", "Sam Whitlock", "Dev Patel"]);
+            assert_eq!(names, ["Mara Okafor", "Sam Whitlock", "Dev Patel"]);
+            assert_eq!(members[0].nickname, "mara-mod");
+            assert!(members[1].nickname.is_empty());
             assert_eq!((members[0].relation, members[0].presence), (Relation::Friend, Presence::Dnd));
             assert_eq!((members[1].relation, members[2].presence), (Relation::None, Presence::Offline));
             assert_eq!(offset, 0);
@@ -3910,7 +3912,11 @@ fn info_mute_leave_pins_and_the_shared_search_ask_discord_once_each_and_only_whe
     assert_eq!(profile.roles.len(), 1, "{:?}", profile.roles);
     let profiles = world.discord.requests_to("GET", "/users/2006/profile");
     assert_eq!(profiles.len(), 1);
-    assert!(profiles[0].path.contains("guild_id=4000") && profiles[0].path.contains("with_mutual_friends=false"));
+    assert!(
+        profiles[0].path.contains("guild_id=4000")
+            && profiles[0].path.contains("with_mutual_friends=true")
+            && profiles[0].path.contains("with_mutual_friends_count=true")
+    );
 
     // A channel's info is what READY said: nothing is asked.
     let before = asked_now();
@@ -5310,6 +5316,511 @@ fn leave_space_sends_delete_refuses_owner_and_cleans_tree() {
         }
         other => panic!("expected Response::Spaces, got {other:?}"),
     }
+}
+
+#[test]
+fn per_server_avatar_and_server_profile() {
+    let world = World::start();
+
+    // 1. Member list uses guild-scoped mavatar: when member.avatar is present and global avatar: otherwise.
+    let _ = world.ask(Request::Members { conversation: world.key("4101"), offset: 0, limit: 50 });
+    world.discord.push(
+        "GUILD_MEMBER_LIST_UPDATE",
+        json!({
+            "guild_id": "4000",
+            "id": "everyone",
+            "member_count": 2,
+            "online_count": 2,
+            "groups": [{"id": "online", "count": 2}],
+            "ops": [{"op": "SYNC", "range": [0, 99], "items": [
+                {"group": {"id": "online", "count": 2}},
+                {"member": {
+                    "user": {"id": "2001", "username": "mara", "global_name": "Mara Okafor", "discriminator": "0", "avatar": "g_mara"},
+                    "nick": "mara-srv",
+                    "avatar": "srv_mara",
+                    "roles": [],
+                    "presence": {"user": {"id": "2001"}, "status": "online", "activities": [], "client_status": {}}
+                }},
+                {"member": {
+                    "user": {"id": "2006", "username": "sam", "global_name": "Sam Whitlock", "discriminator": "0", "avatar": "s4m"},
+                    "nick": null,
+                    "avatar": null,
+                    "roles": [],
+                    "presence": {"user": {"id": "2006"}, "status": "online", "activities": [], "client_status": {}}
+                }}
+            ]}]
+        }),
+    );
+    let delivered = wait("the member list with server avatar", || {
+        let response = world.ask(Request::Members { conversation: world.key("4101"), offset: 0, limit: 50 });
+        matches!(response, Response::Members { pending: false, ref members, .. } if members.len() == 2).then_some(response)
+    });
+    match delivered {
+        Response::Members { members, .. } => {
+            assert_eq!(members[0].avatar.as_ref().map(|a| a.id.as_str()), Some("mavatar:4000:2001:srv_mara"));
+            assert_eq!(members[1].avatar.as_ref().map(|a| a.id.as_str()), Some("avatar:2006:s4m"));
+        }
+        other => panic!("expected Members, got {other:?}"),
+    }
+
+    // 2. Guild message sender uses mavatar:, while a DM message keeps the global avatar:.
+    // A server channel keeps a live message once its history is stored. Until then a
+    // MESSAGE_CREATE only moves unread state, so open the channel before the push.
+    wait("channel 4101 history", || (world.messages("4101").len() == 3).then_some(()));
+    let guild_msg_id = world.incoming(
+        "4101",
+        Some("4000"),
+        "hi from server",
+        json!({"member": {"nick": "SamGuild", "avatar": "srv_sam", "roles": []}}),
+    );
+    let guild_msg = wait("guild message with server avatar", || {
+        world.messages("4101").into_iter().find(|m| m.id == guild_msg_id)
+    });
+    assert_eq!(guild_msg.sender.avatar.as_ref().map(|a| a.id.as_str()), Some("mavatar:4000:2006:srv_sam"));
+
+    let dm_msg_id = world.incoming("3001", None, "hi from dm", json!({}));
+    let dm_msg = wait("dm message with global avatar", || {
+        world.messages("3001").into_iter().find(|m| m.id == dm_msg_id)
+    });
+    assert_eq!(dm_msg.sender.avatar.as_ref().map(|a| a.id.as_str()), Some("avatar:2006:s4m"));
+
+    // 3. Server profile (space: Some) overrides avatar, banner, bio, pronouns, accent and marks server_profile = true.
+    let profile_payload = json!({
+        "user": {"id": "2006", "username": "sam", "global_name": "Sam Whitlock", "discriminator": "0", "avatar": "s4m", "banner": "glob_ban", "accent_color": 1118481},
+        "user_profile": {"bio": "Global bio", "pronouns": "he/him", "accent_color": 1118481, "banner": "glob_ban"},
+        "guild_member": {"nick": "SamGuild", "avatar": "srv_sam", "banner": "srv_ban", "roles": ["4010"], "joined_at": "2023-03-01T12:00:00+00:00"},
+        "guild_member_profile": {"bio": "Server bio", "pronouns": "they/them", "accent_color": 2236962, "banner": "srv_ban"},
+        "mutual_guilds": [{"id": "4000"}]
+    });
+    world.discord.script("/users/2006/profile", 200, profile_payload.clone());
+    let srv_profile = match world.ask(Request::Profile { person: world.key("2006"), space: Some(world.key("4000")) }) {
+        Response::Profile { profile } => profile,
+        other => panic!("expected server profile, got {other:?}"),
+    };
+    assert!(srv_profile.server_profile);
+    assert_eq!(srv_profile.person.avatar.as_ref().map(|a| a.id.as_str()), Some("mavatar:4000:2006:srv_sam"));
+    assert_eq!(srv_profile.banner.as_ref().map(|b| b.id.as_str()), Some("mbanner:4000:2006:srv_ban"));
+    assert_eq!((srv_profile.bio.as_str(), srv_profile.pronouns.as_str(), srv_profile.accent), ("Server bio", "they/them", Some(2236962)));
+
+    // 4. Global profile (space: None) keeps global avatar, banner, bio, pronouns, accent and server_profile = false.
+    world.discord.script("/users/2006/profile", 200, profile_payload);
+    let global_profile = match world.ask(Request::Profile { person: world.key("2006"), space: None }) {
+        Response::Profile { profile } => profile,
+        other => panic!("expected global profile, got {other:?}"),
+    };
+    assert!(!global_profile.server_profile);
+    assert_eq!(global_profile.person.avatar.as_ref().map(|a| a.id.as_str()), Some("avatar:2006:s4m"));
+    assert_eq!(global_profile.banner.as_ref().map(|b| b.id.as_str()), Some("banner:2006:glob_ban"));
+    assert_eq!((global_profile.bio.as_str(), global_profile.pronouns.as_str(), global_profile.accent), ("Global bio", "he/him", Some(1118481)));
+}
+
+#[test]
+fn member_list_activities_and_custom_status_emoji() {
+    let world = World::start();
+    let _ = world.ask(Request::Members { conversation: world.key("4101"), offset: 0, limit: 50 });
+
+    world.discord.push(
+        "GUILD_MEMBER_LIST_UPDATE",
+        json!({
+            "guild_id": "4000",
+            "id": "everyone",
+            "member_count": 4,
+            "online_count": 4,
+            "groups": [{"id": "online", "count": 4}],
+            "ops": [{"op": "SYNC", "range": [0, 99], "items": [
+                {"group": {"id": "online", "count": 4}},
+                {"member": {
+                    "user": {"id": "2001", "username": "mara", "global_name": "Mara Okafor", "discriminator": "0", "avatar": null},
+                    "nick": null, "roles": [],
+                    "presence": {
+                        "user": {"id": "2001"},
+                        "status": "online",
+                        "activities": [{
+                            "type": 0, "name": "Hades", "details": "Elysium",
+                            "timestamps": {"start": 1_700_000_000_000i64}
+                        }]
+                    }
+                }},
+                {"member": {
+                    "user": {"id": "2002", "username": "dev", "global_name": "Dev Patel", "discriminator": "0", "avatar": null},
+                    "nick": null, "roles": [],
+                    "presence": {
+                        "user": {"id": "2002"},
+                        "status": "online",
+                        "activities": [{
+                            "type": 2, "name": "Spotify", "details": "Clair de Lune", "state": "Debussy",
+                            "assets": {"large_image": "spotify:ab67616d00001111"}
+                        }]
+                    }
+                }},
+                {"member": {
+                    "user": {"id": "2003", "username": "kofi", "global_name": "Kofi", "discriminator": "0", "avatar": null},
+                    "nick": null, "roles": [],
+                    "presence": {
+                        "user": {"id": "2003"},
+                        "status": "dnd",
+                        "activities": [{
+                            "type": 1, "name": "Celeste", "url": "https://twitch.tv/kofi"
+                        }]
+                    }
+                }},
+                {"member": {
+                    "user": {"id": "2006", "username": "sam", "global_name": "Sam Whitlock", "discriminator": "0", "avatar": null},
+                    "nick": null, "roles": [],
+                    "presence": {
+                        "user": {"id": "2006"},
+                        "status": "idle",
+                        "activities": [{
+                            "type": 4, "state": "shipping", "emoji": {"id": "5101", "name": "ferris", "animated": false}
+                        }]
+                    }
+                }}
+            ]}]
+        }),
+    );
+
+    let delivered = wait("member list with activities", || {
+        let response = world.ask(Request::Members { conversation: world.key("4101"), offset: 0, limit: 50 });
+        matches!(response, Response::Members { pending: false, ref members, .. } if members.len() == 4).then_some(response)
+    });
+    match delivered {
+        Response::Members { members, .. } => {
+            // 2001: Playing Hades with details & start time (in seconds)
+            let mara = members[0].activity.as_deref().expect("mara activity");
+            assert_eq!((mara.kind, mara.name.as_str(), mara.details.as_str(), mara.started), (protocol::ActivityKind::Playing, "Hades", "Elysium", Some(1_700_000_000)));
+            // 2002: Dev is in voice channel 4201 in READY_SUPPLEMENTAL -> InVoice wins over Spotify, OR Spotify if not in voice yet
+            let dev = members[1].activity.as_deref().expect("dev activity");
+            assert!(
+                dev.kind == protocol::ActivityKind::InVoice || (dev.kind == protocol::ActivityKind::Listening && dev.art.as_ref().map(|a| a.id.as_str()) == Some("actart:spotify:ab67616d00001111")),
+                "unexpected dev activity: {dev:?}"
+            );
+            // 2003: Streaming Celeste with validated https URL
+            let kofi = members[2].activity.as_deref().expect("kofi activity");
+            assert_eq!((kofi.kind, kofi.name.as_str(), kofi.url.as_str()), (protocol::ActivityKind::Streaming, "Celeste", "https://twitch.tv/kofi"));
+            // 2006: Custom status + custom guild emoji file
+            assert_eq!(members[3].status, "shipping");
+            assert_eq!(members[3].emoji_file.as_ref().map(|f| f.id.as_str()), Some("emoji:5101"));
+        }
+        other => panic!("expected Members, got {other:?}"),
+    }
+}
+
+#[test]
+fn profile_returns_mutual_friends_and_mutual_spaces_with_nicknames() {
+    let world = World::start();
+    world.discord.script(
+        "/users/2006/profile",
+        200,
+        json!({
+            "user": {"id": "2006", "username": "sam", "global_name": "Sam Whitlock", "discriminator": "0", "avatar": "s4m"},
+            "user_profile": {"bio": "hi", "pronouns": ""},
+            "mutual_guilds": [
+                {"id": "4000", "nick": "Sammy"},
+                {"id": "7777", "nick": "UnknownGuildNick"}
+            ],
+            "mutual_friends": [
+                {"id": "2001", "username": "mara", "global_name": "Mara Okafor", "discriminator": "0", "avatar": "m1"},
+                {"id": "2002", "username": "dev", "global_name": "Dev Patel", "discriminator": "0", "avatar": "d2"}
+            ],
+            "mutual_friends_count": 2
+        }),
+    );
+
+    let profile = match world.ask(Request::Profile { person: world.key("2006"), space: Some(world.key("4000")) }) {
+        Response::Profile { profile } => profile,
+        other => panic!("expected Profile, got {other:?}"),
+    };
+    let reqs = world.discord.requests_to("GET", "/users/2006/profile");
+    assert_eq!(reqs.len(), 1);
+    assert!(reqs[0].path.contains("type=modal"), "got {}", reqs[0].path);
+    assert!(reqs[0].path.contains("with_mutual_friends=true"), "got {}", reqs[0].path);
+    assert!(reqs[0].path.contains("with_mutual_friends_count=true"), "got {}", reqs[0].path);
+    assert!(reqs[0].path.contains("with_mutual_guilds=true"), "got {}", reqs[0].path);
+
+    assert_eq!(profile.mutual_friends, 2);
+    assert_eq!(profile.mutual_people.len(), 2);
+    assert_eq!(profile.mutual_people[0].key.id, "2001");
+    assert_eq!(profile.mutual_people[0].avatar.as_ref().map(|a| a.id.as_str()), Some("avatar:2001:m1"));
+    assert_eq!(profile.mutual_people[1].key.id, "2002");
+
+    // Only known server 4000 appears in mutual_space_items with its nickname; unknown 7777 is omitted.
+    assert_eq!(profile.mutual_spaces, vec!["Rustaceans".to_owned()]);
+    assert_eq!(profile.mutual_total, 1);
+    assert_eq!(profile.mutual_space_items.len(), 1);
+    assert_eq!(profile.mutual_space_items[0].key, world.key("4000"));
+    assert_eq!(profile.mutual_space_items[0].name, "Rustaceans");
+    assert_eq!(profile.mutual_space_items[0].nickname, "Sammy");
+}
+
+#[test]
+fn edit_own_profile_avatar_banner_and_server_nickname() {
+    let world = World::start();
+    let account = world.account();
+
+    // 1. Free account capabilities: global profile fields enabled, Nitro-only banner/server profile disabled.
+    let can = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key == account).unwrap().can,
+        other => panic!("{other:?}"),
+    };
+    assert!(can.profile_name && can.profile_about && can.profile_pronouns && can.profile_avatar && can.profile_nickname && can.profile_accent);
+    assert!(!can.profile_banner && !can.profile_server);
+
+    // 2. Edit display name, bio, pronouns, and accent color.
+    world.discord.script("/users/@me", 200, json!({"id": "1000", "global_name": "Justin S."}));
+    world.discord.script("/users/@me/profile", 200, json!({"bio": "Rust builder", "pronouns": "he/him", "accent_color": 5793266}));
+    assert_eq!(
+        world.ask(Request::SetProfile {
+            account: account.clone(),
+            name: Some("Justin S.".into()),
+            about: Some("Rust builder".into()),
+            pronouns: Some("he/him".into()),
+            emoji: None,
+            username: None,
+            photo: false,
+            accent: Some(0x5865F2),
+            banner: None,
+            space: None,
+        }),
+        Response::Ok
+    );
+    let me_patches = world.discord.requests_to("PATCH", "/users/@me");
+    assert!(me_patches.iter().any(|r| r.path == "/users/@me" && r.body["global_name"] == "Justin S."));
+    let prof_patches = world.discord.requests_to("PATCH", "/users/@me/profile");
+    assert_eq!(prof_patches.len(), 1);
+    assert_eq!(prof_patches[0].body, json!({"bio": "Rust builder", "pronouns": "he/him", "accent_color": 0x5865F2}));
+
+    // 3. Set PNG avatar -> base64 data URI; GIF avatar refused on free account without hitting Discord.
+    let files_dir = world.dir.with_extension("files");
+    std::fs::create_dir_all(&files_dir).unwrap();
+    let png = files_dir.join("me.png");
+    std::fs::write(&png, b"\x89PNG\r\n\x1a\npayload").unwrap();
+    let gif = files_dir.join("me.gif");
+    std::fs::write(&gif, b"GIF89apayload").unwrap();
+
+    world.discord.script("/users/@me", 200, json!({"id": "1000", "avatar": "newhash"}));
+    assert_eq!(world.ask(Request::SetAvatar { account: account.clone(), path: png.to_string_lossy().into_owned() }), Response::Ok);
+    let avatar_patch = world.discord.requests_to("PATCH", "/users/@me").into_iter().filter(|r| r.path == "/users/@me").last().unwrap();
+    assert!(avatar_patch.body["avatar"].as_str().unwrap_or("").starts_with("data:image/png;base64,"));
+
+    match world.ask(Request::SetAvatar { account: account.clone(), path: gif.to_string_lossy().into_owned() }) {
+        Response::Error { detail, .. } => assert!(detail.contains("Nitro"), "got {detail}"),
+        other => panic!("expected Nitro refusal for GIF avatar, got {other:?}"),
+    }
+
+    // 4. Banner & per-server profile refused locally on free account.
+    match world.ask(Request::SetProfile {
+        account: account.clone(),
+        name: None,
+        about: None,
+        pronouns: None,
+        emoji: None,
+        username: None,
+        photo: false,
+        accent: None,
+        banner: Some(png.to_string_lossy().into_owned()),
+        space: None,
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("Nitro"), "got {detail}"),
+        other => panic!("expected Nitro refusal for banner, got {other:?}"),
+    }
+    match world.ask(Request::SetProfile {
+        account: account.clone(),
+        name: None,
+        about: Some("Server bio".into()),
+        pronouns: None,
+        emoji: None,
+        username: None,
+        photo: false,
+        accent: None,
+        banner: None,
+        space: Some(world.key("4000")),
+    }) {
+        Response::Error { detail, .. } => assert!(detail.contains("Nitro"), "got {detail}"),
+        other => panic!("expected Nitro refusal for server profile, got {other:?}"),
+    }
+
+    // 5. SpaceInfo reports can_change_nickname; set and clear server nickname on guild 4000.
+    // Ready's @everyone (36769344) cannot change its own name.
+    // CHANGE_NICKNAME is 1 << 26, so the role update sets 36769344 | 67108864.
+    world.discord.push(
+        "GUILD_ROLE_UPDATE",
+        json!({
+            "guild_id": "4000",
+            "role": {"id": "4000", "name": "@everyone", "permissions": "103878208"}
+        }),
+    );
+    wait("nickname permission on the server", || match world.ask(Request::SpaceInfo { space: world.key("4000") }) {
+        Response::SpaceInfo { info } if info.can_change_nickname => Some(info),
+        _ => None,
+    });
+
+    world.discord.script("/guilds/4000/members/@me", 200, json!({"nick": "CrabCaptain"}));
+    assert_eq!(
+        world.ask(Request::SetNickname { space: world.key("4000"), nickname: Some("CrabCaptain".into()) }),
+        Response::Ok
+    );
+    let nick_patches = world.discord.requests_to("PATCH", "/guilds/4000/members/@me");
+    assert_eq!(nick_patches.len(), 1);
+    assert_eq!(nick_patches[0].body, json!({"nick": "CrabCaptain"}));
+
+    // Clear nickname sends null.
+    world.discord.script("/guilds/4000/members/@me", 200, json!({"nick": null}));
+    assert_eq!(world.ask(Request::SetNickname { space: world.key("4000"), nickname: None }), Response::Ok);
+    let nick_patches = world.discord.requests_to("PATCH", "/guilds/4000/members/@me");
+    assert_eq!(nick_patches.len(), 2);
+    assert_eq!(nick_patches[1].body, json!({"nick": null}));
+
+    // 6. Nitro account enables banner & server profile and sends PATCH /guilds/4000/profile/@me.
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    ready["user"]["premium_type"] = json!(2);
+    let nitro = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("nitro account to connect", || (nitro.link() == Link::Connected).then_some(()));
+    let nitro_can = match nitro.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key == nitro.account()).unwrap().can,
+        other => panic!("{other:?}"),
+    };
+    assert!(nitro_can.profile_banner && nitro_can.profile_server);
+    nitro.discord.script("/guilds/4000/profile/@me", 200, json!({"bio": "Nitro guild bio"}));
+    assert_eq!(
+        nitro.ask(Request::SetProfile {
+            account: nitro.account(),
+            name: None,
+            about: Some("Nitro guild bio".into()),
+            pronouns: None,
+            emoji: None,
+            username: None,
+            photo: false,
+            accent: None,
+            banner: None,
+            space: Some(nitro.key("4000")),
+        }),
+        Response::Ok
+    );
+    let srv_patches = nitro.discord.requests_to("PATCH", "/guilds/4000/profile/@me");
+    assert_eq!(srv_patches.len(), 1);
+    assert_eq!(srv_patches[0].body, json!({"bio": "Nitro guild bio"}));
+}
+
+#[test]
+fn recent_mentions_fetch_filter_and_dismiss() {
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    // Add an age-gated (NSFW) channel 4199 to guild 4000.
+    ready["guilds"][0]["channels"].as_array_mut().unwrap().push(json!({
+        "id": "4199", "type": 0, "name": "age-gated", "position": 9, "parent_id": "4100",
+        "nsfw": true, "permission_overwrites": []
+    }));
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+    let account = world.account();
+
+    // 1. Capability is advertised.
+    let can = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key == account).unwrap().can,
+        other => panic!("{other:?}"),
+    };
+    assert!(can.mentions_history);
+
+    // 2. Fetch mentions: includes normal channel 4101, filters out message request 3005 and NSFW channel 4199.
+    // Asking for messages starts a history fetch. Settle that page first, so the count
+    // afterwards only moves if a mention itself was stored.
+    let before = wait("channel 4101 history", || {
+        let messages = world.messages("4101");
+        (messages.len() == 3).then_some(messages)
+    });
+    let before_ids: Vec<String> = before.iter().map(|message| message.id.clone()).collect();
+    world.discord.script(
+        "/users/@me/mentions",
+        200,
+        json!([
+            {
+                "id": "1300000000000090001", "channel_id": "4101", "guild_id": "4000", "type": 0,
+                "author": {"id": "2006", "username": "sam", "global_name": "Sam Whitlock", "discriminator": "0", "avatar": "s4m"},
+                "content": "hey <@1000> check this out",
+                "timestamp": "2026-10-13T08:15:00.000000+00:00",
+                "mentions": [{"id": "1000", "username": "justin", "global_name": "Justin"}],
+                "mention_roles": [], "mention_everyone": false, "attachments": [], "embeds": []
+            },
+            {
+                "id": "1300000000000090002", "channel_id": "3005", "type": 0,
+                "author": {"id": "2006", "username": "sam", "global_name": "Sam Whitlock", "discriminator": "0", "avatar": "s4m"},
+                "content": "spam request mention",
+                "timestamp": "2026-10-13T08:14:00.000000+00:00",
+                "mentions": [], "mention_roles": [], "mention_everyone": false, "attachments": [], "embeds": []
+            },
+            {
+                "id": "1300000000000090003", "channel_id": "4199", "guild_id": "4000", "type": 0,
+                "author": {"id": "2006", "username": "sam", "global_name": "Sam Whitlock", "discriminator": "0", "avatar": "s4m"},
+                "content": "nsfw channel mention",
+                "timestamp": "2026-10-13T08:13:00.000000+00:00",
+                "mentions": [], "mention_roles": [], "mention_everyone": false, "attachments": [], "embeds": []
+            }
+        ]),
+    );
+    match world.ask(Request::Mentions {
+        account: account.clone(),
+        before: None,
+        everyone: true,
+        roles: true,
+        space: None,
+        limit: 25,
+    }) {
+        Response::Mentions { items, more, .. } => {
+            assert!(!more);
+            assert_eq!(items.len(), 1, "request DM and NSFW channel must be filtered out: {items:?}");
+            assert_eq!(items[0].message_id, "1300000000000090001");
+            assert_eq!(items[0].conversation, world.key("4101"));
+            assert_eq!(items[0].sender, "Sam Whitlock");
+            assert!(items[0].text.contains("check this out"));
+        }
+        other => panic!("expected Response::Mentions, got {other:?}"),
+    }
+    let reqs = world.discord.requests_to("GET", "/users/@me/mentions");
+    assert_eq!(reqs.len(), 1);
+    assert!(reqs[0].path.contains("limit=25") && reqs[0].path.contains("roles=true") && reqs[0].path.contains("everyone=true"));
+    // Mentions must NEVER be written into channel message history.
+    let after = world.messages("4101");
+    assert_eq!(after.len(), before_ids.len());
+    assert!(after.iter().all(|message| before_ids.iter().any(|id| id == &message.id)));
+
+    // 3. Paging + filters: everyone=false, roles=false, before, guild_id.
+    world.discord.script("/users/@me/mentions", 200, json!([]));
+    assert!(matches!(
+        world.ask(Request::Mentions {
+            account: account.clone(),
+            before: Some("1300000000000090001".into()),
+            everyone: false,
+            roles: false,
+            space: Some(world.key("4000")),
+            limit: 10,
+        }),
+        Response::Mentions { items, more: false, .. } if items.is_empty()
+    ));
+    let reqs = world.discord.requests_to("GET", "/users/@me/mentions");
+    assert_eq!(reqs.len(), 2);
+    assert!(
+        reqs[1].path.contains("limit=10")
+            && reqs[1].path.contains("roles=false")
+            && reqs[1].path.contains("everyone=false")
+            && reqs[1].path.contains("before=1300000000000090001")
+            && reqs[1].path.contains("guild_id=4000"),
+        "got {}",
+        reqs[1].path
+    );
+
+    // 4. Dismiss sends DELETE /users/@me/mentions/{id}.
+    world.discord.script("/users/@me/mentions/1300000000000090001", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::DismissMention {
+            account,
+            message_id: "1300000000000090001".into(),
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("DELETE", "/users/@me/mentions/1300000000000090001").len(), 1);
 }
 
 #[test]

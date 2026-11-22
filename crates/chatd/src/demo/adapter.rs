@@ -395,6 +395,7 @@ impl Demo {
             nickname: if self.ctx.account.network == Network::Discord { "Robin 🍄".to_owned() } else { String::new() },
             roles: if self.ctx.account.network == Network::Discord { vec!["Member".to_owned(), "Trail lead".to_owned()] } else { Vec::new() },
             notify: Notify::Mentions,
+            can_change_nickname: self.ctx.account.network == Network::Discord,
             ..SpaceAbout::default()
         })
     }
@@ -730,7 +731,7 @@ impl Demo {
                 demo.ctx.presence(&demo.me.id, presence, status.as_deref().unwrap_or(&old), true);
                 let _ = reply.send(Ok(()));
             }
-            Command::SetProfile { name: _, about, pronouns: _, reply } => {
+            Command::SetProfile { about, reply, .. } => {
                 if let Some(about) = about {
                     let (presence, _) = demo.hub.shown(&demo.key(&demo.me.id));
                     demo.ctx.presence(&demo.me.id, presence, &about, true);
@@ -1006,6 +1007,10 @@ impl Demo {
             // Nothing is behind these: what is stored is all there is.
             Command::ActivityFeed { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityMarkRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Mentions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DismissMention { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MoveSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetFolder { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReadBy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BookmarkAdd { reply, .. }
             | Command::BookmarkEdit { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

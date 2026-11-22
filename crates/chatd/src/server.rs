@@ -2287,6 +2287,9 @@ impl Chat {
         emoji: Option<String>,
         username: Option<String>,
         photo: bool,
+        accent: Option<u32>,
+        banner: Option<String>,
+        space: Option<Key>,
     ) -> Response {
         if account.network == Network::Signal {
             if photo {
@@ -2310,9 +2313,10 @@ impl Chat {
         if let Err(refused) = self.online(&account) {
             return *refused;
         }
-        match self.ask(&account, |reply| Command::SetProfile { name, about, pronouns, reply }) {
+        let space_id = space.as_ref().filter(|s| s.account() == account).map(|s| s.id.clone());
+        match self.ask(&account, |reply| Command::SetProfile { name, about, pronouns, accent, banner, space_id, reply }) {
             Ok(()) => {
-                self.forget_own_profile(&account, None);
+                self.forget_own_profile(&account, space);
                 Response::Ok
             }
             Err(refused) => *refused,
@@ -2353,6 +2357,7 @@ impl Chat {
         });
         match self.ask(&account, |reply| Command::SetNickname { space_id, nickname, reply }) {
             Ok(()) => {
+                self.hub.space_infos.forget(&space);
                 self.forget_own_profile(&account, Some(space));
                 Response::Ok
             }
@@ -2394,7 +2399,11 @@ impl Chat {
         let cached = (person.clone(), space.clone());
         if let Some(known) = known.clone() {
             if let Some(mut profile) = self.hub.profiles.get(&cached) {
+                let scoped_avatar = profile.person.avatar.clone().filter(|a| a.id.starts_with("mavatar:"));
                 profile.person = self.with_presence(vec![known]).remove(0);
+                if let Some(avatar) = scoped_avatar {
+                    profile.person.avatar = Some(avatar);
+                }
                 return Response::Profile { profile: Box::new(profile) };
             }
         }
@@ -2504,6 +2513,7 @@ impl Chat {
             default_notify: about.default_notify,
             vanity_url: about.vanity_url,
             invites_disabled: about.invites_disabled,
+            can_change_nickname: about.can_change_nickname,
         };
         clip(&mut info.description, 4_000);
         clip(&mut info.nickname, 100);
@@ -4225,8 +4235,8 @@ impl Chat {
             Request::Report { target, reason, note, block } => self.report(target, reason, note, block),
             Request::ReportReasons { target } => self.report_reasons(target),
             Request::SetPresence { account, presence, status, status_emoji, clear_at } => self.set_presence(account, presence, status, status_emoji, clear_at),
-            Request::SetProfile { account, name, about, pronouns, emoji, username, photo } => {
-                self.set_profile(account, name, about, pronouns, emoji, username, photo)
+            Request::SetProfile { account, name, about, pronouns, emoji, username, photo, accent, banner, space } => {
+                self.set_profile(account, name, about, pronouns, emoji, username, photo, accent, banner, space)
             }
             Request::SetAvatar { account, path } => self.set_avatar(account, path),
             Request::SetNickname { space, nickname } => self.set_nickname(space, nickname),
@@ -4850,6 +4860,56 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::Mentions { account, before, everyone, roles, space, limit } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let limit = if limit == 0 { 25 } else { limit.min(50) };
+                let space_id = space.filter(|s| s.account() == account).map(|s| s.id);
+                match self.ask(&account, |reply| Command::Mentions { before, everyone, roles, space_id, limit, reply }) {
+                    Ok((mut items, more, cursor)) => {
+                        for item in &mut items {
+                            clip(&mut item.sender, 120);
+                            clip(&mut item.text, 500);
+                            clip(&mut item.title, 120);
+                            clip(&mut item.space_title, 120);
+                        }
+                        Response::Mentions { items, more, cursor }
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::DismissMention { account, message_id } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::DismissMention { message_id, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::MoveSpace { space, before, folder, into_space } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id;
+                match self.ask(&account, |reply| Command::MoveSpace { space_id, before, folder, into_space, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SetFolder { folder, name, color } => {
+                let account = folder.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let folder_id = folder.id;
+                match self.ask(&account, |reply| Command::SetFolder { folder_id, name, color, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::BookmarkAdd { conversation, title, link, emoji } => {
                 let account = conversation.account();
                 if let Err(refused) = self.online(&account) {
@@ -5284,6 +5344,12 @@ fn typed_profile(person: Person, mut about: About) -> Profile {
     clip(&mut about.time_zone, 64);
     about.mutual_spaces.truncate(MUTUAL_SPACES);
     about.mutual_spaces.iter_mut().for_each(|title| clip(title, 100));
+    about.mutual_space_items.truncate(MUTUAL_SPACES);
+    for item in &mut about.mutual_space_items {
+        clip(&mut item.name, 100);
+        clip(&mut item.nickname, 100);
+    }
+    about.mutual_people.truncate(25);
     about.roles.retain(|role| !role.is_empty());
     about.roles.truncate(protocol::PROFILE_ROLES);
     about.roles.iter_mut().for_each(|role| clip(role, 100));
@@ -5312,6 +5378,8 @@ fn typed_profile(person: Person, mut about: About) -> Profile {
     let mut profile = Profile::of(person);
     profile.bio = about.bio;
     profile.mutual_spaces = about.mutual_spaces;
+    profile.mutual_space_items = about.mutual_space_items;
+    profile.mutual_people = about.mutual_people;
     profile.time_zone = about.time_zone;
     profile.utc_offset = about.utc_offset;
     profile.fields = leftovers;
@@ -5341,6 +5409,10 @@ fn typed_profile(person: Person, mut about: About) -> Profile {
     profile.badges = about.badges;
     profile.connections = about.connections;
     profile.server_tag = about.server_tag;
+    if let Some(avatar) = about.avatar {
+        profile.person.avatar = Some(avatar);
+    }
+    profile.server_profile = about.server_profile;
     profile
 }
 

@@ -292,6 +292,9 @@ impl Floating {
                         if this.profile_asked == asked {
                             this.hub.learn(std::slice::from_ref(&profile.person));
                             this.sync_note_input(&profile.person.key, &profile.note, cx);
+                            if !profile.mutual_people.is_empty() {
+                                this.hub.learn(&profile.mutual_people);
+                            }
                             this.profile = Some(*profile);
                             cx.notify();
                         }
@@ -506,6 +509,7 @@ impl Floating {
         let actions = facts::actions(person, &seen, Surface::Card);
         let place = self.place.as_ref().map(|(_, name)| name.as_str());
         let ring = Ring::on(theme::overlay());
+        let shown_person = profile.map(|p| &p.person).unwrap_or(person);
         let banner_path = profile
             .and_then(|p| p.banner.as_ref())
             .and_then(|file| self.hub.file(&person.key.account(), file, cx).path);
@@ -513,7 +517,7 @@ impl Floating {
             .relative()
             .h(px(16. + draw::AVATAR))
             .children(draw::banner_band(banner_path, profile.and_then(|p| p.accent), theme::overlay()))
-            .child(div().absolute().top(px(16.)).left(px(16.)).child(person_avatar(&self.hub, person, draw::AVATAR, &ring, calling, cx)));
+            .child(div().absolute().top(px(16.)).left(px(16.)).child(person_avatar(&self.hub, shown_person, draw::AVATAR, &ring, calling, cx)));
         let badges: Vec<(String, Option<String>)> = profile
             .map(|p| {
                 p.badges
@@ -536,6 +540,7 @@ impl Floating {
             .flex()
             .flex_col()
             .child(draw::name_line(person.name.clone(), mark).mt(px(12.)))
+            .children(profile.filter(|p| p.server_profile).and_then(|_| draw::soft_line("Server profile".to_owned())))
             .children(draw::soft_line(facts::handle_line(person, profile)))
             .children(draw::badge_strip("card-badge", &badges))
             .children(draw::presence_row(&line, theme::overlay(), 2))
@@ -543,6 +548,23 @@ impl Floating {
                 top.child(self.card_actions(person, &actions, cx).mt(px(16.)))
             });
         let is_self = self.scene.accounts.iter().any(|own| own.key == person.key.account() && own.me == person.key.id);
+        let can_edit_self = is_self
+            && self
+                .scene
+                .accounts
+                .iter()
+                .any(|own| own.key == person.key.account() && own.can.can_edit_profile());
+        if can_edit_self {
+            top = top.child(
+                button("card-edit-profile", ButtonKind::Secondary, "Edit profile")
+                    .w_full()
+                    .mt(px(12.))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.close(cx);
+                        crate::gui::settings::open(crate::gui::settings::Section::Accounts, cx);
+                    })),
+            );
+        }
         if let Some((action, label)) = facts::friendship_action(person).filter(|_| !is_self) {
             let who = person.clone();
             let friendship = button("card-friendship", ButtonKind::Secondary, label).w_full();
@@ -566,6 +588,42 @@ impl Floating {
         }
         let mut body = div().px(px(16.)).flex().flex_col().gap(px(10.));
         let mut any = false;
+        if !person.bot && person.activity.is_some() && seen.online {
+            let now = crate::view::now();
+            let ours = own_offset(now);
+            for (ix, fact) in facts::right_now(person, profile, &line, now, ours)
+                .into_iter()
+                .filter(|f| f.glyph != "icons/clock.svg")
+                .enumerate()
+            {
+                any = true;
+                let opens = fact.opens.clone();
+                let url = fact.url.clone().filter(|_| opens.is_none());
+                let title = fact.words.clone();
+                let art_path = fact
+                    .art
+                    .as_ref()
+                    .and_then(|file| self.hub.file(&person.key.account(), file, cx).path);
+                let row = match art_path {
+                    Some(path) => draw::fact_inline_art(("card-now", ix), path, fact.words, fact.soft),
+                    None => draw::fact_inline(("card-now", ix), fact.glyph, fact.words, fact.soft),
+                };
+                body = body.child(
+                    row.when_some(opens, |row, key| {
+                        row.cursor_pointer().hover(|row| row.bg(theme::hover())).on_click(cx.listener(move |this, _, _, cx| {
+                            let (key, title) = (key.clone(), title.clone());
+                            this.shell_do(cx, move |shell, cx| shell.select(key, &title, cx));
+                        }))
+                    })
+                    .when_some(url, |row, url| {
+                        row.cursor_pointer().hover(|row| row.bg(theme::hover())).on_click(cx.listener(move |this, _, window, cx| {
+                            this.close(cx);
+                            let _ = this.shell.update(cx, |shell, cx| shell.open_external_link(&url, window, cx));
+                        }))
+                    }),
+                );
+            }
+        }
         if let Some(profile) = profile.filter(|_| seen.online) {
             match facts::card_body(person, profile, place) {
                 Some(CardBody::Role(role)) if !self.manage_roles => {
@@ -615,25 +673,85 @@ impl Floating {
                 any = true;
                 body = body.child(self.member_roles(person, profile, cx));
             }
+            let friend_count = profile.mutual_friends.max(profile.mutual_people.len() as u32);
+            if friend_count > 0 {
+                any = true;
+                let (key, space, given) = (person.key.clone(), self.place.as_ref().map(|(key, _)| key.clone()), Some(profile.clone()));
+                let ring = Ring::on(theme::overlay());
+                let faces: Vec<Div> = profile
+                    .mutual_people
+                    .iter()
+                    .take(3)
+                    .map(|friend| person_avatar(&self.hub, friend, 18., &ring, false, cx))
+                    .collect();
+                body = body.child(
+                    div()
+                        .id("card-mutual-friends")
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .cursor_pointer()
+                        .rounded(px(theme::R_CONTROL))
+                        .hover(|r| r.bg(theme::hover()))
+                        .children(faces)
+                        .child(div().ml(px(4.)).type_small().text_color(theme::text_soft()).child(facts::mutual_friends_words(friend_count)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let (key, space, given) = (key.clone(), space.clone(), given.clone());
+                            this.shell_do(cx, move |shell, cx| shell.details_person_with(key, space, given, cx));
+                        })),
+                );
+            }
             if let Some(common) = facts::in_common(network, profile) {
                 any = true;
                 let spaces = self.spaces(cx);
                 let account = person.key.account();
-                let icons = common.names.iter().map(|name| {
-                    let known = spaces.iter().find(|space| space.key.account() == account && space.name == *name);
-                    let key = known.map(|space| space.key.clone()).unwrap_or_else(|| Key { id: name.clone(), ..person.key.clone() });
-                    let icon = known.and_then(|space| space.icon.as_ref()).map(|icon| self.hub.file(&account, icon, cx));
-                    Avatar::new(&key, name, 20.).shape(Plate::Place).image(icon.as_ref()).build()
-                });
-                let icons: Vec<Div> = icons.collect();
-                body = body.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(4.))
-                        .children(icons)
-                        .child(div().ml(px(4.)).type_small().text_color(theme::text_soft()).child(common.words)),
-                );
+                let mut row = div().flex().items_center().gap(px(4.));
+                if !profile.mutual_space_items.is_empty() {
+                    for (ix, item) in profile.mutual_space_items.iter().take(facts::SPACES_SHOWN).enumerate() {
+                        let known = spaces.iter().find(|space| space.key == item.key);
+                        let icon = known.and_then(|space| space.icon.as_ref()).map(|icon| self.hub.file(&account, icon, cx));
+                        let tip_text = if item.nickname.is_empty() {
+                            item.name.clone()
+                        } else {
+                            format!("{} ({})", item.name, item.nickname)
+                        };
+                        let key = item.key.clone();
+                        row = row.child(
+                            div()
+                                .id(("card-mutual-space", ix))
+                                .cursor_pointer()
+                                .rounded(px(4.))
+                                .tooltip(crate::gui::components::tip(tip_text, None))
+                                .child(Avatar::new(&item.key, &item.name, 20.).shape(Plate::Place).image(icon.as_ref()).build())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let key = key.clone();
+                                    this.shell_do(cx, move |shell, cx| shell.go(crate::gui::sidebar::Mode::Space(key), cx));
+                                })),
+                        );
+                    }
+                } else {
+                    for (ix, name) in common.names.iter().enumerate() {
+                        let known = spaces.iter().find(|space| space.key.account() == account && space.name == *name);
+                        let key = known.map(|space| space.key.clone()).unwrap_or_else(|| Key { id: name.clone(), ..person.key.clone() });
+                        let icon = known.and_then(|space| space.icon.as_ref()).map(|icon| self.hub.file(&account, icon, cx));
+                        let clickable = known.is_some();
+                        let click_key = key.clone();
+                        row = row.child(
+                            div()
+                                .id(("card-mutual-space", ix))
+                                .when(clickable, |el| {
+                                    el.cursor_pointer()
+                                        .tooltip(crate::gui::components::tip(name.clone(), None))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            let key = click_key.clone();
+                                            this.shell_do(cx, move |shell, cx| shell.go(crate::gui::sidebar::Mode::Space(key), cx));
+                                        }))
+                                })
+                                .child(Avatar::new(&key, name, 20.).shape(Plate::Place).image(icon.as_ref()).build()),
+                        );
+                    }
+                }
+                body = body.child(row.child(div().ml(px(4.)).type_small().text_color(theme::text_soft()).child(common.words)));
             }
             if !profile.connections.is_empty() {
                 any = true;

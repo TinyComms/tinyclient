@@ -249,20 +249,6 @@ impl GuildInfo {
         self.timeout_until.filter(|until| *until > now)
     }
 
-    /// Guild-level base permissions across `@everyone` and our assigned roles (without channel overwrites).
-    pub(super) fn base_permissions(&self, guild: &str) -> u64 {
-        if self.owner {
-            return u64::MAX;
-        }
-        let everyone = number(guild);
-        let of = |role: &u64| self.roles.get(role).map_or(0, |role| role.permissions);
-        let allowed = self.my_roles.iter().fold(of(&everyone), |all, role| all | of(role));
-        if allowed & ADMINISTRATOR != 0 {
-            return u64::MAX;
-        }
-        allowed
-    }
-
     /// Server-level management flags exposed on [`protocol::Space`].
     pub(super) fn space_rights(&self, guild: &str, now: i64) -> protocol::SpaceRights {
         let perms = self.guild_permissions(guild);
@@ -278,18 +264,29 @@ impl GuildInfo {
         }
     }
 
-    /// Discord's permission rule for a channel: the roles' own permissions, then the channel's
-    /// overwrites for everyone, for our roles, and for us.
-    pub(super) fn permissions(&self, guild: &str, me: &str, channel: &Channel) -> u64 {
+    /// Base server-wide permissions from `@everyone` and our roles (without channel overwrites).
+    pub(super) fn base_permissions(&self, guild: &str) -> u64 {
         if self.owner {
             return u64::MAX;
         }
         let everyone = number(guild);
         let of = |role: &u64| self.roles.get(role).map_or(0, |role| role.permissions);
-        let mut allowed = self.my_roles.iter().fold(of(&everyone), |all, role| all | of(role));
+        let allowed = self.my_roles.iter().fold(of(&everyone), |all, role| all | of(role));
         if allowed & ADMINISTRATOR != 0 {
+            u64::MAX
+        } else {
+            allowed
+        }
+    }
+
+    /// Discord's permission rule for a channel: the roles' own permissions, then the channel's
+    /// overwrites for everyone, for our roles, and for us.
+    pub(super) fn permissions(&self, guild: &str, me: &str, channel: &Channel) -> u64 {
+        let mut allowed = self.base_permissions(guild);
+        if allowed == u64::MAX {
             return u64::MAX;
         }
+        let everyone = number(guild);
         let overwrites = &channel.permission_overwrites;
         if let Some(all) = overwrites.iter().find(|over| !over.member && number(&over.id) == everyone) {
             allowed = (allowed & !all.deny) | all.allow;
@@ -625,6 +622,10 @@ impl Discord {
         for row in &tree.rows {
             self.ctx.muted(&row.id, info.quiet.mutes(&row.id, row.group.as_deref(), now))?;
         }
+        let nsfw: Vec<String> = guild.channels.iter().filter(|ch| ch.nsfw).map(|ch| ch.id.clone()).collect();
+        if !nsfw.is_empty() {
+            self.state.lock().unwrap().nsfw_channels.extend(nsfw);
+        }
         let kept: Vec<Kept> = guild.channels.iter().map(Kept::of).collect();
         self.ctx.set_note(&format!("kept:{}", guild.id), &serde_json::to_string(&kept).unwrap_or_default());
         self.unlist_threads(&guild.id, &tree.rows)
@@ -785,9 +786,7 @@ impl Discord {
                                 person.role_color = color;
                                 person.role_icon = icon.as_ref().map(|(f, _)| f.clone());
                                 person.role_emoji = emoji.clone();
-                                if let Some(nick) = member.nick.as_deref().filter(|n| !n.is_empty()) {
-                                    person.name = nick.to_owned();
-                                }
+                                person.nickname = member.nick.clone().unwrap_or_default();
                                 touched = true;
                             }
                         }
@@ -802,6 +801,7 @@ impl Discord {
             } else {
                 let mut before = std::mem::replace(&mut info.my_roles, roles.clone());
                 before.sort_unstable();
+                info.nick = member.nick.clone().unwrap_or_default();
                 let prev_timeout = std::mem::replace(&mut info.timeout_until, timeout_until);
                 (before != roles, prev_timeout != timeout_until, roster_refresh, icon_file)
             }
@@ -1082,6 +1082,16 @@ impl Discord {
             age_restricted_blocked,
             announcement_follow: true,
             create_space: true,
+            profile_name: true,
+            profile_about: true,
+            profile_pronouns: true,
+            profile_avatar: true,
+            profile_nickname: true,
+            profile_accent: true,
+            profile_banner: premium > 0,
+            profile_server: premium > 0,
+            mentions_history: true,
+            manage_space_folders: true,
             ..Default::default()
         });
         self.state.lock().unwrap().premium = premium;
@@ -1220,6 +1230,26 @@ impl Discord {
             self.state.lock().unwrap().guilds.insert(guild.id.clone(), info);
         }
         self.spaces()?;
+        {
+            let mut state = self.state.lock().unwrap();
+            state.guild_folders_settings = ready
+                .user_settings_proto
+                .as_deref()
+                .and_then(proto::guild_folders_settings)
+                .unwrap_or_default();
+            state.folders = match &folders {
+                Some(list) => list.clone(),
+                None => order
+                    .iter()
+                    .map(|id| proto::GuildFolder {
+                        id: None,
+                        name: String::new(),
+                        color: None,
+                        guild_ids: vec![id.clone()],
+                    })
+                    .collect(),
+            };
+        }
         if let Some(folders) = &folders {
             self.record_folders(folders)?;
         }
@@ -1327,7 +1357,20 @@ impl Discord {
             }
         }
         self.ctx.presence(id, update.presence(), update.status(), owned);
-        let (emoji, doing) = (update.emoji().to_owned(), update.doing());
+        let mut files = Vec::new();
+        if let Some(emoji_file) = update.emoji_file() {
+            files.push(emoji_file);
+        }
+        let doing = update.doing_with_art().map(|(doing, art)| {
+            if let Some(art) = art {
+                files.push(art);
+            }
+            doing
+        });
+        if !files.is_empty() {
+            let _ = self.ctx.media(&files);
+        }
+        let emoji = update.emoji().to_owned();
         if owned {
             self.state.lock().unwrap().doing.insert(id.to_owned(), (emoji.clone(), doing.clone()));
             self.tell_activity(id);
@@ -1353,10 +1396,12 @@ impl Discord {
             Some((channel, guild, place)) => {
                 let name = self.ctx.known(&channel).ok().flatten().map(|row| row.title).unwrap_or_default();
                 let mut voice = protocol::Activity {
-                    kind: if guild.is_some() { protocol::ActivityKind::InVoice } else { protocol::ActivityKind::InCall },
-                    name,
                     place,
                     conversation: Some(self.ctx.key(&channel)),
+                    ..protocol::Activity::new(
+                        if guild.is_some() { protocol::ActivityKind::InVoice } else { protocol::ActivityKind::InCall },
+                        name,
+                    )
                 };
                 voice.bound();
                 Some(voice)
@@ -1483,6 +1528,14 @@ impl Discord {
         };
         if !self.state.lock().unwrap().guilds.contains_key(&guild) {
             return Ok(());
+        }
+        {
+            let mut state = self.state.lock().unwrap();
+            if channel.nsfw {
+                state.nsfw_channels.insert(channel.id.clone());
+            } else {
+                state.nsfw_channels.remove(&channel.id);
+            }
         }
         self.keep(&guild, |kept| match kept.iter_mut().find(|known| known.id == channel.id) {
             Some(known) => *known = Kept::of(&channel),

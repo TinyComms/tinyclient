@@ -4484,10 +4484,12 @@ impl Composer {
                 status: String::new(),
                 link: String::new(),
                 emoji: String::new(),
+                emoji_file: None,
                 activity: None,
                 title: String::new(),
                 utc_offset: None,
                 mark: None,
+                nickname: String::new(),
             };
             let found = vec![
                 person("Dev Patel", "devp", protocol::Presence::Online),

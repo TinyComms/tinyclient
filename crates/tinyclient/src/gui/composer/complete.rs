@@ -192,8 +192,16 @@ mod tests {
             presence: Presence::Unknown,
             status: String::new(),
             link: String::new(),
-            emoji: String::new(), activity: None, title: String::new(), utc_offset: None, mark: None,
-            role_color: None, role_icon: None, role_emoji: None,
+            emoji: String::new(),
+            emoji_file: None,
+            activity: None,
+            nickname: String::new(),
+            title: String::new(),
+            utc_offset: None,
+            mark: None,
+            role_color: None,
+            role_icon: None,
+            role_emoji: None,
         }
     }
 

@@ -294,6 +294,33 @@ pub fn fact_inline(id: impl Into<ElementId>, icon: &'static str, words: String, 
         .child(div().flex_1().min_w_0().child(text))
 }
 
+/// Same as [`fact_inline`], with a 24×24 rounded thumbnail (e.g. Spotify album art) instead of a glyph.
+pub fn fact_inline_art(id: impl Into<ElementId>, path: String, words: String, soft: String) -> Stateful<Div> {
+    let text = gpui::StyledText::new(format!("{words}{soft}")).with_highlights([(
+        words.len()..words.len() + soft.len(),
+        gpui::HighlightStyle { color: Some(theme::text_soft().into_color()), ..Default::default() },
+    )]);
+    div()
+        .id(id)
+        .min_h(px(theme::ROW_ONE))
+        .mx(px(-8.))
+        .px(px(8.))
+        .py(px(5.))
+        .rounded(px(theme::R_CONTROL))
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .type_ui()
+        .child(
+            gpui::img(std::path::PathBuf::from(path))
+                .size(px(24.))
+                .rounded(px(4.))
+                .flex_none()
+                .object_fit(gpui::ObjectFit::Cover),
+        )
+        .child(div().flex_1().min_w_0().child(text))
+}
+
 /// A Space as a place row: 20 rounded square, name 13.
 pub fn place_row(id: impl Into<ElementId>, space: &protocol::Key, name: &str, icon: Option<&protocol::MediaFile>) -> Stateful<Div> {
     div()

@@ -516,7 +516,7 @@ impl Discord {
         // `profile_queued` has waited the turn; this marks it taken.
         crate::hub::lock(&self.state).profiled = Some(Instant::now());
         let mut path = format!(
-            "/users/{person}/profile?type=popout&with_mutual_guilds=true&with_mutual_friends=false&with_mutual_friends_count=false"
+            "/users/{person}/profile?type=modal&with_mutual_guilds=true&with_mutual_friends=true&with_mutual_friends_count=true"
         );
         if let Some(space) = space {
             path.push_str(&format!("&guild_id={space}"));
@@ -535,13 +535,15 @@ impl Discord {
         let mut media: Vec<(protocol::MediaFile, String)> = Vec::new();
         let text = profile.user_profile.as_ref();
         let member_text = profile.guild_member_profile.as_ref();
+        let member_banner_hash = space.and_then(|_| {
+            member_text
+                .and_then(|p| p.banner.as_deref())
+                .filter(|h| !h.is_empty())
+                .or_else(|| profile.guild_member.as_ref().and_then(|m| m.banner.as_deref()).filter(|h| !h.is_empty()))
+        });
         let banner = space
-            .and_then(|guild| {
-                member_text
-                    .and_then(|p| p.banner.as_deref())
-                    .filter(|h| !h.is_empty())
-                    .and_then(|hash| model::member_banner(guild, person, hash))
-            })
+            .zip(member_banner_hash)
+            .and_then(|(guild, hash)| model::member_banner(guild, person, hash))
             .or_else(|| {
                 text.and_then(|p| p.banner.as_deref())
                     .filter(|h| !h.is_empty())
@@ -636,15 +638,110 @@ impl Discord {
             }
         };
 
+        let member_profile = space.and_then(|_| profile.guild_member_profile.as_ref());
+        let mut server_profile = false;
+        let mut server_avatar = None;
+        let member_avatar = space
+            .zip(profile.guild_member.as_ref().and_then(|m| m.avatar.as_deref()).filter(|h| !h.is_empty()))
+            .and_then(|(guild_id, hash)| model::member_avatar(guild_id, person, hash));
+        if let Some((file, url)) = member_avatar {
+            let sizes = model::avatar_variants(&file.id);
+            let id = file.id.clone();
+            let registered = self.ctx.media(&[(file.clone(), url)]);
+            if let (Ok(()), Some(sizes)) = (registered, sizes) {
+                let _ = self.ctx.media_variants(&id, &sizes);
+            }
+            server_avatar = Some(file);
+            server_profile = true;
+        }
+        if member_banner_hash.is_some() && banner_file.is_some() {
+            server_profile = true;
+        }
+        let mut friend_files = Vec::new();
+        for friend in profile.mutual_friends.iter().take(25) {
+            friend_files.push(friend.avatar());
+        }
+        if !friend_files.is_empty() {
+            let _ = self.ctx.media(&friend_files);
+        }
         let state = crate::hub::lock(&self.state);
-        let shared = profile.mutual_guilds.iter().filter_map(|guild| state.guilds.get(&guild.id));
+        // Count known servers before the list is capped. An id we have never seen stays out.
+        let known_spaces: Vec<protocol::MutualSpace> = profile
+            .mutual_guilds
+            .iter()
+            .filter_map(|mg| {
+                let guild = state.guilds.get(&mg.id)?;
+                Some(protocol::MutualSpace {
+                    key: self.ctx.key(&mg.id),
+                    name: guild.name.clone(),
+                    nickname: mg.nick.clone().unwrap_or_default(),
+                })
+            })
+            .collect();
+        let mutual_total = known_spaces.len() as u32;
+        let mutual_space_items: Vec<protocol::MutualSpace> = known_spaces.into_iter().take(protocol::MUTUAL_SPACES).collect();
+        let mutual_spaces: Vec<String> = mutual_space_items.iter().map(|s| s.name.clone()).collect();
+        // An unknown id is not a friend. Inventing Friend here lets the card's learn
+        // replace a blocked or ignored person. Anyone who is not already Friend is left out.
+        let mutual_people: Vec<protocol::Person> = profile
+            .mutual_friends
+            .iter()
+            .take(25)
+            .filter_map(|friend| {
+                let relation = state.relations.get(&friend.id).copied().unwrap_or(protocol::Relation::None);
+                if relation != protocol::Relation::Friend {
+                    return None;
+                }
+                let (avatar, _) = friend.avatar();
+                let name = state.users.get(&friend.id).cloned().unwrap_or_else(|| friend.name().to_owned());
+                Some(protocol::Person {
+                    key: self.ctx.key(&friend.id),
+                    name,
+                    handle: friend.username.clone(),
+                    avatar: Some(avatar),
+                    bot: friend.bot,
+                    relation,
+                    link: model::user_link(&friend.id),
+                    ..protocol::Person::new(self.ctx.key(&friend.id), "")
+                })
+            })
+            .collect();
+        let mutual_friends = profile
+            .mutual_friends_count
+            .unwrap_or(profile.mutual_friends.len() as u32)
+            .max(mutual_people.len() as u32);
+        let bio = match member_profile.map(|p| p.bio.as_str()).filter(|b| !b.is_empty()) {
+            Some(server_bio) => {
+                server_profile = true;
+                let mut bio = server_bio.to_owned();
+                protocol::clip(&mut bio, 1_000);
+                bio
+            }
+            None => profile.bio(),
+        };
+        let pronouns = match member_profile.map(|p| p.pronouns.as_str()).filter(|p| !p.is_empty()) {
+            Some(server_pronouns) => {
+                server_profile = true;
+                server_pronouns.to_owned()
+            }
+            None => text.map(|text| text.pronouns.clone()).unwrap_or_default(),
+        };
+        // The server's own accent colour is part of a server profile; the colour shown is worked out above.
+        if member_profile.and_then(|p| p.accent_color).is_some() {
+            server_profile = true;
+        }
         let mut about = About {
-            bio: profile.bio(),
-            mutual_spaces: shared.map(|guild| guild.name.clone()).take(protocol::MUTUAL_SPACES).collect(),
-            mutual_total: profile.mutual_guilds.len() as u32,
-            pronouns: text.map(|text| text.pronouns.clone()).unwrap_or_default(),
+            bio,
+            mutual_spaces,
+            mutual_space_items,
+            mutual_people,
+            mutual_friends,
+            mutual_total,
+            pronouns,
             accent,
             banner: banner_file,
+            avatar: server_avatar,
+            server_profile,
             badges,
             connections,
             server_tag,
@@ -731,6 +828,7 @@ impl Discord {
             default_notify,
             vanity_url,
             invites_disabled,
+            can_change_nickname,
         ) = {
             let state = crate::hub::lock(&self.state);
             let info = state.guilds.get(guild).ok_or_else(|| refused("This server is gone."))?;
@@ -775,6 +873,8 @@ impl Discord {
                 .vanity_url_code
                 .filter(|s| !s.is_empty())
                 .or_else(|| info.vanity_url_code.clone());
+            let can_change_nickname =
+                info.owner || (info.base_permissions(guild) & (model::ADMINISTRATOR | model::CHANGE_NICKNAME)) != 0;
             (
                 description,
                 banner_hash,
@@ -790,6 +890,7 @@ impl Discord {
                 default_notify,
                 vanity_url,
                 invites_disabled,
+                can_change_nickname,
             )
         };
         let banner = match banner_hash.as_deref() {
@@ -807,6 +908,7 @@ impl Discord {
             nickname,
             roles,
             notify,
+            can_change_nickname,
             banner,
             boost_level,
             boosts,
@@ -825,6 +927,140 @@ impl Discord {
     pub(super) fn note_thread_notify(&self, channel: &str, word: &str) {
         self.ctx.set_note(&format!("thread-notify:{channel}"), word);
         self.ctx.info_stale(channel);
+    }
+    /// Edits our own Discord display name (`PATCH /users/@me`), global profile (`PATCH /users/@me/profile`),
+    /// or Nitro per-server profile (`PATCH /guilds/{id}/profile/@me`).
+    pub(super) fn set_profile(
+        &self,
+        name: Option<String>,
+        about: Option<String>,
+        pronouns: Option<String>,
+        accent: Option<u32>,
+        banner: Option<String>,
+        space_id: Option<String>,
+    ) -> Result<(), Refusal> {
+        let premium = crate::hub::lock(&self.state).premium;
+        if let Some(guild) = space_id {
+            if premium == 0 {
+                return Err(refused("Per-server profiles require Discord Nitro."));
+            }
+            if !crate::hub::lock(&self.state).guilds.contains_key(&guild) {
+                return Err(refused("This server is gone."));
+            }
+            let mut body = serde_json::Map::new();
+            if let Some(mut bio) = about {
+                let trimmed = bio.trim().to_owned();
+                bio = trimmed;
+                protocol::clip(&mut bio, 190);
+                body.insert("bio".into(), json!(bio));
+            }
+            if let Some(mut p) = pronouns {
+                let trimmed = p.trim().to_owned();
+                p = trimmed;
+                protocol::clip(&mut p, 40);
+                body.insert("pronouns".into(), json!(p));
+            }
+            if let Some(color) = accent {
+                body.insert("accent_color".into(), json!(color & 0xFF_FFFF));
+            }
+            if let Some(path) = banner {
+                let trimmed = path.trim();
+                if trimmed.is_empty() {
+                    body.insert("banner".into(), serde_json::Value::Null);
+                } else {
+                    let uri = image_data_uri(trimmed, true)?;
+                    body.insert("banner".into(), json!(uri));
+                }
+            }
+            if !body.is_empty() {
+                self.call("PATCH", &format!("/guilds/{guild}/profile/@me"), Some(serde_json::Value::Object(body)))
+                    .map_err(profile_refusal)?;
+            }
+            return Ok(());
+        }
+
+        if let Some(name) = name {
+            let mut trimmed = name.trim().to_owned();
+            protocol::clip(&mut trimmed, 32);
+            let value = if trimmed.is_empty() { serde_json::Value::Null } else { json!(trimmed) };
+            self.call("PATCH", "/users/@me", Some(json!({"global_name": value})))
+                .map_err(profile_refusal)?;
+        }
+
+        let mut profile_body = serde_json::Map::new();
+        if let Some(about) = about {
+            let mut trimmed = about.trim().to_owned();
+            protocol::clip(&mut trimmed, 190);
+            profile_body.insert("bio".into(), json!(trimmed));
+        }
+        if let Some(pronouns) = pronouns {
+            let mut trimmed = pronouns.trim().to_owned();
+            protocol::clip(&mut trimmed, 40);
+            profile_body.insert("pronouns".into(), json!(trimmed));
+        }
+        if let Some(color) = accent {
+            profile_body.insert("accent_color".into(), json!(color & 0xFF_FFFF));
+        }
+        if let Some(path) = banner {
+            let trimmed = path.trim();
+            if trimmed.is_empty() {
+                profile_body.insert("banner".into(), serde_json::Value::Null);
+            } else {
+                if premium == 0 {
+                    return Err(refused("Profile banners require Discord Nitro."));
+                }
+                let uri = image_data_uri(trimmed, true)?;
+                profile_body.insert("banner".into(), json!(uri));
+            }
+        }
+        if !profile_body.is_empty() {
+            self.call("PATCH", "/users/@me/profile", Some(serde_json::Value::Object(profile_body)))
+                .map_err(profile_refusal)?;
+        }
+        Ok(())
+    }
+
+    /// Sets or clears our own Discord avatar via `PATCH /users/@me`.
+    pub(super) fn set_avatar(&self, path: &str) -> Result<(), Refusal> {
+        let premium = crate::hub::lock(&self.state).premium;
+        let trimmed = path.trim();
+        let value = if trimmed.is_empty() {
+            serde_json::Value::Null
+        } else {
+            let uri = image_data_uri(trimmed, premium > 0)?;
+            json!(uri)
+        };
+        self.call("PATCH", "/users/@me", Some(json!({"avatar": value})))
+            .map_err(profile_refusal)?;
+        Ok(())
+    }
+
+    /// Sets or clears our nickname in a Discord server via `PATCH /guilds/{id}/members/@me`.
+    pub(super) fn set_nickname(&self, guild: &str, nickname: Option<String>) -> Result<(), Refusal> {
+        {
+            let state = crate::hub::lock(&self.state);
+            let info = state.guilds.get(guild).ok_or_else(|| refused("This server is gone."))?;
+            let allowed = info.owner
+                || (info.base_permissions(guild) & (model::ADMINISTRATOR | model::CHANGE_NICKNAME)) != 0;
+            if !allowed {
+                return Err(refused("You don't have permission to change your nickname in this server."));
+            }
+        }
+        let cleaned = nickname.and_then(|n| {
+            let mut trimmed = n.trim().to_owned();
+            protocol::clip(&mut trimmed, 32);
+            (!trimmed.is_empty()).then_some(trimmed)
+        });
+        let value = match &cleaned {
+            Some(nick) => json!(nick),
+            None => serde_json::Value::Null,
+        };
+        self.call("PATCH", &format!("/guilds/{guild}/members/@me"), Some(json!({"nick": value})))
+            .map_err(profile_refusal)?;
+        if let Some(info) = crate::hub::lock(&self.state).guilds.get_mut(guild) {
+            info.nick = cleaned.unwrap_or_default();
+        }
+        Ok(())
     }
 
     /// Sets a conversation's notifications as Discord's own menu does: one settings change for
@@ -2447,6 +2683,85 @@ impl Discord {
         Ok(found_hits)
     }
 
+    /// Recent mentions from before tinyclient was open (`GET /users/@me/mentions`).
+    /// Mapped through `convert()` without writing into channel message history; respects hidden
+    /// channels, message requests, and age-gated (NSFW) channels.
+    pub(super) fn mentions(
+        &self,
+        before: Option<&str>,
+        everyone: bool,
+        roles: bool,
+        space: Option<&str>,
+        limit: u32,
+    ) -> Result<(Vec<protocol::MentionHit>, bool, Option<String>), Refusal> {
+        let cap = limit.clamp(1, 25);
+        let mut path = format!("/users/@me/mentions?limit={cap}&roles={roles}&everyone={everyone}");
+        if let Some(before) = before.filter(|b| !b.is_empty()) {
+            path.push_str(&format!("&before={}", escaped(before)));
+        }
+        if let Some(guild) = space.filter(|g| !g.is_empty()) {
+            path.push_str(&format!("&guild_id={}", escaped(guild)));
+        }
+        let answer = self.call("GET", &path, None).map_err(refusal)?;
+        let raw: Vec<Posted> = serde_json::from_str(&answer).map_err(refused)?;
+        let more = raw.len() >= cap as usize;
+        // The next page starts before the last raw id, even when every hit on this page was
+        // filtered out. One call returns one page.
+        let cursor = more.then(|| raw.last().map(|posted| posted.id.clone())).flatten();
+        let nsfw = crate::hub::lock(&self.state).nsfw_channels.clone();
+        let mut hits = Vec::new();
+        for posted in &raw {
+            if !self.ctx.listable(&posted.channel_id) || nsfw.contains(&posted.channel_id) {
+                continue;
+            }
+            let known = self.ctx.known(&posted.channel_id).ok().flatten();
+            if known.as_ref().is_some_and(|row| row.special == protocol::Special::Request) {
+                continue;
+            }
+            let kind = known.as_ref().map_or(ConversationKind::Channel, |row| row.kind);
+            let title = known.as_ref().map_or_else(String::new, |row| row.title.clone());
+            let space_title = known.as_ref().map_or_else(String::new, |row| row.space_title.clone());
+            let guild = posted
+                .guild_id
+                .as_deref()
+                .or_else(|| known.as_ref().and_then(|row| row.space.as_deref()));
+            let (message, files) = self.convert(posted, guild, kind);
+            if !files.files.is_empty() {
+                let _ = self.ctx.media(&files.files);
+            }
+            let text = if !message.text.is_empty() {
+                message.text
+            } else if let Some(first) = message.attachments.first() {
+                if first.name.is_empty() { "Attachment".to_owned() } else { first.name.clone() }
+            } else {
+                posted.content.clone().unwrap_or_default()
+            };
+            hits.push(protocol::MentionHit {
+                conversation: self.ctx.key(&posted.channel_id),
+                message_id: posted.id.clone(),
+                sent: model::seconds(&posted.id),
+                sender: message.sender.name,
+                sender_avatar: message.sender.avatar,
+                text,
+                title,
+                space_title,
+                mentions_everyone: posted.mention_everyone,
+                mentions_role: !posted.mention_roles.is_empty(),
+            });
+        }
+        Ok((hits, more, cursor))
+    }
+
+    /// Dismisses a recent mention (`DELETE /users/@me/mentions/{message_id}`).
+    pub(super) fn dismiss_mention(&self, message_id: &str) -> Result<(), Refusal> {
+        let id = message_id.trim();
+        if id.is_empty() {
+            return Err(refused("Missing mention message id."));
+        }
+        self.call("DELETE", &format!("/users/@me/mentions/{}", escaped(id)), None)
+            .map_err(refusal)?;
+        Ok(())
+    }
     /// Kicks, bans, times out, untimes out, or renames a guild member, gated by
     /// computed guild permissions and role hierarchy.
     pub(super) fn moderate(
@@ -2495,6 +2810,54 @@ impl Discord {
         Ok(())
     }
 }
+
+/// Largest avatar or banner image file accepted before base64-encoding into a Discord data URI.
+const MAX_PROFILE_IMAGE_BYTES: usize = 10 << 20;
+
+fn profile_refusal(failed: Refused) -> Refusal {
+    match failed {
+        Refused::Status { code: 50035, ref message, .. } if !message.is_empty() => {
+            Refusal::Refused(format!("Discord rejected the profile change: {message}"))
+        }
+        other => refusal(other),
+    }
+}
+
+/// Reads a local image file, validates its magic bytes and size, and encodes it as a
+/// `data:image/{png,jpeg,webp,gif};base64,...` URI for Discord's profile endpoints.
+fn image_data_uri(path: &str, allow_gif: bool) -> Result<String, Refusal> {
+    let len = std::fs::metadata(path).map_err(|err| refused(format!("Could not read image: {err}")))?.len();
+    if len == 0 {
+        return Err(refused("The chosen image file is empty."));
+    }
+    if len > MAX_PROFILE_IMAGE_BYTES as u64 {
+        return Err(refused("Profile images must be 10 MB or smaller."));
+    }
+    let bytes = std::fs::read(path).map_err(|err| refused(format!("Could not read image: {err}")))?;
+    if bytes.is_empty() {
+        return Err(refused("The chosen image file is empty."));
+    }
+    if bytes.len() > MAX_PROFILE_IMAGE_BYTES {
+        return Err(refused("Profile images must be 10 MB or smaller."));
+    }
+    let mime = if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        "image/png"
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "image/jpeg"
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "image/webp"
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        if !allow_gif {
+            return Err(refused("Animated avatars and banners require Discord Nitro."));
+        }
+        "image/gif"
+    } else {
+        return Err(refused("Choose a PNG, JPEG, WebP, or GIF image."));
+    };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:{mime};base64,{encoded}"))
+}
+
 
 /// Builds the `PATCH /users/@me/guilds/{guild}/settings` body for a timed or endless channel mute.
 pub(super) fn mute_override_body(
@@ -2562,6 +2925,48 @@ pub(super) fn encode_audit_reason(reason: &str) -> String {
     out
 }
 
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    #[test]
+    fn image_data_uri_validates_format_and_nitro_gif_gate() {
+        let dir = std::env::temp_dir().join(format!("tinyclient-discord-img-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let png = dir.join("a.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\nrest").unwrap();
+        let uri = image_data_uri(png.to_str().unwrap(), false).unwrap();
+        assert!(uri.starts_with("data:image/png;base64,"), "{uri}");
+
+        let jpg = dir.join("a.jpg");
+        std::fs::write(&jpg, b"\xFF\xD8\xFF\xE0jpg").unwrap();
+        assert!(image_data_uri(jpg.to_str().unwrap(), false).unwrap().starts_with("data:image/jpeg;base64,"));
+
+        let webp = dir.join("a.webp");
+        std::fs::write(&webp, b"RIFF1234WEBPdata").unwrap();
+        assert!(image_data_uri(webp.to_str().unwrap(), false).unwrap().starts_with("data:image/webp;base64,"));
+
+        let gif = dir.join("a.gif");
+        std::fs::write(&gif, b"GIF89adata").unwrap();
+        assert!(image_data_uri(gif.to_str().unwrap(), false).is_err(), "GIF requires Nitro");
+        assert!(image_data_uri(gif.to_str().unwrap(), true).unwrap().starts_with("data:image/gif;base64,"));
+
+        let txt = dir.join("a.txt");
+        std::fs::write(&txt, b"not an image").unwrap();
+        assert!(image_data_uri(txt.to_str().unwrap(), true).is_err());
+
+        let huge = dir.join("huge.png");
+        let file = std::fs::File::create(&huge).unwrap();
+        file.set_len((10 << 20) + 1).unwrap();
+        drop(file);
+        let err = image_data_uri(huge.to_str().unwrap(), true).unwrap_err();
+        let words = format!("{err:?}");
+        assert!(words.contains("10 MB"), "{words}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
 #[cfg(test)]
 mod moderation_tests {
     use super::*;

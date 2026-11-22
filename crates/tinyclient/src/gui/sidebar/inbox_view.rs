@@ -273,6 +273,9 @@ impl Shell {
         if state.filter == InboxFilter::Activity && (!state.activity_items.is_empty() || state.activity_loading || self.has_activity_feed()) {
             return self.activity_feed_view(cx);
         }
+        if state.filter == InboxFilter::Mentions && (!state.mentions_items.is_empty() || state.mentions_loading || self.has_mentions_history()) {
+            return self.mentions_history_view(cx);
+        }
         if state.inbox.fresh {
             return div().pt(px(4.)).children((0..6).map(Self::inbox_placeholder)).into_any_element();
         }
@@ -337,6 +340,144 @@ impl Shell {
         self.snapshot
             .as_ref()
             .is_some_and(|s| s.accounts.iter().any(|a| a.can.activity_feed))
+    }
+
+    fn has_mentions_history(&self) -> bool {
+        self.snapshot
+            .as_ref()
+            .is_some_and(|s| s.accounts.iter().any(|a| a.can.mentions_history))
+    }
+
+    fn mentions_history_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let state = &self.sidebar_state;
+        let toggle_chip = |id: &'static str, label: &'static str, on: bool| {
+            div()
+                .id(id)
+                .px(px(8.))
+                .py(px(3.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(if on { theme::selected() } else { theme::raised() })
+                .type_small()
+                .text_color(if on { theme::text() } else { theme::text_soft() })
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::hover()))
+                .child(label)
+        };
+        let bar = div()
+            .flex_none()
+            .px(px(12.))
+            .py(px(6.))
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(6.))
+            .child(
+                toggle_chip("mentions-everyone", "Include @everyone", state.mentions_everyone)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_mentions_everyone(cx))),
+            )
+            .child(
+                toggle_chip("mentions-roles", "Include role mentions", state.mentions_roles)
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_mentions_roles(cx))),
+            );
+
+        let body: AnyElement = if state.mentions_loading && state.mentions_items.is_empty() && state.inbox_items.is_empty() {
+            div().pt(px(4.)).children((0..5).map(Self::inbox_placeholder)).into_any_element()
+        } else if state.mentions_items.is_empty() && state.inbox_items.is_empty() {
+            self.inbox_empty(cx)
+        } else {
+            let mut list_box = div().id("mentions-history-list").size_full().overflow_y_scroll().flex().flex_col();
+            if !state.inbox_items.is_empty() {
+                let look = Look { mark: self.marks_shown(), context: true, time: true, ..Look::default() };
+                for item in state.inbox_items.iter() {
+                    if let Some(conv) = item.conversation() {
+                        list_box = list_box.child(self.chat_row("mention-unread", conv, look, false, cx));
+                    }
+                }
+            }
+            if !state.mentions_items.is_empty() {
+                list_box = list_box.child(section_header("Recent mentions", state.inbox_items.is_empty()));
+                for (ix, hit) in state.mentions_items.iter().enumerate() {
+                    let place = match (hit.space_title.as_str(), hit.title.as_str()) {
+                        ("", "") => String::new(),
+                        ("", ch) => ch.to_owned(),
+                        (sp, "") => sp.to_owned(),
+                        (sp, ch) => format!("{sp} · #{ch}"),
+                    };
+                    let header_line = if place.is_empty() {
+                        hit.sender.clone()
+                    } else {
+                        format!("{} · {place}", hit.sender)
+                    };
+                    let snippet = super::chat::one_line(&hit.text).into_owned();
+                    let picked = hit.clone();
+                    let dismiss_account = hit.conversation.account();
+                    let dismiss_id = hit.message_id.clone();
+                    let content = div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .type_ui()
+                                        .font_weight(theme::MEDIUM)
+                                        .text_color(theme::text())
+                                        .child(header_line),
+                                )
+                                .child(div().type_micro().text_color(theme::text_faint()).child(row_time(now(), hit.sent)))
+                                .child(
+                                    div()
+                                        .id(("mention-dismiss", ix))
+                                        .size(px(18.))
+                                        .rounded(px(4.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(theme::hover()))
+                                        .child(glyph("icons/x.svg", 12., theme::text_faint()))
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.dismiss_mention_hit(dismiss_account.clone(), dismiss_id.clone(), cx);
+                                        })),
+                                ),
+                        )
+                        .when(!snippet.is_empty(), |col| {
+                            col.child(div().truncate().type_small().text_color(theme::text_soft()).child(snippet))
+                        });
+                    list_box = list_box.child(
+                        list_row(("mention-hit", ix), theme::row_height(theme::ROW_TWO), false, false, content)
+                            .on_click(cx.listener(move |this, _, _, cx| this.open_mention_hit(picked.clone(), cx))),
+                    );
+                }
+            }
+            if !state.mentions_more.is_empty() {
+                list_box = list_box.child(
+                    div()
+                        .py(px(8.))
+                        .flex()
+                        .justify_center()
+                        .child(
+                            button("mentions-more", ButtonKind::Secondary, "Load more")
+                                .h(px(28.))
+                                .on_click(cx.listener(|this, _, _, cx| this.load_more_mentions(cx))),
+                        ),
+                );
+            }
+            crate::gui::components::scroll::scroll_page("mentions-scroll-frame", list_box).into_any_element()
+        };
+
+        div().size_full().flex().flex_col().child(bar).child(div().flex_1().min_h_0().child(body)).into_any_element()
     }
 
     fn activity_feed_view(&self, cx: &mut Context<Self>) -> AnyElement {

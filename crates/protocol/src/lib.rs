@@ -76,6 +76,25 @@ pub(crate) fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// A present JSON value for `Option<Option<T>>`. An absent field stays the `Default` (`None`:
+/// leave it). `null` is `Some(None)` (clear). A value is `Some(Some(value))`. Serde's own
+/// `Option` turns a present `null` into the outer `None`, which cannot be told from absent.
+fn present_or_null<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Some(Option::<T>::deserialize(deserializer)?))
+}
+
+fn default_mentions_true() -> bool {
+    true
+}
+
+fn default_mentions_limit() -> u32 {
+    25
+}
+
 pub(crate) fn is_true(value: &bool) -> bool {
     *value
 }
@@ -866,10 +885,17 @@ pub struct Person {
     /// Their status's emoji, apart from its words (`status`). Live, like presence.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub emoji: String,
+    /// Custom status emoji image (e.g. a Discord guild emoji with an id), fetched via media.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emoji_file: Option<MediaFile>,
     /// What they are doing now: playing, listening, in voice, in a meeting. Live. Boxed: few
     /// people in a list are doing anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<Box<Activity>>,
+    /// A server nickname, shown on that server's member list. People keeps `name`, the global
+    /// display name. Empty when this row has no server nickname.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub nickname: String,
     /// Their job title (Slack, Teams). Stored.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub title: String,
@@ -903,10 +929,12 @@ impl Person {
             status: String::new(),
             link: String::new(),
             emoji: String::new(),
+            emoji_file: None,
             activity: None,
             title: String::new(),
             utc_offset: None,
             mark: None,
+            nickname: String::new(),
             role_color: None,
             role_icon: None,
             role_emoji: None,
@@ -924,6 +952,12 @@ pub struct Profile {
     /// The titles of the Spaces we share, at most [`MUTUAL_SPACES`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mutual_spaces: Vec<String>,
+    /// Shared Spaces with their keys and the person's server nickname there, at most [`MUTUAL_SPACES`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mutual_space_items: Vec<MutualSpace>,
+    /// Mutual friends known to the network (capped at 25).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mutual_people: Vec<Person>,
     /// Their time zone as the network names it (`Europe/Lisbon`), and its offset from UTC in
     /// seconds now, so the shell can show their local time without a zone database.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -1007,6 +1041,9 @@ pub struct Profile {
     /// Short guild/clan tag beside their name (e.g. Discord's primary guild tag).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub server_tag: String,
+    /// True when the profile shows per-Space overrides (e.g. Discord server avatar, banner, bio, pronouns).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub server_profile: bool,
 }
 
 impl Profile {
@@ -1016,6 +1053,8 @@ impl Profile {
             person,
             bio: String::new(),
             mutual_spaces: Vec::new(),
+            mutual_space_items: Vec::new(),
+            mutual_people: Vec::new(),
             time_zone: String::new(),
             utc_offset: None,
             fields: Vec::new(),
@@ -1045,6 +1084,7 @@ impl Profile {
             badges: Vec::new(),
             connections: Vec::new(),
             server_tag: String::new(),
+            server_profile: false,
         }
     }
 }
@@ -2066,6 +2106,15 @@ pub enum Request {
         username: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         photo: bool,
+        /// Optional 0xRRGGBB profile accent colour (Discord).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accent: Option<u32>,
+        /// Optional local image path for a profile banner; empty clears it (Nitro-only on Discord).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        banner: Option<String>,
+        /// Optional Space for per-server profile overrides (Nitro-only on Discord).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<Key>,
     },
     /// Sets our own profile picture on a network from a local file path (empty clears it).
     /// Maps Tiny's `TinyAvatar` onto the shared request.
@@ -3106,6 +3155,50 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<String>,
     },
+    /// Fetch recent mentions from the network (e.g. Discord `GET /users/@me/mentions`),
+    /// asked only when the user opens Mentions or requests another page.
+    Mentions {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
+        #[serde(default = "default_mentions_true")]
+        everyone: bool,
+        #[serde(default = "default_mentions_true")]
+        roles: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<Key>,
+        #[serde(default = "default_mentions_limit")]
+        limit: u32,
+    },
+    /// Dismiss a recent mention on the network (e.g. Discord `DELETE /users/@me/mentions/{id}`).
+    DismissMention {
+        account: AccountKey,
+        message_id: String,
+    },
+    /// Reorder a Space, move it into or out of a folder, or drop it onto another Space to make a folder.
+    MoveSpace {
+        space: Key,
+        /// Insert before this Space. Absent: the end of the target list.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
+        /// Move into this folder. Absent: the Space sits on its own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder: Option<String>,
+        /// Drop onto this Space to make a folder of the two. Not combined with `folder`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        into_space: Option<String>,
+    },
+    /// Rename or recolour a Space folder (e.g. Discord server folder).
+    SetFolder {
+        folder: Key,
+        /// New name. Absent leaves it. Empty clears it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// New colour (`0xRRGGBB`). Absent leaves it. `Some(None)` clears it. A present JSON
+        /// `null` is the clear; serde's `Option` would read that as "leave it".
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present_or_null")]
+        color: Option<Option<u32>>,
+    },
     /// Add a link bookmark to a channel (Slack `bookmarks.add`).
     BookmarkAdd {
         conversation: Key,
@@ -3820,6 +3913,16 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor: Option<String>,
     },
+    /// One page of recent mentions (`Request::Mentions`).
+    Mentions {
+        items: Vec<MentionHit>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        more: bool,
+        /// Ask before this id next. The last id of the raw page, so a page that was filtered
+        /// down to nothing still moves on. Absent when `more` is false.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+    },
     /// A created or edited channel bookmark (`BookmarkAdd` / `BookmarkEdit`).
     Bookmark {
         bookmark: Bookmark,
@@ -4220,6 +4323,31 @@ mod tests {
         assert!(!typing("a", &[]).same_scope(&Change::Messages { conversation: key("a") }));
         assert!(!Change::Messages { conversation: key("a") }
             .same_scope(&Change::Conversation { conversation: key("a") }));
+    }
+
+    #[test]
+    fn clearing_a_folder_colour_round_trips_through_a_frame() {
+        use std::io::Cursor;
+        let folder = Key::new(&AccountKey { network: Network::Discord, account: "1".into() }, "77");
+        let clear = Request::SetFolder { folder: folder.clone(), name: None, color: Some(None) };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &clear).unwrap();
+        let back: Request = read_frame(Cursor::new(&buf)).unwrap();
+        assert!(matches!(back, Request::SetFolder { color: Some(None), name: None, .. }));
+
+        let paint = Request::SetFolder { folder: folder.clone(), name: Some("Games".into()), color: Some(Some(0x34_A8_53)) };
+        buf.clear();
+        write_frame(&mut buf, &paint).unwrap();
+        let back: Request = read_frame(Cursor::new(&buf)).unwrap();
+        assert!(matches!(back, Request::SetFolder { color: Some(Some(0x34_A8_53)), .. }));
+
+        let rename = Request::SetFolder { folder, name: Some("Games".into()), color: None };
+        buf.clear();
+        write_frame(&mut buf, &rename).unwrap();
+        let body = std::str::from_utf8(&buf[4..]).unwrap();
+        assert!(!body.contains("\"color\""));
+        let back: Request = read_frame(Cursor::new(buf)).unwrap();
+        assert!(matches!(back, Request::SetFolder { color: None, .. }));
     }
 
     #[test]

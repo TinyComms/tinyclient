@@ -152,6 +152,10 @@ pub struct About {
     pub bio: String,
     /// Titles of the Spaces we share.
     pub mutual_spaces: Vec<String>,
+    /// Structured mutual spaces (key, name, nickname) for clickable navigation.
+    pub mutual_space_items: Vec<protocol::MutualSpace>,
+    /// Mutual friends (capped).
+    pub mutual_people: Vec<Person>,
     /// As the network names it: `Europe/Lisbon`.
     pub time_zone: String,
     /// Seconds east of UTC now.
@@ -196,6 +200,10 @@ pub struct About {
     pub badges: Vec<protocol::ProfileBadge>,
     pub connections: Vec<protocol::ProfileConnection>,
     pub server_tag: String,
+    /// Space-scoped avatar override (e.g. Discord server avatar), kept out of global People storage.
+    pub avatar: Option<protocol::MediaFile>,
+    /// True when this profile carries per-Space overrides (server avatar, banner, bio, pronouns).
+    pub server_profile: bool,
 }
 
 /// What a conversation's info pane says beyond its row, as the network tells it.
@@ -234,6 +242,7 @@ pub struct SpaceAbout {
     pub default_notify: Option<Notify>,
     pub vanity_url: Option<String>,
     pub invites_disabled: bool,
+    pub can_change_nickname: bool,
 }
 
 /// A page of what was shared, from the network's own search.
@@ -631,6 +640,35 @@ pub enum Command {
     /// Mark one activity feed item (`Some(id)`) or all items (`None`) read.
     ActivityMarkRead {
         item_id: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Fetch recent mentions from the network (e.g. Discord `GET /users/@me/mentions`).
+    Mentions {
+        before: Option<String>,
+        everyone: bool,
+        roles: bool,
+        space_id: Option<String>,
+        limit: u32,
+        reply: Reply<(Vec<protocol::MentionHit>, bool, Option<String>)>,
+    },
+    /// Dismiss a recent mention on the network (`DELETE /users/@me/mentions/{id}`).
+    DismissMention {
+        message_id: String,
+        reply: Reply<()>,
+    },
+    /// Reorder a Space, move it into/out of a folder, or create a folder with another Space.
+    MoveSpace {
+        space_id: String,
+        before: Option<String>,
+        folder: Option<String>,
+        into_space: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Rename or recolour a Space folder.
+    SetFolder {
+        folder_id: String,
+        name: Option<String>,
+        color: Option<Option<u32>>,
         reply: Reply<()>,
     },
     /// Members who have read a given message (`Request::ReadBy`).
@@ -1197,6 +1235,9 @@ pub enum Command {
         name: Option<String>,
         about: Option<String>,
         pronouns: Option<String>,
+        accent: Option<u32>,
+        banner: Option<String>,
+        space_id: Option<String>,
         reply: Reply<()>,
     },
     /// Set (or clear, when `path` is empty) our own profile picture from a local file path.
@@ -1394,6 +1435,10 @@ impl Command {
             Command::Catalog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityFeed { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityMarkRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Mentions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DismissMention { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MoveSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetFolder { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReadBy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BookmarkAdd { reply, .. }
             | Command::BookmarkEdit { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

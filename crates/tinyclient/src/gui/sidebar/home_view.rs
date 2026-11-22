@@ -2,15 +2,44 @@
 
 use super::chat::Look;
 use super::home::{self, Act, Drill, Item};
+use super::super::layout::Menu;
 use super::{joins_from_list, on_screen, respliced, Mode};
 use crate::client::ask;
 use crate::gui::components::{badge_dot, empty_state, glyph, icon_button, list_row, rollup_badge, section_header, tip, Avatar, Shape};
 use crate::gui::state::{Shell, Snapshot};
 use crate::gui::theme::{self, Type};
 use crate::view::now;
-use gpui::{div, list, prelude::*, px, AnyElement, Context, Div, MouseButton, Stateful, Window};
+use gpui::{div, list, prelude::*, px, AnyElement, Context, Div, MouseButton, MouseDownEvent, Render, SharedString, Stateful, Window};
 use protocol::{Conversation, ConversationKind, Folder, Key, Network, Request, Response, Shelf, PAGE_LIMIT};
 use std::rc::Rc;
+
+/// A Discord server being dragged on the home rail.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct MovedSpace {
+    pub(super) key: Key,
+    pub(super) name: String,
+}
+
+struct MoveGhost(SharedString);
+
+impl Render for MoveGhost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(10.))
+            .h(px(28.))
+            .rounded(px(theme::R_CONTROL))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_popover())
+            .flex()
+            .items_center()
+            .font_family(theme::FONT)
+            .type_ui()
+            .text_color(theme::text())
+            .child(self.0.clone())
+    }
+}
 
 /// The most rows a home holds; chatd's order puts the ones that matter first.
 const HOME_HELD: u32 = 500;
@@ -366,7 +395,8 @@ impl Shell {
                     }
                 }
             },
-            Item::Folder { id, .. } => {
+            Item::Folder { key, .. } => {
+                let id = key.id.clone();
                 if !home.opened.remove(&id) {
                     home.opened.insert(id);
                 }
@@ -534,35 +564,52 @@ impl Shell {
                 };
                 click(self.action_row(("home-action", ix), Some(icon), words.into(), lit, trailing, focused), cx).into_any_element()
             }
-            Item::Space { index, child, open } => click(self.space_row(ix, index, child, open, focused), cx).into_any_element(),
-            Item::Folder { id, name, color, open, lit, mention } => {
-                let color = color.map_or(theme::text_faint(), gpui::rgb);
+            Item::Space { index, child, open } => {
+                let mut row = self.space_row(ix, index, child, open, focused);
+                let dragged = self.spaces.get(index).and_then(|space| {
+                    (space.key.network == Network::Discord).then(|| (space.key.clone(), space.name.clone()))
+                });
+                if let Some((key, name)) = dragged.filter(|(key, _)| self.manages_space_folders(&key.account())) {
+                    let target = key.clone();
+                    row = row
+                        .cursor_grab()
+                        .on_drag(MovedSpace { key, name }, |dragged, _, _, cx| cx.new(|_| MoveGhost(SharedString::from(dragged.name.clone()))))
+                        .drag_over::<MovedSpace>(|style, _, _, _| style.bg(theme::accent_soft()))
+                        .on_drop(cx.listener(move |this, dragged: &MovedSpace, _, cx| this.drop_discord_space(target.clone(), dragged, cx)));
+                }
+                click(row, cx).into_any_element()
+            }
+            Item::Folder { key, name, color, open, lit, mention } => {
+                let bar = color.map_or(theme::text_faint(), gpui::rgb);
                 let chevron = if open { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" };
-                let folder_key = self
-                    .sidebar_state
-                    .home
-                    .folders
-                    .iter()
-                    .find(|f| f.key.id == id && (f.unread > 0 || f.mentions > 0))
-                    .map(|f| f.key.clone());
                 let content = div()
                     .gap(px(8.))
-                    .child(div().size(px(20.)).flex_none().flex().items_center().child(div().w(px(3.)).h(px(16.)).rounded(px(1.5)).bg(color)))
+                    .child(div().size(px(20.)).flex_none().flex().items_center().child(div().w(px(3.)).h(px(16.)).rounded(px(1.5)).bg(bar)))
                     .child(div().min_w_0().truncate().type_ui().font_weight(if lit { theme::SEMIBOLD } else { theme::REGULAR }).text_color(if lit { theme::text() } else { theme::text_soft() }).child(name))
                     .child(glyph(chevron, 12., theme::text_faint()))
                     .child(div().flex_1())
                     .children(lit.then(|| badge_dot(8., if mention { theme::mention() } else { theme::unread() })));
-                let mut row = click(list_row(("folder", ix), theme::row_height(theme::ROW_ONE), false, focused, content), cx);
-                if let Some(folder_key) = folder_key {
-                    row = row.on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                            cx.stop_propagation();
-                            this.open_menu(super::Menu::Folder(folder_key.clone(), event.position), cx);
-                        }),
-                    );
+                let menu_key = key.clone();
+                let mut row = list_row(("folder", ix), theme::row_height(theme::ROW_ONE), false, focused, content).on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.open_menu(Menu::Folder(menu_key.clone(), event.position), cx);
+                    }),
+                );
+                if self.manages_space_folders(&key.account()) {
+                    let drop_key = key.clone();
+                    row = row
+                        .drag_over::<MovedSpace>(|style, _, _, _| style.bg(theme::accent_soft()))
+                        .on_drop(cx.listener(move |this, dragged: &MovedSpace, _, cx| this.drop_discord_on_folder(drop_key.clone(), dragged, cx)));
                 }
-                row.into_any_element()
+                if crate::gui::phone::active() {
+                    let held = key.clone();
+                    row = row.relative().child(crate::gui::phone::long_press(cx.listener(move |this, event: &gpui::LongPressEvent, _, cx| {
+                        this.open_menu(Menu::Folder(held.clone(), event.start_position), cx);
+                    })));
+                }
+                click(row, cx).into_any_element()
             }
             Item::Channel(c) => self.place_row(&c, 1, focused, cx).into_any_element(),
         }

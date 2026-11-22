@@ -262,12 +262,44 @@ pub struct Activity {
     /// The conversation to open for it (the voice channel), where there is one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<Key>,
+    /// Extra detail (e.g. game zone or song title) shown on profiles, never in list rows.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub details: String,
+    /// Secondary detail (e.g. artist or party info) shown on profiles, never in list rows.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub state: String,
+    /// Unix seconds when the activity started, for elapsed time on profiles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started: Option<i64>,
+    /// Validated `http://` or `https://` URL for streaming activities.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    /// Album art or activity thumbnail (e.g. Spotify cover), shown on profiles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub art: Option<MediaFile>,
 }
 
 impl Activity {
+    pub fn new(kind: ActivityKind, name: impl Into<String>) -> Activity {
+        Activity {
+            kind,
+            name: name.into(),
+            place: String::new(),
+            conversation: None,
+            details: String::new(),
+            state: String::new(),
+            started: None,
+            url: String::new(),
+            art: None,
+        }
+    }
+
     pub fn bound(&mut self) {
         crate::clip(&mut self.name, 128);
         crate::clip(&mut self.place, 128);
+        crate::clip(&mut self.details, 128);
+        crate::clip(&mut self.state, 128);
+        crate::clip(&mut self.url, 512);
     }
 }
 
@@ -306,6 +338,16 @@ pub struct Folder {
     pub unread: u32,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub mentions: u32,
+}
+
+/// A Space we share with the person on a profile, with their server nickname there if any.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutualSpace {
+    pub key: Key,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub nickname: String,
 }
 
 /// How a phone number or address on a profile is drawn.
@@ -433,6 +475,9 @@ pub struct SpaceInfo {
     pub roles: Vec<String>,
     #[serde(default)]
     pub notify: Notify,
+    /// Whether this account may change its own nickname in this Space.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_change_nickname: bool,
     /// Mentionable team tags in this Space (Teams).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<TeamTag>,
@@ -1020,6 +1065,14 @@ pub struct Capabilities {
     pub profile_avatar: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub profile_nickname: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub profile_accent: bool,
+    /// Own profile banner image (Nitro-only on Discord).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub profile_banner: bool,
+    /// Per-server profile overrides (Nitro-only on Discord).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub profile_server: bool,
     /// Most chats this account may pin on the network (`Request::File`). 0: cannot pin.
     /// Telegram allows 5 without Premium and 10 with Premium.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -1120,6 +1173,12 @@ pub struct Capabilities {
     /// This account supports reading and setting out-of-office / automatic replies (`Request::GetOutOfOffice`, `Request::SetOutOfOffice`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub out_of_office: bool,
+    /// This account can fetch recent mentions from before tinyclient was open (`Request::Mentions`, Discord).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mentions_history: bool,
+    /// This account supports reordering Spaces and creating/renaming/colouring Space folders (`MoveSpace`, `SetFolder`, Discord).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_space_folders: bool,
     /// This account supports muting a conversation for a chosen duration (`SetMute` with `until`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub timed_mute: bool,
@@ -1135,6 +1194,29 @@ pub struct Capabilities {
     /// This account supports jumping to unread mentions and reactions per conversation (Telegram).
     #[serde(default, skip_serializing_if = "is_false")]
     pub unread_jumps: bool,
+}
+
+/// One recent mention fetched from the network (`Request::Mentions`).
+/// Never written to the channel's message history store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MentionHit {
+    pub conversation: Key,
+    pub message_id: String,
+    pub sent: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sender: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_avatar: Option<MediaFile>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub space_title: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mentions_everyone: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mentions_role: bool,
 }
 
 /// Scope of an account-wide notification default (Telegram `InputNotifyUsers` / `Chats` / `Broadcasts`).
@@ -1444,9 +1526,15 @@ impl Capabilities {
         *self == Capabilities::default()
     }
 
-    /// True if any own-profile field (name, about, pronouns, avatar) can be edited on this network.
+    /// True if any own-profile field can be edited on this network.
     pub fn can_edit_profile(&self) -> bool {
-        self.profile_name || self.profile_about || self.profile_pronouns || self.profile_avatar
+        self.profile_name
+            || self.profile_about
+            || self.profile_pronouns
+            || self.profile_avatar
+            || self.profile_accent
+            || self.profile_banner
+            || self.profile_server
     }
 }
 
@@ -1892,6 +1980,9 @@ mod tests {
                 emoji: None,
                 username: None,
                 photo: false,
+                accent: Some(0x5865F2),
+                banner: None,
+                space: None,
             },
             Request::SetAvatar { account: account.clone(), path: "/tmp/avatar.png".into() },
             Request::SetNickname { space: Key::new(&account, "guild-1"), nickname: Some("Ada!".into()) },

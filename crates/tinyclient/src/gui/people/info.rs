@@ -60,6 +60,7 @@ pub(in crate::gui) enum ManageKind {
     Topic,
     Description,
     AddMembers,
+    Nickname,
 }
 
 pub struct InfoPane {
@@ -81,6 +82,8 @@ pub struct InfoPane {
     /// Show was clicked: the phone numbers read in full until the pane shows someone else.
     phones_shown: bool,
     about_open: bool,
+    /// Mutual friends list expanded in the "In common" section.
+    friends_open: bool,
     /// What the user set here, drawn before the row says so.
     notify_set: Option<(Key, Notify)>,
     /// What the user set for a Space's notifications, drawn before SpaceInfo reloads.
@@ -146,6 +149,7 @@ impl InfoPane {
             shared: Shared::default(),
             phones_shown: false,
             about_open: false,
+            friends_open: false,
             notify_set: None,
             space_notify_set: None,
             manage: None,
@@ -238,6 +242,7 @@ impl InfoPane {
         if !same {
             self.phones_shown = false;
             self.about_open = false;
+            self.friends_open = false;
         }
         let entity = cx.entity();
         self.shared.show(self.row.as_ref().map(|row| row.key.clone()), &entity, cx, |pane: &mut InfoPane| &mut pane.shared);
@@ -272,6 +277,9 @@ impl InfoPane {
                     Ok(Response::Profile { profile }) => {
                         this.hub.learn(std::slice::from_ref(&profile.person));
                         this.sync_note_input(&profile.person.key, &profile.note, cx);
+                        if !profile.mutual_people.is_empty() {
+                            this.hub.learn(&profile.mutual_people);
+                        }
                         Answer::Got(*profile)
                     }
                     _ => Answer::Failed,
@@ -676,12 +684,14 @@ impl InfoPane {
         let lone = actions.more && !actions.message && !actions.request && actions.call.is_none();
         let more = actions.more.then(|| self.more_button(person, &seen));
         let (more_in_head, more_in_row) = if lone { (more, None) } else { (None, more) };
-        let head = self.head(person, banner_path, accent, calling, more_in_head, cx);
+        let shown_person = profile.map(|p| &p.person).unwrap_or(person);
+        let head = self.head(shown_person, banner_path, accent, calling, more_in_head, cx);
         let mut top = div()
             .px(px(theme::PANE_PAD))
             .flex()
             .flex_col()
             .child(draw::name_line(person.name.clone(), mark).mt(px(12.)))
+            .children(profile.filter(|p| p.server_profile).and_then(|_| draw::soft_line("Server profile".to_owned())))
             .children(draw::soft_line(facts::handle_line(person, profile)))
             .children(draw::badge_strip("info-badge", &badges))
             .children(draw::presence_row(&line, theme::sidebar(), 2));
@@ -689,6 +699,22 @@ impl InfoPane {
             top = top.child(self.person_actions(person, &actions, &seen, more_in_row, cx).mt(px(16.)));
         }
         let is_self = self.scene.accounts.iter().any(|own| own.key == person.key.account() && own.me == person.key.id);
+        let can_edit_self = is_self
+            && self
+                .scene
+                .accounts
+                .iter()
+                .any(|own| own.key == person.key.account() && own.can.can_edit_profile());
+        if can_edit_self {
+            top = top.child(
+                button("info-edit-profile", ButtonKind::Secondary, "Edit profile")
+                    .w_full()
+                    .mt(px(12.))
+                    .on_click(|_, _, cx| {
+                        crate::gui::settings::open(crate::gui::settings::Section::Accounts, cx);
+                    }),
+            );
+        }
         if let Some((action, label)) = facts::friendship_action(person).filter(|_| !is_self) {
             let who = person.clone();
             let friendship = button("info-friendship", ButtonKind::Secondary, label).w_full();
@@ -814,12 +840,27 @@ impl InfoPane {
             for (ix, fact) in facts::right_now(person, Some(profile), &line, crate::view::now(), ours).into_iter().enumerate() {
                 any = true;
                 let opens = fact.opens.clone();
+                let url = fact.url.clone().filter(|_| opens.is_none());
                 let title = fact.words.clone();
+                let art_path = fact
+                    .art
+                    .as_ref()
+                    .and_then(|file| self.hub.file(&person.key.account(), file, cx).path);
+                let row = match art_path {
+                    Some(path) => draw::fact_inline_art(("info-now", ix), path, fact.words, fact.soft),
+                    None => draw::fact_inline(("info-now", ix), fact.glyph, fact.words, fact.soft),
+                };
                 sections = sections.child(
-                    draw::fact_inline(("info-now", ix), fact.glyph, fact.words, fact.soft).when_some(opens, |row, key| {
+                    row.when_some(opens, |row, key| {
                         row.cursor_pointer().hover(|row| row.bg(theme::hover())).on_click(cx.listener(move |this, _, _, cx| {
                             let (key, title) = (key.clone(), title.clone());
                             this.with_shell(cx, move |shell, cx| shell.select(key, &title, cx));
+                        }))
+                    })
+                    .when_some(url, |row, url| {
+                        row.cursor_pointer().hover(|row| row.bg(theme::hover())).on_click(cx.listener(move |this, _, window, cx| {
+                            let url = url.clone();
+                            this.with_shell(cx, move |shell, cx| shell.open_external_link(&url, window, cx));
                         }))
                     }),
                 );
@@ -943,10 +984,12 @@ impl InfoPane {
                     sections = sections.child(self.contact_row(ix, contact, cx));
                 }
             }
-            if let Some(common) = facts::in_common(network, profile) {
+            let common = facts::in_common(network, profile);
+            let has_mutual_friends = profile.mutual_friends > 0 || !profile.mutual_people.is_empty();
+            if common.is_some() || has_mutual_friends {
                 sections = sections.child(draw::label("In common", !any));
                 any = true;
-                sections = sections.child(self.in_common(person, &common, cx));
+                sections = sections.child(self.in_common(person, profile, common.as_ref(), cx));
             }
             if !profile.connections.is_empty() {
                 sections = sections.child(draw::label("Connections", !any));
@@ -1029,6 +1072,7 @@ impl InfoPane {
 
     fn head(&self, person: &Person, banner_path: Option<String>, accent: Option<u32>, calling: bool, more: Option<AnyElement>, cx: &mut Context<Self>) -> Div {
         let ring = Ring::on(theme::sidebar());
+        let banner_path = banner.and_then(|file| self.hub.file(&person.key.account(), file, cx).path);
         // The band's slot is kept with or without a colour, so nothing below moves.
         div()
             .relative()
@@ -1214,10 +1258,107 @@ impl InfoPane {
             }))
     }
 
-    fn in_common(&self, person: &Person, common: &facts::InCommon, cx: &mut Context<Self>) -> Div {
+    fn in_common(&self, person: &Person, profile: &Profile, common: Option<&facts::InCommon>, cx: &mut Context<Self>) -> Div {
         let spaces = &self.spaces;
         let account = person.key.account();
         let mut rows = div().flex().flex_col();
+        let friend_count = profile.mutual_friends.max(profile.mutual_people.len() as u32);
+        if friend_count > 0 {
+            let expandable = !profile.mutual_people.is_empty();
+            let ring = Ring::on(theme::sidebar());
+            let faces: Vec<Div> = profile
+                .mutual_people
+                .iter()
+                .take(3)
+                .map(|friend| person_avatar(&self.hub, friend, 18., &ring, false, cx))
+                .collect();
+            let toggle = div()
+                .id("info-mutual-friends")
+                .h(px(theme::ROW_ONE))
+                .mx(px(-8.))
+                .px(px(8.))
+                .rounded(px(theme::R_CONTROL))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .type_ui()
+                .when(faces.is_empty(), |row| row.child(glyph("icons/users.svg", 16., theme::text_soft())))
+                .when(!faces.is_empty(), |row| row.child(div().flex().items_center().gap(px(2.)).children(faces)))
+                .child(div().flex_1().min_w_0().truncate().child(facts::mutual_friends_words(friend_count)))
+                .when(expandable, |row| {
+                    let icon = if self.friends_open { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" };
+                    row.cursor_pointer()
+                        .hover(|r| r.bg(theme::hover()))
+                        .child(glyph(icon, 14., theme::text_faint()))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.friends_open = !this.friends_open;
+                            cx.notify();
+                        }))
+                });
+            rows = rows.child(toggle);
+            if self.friends_open && expandable {
+                for (ix, friend) in profile.mutual_people.iter().enumerate() {
+                    let key = friend.key.clone();
+                    let ring = Ring::row(theme::sidebar(), false, "mutual-friend");
+                    rows = rows.child(
+                        div()
+                            .id(("info-mutual-friend", ix))
+                            .group("mutual-friend")
+                            .h(px(theme::ROW_ONE))
+                            .mx(px(-8.))
+                            .pl(px(20.))
+                            .pr(px(8.))
+                            .rounded(px(theme::R_CONTROL))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .type_ui()
+                            .cursor_pointer()
+                            .hover(|r| r.bg(theme::hover()))
+                            .child(person_avatar(&self.hub, friend, 20., &ring, false, cx))
+                            .child(div().flex_1().min_w_0().truncate().child(friend.name.clone()))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let key = key.clone();
+                                this.with_shell(cx, move |shell, cx| shell.details_person(key, None, cx));
+                            })),
+                    );
+                }
+            }
+        }
+        if !profile.mutual_space_items.is_empty() {
+            for (ix, item) in profile.mutual_space_items.iter().take(facts::SPACES_SHOWN).enumerate() {
+                let known = spaces.iter().find(|space| space.key == item.key);
+                let icon = known.and_then(|space| space.icon.as_ref()).map(|icon| self.hub.file(&account, icon, cx));
+                let key = item.key.clone();
+                let mut row = draw::place_row(("info-space", ix), &item.key, &item.name, icon.as_ref());
+                if !item.nickname.is_empty() {
+                    row = row.child(
+                        div()
+                            .flex_none()
+                            .max_w(px(100.))
+                            .truncate()
+                            .type_small()
+                            .text_color(theme::text_faint())
+                            .child(item.nickname.clone()),
+                    );
+                }
+                rows = rows.child(row.cursor_pointer().hover(|row| row.bg(theme::hover())).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        let key = key.clone();
+                        this.with_shell(cx, move |shell, cx| shell.go(crate::gui::sidebar::Mode::Space(key), cx));
+                    },
+                )));
+            }
+            if let Some(common) = common.filter(|c| c.more > 0) {
+                rows = rows.child(
+                    div().h(px(theme::ROW_ONE)).flex().items_center().type_ui().text_color(theme::text_soft()).child(format!("{} more", common.more)),
+                );
+            }
+            return rows;
+        }
+        let Some(common) = common else {
+            return rows;
+        };
         if common.names.is_empty() {
             // CONTRACT: no request names the groups behind `mutual_total`, so the count stays a line.
             return rows.child(draw::fact("info-common", "icons/users.svg", common.words.clone(), ""));
@@ -1584,6 +1725,27 @@ impl InfoPane {
                     return;
                 }
                 Request::MembersAdd { conversation, people }
+            }
+            ManageKind::Nickname => {
+                let space = conversation.clone();
+                let req = Request::SetNickname {
+                    space: space.clone(),
+                    nickname: (!value.is_empty()).then_some(value),
+                };
+                let this = cx.weak_entity();
+                super::ask_later(cx, req, move |answer, cx| {
+                    if matches!(answer, Ok(Response::Ok)) {
+                        let _ = this.update(cx, |this, cx| {
+                            if this.subject == Some(Subject::Space(space.clone())) {
+                                this.space_info = Answer::Waiting;
+                                let known = this.space.clone();
+                                this.show_space(space, known, cx);
+                            }
+                        });
+                    }
+                });
+                cx.notify();
+                return;
             }
             _ => {
                 cx.notify();

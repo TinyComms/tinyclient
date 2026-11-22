@@ -1227,6 +1227,7 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
                     default_notify: None,
                     vanity_url: None,
                     invites_disabled: false,
+                    can_change_nickname: found.key.network == Network::Discord,
                 }),
             },
             None => Response::Error { code: protocol::ErrorCode::NotFound, detail: "Not in the demo.".into() },
