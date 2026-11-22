@@ -7,6 +7,7 @@
 //! snapshot, read each frame.
 
 mod accounts;
+mod discord;
 pub(in crate::gui) mod controls;
 mod notify;
 mod pages;
@@ -431,6 +432,7 @@ pub struct SettingsWindow {
     /// Loaded Discord Privacy & Safety settings (`GetNetworkPrivacy`), keyed by account.
     pub(super) discord_privacy: HashMap<protocol::AccountKey, protocol::NetworkPrivacy>,
     pub(super) discord_privacy_requested: std::collections::HashSet<protocol::AccountKey>,
+    discord_account: HashMap<protocol::AccountKey, discord::AccountPanel>,
     /// Telegram auto-download presets and local chat-kind gates, once `GetAutoDownload` returns.
     pub(super) tg_download: HashMap<protocol::AccountKey, protocol::AutoDownload>,
     pub(super) tg_download_requested: std::collections::HashSet<protocol::AccountKey>,
@@ -609,6 +611,7 @@ impl SettingsWindow {
             tg_session_error: None,
             discord_privacy: HashMap::new(),
             discord_privacy_requested: std::collections::HashSet::new(),
+            discord_account: HashMap::new(),
             tg_download: HashMap::new(),
             tg_download_requested: std::collections::HashSet::new(),
             phone,

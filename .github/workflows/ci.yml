@@ -8,8 +8,7 @@ name: CI
 #
 # What a pull request skips, and where it is caught instead:
 #   - macOS and Windows tests: main's push run, which a release waits for, and a dispatch.
-#   - the release build and packaging: unless the change touches packaging, Cargo.toml or
-#     Cargo.lock (the `changes` job), and always on main.
+#   - the release build and packaging: unless the `changes` job detects a packaging change.
 #   - everything when only docs, the site, or the review and pr-gate tooling changed.
 on:
   push:
@@ -117,7 +116,7 @@ jobs:
         run: |
           set -euo pipefail
           files=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --paginate --jq '.[].filename')
-          if grep -qE '^(packaging/|\.github/actions/|\.github/workflows/ci\.yml$|Cargo\.toml$|Cargo\.lock$)' <<<"$files"; then
+          if grep -qE '^(packaging/|\.github/actions/|\.github/workflows/(ci|release)\.yml$|Cargo\.toml$|Cargo\.lock$)' <<<"$files"; then
             echo "packaging=true" >> "$GITHUB_OUTPUT"
           else
             echo "packaging=false" >> "$GITHUB_OUTPUT"
@@ -130,39 +129,41 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # A pull request that touches packaging packages Linux x86_64, which proves the release build
-        # and the packaging.
-        # The others build only on main, which is what a tag reuses. On a pull request the macOS
-        # build took a second macOS runner beside the tests and queued behind the phone jobs.
-        artifact: ${{ fromJSON(github.event_name != 'pull_request' && '["linux-x86_64","linux-aarch64","macos","windows"]' || '["linux-x86_64"]') }}
+        # Packaging changes exercise Linux x86_64 and the new desktop architectures on PRs.
+        # Main builds every package for a later tag to reuse.
+        artifact: ${{ fromJSON(github.event_name != 'pull_request' && '["linux-x86_64","linux-aarch64","macos","macos-x86_64","windows","windows-aarch64"]' || '["linux-x86_64","macos-x86_64","windows-aarch64"]') }}
     # Ubuntu 22.04 is the oldest glibc the release packages promise.
-    runs-on: ${{ fromJSON('{"linux-x86_64":"ubuntu-22.04","linux-aarch64":"ubuntu-22.04-arm","macos":"macos-latest","windows":"windows-latest"}')[matrix.artifact] }}
+    runs-on: ${{ fromJSON('{"linux-x86_64":"ubuntu-22.04","linux-aarch64":"ubuntu-22.04-arm","macos":"macos-latest","macos-x86_64":"macos-15-intel","windows":"windows-latest","windows-aarch64":"windows-11-arm"}')[matrix.artifact] }}
     # The macOS release build of the workspace alone passed 30 minutes once waves 7-10 landed
     # (rustc was still compiling when the job was cancelled), which left main without a green run.
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
-      # Linux aarch64 builds without a cache. It runs only on main, beside the longer macOS
-      # tests, and its entry would be another few gigabytes in a cache already at its 10 GB cap.
+      # The additional architectures build without a cache. Each would add another large
+      # entry to the repository's 10 GB cache.
       - uses: ./.github/actions/setup-rust
         with:
-          cache-key: ${{ matrix.artifact == 'linux-aarch64' && 'none' || 'release' }}
+          cache-key: ${{ contains(fromJSON('["linux-aarch64","macos-x86_64","windows-aarch64"]'), matrix.artifact) && 'none' || 'release' }}
       - name: Build release
         shell: bash
         env:
           TINYCLIENT_TELEGRAM_API_ID: ${{ secrets.TINYCLIENT_TELEGRAM_API_ID }}
           TINYCLIENT_TELEGRAM_API_HASH: ${{ secrets.TINYCLIENT_TELEGRAM_API_HASH }}
         run: |
+          case "${{ matrix.artifact }}" in
+            macos-x86_64) rustc -vV | grep -Fx 'host: x86_64-apple-darwin' ;;
+            windows-aarch64) rustc -vV | tr -d '\r' | grep -Fx 'host: aarch64-pc-windows-msvc' ;;
+          esac
           cargo build --release \
             -p tinyclient --features tinyclient/gui \
             -p chatd -p mediad -p login
       - name: Bundle tinyclient.app
-        if: matrix.artifact == 'macos'
+        if: startsWith(matrix.artifact, 'macos')
         run: packaging/bundle.sh --no-build
       - uses: actions/upload-artifact@v6
-        if: matrix.artifact == 'macos'
+        if: startsWith(matrix.artifact, 'macos')
         with:
-          name: tinyclient-macos
+          name: tinyclient-${{ matrix.artifact }}
           path: target/release/tinyclient.app
 
       # The release's packaging, so a change that breaks it shows here rather than at the next tag.
@@ -195,7 +196,7 @@ jobs:
           path: perf/build.json
 
       - name: Pack binaries
-        if: matrix.artifact == 'windows'
+        if: startsWith(matrix.artifact, 'windows')
         shell: pwsh
         run: |
           Compress-Archive -Path `
@@ -203,9 +204,9 @@ jobs:
             target/release/chatd.exe, `
             target/release/mediad.exe, `
             target/release/tinyclient-login.exe `
-            -DestinationPath tinyclient-windows-x86_64.zip
+            -DestinationPath tinyclient-windows-${{ matrix.artifact == 'windows-aarch64' && 'aarch64' || 'x86_64' }}.zip
       - uses: actions/upload-artifact@v6
-        if: matrix.artifact == 'windows'
+        if: startsWith(matrix.artifact, 'windows')
         with:
-          name: tinyclient-windows-x86_64
-          path: tinyclient-windows-x86_64.zip
+          name: tinyclient-windows-${{ matrix.artifact == 'windows-aarch64' && 'aarch64' || 'x86_64' }}
+          path: tinyclient-windows-${{ matrix.artifact == 'windows-aarch64' && 'aarch64' || 'x86_64' }}.zip

@@ -127,16 +127,18 @@ pub fn short_commit() -> Option<&'static str> {
 /// This build's archive, as `.github/workflows/release.yml` names the unversioned copy. A build
 /// with none cannot replace itself: it is told about a release and sent to its page.
 pub fn archive_name() -> Option<&'static str> {
-    if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
-        Some("tinyclient-macos.zip")
-    } else if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
-        Some("tinyclient-linux-x86_64.tar.gz")
-    } else if cfg!(target_os = "linux") && cfg!(target_arch = "aarch64") {
-        Some("tinyclient-linux-aarch64.tar.gz")
-    } else if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
-        Some("tinyclient-windows-x86_64.zip")
-    } else {
-        None
+    archive_name_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn archive_name_for(os: &str, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
+        ("macos", "aarch64") => Some("tinyclient-macos.zip"),
+        ("macos", "x86_64") => Some("tinyclient-macos-x86_64.zip"),
+        ("linux", "x86_64") => Some("tinyclient-linux-x86_64.tar.gz"),
+        ("linux", "aarch64") => Some("tinyclient-linux-aarch64.tar.gz"),
+        ("windows", "x86_64") => Some("tinyclient-windows-x86_64.zip"),
+        ("windows", "aarch64") => Some("tinyclient-windows-aarch64.zip"),
+        _ => None,
     }
 }
 
@@ -1116,8 +1118,11 @@ mod tests {
             "assets": [
                 {"name": "tinyclient-v0.9.0-macos.zip", "uploader": {"name": "not-the-file"}, "browser_download_url": "https://github.com/TinyComms/tinyclient/releases/download/v0.9.0/tinyclient-v0.9.0-macos.zip"},
                 {"name": "tinyclient-macos.zip", "uploader": {"name": "not-the-file"}, "browser_download_url": "https://github.com/TinyComms/tinyclient/releases/download/v0.9.0/tinyclient-macos.zip"},
+                {"name": "tinyclient-macos-x86_64.zip", "browser_download_url": "https://github.com/TinyComms/tinyclient/releases/download/v0.9.0/tinyclient-macos-x86_64.zip"},
                 {"name": "tinyclient-linux-x86_64.tar.gz", "browser_download_url": "https://github.com/TinyComms/tinyclient/releases/download/v0.9.0/tinyclient-linux-x86_64.tar.gz"},
+                {"name": "tinyclient-linux-aarch64.tar.gz", "browser_download_url": "https://github.com/TinyComms/tinyclient/releases/download/v0.9.0/tinyclient-linux-aarch64.tar.gz"},
                 {"name": "tinyclient-windows-x86_64.zip", "browser_download_url": "https://github.com/TinyComms/tinyclient/releases/download/v0.9.0/tinyclient-windows-x86_64.zip"},
+                {"name": "tinyclient-windows-aarch64.zip", "browser_download_url": "https://github.com/TinyComms/tinyclient/releases/download/v0.9.0/tinyclient-windows-aarch64.zip"},
                 {"name": "SHA256SUMS", "browser_download_url": "https://github.com/TinyComms/tinyclient/releases/download/v0.9.0/SHA256SUMS"}
             ]
         }"#;
@@ -1129,6 +1134,54 @@ mod tests {
         assert_eq!(release.archive, name);
         assert!(release.archive_url.contains(name));
         assert!(release.sums_url.ends_with("SHA256SUMS"));
+    }
+
+    #[test]
+    fn each_desktop_architecture_has_its_own_update_archive() {
+        for (os, arch, archive) in [
+            ("macos", "aarch64", "tinyclient-macos.zip"),
+            ("macos", "x86_64", "tinyclient-macos-x86_64.zip"),
+            ("linux", "x86_64", "tinyclient-linux-x86_64.tar.gz"),
+            ("linux", "aarch64", "tinyclient-linux-aarch64.tar.gz"),
+            ("windows", "x86_64", "tinyclient-windows-x86_64.zip"),
+            ("windows", "aarch64", "tinyclient-windows-aarch64.zip"),
+        ] {
+            assert_eq!(archive_name_for(os, arch), Some(archive));
+        }
+        for (os, arch) in [("ios", "aarch64"), ("android", "aarch64"), ("windows", "x86"), ("linux", "riscv64")] {
+            assert_eq!(archive_name_for(os, arch), None);
+        }
+    }
+
+    #[test]
+    fn new_architectures_prefer_stable_archives_and_use_their_own_versioned_fallback() {
+        fn fixture(names: &[&str]) -> String {
+            let assets = names.iter().map(|name| {
+                format!(r#"{{"name":"{name}","browser_download_url":"https://github.com/TinyComms/tinyclient/releases/download/v2.0.0/{name}"}}"#)
+            }).collect::<Vec<_>>().join(",");
+            format!(r#"{{"tag_name":"v2.0.0","assets":[{assets}]}}"#)
+        }
+        for (os, arch, other, installer) in [
+            ("macos", "x86_64", "tinyclient-macos.zip", "tinyclient-macos-x86_64.dmg"),
+            ("windows", "aarch64", "tinyclient-windows-x86_64.zip", "tinyclient-windows-aarch64-setup.exe"),
+        ] {
+            let stable = archive_name_for(os, arch).unwrap();
+            let versioned = format!("tinyclient-v2.0.0{}", archive_suffix(stable));
+            let other_versioned = format!("tinyclient-v2.0.0{}", archive_suffix(other));
+            let mut assets = vec![other, &other_versioned, installer, "SHA256SUMS"];
+            assert!(release_for(&fixture(&assets), Some(stable)).is_none(), "{os} {arch}: no matching archive");
+            assets.push(&versioned);
+            let release = release_for(&fixture(&assets), Some(stable)).unwrap();
+            assert_eq!(release.archive, versioned);
+            assert!(release.archive_url.ends_with(&versioned));
+            assets.push(stable);
+            let release = release_for(&fixture(&assets), Some(stable)).unwrap();
+            assert_eq!(release.archive, stable);
+            assert!(release.archive_url.ends_with(stable));
+            assert!(release.sums_url.ends_with("/SHA256SUMS"));
+            assets.retain(|asset| *asset != "SHA256SUMS");
+            assert!(release_for(&fixture(&assets), Some(stable)).is_none(), "{os} {arch}: no checksum file");
+        }
     }
 
     #[test]

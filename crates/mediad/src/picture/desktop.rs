@@ -703,6 +703,9 @@ struct Camera {
 
 impl Camera {
     fn frame(&mut self) -> Result<Rgba, String> {
+        if let Some(pattern) = test_pattern() {
+            return Ok(pattern);
+        }
         let chosen = super::camera_chosen();
         #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         if self.portal {
@@ -934,6 +937,9 @@ pub(super) fn capture_source(id: Option<&str>) -> Result<Rgba, String> {
 }
 
 fn grab(id: Option<&str>, allow_portal: bool) -> Result<Rgba, String> {
+    if let Some(pattern) = test_pattern() {
+        return Ok(pattern);
+    }
     // A headless test run can supply a blank screen when running inside a scratch `TINYCLIENT_DIR`,
     // just like `TINYCLIENT_MEDIAD_AUDIO=null` replaces audio devices.
     if crate::out::var_os("TINYCLIENT_DIR").is_some()
@@ -959,6 +965,41 @@ fn grab(id: Option<&str>, allow_portal: bool) -> Result<Rgba, String> {
         let _ = (id, allow_portal);
         Err("Screen sharing isn't available on this system.".to_owned())
     }
+}
+
+/// A scratch probe supplies a picture before opening any screen or camera. The wide blocks
+/// survive the regular low camera layer, H.264 compression, and the viewer's JPEG paint.
+fn test_pattern() -> Option<Rgba> {
+    use std::sync::{atomic::AtomicU16, OnceLock};
+    if crate::out::var_os("TINYCLIENT_DIR").is_none()
+        || crate::out::var_os("TINYCLIENT_MEDIAD_AUDIO").is_none()
+        || crate::out::var("TINYCLIENT_MEDIAD_PICTURE").as_deref() != Some("pattern")
+    {
+        return None;
+    }
+    static STARTED: OnceLock<Instant> = OnceLock::new();
+    static FRAME: AtomicU16 = AtomicU16::new(0);
+    let (counter, seconds) = if crate::out::var_os("TINY_VIDEO_FREEZE_PATTERN").is_some() {
+        (0, 0)
+    } else {
+        (FRAME.fetch_add(1, Ordering::Relaxed), STARTED.get_or_init(Instant::now).elapsed().as_secs())
+    };
+    let color = [[224, 48, 48, 255], [48, 80, 224, 255], [48, 192, 64, 255]][(seconds % 3) as usize];
+    const WIDTH: usize = 320;
+    const HEIGHT: usize = 192;
+    let mut pixels = Vec::with_capacity(WIDTH * HEIGHT * 4);
+    for y in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let pixel = if y < HEIGHT / 4 {
+                let level = if counter & (1 << (x * 16 / WIDTH)) == 0 { 0 } else { 255 };
+                [level, level, level, 255]
+            } else {
+                color
+            };
+            pixels.extend_from_slice(&pixel);
+        }
+    }
+    Some(Rgba { width: WIDTH as u32, height: HEIGHT as u32, pixels, bgra: false })
 }
 
 /// Wayland shares only through its portal. XWayland's root is not the user's desktop.

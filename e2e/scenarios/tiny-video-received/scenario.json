@@ -1,0 +1,16 @@
+{
+  "id": "tiny-video-received",
+  "title": "A share and a camera sent by one person are received, opened and painted by the other, in a room and in a direct call",
+  "platforms": [
+    "windows",
+    "linux",
+    "macos"
+  ],
+  "not_applicable": {
+    "android": "Headless native probe; phones need the windowed scenario.",
+    "ios": "Headless native probe; phones need the windowed scenario."
+  },
+  "needs": [],
+  "release": true,
+  "max_still_seconds": 120
+}

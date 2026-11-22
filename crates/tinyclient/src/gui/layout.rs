@@ -1978,11 +1978,16 @@ impl Shell {
             list.push(row(ix, network, title.to_owned().into(), line.to_owned().into(), available).when(phone, |row| row.h(px(56.))));
         };
         // A phone offers only the networks it can sign in to (`signin::welcome::on_phone`), as
-        // its first run does: Signal and Messages link from a computer.
+        // its first run does: Signal links from a computer; Google Messages pairs by QR.
         let offered = |network: &Network| !phone || super::signin::welcome::on_phone(*network);
         for network in AVAILABLE.into_iter().filter(offered) {
             if snapshot.link(network) == Link::SignedOut {
-                add(network, network.label(), "Sign in", true);
+                let caption = if phone && network == Network::Messages {
+                    "Pair by QR; arrives while open"
+                } else {
+                    "Sign in"
+                };
+                add(network, network.label(), caption, true);
             } else if network == Network::Slack {
                 add(network, "Add a Slack workspace", "Sign in to another workspace", true);
             } else if network == Network::Telegram {

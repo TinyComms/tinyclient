@@ -13,7 +13,7 @@ $log = Join-Path $Work "logs\build-$Id.log"
 New-Item -ItemType Directory -Force (Split-Path $log), (Join-Path $Work 'target') | Out-Null
 
 # Built before (a second run of the same SHA): nothing to do.
-if (Test-Path (Join-Path $bin 'tinyclient.exe')) {
+if ((Test-Path (Join-Path $bin 'tinyclient.exe')) -and (Test-Path (Join-Path $src '.unpacked'))) {
     Write-Host 'already built'
     Write-Host "BINARIES=$bin"
     Write-Host "TINYCLIENT_SHA256=$((Get-FileHash (Join-Path $bin 'tinyclient.exe') -Algorithm SHA256).Hash.ToLower())"
