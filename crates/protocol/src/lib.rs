@@ -4068,17 +4068,22 @@ pub enum Request {
         #[serde(default)]
         limit: u32,
     },
-    /// List active signed-in devices/sessions for an account (Telegram `account.getAuthorizations`).
+    /// List active signed-in devices for an account.
     /// Answers `Response::ActiveSessions`.
     ActiveSessions {
         account: AccountKey,
     },
-    /// Terminate another active session (Telegram `account.resetAuthorization`). Never ends the current session.
+    /// Terminate another active session. Never ends the current session.
     /// Answers `Response::Ok`.
     EndSession {
         account: AccountKey,
         session_id: String,
     },
+    /// Sign out every other listed Discord device while retaining this session.
+    EndOtherDiscordSessions { account: AccountKey },
+    /// Read one list from Discord's account settings.
+    DiscordAccountEntries { account: AccountKey, list: DiscordAccountList },
+    RemoveDiscordAccountEntry { account: AccountKey, target: DiscordAccountEntryId },
     /// Fetch unread mention or reaction message IDs in a conversation (Telegram `messages.getUnreadMentions` / `getUnreadReactions`).
     /// Answers `Response::UnreadItems`.
     UnreadItems {
@@ -5043,6 +5048,7 @@ pub enum Response {
     ActiveSessions {
         sessions: Vec<ActiveSession>,
     },
+    DiscordAccountEntries { entries: Vec<DiscordAccountEntry> },
     /// Unread mention or reaction message IDs in a conversation (`Request::UnreadItems`).
     UnreadItems {
         message_ids: Vec<String>,

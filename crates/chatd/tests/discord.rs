@@ -47,6 +47,86 @@ use tungstenite::protocol::CloseFrame;
 /// The first part is base64 for the user id 1000, as in a real token.
 const TOKEN: &str = "MTAwMA.Zx9aBc.not-a-real-signature";
 const READY: &str = include_str!("fixtures/discord/ready.json");
+
+#[test]
+fn device_list_is_loaded_on_request_and_marks_the_current_session() {
+    let world = World::launch(&[], |discord| {
+        let mut ready: Value = serde_json::from_str(READY).unwrap();
+        ready["auth_session_id_hash"] = json!("current=");
+        *discord.ready.lock().unwrap() = ready.to_string();
+        discord.script("/auth/sessions", 200, json!({"user_sessions": [
+            {"id_hash":"elsewhere=", "approx_last_used_time":"2026-08-01T13:00:00.000000+00:00",
+             "client_info":{"platform":"Discord Client","os":"Windows","location":"Chicago"}},
+            {"id_hash":"current=", "client_info":{"platform":"Chrome","os":"Linux","location":null}}
+        ]}));
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+    assert!(world.discord.requests_to("GET", "/auth/sessions").is_empty());
+    let Response::ActiveSessions { sessions } = world.ask(Request::ActiveSessions { account: world.account() }) else {
+        panic!("Discord did not return the device list");
+    };
+    assert_eq!(sessions[0].id, "current=");
+    assert!(sessions[0].current);
+    assert_eq!(sessions[1].app, "Discord Client");
+    assert_eq!(sessions[1].platform, "Windows");
+    assert_eq!(sessions[1].location, "Chicago");
+    assert_eq!(sessions[1].last_active, 1785589200);
+
+    assert!(matches!(world.ask(Request::EndSession {
+        account: world.account(), session_id: "current=".into(),
+    }), Response::Error { .. }));
+    assert!(world.discord.requests_to("POST", "/auth/sessions/logout").is_empty());
+    world.discord.script("/auth/sessions/logout", 204, Value::Null);
+    assert!(matches!(world.ask(Request::EndSession {
+        account: world.account(), session_id: "elsewhere=".into(),
+    }), Response::Ok));
+    let writes = world.discord.requests_to("POST", "/auth/sessions/logout");
+    assert_eq!(writes[0].body["session_id_hashes"], json!(["elsewhere="]));
+
+    world.discord.script("/auth/sessions", 200, json!({"user_sessions": [
+        {"id_hash":"current="}, {"id_hash":"phone="}, {"id_hash":"desktop="}
+    ]}));
+    world.discord.script("/auth/sessions/logout", 204, Value::Null);
+    assert!(matches!(world.ask(Request::EndOtherDiscordSessions { account: world.account() }), Response::Ok));
+    let writes = world.discord.requests_to("POST", "/auth/sessions/logout");
+    assert_eq!(writes[1].body["session_id_hashes"], json!(["desktop=", "phone="]));
+}
+
+#[test]
+fn authorized_apps_and_connections_are_listed_and_removed_on_request() {
+    use protocol::DiscordAccountList;
+    let world = World::start();
+    for (list, path, raw, title, delete) in [
+        (DiscordAccountList::AuthorizedApps, "/oauth2/tokens",
+            json!([{"id":"123", "application":{"name":"Wave Calendar"}, "scopes":["identify"]}]),
+            "Wave Calendar", "/oauth2/tokens/123"),
+        (DiscordAccountList::Connections, "/users/@me/connections",
+            json!([{"id":"jay@example.test", "type":"bluesky", "name":"Wave Jay", "access_token":"never expose this"}]),
+            "Wave Jay", "/users/@me/connections/bluesky/jay%40example.test"),
+    ] {
+        assert!(world.discord.requests_to("GET", path).is_empty());
+        world.discord.script(path, 200, raw);
+        let Response::DiscordAccountEntries { entries } = world.ask(Request::DiscordAccountEntries {
+            account: world.account(), list,
+        }) else {
+            panic!("Discord did not return the account list");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, title);
+        let request = Request::RemoveDiscordAccountEntry { account: world.account(), target: entries[0].target.clone() };
+        world.discord.script(delete, 401, json!({"code":60003, "mfa":{"ticket":"private-ticket"}}));
+        let Response::Error { detail, .. } = world.ask(request.clone()) else {
+            panic!("Discord did not report the verification requirement");
+        };
+        assert_eq!(detail, "Discord requires verification for this action. Complete it in Discord.");
+        assert_eq!(world.link(), Link::Connected);
+        assert_eq!(world.discord.requests_to("DELETE", delete).len(), 1);
+
+        world.discord.script(delete, 204, Value::Null);
+        assert!(matches!(world.ask(request), Response::Ok));
+        assert_eq!(world.discord.requests_to("DELETE", delete).len(), 2);
+    }
+}
 const SUPPLEMENTAL: &str = include_str!("fixtures/discord/ready_supplemental.json");
 
 fn history(channel: &str) -> &'static str {
@@ -2410,6 +2490,7 @@ fn sending_echoes_once_and_failures_say_why() {
 fn nitro_plain_text_uses_the_four_thousand_character_limit() {
     let three = "n".repeat(3000);
     let free = account_with_premium(0);
+    assert_eq!(can(&free).discord_plan, Some(protocol::DiscordPlan::Free));
     assert_eq!(text_limit_of(&free), 2000);
     let before = free.discord.requests_to("POST", "/channels/3002/messages").len();
     free.send("3002", "free-3000", &three, None);
@@ -2429,12 +2510,14 @@ fn nitro_plain_text_uses_the_four_thousand_character_limit() {
     }
     assert!(free.discord.requests_to("PATCH", "/channels/3001/messages/1300000000000000009").is_empty());
 
-    let basic = account_with_premium(1);
+    let basic = account_with_premium(3);
+    assert_eq!(can(&basic).discord_plan, Some(protocol::DiscordPlan::Basic));
     assert_eq!(text_limit_of(&basic), 2000);
     basic.send("3002", "basic-3000", &three, None);
     assert_eq!(basic.failure("3002", "basic-3000"), "Message too long: Discord allows 2000 characters.");
 
     let nitro = account_with_premium(2);
+    assert_eq!(can(&nitro).discord_plan, Some(protocol::DiscordPlan::Nitro));
     assert_eq!(text_limit_of(&nitro), 4000);
     // A nonce is kept only when it is digits, at most 25, which is what the shell's client id is.
     nitro.send("3002", "1730000000000000102", &three, None);
@@ -5207,7 +5290,7 @@ fn files_go_up_from_their_paths_with_the_senders_options_and_a_cancel_stops_them
     let with = protocol::Outgoing { files: vec![file(&big.to_string_lossy(), false)], ..Default::default() };
     let asked = Request::Send { conversation: world.key("4101"), client_id: "77002".into(), text: String::new(), reply_to: None, with };
     match world.ask(asked) {
-        Response::Error { detail, .. } => assert_eq!(detail, "big.mov is too big for Discord (limit 10 MB)."),
+        Response::Error { detail, .. } => assert_eq!(detail, "big.mov is too big. Discord allows up to 10 MB per file here."),
         other => panic!("{other:?}"),
     }
     assert_eq!(world.discord.asked().len(), before);
@@ -5445,7 +5528,7 @@ fn upload_limit_honors_server_boost_tier() {
         with: outgoing(),
     });
     match refused {
-        Response::Error { detail, .. } => assert_eq!(detail, "boosted.bin is too big for Discord (limit 10 MB)."),
+        Response::Error { detail, .. } => assert_eq!(detail, "boosted.bin is too big. Discord allows up to 10 MB per file here."),
         other => panic!("tier-0 server should refuse 40 MB, got {other:?}"),
     }
 

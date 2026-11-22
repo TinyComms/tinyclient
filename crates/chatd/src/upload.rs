@@ -62,6 +62,20 @@ use std::time::{Duration, Instant};
 
 /// What a cancelled send is answered with.
 pub const CANCELLED: &str = "Cancelled";
+
+/// The effective per-file limit for the destination, shared by preflight and sending.
+pub(crate) fn size_refusal(network: Network, file: &str, bytes: u64) -> String {
+    let limit = if bytes >= 1 << 30 {
+        format!("{} GB", bytes >> 30)
+    } else {
+        format!("{} MB", bytes >> 20)
+    };
+    if network == Network::Discord {
+        format!("{file} is too big. Discord allows up to {limit} per file here.")
+    } else {
+        format!("{file} is too big for {} (limit {limit}).", network.label())
+    }
+}
 /// Largest part [`Upload::parts`] holds: the upload buffer's whole budget.
 pub const LARGEST_PART: usize = 8 * 1024 * 1024;
 /// Progress is told no more often than this, and once at the end.

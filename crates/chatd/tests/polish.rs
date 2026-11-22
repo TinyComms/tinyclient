@@ -467,7 +467,7 @@ fn files_go_from_their_paths_with_progress_within_the_account_s_limits_and_can_b
     let big = chatd.pick("big.mov", 0);
     std::fs::File::create(&big).unwrap().set_len(11 << 20).unwrap();
     let refused = chatd.ask(Request::Send { conversation: at(Network::Discord, ROBIN, "500000000000000001"), client_id: "1700000000000002".to_owned(), text: String::new(), reply_to: None, with: with(&big) });
-    assert!(matches!(&refused, Response::Error { code: ErrorCode::Refused, detail } if detail.contains("too big for Discord (limit 10 MB)")), "{refused:?}");
+    assert!(matches!(&refused, Response::Error { code: ErrorCode::Refused, detail } if detail.contains("is too big. Discord allows up to 10 MB per file here.")), "{refused:?}");
     assert!(chatd.message(&at(Network::Discord, ROBIN, "500000000000000001"), "1700000000000002").is_none());
 
     // Cancelled on its way: failed, in words, and Retry sends the file again.
