@@ -11,10 +11,10 @@ use super::wire::{
     call_link_room_id, format_call_link, format_group_invite_link, gift_badge_label, parse_call_link,
     parse_group_invite_link, payment_label, view_once_label, Body, CallKind, CallLink, CallLinkJoin, CallLogKind,
     CallOutcome, ChatFolder, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo,
-    GroupMember, GroupMembers, IdentityState, InviteLinkMode, LinkPreview, Linked, Linker, MessageRequestAction, OwnCard,
-    Peer, PersonProfile, Pointer, Quote, QuotedAttachment, SafetyNumber, Sticker, StickerEntry, StickerPackInfo,
-    StorageAccount, StorageContact, StorageGroup, StorageSnapshot, StoryContext, StoryDistributionList,
-    StoryMessageData, StoryText, Text, Wire,
+    GroupMember, GroupMembers, HistoryTransfer, IdentityState, InviteLinkMode, LinkPreview, Linked, Linker,
+    MessageRequestAction, OwnCard, Peer, PersonProfile, Pointer, Quote, QuotedAttachment, SafetyNumber, Sticker,
+    StickerEntry, StickerPackInfo, StorageAccount, StorageContact, StorageGroup, StorageSnapshot, StoryContext,
+    StoryDistributionList, StoryMessageData, StoryText, Text, TransferOutcome, TransferProgress, Wire,
 };
 use super::{group_delta, GroupRevisions, GroupSnap, MemberSnap, Saved};
 use futures::StreamExt;
@@ -3811,6 +3811,232 @@ fn fetch_preview_via_signal_proxy(url: &str) -> Option<LinkPreview> {
     })
 }
 
+/// Metadata returned by Signal's `GET /v1/devices/transfer_archive` endpoint once the primary
+/// phone finishes uploading the encrypted linked-device history archive (or declines/errors).
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TransferArchiveResponse {
+    #[serde(default)]
+    cdn: Option<u32>,
+    #[serde(default)]
+    cdn_number: Option<u32>,
+    #[serde(default)]
+    cdn_key: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// Long-polls Signal's `/v1/devices/transfer_archive` endpoint and streams the encrypted history
+/// archive from Signal's CDN to a private temporary file on disk.
+struct RealHistoryTransfer {
+    credentials: ServiceCredentials,
+    ephemeral_key: [u8; 32],
+    aci: String,
+}
+
+impl RealHistoryTransfer {
+    fn new(credentials: ServiceCredentials, ephemeral_key: [u8; 32], aci: String) -> Self {
+        Self { credentials, ephemeral_key, aci }
+    }
+
+    async fn poll_and_download(
+        &self,
+        on_progress: &dyn Fn(TransferProgress),
+        skip: &AtomicBool,
+    ) -> TransferOutcome {
+        use futures::StreamExt as _;
+        use presage::libsignal_service::configuration::Endpoint;
+        use presage::libsignal_service::push_service::{HttpAuth, HttpAuthOverride};
+        use std::io::Write as _;
+
+        let Some(password) = self.credentials.password.clone() else {
+            return TransferOutcome::Failed("Missing Signal credentials for history transfer.".into());
+        };
+        let http_auth = HttpAuth {
+            username: self.credentials.phonenumber.to_string(),
+            password,
+        };
+        let push = PushService::new(SignalServers::Production, Some(self.credentials.clone()), "tinyclient");
+        let deadline = std::time::Instant::now() + Duration::from_secs(300);
+
+        on_progress(TransferProgress::Waiting);
+
+        let (cdn, cdn_key) = loop {
+            if skip.load(Ordering::Relaxed) {
+                return TransferOutcome::Skipped;
+            }
+            if std::time::Instant::now() >= deadline {
+                return TransferOutcome::Expired(
+                    "Timed out waiting for your phone to send message history.".into(),
+                );
+            }
+            let req = match push.request(
+                reqwest::Method::GET,
+                Endpoint::service("/v1/devices/transfer_archive"),
+                HttpAuthOverride::Identified(http_auth.clone()),
+            ) {
+                Ok(r) => r,
+                Err(err) => return TransferOutcome::Failed(err.to_string()),
+            };
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(err) => return TransferOutcome::Failed(format!("Could not reach Signal: {err}")),
+            };
+            let status = resp.status().as_u16();
+            match status {
+                202 | 204 => {
+                    for _ in 0..8 {
+                        if skip.load(Ordering::Relaxed) {
+                            return TransferOutcome::Skipped;
+                        }
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                    continue;
+                }
+                404 | 410 => {
+                    return TransferOutcome::Expired(
+                        "The message history transfer window expired on Signal's servers.".into(),
+                    );
+                }
+                409 | 412 => {
+                    return TransferOutcome::Declined(
+                        "Your phone chose not to transfer message history.".into(),
+                    );
+                }
+                200 => {
+                    let body: TransferArchiveResponse = match resp.json().await {
+                        Ok(b) => b,
+                        Err(err) => {
+                            return TransferOutcome::Failed(format!(
+                                "Unreadable transfer archive response: {err}"
+                            ));
+                        }
+                    };
+                    if let Some(err) = body.error.as_deref().filter(|e| !e.is_empty()) {
+                        let lower = err.to_ascii_lowercase();
+                        if lower.contains("decline") || lower.contains("skip") || lower.contains("continue_without") {
+                            return TransferOutcome::Declined(
+                                "Your phone chose not to transfer message history.".into(),
+                            );
+                        }
+                        if lower.contains("expir") || lower.contains("timeout") {
+                            return TransferOutcome::Expired(
+                                "The message history transfer archive expired.".into(),
+                            );
+                        }
+                        return TransferOutcome::Failed(format!("Signal reported transfer error: {err}"));
+                    }
+                    let cdn = body.cdn.or(body.cdn_number).unwrap_or(3);
+                    match body.cdn_key.filter(|k| !k.is_empty()) {
+                        Some(key) => break (cdn, key),
+                        None => {
+                            return TransferOutcome::Declined(
+                                "No message history archive was provided by your phone.".into(),
+                            );
+                        }
+                    }
+                }
+                other => {
+                    return TransferOutcome::Failed(format!(
+                        "Signal returned HTTP {other} while waiting for history transfer."
+                    ));
+                }
+            }
+        };
+
+        // Stream the encrypted archive from Signal CDN straight to disk.
+        let mut resp = None;
+        for path in [format!("attachments/{cdn_key}"), format!("backups/{cdn_key}")] {
+            let req = match push.request(
+                reqwest::Method::GET,
+                Endpoint::cdn(cdn, path),
+                HttpAuthOverride::Unidentified,
+            ) {
+                Ok(r) => r,
+                Err(err) => return TransferOutcome::Failed(err.to_string()),
+            };
+            match req.send().await {
+                Ok(r) if r.status().is_success() => {
+                    resp = Some(r);
+                    break;
+                }
+                Ok(r) if matches!(r.status().as_u16(), 404 | 410) => continue,
+                Ok(r) => {
+                    return TransferOutcome::Failed(format!(
+                        "Signal CDN returned HTTP {} downloading history archive.",
+                        r.status().as_u16()
+                    ));
+                }
+                Err(err) => return TransferOutcome::Failed(format!("CDN download failed: {err}")),
+            }
+        }
+        let Some(resp) = resp else {
+            return TransferOutcome::Expired(
+                "The history transfer archive expired on Signal's CDN before download finished.".into(),
+            );
+        };
+        let total_hint = resp.content_length().unwrap_or(0);
+        let dest = protocol::support_dir()
+            .join("signal")
+            .join(format!("transfer-{}.enc", self.aci));
+        if let Some(parent) = dest.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                return TransferOutcome::Failed(err.to_string());
+            }
+        }
+        let mut file = match protocol::private::create(&dest) {
+            Ok(f) => f,
+            Err(err) => return TransferOutcome::Failed(err.to_string()),
+        };
+        let mut downloaded = 0u64;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            if skip.load(Ordering::Relaxed) {
+                drop(file);
+                let _ = std::fs::remove_file(&dest);
+                return TransferOutcome::Skipped;
+            }
+            let bytes = match chunk {
+                Ok(b) => b,
+                Err(err) => {
+                    drop(file);
+                    let _ = std::fs::remove_file(&dest);
+                    return TransferOutcome::Failed(format!("Transfer archive stream interrupted: {err}"));
+                }
+            };
+            if let Err(err) = file.write_all(&bytes) {
+                drop(file);
+                let _ = std::fs::remove_file(&dest);
+                return TransferOutcome::Failed(err.to_string());
+            }
+            downloaded = downloaded.saturating_add(bytes.len() as u64);
+            on_progress(TransferProgress::Downloading {
+                downloaded_bytes: downloaded,
+                total_bytes: total_hint.max(downloaded),
+            });
+        }
+        TransferOutcome::Ready {
+            path: dest,
+            ephemeral_key: self.ephemeral_key,
+            total_bytes: downloaded,
+        }
+    }
+}
+
+impl HistoryTransfer for RealHistoryTransfer {
+    fn fetch(
+        self: Box<Self>,
+        on_progress: &dyn Fn(TransferProgress),
+        skip: Arc<AtomicBool>,
+    ) -> TransferOutcome {
+        let Ok(rt) = runtime() else {
+            return TransferOutcome::Failed("Could not start Signal transfer runtime.".into());
+        };
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, self.poll_and_download(on_progress, &skip))
+    }
+}
+
 /// Links this computer to an account, as Signal Desktop is linked.
 pub struct RealLinker;
 
@@ -3826,7 +4052,11 @@ impl Linker for RealLinker {
         let linked = local.block_on(&runtime, async {
             let link = Manager::link_secondary_device(store.clone(), SignalServers::Production, device.to_owned(), shown_tx);
             let show_link = async {
-                if let Ok(url) = shown_rx.await {
+                if let Ok(mut url) = shown_rx.await {
+                    // Advertise linked-device history transfer capability in the linking URI.
+                    if !url.query_pairs().any(|(k, _)| k == "capabilities") {
+                        url.query_pairs_mut().append_pair("capabilities", "transfer");
+                    }
                     show(url.to_string());
                 }
                 futures::future::pending::<()>().await
@@ -3857,6 +4087,18 @@ impl Linker for RealLinker {
         };
         let aci = manager.registration_data().service_ids.aci.to_string();
         let name = local.block_on(&runtime, own_name(&mut manager)).unwrap_or_default();
+        let transfer_creds = {
+            let data = manager.registration_data();
+            store.password().and_then(|password| {
+                (&data.phone_number).try_into_e164().ok().map(|phonenumber| ServiceCredentials {
+                    aci: Some(data.service_ids.aci),
+                    pni: Some(data.service_ids.pni),
+                    phonenumber,
+                    password: Some(password),
+                    device_id: Some(manager.device_id()),
+                })
+            })
+        };
         // Closed before the user saw it finish: undone, never left on the account.
         if cancelled.load(Ordering::Relaxed) {
             let mut session = Session { manager, vault: store.clone(), me: aci, events: channel().0, names: HashMap::new(), groups: HashMap::new(), known: GroupRevisions::default(), blocked_acis: HashSet::new(), blocked_groups: HashSet::new() };
@@ -3870,9 +4112,17 @@ impl Linker for RealLinker {
         let home = vault::path_of(&aci);
         vault::remove(&home);
         std::fs::rename(&pending, &home).map_err(|err| Fault::Net(err.to_string()))?;
-        let saved = Saved { aci, name, vault: hex(&key) };
+        let saved = Saved { aci: aci.clone(), name, vault: hex(&key) };
         let session = serde_json::to_string(&saved).map_err(|err| Fault::Net(err.to_string()))?;
-        Ok(Linked { session })
+        // Pinned presage rev 9e1f0b8d / libsignal-service-rs f449930 decodes
+        // `ProvisionMessage.ephemeral_backup_key` in protobuf but does not yet surface it on
+        // `NewDeviceRegistration`. Once upstream exposes it, wiring `Some(ephemeral_key)` here
+        // activates `RealHistoryTransfer` automatically without changing the rest of the pipeline.
+        let ephemeral_backup_key: Option<[u8; 32]> = None;
+        let transfer: Option<Box<dyn HistoryTransfer>> = ephemeral_backup_key
+            .zip(transfer_creds)
+            .map(|(k, creds)| Box::new(RealHistoryTransfer::new(creds, k, aci)) as Box<dyn HistoryTransfer>);
+        Ok(Linked { session, transfer })
     }
 }
 

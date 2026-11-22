@@ -4,16 +4,22 @@
 //! type: registering a number here would make this device the account's primary phone and sign the
 //! real phone out, so it is never offered.
 //!
+//! After the phone approves the link, if the primary phone supplied an ephemeral backup key for
+//! Signal's linked-device message history transfer, the flow transitions through
+//! `SignInStep::Transfer` (waiting -> downloading -> importing, or declined / expired / failed)
+//! while keeping a clear "Skip" action at every point. The device stays linked regardless of
+//! whether history transfer completes, is declined, expires, fails, or is skipped.
+//!
 //! One sign-in at a time. It lives from `SignInBegin` to the step that ends it or to
 //! `SignInCancel`, on a thread of its own; nothing of Signal's is loaded before it begins. A link
-//! the user cancels after the phone accepted it is undone on the account (the linker's duty).
+//! the user cancels before the phone finishes linking is undone on the account (the linker's duty).
 
-use super::wire::Fault;
-use super::{linker, supported, unsupported_reason};
+use super::wire::{Fault, HistoryTransfer, TransferOutcome, TransferProgress};
+use super::{linker, parse, supported, transfer, unsupported_reason};
 use crate::hub::Hub;
-use protocol::{AccountKey, Change, Network, SignInInput, SignInProblem, SignInStep};
+use protocol::{AccountKey, Change, Network, SignInInput, SignInProblem, SignInStep, TransferStage};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 /// Keeps a finished session and starts its accounts.
 pub type Adopt = Box<dyn Fn(&str) -> Result<Vec<AccountKey>, String> + Send + Sync>;
@@ -28,6 +34,8 @@ struct Flow {
     step: Mutex<SignInStep>,
     ended: AtomicBool,
     cancelled: Arc<AtomicBool>,
+    skip_transfer: Arc<AtomicBool>,
+    wake: (Mutex<bool>, Condvar),
 }
 
 static FLOW: Mutex<Option<Arc<Flow>>> = Mutex::new(None);
@@ -38,6 +46,24 @@ fn current() -> MutexGuard<'static, Option<Arc<Flow>>> {
 
 fn waiting() -> SignInStep {
     SignInStep::Qr { link: String::new(), expires: 0, problem: None }
+}
+
+fn transfer_step(
+    stage: TransferStage,
+    chats: u32,
+    messages: u32,
+    downloaded_bytes: u64,
+    total_bytes: u64,
+    detail: impl Into<String>,
+) -> SignInStep {
+    SignInStep::Transfer {
+        stage,
+        chats,
+        messages,
+        downloaded_bytes,
+        total_bytes,
+        detail: detail.into(),
+    }
 }
 
 /// Begins a sign-in, or with `input` answers the step on show. Answers the step to draw.
@@ -53,7 +79,14 @@ pub fn step(hub: &Arc<Hub>, input: Option<SignInInput>, adopt: Adopt) -> Result<
         (None, Some(_)) => return Ok(SignInStep::Failed { reason: "That sign-in is over. Start again.".to_owned() }),
         (None, None) => {
             let linker = linker()?;
-            let flow = Arc::new(Flow { hub: hub.clone(), step: Mutex::new(waiting()), ended: AtomicBool::new(false), cancelled: Arc::default() });
+            let flow = Arc::new(Flow {
+                hub: hub.clone(),
+                step: Mutex::new(waiting()),
+                ended: AtomicBool::new(false),
+                cancelled: Arc::default(),
+                skip_transfer: Arc::default(),
+                wake: (Mutex::new(false), Condvar::new()),
+            });
             let running = flow.clone();
             super::presage_thread("signal-link")
                 .spawn(move || running.run(linker, adopt))
@@ -63,6 +96,9 @@ pub fn step(hub: &Arc<Hub>, input: Option<SignInInput>, adopt: Adopt) -> Result<
         }
     };
     drop(held);
+    if matches!(input, Some(SignInInput::Skip)) {
+        flow.request_skip();
+    }
     let step = flow.step().clone();
     Ok(match input {
         // Every other way in is a phone number's, which Signal does not offer a second device.
@@ -84,6 +120,7 @@ pub fn step(hub: &Arc<Hub>, input: Option<SignInInput>, adopt: Adopt) -> Result<
 pub fn cancel() {
     if let Some(flow) = current().take() {
         flow.cancelled.store(true, Ordering::Relaxed);
+        flow.request_skip();
         flow.ended.store(true, Ordering::Relaxed);
     }
 }
@@ -91,6 +128,21 @@ pub fn cancel() {
 impl Flow {
     fn step(&self) -> MutexGuard<'_, SignInStep> {
         self.step.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn request_skip(&self) {
+        self.skip_transfer.store(true, Ordering::Relaxed);
+        let (lock, cvar) = &self.wake;
+        *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        cvar.notify_all();
+    }
+
+    fn wait_for_ack(&self) {
+        let (lock, cvar) = &self.wake;
+        let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        while !*guard && !self.skip_transfer.load(Ordering::Relaxed) && !self.cancelled.load(Ordering::Relaxed) {
+            guard = cvar.wait(guard).unwrap_or_else(|p| p.into_inner());
+        }
     }
 
     /// Shows a step, and tells the shell when it changed without being asked.
@@ -130,15 +182,115 @@ impl Flow {
                 Err(fault) => break Err(fault.words_for_link()),
             }
         };
-        let step = match outcome {
+        let (account, saved, transfer_handle) = match outcome {
             Ok(linked) => match adopt(&linked.session) {
-                Ok(accounts) => SignInStep::Done { account: accounts.into_iter().next() },
-                Err(why) => SignInStep::Failed { reason: format!("Signal linked, but tinyclient could not keep the session: {why}") },
+                Ok(accounts) => {
+                    let account = accounts.into_iter().next();
+                    let saved = parse(&linked.session).ok();
+                    (account, saved, linked.transfer)
+                }
+                Err(why) => {
+                    self.show(SignInStep::Failed {
+                        reason: format!("Signal linked, but tinyclient could not keep the session: {why}"),
+                    });
+                    self.ended.store(true, Ordering::Relaxed);
+                    return;
+                }
             },
-            Err(reason) => SignInStep::Failed { reason },
+            Err(reason) => {
+                self.show(SignInStep::Failed { reason });
+                self.ended.store(true, Ordering::Relaxed);
+                return;
+            }
         };
-        self.show(step);
+
+        if let (Some(account_key), Some(saved), Some(transfer_handle)) = (&account, &saved, transfer_handle) {
+            self.run_transfer(account_key, saved, transfer_handle);
+        }
+
+        self.show(SignInStep::Done { account });
         self.ended.store(true, Ordering::Relaxed);
+    }
+
+    fn run_transfer(&self, account: &AccountKey, saved: &super::Saved, transfer_handle: Box<dyn HistoryTransfer>) {
+        if self.skip_transfer.load(Ordering::Relaxed) || self.cancelled.load(Ordering::Relaxed) {
+            return;
+        }
+        self.show(transfer_step(TransferStage::Waiting, 0, 0, 0, 0, ""));
+
+        let on_download_progress = |progress: TransferProgress| match progress {
+            TransferProgress::Waiting => {
+                self.show(transfer_step(TransferStage::Waiting, 0, 0, 0, 0, ""));
+            }
+            TransferProgress::Downloading { downloaded_bytes, total_bytes } => {
+                self.show(transfer_step(
+                    TransferStage::Downloading,
+                    0,
+                    0,
+                    downloaded_bytes,
+                    total_bytes,
+                    "",
+                ));
+            }
+        };
+
+        match transfer_handle.fetch(&on_download_progress, self.skip_transfer.clone()) {
+            TransferOutcome::Ready { path, ephemeral_key, total_bytes } => {
+                if self.skip_transfer.load(Ordering::Relaxed) || self.cancelled.load(Ordering::Relaxed) {
+                    let _ = std::fs::remove_file(&path);
+                    return;
+                }
+                self.show(transfer_step(TransferStage::Importing, 0, 0, total_bytes, total_bytes, ""));
+                let on_import_progress = |chats: u32, messages: u32| {
+                    self.show(transfer_step(
+                        TransferStage::Importing,
+                        chats,
+                        messages,
+                        total_bytes,
+                        total_bytes,
+                        "",
+                    ));
+                };
+                let result = transfer::import_archive(
+                    &self.hub,
+                    account,
+                    &saved.aci,
+                    &saved.name,
+                    &ephemeral_key,
+                    &path,
+                    &on_import_progress,
+                    &self.skip_transfer,
+                );
+                // Always remove the temporary encrypted transfer archive once import finishes or fails.
+                let _ = std::fs::remove_file(&path);
+                if let Err(why) = result {
+                    if !self.skip_transfer.load(Ordering::Relaxed) && !self.cancelled.load(Ordering::Relaxed) {
+                        tracing::warn!("chatd: Signal: history transfer import failed: {why}");
+                        self.show(transfer_step(TransferStage::Failed, 0, 0, total_bytes, total_bytes, why));
+                        self.wait_for_ack();
+                    }
+                }
+            }
+            TransferOutcome::Declined(why) => {
+                if !self.skip_transfer.load(Ordering::Relaxed) && !self.cancelled.load(Ordering::Relaxed) {
+                    self.show(transfer_step(TransferStage::Declined, 0, 0, 0, 0, why));
+                    self.wait_for_ack();
+                }
+            }
+            TransferOutcome::Expired(why) => {
+                if !self.skip_transfer.load(Ordering::Relaxed) && !self.cancelled.load(Ordering::Relaxed) {
+                    self.show(transfer_step(TransferStage::Expired, 0, 0, 0, 0, why));
+                    self.wait_for_ack();
+                }
+            }
+            TransferOutcome::Failed(why) => {
+                if !self.skip_transfer.load(Ordering::Relaxed) && !self.cancelled.load(Ordering::Relaxed) {
+                    self.show(transfer_step(TransferStage::Failed, 0, 0, 0, 0, why));
+                    self.wait_for_ack();
+                }
+            }
+            TransferOutcome::Skipped => {}
+        }
     }
 }
 
