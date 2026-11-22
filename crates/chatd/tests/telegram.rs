@@ -2853,7 +2853,10 @@ fn a_login_email_a_new_account_and_password_recovery_does_not_sign_in_and_a_pass
     world.sign_in(Some(SignInInput::UsePhone));
     world.sign_in(Some(SignInInput::Phone { number: "+1 555 010 0188".into() }));
     let signup = world.sign_in(Some(SignInInput::Code { code: "24680".into() }));
-    assert!(matches!(signup, SignInStep::SignUp { ref terms, problem: None } if terms.contains("spam")), "{signup:?}");
+    assert!(
+        matches!(signup, SignInStep::SignUp { ref phone, ref terms, problem: None } if phone == "+1 555 010 0188" && terms.contains("spam")),
+        "{signup:?}"
+    );
     let nameless = world.sign_in(Some(SignInInput::SignUp { first_name: "  ".into(), last_name: String::new() }));
     assert!(matches!(nameless, SignInStep::SignUp { problem: Some(_), .. }), "{nameless:?}");
     assert_eq!(
