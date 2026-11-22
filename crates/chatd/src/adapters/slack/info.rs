@@ -1179,7 +1179,7 @@ impl Slack {
     }
 
     /// Uploads a custom emoji (`emoji.add`, multipart upload). Validates the local path through
-    /// `crate::upload::allowed` and rejects non-image or oversized (> 1 MiB) files.
+    /// `crate::blobs::upload::allowed` and rejects non-image or oversized (> 1 MiB) files.
     pub(super) fn add_custom_emoji(&self, name: &str, path: &str) -> Result<(), Fault> {
         let clean = name.trim().trim_matches(':').to_ascii_lowercase();
         if clean.is_empty()
@@ -1190,7 +1190,7 @@ impl Slack {
         {
             return Err(Fault::Slack("error_name_bad_characters".to_owned()));
         }
-        let (real, _) = crate::upload::allowed(path.trim()).map_err(|why| Fault::Net(format!("emoji: {why}")))?;
+        let (real, _) = crate::blobs::upload::allowed(path.trim()).map_err(|why| Fault::Net(format!("emoji: {why}")))?;
         let ext = real
             .extension()
             .and_then(|e| e.to_str())

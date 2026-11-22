@@ -920,11 +920,16 @@ impl Slack {
         // Before any row: this registers each partner's picture and records them as people.
         self.users(&partners);
 
-        let mut rows: Vec<(usize, ConversationRow)> = Vec::with_capacity(channels.len());
+        let mut rows: Vec<(usize, i64, ConversationRow)> = Vec::with_capacity(channels.len());
         let mut direct = HashMap::new();
         for channel in &channels {
             let Some(mut row) = self.row(channel) else {
                 continue;
+            };
+            // `updated` lives on Slack's channel, not on the stored row.
+            let updated = match channel["updated"].as_str() {
+                Some(ts) => seconds(ts),
+                None => channel["updated"].as_i64().unwrap_or(0),
             };
             if let Some(person) = partner(channel) {
                 direct.insert(person, row.id.clone());
@@ -937,10 +942,10 @@ impl Slack {
                     .position(|section| section.kind == "standard" && section.channels.contains(&row.id))
                 {
                     row.group = Some(sections[at].id.clone());
-                    rows.push((at, row));
+                    rows.push((at, updated, row));
                 } else {
                     // After every section.
-                    rows.push((sections.len(), row));
+                    rows.push((sections.len(), updated, row));
                 }
                 continue;
             }
@@ -949,15 +954,15 @@ impl Slack {
             let at = filed.or_else(|| sections.iter().position(|section| Some(&section.id) == row.group.as_ref()));
             let at = at.unwrap_or(0);
             row.group = Some(sections[at].id.clone());
-            rows.push((at, row));
+            rows.push((at, updated, row));
         }
         drop(channels);
         // Honour per-section sort ("recent" puts newest first; default is alphabetical).
-        rows.sort_by(|(at_a, row_a), (at_b, row_b)| {
+        rows.sort_by(|(at_a, updated_a, row_a), (at_b, updated_b, row_b)| {
             at_a.cmp(at_b).then_with(|| {
                 let recent = sections.get(*at_a).is_some_and(|s| s.sort == "recent");
                 if recent {
-                    row_b.updated.cmp(&row_a.updated).then_with(|| row_a.title.to_lowercase().cmp(&row_b.title.to_lowercase()))
+                    updated_b.cmp(updated_a).then_with(|| row_a.title.to_lowercase().cmp(&row_b.title.to_lowercase()))
                 } else {
                     row_a.title.to_lowercase().cmp(&row_b.title.to_lowercase())
                 }
@@ -966,7 +971,7 @@ impl Slack {
         let rows: Vec<ConversationRow> = rows
             .into_iter()
             .enumerate()
-            .map(|(position, (_, row))| ConversationRow {
+            .map(|(position, (_, _, row))| ConversationRow {
                 position: position as i32,
                 ..row
             })
