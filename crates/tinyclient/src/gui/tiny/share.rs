@@ -4,11 +4,14 @@
 //! watches it and fills the stage with it, and the stage can have the whole window, until Escape.
 
 use super::Modal;
+use crate::gui::app::prefs;
 use crate::gui::components::{button, button_disabled, glyph, modal, segment, segmented, ButtonKind};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use gpui::{div, img, prelude::*, px, Context, Div, ObjectFit, SharedString, Window};
-use protocol::{MediaRequest, Request, ScreenSource, ShareQuality, SCREENS_LIMIT};
+use protocol::settings::{GLOBAL, SHARE_FPS, SHARE_QUALITY, SHARE_RESOLUTION};
+use protocol::{Content, MediaRequest, Request, ScreenSource, ShareQuality, ShareResolution, SCREENS_LIMIT};
+use std::sync::Mutex;
 
 /// A picture in the picker, 16:9.
 const THUMB_W: f32 = 184.;
@@ -35,32 +38,85 @@ pub(in crate::gui) fn share_preview_flag(on: bool) -> Option<bool> {
     share_preview_offered().then_some(on)
 }
 
-/// The picker's qualities, with what each costs in words.
+/// Draft resolution and FPS while the share picker modal is open (kept local here to avoid
+/// coupling `tiny::State` across branches; synced from/to persisted `prefs::values()`).
+static DRAFT: Mutex<(ShareResolution, u32)> = Mutex::new((ShareResolution::P1440, 60));
+
+fn draft_get() -> (ShareResolution, u32) {
+    *DRAFT.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+fn draft_set(resolution: ShareResolution, fps: u32) {
+    *DRAFT.lock().unwrap_or_else(|p| p.into_inner()) = (resolution, fps);
+}
+
+/// The picker's bitrate tiers, with what each costs in words.
 const QUALITIES: [(ShareQuality, &str, &str); 3] = [
-    (ShareQuality::Best, "Best", "Your screen as it is, up to 1440p at 60 fps. About 8 Mb/s."),
-    (ShareQuality::Balanced, "Balanced", "1080p at 30 fps. About 4 Mb/s."),
-    (ShareQuality::Low, "Low", "720p at 15 fps. About 1.5 Mb/s, for a slow connection."),
+    (ShareQuality::Low, "Low", "About 1.5 Mb/s, for a slow connection."),
+    (ShareQuality::Balanced, "Balanced", "About 4 Mb/s."),
+    (ShareQuality::Best, "Best", "About 8 Mb/s, crisp text and motion."),
+];
+
+const RESOLUTIONS: [(ShareResolution, &str, &str); 4] = [
+    (ShareResolution::P720, "720p", "Up to 1280×720."),
+    (ShareResolution::P1080, "1080p", "Up to 1920×1080."),
+    (ShareResolution::P1440, "1440p", "Up to 2560×1440."),
+    (ShareResolution::Source, "Source", "Native screen resolution, up to 4K."),
+];
+
+const FPS_CHOICES: [(u32, &str, &str); 3] = [
+    (15, "15 fps", "Low CPU and bandwidth; good for slides and code."),
+    (30, "30 fps", "Smooth desktop motion."),
+    (60, "60 fps", "High frame rate for video and games (capped to monitor refresh rate)."),
 ];
 
 impl Shell {
-    /// Share pressed while not sharing: the picker.
+    fn sharing_now(&self) -> bool {
+        self.snapshot
+            .as_ref()
+            .and_then(|s| s.call.as_ref())
+            .is_some_and(|call| call.video.iter().any(|v| v.content == Content::Share && v.direction == protocol::Direction::Encode))
+    }
+
+    /// Share pressed: opens the picker (or live settings picker if already sharing).
     pub(in crate::gui) fn tiny_share(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let values = prefs::values();
+        let quality = values.share_quality();
+        let resolution = values.share_resolution();
+        let fps = values.share_fps();
         if crate::gui::phone::active() {
-            self.call_ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None, sound: None, preview: None }), cx);
+            self.call_ask(
+                Request::Media(MediaRequest::ShareSend {
+                    on: true,
+                    screen: None,
+                    quality: Some(quality),
+                    show_cursor: None,
+                    sound: None,
+                    preview: None,
+                    resolution: Some(resolution),
+                    fps: Some(fps),
+                }),
+                cx,
+            );
             return;
         }
+        self.tiny_state.share_quality = quality;
+        draft_set(resolution, fps);
+        let current_pick = self.tiny_state.shared.as_ref().map(|s| s.id.clone());
+        let current_window = self.tiny_state.shared.as_ref().is_some_and(|s| s.window);
         self.tiny_state.screens = None;
-        self.tiny_state.screen_pick = None;
-        self.tiny_state.screen_windows = false;
+        self.tiny_state.screen_pick = current_pick.clone();
+        self.tiny_state.screen_windows = current_window;
         self.tiny_open_modal(Modal::Share, window, cx);
-        self.off_thread(cx, read_screens, |this, screens, cx| {
-            this.tiny_state.screen_pick = screens.iter().find(|screen| screen.primary).or(screens.first()).map(|screen| screen.id.clone());
+        self.off_thread(cx, read_screens, move |this, screens, cx| {
+            let kept = current_pick.filter(|id| screens.iter().any(|s| &s.id == id));
+            this.tiny_state.screen_pick = kept.or_else(|| screens.iter().find(|screen| screen.primary).or(screens.first()).map(|screen| screen.id.clone()));
             this.tiny_state.screens = Some(screens);
             cx.notify();
         });
     }
 
-    /// Shares the selected source from the visible tab.
+    /// Shares the selected source from the visible tab (or updates the active share live).
     fn tiny_share_picked(&mut self, cx: &mut Context<Self>) {
         let Some(picked) = self.tiny_state.screen_pick.as_ref().and_then(|id| {
             self.tiny_state.screens.iter().flatten().find(|screen| screen.id == *id && screen.window == self.tiny_state.screen_windows)
@@ -70,16 +126,54 @@ impl Shell {
         let screen = Some(picked.id.clone());
         self.tiny_state.shared = Some(picked);
         self.close_modal(cx);
-        let quality = Some(self.tiny_state.share_quality);
+        let quality = self.tiny_state.share_quality;
+        let (resolution, fps) = draft_get();
         let show_cursor = Some(self.tiny_state.share_cursor);
         let sound = share_sound_flag(self.tiny_state.share_sound);
         let preview = share_preview_flag(self.tiny_state.share_preview);
-        self.call_ask(Request::Media(MediaRequest::ShareSend { on: true, screen, quality, show_cursor, sound, preview }), cx);
+        let mut values = prefs::values();
+        values.set(GLOBAL, SHARE_QUALITY, Some(quality.as_str().to_owned()));
+        values.set(GLOBAL, SHARE_RESOLUTION, Some(resolution.as_str().to_owned()));
+        values.set(GLOBAL, SHARE_FPS, Some(fps.to_string()));
+        prefs::set_values(values);
+        crate::gui::settings::redraw(cx);
+        for (key, value) in [
+            (SHARE_QUALITY, quality.as_str().to_owned()),
+            (SHARE_RESOLUTION, resolution.as_str().to_owned()),
+            (SHARE_FPS, fps.to_string()),
+        ] {
+            self.call_ask(Request::Set { scope: GLOBAL.to_owned(), key: key.to_owned(), value: Some(value) }, cx);
+        }
+        self.call_ask(
+            Request::Media(MediaRequest::ShareSend {
+                on: true,
+                screen,
+                quality: Some(quality),
+                show_cursor,
+                sound,
+                preview,
+                resolution: Some(resolution),
+                fps: Some(fps),
+            }),
+            cx,
+        );
     }
 
     pub(in crate::gui) fn tiny_stop_share(&mut self, cx: &mut Context<Self>) {
         self.tiny_state.shared = None;
-        self.call_ask(Request::Media(MediaRequest::ShareSend { on: false, screen: None, quality: None, show_cursor: None, sound: None, preview: None }), cx);
+        self.call_ask(
+            Request::Media(MediaRequest::ShareSend {
+                on: false,
+                screen: None,
+                quality: None,
+                show_cursor: None,
+                sound: None,
+                preview: None,
+                resolution: None,
+                fps: None,
+            }),
+            cx,
+        );
     }
 
     /// The picker: screens or windows, a picture and a name each, Cancel and Share.
@@ -122,30 +216,61 @@ impl Shell {
                 .children(screens.iter().filter(|screen| screen.window == windows).map(|screen| self.tiny_share_card(screen, cx)))
                 .into_any_element(),
         };
-        // How much the share spends. Best is the screen as it is; the others for a slow link
-        // or a busy machine.
-        let quality = div()
+        // Resolution, frame rate, bitrate/quality, and pointer controls.
+        let (draft_res, draft_fps) = draft_get();
+        let resolution_row = div()
             .mt(px(14.))
             .flex()
             .items_center()
             .gap(px(10.))
-            .child(div().type_ui().text_color(theme::text_soft()).child("Quality"))
+            .child(div().w(px(76.)).flex_none().type_ui().text_color(theme::text_soft()).child("Resolution"))
+            .child(segmented().children(RESOLUTIONS.iter().map(|&(res, label, hint)| {
+                segment(SharedString::from(format!("tiny-share-res-{label}")), label, draft_res == res)
+                    .tooltip(crate::gui::components::tip(hint, None))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        let (_, fps) = draft_get();
+                        draft_set(res, fps);
+                        cx.notify();
+                    }))
+            })));
+        let fps_row = div()
+            .mt(px(8.))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .child(div().w(px(76.)).flex_none().type_ui().text_color(theme::text_soft()).child("Frame rate"))
+            .child(segmented().children(FPS_CHOICES.iter().map(|&(fps, label, hint)| {
+                segment(SharedString::from(format!("tiny-share-fps-{fps}")), label, draft_fps == fps)
+                    .tooltip(crate::gui::components::tip(hint, None))
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        let (res, _) = draft_get();
+                        draft_set(res, fps);
+                        cx.notify();
+                    }))
+            })));
+        let quality_row = div()
+            .mt(px(8.))
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .child(div().w(px(76.)).flex_none().type_ui().text_color(theme::text_soft()).child("Bitrate"))
             .child(segmented().children(QUALITIES.iter().map(|&(quality, label, hint)| {
                 segment(SharedString::from(format!("tiny-share-quality-{label}")), label, state.share_quality == quality)
                     .tooltip(crate::gui::components::tip(hint, None))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.tiny_state.share_quality = quality;
+                        draft_set(quality.default_resolution(), quality.default_fps());
                         cx.notify();
                     }))
             })));
         // Whether viewers see my pointer, so they can follow what I point at. Shown unless they
         // are told otherwise; a platform that cannot draw it just keeps drawing none.
         let pointer = div()
-            .mt(px(10.))
+            .mt(px(8.))
             .flex()
             .items_center()
             .gap(px(10.))
-            .child(div().type_ui().text_color(theme::text_soft()).child("Pointer"))
+            .child(div().w(px(76.)).flex_none().type_ui().text_color(theme::text_soft()).child("Pointer"))
             .child(segmented()
                 .child(segment("tiny-share-pointer-shown", "Shown", state.share_cursor).on_click(cx.listener(|this, _, _, cx| {
                     this.tiny_state.share_cursor = true;
@@ -196,19 +321,27 @@ impl Shell {
                         })))))
                 .child(div().whitespace_normal().type_small().text_color(theme::text_faint()).child("A small picture of this share, sent to Discord outside the encrypted stream."))
         });
+        let updating = self.sharing_now();
+        let verb = if updating { "Apply" } else { "Share" };
         let ready = state.screen_pick.is_some();
         let go = if ready && !self.tiny_state.busy {
-            button("tiny-share-go", ButtonKind::Primary, "Share").h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.tiny_share_picked(cx))).into_any_element()
+            button("tiny-share-go", ButtonKind::Primary, verb).h(px(32.)).on_click(cx.listener(|this, _, _, cx| this.tiny_share_picked(cx))).into_any_element()
         } else {
-            button_disabled("Share").h(px(32.)).into_any_element()
+            button_disabled(verb).h(px(32.)).into_any_element()
         };
-        modal("Share your screen")
+        modal(if updating { "Screen share settings" } else { "Share your screen" })
             // Three cards a row, with room for the list's scroll bar.
             .w(px(3. * (THUMB_W + 16.) + 2. * 12. + 40. + 16.))
-            .child(div().mt(px(6.)).whitespace_normal().type_ui().text_color(theme::text_soft()).child("Pick what everyone in the call can watch."))
+            .child(div().mt(px(6.)).whitespace_normal().type_ui().text_color(theme::text_soft()).child(if updating {
+                "Change what you're sharing, resolution, frame rate, bitrate, or pointer live."
+            } else {
+                "Pick what everyone in the call can watch, and choose resolution, frame rate, and bitrate."
+            }))
             .children(tabs)
             .child(body)
-            .child(quality)
+            .child(resolution_row)
+            .child(fps_row)
+            .child(quality_row)
             .child(pointer)
             .children(sound)
             .children(preview)

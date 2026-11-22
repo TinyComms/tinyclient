@@ -127,6 +127,115 @@ pub enum ShareQuality {
     Low,
 }
 
+impl ShareQuality {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ShareQuality::Best => "best",
+            ShareQuality::Balanced => "balanced",
+            ShareQuality::Low => "low",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<ShareQuality> {
+        Some(match value {
+            "best" => ShareQuality::Best,
+            "balanced" => ShareQuality::Balanced,
+            "low" => ShareQuality::Low,
+            _ => return None,
+        })
+    }
+
+    pub const fn default_resolution(self) -> ShareResolution {
+        match self {
+            ShareQuality::Best => ShareResolution::P1440,
+            ShareQuality::Balanced => ShareResolution::P1080,
+            ShareQuality::Low => ShareResolution::P720,
+        }
+    }
+
+    pub const fn default_fps(self) -> u32 {
+        match self {
+            ShareQuality::Best => 60,
+            ShareQuality::Balanced => 30,
+            ShareQuality::Low => 15,
+        }
+    }
+
+    pub const fn bps(self) -> u32 {
+        match self {
+            ShareQuality::Best => 8_000_000,
+            ShareQuality::Balanced => 4_000_000,
+            ShareQuality::Low => 1_500_000,
+        }
+    }
+}
+
+/// Max resolution cap for screen sharing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShareResolution {
+    #[serde(rename = "720", alias = "720p", alias = "p720")]
+    P720,
+    #[serde(rename = "1080", alias = "1080p", alias = "p1080")]
+    P1080,
+    #[default]
+    #[serde(rename = "1440", alias = "1440p", alias = "p1440")]
+    P1440,
+    #[serde(rename = "source", alias = "2160", alias = "4k")]
+    Source,
+}
+
+impl ShareResolution {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ShareResolution::P720 => "720",
+            ShareResolution::P1080 => "1080",
+            ShareResolution::P1440 => "1440",
+            ShareResolution::Source => "source",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ShareResolution::P720 => "720p",
+            ShareResolution::P1080 => "1080p",
+            ShareResolution::P1440 => "1440p",
+            ShareResolution::Source => "Source",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<ShareResolution> {
+        Some(match value {
+            "720" | "720p" => ShareResolution::P720,
+            "1080" | "1080p" => ShareResolution::P1080,
+            "1440" | "1440p" => ShareResolution::P1440,
+            "source" | "2160" | "4k" => ShareResolution::Source,
+            _ => return None,
+        })
+    }
+
+    pub const fn max_size(self) -> (u32, u32) {
+        match self {
+            ShareResolution::P720 => (1280, 720),
+            ShareResolution::P1080 => (1920, 1080),
+            ShareResolution::P1440 => (2560, 1440),
+            ShareResolution::Source => (3840, 2160),
+        }
+    }
+
+    pub const fn from_height(height: u32) -> ShareResolution {
+        match height {
+            0..=720 => ShareResolution::P720,
+            721..=1080 => ShareResolution::P1080,
+            1081..=1440 => ShareResolution::P1440,
+            _ => ShareResolution::Source,
+        }
+    }
+
+    pub const fn height(self) -> u32 {
+        self.max_size().1
+    }
+}
+
 /// How much of the camera a call spends: its top resolution, frame rate, and bitrate ceiling.
 /// `Auto` picks HD (1280×720 at 30 fps) when a hardware encoder is available and 640×360 at 15 fps
 /// on software; `DataSaver` caps at 640×360 at 15 fps / 350 kb/s.
@@ -1189,7 +1298,8 @@ pub struct SignalAccept {
 #[serde(tag = "media", rename_all = "snake_case")]
 pub enum MediaRequest {
     Streams,
-    /// Send our screen, or stop sending it.
+    /// Send our screen, or stop sending it. Sending `on: true` while already sharing updates the
+    /// captured source, resolution, frame rate, bitrate, and pointer live without restarting the call.
     ShareSend {
         on: bool,
         /// Which screen or window, as `mediad --screens` lists it ([`ScreenSource::id`]).
@@ -1212,6 +1322,12 @@ pub enum MediaRequest {
         /// off: an older shell, or a phone, which has no switch for it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         preview: Option<bool>,
+        /// Optional explicit max resolution cap overriding `quality`'s default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolution: Option<ShareResolution>,
+        /// Optional explicit target frame rate (15, 30, 60) overriding `quality`'s default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fps: Option<u32>,
     },
     /// Watch one participant's share. Replaces any share already being watched.
     ShareWatch { source: Option<String> },
@@ -1632,6 +1748,15 @@ pub struct VideoStats {
     pub height: u32,
     /// Time since the last completed image. None until an image exists.
     pub frame_age_ms: Option<u32>,
+    /// Active outbound share/camera dimensions and encoder backend when sending.
+    #[serde(default)]
+    pub send_width: u32,
+    #[serde(default)]
+    pub send_height: u32,
+    #[serde(default)]
+    pub send_target_fps: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub encoder: String,
 }
 
 /// What the user chose for a call's sound. Percentages, 0 to 100.
@@ -1928,22 +2053,54 @@ mod tests {
     #[test]
     fn a_share_without_a_screen_is_the_frame_an_older_build_sends() {
         let older: MediaRequest = serde_json::from_str(r#"{"media":"share_send","on":true}"#).unwrap();
-        assert_eq!(older, MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None, sound: None, preview: None });
+        assert_eq!(
+            older,
+            MediaRequest::ShareSend {
+                on: true,
+                screen: None,
+                quality: None,
+                show_cursor: None,
+                sound: None,
+                preview: None,
+                resolution: None,
+                fps: None,
+            }
+        );
         assert_eq!(serde_json::to_string(&older).unwrap(), r#"{"media":"share_send","on":true}"#);
         // The pointer is on when nothing is said, so an older shell gets it like everyone.
-        let chosen = MediaRequest::ShareSend { on: true, screen: Some("display:\\\\.\\DISPLAY2".into()), quality: Some(ShareQuality::Balanced), show_cursor: Some(false), sound: None, preview: None };
+        let chosen = MediaRequest::ShareSend {
+            on: true,
+            screen: Some("display:\\\\.\\DISPLAY2".into()),
+            quality: Some(ShareQuality::Balanced),
+            show_cursor: Some(false),
+            sound: None,
+            preview: None,
+            resolution: Some(ShareResolution::P1080),
+            fps: Some(60),
+        };
         let json = serde_json::to_string(&chosen).unwrap();
         assert!(json.contains(r#""quality":"balanced""#) && json.contains(r#""show_cursor":false"#));
         assert!(!json.contains("sound"), "{json}");
         assert!(!json.contains("preview"), "{json}");
+        assert!(json.contains(r#""resolution":"1080""#));
+        assert!(json.contains(r#""fps":60"#));
         assert_eq!(serde_json::from_str::<MediaRequest>(&json).unwrap(), chosen);
-        let shown = MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: Some(true), sound: None, preview: None };
+        let shown = MediaRequest::ShareSend {
+            on: true,
+            screen: None,
+            quality: None,
+            show_cursor: Some(true),
+            sound: None,
+            preview: None,
+            resolution: None,
+            fps: None,
+        };
         assert_eq!(serde_json::to_string(&shown).unwrap(), r#"{"media":"share_send","on":true,"show_cursor":true}"#);
-        let heard = MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None, sound: Some(true), preview: None };
+        let heard = MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None, sound: Some(true), preview: None, resolution: None, fps: None };
         let json = serde_json::to_string(&heard).unwrap();
         assert_eq!(json, r#"{"media":"share_send","on":true,"sound":true}"#);
         assert_eq!(serde_json::from_str::<MediaRequest>(&json).unwrap(), heard);
-        let previewed = MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None, sound: None, preview: Some(true) };
+        let previewed = MediaRequest::ShareSend { on: true, screen: None, quality: None, show_cursor: None, sound: None, preview: Some(true), resolution: None, fps: None };
         let json = serde_json::to_string(&previewed).unwrap();
         assert_eq!(json, r#"{"media":"share_send","on":true,"preview":true}"#);
         assert_eq!(serde_json::from_str::<MediaRequest>(&json).unwrap(), previewed);

@@ -11,8 +11,8 @@ use crate::gui::phone::tokens::{self, PhoneType};
 use crate::gui::phone::{sheet, sheet_title};
 use crate::gui::theme;
 use gpui::{div, prelude::*, px, AnyElement, Context, Div, MouseButton, SharedString, Stateful};
-use protocol::settings::{DeviceChoice, ECHO_CANCELLATION, GLOBAL, INPUT, NOISE_SUPPRESSION, PUSH_TO_TALK};
-use protocol::{Call, Content, ConversationKind, Key, Request};
+use protocol::settings::{DeviceChoice, ECHO_CANCELLATION, GLOBAL, INPUT, NOISE_SUPPRESSION, PUSH_TO_TALK, SHARE_FPS, SHARE_QUALITY, SHARE_RESOLUTION};
+use protocol::{Call, Content, ConversationKind, Key, MediaRequest, Request, ShareQuality, ShareResolution};
 
 /// A row of a sheet: a glyph on its plate, the label and what it says now, then what is at its
 /// right (a switch, a check, a chevron).
@@ -136,6 +136,32 @@ impl Shell {
                     this.call_phone_close_sheet(cx);
                     this.open_voice_status(&channel, cx);
                 })));
+        let share_on = sending(call, Content::Share);
+        let res = values.share_resolution();
+        let next_res = match res {
+            ShareResolution::P720 => ShareResolution::P1080,
+            ShareResolution::P1080 => ShareResolution::P1440,
+            ShareResolution::P1440 => ShareResolution::Source,
+            ShareResolution::Source => ShareResolution::P720,
+        };
+        let fps = values.share_fps();
+        let next_fps = match fps {
+            15 => 30,
+            30 => 60,
+            _ => 15,
+        };
+        let sq = values.share_quality();
+        let next_sq = match sq {
+            ShareQuality::Low => ShareQuality::Balanced,
+            ShareQuality::Balanced => ShareQuality::Best,
+            ShareQuality::Best => ShareQuality::Low,
+        };
+        let res_label = res.label();
+        let sq_label = match sq {
+            ShareQuality::Low => "Low · 1.5 Mb/s",
+            ShareQuality::Balanced => "Balanced · 4 Mb/s",
+            ShareQuality::Best => "Best · 8 Mb/s",
+        };
         div()
             .child(sheet_title(subject.title.clone()))
             .children(people)
@@ -144,6 +170,55 @@ impl Shell {
                     .on_click(cx.listener(|this, _, _, cx| this.call_phone_open_sheet(Sheet::Devices, cx))),
             )
             .children(security)
+            .child(label("SCREEN SHARE"))
+            .child(
+                row("call-phone-more-share-res", "icons/monitor-up.svg", "Resolution", Some(format!("{res_label} (tap to change)")), None)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let mut values = crate::gui::app::prefs::values();
+                        values.set(GLOBAL, SHARE_RESOLUTION, Some(next_res.as_str().to_owned()));
+                        let q = values.share_quality();
+                        let f = values.share_fps();
+                        crate::gui::app::prefs::set_values(values);
+                        crate::gui::settings::redraw(cx);
+                        this.call_ask(Request::Set { scope: GLOBAL.to_owned(), key: SHARE_RESOLUTION.to_owned(), value: Some(next_res.as_str().to_owned()) }, cx);
+                        if share_on {
+                            this.call_ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None, quality: Some(q), show_cursor: None, sound: None, preview: None, resolution: Some(next_res), fps: Some(f) }), cx);
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(
+                row("call-phone-more-share-fps", "icons/video.svg", "Frame rate", Some(format!("{fps} fps (tap to change)")), None)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let mut values = crate::gui::app::prefs::values();
+                        values.set(GLOBAL, SHARE_FPS, Some(next_fps.to_string()));
+                        let q = values.share_quality();
+                        let r = values.share_resolution();
+                        crate::gui::app::prefs::set_values(values);
+                        crate::gui::settings::redraw(cx);
+                        this.call_ask(Request::Set { scope: GLOBAL.to_owned(), key: SHARE_FPS.to_owned(), value: Some(next_fps.to_string()) }, cx);
+                        if share_on {
+                            this.call_ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None, quality: Some(q), show_cursor: None, sound: None, preview: None, resolution: Some(r), fps: Some(next_fps) }), cx);
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(
+                row("call-phone-more-share-quality", "icons/settings.svg", "Bitrate", Some(format!("{sq_label} (tap to change)")), None)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let mut values = crate::gui::app::prefs::values();
+                        values.set(GLOBAL, SHARE_QUALITY, Some(next_sq.as_str().to_owned()));
+                        let r = values.share_resolution();
+                        let f = values.share_fps();
+                        crate::gui::app::prefs::set_values(values);
+                        crate::gui::settings::redraw(cx);
+                        this.call_ask(Request::Set { scope: GLOBAL.to_owned(), key: SHARE_QUALITY.to_owned(), value: Some(next_sq.as_str().to_owned()) }, cx);
+                        if share_on {
+                            this.call_ask(Request::Media(MediaRequest::ShareSend { on: true, screen: None, quality: Some(next_sq), show_cursor: None, sound: None, preview: None, resolution: Some(r), fps: Some(f) }), cx);
+                        }
+                        cx.notify();
+                    })),
+            )
             .children(status)
             .children((call.conversation.network == protocol::Network::Discord && call.state == protocol::CallState::Joined).then(|| {
                 let key = call.conversation.clone();

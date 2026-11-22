@@ -101,8 +101,18 @@ pub const AUTO_GAIN: &str = "auto_gain";
 pub const INPUT_VOLUME: &str = "input_volume";
 /// Opus encode quality within a Tiny room's bitrate: [`QUALITY_CHOICES`].
 pub const VOICE_QUALITY: &str = "voice_quality";
+/// Screen share defaults: preset bitrate tier, max resolution, and target FPS.
+pub const SHARE_QUALITY: &str = "share_quality";
+pub const SHARE_RESOLUTION: &str = "share_resolution";
+pub const SHARE_FPS: &str = "share_fps";
+/// Viewer receive video quality preference on Tiny calls (`high`, `low`, `off`).
+pub const VIDEO_QUALITY: &str = "video_quality";
 pub const NOISE_CHOICES: [&str; 4] = ["off", "standard", "high", "enhanced"];
 pub const QUALITY_CHOICES: [&str; 3] = ["data_saver", "standard", "high"];
+pub const SHARE_QUALITY_CHOICES: [&str; 3] = ["best", "balanced", "low"];
+pub const SHARE_RESOLUTION_CHOICES: [&str; 4] = ["720", "1080", "1440", "source"];
+pub const SHARE_FPS_CHOICES: [u32; 3] = [15, 30, 60];
+pub const VIDEO_QUALITY_CHOICES: [&str; 3] = ["high", "low", "off"];
 /// V8, V13, V14, V15. The shell's global keys, as [`crate::hotkey::Binding`] writes them:
 /// push-to-talk, push-to-talk with priority, toggle mute, toggle deafen. Absent is no key.
 /// Read by the shell; chatd only keeps them.
@@ -318,6 +328,10 @@ fn kind(key: &str) -> Option<Kind> {
         ECHO_CANCELLATION | AUTO_GAIN => Kind::Switch(true),
         NOISE_SUPPRESSION => Kind::Word(&NOISE_CHOICES, "enhanced"),
         VOICE_QUALITY => Kind::Word(&QUALITY_CHOICES, "standard"),
+        SHARE_QUALITY => Kind::Word(&SHARE_QUALITY_CHOICES, "best"),
+        SHARE_RESOLUTION => Kind::Word(&SHARE_RESOLUTION_CHOICES, "1440"),
+        SHARE_FPS => Kind::Choice(&SHARE_FPS_CHOICES, 60),
+        VIDEO_QUALITY => Kind::Word(&VIDEO_QUALITY_CHOICES, "high"),
         CAMERA_QUALITY => Kind::Word(&CAMERA_QUALITY_CHOICES, "auto"),
         CAMERA_MIRROR => Kind::Switch(true),
         CAMERA_BLUR => Kind::Switch(false),
@@ -737,6 +751,26 @@ impl Values {
     /// How clearly to encode on a Tiny call, within the room's bitrate.
     pub fn voice_quality(&self) -> crate::VoiceQuality {
         crate::VoiceQuality::parse(self.word(GLOBAL, VOICE_QUALITY)).unwrap_or_default()
+    }
+
+    /// Persisted screen share bitrate preset (`best`, `balanced`, `low`).
+    pub fn share_quality(&self) -> crate::ShareQuality {
+        crate::ShareQuality::parse(self.word(GLOBAL, SHARE_QUALITY)).unwrap_or_default()
+    }
+
+    /// Persisted screen share max resolution (`720`, `1080`, `1440`, `source`).
+    pub fn share_resolution(&self) -> crate::ShareResolution {
+        crate::ShareResolution::parse(self.word(GLOBAL, SHARE_RESOLUTION)).unwrap_or_default()
+    }
+
+    /// Persisted screen share target frame rate (`15`, `30`, `60`).
+    pub fn share_fps(&self) -> u32 {
+        self.number(SHARE_FPS)
+    }
+
+    /// Persisted viewer video quality preference (`high`, `low`, `off`).
+    pub fn video_quality(&self) -> &str {
+        self.word(GLOBAL, VIDEO_QUALITY)
     }
 
     /// Preferred target language for on-demand message translation (`auto` or a BCP-47 tag).

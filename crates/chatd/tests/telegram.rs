@@ -7636,6 +7636,8 @@ fn wave16b2_recording_volume_camera_share_limits_and_rtmp_streams() {
             show_cursor: None,
             sound: None,
             preview: None,
+            resolution: None,
+            fps: None,
         })),
         Response::Status { .. }
     ));
@@ -7652,6 +7654,8 @@ fn wave16b2_recording_volume_camera_share_limits_and_rtmp_streams() {
             show_cursor: None,
             sound: None,
             preview: None,
+            resolution: None,
+            fps: None,
         })),
         Response::Status { .. }
     ));
@@ -7681,6 +7685,8 @@ fn wave16b2_recording_volume_camera_share_limits_and_rtmp_streams() {
         show_cursor: None,
         sound: None,
         preview: None,
+        resolution: None,
+        fps: None,
     })) {
         Response::Error { detail, .. } => assert!(detail.contains("4 of 4"), "unexpected reason: {detail}"),
         other => panic!("expected ShareSend refused at video limit, got {other:?}"),
@@ -7853,6 +7859,8 @@ fn direct_screen_share_with_sound_updates_sharing_and_notifies_stop() {
             show_cursor: Some(true),
             sound: Some(true),
             preview: None,
+            resolution: None,
+            fps: None,
         })),
         Response::Status { .. }
     ));
@@ -7882,6 +7890,8 @@ fn direct_screen_share_with_sound_updates_sharing_and_notifies_stop() {
             show_cursor: None,
             sound: None,
             preview: None,
+            resolution: None,
+            fps: None,
         })),
         Response::Status { .. }
     ));

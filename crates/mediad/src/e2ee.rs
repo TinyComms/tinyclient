@@ -570,15 +570,23 @@ impl E2ee {
 
     /// One H.264 picture, Annex B, as it goes into RTP. The NAL header stays clear. `None`
     /// holds it back while the call is to be end to end and has no keys yet.
+    ///
+    /// Strips AUD (NAL type 9) and Filler (NAL type 12) units before sealing: `str0m`'s H.264
+    /// packetizer drops those units, which would otherwise invalidate DAVE's authenticated
+    /// unencrypted ranges on the receiver.
     pub fn seal_video(&mut self, frame: &[u8]) -> Option<Vec<u8>> {
+        let clean = crate::h264::sanitize_annex_b(frame);
+        if clean.is_empty() {
+            return None;
+        }
         match self.mode {
-            Mode::Transport => Some(frame.to_vec()),
+            Mode::Transport => Some(clean),
             Mode::Waiting | Mode::Blocked => None,
             Mode::Group => {
                 if !self.ready() {
                     return None;
                 }
-                match self.session.as_mut()?.encrypt(MediaType::VIDEO, Codec::H264, frame) {
+                match self.session.as_mut()?.encrypt(MediaType::VIDEO, Codec::H264, &clean) {
                     Ok(sealed) => Some(sealed.into_owned()),
                     Err(err) => {
                         tracing::warn!("mediad: e2ee: a picture was not sealed, and is dropped: {err}");
@@ -752,7 +760,7 @@ pub fn safety_number(id: u64, key: &[u8], me: u64, mine: &[u8]) -> String {
 const BROKEN: &str = "The call's encryption stopped working. Try joining again.";
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// The encryption of the Tiny call these controls run, from chatd's thread and the call's loop.
 impl crate::session::Controls {

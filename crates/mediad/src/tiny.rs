@@ -1380,6 +1380,12 @@ impl Call {
             let watch_sources = self.controls.watch_sources();
             let mids: Vec<Mid> = self.link.screen_mids().to_vec();
             self.video.watch_slot(0, false);
+            if !self.watching {
+                self.video.reset_slot(0);
+                if let Some(&mid) = mids.first() {
+                    self.ask_keyframe_mid(mid);
+                }
+            }
             for (slot_idx, mid) in mids.iter().enumerate().skip(1) {
                 if let Some(pictured) = self.shown.get(mid) {
                     let small = watch_sources
@@ -1426,21 +1432,24 @@ impl Call {
         let keep_camera = self.controls.camera() || preview_camera;
         let share = self.connected && self.sending_share && self.controls.share();
         let camera = self.connected && self.sending_camera && self.controls.camera();
+        let share_version = crate::picture::share_config_version();
         let desired = video::desired(share, camera);
-        if let Some(estimate) = self.estimate {
-            let estimate = self.uplink.usable(estimate, desired, Instant::now());
-            self.rates = video::allocate(estimate, share, camera, self.rates);
-        }
         if desired != self.desired {
             if self.desired == 0 {
                 self.link.rtc.bwe().reset(Bitrate::bps(START_BPS));
                 self.estimate = None;
                 self.rates = Rates::default();
+            } else if self.estimate.is_none() {
+                self.rates = Rates::default();
             }
             self.desired = desired;
             self.link.rtc.bwe().set_desired_bitrate(Bitrate::bps(desired));
         }
-        self.video.want(Wants { share, camera, preview_camera, keep_camera, rates: self.rates });
+        if let Some(estimate) = self.estimate {
+            let estimate = self.uplink.usable(estimate, desired, Instant::now());
+            self.rates = video::allocate(estimate, share, camera, self.rates);
+        }
+        self.video.want(Wants { share, camera, preview_camera, keep_camera, rates: self.rates, share_version });
         while let Some(word) = self.video.next() {
             match word {
                 Word::Frame { track, payload, rtp, at } => self.write_video(track, payload, rtp, at),
@@ -1684,7 +1693,15 @@ impl Call {
         }
         if self.ticks.is_multiple_of(SECOND) && self.connected {
             let mut stats = self.meter.second(self.slots.values_mut().map(|slot| slot.stream.counts()));
-            let video = self.controls.video_stats.lock().unwrap().sample(Instant::now());
+            let mut vmeter = self.controls.video_stats.lock().unwrap();
+            if self.sending_share || self.sending_camera {
+                let info = crate::picture::outbound_info();
+                vmeter.sending(info.width, info.height, info.target_fps, info.encoder);
+            } else {
+                vmeter.sending(0, 0, 0, "");
+            }
+            let video = vmeter.sample(Instant::now());
+            drop(vmeter);
             if self.sending_share || self.sending_camera || self.watching {
                 stats.video = Some(video);
             }

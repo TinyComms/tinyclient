@@ -57,10 +57,15 @@ impl Shell {
         if may.invite {
             items = items.child(self.plain(menu_item("tiny-menu-invite", Some("icons/user-plus.svg"), "Invite people", None), cx).on_click(cx.listener(|this, _, window, cx| this.tiny_open_modal(Modal::Invite, window, cx))));
         }
-        items = items.child(
-            self.plain(menu_item("tiny-menu-settings", Some("icons/settings.svg"), "Server settings", None), cx)
-                .on_click(cx.listener(|this, _, window, cx| this.tiny_open_settings(super::settings::Page::Overview, None, window, cx))),
-        );
+        items = items
+            .child(
+                self.plain(menu_item("tiny-menu-account", Some("icons/user.svg"), "My account & profile", None), cx)
+                    .on_click(cx.listener(|this, _, window, cx| this.tiny_open_settings(super::settings::Page::SignIn, None, window, cx))),
+            )
+            .child(
+                self.plain(menu_item("tiny-menu-settings", Some("icons/settings.svg"), "Server settings", None), cx)
+                    .on_click(cx.listener(|this, _, window, cx| this.tiny_open_settings(super::settings::Page::Overview, None, window, cx))),
+            );
         if may.make_room || may.categories {
             items = items.child(menu_separator());
         }
@@ -147,10 +152,20 @@ impl Shell {
         );
         items = items.child(menu_separator());
         if facts.me {
-            items = items.child(self.plain(menu_item("tiny-person-picture", Some("icons/upload.svg"), "Change picture", None), cx).on_click(cx.listener(|this, _, _, cx| {
-                this.tiny_close_float(cx);
-                this.tiny_pick_avatar(cx);
-            })));
+            items = items
+                .child(self.plain(menu_item("tiny-person-account", Some("icons/user.svg"), "My account & profile", None), cx).on_click(cx.listener(|this, _, window, cx| {
+                    this.tiny_open_settings(super::settings::Page::SignIn, None, window, cx);
+                })))
+                .child(self.plain(menu_item("tiny-person-picture", Some("icons/upload.svg"), "Change picture", None), cx).on_click(cx.listener(|this, _, _, cx| {
+                    this.tiny_close_float(cx);
+                    this.tiny_pick_avatar(cx);
+                })));
+            if member.avatar.is_some() {
+                items = items.child(self.plain(menu_item("tiny-person-picture-remove", Some("icons/trash-2.svg"), "Remove picture", None), cx).on_click(cx.listener(|this, _, _, cx| {
+                    this.tiny_close_float(cx);
+                    this.tiny_send_avatar(None, cx);
+                })));
+            }
         } else {
             let message_id = user_id.to_owned();
             items = items.child(self.plain(menu_item("tiny-person-message", Some("icons/message-square.svg"), "Message", None), cx).on_click(cx.listener(move |this, _, _, cx| this.tiny_message(message_id.clone(), cx))));
@@ -210,6 +225,23 @@ impl Shell {
                 items = items.child(self.more("tiny-person-move", "icons/arrow-right-left.svg", "Move to", Sub::Move, cx));
             }
             if facts.disconnect {
+                if let Some(share_room) = page
+                    .community
+                    .rooms
+                    .iter()
+                    .find(|room| room.participants.iter().any(|seat| seat.user_id == user_id && seat.sharing))
+                    .map(|room| room.id.clone())
+                {
+                    let account = page.account.clone();
+                    items = items.child(self.plain(menu_item("tiny-person-end-share", Some("icons/monitor-off.svg"), "End screen share", None), cx).on_click(cx.listener(move |this, _, _, cx| {
+                        this.tiny_close_float(cx);
+                        let req = protocol::Request::TinyShareEnd { account: account.clone(), room_id: share_room.clone() };
+                        this.off_thread(cx, move || crate::client::ask(&req), |this, _, cx| {
+                            this.reload_all(cx);
+                            cx.notify();
+                        });
+                    })));
+                }
                 let id = user_id.to_owned();
                 items = items.child(self.plain(menu_item("tiny-person-disconnect", Some("icons/phone-off.svg"), "Disconnect from call", None), cx).on_click(cx.listener(move |this, _, _, cx| {
                     this.tiny_close_float(cx);

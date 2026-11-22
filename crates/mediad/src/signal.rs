@@ -601,6 +601,7 @@ pub fn run(mut link: Link, user_id: String, peer_id: String, controls: Arc<Contr
             preview_camera,
             keep_camera,
             rates,
+            share_version: crate::picture::share_config_version(),
         });
         while let Some(word) = video.next() {
             match word {

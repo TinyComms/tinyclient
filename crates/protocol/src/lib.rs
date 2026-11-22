@@ -3628,6 +3628,16 @@ pub enum Request {
     TinyDeleteAccount {
         account: AccountKey,
     },
+    /// Sets the desired incoming video quality (`"high"`, `"low"`, `"off"`) on the active Tiny call.
+    TinyCallQuality {
+        account: AccountKey,
+        quality: String,
+    },
+    /// Ends the active screen share in a Tiny voice room (requires disconnect permission).
+    TinyShareEnd {
+        account: AccountKey,
+        room_id: String,
+    },
     /// Files an abuse report on a Tiny server (`POST /v1/reports`). Answers `TinyReported`.
     TinyReport {
         account: AccountKey,

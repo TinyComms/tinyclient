@@ -52,8 +52,7 @@ struct Coded {
     backend: Backend,
     width: u32,
     height: u32,
-    /// What the track asked at open: what a mid-share failover sets the software encoder
-    /// up with.
+    /// What the track asked at open: used to detect quality/FPS changes and for mid-share failover.
     bps: u32,
     fps: f32,
     screen: bool,
@@ -344,10 +343,10 @@ pub(super) fn hardware_encoder_available() -> bool {
     }
 }
 
-/// The encoder for one track at this size: the one it has, or a new one, which starts with a
-/// keyframe.
+/// The encoder for one track at this size, bitrate, and frame rate: the one it has, or a new
+/// one, which starts with a keyframe.
 fn coded(slot: &mut Option<Coded>, width: u32, height: u32, nominal: u32, fps: f32, screen: bool) -> Result<&mut Coded, String> {
-    if !slot.as_ref().is_some_and(|coded| coded.width == width && coded.height == height) {
+    if !slot.as_ref().is_some_and(|coded| coded.width == width && coded.height == height && coded.bps == nominal && (coded.fps - fps).abs() < 0.5) {
         *slot = Some(Coded::open(width, height, nominal, fps, screen)?);
     }
     slot.as_mut().ok_or_else(|| "No encoder.".to_owned())
@@ -475,14 +474,22 @@ impl Outgoing {
     pub fn share(&mut self, ask: Ask) -> Result<Encoded, String> {
         let quality = super::share_quality();
         let began = Instant::now();
-        let grabbed = capture_screen()?;
+        let grabbed = match capture_screen() {
+            Ok(grabbed) => grabbed,
+            #[cfg(windows)]
+            Err(words) if words == super::screens::WINDOW_MINIMIZED => return Ok(Encoded::default()),
+            Err(words) => return Err(words),
+        };
         let captured = Instant::now();
         let (width, height) = fit(grabbed.width, grabbed.height, quality.max.0, quality.max.1);
         let planes = i420(&grabbed.pixels, grabbed.width, grabbed.height, width, height, grabbed.bgra);
         let converted = Instant::now();
         // The grab is the whole screen, so the preview costs one shrink a tenth of a second.
         self.screen_selfie.shoot(&grabbed);
-        let encoded = coded(&mut self.share, width, height, quality.bps, quality.fps as f32, true)?.encode(&planes, &ask);
+        let target_fps = super::share_fps();
+        let encoder = coded(&mut self.share, width, height, quality.bps, target_fps as f32, true)?;
+        let encoded = encoder.encode(&planes, &ask);
+        super::set_outbound_info(width, height, target_fps, encoder.backend.name());
         self.cost.note(began, captured, converted, Instant::now(), (grabbed.width, grabbed.height), (width, height));
         encoded
     }
@@ -539,10 +546,12 @@ impl Outgoing {
         self.selfie.forget();
     }
 
-    /// The share is off. Drop the encoder, and on Linux close the portal session so the recording indicator does not stay up.
+    /// The share is off. Drop the encoder, release Desktop Duplication, and on Linux close the portal session.
     pub fn close_share(&mut self) {
         self.share = None;
         self.screen_selfie.forget();
+        super::clear_outbound_info();
+        super::screens::close_capture();
         #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
         super::portal::stop_screen();
         #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
@@ -1621,10 +1630,15 @@ mod tests {
         outgoing.screen_selfie.shoot_mirrored(&screen(), false, now);
         assert!(outgoing.share_view().is_none(), "a grab inside the interval is not painted");
 
-        outgoing.screen_selfie.shoot_mirrored(&screen(), false, now + SELF_VIEW_EVERY);
-        let next = outgoing.share_view().unwrap();
+        let mut next = first.clone();
+        let mut tick = now;
+        for _ in 0..super::CANVAS_RING {
+            tick += SELF_VIEW_EVERY;
+            outgoing.screen_selfie.shoot_mirrored(&screen(), false, tick);
+            next = outgoing.share_view().unwrap();
+        }
         assert_ne!(next.generation, first.generation);
-        assert!(!first.path.exists(), "the file before it is gone");
+        assert!(!first.path.exists(), "the oldest file beyond the ring is gone");
 
         outgoing.screen_selfie.forget();
         assert!(!next.path.exists(), "and so is the last one when the share stops");

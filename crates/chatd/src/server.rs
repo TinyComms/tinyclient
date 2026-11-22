@@ -6561,6 +6561,18 @@ impl Chat {
                 Ok(()) => self.forget_deleted_tiny(account),
                 Err(answer) => answer,
             },
+            Request::TinyCallQuality { account, quality } => {
+                if !matches!(quality.as_str(), "high" | "low" | "off") {
+                    return error(ErrorCode::Refused, "Video quality must be high, low, or off.");
+                }
+                self.command(&account, Command::Tiny(adapters::tiny::live::Ask::CallQuality { video: quality }));
+                Response::Ok
+            }
+            Request::TinyShareEnd { account, room_id } => {
+                let ids = [room_id.as_str()];
+                let ask = |reply| adapters::tiny::live::Ask::ShareEnd { room_id: room_id.clone(), reply };
+                self.tiny_moderate(&account, &["community.calls.disconnect"], &ids, ask)
+            }
             Request::TinyReport { account, kind, target_id, category, note, evidence } => {
                 adapters::tiny::manage::report_create(account, kind, target_id, category, note, evidence)
             }
@@ -7173,7 +7185,19 @@ impl Chat {
                 self.hub.recorder.request(&self.hub, request);
                 Response::Ok
             }
-            Request::Media(request) => {
+            Request::Media(mut request) => {
+                if let MediaRequest::ShareSend { on: true, quality, resolution, fps, .. } = &mut request {
+                    let values = self.hub.settings();
+                    if quality.is_none() {
+                        *quality = Some(values.share_quality());
+                    }
+                    if resolution.is_none() {
+                        *resolution = Some(values.share_resolution());
+                    }
+                    if fps.is_none() {
+                        *fps = Some(values.share_fps());
+                    }
+                }
                 // Tiny `call.watch` reaches mediad from the live socket, and only when that
                 // list is still the newest one accepted. Applying the sources here, after
                 // `ask` returns, lets an older connection thread rewind mediad. A single

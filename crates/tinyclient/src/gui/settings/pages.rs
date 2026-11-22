@@ -18,7 +18,8 @@ use protocol::settings::{
     self as keys, account_scope, DeviceChoice, Values, AUTO_GAIN, AUTO_WATCH_SHARE, CACHE_MB, CAMERA, CAMERA_BLUR, CAMERA_MIRROR, CAMERA_QUALITY, CAMERA_QUALITY_CHOICES,
     CACHE_MB_CHOICES, CUE_CONNECTION, CUE_JOINS, CUE_MINE, CUE_VOLUME, ECHO_CANCELLATION, GLOBAL, INPUT, INPUT_VOLUME, JOIN_MUTED, KEEP_DAYS,
     KEEP_DAYS_CHOICES, KEEP_RUNNING, NOISE_CHOICES, NOISE_SUPPRESSION, OUTPUT, PTT_RELEASE_CHOICES, PTT_RELEASE_MS, PUSH_TO_TALK, PRESENCE_ACTIVITY, QUALITY_CHOICES,
-    RECEIPTS, REQUIRE_CALL_E2EE, SENSITIVITY, SIGNAL_ALWAYS_RELAY, SOUNDS, SOUNDBOARD_VOLUME, STREAMER_DETECT_OBS, STREAMER_HIDE_WINDOW, STREAMER_MODE, STREAMER_MODE_CHOICES, TRANSLATE_TO, TRANSLATE_TO_CHOICES, TYPING, VOICE_QUALITY, VOICE_VOLUME,
+    RECEIPTS, REQUIRE_CALL_E2EE, SENSITIVITY, SHARE_FPS, SHARE_FPS_CHOICES, SHARE_QUALITY, SHARE_QUALITY_CHOICES, SHARE_RESOLUTION, SHARE_RESOLUTION_CHOICES, SIGNAL_ALWAYS_RELAY, SOUNDS, SOUNDBOARD_VOLUME,
+    STREAMER_DETECT_OBS, STREAMER_HIDE_WINDOW, STREAMER_MODE, STREAMER_MODE_CHOICES, TRANSLATE_TO, TRANSLATE_TO_CHOICES, TYPING, VIDEO_QUALITY, VIDEO_QUALITY_CHOICES, VOICE_QUALITY, VOICE_VOLUME,
 };
 use protocol::{AccountStatus, Link, Network, Request, Response};
 use std::rc::Rc;
@@ -30,7 +31,7 @@ const TRANSLATE_LABELS: [&str; 13] = [
 
 /// Choice sets whose pills do not fit beside their label. Short pairs stay pills.
 pub(super) fn menu_choice(id: &str) -> bool {
-    matches!(id, "S2" | "S3" | "S4" | "N2" | "N4" | "NL" | "N6" | "M5" | "M8" | "P4" | "PS1" | "D2" | "V8" | "V11" | "V21" | "V23")
+    matches!(id, "S2" | "S3" | "S4" | "N2" | "N4" | "NL" | "N6" | "M5" | "M8" | "P4" | "PS1" | "D2" | "V8" | "V11" | "V21" | "V23" | "V28" | "V29" | "V30" | "V31")
 }
 
 /// `--settings-choice` names one of these.
@@ -53,6 +54,10 @@ pub(super) fn choice_id(name: &str) -> Option<&'static str> {
         "V11" => "V11",
         "V21" => "V21",
         "V23" => "V23",
+        "V28" => "V28",
+        "V29" => "V29",
+        "V30" => "V30",
+        "V31" => "V31",
         _ => return None,
     })
 }
@@ -77,6 +82,10 @@ fn choice_slot(id: &str) -> usize {
         "V11" => 49,
         "V21" => 50,
         "V23" => 53,
+        "V28" => 54,
+        "V29" => 55,
+        "V30" => 56,
+        "V31" => 57,
         _ => 0,
     }
 }
@@ -138,6 +147,23 @@ fn choice_list(id: &str) -> Option<(Vec<(String, String)>, usize, usize)> {
         "V23" => {
             let at = CAMERA_QUALITY_CHOICES.iter().position(|w| *w == values.word(GLOBAL, CAMERA_QUALITY)).unwrap_or(0);
             (CAMERA_QUALITY_CHOICES.iter().zip(["Auto", "HD (720p)", "Standard (360p)", "Data saver"]).map(|(w, l)| ((*w).to_owned(), (*l).to_owned())).collect(), at, 0)
+        }
+        "V28" => {
+            let at = SHARE_RESOLUTION_CHOICES.iter().position(|w| *w == values.word(GLOBAL, SHARE_RESOLUTION)).unwrap_or(2);
+            (SHARE_RESOLUTION_CHOICES.iter().zip(["720p", "1080p", "1440p", "Source"]).map(|(w, l)| ((*w).to_owned(), (*l).to_owned())).collect(), at, 2)
+        }
+        "V29" => {
+            let fps = values.share_fps();
+            let at = SHARE_FPS_CHOICES.iter().position(|f| *f == fps).unwrap_or(2);
+            (SHARE_FPS_CHOICES.iter().zip(["15 fps", "30 fps", "60 fps"]).map(|(f, l)| (f.to_string(), (*l).to_owned())).collect(), at, 2)
+        }
+        "V30" => {
+            let at = SHARE_QUALITY_CHOICES.iter().position(|w| *w == values.word(GLOBAL, SHARE_QUALITY)).unwrap_or(0);
+            (SHARE_QUALITY_CHOICES.iter().zip(["Best (8 Mb/s)", "Balanced (4 Mb/s)", "Low (1.5 Mb/s)"]).map(|(w, l)| ((*w).to_owned(), (*l).to_owned())).collect(), at, 0)
+        }
+        "V31" => {
+            let at = VIDEO_QUALITY_CHOICES.iter().position(|w| *w == values.video_quality()).unwrap_or(0);
+            (VIDEO_QUALITY_CHOICES.iter().zip(["High", "Low", "Off"]).map(|(w, l)| ((*w).to_owned(), (*l).to_owned())).collect(), at, 0)
         }
         "M8" => {
             let at = TRANSLATE_TO_CHOICES.iter().position(|w| *w == values.word(GLOBAL, TRANSLATE_TO)).unwrap_or(0);
@@ -459,7 +485,8 @@ impl SettingsWindow {
                     .child(caption("Picking a device in a call's menu changes that call only. These are the defaults.")),
                 self.group(&["V22", "V23", "V24", "V25"], Some("Camera"), window, cx).child(self.camera_preview(cx)),
                 self.group(&["V4", "V26"], Some("Joining"), window, cx),
-                self.group(&["V27"], Some("Screen sharing"), window, cx),
+                self.group(&["V27", "V28", "V29", "V30", "V31"], Some("Screen sharing"), window, cx)
+                    .child(caption("Defaults for new screen shares and incoming video. You can also adjust resolution, frame rate, and bitrate live from the Share picker.")),
             ],
             Section::Voice => {
                 let values = prefs::values();
@@ -1002,6 +1029,27 @@ impl SettingsWindow {
                 let on = values.on(AUTO_WATCH_SHARE);
                 self.switch_row(id, on, false, None, move |this, on, cx| this.set_switch(id, AUTO_WATCH_SHARE, on, false, cx), cx)
             }
+            "V28" => {
+                let at = SHARE_RESOLUTION_CHOICES.iter().position(|w| *w == values.word(GLOBAL, SHARE_RESOLUTION)).unwrap_or(2);
+                let second = Some("Maximum resolution sent when you share your screen or a window.".to_owned());
+                self.menu_choice_row(id, &["720p", "1080p", "1440p", "Source"], at, 2, second, None, cx)
+            }
+            "V29" => {
+                let fps = values.share_fps();
+                let at = SHARE_FPS_CHOICES.iter().position(|f| *f == fps).unwrap_or(2);
+                let second = Some("Target capture frame rate for screen sharing, capped to the monitor's refresh rate.".to_owned());
+                self.menu_choice_row(id, &["15 fps", "30 fps", "60 fps"], at, 2, second, None, cx)
+            }
+            "V30" => {
+                let at = SHARE_QUALITY_CHOICES.iter().position(|w| *w == values.word(GLOBAL, SHARE_QUALITY)).unwrap_or(0);
+                let second = Some("Target video bitrate for screen shares. Best is sharpest; Low saves uplink bandwidth.".to_owned());
+                self.menu_choice_row(id, &["Best (8 Mb/s)", "Balanced (4 Mb/s)", "Low (1.5 Mb/s)"], at, 0, second, None, cx)
+            }
+            "V31" => {
+                let at = VIDEO_QUALITY_CHOICES.iter().position(|w| *w == values.video_quality()).unwrap_or(0);
+                let second = Some("Video layer requested on Tiny calls. Low saves download bandwidth; Off pauses incoming video.".to_owned());
+                self.menu_choice_row(id, &["High", "Low", "Off"], at, 0, second, None, cx)
+            }
             "V26" => {
                 let second = Some("Automatically opens the always-on-top call video window when you switch to another app while watching a screen share.".to_owned());
                 self.switch_row(id, choices.auto_popout_call, false, second, |this, on, cx| this.choose(|c| c.auto_popout_call = on, cx), cx)
@@ -1352,6 +1400,42 @@ impl SettingsWindow {
                 let word = CAMERA_QUALITY_CHOICES[ix.min(CAMERA_QUALITY_CHOICES.len() - 1)];
                 let stored = (word != "auto").then(|| word.to_owned());
                 self.set(id, GLOBAL.into(), CAMERA_QUALITY, stored, cx);
+            }
+            "V28" => {
+                let word = SHARE_RESOLUTION_CHOICES[ix.min(SHARE_RESOLUTION_CHOICES.len() - 1)];
+                let stored = (word != "1440").then(|| word.to_owned());
+                self.set(id, GLOBAL.into(), SHARE_RESOLUTION, stored, cx);
+            }
+            "V29" => {
+                let fps = SHARE_FPS_CHOICES[ix.min(SHARE_FPS_CHOICES.len() - 1)];
+                let stored = (fps != 60).then(|| fps.to_string());
+                self.set(id, GLOBAL.into(), SHARE_FPS, stored, cx);
+            }
+            "V30" => {
+                let word = SHARE_QUALITY_CHOICES[ix.min(SHARE_QUALITY_CHOICES.len() - 1)];
+                let stored = (word != "best").then(|| word.to_owned());
+                self.set(id, GLOBAL.into(), SHARE_QUALITY, stored, cx);
+            }
+            "V31" => {
+                let word = VIDEO_QUALITY_CHOICES[ix.min(VIDEO_QUALITY_CHOICES.len() - 1)];
+                let stored = (word != "high").then(|| word.to_owned());
+                self.set(id, GLOBAL.into(), VIDEO_QUALITY, stored, cx);
+                if let Some(account) = self.shell.upgrade().and_then(|shell| {
+                    shell
+                        .read(cx)
+                        .snapshot
+                        .as_ref()
+                        .and_then(|s| s.call.as_ref())
+                        .filter(|call| call.conversation.network == Network::Tiny)
+                        .map(|call| call.conversation.account())
+                }) {
+                    let quality = word.to_owned();
+                    cx.background_executor()
+                        .spawn(async move {
+                            let _ = crate::client::ask(&Request::TinyCallQuality { account, quality });
+                        })
+                        .detach();
+                }
             }
             "M8" => {
                 let word = TRANSLATE_TO_CHOICES[ix.min(TRANSLATE_TO_CHOICES.len() - 1)];
@@ -2234,6 +2318,7 @@ impl SettingsWindow {
             Confirm::SignOut(account) => self.sign_out_modal(&account, cx),
             Confirm::EditProfile(account) => self.edit_profile_modal(&account, cx),
             Confirm::TinyEverywhere(account) => self.tiny_everywhere_modal(&account, cx),
+            Confirm::TinyDeleteAccount(account) => self.tiny_delete_account_modal(&account, cx),
             Confirm::Retention { days, prunable } => modal_panel(
                 format!("Delete messages older than {days} days?"),
                 vec![retention_words(prunable)],
@@ -2716,7 +2801,7 @@ mod tests {
 
     #[test]
     fn long_choice_sets_are_menus_and_the_button_stays_in_the_column() {
-        for id in ["S2", "S3", "S4", "N2", "N4", "NL", "N6", "M5", "M8", "P4", "PS1", "D2", "V8", "V11", "V21", "V23"] {
+        for id in ["S2", "S3", "S4", "N2", "N4", "NL", "N6", "M5", "M8", "P4", "PS1", "D2", "V8", "V11", "V21", "V23", "V28", "V29", "V30", "V31"] {
             assert!(menu_choice(id), "{id}");
         }
         assert_eq!(TRANSLATE_LABELS.len(), TRANSLATE_TO_CHOICES.len());

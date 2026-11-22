@@ -492,10 +492,20 @@ impl Dave {
     /// - `Codec::VP8`: 10-byte uncompressed header for keyframes (`frame[0] & 1 == 0`), 1 byte for delta frames.
     /// - `Codec::AV1`: OBU header, optional extension, and non-last LEB128 size stay clear; last OBU clears `has_size`.
     pub fn encrypt_video_codec(&mut self, codec: Codec, frame: &[u8]) -> Option<Vec<u8>> {
+        let clean;
+        let bytes = if codec == Codec::H264 {
+            clean = crate::h264::sanitize_annex_b(frame);
+            if clean.is_empty() {
+                return None;
+            }
+            &clean[..]
+        } else {
+            frame
+        };
         if !self.encrypting() {
-            return Some(frame.to_vec());
+            return Some(bytes.to_vec());
         }
-        match self.session.as_mut()?.encrypt(MediaType::VIDEO, codec, frame) {
+        match self.session.as_mut()?.encrypt(MediaType::VIDEO, codec, bytes) {
             Ok(sealed) => Some(sealed.into_owned()),
             Err(err) => {
                 tracing::warn!("mediad: dave: a picture was not encrypted, dropped: {err}");

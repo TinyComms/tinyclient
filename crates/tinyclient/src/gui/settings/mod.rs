@@ -160,6 +160,7 @@ pub(super) enum Confirm {
     ExportAll,
     Reset,
     TinyEverywhere(Box<AccountStatus>),
+    TinyDeleteAccount(Box<AccountStatus>),
     EditProfile(Box<AccountStatus>),
 }
 

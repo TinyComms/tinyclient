@@ -47,7 +47,7 @@ impl<I> Feed<I> {
         if self
             .newest
             .as_ref()
-            .is_some_and(|(generation, _)| *generation == picture.0)
+            .is_some_and(|(generation, _)| picture.0 <= *generation)
         {
             return (None, None);
         }

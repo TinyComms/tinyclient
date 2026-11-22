@@ -9,7 +9,7 @@ mod mls {
 }
 
 const ROOM: &str = "0b6f2c4e-0000-4000-8000-000000000001";
-const ADA: &str = "5a0c0000-0000-4000-8000-0000000000a1";
+pub(crate) const ADA: &str = "5a0c0000-0000-4000-8000-0000000000a1";
 const BEA: &str = "9d1e0000-0000-4000-8000-0000000000b2";
 const CY: &str = "c0de0000-0000-4000-8000-0000000000c3";
 const TONE: &[u8] = &[0x78, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
@@ -488,6 +488,139 @@ fn a_sealed_picture_keeps_its_nal_header_and_opens() {
     assert_ne!(&sealed[idr + 5..], &frame[13..], "the slice body is not in clear");
     assert_eq!(bea.open_video(ADA, &sealed).as_deref(), Some(&frame[..]));
     assert_eq!(bea.open_video(ADA, &frame), None, "a clear picture is dropped in an end-to-end call");
+}
+
+/// Helper for cross-module proof tests (e.g. `mf_encoder::tests`).
+pub(crate) fn pair_for_video_proof() -> (E2ee, E2ee) {
+    let (_, ada, bea, _) = three();
+    (ada, bea)
+}
+
+/// Real `str0m::Rtc` loopback pair (ICE + DTLS + SRTP + H264Packetizer + H264Depacketizer)
+/// proving sealed H.264 frames survive the exact WebRTC RTP pipeline used in Tiny calls.
+pub(crate) struct Str0mVideoPipe {
+    tx: str0m::Rtc,
+    rx: str0m::Rtc,
+    tx_addr: std::net::SocketAddr,
+    rx_addr: std::net::SocketAddr,
+    mid: str0m::media::Mid,
+    pt: str0m::media::Pt,
+    now: Instant,
+}
+
+impl Str0mVideoPipe {
+    pub(crate) fn new() -> Self {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use str0m::media::{Direction, MediaKind, Pt};
+        use str0m::{Candidate, RtcConfig};
+        let now = Instant::now();
+        let make = |ice_lite: bool| {
+            let mut cfg = RtcConfig::new().clear_codecs();
+            if ice_lite {
+                cfg = cfg.set_ice_lite(true);
+            }
+            cfg.codec_config().add_h264(Pt::new_with_value(108), None, true, 0x42e033);
+            cfg.build(now)
+        };
+        let mut tx = make(false);
+        let mut rx = make(true);
+        let tx_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40001);
+        let rx_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40002);
+        tx.add_local_candidate(Candidate::host(tx_addr, "udp").unwrap());
+        rx.add_local_candidate(Candidate::host(rx_addr, "udp").unwrap());
+        let mut api = tx.sdp_api();
+        let mid = api.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
+        let (offer, pending) = api.apply().unwrap();
+        let answer = rx.sdp_api().accept_offer(offer).unwrap();
+        tx.sdp_api().accept_answer(pending, answer).unwrap();
+        let mut pipe = Self { tx, rx, tx_addr, rx_addr, mid, pt: Pt::new_with_value(108), now };
+        pipe.pump_until_connected();
+        pipe
+    }
+
+    fn pump_until_connected(&mut self) {
+        for _ in 0..200 {
+            if self.tx.is_connected() && self.rx.is_connected() {
+                return;
+            }
+            let _ = self.pump_once();
+        }
+        panic!("str0m loopback pipe did not connect");
+    }
+
+    fn pump_once(&mut self) -> Vec<Vec<u8>> {
+        use str0m::net::{Protocol, Receive};
+        use str0m::{Event, Input, Output};
+        let mut out = Vec::new();
+        self.now += Duration::from_millis(5);
+        let _ = self.tx.handle_input(Input::Timeout(self.now));
+        let _ = self.rx.handle_input(Input::Timeout(self.now));
+        let mut to_rx = Vec::new();
+        let mut to_tx = Vec::new();
+        loop {
+            match self.tx.poll_output().unwrap() {
+                Output::Timeout(_) => break,
+                Output::Transmit(t) => to_rx.push(t.contents),
+                Output::Event(_) => {}
+            }
+        }
+        for pkt in to_rx {
+            let r = Receive { proto: Protocol::Udp, source: self.tx_addr, destination: self.rx_addr, contents: (&*pkt).try_into().unwrap() };
+            let _ = self.rx.handle_input(Input::Receive(self.now, r));
+        }
+        loop {
+            match self.rx.poll_output().unwrap() {
+                Output::Timeout(_) => break,
+                Output::Transmit(t) => to_tx.push(t.contents),
+                Output::Event(Event::MediaData(data)) => out.push(data.data.to_vec()),
+                Output::Event(_) => {}
+            }
+        }
+        for pkt in to_tx {
+            let r = Receive { proto: Protocol::Udp, source: self.rx_addr, destination: self.tx_addr, contents: (&*pkt).try_into().unwrap() };
+            let _ = self.tx.handle_input(Input::Receive(self.now, r));
+        }
+        out
+    }
+
+    pub(crate) fn send_and_receive(&mut self, frame: Vec<u8>, rtp_ts: u64) -> Vec<u8> {
+        use str0m::media::{Frequency, MediaTime};
+        let writer = self.tx.writer(self.mid).expect("video writer");
+        writer.write(self.pt, self.now, MediaTime::new(rtp_ts, Frequency::NINETY_KHZ), frame).expect("str0m write");
+        for _ in 0..40 {
+            let got = self.pump_once();
+            if let Some(first) = got.into_iter().next() {
+                return first;
+            }
+        }
+        panic!("str0m loopback did not deliver video frame");
+    }
+}
+
+/// Windows hardware H.264 encoders commonly emit AUD (NAL type 9) and CBR Filler (NAL type 12).
+/// str0m's `H264Packetizer` silently drops NAL types 9 and 12; if `seal_video` did not strip them
+/// before `davey` encrypted the frame, `open_video` on the receiver would fail AES-GCM on every
+/// frame. This proves the sanitized sealed frame survives real str0m WebRTC RTP round-trip.
+#[test]
+fn a_sealed_picture_with_aud_and_filler_survives_str0m_rtp_round_trip() {
+    let (_, mut ada, mut bea, _) = three();
+    let frame_with_aud_and_filler = [
+        0, 0, 0, 1, 0x09, 0x10,                         // AUD (NAL 9)
+        0, 0, 0, 1, 0x06, 0x05, 0x02, 0xaa, 0xbb, 0x80, // SEI (NAL 6)
+        0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x1f,             // SPS (NAL 7)
+        0, 0, 0, 1, 0x68, 0xce, 0x38, 0x80,             // PPS (NAL 8)
+        0, 0, 0, 1, 0x0c, 0xff, 0xff, 0x80,             // Filler (NAL 12)
+        0, 0, 0, 1, 0x65, 0x88, 0x84, 0x21, 0xff, 0x10, 0x22, 0x33, 0x44, 0x55, // IDR (NAL 5)
+    ];
+    let sealed = ada.seal_video(&frame_with_aud_and_filler).expect("sealed");
+    let mut pipe = Str0mVideoPipe::new();
+    let reassembled = pipe.send_and_receive(sealed, 90_000);
+    let opened = bea.open_video(ADA, &reassembled).expect("receiver must decrypt frame after real str0m WebRTC RTP round-trip");
+    assert!(opened.windows(5).any(|w| w == [0, 0, 0, 1, 0x67]), "SPS preserved");
+    assert!(opened.windows(5).any(|w| w == [0, 0, 0, 1, 0x68]), "PPS preserved");
+    assert!(opened.windows(5).any(|w| w == [0, 0, 0, 1, 0x65]), "IDR preserved");
+    assert!(!opened.windows(5).any(|w| w == [0, 0, 0, 1, 0x09]), "AUD stripped");
+    assert!(!opened.windows(5).any(|w| w == [0, 0, 0, 1, 0x0c]), "Filler stripped");
 }
 
 /// Multi-stream video: one sender's camera and screen share are sealed by one encryptor, so they

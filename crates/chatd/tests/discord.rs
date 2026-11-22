@@ -13612,6 +13612,8 @@ fn a_share_posts_one_preview_and_viewers_come_from_the_stream() {
         show_cursor: None,
         sound: None,
         preview: Some(true),
+        resolution: None,
+        fps: None,
     }));
     wait("go live", || world.discord.frames_of(18).pop());
     world.discord.push(

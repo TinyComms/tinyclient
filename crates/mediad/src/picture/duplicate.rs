@@ -15,7 +15,10 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_FLAG, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+    DXGI_SAMPLE_DESC,
+};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
 };
@@ -104,21 +107,31 @@ impl Duplicator {
         }
     }
 
-    /// Copies `texture` to the CPU and reads it back as BGRA rows.
+    /// Copies `texture` to the CPU and reads it back as BGRA/RGBA rows, converting HDR
+    /// (16-bit float scRGB) and 10-bit surfaces so Desktop Duplication stays active on HDR displays.
     unsafe fn read(&mut self, texture: &ID3D11Texture2D) -> Result<Rgba, &'static str> {
         // SAFETY: as in `open`; the mapped memory is read only between Map and Unmap, and only
         // inside the rows and pitch Direct3D reports.
         unsafe {
             let mut desc = D3D11_TEXTURE2D_DESC::default();
             texture.GetDesc(&mut desc);
-            if desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
-                return Err("The screen is not BGRA.");
+            let supported = matches!(
+                desc.Format,
+                DXGI_FORMAT_B8G8R8A8_UNORM
+                    | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+                    | DXGI_FORMAT_R8G8B8A8_UNORM
+                    | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+                    | DXGI_FORMAT_R10G10B10A2_UNORM
+                    | DXGI_FORMAT_R16G16B16A16_FLOAT
+            );
+            if !supported {
+                return Err("The screen format is not supported by Desktop Duplication.");
             }
             (self.width, self.height) = (desc.Width, desc.Height);
             if self.staging.as_ref().is_none_or(|staging| {
                 let mut have = D3D11_TEXTURE2D_DESC::default();
                 staging.GetDesc(&mut have);
-                have.Width != desc.Width || have.Height != desc.Height
+                have.Width != desc.Width || have.Height != desc.Height || have.Format != desc.Format
             }) {
                 let staging = D3D11_TEXTURE2D_DESC {
                     Width: desc.Width,
@@ -142,12 +155,90 @@ impl Duplicator {
             self.context.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).map_err(|_| "The frame could not be read.")?;
             let (width, height, pitch) = (desc.Width as usize, desc.Height as usize, mapped.RowPitch as usize);
             let mut pixels = Vec::with_capacity(width * height * 4);
-            for row in 0..height {
-                let from = std::slice::from_raw_parts((mapped.pData as *const u8).add(row * pitch), width * 4);
-                pixels.extend_from_slice(from);
-            }
+            let bgra = match desc.Format {
+                DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => {
+                    for row in 0..height {
+                        let from = std::slice::from_raw_parts((mapped.pData as *const u8).add(row * pitch), width * 4);
+                        pixels.extend_from_slice(from);
+                    }
+                    true
+                }
+                DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => {
+                    for row in 0..height {
+                        let from = std::slice::from_raw_parts((mapped.pData as *const u8).add(row * pitch), width * 4);
+                        pixels.extend_from_slice(from);
+                    }
+                    false
+                }
+                DXGI_FORMAT_R10G10B10A2_UNORM => {
+                    for row in 0..height {
+                        let from = std::slice::from_raw_parts((mapped.pData as *const u8).add(row * pitch), width * 4);
+                        for chunk in from.chunks_exact(4) {
+                            let packed = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                            let r = (((packed & 0x3ff) * 255 + 511) / 1023) as u8;
+                            let g = ((((packed >> 10) & 0x3ff) * 255 + 511) / 1023) as u8;
+                            let b = ((((packed >> 20) & 0x3ff) * 255 + 511) / 1023) as u8;
+                            pixels.extend_from_slice(&[b, g, r, 255]);
+                        }
+                    }
+                    true
+                }
+                DXGI_FORMAT_R16G16B16A16_FLOAT => {
+                    for row in 0..height {
+                        let from = std::slice::from_raw_parts((mapped.pData as *const u8).add(row * pitch), width * 8);
+                        for chunk in from.chunks_exact(8) {
+                            let r = linear_to_srgb_u8(f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])));
+                            let g = linear_to_srgb_u8(f16_to_f32(u16::from_le_bytes([chunk[2], chunk[3]])));
+                            let b = linear_to_srgb_u8(f16_to_f32(u16::from_le_bytes([chunk[4], chunk[5]])));
+                            pixels.extend_from_slice(&[b, g, r, 255]);
+                        }
+                    }
+                    true
+                }
+                _ => {
+                    self.context.Unmap(staging, 0);
+                    return Err("The screen format is not supported by Desktop Duplication.");
+                }
+            };
             self.context.Unmap(staging, 0);
-            Ok(Rgba { width: desc.Width, height: desc.Height, pixels, bgra: true })
+            Ok(Rgba { width: desc.Width, height: desc.Height, pixels, bgra })
         }
     }
+}
+
+/// IEEE 754 binary16 (half-float) to f32 for Windows HDR scRGB surfaces.
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = u32::from(bits >> 15) << 31;
+    let exp = u32::from((bits >> 10) & 0x1f);
+    let mant = u32::from(bits & 0x3ff);
+    let out = if exp == 0 {
+        if mant == 0 {
+            sign
+        } else {
+            // Subnormal half -> normal f32.
+            let mut m = mant;
+            let mut e: i32 = -14;
+            while (m & 0x400) == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            m &= 0x3ff;
+            sign | (((e + 127) as u32) << 23) | (m << 13)
+        }
+    } else if exp == 31 {
+        sign | (0xff << 23) | (mant << 13)
+    } else {
+        sign | ((exp + 112) << 23) | (mant << 13)
+    };
+    f32::from_bits(out)
+}
+
+/// Linear scRGB component (`1.0` = SDR white) to 8-bit sRGB.
+fn linear_to_srgb_u8(v: f32) -> u8 {
+    if !v.is_finite() || v <= 0.0 {
+        return 0;
+    }
+    let c = v.min(1.0);
+    let s = if c <= 0.003_130_8 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+    (s * 255.0 + 0.5).clamp(0.0, 255.0) as u8
 }

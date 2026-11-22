@@ -194,6 +194,15 @@ pub enum Ask {
     Offer {
         sdp: String,
     },
+    /// Desired incoming video quality (`"high"`, `"low"`, `"off"`), for `call.quality`.
+    CallQuality {
+        video: String,
+    },
+    /// Moderator action to stop the active screen share in `room_id`, for `call.share_end`.
+    ShareEnd {
+        room_id: String,
+        reply: Reply<()>,
+    },
     /// Multi-stream watch selection for `call.watch` (sent only when server advertises `multi_video`).
     Watch {
         sources: Vec<protocol::WatchSource>,
@@ -250,6 +259,7 @@ impl Ask {
             | Ask::Kick { reply, .. }
             | Ask::Moderate { reply, .. }
             | Ask::Move { reply, .. }
+            | Ask::ShareEnd { reply, .. }
             | Ask::SetPresence { reply, .. }
             | Ask::Watch { reply, .. }
             | Ask::GroupStart { reply, .. }
@@ -264,6 +274,7 @@ impl Ask {
             | Ask::Priority { .. }
             | Ask::E2ee { .. }
             | Ask::Offer { .. }
+            | Ask::CallQuality { .. }
             | Ask::Resume
             | Ask::Settled => None,
         }
@@ -339,7 +350,7 @@ impl Live {
             // A hang-up while down needs nothing sent now: the seat is not taken again without
             // the call (`rejoin`), and one the server kept is left on `ready` (`seat_kept`).
             ask if !inner.connected => ask.refuse(OFFLINE),
-            ask @ (Ask::Join { .. } | Ask::GroupStart { .. } | Ask::GroupJoin { .. }) if inner.media == "down" => ask.refuse(AUDIO_DOWN),
+            ask @ (Ask::Join { .. } | Ask::Ring { .. } | Ask::Accept { .. } | Ask::GroupStart { .. } | Ask::GroupJoin { .. }) if inner.media == "down" => ask.refuse(AUDIO_DOWN),
             ask if inner.queued.len() >= QUEUED => ask.refuse(BUSY),
             ask => {
                 inner.queued.push_back(ask);
@@ -1150,6 +1161,21 @@ fn serve(
                             reply: Some(reply),
                         });
                         wire.send(json!({"type": "call.move", "ref": reference, "user_id": user_id, "room_id": room_id}).to_string())
+                    }
+                    Ask::CallQuality { video } if seat.call_id.is_some() => {
+                        let reference = refs.to_string();
+                        wire.send(json!({"type": "call.quality", "ref": reference, "video": video}).to_string())
+                    }
+                    Ask::CallQuality { .. } => Ok(()),
+                    Ask::ShareEnd { room_id, reply } => {
+                        let reference = refs.to_string();
+                        pending.push(Pending {
+                            reference: reference.clone(),
+                            asked: Asked::Moderate,
+                            until: Instant::now() + timing.answer,
+                            reply: Some(reply),
+                        });
+                        wire.send(json!({"type": "call.share_end", "ref": reference, "room_id": room_id}).to_string())
                     }
                     Ask::Kick {
                         room_id,
@@ -2054,6 +2080,8 @@ fn heard_frame(
                                 show_cursor: None,
                                 sound: None,
                                 preview: None,
+                                resolution: None,
+                                fps: None,
                             },
                         );
                     }
@@ -2921,6 +2949,8 @@ fn direct_state(ctx: &Context, seat: &mut Seat, direct_id: &str, user: &str, fra
                 show_cursor: None,
                 sound: None,
                 preview: None,
+                resolution: None,
+                fps: None,
             },
         );
     }
@@ -2947,21 +2977,38 @@ fn tell_direct(ctx: &Context, seat: &Seat, direct_id: &str) {
         .people
         .iter()
         .filter(|who| who.user != seat.me)
-        .map(|who| Participant {
-            id: who.user.clone(),
-            name: person_name(seat, &who.user),
-            avatar: None,
-            speaking: false,
-            muted: who.muted,
-            deafened: who.deafened,
-            server_muted: who.server_muted,
-            server_deafened: who.server_deafened,
-            suppressed: who.suppressed,
-            priority: who.priority,
-            camera: who.camera,
-            sharing: who.sharing,
-            ringing: false,
-            ..Participant::default()
+        .map(|who| {
+            let name = seat
+                .names
+                .get(&who.user)
+                .filter(|name| !name.is_empty())
+                .cloned()
+                .or_else(|| {
+                    ctx.hub
+                        .store()
+                        .person(&ctx.key(&who.user))
+                        .ok()
+                        .flatten()
+                        .map(|p| p.name)
+                        .filter(|n| !n.is_empty())
+                })
+                .unwrap_or_else(|| person_name(seat, &who.user));
+            Participant {
+                id: who.user.clone(),
+                name,
+                avatar: None,
+                speaking: seat.speaking.contains(&who.user),
+                muted: who.muted,
+                deafened: who.deafened,
+                server_muted: who.server_muted,
+                server_deafened: who.server_deafened,
+                suppressed: who.suppressed,
+                priority: who.priority,
+                camera: who.camera,
+                sharing: who.sharing,
+                ringing: false,
+                ..Participant::default()
+            }
         });
     ctx.participants(direct_id, roster.collect());
 }
@@ -3649,6 +3696,13 @@ fn durable(ctx: &Context, saved: &super::Saved, seat: &mut Seat, kind: &str, fra
                 if kind == "member.renamed" {
                     super::messages::member_renamed(ctx, saved, user, name);
                 }
+                if !name.is_empty() {
+                    let _ = ctx.people(&[crate::store::PersonRow {
+                        id: user.to_owned(),
+                        name: name.to_owned(),
+                        ..crate::store::PersonRow::default()
+                    }]);
+                }
             }
             if let Some(role) = role.filter(|role| user == seat.me && *role != seat.role && matches!(*role, "owner" | "admin" | "member")) {
                 seat.role = role.to_owned();
@@ -3657,6 +3711,9 @@ fn durable(ctx: &Context, saved: &super::Saved, seat: &mut Seat, kind: &str, fra
             let rooms: Vec<String> = seat.calls.iter().filter(|(_, people)| people.iter().any(|who| who.user == user)).map(|(room, _)| room.clone()).collect();
             for room in rooms {
                 tell(ctx, seat, &room);
+            }
+            if let Some(direct_id) = seat.direct.as_ref().filter(|d| d.people.iter().any(|p| p.user == user)).map(|d| d.direct_id.clone()) {
+                tell_direct(ctx, seat, &direct_id);
             }
         }
         "member.removed" | "member.banned" => {

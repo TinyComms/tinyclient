@@ -113,7 +113,7 @@ impl Call {
     fn apply(&mut self, request: MediaRequest) -> MediaResponse {
         match request {
             MediaRequest::Streams => {}
-            MediaRequest::ShareSend { on, screen, quality, show_cursor, sound, .. } => {
+            MediaRequest::ShareSend { on, screen, quality, show_cursor, sound, resolution, fps, .. } => {
                 // What the share captures, chosen before the probe so the probe tries that one,
                 // and what it spends. Before a call is up the request is only noted: the voice
                 // tests ask then, and a headless run must not open a screen to answer them.
@@ -121,7 +121,7 @@ impl Call {
                 // share also sees whether its sound goes with it. Nothing here opens a loopback.
                 if on {
                     picture::choose_screen(screen);
-                    picture::choose_quality(quality);
+                    picture::choose_share_config(quality, resolution, fps);
                     picture::choose_cursor(show_cursor);
                 }
                 self.controls.set_share_sound(on && sound == Some(true));

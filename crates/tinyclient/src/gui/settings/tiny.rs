@@ -97,7 +97,10 @@ impl SettingsWindow {
                 })),
             )
         };
+        let avatar_key = account.key.clone();
+        let remove_key = account.key.clone();
         let everywhere = Box::new(account.clone());
+        let delete_account = Box::new(account.clone());
         div()
             .flex()
             .flex_col()
@@ -105,11 +108,36 @@ impl SettingsWindow {
             .child(name_row)
             .child(rule())
             .child(row(
+                "Picture",
+                Some("Your avatar shown on this Tiny server.".into()),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(super::controls::touch(button(("tiny-avatar-pick", ix), ButtonKind::Secondary, "Change…")).on_click(cx.listener(move |this, _, _, cx| {
+                        this.pick_tiny_avatar(avatar_key.clone(), cx);
+                    })))
+                    .child(super::controls::touch(button(("tiny-avatar-remove", ix), ButtonKind::Ghost, "Remove")).on_click(cx.listener(move |this, _, _, cx| {
+                        this.send_tiny_avatar(remove_key.clone(), None, cx);
+                    }))),
+            ))
+            .child(rule())
+            .child(row(
                 "Sign out everywhere",
                 Some("Every device signed in as you, this one too.".into()),
                 super::controls::touch(button(("tiny-everywhere", ix), ButtonKind::Ghost, if crate::gui::phone::active() { "Sign out…" } else { "Sign out everywhere…" })).on_click(cx.listener(move |this, _, _, cx| {
                     this.tiny.line = None;
                     this.confirm = Some(Confirm::TinyEverywhere(everywhere.clone()));
+                    cx.notify();
+                })),
+            ))
+            .child(rule())
+            .child(row(
+                "Delete account",
+                Some("Permanently remove your account, sessions, passkeys, and avatar from this server.".into()),
+                super::controls::touch(button(("tiny-delete-account", ix), ButtonKind::Danger, "Delete account…")).on_click(cx.listener(move |this, _, _, cx| {
+                    this.tiny.line = None;
+                    this.confirm = Some(Confirm::TinyDeleteAccount(delete_account.clone()));
                     cx.notify();
                 })),
             ))
@@ -216,6 +244,68 @@ impl SettingsWindow {
         });
     }
 
+    fn pick_tiny_avatar(&mut self, account: AccountKey, cx: &mut Context<Self>) {
+        let asked = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Use as your picture".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = asked.await {
+                if let Some(path) = paths.into_iter().next() {
+                    let _ = this.update(cx, |this, cx| {
+                        this.send_tiny_avatar(account, Some(path.to_string_lossy().into_owned()), cx);
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn send_tiny_avatar(&mut self, account: AccountKey, path: Option<String>, cx: &mut Context<Self>) {
+        if self.tiny.busy {
+            return;
+        }
+        self.tiny.busy = true;
+        self.tiny.line = None;
+        cx.notify();
+        let removed = path.is_none();
+        let request = Request::TinyAvatar { account, path };
+        self.off_thread(cx, move || crate::client::ask(&request), move |this, answer, cx| {
+            this.tiny.busy = false;
+            match answer {
+                Ok(Response::Ok) => {
+                    this.tiny.line = Some((if removed { "Your picture was removed." } else { "Your picture was updated." }.to_owned(), false));
+                    let _ = this.shell.update(cx, |shell, cx| shell.reload_all(cx));
+                }
+                other => this.tiny.line = Some((failure(other), true)),
+            }
+            cx.notify();
+        });
+    }
+
+    fn send_tiny_delete_account(&mut self, account: AccountKey, cx: &mut Context<Self>) {
+        self.confirm = None;
+        self.tiny.busy = true;
+        cx.notify();
+        let request = Request::TinyDeleteAccount { account };
+        self.off_thread(cx, move || crate::client::ask(&request), |this, answer, cx| {
+            this.tiny.busy = false;
+            match answer {
+                Ok(Response::Status { .. }) | Ok(Response::Ok) => {
+                    this.tiny.line = Some(("Your account was deleted.".to_owned(), false));
+                    let _ = this.shell.update(cx, |shell, cx| {
+                        shell.load_status(cx);
+                        shell.reload_all(cx);
+                    });
+                }
+                other => this.tiny.line = Some((failure(other), true)),
+            }
+            cx.notify();
+        });
+    }
+
     pub(super) fn tiny_everywhere_modal(&self, account: &AccountStatus, cx: &mut Context<Self>) -> Div {
         let key = account.key.clone();
         // The account is named by its host.
@@ -224,10 +314,25 @@ impl SettingsWindow {
             "Sign out everywhere?",
             vec![
                 format!("Every device signed in to {host} as you is signed out, this one too."),
-                "Sign in again in your browser.".to_owned(),
+                "You can sign in again when you want back in.".to_owned(),
             ],
             button("tiny-everywhere-confirm", ButtonKind::Danger, "Sign out everywhere")
                 .on_click(cx.listener(move |this, _, _, cx| this.send_tiny_everywhere(key.clone(), cx))),
+            cx,
+        )
+    }
+
+    pub(super) fn tiny_delete_account_modal(&self, account: &AccountStatus, cx: &mut Context<Self>) -> Div {
+        let key = account.key.clone();
+        let host = if account.name.is_empty() { "this Tiny server".to_owned() } else { account.name.clone() };
+        super::modal_panel(
+            format!("Delete your account on {host}?"),
+            vec![
+                "Your sessions, passkeys, recovery codes, picture, and membership on this server are permanently deleted.".to_owned(),
+                "If you are the last owner, transfer ownership first.".to_owned(),
+            ],
+            button("tiny-delete-account-confirm", ButtonKind::Danger, "Delete account")
+                .on_click(cx.listener(move |this, _, _, cx| this.send_tiny_delete_account(key.clone(), cx))),
             cx,
         )
     }

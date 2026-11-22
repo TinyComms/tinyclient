@@ -141,7 +141,29 @@ impl Shell {
                 if !live { Look::Unavailable } else if share_on { Look::On } else { Look::Rest },
                 SIZE,
             )
-            .when(live, |button| button.on_click(cx.listener(move |this, _, _, cx| this.call_ask(Request::Media(MediaRequest::ShareSend { on: !share_on, screen: None, quality: None, show_cursor: None, sound: None, preview: None }), cx))));
+            .when(live, |button| {
+                button.on_click(cx.listener(move |this, _, _, cx| {
+                    let values = crate::gui::app::prefs::values();
+                    let (quality, resolution, fps) = if !share_on {
+                        (Some(values.share_quality()), Some(values.share_resolution()), Some(values.share_fps()))
+                    } else {
+                        (None, None, None)
+                    };
+                    this.call_ask(
+                        Request::Media(MediaRequest::ShareSend {
+                            on: !share_on,
+                            screen: None,
+                            quality,
+                            show_cursor: None,
+                            sound: None,
+                            preview: None,
+                            resolution,
+                            fps,
+                        }),
+                        cx,
+                    );
+                }))
+            });
             vec![self.call_phone_row(vec![camera, flip, share, speaker], false), self.call_phone_row(vec![mute, deafen, more, end], false)]
         } else {
             vec![self.call_phone_row(vec![mute, speaker, deafen, more, end], false)]
