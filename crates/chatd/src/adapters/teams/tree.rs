@@ -3,7 +3,7 @@
 //! state Teams keeps for all of it. Everything comes from one call, and the Activity stream is
 //! read once at connect for the mentions that came while tinyclient was closed.
 
-use super::{chain_id, escaped, id_of, millis, now_ms, seconds, thread_of, Auth, Body, Fault, Teams, AGGREGATOR, SPACES, TREE_FRESH};
+use super::{chain_id, escaped, id_of, millis, now_ms, seconds, thread_of, Audience, Auth, Body, Fault, Teams, TREE_FRESH};
 use crate::adapters::{ActivityPage, BrowsedPage, Command};
 use crate::store::{ConversationRow, Filing, PreviewLine, SpaceRow};
 use protocol::{ActivityItem, ActivityItemKind, BrowsedChannel, CallSupport, ConversationKind, Mark, Relation, Special};
@@ -242,7 +242,7 @@ impl Teams {
     /// for its sidebar. Rows go to the store team by team and nothing is kept.
     fn list(&self, first: bool) -> Result<(), Fault> {
         let url = format!("{}/api/csa/api/v1/teams/users/me?isPrefetch=false&enableMembershipSummary=true", self.api);
-        let mut listed = self.call("GET", &url, Auth::Both(AGGREGATOR), Body::None, true)?.body;
+        let mut listed = self.call("GET", &url, Auth::Both(Audience::Aggregator), Body::None, true)?.body;
         let (teams, chats, shared_channels) = (
             taken(&mut listed, "teams"),
             taken(&mut listed, "chats"),
@@ -482,6 +482,9 @@ impl Teams {
             let mut row = self.chat_row(id, &title_of(chat), &people, partner.map(String::as_str));
             row.position = position as i32;
             row.meeting = is_meeting(chat);
+            if let Some(event) = super::info::meeting_from_chat(self.cloud.endpoints().teams, chat) {
+                super::info::remember(&mut self.state().meetings, event);
+            }
             let pending_req = is_pending_request(chat);
             let chat_external = is_external_chat(chat, &people, &self.session.tenant)
                 || people.iter().any(|p| self.cached(p).is_some_and(|k| k.external) || super::people::is_consumer_mri(p));
@@ -1158,7 +1161,7 @@ impl Teams {
         if space_id.trim().is_empty() {
             let joined_spaces: HashSet<String> = self.state().spaces.iter().map(|s| s.id.clone()).collect();
             let url = format!("{}/beta/teams/public", self.place()?.middle);
-            let answer = self.call("GET", &url, Auth::Both(SPACES), Body::None, true)?.body;
+            let answer = self.call("GET", &url, Auth::Both(Audience::Spaces), Body::None, true)?.body;
             let entries = [
                 answer["teams"].as_array(),
                 answer["value"].as_array(),
@@ -1201,7 +1204,7 @@ impl Teams {
             }
         } else {
             let url = format!("{}/api/csa/api/v1/teams/{}/channels", self.api, escaped(space_id));
-            let answer = self.call("GET", &url, Auth::Both(AGGREGATOR), Body::None, true)?.body;
+            let answer = self.call("GET", &url, Auth::Both(Audience::Aggregator), Body::None, true)?.body;
             let entries = [
                 answer["channels"].as_array(),
                 answer["value"].as_array(),
@@ -1392,7 +1395,7 @@ impl Teams {
             "membershipType": if private { "private" } else { "standard" },
         });
         let answer = self
-            .call("POST", &url, Auth::Both(SPACES), Body::Json(&body), false)
+            .call("POST", &url, Auth::Both(Audience::Spaces), Body::Json(&body), false)
             .map_err(|fault| match fault {
                 Fault::Refused { status: 403, .. } => Fault::Refused {
                     status: 403,
@@ -1449,7 +1452,7 @@ impl Teams {
         let code = parse_teams_join_code(raw).map_err(|message| Fault::Refused { status: 400, message })?;
         let url = format!("{}/beta/teams/joinCode/{}", self.place()?.middle, escaped(&code));
         let body = self
-            .call("GET", &url, Auth::Both(SPACES), Body::None, true)
+            .call("GET", &url, Auth::Both(Audience::Spaces), Body::None, true)
             .map_err(|fault| match fault {
                 Fault::Refused { status: 404, .. } => Fault::Refused {
                     status: 400,
@@ -1498,7 +1501,7 @@ impl Teams {
         let code = parse_teams_join_code(raw).map_err(|message| Fault::Refused { status: 400, message })?;
         let url = format!("{}/beta/teams/joinByCode", self.place()?.middle);
         let body = self
-            .call("POST", &url, Auth::Both(SPACES), Body::Json(&json!({"joinCode": code})), false)
+            .call("POST", &url, Auth::Both(Audience::Spaces), Body::Json(&json!({"joinCode": code})), false)
             .map_err(|fault| match fault {
                 Fault::Refused { status: 404, .. } => Fault::Refused {
                     status: 400,

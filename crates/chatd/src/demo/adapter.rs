@@ -381,6 +381,7 @@ impl Demo {
             link: if self.ctx.account.network == Network::Telegram && !row.kind.is_direct() { format!("https://t.me/{}", row.title.to_lowercase().replace(' ', "_")) } else { String::new() },
             disappearing: row.disappearing,
             bookmarks: Vec::new(),
+            ..ConversationAbout::default()
         })
     }
 
@@ -1061,6 +1062,9 @@ impl Demo {
             Command::EndSession { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::UnreadItems { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MarkUnreadItemsRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Translate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Meetings { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MeetingRsvp { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Backfill(_)
             | Command::Warm(_)
             | Command::History { .. }

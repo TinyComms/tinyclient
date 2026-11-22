@@ -4,12 +4,12 @@ use super::chat::Look;
 use super::home::{self, Act, Drill, Item};
 use super::{joins_from_list, on_screen, respliced, Mode};
 use crate::client::ask;
-use crate::gui::components::{badge_dot, empty_state, glyph, icon_button, list_row, rollup_badge, section_header, Avatar, Shape};
+use crate::gui::components::{badge_dot, button, empty_state, glyph, icon_button, list_row, rollup_badge, section_header, Avatar, ButtonKind, Shape};
 use crate::gui::state::{Shell, Snapshot};
 use crate::gui::theme::{self, Type};
 use crate::view::now;
 use gpui::{div, list, prelude::*, px, AnyElement, Context, Div, MouseButton, Stateful, Window};
-use protocol::{Conversation, ConversationKind, Folder, Key, Network, Request, Response, Shelf, PAGE_LIMIT};
+use protocol::{Conversation, ConversationKind, Folder, Key, MeetingEvent, Network, Request, Response, Shelf, PAGE_LIMIT};
 use std::rc::Rc;
 
 /// The most rows a home holds; chatd's order puts the ones that matter first.
@@ -29,6 +29,9 @@ struct Read {
     calls: Vec<protocol::CallLogEntry>,
     calls_next: Option<String>,
     calls_more: bool,
+    meetings: Vec<MeetingEvent>,
+    meetings_account: String,
+    meetings_ok: bool,
 }
 
 fn conversations(request: &Request) -> std::io::Result<(Vec<Conversation>, u32)> {
@@ -75,6 +78,11 @@ impl Shell {
             .snapshot
             .as_ref()
             .and_then(|s| s.accounts.iter().find(|a| a.key.network == Network::Telegram && a.link == protocol::Link::Connected))
+            .map(|a| a.key.clone());
+        let teams_account = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.accounts.iter().find(|a| a.key.network == Network::Teams && a.link == protocol::Link::Connected))
             .map(|a| a.key.clone());
         let calls_missed = self.sidebar_state.home.calls_missed;
         let folder = self.sidebar_state.home.folder.clone();
@@ -124,6 +132,13 @@ impl Shell {
                     read.chats = whole(network, None, Shelf::Main)?.0;
                     let requests = Request::Home { network, account: None, folder: None, shelf: Shelf::Requests, offset: 0, limit: 1 };
                     read.requests = conversations(&requests)?.1;
+                    if let Some(account) = teams_account.clone() {
+                        read.meetings_account = account.account.clone();
+                        if let Ok(Response::Meetings { events }) = ask(&Request::Meetings { account }) {
+                            read.meetings = events;
+                            read.meetings_ok = true;
+                        }
+                    }
                 }
                 Network::Signal | Network::Messages => read.chats = whole(network, None, Shelf::Main)?.0,
                 Network::Slack | Network::Tiny => {}
@@ -150,6 +165,10 @@ impl Shell {
                 home.calls = read.calls;
                 home.calls_next = read.calls_next;
                 home.calls_more = read.calls_more;
+            }
+            if read.meetings_ok {
+                home.upcoming = read.meetings;
+                home.upcoming_account = read.meetings_account;
             }
             home.loaded = true;
             home.loaded_once = true;
@@ -287,7 +306,7 @@ impl Shell {
         }
     }
 
-    pub(super) fn activate_home(&mut self, ix: usize, cx: &mut Context<Self>) {
+    pub(super) fn activate_home(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(item) = self.sidebar_state.home_items.get(ix).cloned() else {
             return;
         };
@@ -304,6 +323,20 @@ impl Shell {
                 } else {
                     pane.update(cx, |pane, _| pane.land_next(msg_id));
                     self.select(key, &title, cx);
+                }
+                return;
+            }
+            Item::Meeting(event) => {
+                let account = home.upcoming_account.clone();
+                let conversation = event.conversation.clone();
+                let join = event.join_url.clone();
+                let title = event.title.clone();
+                if !account.is_empty() && !conversation.is_empty() {
+                    return self.select(Key { network: Network::Teams, account, id: conversation }, &title, cx);
+                }
+                if join.starts_with("https://") {
+                    let pane = self.pane(cx);
+                    pane.update(cx, |pane, cx| pane.open_external_link(&join, window, cx));
                 }
                 return;
             }
@@ -403,7 +436,9 @@ impl Shell {
         };
         let focused = self.sidebar_state.listed() && self.sidebar_state.cursor == Some(ix) && (self.sidebar_state.focus.is_focused(window) || self.focus.is_focused(window));
         let network = self.sidebar_state.home.network;
-        let click = |row: Stateful<Div>, cx: &mut Context<Self>| self.tap(row, crate::gui::phone::token(&["home-item", &ix.to_string()]), None, move |this, cx| this.activate_home(ix, cx), cx);
+        let click = |row: Stateful<Div>, cx: &mut Context<Self>| {
+            self.tap(row, crate::gui::phone::token(&["home-item", &ix.to_string()]), None, move |this, window, cx| this.activate_home(ix, window, cx), cx)
+        };
         match item {
             Item::Header { label, first } => section_header(label, first).into_any_element(),
             Item::Chat(c) => {
@@ -488,6 +523,33 @@ impl Shell {
                     .children(call_btn)
                     .child(del_btn);
                 click(list_row(("home-call", ix), theme::row_height(48.), false, focused, content), cx).into_any_element()
+            }
+            Item::Meeting(event) => {
+                let line = crate::gui::time::meeting_display(&event, now());
+                let title = event.title.clone();
+                let join = event.join_url.clone();
+                let join_btn = join.starts_with("https://").then(|| {
+                    button(("home-meet-join", ix), ButtonKind::Secondary, "Join")
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let pane = this.pane(cx);
+                            pane.update(cx, |pane, cx| pane.open_external_link(&join, window, cx));
+                        }))
+                });
+                let content = div()
+                    .gap(px(8.))
+                    .child(glyph("icons/calendar.svg", 16., theme::text_soft()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(div().type_ui().text_color(theme::text()).truncate().child(title))
+                            .child(div().type_small().text_color(theme::text_faint()).truncate().child(line)),
+                    )
+                    .children(join_btn);
+                click(list_row(("home-meet", ix), theme::row_height(48.), false, focused, content), cx).into_any_element()
             }
             Item::Action { act: Act::Meetings, icon, words, after, .. } => {
                 // The subjects use the row that remains after the label. The chevron says the fold is open.
@@ -677,7 +739,7 @@ impl Shell {
                 if crate::gui::phone::active() {
                     let token = crate::gui::phone::token(&["row", picked.key.network.label(), &picked.key.account, &picked.key.id]);
                     let menu = Some(picked.clone());
-                    return self.tap(row, token, menu, move |this, cx| this.pick_row(&picked, cx), cx);
+                    return self.tap(row, token, menu, move |this, _, cx| this.pick_row(&picked, cx), cx);
                 }
                 row.on_mouse_down(
                     MouseButton::Left,

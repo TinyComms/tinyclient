@@ -124,7 +124,7 @@ impl Shell {
             Item::App(app) => self.app_row(ix, &app, look.mark, focused, cx).into_any_element(),
             Item::AppsMore(more) => self
                 .action_row(("apps-more", ix), Some("icons/chevron-down.svg"), format!("Show {more} more").into(), false, None, focused)
-                .map(|row| self.tap(row, crate::gui::phone::token(&["inbox-item", &ix.to_string()]), None, move |this, cx| this.activate_inbox(ix, cx), cx))
+                .map(|row| self.tap(row, crate::gui::phone::token(&["inbox-item", &ix.to_string()]), None, move |this, _, cx| this.activate_inbox(ix, cx), cx))
                 .into_any_element(),
             Item::End => self.end_line(cx).into_any_element(),
         }
@@ -178,7 +178,7 @@ impl Shell {
                     ),
             );
         list_row(("apps", ix), theme::row_height(theme::ROW_TWO), false, focused, content)
-            .map(|row| self.tap(row, crate::gui::phone::token(&["inbox-item", &ix.to_string()]), None, move |this, cx| this.activate_inbox(ix, cx), cx))
+            .map(|row| self.tap(row, crate::gui::phone::token(&["inbox-item", &ix.to_string()]), None, move |this, _, cx| this.activate_inbox(ix, cx), cx))
     }
 
     /// An app under the open Apps row, 28: its square, name, last line, time and dot.
@@ -198,7 +198,7 @@ impl Shell {
             .children(super::super::components::row_badge(app));
         let picked = app.clone();
         list_row(("app", ix), theme::row_height(theme::ROW_ONE), selected, focused, content)
-            .map(|row| self.tap(row, crate::gui::phone::token(&["row", picked.key.network.label(), &picked.key.account, &picked.key.id]), Some(picked.clone()), move |this, cx| this.pick_row(&picked, cx), cx))
+            .map(|row| self.tap(row, crate::gui::phone::token(&["row", picked.key.network.label(), &picked.key.account, &picked.key.id]), Some(picked.clone()), move |this, _, cx| this.pick_row(&picked, cx), cx))
     }
 
     /// "Older conversations are in Discord · Slack": each opens that network's home.

@@ -13,7 +13,7 @@
 use base64::Engine;
 use protocol::{
     read_frame, write_frame, Badge, CallSupport, Change, Conversation, ConversationKind, Group,
-    Key, Link, MediaKind, MentionKind, Message, MessageKind, Network, Page, Presence, Relation,
+    Key, Link, MediaKind, MeetingResponse, MentionKind, Message, MessageKind, Network, Page, Presence, Relation,
     Request, Response, SendState, Style, Watching,
 };
 use serde_json::{json, Value};
@@ -460,6 +460,30 @@ impl Fake {
             },
             _ if path.starts_with("/graph/") && bearer("graph") => self.graph(call, &path["/graph".len()..]),
             _ if path.starts_with("/upload/") => self.upload(call),
+            _ if path == "/ams/v1/objects" && call.method == "POST" && call.json()["type"] == "pish/audio" => {
+                if header("authorization") != format!("skype_token {skype}") {
+                    return unauthorized();
+                }
+                answer("201 Created", json!({"id": "0-weu-d1-sentvoice"}))
+            }
+            _ if path.starts_with("/ams/v1/objects/") && path.ends_with("/content/audio") && call.method == "PUT" => {
+                if header("authorization") != format!("skype_token {skype}") {
+                    return unauthorized();
+                }
+                answer("201 Created", json!({}))
+            }
+            _ if path.starts_with("/ams/v1/objects/") && path.ends_with("/views/audio") => Reply {
+                status: "200 OK",
+                headers: Vec::new(),
+                kind: "audio/ogg",
+                body: b"OggSfake-voice-bytes".to_vec(),
+            },
+            _ if path.starts_with("/ams/v1/objects/") && path.ends_with("/views/video") => Reply {
+                status: "200 OK",
+                headers: Vec::new(),
+                kind: "video/mp4",
+                body: b"\x00\x00\x00\x18ftypmp42video".to_vec(),
+            },
             _ if path.starts_with("/ams/v1/objects") && (call.method == "POST" || call.method == "PUT") => {
                 if header("authorization") != format!("skype_token {skype}") {
                     return unauthorized();
@@ -490,11 +514,23 @@ impl Fake {
         let presented = asked.get("refresh_token").cloned().unwrap_or_default();
         let scope = asked.get("scope").cloned().unwrap_or_default();
         let audience = match scope.as_str() {
-            scope if scope.starts_with("https://api.spaces.skype.com/.default ") => "spaces",
-            scope if scope.starts_with("https://chatsvcagg.teams.microsoft.com/.default ") => "csa",
-            scope if scope.starts_with("https://presence.teams.microsoft.com/.default ") => "presence",
+            scope if scope.starts_with("https://api.spaces.skype.com/.default ")
+                || scope.starts_with("https://gov.teams.microsoft.us/.default ")
+                || scope.starts_with("https://dod.teams.microsoft.us/.default ")
+                || scope.starts_with("https://teams.microsoftonline.cn/.default ") => "spaces",
+            scope if scope.starts_with("https://chatsvcagg.teams.microsoft.com/.default ")
+                || scope.starts_with("https://chatsvcagg.gov.teams.microsoft.us/.default ")
+                || scope.starts_with("https://chatsvcagg.dod.teams.microsoft.us/.default ")
+                || scope.starts_with("https://chatsvcagg.teams.microsoftonline.cn/.default ") => "csa",
+            scope if scope.starts_with("https://presence.teams.microsoft.com/.default ")
+                || scope.starts_with("https://presence.gov.teams.microsoft.us/.default ")
+                || scope.starts_with("https://presence.dod.teams.microsoft.us/.default ")
+                || scope.starts_with("https://presence.teams.microsoftonline.cn/.default ") => "presence",
+            scope if scope.starts_with("https://graph.microsoft.com/.default ")
+                || scope.starts_with("https://graph.microsoft.us/.default ")
+                || scope.starts_with("https://dod-graph.microsoft.us/.default ")
+                || scope.starts_with("https://microsoftgraph.chinacloudapi.cn/.default ") => "graph",
             scope if scope.starts_with("https://substrate.office.com/.default ") => "substrate",
-            scope if scope.starts_with("https://graph.microsoft.com/.default ") => "graph",
             _ => return answer("400 Bad Request", json!({"error": "invalid_scope", "error_description": "AADSTS70011: The provided value for the input parameter 'scope' is not valid."})),
         };
         let shaped = asked.get("grant_type").map(String::as_str) == Some("refresh_token")
@@ -691,6 +727,11 @@ impl Fake {
                         "members": [{"id": ME, "role": "Admin"}, {"id": ANA, "role": "Admin"}, {"id": BEN, "role": "Admin"}]
                     })),
                     "19:grp1@thread.v2" => Some(json!({"id": thread, "properties": {"threadType": "chat"}, "members": [{}, {}, {}]})),
+                    "19:meeting_NzQ2YjE@thread.v2" => Some(json!({
+                        "id": thread,
+                        "properties": {"threadType": "meeting", "meetingInformation": {"subject": "Weekly sync"}},
+                        "members": [{}, {}]
+                    })),
                     "19:platform0hidden@thread.tacv2" => Some(json!({
                         "id": thread,
                         "properties": {"threadType": "topic", "topic": "Hidden one"},
@@ -862,6 +903,9 @@ impl Fake {
         let (thread, root) = conversation.split_once(";messageid=").map_or((conversation, None), |(thread, root)| (thread, Some(root.to_owned())));
         let root = root.or_else(|| thread.contains("@thread.tacv2").then(|| arrived.to_string()));
         let mut echo = message(thread, root.as_deref(), arrived, ME, sent["imdisplayname"].as_str().unwrap_or(""), sent["content"].as_str().unwrap_or(""));
+        if let Some(mt) = sent["messagetype"].as_str().filter(|s| !s.is_empty()) {
+            echo["messagetype"] = json!(mt);
+        }
         echo["clientmessageid"] = sent["clientmessageid"].clone();
         if sent["properties"].is_object() {
             echo["properties"] = sent["properties"].clone();
@@ -927,6 +971,12 @@ impl Fake {
                 *self.mailbox_ooo.lock().unwrap() = body["automaticRepliesSetting"].clone();
             }
             return ok(json!({"automaticRepliesSetting": self.mailbox_ooo.lock().unwrap().clone()}));
+        }
+        if call.method == "GET" && path.contains("/v1.0/me/calendarView") {
+            return ok(calendar_view(&call.query));
+        }
+        if call.method == "POST" && path.contains("/v1.0/me/events/") {
+            return ok(json!({}));
         }
         if call.method == "POST" && path.starts_with("/v1.0/me/drive/root:/Microsoft Teams Chat Files/") && path.ends_with(":/createUploadSession") {
             return ok(json!({"uploadUrl": format!("{}/upload/session-1?sig=x", self.base), "expirationDateTime": "2026-10-15T00:00:00Z"}));
@@ -1198,6 +1248,94 @@ impl Fake {
                 }
             }
         }
+        if call.path.ends_with("/beta/giphy/trending") || call.path.ends_with("/beta/giphy/search") {
+            let query = call
+                .query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("q="))
+                .map(unescape)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let all = vec![
+                json!({
+                    "id": "gif-cat",
+                    "title": "Happy Cat",
+                    "images": {
+                        "original": {"url": "https://media4.giphy.com/media/cat123/giphy.gif", "width": "320", "height": "200"},
+                        "fixed_height_small": {"url": format!("{}/ams/v1/objects/gif-cat/views/imgo", self.base), "width": "160", "height": "100"}
+                    }
+                }),
+                json!({
+                    "id": "gif-ship",
+                    "title": "Ship It Rocket",
+                    "images": {
+                        "original": {"url": "https://media2.giphy.com/media/ship456/giphy.gif", "width": "400", "height": "225"},
+                        "fixed_height_small": {"url": format!("{}/ams/v1/objects/gif-ship/views/imgo", self.base), "width": "178", "height": "100"}
+                    }
+                }),
+            ];
+            let data: Vec<Value> = if query.is_empty() {
+                all
+            } else {
+                all.into_iter()
+                    .filter(|item| item["title"].as_str().unwrap_or("").to_ascii_lowercase().contains(&query))
+                    .collect()
+            };
+            let count = data.len();
+            return ok(json!({
+                "data": data,
+                "pagination": {"offset": 0, "count": count, "total_count": count + 10}
+            }));
+        }
+        if call.path.ends_with("/beta/stickers") {
+            return ok(json!({
+                "packs": [
+                    {
+                        "name": "Office drama",
+                        "stickers": [
+                            {
+                                "id": "stk-coffee",
+                                "name": "Need Coffee",
+                                "imageUrl": format!("{}/ams/v1/objects/stk-coffee/views/imgo", self.base),
+                                "width": 180,
+                                "height": 180
+                            }
+                        ]
+                    },
+                    {
+                        "name": "Memes",
+                        "stickers": [
+                            {
+                                "id": "stk-ship",
+                                "name": "LGTM Ship It",
+                                "imageUrl": format!("{}/ams/v1/objects/stk-ship/views/imgo", self.base),
+                                "width": 200,
+                                "height": 200
+                            }
+                        ]
+                    }
+                ]
+            }));
+        }
+        if call.path.ends_with("/tabs") && (call.path.contains("/beta/channels/") || call.path.contains("/beta/chats/")) {
+            if call.path.contains(GENERAL) {
+                return ok(self.fixture("tabs").unwrap());
+            }
+            return ok(json!({"value": []}));
+        }
+        if call.path.ends_with("/v1/messages/translate") {
+            let asked = call.json();
+            let to = asked["targetLanguage"].as_str().unwrap_or("en");
+            let text = asked["text"].as_str().unwrap_or("");
+            let translated = match to {
+                "fr" => format!("Bonjour l'équipe ({text})"),
+                _ => "Good morning team!".to_owned(),
+            };
+            return ok(json!({
+                "translatedText": translated,
+                "detectedLanguage": "es"
+            }));
+        }
         if call.path.ends_with("/v1/urlpreview") {
             let asked = call.json();
             let url = asked["url"].as_str().unwrap_or("");
@@ -1396,13 +1534,17 @@ fn chain() -> Key {
 
 impl World {
     fn start() -> World {
+        World::start_with_cloud(None)
+    }
+
+    fn start_with_cloud(cloud: Option<&str>) -> World {
         static NEXT: AtomicU32 = AtomicU32::new(0);
         let fake = Fake::start();
         // Short path: a unix socket address holds about 100 bytes. On Windows "/tmp" has no drive; chatd takes only absolute paths.
         let dir = std::path::absolute(format!("/tmp/tinyclient-teams-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed))).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         // What the sign-in helper prints for someone who is also a guest in a second tenant.
-        let session = json!({
+        let mut session = json!({
             "client_id": "1fec8e78-bce4-4aaf-ab1b-5451cc387264", "user_agent": agent(),
             "oid": "00000000-0000-4000-8000-0000000000aa", "name": "Me Myself", "upn": "me@contoso.com",
             "tenants": [
@@ -1410,6 +1552,9 @@ impl World {
                 {"id": GUEST, "name": "Fabrikam", "refresh_token": "rt-guest"},
             ],
         });
+        if let Some(cloud) = cloud {
+            session["cloud"] = json!(cloud);
+        }
         let log = if std::env::var_os("TINYCLIENT_TEST_LOG").is_some() { Stdio::inherit() } else { Stdio::null() };
         let child = Command::new(env!("CARGO_BIN_EXE_chatd"))
             .env("TINYCLIENT_DIR", &dir)
@@ -5144,3 +5289,589 @@ fn channels_can_be_shown_hidden_and_pinned_with_filing_updates() {
     );
     assert!(!world.conversation(&hidden).unwrap().opted_out, "shown channel should have opted_out=false");
 }
+
+#[test]
+fn gcc_high_session_mints_sovereign_audiences_and_uses_sovereign_origin() {
+    let world = World::start_with_cloud(Some("gcc_high"));
+    world.ready();
+
+    let calls = world.fake.calls.lock().unwrap().clone();
+    let token_calls: Vec<&Call> = calls.iter().filter(|c| c.path.ends_with("/oauth2/v2.0/token")).collect();
+    assert!(!token_calls.is_empty());
+    let scopes: Vec<String> = token_calls
+        .iter()
+        .filter_map(|c| form(&c.body).remove("scope"))
+        .collect();
+    assert!(scopes.iter().any(|s| s.starts_with("https://gov.teams.microsoft.us/.default")));
+    assert!(scopes.iter().any(|s| s.starts_with("https://chatsvcagg.gov.teams.microsoft.us/.default")));
+    assert!(
+        !scopes.iter().any(|s| s.contains(".com") || s.contains("skype") || s.contains("teams.microsoft.cn")),
+        "GCC High session must never mint worldwide or Skype audiences: {scopes:?}"
+    );
+
+    let list_call = world.fake.calls("GET", "/api/csa/api/v1/teams/users/me").pop().unwrap();
+    assert_eq!(list_call.headers.get("origin").map(String::as_str), Some("https://gov.teams.microsoft.us"));
+    assert_eq!(list_call.headers.get("referer").map(String::as_str), Some("https://gov.teams.microsoft.us/"));
+
+    let Response::ConversationInfo { info } = world.ask(Request::ConversationInfo { conversation: key(GENERAL) }) else {
+        panic!("no info");
+    };
+    assert!(info.link.starts_with("https://gov.teams.microsoft.us/l/channel/"), "{}", info.link);
+}
+
+#[test]
+fn voice_messages_and_video_clips_can_be_played_and_recorded() {
+    let world = World::start();
+    world.ready();
+    let ana = key(CHAT_ANA);
+    world.open(&ana, 3);
+
+    // 1. Teams advertises voice notes while keeping general OneDrive uploads disabled.
+    let status = world.account(HOME);
+    assert!(status.can.voice_notes, "Teams must advertise voice_notes");
+    assert_eq!(status.can.max_file_bytes, 0, "general file uploads remain disabled");
+
+    // 2. Receive voice message, video clip, and unhosted fallback fixtures.
+    let fixtures = world.fake.fixture("clips").expect("clips fixture");
+    for kind in ["voice", "video", "unhosted_voice"] {
+        world.fake.push("NewMessage", fixtures[kind].clone(), false);
+    }
+    world.until("all three clip fixtures", || {
+        let msgs = world.messages(&ana);
+        ["1760000840001", "1760000840002", "1760000840003"]
+            .iter()
+            .all(|id| msgs.iter().any(|m| m.id == *id))
+            .then_some(())
+    });
+
+    let voice = world.message(&ana, "1760000840001").unwrap();
+    assert_eq!(voice.attachments.len(), 1);
+    assert_eq!(voice.attachments[0].file.kind, MediaKind::Audio);
+    assert_eq!(voice.attachments[0].duration, 12);
+    assert_eq!(voice.attachments[0].waveform, vec![5, 18, 29, 12]);
+    let voice_id = voice.attachments[0].file.id.clone();
+    let fetched_voice = world.until("voice message audio to be fetched", || {
+        match world.ask(Request::Fetch { retry: false, size: None, account: ana.account(), ids: vec![voice_id.clone()] }) {
+            Response::Media { files } => files.into_iter().find(|f| f.id == voice_id && f.path.is_some()),
+            _ => None,
+        }
+    });
+    assert_eq!(std::fs::read(fetched_voice.path.as_deref().unwrap()).unwrap(), b"OggSfake-voice-bytes");
+
+    let video = world.message(&ana, "1760000840002").unwrap();
+    assert_eq!(video.attachments.len(), 1);
+    assert_eq!(video.attachments[0].file.kind, MediaKind::Video);
+    assert_eq!(video.attachments[0].duration, 25);
+    assert_eq!(video.attachments[0].file.width, 640);
+    assert_eq!(video.attachments[0].file.height, 360);
+    let thumb = video.attachments[0].thumb.as_ref().expect("video clip thumbnail");
+    assert_eq!(thumb.kind, MediaKind::Image);
+    let video_id = video.attachments[0].file.id.clone();
+    let fetched_video = world.until("video clip to be fetched", || {
+        match world.ask(Request::Fetch { retry: false, size: None, account: ana.account(), ids: vec![video_id.clone()] }) {
+            Response::Media { files } => files.into_iter().find(|f| f.id == video_id && f.path.is_some()),
+            _ => None,
+        }
+    });
+    assert_eq!(std::fs::read(fetched_video.path.as_deref().unwrap()).unwrap(), b"\x00\x00\x00\x18ftypmp42video");
+
+    let unhosted = world.message(&ana, "1760000840003").unwrap();
+    assert!(unhosted.attachments.is_empty());
+    assert_eq!(unhosted.text, "Voice message", "unhosted clip must not say Card");
+
+    // 3. Send a recorded voice note: accepted even though max_file_bytes == 0.
+    let clip_path = std::env::temp_dir().join(format!("tiny-teams-voice-{}.opus", std::process::id()));
+    std::fs::write(&clip_path, b"OggSrecorded-voice-note").unwrap();
+    let send_voice = Request::Send {
+        conversation: ana.clone(),
+        client_id: "1760000999000672".to_owned(),
+        text: String::new(),
+        reply_to: None,
+        with: protocol::Outgoing {
+            files: vec![protocol::OutgoingFile {
+                path: clip_path.to_string_lossy().into_owned(),
+                name: "voice-note.opus".to_owned(),
+                spoiler: false,
+                as_file: false,
+                original: false,
+                view_once: false,
+                media: None,
+            }],
+            voice: Some(protocol::VoiceNote { duration: 4_600, waveform: vec![10, 20, 30] }),
+            ..protocol::Outgoing::default()
+        },
+    };
+    assert!(matches!(world.ask(send_voice), Response::Sent { .. }));
+    let sent_voice = world.until("sent voice note", || {
+        world
+            .messages(&ana)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("1760000999000672") && m.state == SendState::Sent)
+    });
+    assert_eq!(sent_voice.attachments.len(), 1);
+    assert_eq!(sent_voice.attachments[0].file.kind, MediaKind::Audio);
+    assert_eq!(sent_voice.attachments[0].duration, 5);
+    assert!(!world.fake.calls("POST", "/ams/v1/objects").is_empty());
+    assert!(!world.fake.calls("PUT", "/ams/v1/objects/0-weu-d1-sentvoice/content/audio").is_empty());
+    let posted = world
+        .fake
+        .calls("POST", &format!("/chat/v1/users/ME/conversations/{CHAT_ANA}/messages"))
+        .into_iter()
+        .find(|c| c.json()["clientmessageid"] == "1760000999000672")
+        .expect("voice message POST");
+    assert_eq!(posted.json()["messagetype"].as_str(), Some("RichText/Media_AudioMsg"));
+    assert!(posted.json()["content"].as_str().unwrap_or("").contains("type=\"Audio.1\""));
+    assert_eq!(posted.json()["properties"]["amsreferences"][0].as_str(), Some("0-weu-d1-sentvoice"));
+
+    // A voice send of a document is refused before AMS, and is not posted as an audio clip.
+    let ams_posts = world.fake.calls("POST", "/ams/v1/objects").len();
+    for (client_id, name) in [("1760000999000674", "notes.txt"), ("1760000999000675", "brief.pdf")] {
+        let refused = world.ask(Request::Send {
+            conversation: ana.clone(),
+            client_id: client_id.to_owned(),
+            text: String::new(),
+            reply_to: None,
+            with: protocol::Outgoing {
+                files: vec![protocol::OutgoingFile {
+                    path: clip_path.to_string_lossy().into_owned(),
+                    name: name.to_owned(),
+                    spoiler: false,
+                    as_file: false,
+                    original: false,
+                    view_once: false,
+                    media: None,
+                }],
+                voice: Some(protocol::VoiceNote { duration: 4_600, waveform: vec![10, 20, 30] }),
+                ..protocol::Outgoing::default()
+            },
+        });
+        assert!(
+            matches!(&refused, Response::Error { detail, .. } if detail == &format!("{name} is not an audio or video clip.")),
+            "{name}: {refused:?}"
+        );
+        let posted = world
+            .fake
+            .calls("POST", &format!("/chat/v1/users/ME/conversations/{CHAT_ANA}/messages"))
+            .into_iter()
+            .any(|call| call.json()["clientmessageid"] == client_id);
+        assert!(!posted, "{name} was posted");
+    }
+    assert_eq!(world.fake.calls("POST", "/ams/v1/objects").len(), ams_posts);
+
+    // 4. Ordinary file sends remain refused when general uploads are disabled.
+    let plain_file = Request::Send {
+        conversation: ana.clone(),
+        client_id: "1760000999000673".to_owned(),
+        text: String::new(),
+        reply_to: None,
+        with: protocol::Outgoing {
+            files: vec![protocol::OutgoingFile {
+                path: clip_path.to_string_lossy().into_owned(),
+                name: "notes.txt".to_owned(),
+                spoiler: false,
+                as_file: false,
+                original: false,
+                view_once: false,
+                media: None,
+            }],
+            ..protocol::Outgoing::default()
+        },
+    };
+    assert!(matches!(world.ask(plain_file), Response::Error { .. }));
+    let _ = std::fs::remove_file(&clip_path);
+}
+
+#[test]
+fn gif_search_and_stickers_work_in_catalog_and_send() {
+    let world = World::start();
+    world.ready();
+    let ana = key(CHAT_ANA);
+    world.open(&ana, 3);
+
+    // 1. Commercial Teams advertises both GIFs and stickers.
+    let status = world.account(HOME);
+    assert!(status.can.gifs, "Teams should advertise GIF picker");
+    assert!(status.can.stickers, "Teams should advertise Stickers picker");
+
+    // 2. Trending GIFs and searched GIFs come from Teams' middle-tier Giphy proxy.
+    let Response::Catalog { items: trending, cursor } = world.ask(Request::Catalog {
+        account: ana.account(),
+        kind: protocol::CatalogKind::Gifs,
+        space: None,
+        query: String::new(),
+        cursor: None,
+    }) else {
+        panic!("expected Response::Catalog for trending GIFs");
+    };
+    assert_eq!(trending.len(), 2);
+    assert_eq!(trending[0].pack, "Trending");
+    assert!(cursor.is_some());
+
+    let Response::Catalog { items: searched, .. } = world.ask(Request::Catalog {
+        account: ana.account(),
+        kind: protocol::CatalogKind::Gifs,
+        space: None,
+        query: "rocket".to_owned(),
+        cursor: None,
+    }) else {
+        panic!("expected Response::Catalog for GIF search");
+    };
+    assert_eq!(searched.len(), 1);
+    assert_eq!(searched[0].name, "Ship It Rocket");
+    let chosen_gif = searched[0].id.clone();
+
+    // 3. Picking a GIF posts Teams' Giphy HTML img and produces a GIF attachment.
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: ana.clone(),
+            client_id: "1760000999000623".to_owned(),
+            text: String::new(),
+            reply_to: None,
+            with: protocol::Outgoing {
+                pick: Some(protocol::Pick { kind: protocol::CatalogKind::Gifs, id: chosen_gif.clone() }),
+                ..protocol::Outgoing::default()
+            },
+        }),
+        Response::Sent { .. }
+    ));
+    let sent_gif = world.until("sent GIF message", || {
+        world
+            .messages(&ana)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("1760000999000623") && m.state == SendState::Sent)
+    });
+    assert_eq!(sent_gif.attachments.len(), 1);
+    assert_eq!(sent_gif.attachments[0].file.kind, MediaKind::Gif);
+    let gif_post = world
+        .fake
+        .calls("POST", &format!("/chat/v1/users/ME/conversations/{CHAT_ANA}/messages"))
+        .into_iter()
+        .find(|c| c.json()["clientmessageid"] == "1760000999000623")
+        .expect("GIF POST");
+    let gif_html = gif_post.json()["content"].as_str().unwrap_or("").to_owned();
+    assert!(gif_html.contains("http://schema.skype.com/Giphy"), "{gif_html}");
+    assert!(gif_html.contains(&chosen_gif), "{gif_html}");
+
+    // 4. Sticker & meme packs are listed, filtered by query, and sent as Sticker markup.
+    let Response::Catalog { items: stickers, .. } = world.ask(Request::Catalog {
+        account: ana.account(),
+        kind: protocol::CatalogKind::Stickers,
+        space: None,
+        query: "meme".to_owned(),
+        cursor: None,
+    }) else {
+        panic!("expected Response::Catalog for stickers");
+    };
+    assert_eq!(stickers.len(), 1);
+    assert_eq!(stickers[0].pack, "Memes");
+    assert_eq!(stickers[0].name, "LGTM Ship It");
+    let chosen_sticker = stickers[0].id.clone();
+
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: ana.clone(),
+            client_id: "1760000999000624".to_owned(),
+            text: String::new(),
+            reply_to: None,
+            with: protocol::Outgoing {
+                pick: Some(protocol::Pick { kind: protocol::CatalogKind::Stickers, id: chosen_sticker.clone() }),
+                ..protocol::Outgoing::default()
+            },
+        }),
+        Response::Sent { .. }
+    ));
+    let sent_sticker = world.until("sent sticker message", || {
+        world
+            .messages(&ana)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("1760000999000624") && m.state == SendState::Sent)
+    });
+    assert_eq!(sent_sticker.attachments.len(), 1);
+    assert!(sent_sticker.attachments[0].sticker);
+    let sticker_post = world
+        .fake
+        .calls("POST", &format!("/chat/v1/users/ME/conversations/{CHAT_ANA}/messages"))
+        .into_iter()
+        .find(|c| c.json()["clientmessageid"] == "1760000999000624")
+        .expect("Sticker POST");
+    assert!(sticker_post.json()["content"].as_str().unwrap_or("").contains("http://schema.skype.com/Sticker"));
+
+    // 5. GCC High cloud does not enable external Giphy while keeping Teams-hosted stickers.
+    let gov = World::start_with_cloud(Some("gcc_high"));
+    gov.ready();
+    let gov_status = gov.account(HOME);
+    assert!(!gov_status.can.gifs, "GCC High must not advertise worldwide Giphy");
+    assert!(gov_status.can.stickers, "GCC High keeps Teams-hosted stickers");
+}
+
+#[test]
+fn translate_message_returns_ephemeral_translation_without_mutating_store() {
+    let world = World::start();
+    world.ready();
+    let ana = key(CHAT_ANA);
+    world.open(&ana, 3);
+
+    // 1. Teams advertises message translation.
+    assert!(world.account(HOME).can.translate);
+
+    // 2. Receive a Spanish message.
+    let inbound = message(CHAT_ANA, None, 1_760_000_850_001, ANA, "Ana Ruiz", "<p>¡Buenos días equipo!</p>");
+    world.fake.push("NewMessage", inbound, false);
+    let orig = world.until("Spanish message arrives", || world.message(&ana, "1760000850001"));
+    assert_eq!(orig.text, "¡Buenos días equipo!");
+
+    // 3. Translate into English on demand.
+    let Response::Translated { text, detected_language } = world.ask(Request::Translate {
+        conversation: ana.clone(),
+        message_id: "1760000850001".to_owned(),
+        to: "en".to_owned(),
+    }) else {
+        panic!("expected Response::Translated");
+    };
+    assert_eq!(text, "Good morning team!");
+    assert_eq!(detected_language, "es");
+
+    // 4. Stored message in SQLite is completely unchanged (ephemeral translation).
+    let after = world.message(&ana, "1760000850001").unwrap();
+    assert_eq!(after.text, "¡Buenos días equipo!");
+
+    // 5. Configuring `translate_lang` in settings drives empty `to` requests, and invalid tags are refused.
+    assert!(matches!(
+        world.ask(Request::Set {
+            scope: protocol::settings::GLOBAL.to_owned(),
+            key: protocol::settings::TRANSLATE_LANG.to_owned(),
+            value: Some("fr".to_owned()),
+        }),
+        Response::Ok
+    ));
+    assert!(matches!(
+        world.ask(Request::Set {
+            scope: protocol::settings::GLOBAL.to_owned(),
+            key: protocol::settings::TRANSLATE_LANG.to_owned(),
+            value: Some("not a tag!!".to_owned()),
+        }),
+        Response::Error { .. }
+    ));
+    let Response::Translated { text: fr_text, .. } = world.ask(Request::Translate {
+        conversation: ana.clone(),
+        message_id: "1760000850001".to_owned(),
+        to: String::new(),
+    }) else {
+        panic!("expected Response::Translated with stored target language");
+    };
+    assert!(fr_text.starts_with("Bonjour"), "{fr_text}");
+}
+
+#[test]
+fn channel_and_chat_tabs_are_listed_and_tab_added_activity_is_readable() {
+    let world = World::start();
+    world.ready();
+    let general = key(GENERAL);
+    world.open(&general, 1);
+
+    // 1. Channel info lists Files, Planner, and Website tabs with validated external URLs.
+    let Response::ConversationInfo { info } = world.ask(Request::ConversationInfo { conversation: general.clone() }) else {
+        panic!("expected Response::ConversationInfo");
+    };
+    assert_eq!(info.tabs.len(), 3, "{:?}", info.tabs);
+    assert_eq!((info.tabs[0].name.as_str(), info.tabs[0].kind.as_str()), ("Files", "files"));
+    assert!(info.tabs[0].web_url.starts_with("https://contoso.sharepoint.com/"));
+    assert_eq!((info.tabs[1].name.as_str(), info.tabs[1].app.as_str(), info.tabs[1].kind.as_str()), ("Sprint Board", "Planner", "planner"));
+    assert_eq!((info.tabs[2].name.as_str(), info.tabs[2].kind.as_str()), ("Runbook", "website"));
+    assert_eq!(info.tabs[2].web_url, "https://docs.contoso.example/runbook");
+
+    // 2. "New tab added" ThreadActivity arrives as a readable system message naming the tab.
+    let mut tab_event = message(
+        GENERAL,
+        None,
+        1_760_000_860_001,
+        ANA,
+        "Ana Ruiz",
+        "<addtab><initiator>8:orgid:00000000-0000-4000-8000-0000000000a1</initiator><tabName>Sprint Board</tabName></addtab>",
+    );
+    tab_event["messagetype"] = json!("ThreadActivity/AddTab");
+    world.fake.push("NewMessage", tab_event, false);
+    let added = world.until("tab added system message", || world.message(&general, "1760000860001"));
+    assert_eq!(added.kind, MessageKind::System);
+    assert!(added.text.contains("Sprint Board"), "{}", added.text);
+    assert!(!added.text.contains("Card"), "{}", added.text);
+}
+
+/// Calendar rows relative to the view's `startDateTime`, kept on the machine's local today.
+fn calendar_view(query: &str) -> Value {
+    let start_raw = query.split('&').find_map(|pair| pair.strip_prefix("startDateTime=")).map(unescape).unwrap_or_default();
+    let anchor = unix_of_iso(&start_raw);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|since| since.as_secs() as i64).unwrap_or(anchor);
+    let hour = anchor.rem_euclid(86_400) / 3600;
+    let (early, late) = if hour <= 20 { (60_i64, 180) } else { (-180, -60) };
+    let mut first = anchor + early * 60;
+    let mut second = anchor + late * 60;
+    if !same_local_day(first, now) || !same_local_day(second, now) {
+        let (early, late) = if hour <= 20 { (-180_i64, -60) } else { (60, 180) };
+        first = anchor + early * 60;
+        second = anchor + late * 60;
+    }
+    if !same_local_day(first, now) || !same_local_day(second, now) {
+        let step = if local_hour(now) >= 22 { -1 } else { 1 };
+        first = now + step * 20 * 60;
+        second = now + step * 50 * 60;
+    }
+    if first > second {
+        std::mem::swap(&mut first, &mut second);
+    }
+    let middle = first + (second - first) / 2;
+    let thread = "19:meeting_NzQ2YjE@thread.v2";
+    json!({
+        "value": [
+            {
+                "id": "AAMkAGI2/stand=up",
+                "subject": "Standup",
+                "start": {"dateTime": iso_utc(first), "timeZone": "UTC"},
+                "end": {"dateTime": iso_utc(first + 1800), "timeZone": "UTC"},
+                "organizer": {"emailAddress": {"name": "Ada Lovelace"}},
+                "onlineMeeting": {"joinUrl": format!("https://teams.microsoft.com/l/meetup-join/{thread}/0")},
+                "responseStatus": {"response": "notResponded"}
+            },
+            {
+                "id": "bad-link",
+                "subject": "Bad link",
+                "start": iso_utc(middle),
+                "end": iso_utc(middle + 1800),
+                "joinUrl": "javascript:alert(1)"
+            },
+            {
+                "id": "design-review",
+                "title": "Design review",
+                "start": second,
+                "end": second + 1800,
+                "joinWebUrl": "https://teams.microsoft.com/l/meetup-join/19:meeting_design@thread.v2/0",
+                "organizerName": "Grace Hopper"
+            }
+        ]
+    })
+}
+
+fn unix_of_iso(iso: &str) -> i64 {
+    let number = |range: std::ops::Range<usize>| iso.get(range).and_then(|part| part.parse::<i64>().ok());
+    let (Some(year), Some(month), Some(day)) = (number(0..4), number(5..7), number(8..10)) else {
+        return 0;
+    };
+    let (Some(hour), Some(minute), Some(second)) = (number(11..13), number(14..16), number(17..19)) else {
+        return 0;
+    };
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let of_era = year.rem_euclid(400);
+    let of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let days = era * 146_097 + of_era * 365 + of_era / 4 - of_era / 100 + of_year - 719_468;
+    days * 86_400 + hour * 3600 + minute * 60 + second
+}
+
+fn iso_utc(unix_secs: i64) -> String {
+    let days = unix_secs.div_euclid(86_400) + 719_468;
+    let secs = unix_secs.rem_euclid(86_400);
+    let era = days.div_euclid(146_097);
+    let doe = days.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    let hour = secs / 3600;
+    let minute = (secs % 3600) / 60;
+    let second = secs % 60;
+    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}.000Z")
+}
+
+fn same_local_day(a: i64, b: i64) -> bool {
+    match (local_yday(a), local_yday(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn local_hour(unix: i64) -> i64 {
+    unsafe {
+        let mut local: libc::tm = std::mem::zeroed();
+        let unix = unix as libc::time_t;
+        #[cfg(unix)]
+        libc::localtime_r(&unix, &mut local);
+        #[cfg(windows)]
+        if libc::localtime_s(&mut local, &unix) != 0 {
+            return 0;
+        }
+        local.tm_hour as i64
+    }
+}
+
+fn local_yday(unix: i64) -> Option<(i32, i32)> {
+    unsafe {
+        let mut local: libc::tm = std::mem::zeroed();
+        let unix = unix as libc::time_t;
+        #[cfg(unix)]
+        libc::localtime_r(&unix, &mut local);
+        #[cfg(windows)]
+        if libc::localtime_s(&mut local, &unix) != 0 {
+            return None;
+        }
+        Some((local.tm_year, local.tm_yday))
+    }
+}
+
+#[test]
+fn todays_meetings_are_soonest_first_with_join_and_rsvp() {
+    let world = World::start();
+    world.ready();
+    let account = key(HOME).account();
+    let Response::Meetings { events } = world.ask(Request::Meetings { account: account.clone() }) else {
+        panic!("expected today's meetings");
+    };
+    assert_eq!(events.iter().map(|event| event.title.as_str()).collect::<Vec<_>>(), ["Standup", "Bad link", "Design review"]);
+    assert!(events.windows(2).all(|pair| pair[0].start <= pair[1].start));
+    assert!(events.iter().all(|event| !event.join_url.to_ascii_lowercase().contains("javascript")));
+    assert!(events.iter().all(|event| event.join_url.is_empty() || event.join_url.starts_with("https://")));
+    let standup = events.iter().find(|event| event.title == "Standup").unwrap();
+    assert_eq!(standup.conversation, "19:meeting_NzQ2YjE@thread.v2");
+    assert!(standup.join_url.contains("meetup-join"), "{}", standup.join_url);
+    assert_eq!(standup.organizer, "Ada Lovelace");
+    assert!(standup.id.contains('=') && standup.id.contains('/'));
+    assert!(events.iter().find(|event| event.title == "Bad link").unwrap().join_url.is_empty());
+
+    let Response::ConversationInfo { info } = world.ask(Request::ConversationInfo { conversation: key("19:meeting_NzQ2YjE@thread.v2") }) else {
+        panic!("expected the meeting chat's info");
+    };
+    let meeting = info.meeting.expect("the calendar row is attached to the meeting chat");
+    assert_eq!(meeting.title, "Standup");
+    assert!(meeting.join_url.starts_with("https://"));
+    assert!(meeting.start > 0);
+
+    let id = standup.id.clone();
+    assert!(matches!(
+        world.ask(Request::MeetingRsvp { account: account.clone(), id: id.clone(), response: MeetingResponse::Accepted, propose: None }),
+        Response::Ok
+    ));
+    assert!(!world.fake.calls("POST", "/accept").is_empty(), "accept is posted");
+    assert!(matches!(
+        world.ask(Request::MeetingRsvp {
+            account: account.clone(),
+            id: id.clone(),
+            response: MeetingResponse::Tentative,
+            propose: Some(standup.start + 15 * 60),
+        }),
+        Response::Ok
+    ));
+    let proposed = world.fake.calls("POST", "/tentativelyAccept");
+    assert_eq!(proposed.len(), 1);
+    assert_eq!(proposed[0].json()["sendResponse"], true);
+    assert!(proposed[0].json()["proposedNewTime"]["start"]["dateTime"].as_str().unwrap_or("").contains('T'));
+    assert_eq!(proposed[0].json()["proposedNewTime"]["start"]["timeZone"], "UTC");
+    assert!(matches!(
+        world.ask(Request::MeetingRsvp { account, id, response: MeetingResponse::Declined, propose: None }),
+        Response::Ok
+    ));
+    assert_eq!(world.fake.calls("POST", "/decline").len(), 1);
+}
+
+

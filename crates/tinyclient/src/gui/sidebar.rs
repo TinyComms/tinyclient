@@ -1128,14 +1128,14 @@ impl Shell {
     }
 
     /// Return on the cursor's row.
-    pub(super) fn open_cursor(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn open_cursor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.sidebar_state.cursor else {
             return;
         };
         let state = &self.sidebar_state;
         match state.mode {
             Mode::Inbox => self.activate_inbox(ix, cx),
-            _ if state.listed() => self.activate_home(ix, cx),
+            _ if state.listed() => self.activate_home(ix, window, cx),
             _ => self.activate(ix, cx),
         }
     }
@@ -1171,11 +1171,11 @@ impl Shell {
         row: Stateful<Div>,
         token: u64,
         menu: Option<Rc<Conversation>>,
-        act: impl Fn(&mut Shell, &mut Context<Shell>) + 'static,
+        act: impl Fn(&mut Shell, &mut Window, &mut Context<Shell>) + 'static,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         if !super::phone::active() {
-            return row.on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| act(this, cx)));
+            return row.on_mouse_down(MouseButton::Left, cx.listener(move |this, _, window, cx| act(this, window, cx)));
         }
         // A finger's long press: the timer below never starts for one, as its mouse-down only
         // comes when it lifts.
@@ -1194,9 +1194,9 @@ impl Shell {
         )
         .on_mouse_up(
             MouseButton::Left,
-            cx.listener(move |this, event: &gpui::MouseUpEvent, _, cx| {
+            cx.listener(move |this, event: &gpui::MouseUpEvent, window, cx| {
                 if this.phone_state.press_up(token, super::phone::at(event.position)) {
-                    act(this, cx);
+                    act(this, window, cx);
                 }
             }),
         )
@@ -1418,12 +1418,12 @@ impl Shell {
                     (count, false) => Some(super::components::badge_count_unread(count)),
                 };
                 self.action_row(("threads", ix), Some("icons/messages-square.svg"), "Threads".into(), *count > 0, trailing, focused)
-                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, cx| this.activate(ix, cx), cx))
+                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, _, cx| this.activate(ix, cx), cx))
             }
             Row::Drafts { count, .. } => {
                 let trailing = (*count > 0).then(|| super::components::badge_count_unread(*count));
                 self.action_row(("drafts", ix), Some("icons/pencil.svg"), "Drafts & sent".into(), false, trailing, focused)
-                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, cx| this.activate(ix, cx), cx))
+                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, _, cx| this.activate(ix, cx), cx))
             }
             Row::Fold { words, depth, .. } => {
                 let content = div()
@@ -1432,7 +1432,7 @@ impl Shell {
                     .child(div().size(px(20.)).flex_none().flex().items_center().justify_center().child(glyph("icons/ellipsis.svg", 14., theme::text_faint())))
                     .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text_faint()).child(words.clone()));
                 list_row(("fold", ix), height, false, focused, content)
-                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, cx| this.activate(ix, cx), cx))
+                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, _, cx| this.activate(ix, cx), cx))
             }
             Row::More { words, depth } => {
                 let content = div().children(indent(*depth, 0.)).child(div().pl(px(28.)).type_small().text_color(theme::text_faint()).child(words.clone()));
@@ -1459,7 +1459,7 @@ impl Shell {
                     .when(occupant.server_deafened, |row| row.child(glyph("icons/headphone-off.svg", 14., theme::danger())))
                     .when(!occupant.server_deafened && occupant.deafened, |row| row.child(glyph("icons/headphone-off.svg", 14., theme::text_faint())));
                 list_row(row_id("occupant", &occupant.person), height, false, false, content)
-                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, cx| this.activate(ix, cx), cx))
+                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, _, cx| this.activate(ix, cx), cx))
             }
             Row::Group { space, id, name, collapsed, rollup, depth, .. } => {
                 let lit = *collapsed && (rollup.attention > 0 || rollup.unread);
@@ -1498,7 +1498,7 @@ impl Shell {
                     .children(add_btn)
                     .children(dot);
                 list_row((gpui::ElementId::from("group"), id.clone()), height, false, focused, content)
-                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, cx| this.activate(ix, cx), cx))
+                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, _, cx| this.activate(ix, cx), cx))
             }
             Row::Conversation { conversation: c, depth } => self.place_row(c, *depth, focused, cx),
         }
@@ -1626,7 +1626,7 @@ impl Shell {
                         row,
                         token,
                         menu,
-                        move |this, cx| {
+                        move |this, _, cx| {
                             if voice && ours {
                                 this.call_phone_restore(cx);
                             } else if join {

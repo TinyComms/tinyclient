@@ -2,7 +2,7 @@
 //! middle tier (with Microsoft Graph fallback), remembering which tags belong to the signed-in
 //! user for `mentions_me`, and starting a group chat with a tag's members.
 
-use super::{escaped, Auth, Body, Fault, Teams, GRAPH, SPACES};
+use super::{escaped, Audience, Auth, Body, Fault, Teams};
 use protocol::{Key, ProfilePerson, TeamTag};
 use serde_json::Value;
 
@@ -110,14 +110,14 @@ impl Teams {
     pub(super) fn space_tags(&self, space: &str) -> Result<Vec<TeamTag>, Fault> {
         let place = self.place()?;
         let mt_url = format!("{}/beta/teams/{}/tags", place.middle, escaped(space));
-        let raw = match self.call("GET", &mt_url, Auth::Both(SPACES), Body::None, true) {
+        let raw = match self.call("GET", &mt_url, Auth::Both(Audience::Spaces), Body::None, true) {
             Ok(answer) => answer.body,
             Err(_) => {
                 let Some(group_id) = self.ctx.note(&format!("group:{space}")).filter(|s| !s.is_empty()) else {
                     return Ok(Vec::new());
                 };
                 let graph_url = format!("{}/v1.0/teams/{}/tags?$expand=members", self.graph, escaped(&group_id));
-                match self.call("GET", &graph_url, Auth::Bearer(GRAPH), Body::None, true) {
+                match self.call("GET", &graph_url, Auth::Bearer(Audience::Graph), Body::None, true) {
                     Ok(answer) => answer.body,
                     Err(_) => return Ok(Vec::new()),
                 }

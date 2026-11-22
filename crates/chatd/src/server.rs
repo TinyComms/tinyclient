@@ -1372,6 +1372,16 @@ impl Chat {
         if with.files.is_empty() {
             return Ok(());
         }
+        // A voice send is one clip. A document sent that way is refused before the upload, and
+        // before the voice-note size exception below.
+        if with.voice.is_some() && with.files.len() == 1 {
+            let named = file_name(&with.files[0]);
+            let mime = crate::blobs::upload::mime_of(&named);
+            if !(mime.starts_with("audio/") || mime.starts_with("video/")) {
+                return refuse(format!("{named} is not an audio or video clip."));
+            }
+        }
+        let voice_only = with.voice.is_some() && with.files.len() == 1 && can.voice_notes;
         let max_file_bytes = self
             .hub
             .store()
@@ -1379,6 +1389,11 @@ impl Chat {
             .ok()
             .flatten()
             .map_or(can.max_file_bytes, |row| can.max_file_bytes.max(row.max_file_bytes));
+        let max_file_bytes = if voice_only && max_file_bytes == 0 {
+            25 * 1024 * 1024
+        } else {
+            max_file_bytes
+        };
         if max_file_bytes == 0 {
             return refuse(format!("Files can't be sent to {name} from tinyclient yet."));
         }
@@ -1949,6 +1964,45 @@ impl Chat {
         Response::Profile { profile: Box::new(profile) }
     }
 
+    /// Today's meetings, soonest first. A calendar failure is the adapter's to soften.
+    fn meetings(&self, account: AccountKey) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::Meetings { reply }) {
+            Ok(mut events) => {
+                for event in &mut events {
+                    clip_meeting(event);
+                }
+                events.retain(|event| event.start > 0 && !event.title.is_empty());
+                events.sort_by_key(|event| event.start);
+                events.truncate(protocol::MEETINGS_LIMIT);
+                Response::Meetings { events }
+            }
+            Err(refused) => *refused,
+        }
+    }
+
+    /// Accept, decline, or tentatively accept one meeting. Forgets cached conversation info so
+    /// the next Details open reads the new answer.
+    fn meeting_rsvp(&self, account: AccountKey, id: String, response: protocol::MeetingResponse, propose: Option<i64>) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let mut id = id;
+        clip(&mut id, 256);
+        if id.is_empty() {
+            return error(ErrorCode::NotFound, "no such meeting");
+        }
+        match self.ask(&account, |reply| Command::MeetingRsvp { id, response, propose, reply }) {
+            Ok(()) => {
+                self.hub.infos.forget_where(|key| key.account() == account);
+                Response::Ok
+            }
+            Err(refused) => *refused,
+        }
+    }
+
     /// A conversation's info: its row, and what the network says beyond it, kept five minutes.
     fn conversation_info(&self, conversation: Key) -> Response {
         let row = match self.hub.store().conversation(&conversation) {
@@ -1978,11 +2032,34 @@ impl Chat {
             external: about.external,
             link: about.link,
             bookmarks: about.bookmarks,
+            tabs: about.tabs,
+            meeting: about.meeting,
         };
         clip(&mut info.description, 4_000);
         clip(&mut info.creator, 100);
         clip(&mut info.external, 100);
         clip(&mut info.link, 300);
+        info.tabs.truncate(protocol::TABS_LIMIT);
+        for tab in &mut info.tabs {
+            clip(&mut tab.id, 128);
+            clip(&mut tab.name, 120);
+            clip(&mut tab.app, 80);
+            clip(&mut tab.kind, 32);
+            clip(&mut tab.web_url, 1_024);
+            clip(&mut tab.content_url, 1_024);
+            if !tab.web_url.starts_with("https://") && !tab.web_url.starts_with("http://") {
+                tab.web_url.clear();
+            }
+            if !tab.content_url.starts_with("https://") && !tab.content_url.starts_with("http://") {
+                tab.content_url.clear();
+            }
+        }
+        if let Some(meeting) = info.meeting.as_mut() {
+            clip_meeting(meeting);
+            if meeting.start <= 0 {
+                info.meeting = None;
+            }
+        }
         self.hub.infos.keep(conversation, info.clone());
         Response::ConversationInfo { info: Box::new(info) }
     }
@@ -2818,6 +2895,37 @@ impl Chat {
                     Ok(()) => {
                         self.hub.catalogs.forget_where(|(acct, kind, ..)| acct == &account && *kind == CatalogKind::Stickers);
                         Response::Ok
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::Translate { conversation, message_id, to } => {
+                if !self.shows(&conversation.account()) {
+                    return error(ErrorCode::NotFound, "signed out");
+                }
+                let requested = to.trim();
+                let target = if !requested.is_empty() && requested != "auto" {
+                    if !protocol::settings::valid_language_tag(requested) {
+                        return error(ErrorCode::Refused, "Unsupported target language.");
+                    }
+                    requested.to_owned()
+                } else {
+                    let stored = self.hub.settings().translate_lang();
+                    if stored != "auto" { stored } else { "en".to_owned() }
+                };
+                match self.ask(&conversation.account(), |reply| Command::Translate {
+                    conversation_id: conversation.id.clone(),
+                    message_id,
+                    to: target,
+                    reply,
+                }) {
+                    Ok(mut translated) => {
+                        protocol::clip(&mut translated.text, 40_000);
+                        protocol::clip(&mut translated.detected_language, 32);
+                        Response::Translated {
+                            text: translated.text,
+                            detected_language: translated.detected_language,
+                        }
                     }
                     Err(refused) => *refused,
                 }
@@ -4213,6 +4321,8 @@ impl Chat {
                     reply,
                 })
             }
+            Request::Meetings { account } => self.meetings(account),
+            Request::MeetingRsvp { account, id, response, propose } => self.meeting_rsvp(account, id, response, propose),
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
                     Some(id) => self.hub.settings().custom_sound(id).is_some(),
@@ -4241,6 +4351,28 @@ impl Chat {
 
 /// Tiny keeps every server in the one item. A second sign-in is folded in before anything is
 /// saved, so it does not replace the server already there. Other networks still replace.
+/// Keeps a meeting row inside the sizes the shell draws, and drops a join target that is not
+/// `https://` or `http://`.
+fn clip_meeting(event: &mut protocol::MeetingEvent) {
+    clip(&mut event.id, 256);
+    clip(&mut event.title, 200);
+    clip(&mut event.organizer, 120);
+    clip(&mut event.join_url, 1_024);
+    clip(&mut event.conversation, 256);
+    if event.start < 0 {
+        event.start = 0;
+    }
+    if event.end < event.start {
+        event.end = event.start;
+    }
+    if !event.join_url.starts_with("https://") && !event.join_url.starts_with("http://") {
+        event.join_url.clear();
+    }
+    if event.title.is_empty() {
+        event.title = "Meeting".to_owned();
+    }
+}
+
 fn merged(network: Network, session: &str) -> Result<String, String> {
     if network != Network::Tiny || !session::enabled() {
         return Ok(session.to_owned());

@@ -1375,10 +1375,16 @@ impl Pane {
         if message.text.trim().is_empty() {
             return message.edited.then(|| self.edited_mark(message, cx)).into_iter().collect();
         }
-        if let Some(emoji) = rich::jumbo(&message.text, &message.spans) {
-            return vec![self.jumbo(&emoji, window, cx)];
+        let translated = self.translations.get(&message.id).cloned();
+        if translated.is_none() {
+            if let Some(emoji) = rich::jumbo(&message.text, &message.spans) {
+                return vec![self.jumbo(&emoji, window, cx)];
+            }
         }
-        let mut blocks = rich::blocks(&message.text, &message.spans);
+        let mut blocks = match &translated {
+            Some((text, _)) => rich::blocks(text, &[]),
+            None => rich::blocks(&message.text, &message.spans),
+        };
         let mut edited_alone = message.edited;
         if let (true, Some(Block::Text(last))) = (message.edited, blocks.last_mut()) {
             last.mark_edited();
@@ -1438,6 +1444,28 @@ impl Pane {
         }
         if edited_alone {
             out.push(self.edited_mark(message, cx));
+        }
+        if let Some((_, detected)) = translated {
+            let caption = if detected.is_empty() {
+                "Translated · Show original".to_owned()
+            } else {
+                format!("Translated from {detected} · Show original")
+            };
+            let msg = message.clone();
+            out.push(
+                div()
+                    .id(name_id("translated", &message.id))
+                    .mt(px(2.))
+                    .type_micro()
+                    .text_color(theme::text_faint())
+                    .cursor_pointer()
+                    .hover(|style| style.text_color(theme::text_soft()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_translate(&msg, cx);
+                    }))
+                    .child(caption)
+                    .into_any_element(),
+            );
         }
         if let Some(expires_at) = message.expires_at {
             if let Some(label) = expiry_label(expires_at, crate::view::now()) {

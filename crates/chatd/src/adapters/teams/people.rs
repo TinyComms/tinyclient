@@ -1,7 +1,7 @@
 //! People in a tenant: who wrote a message, who a chat is with, who is online. The directory is
 //! searched and looked up by id, never listed.
 
-use super::{escaped, iso_utc, Auth, Body, Fault, Teams, GRAPH, PRESENCE, REMEMBERED, SPACES};
+use super::{escaped, iso_utc, Audience, Auth, Body, Fault, Teams, REMEMBERED};
 use crate::adapters::{About, Members};
 use crate::store::{PersonDetails, PersonRow};
 use protocol::{
@@ -505,7 +505,7 @@ impl Teams {
 
     fn middle(&self, path: &str, body: Body) -> Result<Value, Fault> {
         let url = format!("{}{path}", self.place()?.middle);
-        Ok(self.call("POST", &url, Auth::Both(SPACES), body, true)?.body)
+        Ok(self.call("POST", &url, Auth::Both(Audience::Spaces), body, true)?.body)
     }
 
     /// The people an answer of the middle tier lists, under whichever name it used.
@@ -551,7 +551,7 @@ impl Teams {
                 self.place()?.middle,
                 escaped(email)
             );
-            if let Ok(answer) = self.call("GET", &ext_url, Auth::Both(SPACES), Body::None, true) {
+            if let Ok(answer) = self.call("GET", &ext_url, Auth::Both(Audience::Spaces), Body::None, true) {
                 let mut external_people: Vec<Value> = Teams::listed(&answer.body).to_vec();
                 if external_people.is_empty() && answer.body.is_object() && answer.body["mri"].is_string() {
                     external_people.push(answer.body);
@@ -577,7 +577,7 @@ impl Teams {
             return;
         };
         let url = format!("{}/beta/users/blocklist", place.middle);
-        let Ok(answer) = self.call("GET", &url, Auth::Both(SPACES), Body::None, true) else {
+        let Ok(answer) = self.call("GET", &url, Auth::Both(Audience::Spaces), Body::None, true) else {
             return;
         };
         let list = [
@@ -662,13 +662,13 @@ impl Teams {
         let url = format!("{}/beta/users/blocklist/{}", place.middle, escaped(person_id));
         match action {
             RelateAction::Block => {
-                self.call("PUT", &url, Auth::Both(SPACES), Body::Json(&json!({"mri": person_id})), false)?;
+                self.call("PUT", &url, Auth::Both(Audience::Spaces), Body::Json(&json!({"mri": person_id})), false)?;
                 self.state().blocked.insert(person_id.to_owned());
                 self.ctx.relation(person_id, Relation::Blocked)?;
                 Ok(())
             }
             RelateAction::Unblock => {
-                self.call("DELETE", &url, Auth::Both(SPACES), Body::None, false)?;
+                self.call("DELETE", &url, Auth::Both(Audience::Spaces), Body::None, false)?;
                 let restored = {
                     let mut state = self.state();
                     state.blocked.remove(person_id);
@@ -834,7 +834,7 @@ impl Teams {
         };
         let asked: Vec<Value> = mris.iter().map(|id| json!({"mri": id})).collect();
         let url = format!("{}/v1/presence/getpresence/", place.presence);
-        if let Ok(found) = self.call("POST", &url, Auth::Bearer(PRESENCE), Body::Json(&json!(asked)), true) {
+        if let Ok(found) = self.call("POST", &url, Auth::Bearer(Audience::Presence), Body::Json(&json!(asked)), true) {
             self.presences(&found.body);
         }
     }
@@ -1113,7 +1113,7 @@ impl Teams {
                 self.graph,
                 escaped(oid)
             );
-            if let Ok(answer) = self.call("GET", &user_url, Auth::Bearer(GRAPH), Body::None, true) {
+            if let Ok(answer) = self.call("GET", &user_url, Auth::Bearer(Audience::Graph), Body::None, true) {
                 let u = &answer.body;
                 if let Some(v) = u["jobTitle"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
                     if known.title.is_empty() {
@@ -1153,7 +1153,7 @@ impl Teams {
                 self.graph,
                 escaped(oid)
             );
-            if let Ok(answer) = self.call("GET", &mgr_url, Auth::Bearer(GRAPH), Body::None, true) {
+            if let Ok(answer) = self.call("GET", &mgr_url, Auth::Bearer(Audience::Graph), Body::None, true) {
                 manager = self.learn_graph_person(&answer.body);
             }
             let rep_url = format!(
@@ -1161,7 +1161,7 @@ impl Teams {
                 self.graph,
                 escaped(oid)
             );
-            if let Ok(answer) = self.call("GET", &rep_url, Auth::Bearer(GRAPH), Body::None, true) {
+            if let Ok(answer) = self.call("GET", &rep_url, Auth::Bearer(Audience::Graph), Body::None, true) {
                 for entry in answer.body["value"].as_array().into_iter().flatten().take(10) {
                     if let Some(rp) = self.learn_graph_person(entry) {
                         reports.push(rp);
@@ -1207,7 +1207,7 @@ impl Teams {
     /// Reads our Exchange/Teams automatic replies setting from Microsoft Graph.
     pub(super) fn get_out_of_office(&self) -> Result<protocol::OutOfOffice, Fault> {
         let url = format!("{}/v1.0/me/mailboxSettings/automaticRepliesSetting", self.graph);
-        let answer = self.call("GET", &url, Auth::Bearer(GRAPH), Body::None, true)?.body;
+        let answer = self.call("GET", &url, Auth::Bearer(Audience::Graph), Body::None, true)?.body;
         let setting = if answer["automaticRepliesSetting"].is_object() {
             &answer["automaticRepliesSetting"]
         } else {
@@ -1268,7 +1268,7 @@ impl Teams {
         }
         let url = format!("{}/v1.0/me/mailboxSettings", self.graph);
         let body = json!({"automaticRepliesSetting": setting});
-        let answer = self.call("PATCH", &url, Auth::Bearer(GRAPH), Body::Json(&body), false)?.body;
+        let answer = self.call("PATCH", &url, Auth::Bearer(Audience::Graph), Body::Json(&body), false)?.body;
         let saved = if answer["automaticRepliesSetting"].is_object() {
             parse_automatic_replies(&answer["automaticRepliesSetting"])
         } else {
@@ -1345,7 +1345,7 @@ impl Teams {
         }
         let asked: Vec<Value> = ids.iter().map(|id| json!({"mri": id})).collect();
         let url = format!("{}/v1/presence/getpresence/", self.place()?.presence);
-        let found = self.call("POST", &url, Auth::Bearer(PRESENCE), Body::Json(&json!(asked)), true)?.body;
+        let found = self.call("POST", &url, Auth::Bearer(Audience::Presence), Body::Json(&json!(asked)), true)?.body;
         self.presences(&found);
         Ok(())
     }
@@ -1357,7 +1357,7 @@ impl Teams {
         let place = self.place()?;
         if presence == Presence::Unknown && status.is_none() {
             let url = format!("{}/v1/me/forceavailability/", place.presence);
-            self.call("DELETE", &url, Auth::Bearer(PRESENCE), Body::None, false)?;
+            self.call("DELETE", &url, Auth::Bearer(Audience::Presence), Body::None, false)?;
             let me = self.me();
             if !me.is_empty() {
                 self.fetch_presence_for(&[me]);
@@ -1378,7 +1378,7 @@ impl Teams {
             if let Some(ts) = clear_at.filter(|&ts| ts > 0) {
                 body["expiry"] = Value::String(iso_utc(ts));
             }
-            self.call("PUT", &url, Auth::Bearer(PRESENCE), Body::Json(&body), false)?;
+            self.call("PUT", &url, Auth::Bearer(Audience::Presence), Body::Json(&body), false)?;
         }
         if let Some(note) = status {
             let url = format!("{}/v1/me/publishnote", place.presence);
@@ -1387,7 +1387,7 @@ impl Teams {
                 .map(iso_utc)
                 .unwrap_or_else(|| "9999-12-30T23:00:00.000Z".to_owned());
             let body = json!({"message": note, "expiry": expiry});
-            self.call("PUT", &url, Auth::Bearer(PRESENCE), Body::Json(&body), false)?;
+            self.call("PUT", &url, Auth::Bearer(Audience::Presence), Body::Json(&body), false)?;
         }
         Ok(())
     }
@@ -1404,9 +1404,9 @@ impl Teams {
             } else {
                 json!({"availability": "Busy", "activity": "InACall"})
             };
-            self.call("PUT", &url, Auth::Bearer(PRESENCE), Body::Json(&body), false)?;
+            self.call("PUT", &url, Auth::Bearer(Audience::Presence), Body::Json(&body), false)?;
         } else {
-            self.call("DELETE", &url, Auth::Bearer(PRESENCE), Body::None, false)?;
+            self.call("DELETE", &url, Auth::Bearer(Audience::Presence), Body::None, false)?;
         }
         Ok(())
     }

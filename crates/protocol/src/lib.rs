@@ -1601,6 +1601,20 @@ pub enum Request {
     ConversationInfo {
         conversation: Key,
     },
+    /// Today's meetings for one account, soonest first. Teams reads its calendar; Join is a
+    /// link until a call can be placed here.
+    Meetings {
+        account: AccountKey,
+    },
+    /// Accept, decline, or tentatively accept one meeting. `propose` is a new start, Unix
+    /// seconds, sent with a tentative answer.
+    MeetingRsvp {
+        account: AccountKey,
+        id: String,
+        response: MeetingResponse,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        propose: Option<i64>,
+    },
     /// A Space's own info, opened from its name.
     SpaceInfo {
         space: Key,
@@ -2151,6 +2165,14 @@ pub enum Request {
     /// Where the official app takes this conversation's call.
     Handoff {
         conversation: Key,
+    },
+    /// Translates one message on demand into `to` (empty or `auto` uses the configured/default
+    /// language). Ephemeral: chatd never overwrites the stored original message.
+    Translate {
+        conversation: Key,
+        message_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        to: String,
     },
     Media(MediaRequest),
     /// A voice message or audio file: play, pause, seek, speed, stop. Answers `Ok`; the rest is
@@ -3135,6 +3157,10 @@ pub enum Response {
     ConversationInfo {
         info: Box<ConversationInfo>,
     },
+    /// Answers `Meetings`.
+    Meetings {
+        events: Vec<MeetingEvent>,
+    },
     SpaceInfo {
         info: Box<SpaceInfo>,
     },
@@ -3287,6 +3313,12 @@ pub enum Response {
     /// What an encrypted backup file holds (`ExportBackup`) or added here (`ImportBackup`).
     TinyBackup {
         messages: u64,
+    },
+    /// Ephemeral result of [`Request::Translate`]. The stored original message is unchanged.
+    Translated {
+        text: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        detected_language: String,
     },
     /// What `E2eeAsk::Link` asked: the device link in progress on this device, if any.
     TinyE2eeLink {

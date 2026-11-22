@@ -249,6 +249,20 @@ pub(super) struct OpenSelect {
     pub at: Point<Pixels>,
 }
 
+/// Infers a short BCP-47 primary language tag from the process locale, defaulting to `"en"`.
+fn system_translate_lang() -> String {
+    for var in ["LC_ALL", "LC_MESSAGES", "LANG"] {
+        if let Ok(raw) = std::env::var(var) {
+            let head = raw.split(['.', '@']).next().unwrap_or("").replace('_', "-");
+            let primary = head.split('-').next().unwrap_or("");
+            if protocol::settings::valid_language_tag(primary) {
+                return primary.to_ascii_lowercase();
+            }
+        }
+    }
+    "en".to_owned()
+}
+
 /// The one rule for telling the network how far the user has read: a real window that is
 /// active, showing the conversation, with the message on screen. A build that takes
 /// screenshots never does, whatever it is showing: a picture of a conversation must not read it.
@@ -448,6 +462,11 @@ pub struct Pane {
     scrub_bounds: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
     /// A file the user pressed play on before it was on disk: file, message, attachment, from.
     play_after: Option<(String, String, usize, Option<u32>)>,
+    /// Ephemeral in-memory message translations: `message_id -> (translated_text, detected_lang)`.
+    /// Cleared on conversation switch and never persisted to disk.
+    translations: HashMap<String, (String, String)>,
+    /// Message ids with an in-flight `Request::Translate`.
+    translating: HashSet<String>,
 
     /// How wide the list was when last drawn; 0 before the first draw.
     width: f32,
@@ -540,6 +559,8 @@ impl Pane {
             scrub: None,
             scrub_bounds: Rc::default(),
             play_after: None,
+            translations: HashMap::new(),
+            translating: HashSet::new(),
             width: 0.,
             opening: false,
             seen: Rc::default(),
@@ -572,6 +593,52 @@ impl Pane {
             self.revealed_contacts.insert(key);
         }
         cx.notify();
+    }
+
+    /// Toggles on-demand in-place translation for one message. If already translated, restores
+    /// the original immediately; otherwise asks chatd without modifying the stored message.
+    pub(super) fn toggle_translate(&mut self, message: &Message, cx: &mut Context<Self>) {
+        if self.translations.remove(&message.id).is_some() {
+            cx.notify();
+            return;
+        }
+        if SCREENSHOTS || self.translating.contains(&message.id) {
+            return;
+        }
+        let Some(conversation) = self.open.as_ref().map(|open| open.key.clone()) else {
+            return;
+        };
+        let message_id = message.id.clone();
+        let pref = super::app::prefs::values().translate_lang();
+        let to = if pref != "auto" { pref } else { system_translate_lang() };
+        self.translating.insert(message_id.clone());
+        cx.notify();
+        cx.spawn(async move |pane, cx| {
+            let ask_id = message_id.clone();
+            let answer = cx
+                .background_executor()
+                .spawn(async move {
+                    ask(&Request::Translate { conversation, message_id: ask_id, to })
+                })
+                .await;
+            let _ = pane.update(cx, |this, cx| {
+                this.translating.remove(&message_id);
+                match answer {
+                    Ok(Response::Translated { text, detected_language }) => {
+                        this.translations.insert(message_id, (text, detected_language));
+                    }
+                    Ok(Response::Error { detail, .. }) => {
+                        let shell = this.shell.clone();
+                        cx.defer(move |cx| {
+                            let _ = shell.update(cx, |shell, cx| shell.toast(None, detail, cx));
+                        });
+                    }
+                    _ => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(super) fn vote_poll(&mut self, message_id: String, votes: Option<Vec<u32>>, cx: &mut Context<Self>) {
@@ -736,6 +803,8 @@ impl Pane {
         self.code_colors.clear();
         self.multi_select.clear();
         self.code_coloring.clear();
+        self.translations.clear();
+        self.translating.clear();
         self.copied = None;
         self.hovered = None;
         self.selection = None;

@@ -422,7 +422,7 @@ impl Shell {
             );
         let (picked, menu_row) = (c.clone(), c.clone());
         list_row(row_id(id, &c.key), theme::row_height(theme::ROW_TWO), selected, focused, content)
-            .map(|row| self.tap(row, crate::gui::phone::token(&[id, picked.key.network.label(), &picked.key.account, &picked.key.id]), Some(picked.clone()), move |this, cx| this.pick_row(&picked, cx), cx))
+            .map(|row| self.tap(row, crate::gui::phone::token(&[id, picked.key.network.label(), &picked.key.account, &picked.key.id]), Some(picked.clone()), move |this, _, cx| this.pick_row(&picked, cx), cx))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {

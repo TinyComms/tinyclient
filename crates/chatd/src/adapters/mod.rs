@@ -207,6 +207,9 @@ pub struct ConversationAbout {
     pub link: String,
     pub disappearing: Option<u32>,
     pub bookmarks: Vec<protocol::Bookmark>,
+    pub tabs: Vec<protocol::ConversationTab>,
+    /// The meeting this chat is for, when the network gave a start time.
+    pub meeting: Option<protocol::MeetingEvent>,
 }
 
 /// What a Space's info says, as the network tells it.
@@ -266,6 +269,13 @@ pub struct BrowsedPage {
 pub struct ReactorsPage {
     pub reactors: Vec<protocol::Reactor>,
     pub more: bool,
+}
+
+/// Ephemeral result of `Command::Translate`.
+#[derive(Debug, Clone, Default)]
+pub struct Translation {
+    pub text: String,
+    pub detected_language: String,
 }
 
 /// A picture on the call the user is in. Discord is the network that acts on it.
@@ -933,6 +943,23 @@ pub enum Command {
     Wanted(Vec<String>),
     /// The link that opens this conversation's call in the official app.
     Handoff { conversation_id: String, reply: Reply<String> },
+    /// Today's meetings, soonest first. A calendar the account cannot read answers with what
+    /// the chat list already remembered.
+    Meetings { reply: Reply<Vec<protocol::MeetingEvent>> },
+    /// Accept, decline, or tentatively accept one meeting. `propose` is a new start.
+    MeetingRsvp {
+        id: String,
+        response: protocol::MeetingResponse,
+        propose: Option<i64>,
+        reply: Reply<()>,
+    },
+    /// On-demand translation of one message into BCP-47 tag `to`. Ephemeral: never stored.
+    Translate {
+        conversation_id: String,
+        message_id: String,
+        to: String,
+        reply: Reply<Translation>,
+    },
     /// mediad is up: join or ring on the network, then report through [`Context::voice`].
     CallJoin(String),
     /// Leave, cancel or decline on the network. Also sent when the call failed here (mediad
@@ -1068,6 +1095,9 @@ impl Command {
             | Command::OpenForum { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Source { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReportReasons { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Translate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Meetings { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MeetingRsvp { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             // Nothing to end on the network: the session is simply forgotten.
             Command::SignOut(reply) => drop(reply.send(Ok(()))),
             Command::Download { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

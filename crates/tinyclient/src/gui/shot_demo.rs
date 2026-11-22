@@ -1196,6 +1196,8 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
                     link: String::new(),
                     disappearing: row.disappearing,
                     bookmarks: Vec::new(),
+                    tabs: Vec::new(),
+                    meeting: None,
                 }),
             },
             None => Response::Error { code: protocol::ErrorCode::NotFound, detail: "Not in the demo.".into() },

@@ -203,6 +203,7 @@ impl Shell {
                     .children(role.map(|role| role_chip(&role.name, role.color)))
                     .children(self.encryption_chip(open, cx))
                     .children(self.disappearing_chip(open, cx))
+                    .children(self.meeting_chip(open, cx))
                     .children(line)
                     .children(trouble.map(|words| div().flex_none().type_small().text_color(theme::text_faint()).child(words))),
             )
@@ -268,6 +269,48 @@ impl Shell {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_details(cx)))
                 .child(glyph("icons/clock.svg", 12., theme::text_soft()))
+                .child(label),
+        )
+    }
+
+    /// Today's meeting for this chat: the time, and Join when the link is https.
+    fn meeting_chip(&self, open: &Conversation, cx: &mut Context<Self>) -> Option<gpui::Stateful<Div>> {
+        if open.key.network != Network::Teams {
+            return None;
+        }
+        let event = self.sidebar_state.home.upcoming.iter().find(|event| {
+            event.conversation == open.key.id && (self.sidebar_state.home.upcoming_account.is_empty() || self.sidebar_state.home.upcoming_account == open.key.account)
+        })?;
+        let mut label = crate::gui::time::meeting_display(event, crate::view::now());
+        let join = event.join_url.clone();
+        let can_join = join.starts_with("https://");
+        if can_join {
+            label.push_str(" · Join");
+        }
+        Some(
+            div()
+                .id("conversation-meeting")
+                .flex_none()
+                .self_center()
+                .h(px(18.))
+                .px(px(6.))
+                .rounded(px(999.))
+                .bg(theme::raised())
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .type_small()
+                .text_color(theme::text_soft())
+                .when(can_join, |chip| {
+                    chip.cursor_pointer()
+                        .hover(|style| style.text_color(theme::text()))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            let pane = this.pane(cx);
+                            pane.update(cx, |pane, cx| pane.open_external_link(&join, window, cx));
+                        }))
+                })
+                .child(glyph("icons/calendar.svg", 12., theme::text_soft()))
                 .child(label),
         )
     }

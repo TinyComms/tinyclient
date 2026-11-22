@@ -9,7 +9,7 @@ use crate::gui::people::info::{InfoPane, ManageKind};
 use crate::gui::people::presence::{self, Ring, Shape};
 use crate::gui::theme::{self, Type};
 use gpui::{div, prelude::*, px, Context, Div, MouseButton, Window};
-use protocol::{CallSupport, Conversation, ConversationKind, Key, Network, Notify, Presence, Request};
+use protocol::{CallSupport, Conversation, ConversationKind, Key, MeetingResponse, Network, Notify, Presence, Request};
 
 /// S6: this conversation's own notification sound, kept here only (the network never sees it),
 /// over its account's and the global one. Picking one plays it.
@@ -195,6 +195,13 @@ fn head_picture(pane: &InfoPane, row: &Conversation, cx: &mut Context<InfoPane>)
                 .child(glyph(icon, 28., theme::text_soft()))
         }
     }
+}
+
+fn open_https_link(pane: &InfoPane, url: &str, window: &mut Window, cx: &mut Context<InfoPane>) {
+    pane.shell_do(cx, |shell, cx| {
+        let conv = shell.pane(cx);
+        conv.update(cx, |conv, cx| conv.open_external_link(url, window, cx));
+    });
 }
 
 /// A conversation's Details.
@@ -510,6 +517,7 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                 format!("{} {}", bm.emoji, bm.title)
             };
             let url = bm.link.clone();
+            let valid_url = url.starts_with("https://") || url.starts_with("http://");
             let chip = div()
                 .id(("details-bookmark", ix))
                 .px(px(8.))
@@ -518,7 +526,7 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                 .bg(theme::raised())
                 .type_small()
                 .text_color(theme::text())
-                .when(!url.is_empty(), |d| {
+                .when(valid_url, |d| {
                     d.cursor_pointer()
                         .hover(|s| s.bg(theme::hover()))
                         .on_click(move |_, _, cx| cx.open_url(&url))
@@ -535,6 +543,99 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                 .gap(px(8.))
                 .child(div().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child("Bookmarks"))
                 .child(chips),
+        );
+    }
+    if let Some(meeting) = info.and_then(|info| info.meeting.clone()) {
+        let line = crate::gui::time::meeting_display(&meeting, crate::view::now());
+        let can_join = meeting.join_url.starts_with("https://");
+        let join = meeting.join_url.clone();
+        let show_rsvp = meeting.response != MeetingResponse::Organizer && !meeting.id.is_empty();
+        let mut actions = div().flex().flex_wrap().gap(px(6.));
+        if can_join {
+            actions = actions.child(button("details-meeting-join", ButtonKind::Secondary, "Join").on_click(cx.listener(move |pane, _, window, cx| {
+                open_https_link(pane, &join, window, cx);
+            })));
+        }
+        if show_rsvp {
+            let account = row.key.account();
+            let id = meeting.id.clone();
+            let propose_at = meeting.start + 15 * 60;
+            let choices = [
+                ("Accept", MeetingResponse::Accepted, None),
+                ("Tentative", MeetingResponse::Tentative, None),
+                ("Decline", MeetingResponse::Declined, None),
+                ("Propose 15 min later", MeetingResponse::Tentative, Some(propose_at)),
+            ];
+            for (slot, (label, response, propose)) in choices.into_iter().enumerate() {
+                let account = account.clone();
+                let id = id.clone();
+                actions = actions.child(button(("details-meeting-rsvp", slot), ButtonKind::Ghost, label).on_click(cx.listener(move |pane, _, _, cx| {
+                    pane.note_meeting_response(response);
+                    crate::gui::people::ask_later(cx, Request::MeetingRsvp { account, id, response, propose }, |_, _| {});
+                })));
+            }
+        }
+        body = body.child(draw::rule().mt(px(16.))).child(
+            div()
+                .px(px(theme::PANE_PAD))
+                .pt(px(12.))
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(div().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child("Meeting"))
+                .child(div().type_small().text_color(theme::text_soft()).child(line))
+                .child(actions),
+        );
+    }
+    if let Some(tabs) = info.map(|i| i.tabs.as_slice()).filter(|t| !t.is_empty()) {
+        let fallback_link = link.clone().unwrap_or_default();
+        let mut rows = div().flex().flex_col().gap(px(2.));
+        for (ix, tab) in tabs.iter().enumerate() {
+            let open_url = [&tab.web_url, &tab.content_url, &fallback_link]
+                .into_iter()
+                .find(|u| u.starts_with("https://"))
+                .cloned();
+            let icon = match tab.kind.as_str() {
+                "files" => "icons/folder-plus.svg",
+                "planner" => "icons/check.svg",
+                "website" => "icons/link.svg",
+                _ => "icons/external-link.svg",
+            };
+            let show_app = !tab.app.is_empty() && !tab.app.eq_ignore_ascii_case(&tab.name);
+            let mut row = div()
+                .id(("details-tab", ix))
+                .h(px(theme::ROW_ONE))
+                .mx(px(-8.))
+                .px(px(8.))
+                .rounded(px(theme::R_CONTROL))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .type_ui()
+                .child(glyph(icon, 15., theme::text_soft()))
+                .child(div().flex_1().min_w_0().truncate().text_color(theme::text()).child(tab.name.clone()));
+            if show_app {
+                row = row.child(div().flex_none().type_micro().text_color(theme::text_faint()).child(tab.app.clone()));
+            }
+            if let Some(url) = open_url {
+                row = row
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()))
+                    .child(glyph("icons/external-link.svg", 13., theme::text_faint()))
+                    .on_click(cx.listener(move |pane, _, window, cx| open_https_link(pane, &url, window, cx)));
+            }
+            rows = rows.child(row);
+        }
+        body = body.child(draw::rule().mt(px(16.))).child(
+            div()
+                .px(px(theme::PANE_PAD))
+                .pt(px(12.))
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(div().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child("Tabs"))
+                .child(div().type_micro().text_color(theme::text_faint()).child("Tabs open in your browser or Teams."))
+                .child(rows),
         );
     }
     if !waiting || late {

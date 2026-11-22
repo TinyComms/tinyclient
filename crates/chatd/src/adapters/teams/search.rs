@@ -2,7 +2,7 @@
 //! supporting account-wide search, team-scoped search, in-conversation search, structured filters
 //! (`from`, `has`, `before`, `after`, `mentions_me`), and jumping into channel reply chains.
 
-use super::{chain_id, id_of, millis, seconds, thread_of, Auth, Body, Fault, Teams, SUBSTRATE};
+use super::{chain_id, id_of, millis, seconds, thread_of, Audience, Auth, Body, Fault, Teams, SUBSTRATE};
 use crate::adapters::SearchScope;
 use protocol::{MessageHit, SearchFilters, SearchHas};
 use serde_json::{json, Value};
@@ -447,7 +447,7 @@ impl Teams {
         }
 
         let endpoint = self.search_endpoint()?;
-        let answer = self.call("POST", &endpoint, Auth::Bearer(SUBSTRATE), Body::Json(&request_obj), true)?.body;
+        let answer = self.call("POST", &endpoint, Auth::Bearer(Audience::Substrate), Body::Json(&request_obj), true)?.body;
         let me = self.me();
         let space_group = match scope {
             SearchScope::Space(space_id) => self.ctx.note(&format!("group:{space_id}")),

@@ -2,7 +2,7 @@
 //! everything done to messages: pages, sending, editing, deleting, reacting.
 
 use super::html::{self, Lookup};
-use super::{chain_id, chain_of, escaped, id_of, millis, now_ms, seconds, thread_of, Body, Fault, Teams, CHAIN, PAGE, TEAMS, TYPING_SHOWN};
+use super::{chain_id, chain_of, escaped, id_of, millis, now_ms, seconds, thread_of, Audience, Body, Fault, Teams, CHAIN, PAGE, TYPING_SHOWN};
 use protocol::{
     Attachment, ConversationKind, Forwarded, MediaFile, MediaKind, MentionKind, Message,
     MessageKind, Preview, Reaction, ReplyTo, Span, Style, ThreadSummary,
@@ -642,7 +642,7 @@ impl Teams {
         let thread = placed.as_ref().map(|(channel, _)| channel.as_str()).unwrap_or_else(|| thread_of(conversation));
         let parent = placed.as_ref().and_then(|(_, root)| root.as_deref()).filter(|root| *root != id);
         let parent = parent.or_else(|| chain_of(conversation).map(|(_, root)| root).filter(|root| *root != id));
-        super::links::message_share(thread, id, &self.session.tenant, parent)
+        super::links::message_share_on(self.cloud.endpoints().teams, thread, id, &self.session.tenant, parent)
     }
 
     /// `ThreadActivity/…`: who joined, left or renamed the conversation, in words. Names come
@@ -679,6 +679,29 @@ impl Teams {
             "MemberJoined" => joined("joined"),
             "MemberLeft" => joined("left"),
             "PictureUpdate" => Some("The picture was changed".to_owned()),
+            "AddTab" | "TabAdded" => {
+                let tab = tab_name_from(content);
+                Some(match (initiator, tab) {
+                    (Some(who), Some(name)) => format!("{who} added tab {name}"),
+                    (None, Some(name)) => format!("Added tab {name}"),
+                    (Some(who), None) => format!("{who} added a tab"),
+                    (None, None) => "Added a tab".to_owned(),
+                })
+            }
+            "UpdateTab" | "TabUpdated" => {
+                let tab = tab_name_from(content);
+                Some(match tab {
+                    Some(name) => format!("Updated tab {name}"),
+                    None => "Updated a tab".to_owned(),
+                })
+            }
+            "DeleteTab" | "RemoveTab" | "TabRemoved" => {
+                let tab = tab_name_from(content);
+                Some(match tab {
+                    Some(name) => format!("Removed tab {name}"),
+                    None => "Removed a tab".to_owned(),
+                })
+            }
             _ => None,
         }
     }
@@ -860,6 +883,147 @@ impl Teams {
         for gif in parsed.gifs {
             message.attachments.push(giphy_gif(&gif, &mut media));
         }
+        for sticker in parsed.stickers {
+            let file = MediaFile {
+                width: sticker.width,
+                height: sticker.height,
+                ..MediaFile::new(format!("sticker:{:x}", super::picker::fnv(&sticker.src)), MediaKind::Image)
+            };
+            media.push((file.clone(), sticker.src.clone()));
+            let named = if sticker.name.trim().is_empty() { "Sticker" } else { sticker.name.trim() };
+            message.attachments.push(Attachment {
+                thumb: Some(file.clone()),
+                sticker: true,
+                ..Attachment::new(named, file)
+            });
+        }
+        let is_voice_msg = matches!(kind, "RichText/Media_AudioMsg" | "RichText/Media_VoiceClip");
+        let is_video_msg = matches!(kind, "RichText/Media_Video" | "RichText/Media_VideoClip");
+        let mut saw_voice_clip = is_voice_msg;
+        let mut saw_video_clip = is_video_msg;
+        let prop_duration = [&props["voiceMessageDuration"], &props["durationInSeconds"], &props["duration"]]
+            .into_iter()
+            .find_map(|v| match v {
+                Value::Number(n) => n.as_f64().filter(|f| *f > 0.0).map(|f| f.round() as u32),
+                Value::String(s) => Some(html::parse_duration_secs(s, false)).filter(|d| *d > 0),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let prop_waveform: Vec<u8> = match &props["waveform"] {
+            Value::Array(items) => items
+                .iter()
+                .filter_map(|v| v.as_u64().map(|n| n.min(255) as u8))
+                .take(protocol::WAVEFORM_LIMIT)
+                .collect(),
+            Value::String(raw) if !raw.trim().is_empty() => {
+                let trimmed = raw.trim();
+                if trimmed.starts_with('[') {
+                    serde_json::from_str::<Vec<u64>>(trimmed)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|n| n.min(255) as u8)
+                        .take(protocol::WAVEFORM_LIMIT)
+                        .collect()
+                } else {
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, trimmed)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .take(protocol::WAVEFORM_LIMIT)
+                        .collect()
+                }
+            }
+            _ => Vec::new(),
+        };
+        for (idx, clip) in parsed.clips.into_iter().enumerate() {
+            match clip.kind {
+                html::ClipKind::Audio => saw_voice_clip = true,
+                html::ClipKind::Video => saw_video_clip = true,
+            }
+            if clip.uri.is_empty() || !self.pictures(&clip.uri) {
+                continue;
+            }
+            let base = clip.uri.trim_end_matches('/');
+            let object = base
+                .split("/objects/")
+                .nth(1)
+                .and_then(|rest| rest.split('/').next())
+                .filter(|s| !s.is_empty())
+                .or_else(|| (!clip.doc_id.is_empty()).then_some(clip.doc_id.as_str()))
+                .unwrap_or(&id);
+            match clip.kind {
+                html::ClipKind::Audio => {
+                    let fetch_url = if base.contains("/views/") {
+                        base.to_owned()
+                    } else {
+                        format!("{base}/views/audio")
+                    };
+                    let named = if clip.name.trim().is_empty() { "Voice message" } else { clip.name.trim() };
+                    let ext = named.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+                    let mime = match ext.as_str() {
+                        "ogg" | "oga" | "opus" => "audio/ogg",
+                        "mp3" => "audio/mpeg",
+                        "wav" => "audio/wav",
+                        "webm" => "audio/webm",
+                        _ => "audio/mp4",
+                    };
+                    let file = MediaFile {
+                        bytes: clip.bytes,
+                        ..MediaFile::new(format!("voice:{}:{idx}", escaped(object)), MediaKind::Audio)
+                    };
+                    media.push((file.clone(), fetch_url));
+                    message.attachments.push(Attachment {
+                        mime: mime.to_owned(),
+                        duration: if clip.duration > 0 { clip.duration } else { prop_duration },
+                        waveform: prop_waveform.clone(),
+                        ..Attachment::new(named, file)
+                    });
+                }
+                html::ClipKind::Video => {
+                    let fetch_url = if base.contains("/views/") {
+                        base.to_owned()
+                    } else {
+                        format!("{base}/views/video")
+                    };
+                    let named = if clip.name.trim().is_empty() { "Video clip" } else { clip.name.trim() };
+                    let ext = named.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+                    let mime = match ext.as_str() {
+                        "webm" => "video/webm",
+                        "mov" => "video/quicktime",
+                        _ => "video/mp4",
+                    };
+                    let file = MediaFile {
+                        width: clip.width,
+                        height: clip.height,
+                        bytes: clip.bytes,
+                        ..MediaFile::new(format!("video:{}:{idx}", escaped(object)), MediaKind::Video)
+                    };
+                    media.push((file.clone(), fetch_url));
+                    let thumb_url = if !clip.thumb.is_empty() && self.pictures(&clip.thumb) {
+                        Some(clip.thumb.clone())
+                    } else if base.contains("/objects/") {
+                        let root = base.split("/views/").next().unwrap_or(base);
+                        Some(format!("{root}/views/video_imgt1"))
+                    } else {
+                        None
+                    };
+                    let thumb = thumb_url.map(|u| {
+                        let t = MediaFile {
+                            width: clip.width,
+                            height: clip.height,
+                            ..MediaFile::new(format!("video:{}:{idx}:thumb", escaped(object)), MediaKind::Image)
+                        };
+                        media.push((t.clone(), u));
+                        t
+                    });
+                    message.attachments.push(Attachment {
+                        thumb,
+                        mime: mime.to_owned(),
+                        duration: if clip.duration > 0 { clip.duration } else { prop_duration },
+                        ..Attachment::new(named, file)
+                    });
+                }
+            }
+        }
         let shared_files = listed(&props["files"]);
         if !shared_files.is_empty() {
             let mut state = self.state();
@@ -971,7 +1135,7 @@ impl Teams {
                 })
                 .or_else(|| {
                     (!orig_conv_id.is_empty() && !orig_msg_id.is_empty())
-                        .then(|| super::links::message_share(&orig_conv_id, &orig_msg_id, &self.session.tenant, None))
+                        .then(|| super::links::message_share_on(self.cloud.endpoints().teams, &orig_conv_id, &orig_msg_id, &self.session.tenant, None))
                 })
                 .unwrap_or_default();
             let fwd_body = html_fwd
@@ -1015,7 +1179,7 @@ impl Teams {
             message.text = title.map_or_else(|| "Meeting".to_owned(), |title| format!("Meeting: {title}"));
             message.spans.clear();
             message.kind = MessageKind::Unsupported {
-                link: format!("{TEAMS}/l/meetup-join/{}/0", escaped(conversation)),
+                link: super::links::meeting_share_on(self.cloud.endpoints().teams, conversation),
             };
         } else if let Some(component) = loop_card(&cards) {
             // A Loop component names itself and opens its file. Live editing is not drawn.
@@ -1057,7 +1221,13 @@ impl Teams {
                 message.kind = MessageKind::Unsupported { link };
             }
         } else if message.text.is_empty() && message.attachments.is_empty() && message.card.is_none() && message.poll.is_none() && message.previews.is_empty() {
-            message.text = "Unsupported message".to_owned();
+            message.text = if saw_voice_clip {
+                "Voice message".to_owned()
+            } else if saw_video_clip {
+                "Video clip".to_owned()
+            } else {
+                "Unsupported message".to_owned()
+            };
             message.kind = MessageKind::Unsupported { link: self.message_link(conversation, &id, raw) };
         }
         message.client_id = echoed_client_id(raw, message.outgoing, &id);
@@ -1726,7 +1896,7 @@ pub(super) fn invoke_card_action(
         let place = self.place().ok()?;
         let endpoint = format!("{}/v1/urlpreview", place.middle);
         let body = json!({"url": url});
-        let answer = self.call("POST", &endpoint, super::Auth::Both(super::SPACES), Body::Json(&body), false).ok()?;
+        let answer = self.call("POST", &endpoint, super::Auth::Both(Audience::Spaces), Body::Json(&body), false).ok()?;
         let info = &answer.body;
         let title = [&info["title"], &info["previewTitle"]].into_iter().filter_map(Value::as_str).find(|s| !s.is_empty()).unwrap_or("");
         let description = [&info["description"], &info["previewDescription"]].into_iter().filter_map(Value::as_str).find(|s| !s.is_empty()).unwrap_or("");
@@ -1907,8 +2077,117 @@ pub(super) fn invoke_card_action(
         Ok(message)
     }
 
+    /// Posts a message with caller-built raw content and an explicit Teams `messagetype`
+    /// (e.g. `RichText/Media_AudioMsg` for voice notes, or `RichText/Html` for GIF/sticker embeds).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn post_raw_message(
+        &self,
+        conversation: &str,
+        client_id: &str,
+        message_type: &str,
+        content: &str,
+        reply_to: Option<&str>,
+        with: &protocol::Outgoing,
+        mut properties: Option<Value>,
+        attachments: Vec<Attachment>,
+    ) -> Result<Message, Fault> {
+        let mut target = conversation.to_owned();
+        let quote = match reply_to {
+            Some(original) => self.quoted(conversation, original)?,
+            None => None,
+        };
+        let channel = chain_of(conversation).is_none() && self.ctx.known(conversation)?.is_some_and(|row| row.kind == ConversationKind::Channel);
+        let mut wire_content = content.to_owned();
+        if let Some(level) = importance_wire(with.importance) {
+            let props = properties.get_or_insert_with(|| json!({}));
+            if let Some(map) = props.as_object_mut() {
+                map.insert("importance".to_owned(), Value::String(level.to_owned()));
+            }
+        }
+        match (reply_to, &quote) {
+            (Some(original), _) if channel => target = chain_id(conversation, original),
+            (_, Some(quote)) if message_type == "RichText/Html" => wire_content = format!("{}{wire_content}", quote_markup(quote)),
+            _ => {}
+        }
+        let path = format!("/v1/users/ME/conversations/{}/messages", escaped(&target));
+        let mut body = json!({
+            "clientmessageid": client_id,
+            "content": wire_content,
+            "messagetype": message_type,
+            "contenttype": "text",
+            "imdisplayname": self.own_name(),
+        });
+        if let Some(properties) = properties {
+            body["properties"] = properties;
+        }
+        let answer = self.chat("POST", &path, Body::Json(&body), false).map_err(|fault| match fault {
+            Fault::Refused { status: 403, .. } if channel && reply_to.is_none() => Fault::Refused {
+                status: 403,
+                message: "Only channel moderators can start new posts here.".to_owned(),
+            },
+            other => other,
+        })?;
+        let id = id_of(&answer.body["OriginalArrivalTime"]);
+        if millis(&id) == 0 {
+            return Err(Fault::Net("Teams accepted the message but did not name it".to_owned()));
+        }
+        let me = self.me();
+        let name = self.own_name();
+        let sent = millis(&id) / 1000;
+        let mut message = Message::plain(id, name.clone(), String::new(), sent, true);
+        message.importance = with.importance;
+        message.attachments = attachments;
+        message.sender.avatar = self.picture(&me, &name);
+        message.sender.id = me;
+        if let Some((channel, root)) = chain_of(&target) {
+            if target != conversation {
+                self.chain_known(channel, root)?;
+                self.ctx.history(&target, std::slice::from_ref(&message))?;
+            }
+            self.bump(channel, root, &[&message], false)?;
+        }
+        message.reply_to = quote;
+        Ok(message)
+    }
+
     fn message_path(&self, conversation: &str, id: &str) -> String {
         format!("/v1/users/ME/conversations/{}/messages/{}", escaped(conversation), escaped(id))
+    }
+
+    /// Translates one stored message on demand through Teams' middle-tier translation service.
+    /// Ephemeral: never overwrites the stored original message.
+    pub(super) fn translate(&self, conversation: &str, message_id: &str, to: &str) -> Result<crate::adapters::Translation, Fault> {
+        if self.state().translation_disabled {
+            return Err(Fault::Refused {
+                status: 403,
+                message: "Message translation is disabled by your Teams organization.".to_owned(),
+            });
+        }
+        let Some(stored) = self.ctx.stored_message(conversation, message_id)? else {
+            return Err(Fault::Refused {
+                status: 404,
+                message: "Message not found.".to_owned(),
+            });
+        };
+        let original = stored.text.trim();
+        if original.is_empty() {
+            return Err(Fault::Refused {
+                status: 400,
+                message: "This message has no text to translate.".to_owned(),
+            });
+        }
+        let place = self.place()?;
+        let url = format!("{}/v1/messages/translate", place.middle);
+        let body = json!({
+            "text": original,
+            "targetLanguage": to,
+            "conversationId": thread_of(conversation),
+            "messageId": message_id,
+        });
+        let answer = self.call("POST", &url, super::Auth::Both(Audience::Spaces), Body::Json(&body), false)?;
+        parse_translation_response(&answer.body).ok_or_else(|| {
+            Fault::Net("Teams returned no translated text.".to_owned())
+        })
     }
 
     pub(super) fn edit(&self, conversation: &str, id: &str, text: &str, mention_spans: &[Span]) -> Result<(), Fault> {
@@ -2169,6 +2448,58 @@ pub(super) fn prove_chain_paging() -> Result<(), String> {
         return Err(format!("a jump into a chain did not ask by time: {jump}"));
     }
     Ok(())
+}
+
+/// Extracts a tab's display name from a Teams `ThreadActivity/*Tab*` XML or JSON payload.
+fn tab_name_from(content: &str) -> Option<String> {
+    if let Ok(parsed) = serde_json::from_str::<Value>(content) {
+        for key in ["tabName", "displayName", "name", "title"] {
+            if let Some(name) = parsed[key].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                return Some(name.to_owned());
+            }
+        }
+    }
+    for tag in ["tabName", "tabname", "displayName", "displayname", "name", "value"] {
+        if let Some(found) = inside(content, tag).first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            return Some(found.to_owned());
+        }
+    }
+    None
+}
+
+/// Reads a translated message body and optional detected language from Teams' translate response.
+fn parse_translation_response(body: &Value) -> Option<crate::adapters::Translation> {
+    let direct_text = [&body["translatedText"], &body["translation"], &body["text"]]
+        .into_iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .find(|s| !s.is_empty());
+    if let Some(text) = direct_text {
+        let detected = [
+            &body["detectedLanguage"]["language"],
+            &body["detectedLanguage"],
+            &body["sourceLanguage"],
+            &body["from"],
+        ]
+        .into_iter()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .unwrap_or("")
+        .to_owned();
+        return Some(crate::adapters::Translation { text: text.to_owned(), detected_language: detected });
+    }
+    let first = body.as_array()?.first()?;
+    let text = first["translations"].as_array()?.first()?["text"].as_str()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let detected = first["detectedLanguage"]["language"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    Some(crate::adapters::Translation { text: text.to_owned(), detected_language: detected })
 }
 
 #[cfg(test)]
@@ -2482,5 +2813,31 @@ mod tests {
         assert!(matching_control(&message, "app", "approve", r#"{"action":"approve"}"#).is_some());
         assert!(matching_control(&message, "app", "approve", r#"{"action":"reject"}"#).is_none());
         assert!(matching_control(&message, "other", "approve", r#"{"action":"approve"}"#).is_none());
+    }
+
+    #[test]
+    fn parse_translation_response_reads_object_and_cognitive_array_shapes() {
+        let obj = json!({"translatedText": "Hello world", "detectedLanguage": "es"});
+        let t1 = parse_translation_response(&obj).unwrap();
+        assert_eq!((t1.text.as_str(), t1.detected_language.as_str()), ("Hello world", "es"));
+
+        let arr = json!([{"detectedLanguage": {"language": "ja"}, "translations": [{"text": "Good morning", "to": "en"}]}]);
+        let t2 = parse_translation_response(&arr).unwrap();
+        assert_eq!((t2.text.as_str(), t2.detected_language.as_str()), ("Good morning", "ja"));
+
+        assert!(parse_translation_response(&json!({"translatedText": "   "})).is_none());
+    }
+
+    #[test]
+    fn tab_activity_extracts_tab_name_from_xml_and_json() {
+        assert_eq!(
+            tab_name_from("<addtab><initiator>8:orgid:ana</initiator><tabName>Sprint Board</tabName></addtab>").as_deref(),
+            Some("Sprint Board")
+        );
+        assert_eq!(
+            tab_name_from(r#"{"displayName":"Runbook"}"#).as_deref(),
+            Some("Runbook")
+        );
+        assert_eq!(tab_name_from("<addtab></addtab>"), None);
     }
 }
