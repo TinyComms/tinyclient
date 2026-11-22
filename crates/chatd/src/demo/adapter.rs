@@ -228,25 +228,22 @@ impl Demo {
     }
 
     /// Our reaction as the network would report it. A custom emoji is named by its file's id.
-    fn reaction(&self, emoji: &str) -> Reaction {
+    /// A super reaction is counted on its own, not as a normal one.
+    fn reaction(&self, emoji: &str, burst: bool) -> Reaction {
         let custom = self.hub.store().media(&self.ctx.account, &[emoji.to_owned()]).ok().and_then(|mut known| known.pop());
-        match custom {
-            Some((file, _)) => Reaction {
-                emoji: format!(":{}:", emoji.trim_start_matches("emoji-")),
-                file: Some(file),
-                count: 1,
-                mine: true,
-                who: Vec::new(),
-                ..Reaction::default()
-            },
-            None => Reaction {
-                emoji: emoji.to_owned(),
-                file: None,
-                count: 1,
-                mine: true,
-                who: Vec::new(),
-                ..Reaction::default()
-            },
+        let (emoji, file) = match custom {
+            Some((file, _)) => (format!(":{}:", emoji.trim_start_matches("emoji-")), Some(file)),
+            None => (emoji.to_owned(), None),
+        };
+        Reaction {
+            emoji,
+            file,
+            count: if burst { 0 } else { 1 },
+            mine: !burst,
+            who: Vec::new(),
+            burst: u32::from(burst),
+            mine_burst: burst,
+            burst_colors: Vec::new(),
         }
     }
 
@@ -637,10 +634,13 @@ impl Demo {
             }
             Network::Discord => {
                 let direct = row.as_ref().is_none_or(|row| row.space.is_none());
+                let join_only = row.is_some_and(|row| row.read_only);
                 ReactionRules {
                     custom: if direct { EmojiScope::None } else { EmojiScope::Space },
-                    join_only: row.is_some_and(|row| row.read_only),
+                    join_only,
                     distinct: 20,
+                    // The demo Discord account has super reactions. A read-only channel still cannot start one.
+                    burst: !join_only,
                     ..ReactionRules::default()
                 }
             }
@@ -655,8 +655,8 @@ impl Demo {
     fn serve(demo: &Arc<Demo>, command: Command) {
         match command {
             Command::Send { conversation_id, client_id, text, reply_to } => demo.send(&conversation_id, &client_id, text, reply_to),
-            Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
-                let reacted = demo.ctx.reacted(&conversation_id, &message_id, &demo.reaction(&emoji), on);
+            Command::React { conversation_id, message_id, emoji, on, burst, reply } => {
+                let reacted = demo.ctx.reacted(&conversation_id, &message_id, &demo.reaction(&emoji, burst), on);
                 let _ = reply.send(reacted.map_err(|err| Refusal::Refused(err.to_string())));
             }
             Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
