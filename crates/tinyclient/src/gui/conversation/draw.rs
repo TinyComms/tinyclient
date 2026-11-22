@@ -36,6 +36,31 @@ use std::time::Duration;
 /// How long the tint on a jump's target takes to fade.
 pub const FLASH: Duration = Duration::from_millis(1200);
 
+#[test]
+fn translation_attribution_only_claims_a_known_source() {
+    let mut translation = protocol::Translation {
+        text: "See you tomorrow.".into(),
+        source_lang: Some("es".into()),
+        target_lang: "en".into(),
+    };
+    assert_eq!(translation_attribution(&translation), "Translated from Spanish");
+    for source in [None, Some("auto"), Some("und"), Some(" ")] {
+        translation.source_lang = source.map(str::to_owned);
+        assert_eq!(translation_attribution(&translation), "Translated to English");
+    }
+}
+
+fn translation_attribution(translation: &protocol::Translation) -> String {
+    let source = translation.source_lang.as_deref().map(str::trim).filter(|tag| {
+        let primary = tag.split(['-', '_']).next().unwrap_or_default();
+        !primary.is_empty() && !["auto", "und", "mul", "zxx"].iter().any(|code| primary.eq_ignore_ascii_case(code))
+    });
+    match source {
+        Some(tag) => format!("Translated from {}", protocol::language_name(tag)),
+        None => format!("Translated to {}", protocol::language_name(&translation.target_lang)),
+    }
+}
+
 fn poll_percentage(count: u32, total: u32) -> u32 {
     if total == 0 {
         return 0;
@@ -1170,12 +1195,7 @@ impl Pane {
                 );
             } else if let Some(translated) = self.translations.get(&message.id).cloned() {
                 let clear_id = message.id.clone();
-                let attribution = match translated.source_lang.as_deref() {
-                    Some(src) if !src.is_empty() && !src.eq_ignore_ascii_case("auto") => {
-                        format!("Translated from {}", protocol::language_name(src))
-                    }
-                    _ => format!("Translated to {}", protocol::language_name(&translated.target_lang)),
-                };
+                let attribution = translation_attribution(&translated);
                 sent = sent.child(
                     div()
                         .mt(px(4.))
@@ -1198,6 +1218,10 @@ impl Pane {
                                 .child(
                                     div()
                                         .id(SharedString::from(format!("translation-clear-{}", message.id)))
+                                        .role(gpui::Role::Button)
+                                        .aria_label("Show original")
+                                        .tab_index(0)
+                                        .focus_visible(|style| style.shadow(theme::focus_ring()))
                                         .cursor_pointer()
                                         .text_color(theme::text_soft())
                                         .hover(|style| style.underline())

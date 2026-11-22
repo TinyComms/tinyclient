@@ -1078,8 +1078,12 @@ impl Demo {
                     Err(Refusal::Refused("Nothing to translate.".to_owned()))
                 } else {
                     Ok(protocol::Translation {
-                        text: format!("[{target_lang}] {original}"),
-                        source_lang: Some("auto".to_owned()),
+                        text: if original == super::telegram::FERRY_ORIGINAL && target_lang == "en" {
+                            super::telegram::FERRY_ENGLISH.to_owned()
+                        } else {
+                            format!("[{target_lang}] {original}")
+                        },
+                        source_lang: (original == super::telegram::FERRY_ORIGINAL).then(|| "es".to_owned()),
                         target_lang,
                     })
                 };
