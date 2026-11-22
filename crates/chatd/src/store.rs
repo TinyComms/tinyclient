@@ -3421,7 +3421,7 @@ impl Store {
         Ok(outcome)
     }
 
-    /// A transcript line that is not a message. The conversation must already exist. A row
+    /// A transcription line that is not a message. The conversation must already exist. A row
     /// with this id is left alone, so a replay does not count twice. `bump_unread` adds one
     /// to the unread count and changes nothing else on the conversation: not the preview,
     /// not when it was updated, not whether it is hidden.

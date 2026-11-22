@@ -272,14 +272,14 @@ impl Pane {
     pub(super) fn transcribe_button(&self, message: &Rc<Message>, index: usize, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let can_transcribe = self.open.as_ref().is_some_and(|open| open.can.transcribe);
         let attachment = message.attachments.get(index)?;
-        if !can_transcribe && attachment.transcript.is_none() {
+        if !can_transcribe && attachment.transcription.is_none() {
             return None;
         }
         let slot = (message.id.clone(), index);
         let busy = self.transcribing.contains(&slot)
-            || attachment.transcript.as_ref().is_some_and(|t| t.pending);
+            || attachment.transcription.as_ref().is_some_and(|t| t.pending);
         let has_ready = attachment
-            .transcript
+            .transcription
             .as_ref()
             .is_some_and(|t| !t.pending && t.failed.is_none() && !t.text.is_empty());
         let collapsed = self.transcript_collapsed.contains(&slot);
@@ -329,13 +329,13 @@ impl Pane {
         )
     }
 
-    /// Collapsible transcript panel rendered under a voice player or round video circle.
+    /// Collapsible transcription panel rendered under a voice player or round video circle.
     pub(super) fn transcript_block(&self, message: &Rc<Message>, index: usize, cx: &mut Context<Self>) -> Option<Div> {
         let attachment = message.attachments.get(index)?;
         let slot = (message.id.clone(), index);
         let inflight = self.transcribing.contains(&slot);
-        let transcript = attachment.transcript.as_ref();
-        if !inflight && transcript.is_none() {
+        let transcription = attachment.transcription.as_ref();
+        if !inflight && transcription.is_none() {
             return None;
         }
         if !inflight && self.transcript_collapsed.contains(&slot) {
@@ -353,7 +353,7 @@ impl Pane {
             .flex()
             .flex_col()
             .gap(px(4.));
-        if inflight && transcript.is_none() {
+        if inflight && transcription.is_none() {
             return Some(
                 box_div.child(
                     div()
@@ -363,7 +363,7 @@ impl Pane {
                 ),
             );
         }
-        if let Some(tr) = transcript {
+        if let Some(tr) = transcription {
             if let Some(failed) = &tr.failed {
                 box_div = box_div.child(
                     div()
@@ -523,7 +523,7 @@ impl Pane {
             .gap(px(10.))
             .when_some(reason, |row, reason| row.tooltip(tip(format!("{reason} Click play to try again."), None)));
         let transcribe_btn = if voice { self.transcribe_button(message, index, cx) } else { None };
-        let transcript = if voice { self.transcript_block(message, index, cx) } else { None };
+        let transcription = if voice { self.transcript_block(message, index, cx) } else { None };
         let row = if voice {
             let unplayed = message.media_unread && (message.outgoing || shown.status == Status::Idle);
             let unplayed_dot = unplayed.then(|| {
@@ -562,7 +562,7 @@ impl Pane {
                 .child(div().flex().items_center().gap(px(8.)).child(track).child(time));
             row.h(px(56.)).child(button).child(lines).child(speed)
         };
-        match transcript {
+        match transcription {
             Some(block) => div().flex().flex_col().gap(px(4.)).child(row).child(block).into_any_element(),
             None => row.into_any_element(),
         }

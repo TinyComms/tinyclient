@@ -6208,7 +6208,7 @@ fn voice_transcription_streams_update_persists_across_restart_and_reports_trial_
     let voice_msg = world.until("incoming voice message", || {
         world.messages("u7002").into_iter().find(|m| m.attachments.iter().any(|a| !a.waveform.is_empty()))
     });
-    assert!(voice_msg.attachments[0].transcript.is_none(), "never transcribe automatically");
+    assert!(voice_msg.attachments[0].transcription.is_none(), "never transcribe automatically");
     assert_eq!(world.called("TranscribeAudio"), 0, "no automatic transcription call");
 
     // 1. Pending transcription response followed by `updateTranscribedAudio` completing the text.
@@ -6218,8 +6218,8 @@ fn voice_transcription_streams_update_persists_across_restart_and_reports_trial_
         message_id: voice_msg.id.clone(),
     });
     let pending = match resp {
-        Response::Transcript { transcript } => transcript,
-        other => panic!("expected Transcript, got {other:?}"),
+        Response::Transcription { transcription } => transcription,
+        other => panic!("expected Transcription, got {other:?}"),
     };
     assert!(pending.pending);
     assert_eq!(pending.id, 901);
@@ -6230,9 +6230,9 @@ fn voice_transcription_streams_update_persists_across_restart_and_reports_trial_
 
     // Final part arrives via updateTranscribedAudio.
     world.steer(&format!("transcribe-update u7002 {} 0 Meet at the trailhead at seven.", voice_msg.id));
-    let completed = world.until("transcript completed by update", || {
+    let completed = world.until("transcription completed by update", || {
         let msg = world.message("u7002", &voice_msg.id)?;
-        let tr = msg.attachments.first()?.transcript.clone()?;
+        let tr = msg.attachments.first()?.transcription.clone()?;
         (!tr.pending && tr.text == "Meet at the trailhead at seven.").then_some(tr)
     });
     assert_eq!(completed.id, 901);
@@ -6253,9 +6253,9 @@ fn voice_transcription_streams_update_persists_across_restart_and_reports_trial_
     // Persisted in store across chatd restart.
     world.restart();
     world.connected();
-    let after_restart = world.until("transcript survives restart", || {
+    let after_restart = world.until("transcription survives restart", || {
         let msg = world.message("u7002", &voice_msg.id)?;
-        let tr = msg.attachments.first()?.transcript.clone()?;
+        let tr = msg.attachments.first()?.transcription.clone()?;
         (tr.text == "Meet at the trailhead at seven." && tr.rated == Some(true)).then_some(tr)
     });
     assert!(!after_restart.pending);
@@ -6267,8 +6267,8 @@ fn voice_transcription_streams_update_persists_across_restart_and_reports_trial_
         message_id: voice_msg.id.clone(),
     });
     let exhausted = match resp {
-        Response::Transcript { transcript } => transcript,
-        other => panic!("expected Transcript on exhausted trial, got {other:?}"),
+        Response::Transcription { transcription } => transcription,
+        other => panic!("expected Transcription on exhausted trial, got {other:?}"),
     };
     assert!(!exhausted.pending);
     assert_eq!(exhausted.trial_remains, Some(0));

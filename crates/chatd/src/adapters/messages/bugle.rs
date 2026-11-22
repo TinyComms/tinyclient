@@ -3242,7 +3242,7 @@ fn decode_messages(bytes: &[u8]) -> Vec<Note> {
             continue;
         }
         // 300 is MESSAGE_DELETED. A known tombstone is a system line. The rest of 200–299
-        // stay hidden: they are toolstones, not something to put in the transcript.
+        // stay hidden: they are toolstones, not something to put in the transcription.
         // Encryption changes were already taken above.
         if status == 300 {
             notes.push(Note {

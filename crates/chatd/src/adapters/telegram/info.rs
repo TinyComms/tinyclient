@@ -2599,7 +2599,7 @@ pub(super) fn mark_unread_items_read(
     Ok(())
 }
 
-/// Finds the voice or round video attachment on a message to attach a transcript to.
+/// Finds the voice or round video attachment on a message to attach a transcription to.
 fn transcript_slot(attachments: &mut [protocol::Attachment]) -> Option<&mut protocol::Attachment> {
     let idx = attachments
         .iter()
@@ -2614,11 +2614,11 @@ pub(super) fn transcribe(
     account: &Account,
     conversation: &str,
     message_id: &str,
-) -> Result<protocol::Transcript, Fault> {
+) -> Result<protocol::Transcription, Fault> {
     let (who, _) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
     let msg_id = message_id.parse::<i32>().map_err(|_| invalid("MESSAGE_ID_INVALID"))?;
     let peer = account.input(who)?;
-    let transcript = match account.ask(&tl::functions::messages::TranscribeAudio { peer, msg_id }) {
+    let transcription = match account.ask(&tl::functions::messages::TranscribeAudio { peer, msg_id }) {
         Ok(tl::enums::messages::TranscribedAudio::Audio(res)) => {
             let trial_remains = res.trial_remains_num.map(|n| n.max(0) as u32);
             let trial_resets_at = res.trial_remains_until_date.map(i64::from);
@@ -2627,7 +2627,7 @@ pub(super) fn transcribe(
             } else {
                 None
             };
-            protocol::Transcript {
+            protocol::Transcription {
                 id: res.transcription_id,
                 text: res.text,
                 pending: res.pending,
@@ -2637,7 +2637,7 @@ pub(super) fn transcribe(
                 rated: None,
             }
         }
-        Err(fault) if fault.is("PREMIUM_ACCOUNT_REQUIRED") => protocol::Transcript {
+        Err(fault) if fault.is("PREMIUM_ACCOUNT_REQUIRED") => protocol::Transcription {
             id: 0,
             text: String::new(),
             pending: false,
@@ -2646,7 +2646,7 @@ pub(super) fn transcribe(
             trial_resets_at: None,
             rated: None,
         },
-        Err(fault) if fault.is("TRANSCRIPTION_FAILED") => protocol::Transcript {
+        Err(fault) if fault.is("TRANSCRIPTION_FAILED") => protocol::Transcription {
             id: 0,
             text: String::new(),
             pending: false,
@@ -2659,11 +2659,11 @@ pub(super) fn transcribe(
     };
     if let Ok(Some(mut stored)) = account.ctx.stored_message(conversation, message_id) {
         if let Some(att) = transcript_slot(&mut stored.attachments) {
-            att.transcript = Some(transcript.clone());
+            att.transcription = Some(transcription.clone());
             let _ = account.ctx.history(conversation, std::slice::from_ref(&stored));
         }
     }
-    Ok(transcript)
+    Ok(transcription)
 }
 
 /// Applies an incremental or final `updateTranscribedAudio` update onto the stored message.
@@ -2682,12 +2682,12 @@ pub(super) fn apply_transcript_update(
     let Some(att) = transcript_slot(&mut stored.attachments) else {
         return;
     };
-    let mut next = att.transcript.clone().unwrap_or_default();
+    let mut next = att.transcription.clone().unwrap_or_default();
     next.id = transcription_id;
     next.text = text.to_owned();
     next.pending = pending;
     next.failed = None;
-    att.transcript = Some(next);
+    att.transcription = Some(next);
     let _ = account.ctx.history(conversation, std::slice::from_ref(&stored));
 }
 
@@ -2710,7 +2710,7 @@ pub(super) fn rate_transcript(
     })?;
     if let Ok(Some(mut stored)) = account.ctx.stored_message(conversation, message_id) {
         if let Some(att) = transcript_slot(&mut stored.attachments) {
-            if let Some(tr) = att.transcript.as_mut() {
+            if let Some(tr) = att.transcription.as_mut() {
                 tr.rated = Some(good);
                 let _ = account.ctx.history(conversation, std::slice::from_ref(&stored));
             }

@@ -411,7 +411,7 @@ mod tests {
             round: false,
             view_once: false,
             sticker_set: String::new(),
-            transcript: None,
+            transcription: None,
         };
         assert_eq!(shape(&attachment("a.png", MediaKind::Image, "image/png", true, 0)), Shape::Image);
         assert_eq!(shape(&attachment("a.mp4", MediaKind::Video, "video/mp4", true, 84)), Shape::Video);

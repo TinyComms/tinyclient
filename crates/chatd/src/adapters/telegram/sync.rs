@@ -1652,9 +1652,9 @@ pub(super) fn finish(account: &Account, conversation: &str, mapped: &mut Mapped,
     if !mapped.message.attachments.is_empty() {
         if let Ok(Some(stored)) = account.ctx.stored_message(conversation, &mapped.message.id) {
             for att in &mut mapped.message.attachments {
-                if att.transcript.is_none() {
+                if att.transcription.is_none() {
                     if let Some(prev) = stored.attachments.iter().find(|old| old.file.id == att.file.id) {
-                        att.transcript = prev.transcript.clone();
+                        att.transcription = prev.transcription.clone();
                     }
                 }
             }

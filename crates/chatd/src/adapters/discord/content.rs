@@ -519,7 +519,7 @@ fn attachment(rich: &mut Rich, attached: &Attached) -> Attachment {
         round: false,
         view_once: false,
         sticker_set: String::new(),
-        transcript: None,
+        transcription: None,
     }
 }
 
@@ -555,7 +555,7 @@ fn sticker(rich: &mut Rich, sticker: &model::Sticker) -> Attachment {
         round: false,
         view_once: false,
         sticker_set: String::new(),
-        transcript: None,
+        transcription: None,
     }
 }
 

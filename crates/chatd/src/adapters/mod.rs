@@ -1000,7 +1000,7 @@ pub enum Command {
     Transcribe {
         conversation_id: String,
         message_id: String,
-        reply: Reply<protocol::Transcript>,
+        reply: Reply<protocol::Transcription>,
     },
     /// Rate a completed transcription (`messages.rateTranscribedAudio`).
     RateTranscript {

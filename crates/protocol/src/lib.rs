@@ -3072,7 +3072,7 @@ pub enum Request {
         to: String,
     },
     /// Transcribe a voice or round video message on the network (`messages.transcribeAudio`).
-    /// Never called automatically. Answers `Response::Transcript`.
+    /// Never called automatically. Answers `Response::Transcription`.
     Transcribe {
         conversation: Key,
         message_id: String,
@@ -3714,9 +3714,9 @@ pub enum Response {
     UnreadItems {
         message_ids: Vec<String>,
     },
-    /// Answers `Request::Transcribe`: the transcript state returned by the network.
-    Transcript {
-        transcript: Transcript,
+    /// Answers `Request::Transcribe`: the transcription state returned by the network.
+    Transcription {
+        transcription: Transcription,
     },
 }
 

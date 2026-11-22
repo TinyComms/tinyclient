@@ -156,16 +156,16 @@ pub struct Span {
 }
 
 /// Server-side transcription of a voice or round video message (Telegram).
-/// Stored inside [`Attachment::transcript`] so it survives restarts.
+/// Stored inside [`Attachment::transcription`] so it survives restarts.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Transcript {
+pub struct Transcription {
     /// Network transcription id (used for rating feedback).
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub id: i64,
     /// Transcribed text so far (may stream in chunks while `pending` is true).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
-    /// True while the network is still generating the transcript.
+    /// True while the network is still generating the transcription.
     #[serde(default, skip_serializing_if = "is_false")]
     pub pending: bool,
     /// Plain-words failure or quota message (e.g. Premium required when trial is used up).
@@ -221,9 +221,9 @@ pub struct Attachment {
     /// Telegram sticker pack as `id:access_hash` or a short name. Empty on every other attachment.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub sticker_set: String,
-    /// Server-side speech-to-text transcript for a voice or round video message.
+    /// Server-side speech-to-text transcription for a voice or round video message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transcript: Option<Transcript>,
+    pub transcription: Option<Transcription>,
 }
 
 impl Attachment {
@@ -242,7 +242,7 @@ impl Attachment {
             round: false,
             view_once: false,
             sticker_set: String::new(),
-            transcript: None,
+            transcription: None,
         }
     }
 }
@@ -1014,7 +1014,7 @@ pub struct Message {
     /// Why a read list is empty. "Read receipts are off" when this account does not share them.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub receipt_note: String,
-    /// Structured metadata for a call transcript row (`MessageKind::System`).
+    /// Structured metadata for a call transcription row (`MessageKind::System`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call: Option<CallNote>,
     /// Per-message edit override when the network decides per message. `None`: derived from

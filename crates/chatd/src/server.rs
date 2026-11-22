@@ -3357,7 +3357,7 @@ impl Chat {
                     message_id,
                     reply,
                 }) {
-                    Ok(transcript) => Response::Transcript { transcript },
+                    Ok(transcription) => Response::Transcription { transcription },
                     Err(refused) => *refused,
                 }
             }

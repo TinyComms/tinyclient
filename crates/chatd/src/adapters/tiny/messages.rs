@@ -3994,7 +3994,7 @@ fn format_call_duration(seconds: u32) -> String {
     }
 }
 
-/// The transcript line for a finished call. Nothing about the conversation row changes except the
+/// The transcription line for a finished call. Nothing about the conversation row changes except the
 /// unread count, and only for a missed call we did not place.
 fn record_call(
     ctx: &Context,
