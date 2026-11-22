@@ -14,6 +14,7 @@ x11rb::atom_manager! {
     Atoms: AtomsCookie {
         _NET_CLIENT_LIST,
         _NET_WM_NAME,
+        _NET_WM_PID,
         _NET_WM_WINDOW_TYPE,
         _NET_WM_WINDOW_TYPE_DESKTOP,
         _NET_WM_WINDOW_TYPE_DOCK,
@@ -61,6 +62,7 @@ struct Capture {
     root: Window,
     randr: bool,
     composite: bool,
+    compositor_selection: Atom,
     fixes: bool,
     shm: bool,
     shared: Option<SharedImage>,
@@ -117,6 +119,12 @@ impl Capture {
             .ok()
             .and_then(|reply| reply.reply().ok())
             .is_some_and(|reply| (reply.major_version, reply.minor_version) >= (0, 2));
+        let compositor_selection = conn
+            .intern_atom(false, format!("_NET_WM_CM_S{screen}").as_bytes())
+            .map_err(|_| READ_FAILED.to_owned())?
+            .reply()
+            .map_err(|_| READ_FAILED.to_owned())?
+            .atom;
         let fixes = xfixes::query_version(&conn, 2, 0)
             .ok()
             .and_then(|reply| reply.reply().ok())
@@ -131,6 +139,7 @@ impl Capture {
             root,
             randr,
             composite,
+            compositor_selection,
             fixes,
             shm,
             shared: None,
@@ -209,11 +218,21 @@ impl Capture {
         else {
             return Vec::new();
         };
+        let picker_pid = std::env::var("TINYCLIENT_SHARE_PICKER_PID")
+            .ok()
+            .and_then(|pid| pid.parse::<u32>().ok());
         clients
             .value32()
             .into_iter()
             .flatten()
             .filter_map(|window| {
+                if picker_pid.is_some_and(|pid| {
+                    self.property(window, atoms._NET_WM_PID, AtomEnum::CARDINAL.into())
+                        .and_then(|value| value.value32()?.next())
+                        == Some(pid)
+                }) {
+                    return None;
+                }
                 if let Some(kind) =
                     self.property(window, atoms._NET_WM_WINDOW_TYPE, AtomEnum::ATOM.into())
                 {
@@ -275,18 +294,30 @@ impl Capture {
     }
 
     fn frame(&mut self, id: Option<&str>, cursor: bool) -> Result<Rgba, String> {
-        let (drawable, rect, origin, pixmap) =
+        let (drawable, rect, origin, fallback_window) =
             if let Some(id) = id.and_then(|id| id.strip_prefix("window:")) {
                 let window = id.parse::<Window>().map_err(|_| GONE.to_owned())?;
                 let (rect, origin) = self.window_rect(window).ok_or_else(|| GONE.to_owned())?;
                 if let Some((pixmap, pixels)) = self.window_pixmap(window) {
-                    (pixmap, pixels, origin, Some(pixmap))
+                    (pixmap, pixels, origin, None)
                 } else {
+                    // Only uncomposited sessions fall back to desktop pixels. If the
+                    // compositor could not supply a pixmap, sending unrelated windows
+                    // would expose more than the person selected.
+                    let compositor = self
+                        .conn
+                        .get_selection_owner(self.compositor_selection)
+                        .ok()
+                        .and_then(|reply| reply.reply().ok())
+                        .ok_or_else(|| READ_FAILED.to_owned())?;
+                    if compositor.owner != x11rb::NONE {
+                        return Err(READ_FAILED.to_owned());
+                    }
                     let root = self.root_rect().ok_or_else(|| READ_FAILED.to_owned())?;
                     let rect = rect
                         .clip(root.width, root.height)
                         .ok_or_else(|| GONE.to_owned())?;
-                    (self.root, rect, (rect.x, rect.y), None)
+                    (self.root, rect, (rect.x, rect.y), Some(window))
                 }
             } else {
                 let monitor = self
@@ -306,8 +337,17 @@ impl Capture {
             };
 
         let picture = self.read(drawable, rect);
-        if let Some(pixmap) = pixmap {
-            let _ = self.conn.free_pixmap(pixmap);
+        if drawable != self.root {
+            let _ = self.conn.free_pixmap(drawable);
+        }
+        if fallback_window.is_some_and(|window| {
+            self.conn
+                .get_window_attributes(window)
+                .ok()
+                .and_then(|reply| reply.reply().ok())
+                .is_none_or(|attributes| attributes.map_state != MapState::VIEWABLE)
+        }) {
+            return Err(GONE.to_owned());
         }
         let mut frame = picture?;
         if cursor && self.fixes {

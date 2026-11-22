@@ -13,8 +13,8 @@ use objc2_core_video::{
 };
 use objc2_foundation::{NSArray, NSError, NSObject};
 use objc2_screen_capture_kit::{
-    SCContentFilter, SCShareableContent, SCStream, SCStreamConfiguration, SCStreamDelegate,
-    SCStreamOutput, SCStreamOutputType, SCWindow,
+    SCContentFilter, SCRunningApplication, SCShareableContent, SCStream, SCStreamConfiguration,
+    SCStreamDelegate, SCStreamOutput, SCStreamOutputType, SCWindow,
 };
 use protocol::ScreenSource;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -81,15 +81,21 @@ pub(super) fn listed() -> Vec<ScreenSource> {
 }
 
 fn ours(window: &SCWindow) -> bool {
+    unsafe { window.owningApplication().as_deref().is_some_and(our_app) }
+}
+
+fn our_app(app: &SCRunningApplication) -> bool {
+    let picker_pid = std::env::var("TINYCLIENT_SHARE_PICKER_PID")
+        .ok()
+        .and_then(|pid| pid.parse::<i32>().ok());
     // The picker and call pop-out belong to the same application as the main window.
     unsafe {
-        window.owningApplication().is_some_and(|app| {
-            app.bundleIdentifier().to_string() == "dev.tinyclient.app"
-                || app
-                    .applicationName()
-                    .to_string()
-                    .eq_ignore_ascii_case("tinyclient")
-        })
+        picker_pid == Some(app.processID())
+            || app.bundleIdentifier().to_string() == "dev.tinyclient.app"
+            || app
+                .applicationName()
+                .to_string()
+                .eq_ignore_ascii_case("tinyclient")
     }
 }
 
@@ -279,13 +285,7 @@ impl Source {
                     let apps = content
                         .applications()
                         .iter()
-                        .filter(|app| {
-                            app.bundleIdentifier().to_string() == "dev.tinyclient.app"
-                                || app
-                                    .applicationName()
-                                    .to_string()
-                                    .eq_ignore_ascii_case("tinyclient")
-                        })
+                        .filter(|app| our_app(app))
                         .collect::<Vec<_>>();
                     let excluded = NSArray::from_retained_slice(&apps);
                     let filter =
@@ -374,7 +374,12 @@ fn record(options: Options, frames: Arc<Frames>, stop: Receiver<()>) -> Result<(
             .map_err(|error| error.localizedDescription().to_string())?;
         stream
     };
-    stream_result(|done| unsafe { stream.startCaptureWithCompletionHandler(Some(done)) })?;
+    if let Err(error) =
+        stream_result(|done| unsafe { stream.startCaptureWithCompletionHandler(Some(done)) })
+    {
+        unsafe { stream.stopCaptureWithCompletionHandler(None) };
+        return Err(error);
+    }
     let result = loop {
         match stop.recv_timeout(WINDOW_CHECK) {
             Ok(()) | Err(RecvTimeoutError::Disconnected) => break Ok(()),

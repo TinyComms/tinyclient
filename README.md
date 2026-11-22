@@ -380,6 +380,8 @@ Shortcuts use Command on macOS and Ctrl on Linux and Windows. Menus, tooltips, a
 
 Settings → Shortcuts lists the keys and changes them. Click a row, then press the new keys. Reset restores the defaults, and Backspace on a row restores that one. A key another command uses is refused. Undo, Redo, Cut, Copy, Paste and Select All stay the platform's own keys. Voice keys are separate: Settings → Voice records push-to-talk, priority push-to-talk, toggle mute, and toggle deafen. On Wayland those mute and deafen keys work while the window is in front, and push-to-talk does not.
 
+In a call on Windows, macOS or X11 Linux, choose an individual display or window in the share picker. On Wayland the desktop portal shows its own list. On macOS, grant Screen & System Audio Recording access in Privacy & Security, then restart tinyclient. Without an X11 compositor, a window share shows anything that overlaps the selected window.
+
 Type `>` in the Quick Switcher for commands: menu actions, set status, pause notifications, toggle mute, sign in, and open a settings section. Commands with nothing behind them are not listed.
 
 With a message row focused, E edits, R replies, + reacts, T starts a thread, and Delete deletes, when that message allows it. P and U are listed and resolve the message, and they do not call out: pinning and mark-unread-from-here have no request. Up on an empty composer is the edit-last binding. The composer does not read it yet.
