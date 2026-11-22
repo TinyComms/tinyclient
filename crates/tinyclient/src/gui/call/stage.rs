@@ -786,6 +786,7 @@ mod tests {
             kind: ConversationKind::Direct,
             avatar: None,
             space: None,
+            occupied: 0,
         };
         for state in [CallState::RingingOut, CallState::Connecting] {
             let call = sample_call(state, Vec::new());
@@ -806,6 +807,7 @@ mod tests {
             kind: ConversationKind::Direct,
             avatar: None,
             space: None,
+            occupied: 0,
         };
         let call = sample_call(
             CallState::RingingOut,
@@ -829,6 +831,7 @@ mod tests {
             kind: ConversationKind::Group,
             avatar: None,
             space: None,
+            occupied: 0,
         };
         let ringing = |id: &str| Participant {
             id: id.into(),
@@ -836,7 +839,7 @@ mod tests {
             ringing: true,
             ..Participant::default()
         };
-        let call = sample_call(
+        let mut call = sample_call(
             CallState::Joined,
             vec![
                 ringing("mara"),
@@ -846,9 +849,14 @@ mod tests {
                 ringing("robin"),
             ],
         );
+        call.ringing = vec![
+            protocol::CallRing { id: "mara".into(), name: "Mara".into(), state: "ringing".into() },
+            protocol::CallRing { id: "kai".into(), name: "Kai".into(), state: "ringing".into() },
+            protocol::CallRing { id: "lee".into(), name: "Lee".into(), state: "declined".into() },
+        ];
         let stage = Stage::of_call(&call, &subject, "robin", "Robin", None);
         let seats: Vec<_> = stage.seats.iter().map(|seat| (seat.id.as_str(), seat.ringing)).collect();
-        assert_eq!(seats, [("mara", false), ("dev", true), ("robin", false)]);
+        assert_eq!(seats, [("mara", false), ("dev", true), ("kai", true), ("robin", false)]);
         assert!(stage.seats[0].speaking);
     }
 

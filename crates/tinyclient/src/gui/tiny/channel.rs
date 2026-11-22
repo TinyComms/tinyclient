@@ -4,6 +4,8 @@
 
 use super::{join_blocked, model, Page};
 use crate::gui::call::stage::Stage;
+#[cfg(test)]
+use crate::gui::call::stage;
 use crate::gui::call::view::ViewBar;
 use crate::gui::components::{button, button_disabled, button_with_icon, glyph, tip, ButtonKind};
 use crate::gui::state::Shell;

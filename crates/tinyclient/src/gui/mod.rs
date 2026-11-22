@@ -283,6 +283,7 @@ pub(crate) fn prove_tiny_call_ux() -> Result<(), &'static str> {
         kind: protocol::ConversationKind::Direct,
         avatar: None,
         space: None,
+        occupied: 0,
     };
     let stage = call::stage::Stage::of_call(&ring, &subject, "me", "Blitz", Some("peer-1"));
     if stage.seats.len() != 2 || !stage.seats.iter().any(|seat| !seat.me && seat.ringing) {
