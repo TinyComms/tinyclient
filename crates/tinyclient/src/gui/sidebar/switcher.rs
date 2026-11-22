@@ -853,7 +853,8 @@ impl Shell {
                     .and_then(|sw| sw.group_people.first())
                     .is_none_or(|first| first.key.account() == account);
                 let picked = switcher.is_some_and(|sw| sw.group_people.iter().any(|p| p.key == person.key));
-                (cap > 0 && same_account).then(|| {
+                let discord_non_friend = person.key.network == Network::Discord && person.relation != protocol::Relation::Friend;
+                (cap > 0 && same_account && !discord_non_friend).then(|| {
                     let who = (**person).clone();
                     div()
                         .id(("add-grp", ix))
@@ -922,6 +923,9 @@ impl Shell {
         if let Some(pos) = switcher.group_people.iter().position(|p| p.key == person.key) {
             switcher.group_people.remove(pos);
         } else {
+            if person.key.network == Network::Discord && person.relation != protocol::Relation::Friend {
+                return;
+            }
             let cap = self
                 .snapshot
                 .as_ref()
@@ -1067,6 +1071,7 @@ impl Shell {
                             .child(div().text_color(theme::text_faint()).child("×")),
                     );
                 }
+                let discord_group = switcher.group_people.first().is_some_and(|p| p.key.network == Network::Discord);
                 sheet.child(
                     div()
                         .px(px(12.))
@@ -1077,6 +1082,14 @@ impl Shell {
                         .flex_col()
                         .gap(px(6.))
                         .child(chips)
+                        .when(discord_group, |box_| {
+                            box_.child(
+                                div()
+                                    .type_micro()
+                                    .text_color(theme::text_faint())
+                                    .child("Only Discord friends can join a group DM (up to 10 people including you)."),
+                            )
+                        })
                         .child(
                             div()
                                 .flex()
@@ -1198,6 +1211,8 @@ mod tests {
             avatar: None,
             presence: Presence::Unknown,
             status: String::new(),
+            status_emoji: String::new(),
+            status_until: None,
             can: Default::default(),
             send_as: Vec::new(),
         }
@@ -1340,7 +1355,7 @@ mod tests {
         let mut desmond = (*row("Desmond", Direct, 10)).clone();
         desmond.peer = Some("desmond".into());
         let rows = vec![row("design", Channel, 10), row("redesign", Channel, 10), Rc::new(desmond), row("general", Channel, 99)];
-        let space = Space { key: key("s"), name: "Design Guild".into(), icon: None, position: 0, attention: 0, unread: false, folder: None, muted: false, hide_muted: false, can_create_channels: false };
+        let space = Space { key: key("s"), name: "Design Guild".into(), icon: None, position: 0, attention: 0, unread: false, folder: None, muted: false, hide_muted: false, can_create_channels: false, can_create_invites: false };
         let people = vec![person("desmond"), person("Desiree")];
         // Long after anything was said, so recency lifts nothing.
         let found = hits("des", &rows, std::slice::from_ref(&space), &people, &[], true, 10_000_000);
@@ -1409,6 +1424,8 @@ mod tests {
             required: String::new(),
             presence: protocol::Presence::Unknown,
             status: String::new(),
+            status_emoji: String::new(),
+            status_until: None,
             can: protocol::Capabilities::default(),
             send_as: Vec::new(),
         }];

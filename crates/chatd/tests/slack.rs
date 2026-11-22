@@ -3313,7 +3313,7 @@ fn closing_a_direct_or_leaving_a_group_dm_calls_conversations_close_and_drops_th
 
     let closed = world.ask(Request::CloseDirect { conversation: dm.clone() });
     assert!(matches!(closed, Response::Ok), "CloseDirect should succeed, got {closed:?}");
-    let left = world.ask(Request::Leave { conversation: group.clone() });
+    let left = world.ask(Request::Leave { conversation: group.clone(), silent: false });
     assert!(matches!(left, Response::Ok), "Leave on group DM should succeed, got {left:?}");
 
     let calls = world.fake.calls(ALPHA, "conversations.close");
@@ -3795,7 +3795,7 @@ fn slack_leave_rename_archive_and_browse_archived_channels() {
     assert!(world.account("T01ALPHA").can.archive, "Slack should advertise archive capability");
 
     // Leaving #general refuses with a clear human-readable message.
-    let err = world.ask(Request::Leave { conversation: general.clone() });
+    let err = world.ask(Request::Leave { conversation: general.clone(), silent: false });
     match err {
         Response::Error { code: ErrorCode::Refused, detail } => {
             assert!(detail.to_lowercase().contains("general"), "expected clear cant_leave_general message, got: {detail}");
@@ -3873,7 +3873,7 @@ fn slack_leave_rename_archive_and_browse_archived_channels() {
     assert!(!row.archived && !row.read_only, "unarchived channel must clear archived and read-only");
 
     // Leave a regular channel calls conversations.leave and drops it from the tree.
-    let left = world.ask(Request::Leave { conversation: side.clone() });
+    let left = world.ask(Request::Leave { conversation: side.clone(), silent: false });
     assert_eq!(left, Response::Ok);
     let leave_calls = world.fake.calls(ALPHA, "conversations.leave");
     assert!(leave_calls.iter().any(|c| c.params["channel"] == "C0SIDE"));

@@ -91,6 +91,8 @@ pub(in crate::gui) struct Own {
     pub me: String,
     pub presence: Presence,
     pub status: String,
+    pub status_emoji: String,
+    pub status_until: Option<i64>,
     pub avatar: Option<MediaFile>,
     pub can: protocol::Capabilities,
 }
@@ -359,6 +361,8 @@ impl Shell {
                     me: account.me.clone(),
                     presence: account.presence,
                     status: account.status.clone(),
+                    status_emoji: account.status_emoji.clone(),
+                    status_until: account.status_until,
                     avatar: account.avatar.clone(),
                     can: account.can,
                 })
@@ -395,9 +399,28 @@ impl Shell {
         self.people_state.hub.changed(change, cx);
         let state = &self.people_state;
         match change {
-            Change::People { account } => {
-                if let Some(list) = state.list.get() {
-                    list.update(cx, |list, cx| list.people_changed(account, cx));
+            Change::People { account, person } => {
+                // A list refresh is account-wide. A note from another device names one person
+                // and must not refetch every open card or restart the people list.
+                if person.is_none() {
+                    if let Some(list) = state.list.get() {
+                        list.update(cx, |list, cx| list.people_changed(account, cx));
+                    }
+                } else if let Some(who) = person {
+                    if let Some(floating) = state.floating.get() {
+                        floating.update(cx, |floating, cx| {
+                            if floating.card_person() == Some(who) {
+                                floating.refresh_profile(account, cx);
+                            }
+                        });
+                    }
+                    if let Some(info) = state.info.get() {
+                        info.update(cx, |info, cx| {
+                            if info.person() == Some(who) {
+                                info.refresh_profile(account, cx);
+                            }
+                        });
+                    }
                 }
             }
             Change::Members { conversation } => {

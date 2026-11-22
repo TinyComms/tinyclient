@@ -55,6 +55,8 @@ const WARM: usize = 5;
 const PAGE: usize = 50;
 /// Discord's own limit on a message. Nitro (`premium_type` 2) is twice this.
 const LONGEST: usize = 2000;
+/// Discord's limit on a group DM, including ourselves (at most 9 friends).
+const GROUP_DM_LIMIT: usize = 10;
 
 /// Characters one message may hold. Nitro is 4,000. Every other plan, including Nitro Basic,
 /// stays at 2,000. A server's boosts are not part of this.
@@ -266,6 +268,8 @@ struct GuildInfo {
     timeout_until: Option<i64>,
     emojis: Vec<Pickable>,
     stickers: Vec<Pickable>,
+    /// True when at least one visible channel in this guild permits `CREATE_INSTANT_INVITE`.
+    can_invite: bool,
 }
 
 impl GuildInfo {
@@ -466,6 +470,7 @@ pub(super) fn renamed(known: &protocol::Conversation, title: &str) -> crate::sto
     row.limit = known.limit;
     row.max_file_bytes = known.max_file_bytes;
     row.read_only_reason = known.read_only_reason.clone();
+    row.rights = known.rights;
     row.spam = known.spam;
     row.rights = known.rights;
     row.slowmode_seconds = known.slowmode_seconds;
@@ -517,6 +522,9 @@ struct State {
     /// Our own presence and status line as the settings have them, and those settings as
     /// Discord sent them (`proto::status_settings`), to change one part and send back the rest.
     own: (Presence, String),
+    own_emoji: String,
+    own_emoji_id: Option<u64>,
+    own_status_until: Option<i64>,
     status_settings: Vec<u8>,
     /// Per conversation, the stretches of history fetched whole in this session, as message
     /// ids from and to: reading on inside one asks Discord nothing.
@@ -530,6 +538,8 @@ struct State {
     /// Friends' status emoji and what they are doing, as their presence last said, so a voice
     /// state can be told beside it.
     doing: HashMap<String, (String, Option<protocol::Activity>)>,
+    /// Cached private notes on people (`user_id -> note`), updated on fetch, write, and `USER_NOTE_UPDATE`.
+    notes: HashMap<String, String>,
     /// When the last profile was asked for: the route is watched, so one per 3 s at most.
     profiled: Option<Instant>,
     /// How many profiles have been asked for: one still waiting its turn that is not the newest
@@ -822,6 +832,7 @@ impl Discord {
     }
 
     /// One-shot request (never retried on 429; wakes socket on 401).
+    /// One-shot request (no 429 retry, per-request captcha failure), waking the socket on 401.
     fn call_once(&self, method: &str, path: &str, body: Option<Value>) -> Result<String, Refused> {
         let answer = self.rest.call_once_with(method, path, body, &[]);
         if matches!(answer, Err(Refused::Expired)) {
@@ -1599,10 +1610,10 @@ impl Discord {
         let icon = space_id
             .as_deref()
             .zip(guild.and_then(|g| g.get("icon")).and_then(Value::as_str))
-            .map(|(gid, hash)| {
-                let (file, url) = model::guild_icon(gid, hash);
+            .and_then(|(gid, hash)| {
+                let (file, url) = model::guild_icon(gid, hash)?;
                 let _ = self.ctx.media(&[(file.clone(), url)]);
-                file
+                Some(file)
             });
         let channel_id = parsed
             .get("channel")
@@ -1645,38 +1656,249 @@ impl Discord {
         Ok((space_id, channel_id))
     }
 
-    /// Our own presence, and the status line unless it is `None`. Both are settings: the web
-    /// client saves them (protobuf, `settings-proto/1`) and tells the gateway (op 3), and so
-    /// does this.
+    /// Creates a `discord.gg` invite link for a channel (`POST /channels/{id}/invites`), a
+    /// server (first channel allowing `CREATE_INSTANT_INVITE`), or a friend invite
+    /// (`POST /users/@me/invites`). One-shot per click; permissions are checked locally first.
+    fn create_invite(
+        &self,
+        conversation_id: Option<&str>,
+        space_id: Option<&str>,
+        max_age: u32,
+        max_uses: u32,
+        temporary: bool,
+    ) -> Result<String, Refusal> {
+        let (path, body) = match (conversation_id, space_id) {
+            (Some(channel), _) => {
+                let known = self
+                    .ctx
+                    .known(channel)
+                    .map_err(|err| Refusal::Refused(err.to_string()))?
+                    .ok_or_else(|| Refusal::Refused("This conversation is gone.".to_owned()))?;
+                if let Some(guild) = self.guild_of(&known) {
+                    if !self.can_invite_channel(&guild, channel) {
+                        return Err(Refusal::Refused(
+                            "You do not have permission to create an invite for this channel.".to_owned(),
+                        ));
+                    }
+                } else if known.kind != ConversationKind::Group {
+                    return Err(Refusal::Refused("Only server channels or group DMs can create an invite.".to_owned()));
+                }
+                (
+                    format!("/channels/{channel}/invites"),
+                    json!({
+                        "max_age": max_age,
+                        "max_uses": max_uses,
+                        "temporary": temporary,
+                        "flags": 0,
+                    }),
+                )
+            }
+            (None, Some(guild)) => {
+                let Some(channel) = self.invite_channel(guild) else {
+                    return Err(Refusal::Refused(
+                        "You do not have permission to create an invite for this server.".to_owned(),
+                    ));
+                };
+                (
+                    format!("/channels/{channel}/invites"),
+                    json!({
+                        "max_age": max_age,
+                        "max_uses": max_uses,
+                        "temporary": temporary,
+                        "flags": 0,
+                    }),
+                )
+            }
+            (None, None) => ("/users/@me/invites".to_owned(), json!({})),
+        };
+        let answer = self.call_once("POST", &path, Some(body)).map_err(invite_refusal)?;
+        let parsed: Value = serde_json::from_str(&answer)
+            .map_err(|err| Refusal::Refused(format!("Discord's answer was unreadable: {err}")))?;
+        let code = parsed
+            .get("code")
+            .and_then(Value::as_str)
+            .filter(|code| model::cdn_token(code))
+            .ok_or_else(|| Refusal::Refused("Discord did not return an invite code.".to_owned()))?;
+        Ok(format!("https://discord.gg/{code}"))
+    }
+
+    /// Resolves a user-supplied status emoji string into `(emoji_id, emoji_name, animated)`.
+    /// Accepts Unicode glyphs (e.g. `"📅"`), custom Discord formats (`"<a:ferris:7001>"`,
+    /// `"<:ferris:7001>"`, `"ferris:7001"`), or a server emoji shortcode (`":ferris:"`).
+    fn resolve_status_emoji(state: &State, raw: &str) -> (Option<u64>, String, bool) {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return (None, String::new(), false);
+        }
+        // `<a:name:id>` or `<:name:id>`
+        if let Some(inner) = trimmed.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
+            let parts: Vec<&str> = inner.split(':').collect();
+            if parts.len() == 3 {
+                if let Ok(id) = parts[2].parse::<u64>() {
+                    return (Some(id), parts[1].to_owned(), parts[0] == "a");
+                }
+            }
+        }
+        // `name:id`
+        if let Some((name, id_str)) = trimmed.split_once(':') {
+            if !name.is_empty() && !id_str.is_empty() {
+                if let Ok(id) = id_str.parse::<u64>() {
+                    let animated = state
+                        .guilds
+                        .values()
+                        .flat_map(|g| g.emojis.iter())
+                        .find(|e| e.id == id_str)
+                        .is_some_and(|e| e.animated);
+                    return (Some(id), name.to_owned(), animated);
+                }
+            }
+        }
+        // `:shortcode:` lookup in guild custom emojis
+        if let Some(code) = trimmed.strip_prefix(':').and_then(|s| s.strip_suffix(':')) {
+            if let Some(found) = state.guilds.values().flat_map(|g| g.emojis.iter()).find(|e| e.name == code) {
+                if let Ok(id) = found.id.parse::<u64>() {
+                    return (Some(id), found.name.clone(), found.animated);
+                }
+            }
+        }
+        // A re-save publishes the bare name. Keep the id we already resolved for it.
+        if state.own_emoji_id.is_some() && trimmed == state.own_emoji {
+            let animated = state
+                .own_emoji_id
+                .and_then(|id| {
+                    let sid = id.to_string();
+                    state
+                        .guilds
+                        .values()
+                        .flat_map(|g| g.emojis.iter())
+                        .find(|e| e.id == sid)
+                        .map(|e| e.animated)
+                })
+                .unwrap_or(false);
+            return (state.own_emoji_id, trimmed.to_owned(), animated);
+        }
+        // A bare custom-emoji name, the form the status line shows.
+        if let Some(found) = state.guilds.values().flat_map(|g| g.emojis.iter()).find(|e| e.name == trimmed) {
+            if let Ok(id) = found.id.parse::<u64>() {
+                return (Some(id), found.name.clone(), found.animated);
+            }
+        }
+        (None, trimmed.to_owned(), false)
+    }
+
+    /// Our own presence, and custom status (text, emoji, clear-after) unless all three are `None`.
+    /// Both are settings: the web client saves them (protobuf, `settings-proto/1`) and tells the
+    /// gateway (op 3), and so does this.
     ///
     /// Unverified against a real account: the field numbers of the status settings are the
     /// community's (`proto.rs`), and the whole status block is sent back so nothing in it is
     /// lost if Discord replaces rather than merges it.
-    fn set_presence(&self, presence: Presence, status: Option<String>) -> Result<(), Refusal> {
+    fn set_presence(
+        &self,
+        presence: Presence,
+        status: Option<String>,
+        status_emoji: Option<String>,
+        clear_at: Option<i64>,
+    ) -> Result<(), Refusal> {
         let word = match presence {
             Presence::Idle => "idle",
             Presence::Dnd => "dnd",
             Presence::Offline => "invisible",
             Presence::Online | Presence::Unknown | Presence::Busy => "online",
         };
-        let (kept, text) = {
+        let changing_custom = status.is_some() || status_emoji.is_some() || clear_at.is_some();
+        let (kept, custom, animated) = {
             let state = crate::hub::lock(&self.state);
-            (state.status_settings.clone(), status.clone().unwrap_or_else(|| state.own.1.clone()))
+            let kept = state.status_settings.clone();
+            if changing_custom {
+                let text = status.unwrap_or_else(|| state.own.1.clone());
+                let (emoji_id, emoji_name, animated) = match status_emoji {
+                    Some(raw) => Self::resolve_status_emoji(&state, &raw),
+                    None => {
+                        let anim = state
+                            .own_emoji_id
+                            .and_then(|id| {
+                                let sid = id.to_string();
+                                state
+                                    .guilds
+                                    .values()
+                                    .flat_map(|g| g.emojis.iter())
+                                    .find(|e| e.id == sid)
+                                    .map(|e| e.animated)
+                            })
+                            .unwrap_or(false);
+                        (state.own_emoji_id, state.own_emoji.clone(), anim)
+                    }
+                };
+                let empty = text.is_empty() && emoji_name.is_empty() && emoji_id.is_none();
+                let expires_at_ms = if empty {
+                    None
+                } else {
+                    clear_at.filter(|&s| s > 0).map(|s| (s as u64).saturating_mul(1000))
+                };
+                (
+                    kept,
+                    proto::CustomStatus { text, emoji_id, emoji_name, expires_at_ms },
+                    animated,
+                )
+            } else {
+                let anim = state
+                    .own_emoji_id
+                    .and_then(|id| {
+                        let sid = id.to_string();
+                        state
+                            .guilds
+                            .values()
+                            .flat_map(|g| g.emojis.iter())
+                            .find(|e| e.id == sid)
+                            .map(|e| e.animated)
+                    })
+                    .unwrap_or(false);
+                (
+                    kept,
+                    proto::CustomStatus {
+                        text: state.own.1.clone(),
+                        emoji_id: state.own_emoji_id,
+                        emoji_name: state.own_emoji.clone(),
+                        expires_at_ms: state
+                            .own_status_until
+                            .filter(|&s| s > 0)
+                            .map(|s| (s as u64).saturating_mul(1000)),
+                    },
+                    anim,
+                )
+            }
         };
-        let settings = proto::with_status(&kept, word, status.as_deref());
+        let settings = proto::with_custom_status(&kept, word, changing_custom.then_some(&custom));
         let body = json!({"settings": proto::settings(&settings)});
         self.call("PATCH", "/users/@me/settings-proto/1", Some(body)).map_err(refusal)?;
-        let custom = match text.is_empty() {
-            true => json!([]),
-            false => json!([{"name": "Custom Status", "type": 4, "state": text, "emoji": null}]),
+        let activities = if custom.is_empty() {
+            json!([])
+        } else {
+            let emoji_json = if let Some(id) = custom.emoji_id {
+                json!({"id": id.to_string(), "name": custom.emoji_name, "animated": animated})
+            } else if !custom.emoji_name.is_empty() {
+                json!({"id": null, "name": custom.emoji_name, "animated": false})
+            } else {
+                Value::Null
+            };
+            json!([{"name": "Custom Status", "type": 4, "state": custom.text, "emoji": emoji_json}])
         };
-        self.tell(3, json!({"status": word, "since": 0, "activities": custom, "afk": false}));
+        self.tell(3, json!({"status": word, "since": 0, "activities": activities, "afk": false}));
+        let until = custom.expires_at_ms.map(|ms| (ms / 1000) as i64);
         {
             let mut state = crate::hub::lock(&self.state);
             state.status_settings = settings;
-            state.own = (presence, text.clone());
+            state.own = (presence, custom.text.clone());
+            state.own_emoji = custom.emoji_name.clone();
+            state.own_emoji_id = custom.emoji_id;
+            state.own_status_until = until;
         }
-        self.ctx.presence(&self.me(), presence, &text, true);
+        let me = self.me();
+        self.ctx.presence(&me, presence, &custom.text, true);
+        self.ctx.activity(&me, &custom.emoji_name, None, true);
+        self.ctx.status_until(&me, until, true);
+        self.reschedule_unmute();
         Ok(())
     }
 
@@ -1866,6 +2088,158 @@ impl Discord {
         let channel: model::Channel = serde_json::from_str(&created).map_err(|err| refuse(err.to_string()))?;
         self.direct(&channel, &HashMap::new()).map_err(|err| refuse(err.to_string()))?;
         Ok(channel.id)
+    }
+
+    /// Starts a new group DM with friends (`POST /users/@me/channels`). One-shot per click:
+    /// Discord watches group creation closely. Only friends may be added, up to 10 people total.
+    fn start_group(&self, people: &[String], title: Option<&str>) -> Result<String, Refusal> {
+        let refuse = |why: String| Refusal::Refused(why);
+        let recipients: Vec<String> = {
+            let state = crate::hub::lock(&self.state);
+            let mut out = Vec::new();
+            for id in people {
+                if id.is_empty() || id == &state.me || out.contains(id) {
+                    continue;
+                }
+                if state.relations.get(id) != Some(&Relation::Friend) {
+                    return Err(refuse("Only Discord friends can be added to a group DM.".to_owned()));
+                }
+                out.push(id.clone());
+            }
+            out
+        };
+        if recipients.is_empty() {
+            return Err(refuse("Choose at least one friend to start a group.".to_owned()));
+        }
+        if recipients.len() + 1 > GROUP_DM_LIMIT {
+            return Err(refuse(format!("A Discord group DM can have at most {GROUP_DM_LIMIT} people.")));
+        }
+        let created = self
+            .call_once("POST", "/users/@me/channels", Some(json!({ "recipients": recipients })))
+            .map_err(refusal)?;
+        let mut channel: model::Channel = serde_json::from_str(&created).map_err(|err| refuse(err.to_string()))?;
+        if let Some(name) = title.map(str::trim).filter(|t| !t.is_empty()) {
+            if channel.kind == model::GROUP_DM {
+                if let Ok(patched) = self.call("PATCH", &format!("/channels/{}", channel.id), Some(json!({ "name": name }))) {
+                    if let Ok(updated) = serde_json::from_str::<model::Channel>(&patched) {
+                        channel = updated;
+                    } else {
+                        channel.name = Some(name.to_owned());
+                    }
+                }
+            }
+        }
+        self.direct(&channel, &HashMap::new()).map_err(|err| refuse(err.to_string()))?;
+        Ok(channel.id)
+    }
+
+    /// Adds friends to a group DM (`PUT /channels/{id}/recipients/{user}`), or escalates a 1:1 DM
+    /// into a new group DM (`POST /users/@me/channels` with `[peer, ...added]`), as Discord does.
+    fn add_to_group(&self, channel: &str, people: &[String]) -> Result<(), Refusal> {
+        let refuse = |why: String| Refusal::Refused(why);
+        let known = self
+            .ctx
+            .known(channel)
+            .map_err(|err| refuse(err.to_string()))?
+            .ok_or_else(|| refuse("This conversation is gone.".to_owned()))?;
+        let (me, added, peer_for_direct) = {
+            let state = crate::hub::lock(&self.state);
+            let mut out = Vec::new();
+            for id in people {
+                if id.is_empty() || id == &state.me || out.contains(id) {
+                    continue;
+                }
+                if state.relations.get(id) != Some(&Relation::Friend) {
+                    return Err(refuse("Only Discord friends can be added to a group DM.".to_owned()));
+                }
+                out.push(id.clone());
+            }
+            let peer = known.peer.clone().or_else(|| {
+                state
+                    .directs
+                    .iter()
+                    .find(|(_, ch)| ch.as_str() == channel)
+                    .map(|(user, _)| user.clone())
+            });
+            if known.kind == ConversationKind::Direct {
+                if let Some(peer_id) = peer.as_deref().filter(|id| !id.is_empty() && *id != state.me) {
+                    if state.relations.get(peer_id) != Some(&Relation::Friend) {
+                        return Err(refuse("Only Discord friends can be added to a group DM.".to_owned()));
+                    }
+                }
+            }
+            (state.me.clone(), out, peer)
+        };
+        if added.is_empty() {
+            return Err(refuse("Choose at least one friend to add.".to_owned()));
+        }
+        match known.kind {
+            ConversationKind::Direct => {
+                let mut recipients = Vec::new();
+                if let Some(peer) = peer_for_direct.filter(|p| !p.is_empty() && p != &me) {
+                    recipients.push(peer);
+                }
+                for id in added {
+                    if !recipients.contains(&id) {
+                        recipients.push(id);
+                    }
+                }
+                if recipients.len() + 1 > GROUP_DM_LIMIT {
+                    return Err(refuse(format!("A Discord group DM can have at most {GROUP_DM_LIMIT} people.")));
+                }
+                let created = self
+                    .call_once("POST", "/users/@me/channels", Some(json!({ "recipients": recipients })))
+                    .map_err(refusal)?;
+                let new_channel: model::Channel = serde_json::from_str(&created).map_err(|err| refuse(err.to_string()))?;
+                self.direct(&new_channel, &HashMap::new()).map_err(|err| refuse(err.to_string()))?;
+                Ok(())
+            }
+            ConversationKind::Group => {
+                let (to_add, current_count) = {
+                    let state = crate::hub::lock(&self.state);
+                    let existing = state.groups.get(channel).map(|g| g.recipients.clone()).unwrap_or_default();
+                    let count = existing.len() + 1;
+                    let to_add: Vec<String> = added.into_iter().filter(|id| !existing.contains(id)).collect();
+                    (to_add, count)
+                };
+                if to_add.is_empty() {
+                    return Ok(());
+                }
+                if current_count + to_add.len() > GROUP_DM_LIMIT {
+                    return Err(refuse(format!("A Discord group DM can have at most {GROUP_DM_LIMIT} people.")));
+                }
+                for user in &to_add {
+                    self.call("PUT", &format!("/channels/{channel}/recipients/{user}"), None).map_err(refusal)?;
+                    let title = {
+                        let mut state = crate::hub::lock(&self.state);
+                        if let Some(group) = state.groups.get_mut(channel) {
+                            if !group.recipients.contains(user) {
+                                group.recipients.push(user.clone());
+                            }
+                            let named = group.named;
+                            let recs = group.recipients.clone();
+                            (!named).then(|| {
+                                recs.iter()
+                                    .filter_map(|id| state.users.get(id).map(String::as_str))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            })
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(title) = title.filter(|t| !t.is_empty()) {
+                        if let Ok(Some(current)) = self.ctx.known(channel) {
+                            let _ = self.ctx.conversation(&renamed(&current, &title));
+                        }
+                    }
+                    self.ctx.info_stale(channel);
+                    self.ctx.members_changed(channel);
+                }
+                Ok(())
+            }
+            _ => Err(Refusal::Unsupported),
+        }
     }
 
     /// Creates a Discord thread, attached to `message_id` when `Some` or standalone when `None`.
@@ -2604,6 +2978,7 @@ impl Discord {
             }
             Command::Relate { person_id, action, reply } => answer(reply, self.relate(&person_id, action)),
             Command::AddFriend { username, reply } => answer(reply, self.add_friend(&username)),
+            Command::SetNote { person_id, text, reply } => answer(reply, self.set_note(&person_id, &text)),
             Command::SetFriendNickname { person_id, nickname, reply } => {
                 answer(reply, self.set_friend_nickname(&person_id, nickname))
             }
@@ -2613,17 +2988,25 @@ impl Discord {
             Command::Unban { space_id, person_id, reason, reply } => {
                 answer(reply, self.unban(&space_id, &person_id, &reason))
             }
-            Command::SetPresence { presence, status, status_emoji: _, clear_at: _, reply } => answer(reply, self.set_presence(presence, status)),
+            Command::SetPresence { presence, status, status_emoji, clear_at, reply } => {
+                answer(reply, self.set_presence(presence, status, status_emoji, clear_at))
+            }
             Command::Profile { person_id, reply } => answer(reply, self.profile(&person_id, None)),
             Command::ProfileIn { person_id, space_id, reply } => answer(reply, self.profile(&person_id, Some(&space_id))),
             Command::ConversationInfo { conversation_id, reply } => answer(reply, self.conversation_info(&conversation_id)),
             Command::SpaceInfo { space_id, reply } => answer(reply, self.space_info(&space_id)),
             Command::InvitePreview { code, reply } => answer(reply, self.invite_preview(&code)),
             Command::InviteJoin { code, reply } => answer(reply, self.invite_join(&code)),
+            Command::CreateInvite { conversation_id, space_id, max_age, max_uses, temporary, reply } => {
+                answer(reply, self.create_invite(conversation_id.as_deref(), space_id.as_deref(), max_age, max_uses, temporary))
+            }
             Command::SetMute { conversation_id, notify, until, reply } => answer(reply, self.set_mute(&conversation_id, notify, until)),
-            Command::Leave { conversation_id, reply } => answer(reply, self.leave(&conversation_id, false)),
+            Command::Leave { conversation_id, silent, reply } => answer(reply, self.leave(&conversation_id, false, silent)),
+            Command::TransferOwner { conversation_id, person, reply } => {
+                answer(reply, self.transfer_group_owner(&conversation_id, &person))
+            }
             Command::LeaveSpace { space_id, reply } => answer(reply, self.leave_space(&space_id)),
-            Command::CloseDirect { conversation_id, reply } => answer(reply, self.leave(&conversation_id, true)),
+            Command::CloseDirect { conversation_id, reply } => answer(reply, self.leave(&conversation_id, true, false)),
             Command::AnswerMessageRequest { conversation_id, accept, reply } => {
                 answer(reply, self.answer_message_request(&conversation_id, accept))
             }
@@ -2657,8 +3040,23 @@ impl Discord {
             Command::Members { conversation_id, offset, limit, reply } => {
                 self.members(conversation_id, offset, limit, reply)
             }
+            Command::StartGroup { people, title, reply } => answer(reply, self.start_group(&people, title.as_deref())),
+            Command::MembersRemove { conversation_id, person, reply } => {
+                answer(reply, self.remove_from_group(&conversation_id, &person))
+            }
+            Command::ConversationUpdate { conversation_id, title, topic: _, description: _, reply } => {
+                answer(reply, self.update_group(&conversation_id, title.as_deref()))
+            }
+            Command::ConversationPicture { conversation_id, path, reply } => {
+                answer(reply, self.set_group_icon(&conversation_id, &path))
+            }
             Command::MembersAdd { conversation_id, people, reply } => {
-                answer(reply, self.add_members(&conversation_id, &people))
+                // A thread takes thread members; anything else Discord lets us add to is a group DM.
+                let added = match self.add_members(&conversation_id, &people) {
+                    Err(Refusal::Unsupported) => self.add_to_group(&conversation_id, &people),
+                    done => done,
+                };
+                answer(reply, added)
             }
             Command::FollowThread { conversation_id, on, reply } => {
                 answer(reply, self.follow_thread(&conversation_id, on))

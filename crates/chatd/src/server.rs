@@ -654,9 +654,9 @@ impl Chat {
             .into_iter()
             .map(|row| {
                 let linked = links.iter().find(|linked| linked.account == row.key);
-                let (presence, status) = match row.me.as_str() {
-                    "" => (Presence::Unknown, String::new()),
-                    me => self.hub.shown(&Key::new(&row.key, me)),
+                let doing = match row.me.as_str() {
+                    "" => crate::hub::Doing::default(),
+                    me => self.hub.doing(&Key::new(&row.key, me)),
                 };
                 // An account whose session is still being read, or was refused, is kept on
                 // screen as offline with the reason, never dropped as signed out.
@@ -685,8 +685,10 @@ impl Chat {
                     attention: row.attention,
                     unread: row.unread,
                     avatar: row.avatar,
-                    presence,
-                    status,
+                    presence: doing.presence,
+                    status: doing.status,
+                    status_emoji: doing.emoji,
+                    status_until: doing.status_until,
                     can: linked.map_or_else(Capabilities::default, |linked| linked.can),
                     send_as: linked.map_or_else(Vec::new, |linked| linked.send_as.clone()),
                 }
@@ -1738,6 +1740,22 @@ impl Chat {
         }
     }
 
+    fn set_note(&self, person: Key, text: String) -> Response {
+        let account = person.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let person_id = person.id.clone();
+        let saved = text.clone();
+        match self.ask(&account, |reply| Command::SetNote { person_id, text, reply }) {
+            Ok(()) => {
+                self.hub.profiles.update_where(|(key, _)| *key == person, |profile| profile.note = saved.clone());
+                Response::Ok
+            }
+            Err(refused) => *refused,
+        }
+    }
+
     fn set_friend_nickname(&self, person: Key, nickname: Option<String>) -> Response {
         let account = person.account();
         if let Err(refused) = self.online(&account) {
@@ -1781,6 +1799,41 @@ impl Chat {
                 space: space_id.map(|id| Key::new(&account, id)),
                 conversation: channel_id.map(|id| Key::new(&account, id)),
             },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn create_invite(
+        &self,
+        conversation: Option<Key>,
+        space: Option<Key>,
+        account: Option<AccountKey>,
+        max_age: u32,
+        max_uses: u32,
+        temporary: bool,
+    ) -> Response {
+        let Some(account) = conversation
+            .as_ref()
+            .map(Key::account)
+            .or_else(|| space.as_ref().map(Key::account))
+            .or(account)
+        else {
+            return error(ErrorCode::Refused, "Choose a channel, server, or account to create an invite.");
+        };
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let conversation_id = conversation.map(|k| k.id);
+        let space_id = space.map(|k| k.id);
+        match self.ask(&account, |reply| Command::CreateInvite {
+            conversation_id,
+            space_id,
+            max_age,
+            max_uses,
+            temporary,
+            reply,
+        }) {
+            Ok(url) => Response::Link { url },
             Err(refused) => *refused,
         }
     }
@@ -1845,16 +1898,33 @@ impl Chat {
             clip(&mut emoji, 64);
             emoji
         });
-        let before = me.as_ref().map(|me| self.hub.shown(me));
-        if let (Some(me), Some((_, old))) = (&me, &before) {
-            self.hub.set_presence(me.clone(), presence, status.as_deref().unwrap_or(old), true);
+        let before = me.as_ref().map(|me| self.hub.doing(me));
+        if let (Some(me), Some(old)) = (&me, &before) {
+            let next_status = status.as_deref().unwrap_or(&old.status);
+            let next_emoji = status_emoji.as_deref().unwrap_or(&old.emoji);
+            let next_until = if status.is_some() || status_emoji.is_some() || clear_at.is_some() {
+                if next_status.is_empty() && next_emoji.is_empty() {
+                    None
+                } else {
+                    clear_at.filter(|&at| at > 0)
+                }
+            } else {
+                old.status_until
+            };
+            self.hub.set_presence(me.clone(), presence, next_status, true);
+            if status_emoji.is_some() {
+                self.hub.set_activity(me.clone(), next_emoji, old.activity.clone(), true);
+            }
+            self.hub.set_status_until(me.clone(), next_until, true);
             self.hub.changed(Change::Status);
         }
         match self.ask(&account, |reply| Command::SetPresence { presence, status, status_emoji, clear_at, reply }) {
             Ok(()) => Response::Ok,
             Err(refused) => {
-                if let (Some(me), Some((presence, status))) = (me, before) {
-                    self.hub.set_presence(me, presence, &status, true);
+                if let (Some(me), Some(old)) = (me, before) {
+                    self.hub.set_presence(me.clone(), old.presence, &old.status, true);
+                    self.hub.set_activity(me.clone(), &old.emoji, old.activity, true);
+                    self.hub.set_status_until(me, old.status_until, true);
                     self.hub.changed(Change::Status);
                 }
                 *refused
@@ -3446,7 +3516,23 @@ impl Chat {
                 }
                 res
             }
-            Request::Leave { conversation } => self.act(&conversation, |conversation_id, reply| Command::Leave { conversation_id, reply }),
+            Request::Leave { conversation, silent } => {
+                self.act(&conversation, |conversation_id, reply| Command::Leave { conversation_id, silent, reply })
+            }
+            Request::TransferOwner { conversation, person } => {
+                if person.trim().is_empty() {
+                    return error(ErrorCode::Refused, "Choose a member to transfer ownership to.");
+                }
+                let res = self.act(&conversation, |conversation_id, reply| Command::TransferOwner {
+                    conversation_id,
+                    person,
+                    reply,
+                });
+                if res == Response::Ok {
+                    self.hub.infos.forget(&conversation);
+                }
+                res
+            }
             Request::LeaveSpace { space } => self.leave_space(space),
             Request::CloseDirect { conversation } => {
                 self.act(&conversation, |conversation_id, reply| Command::CloseDirect { conversation_id, reply })
@@ -3559,9 +3645,13 @@ impl Chat {
             }
             Request::SetAvatar { account, path } => self.set_avatar(account, path),
             Request::SetNickname { space, nickname } => self.set_nickname(space, nickname),
+            Request::SetNote { person, text } => self.set_note(person, text),
             Request::SetFriendNickname { person, nickname } => self.set_friend_nickname(person, nickname),
             Request::InvitePreview { account, code } => self.invite_preview(account, code),
             Request::InviteJoin { account, code } => self.invite_join(account, code),
+            Request::CreateInvite { conversation, space, account, max_age, max_uses, temporary } => {
+                self.create_invite(conversation, space, account, max_age, max_uses, temporary)
+            }
             Request::Watch(watching) => self.watch(watching),
 
             Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),
@@ -4573,6 +4663,19 @@ fn typed_profile(person: Person, mut about: About) -> Profile {
         // Phone numbers are never drawn in full until clicked, whoever the network is.
         contact.masked |= contact.kind == protocol::ContactKind::Phone;
     }
+    about.badges.retain(|badge| !badge.name.trim().is_empty());
+    about.badges.truncate(protocol::PROFILE_BADGES);
+    for badge in &mut about.badges {
+        clip(&mut badge.name, 64);
+    }
+    about.connections.retain(|c| !c.service.trim().is_empty() && !c.name.trim().is_empty());
+    about.connections.truncate(protocol::PROFILE_CONNECTIONS);
+    for conn in &mut about.connections {
+        clip(&mut conn.service, 32);
+        clip(&mut conn.name, 128);
+        clip(&mut conn.url, 256);
+    }
+    clip(&mut about.server_tag, 16);
     let mut profile = Profile::of(person);
     profile.bio = about.bio;
     profile.mutual_spaces = about.mutual_spaces;
@@ -4601,6 +4704,9 @@ fn typed_profile(person: Person, mut about: About) -> Profile {
     profile.away_until = about.away_until;
     profile.note = about.note;
     profile.warning = about.warning;
+    profile.badges = about.badges;
+    profile.connections = about.connections;
+    profile.server_tag = about.server_tag;
     profile
 }
 

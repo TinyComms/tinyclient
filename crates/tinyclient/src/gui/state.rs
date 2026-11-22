@@ -1180,6 +1180,7 @@ mod tests {
             },
             Change::People {
                 account: account.clone(),
+                person: None,
             },
             Change::Media {
                 account,

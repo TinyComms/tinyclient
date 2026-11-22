@@ -3886,12 +3886,12 @@ fn info_mute_leave_pins_and_the_shared_search_ask_discord_once_each_and_only_whe
     assert_eq!(direct[0].body["channel_overrides"]["3001"], json!({"muted": false, "message_notifications": 1, "mute_config": {"end_time": null, "selected_time_window": -1}}));
 
     // Leave a group, close a DM: one DELETE each, and the row goes. A server channel is neither.
-    assert_eq!(world.ask(Request::Leave { conversation: world.key("3003") }), Response::Ok);
+    assert_eq!(world.ask(Request::Leave { conversation: world.key("3003"), silent: false }), Response::Ok);
     assert_eq!(world.ask(Request::CloseDirect { conversation: world.key("3002") }), Response::Ok);
     let deleted: Vec<String> = world.discord.requests_to("DELETE", "/channels/").into_iter().map(|seen| seen.path).collect();
     assert_eq!(deleted, ["/channels/3003?silent=false", "/channels/3002"]);
     assert!(matches!(world.ask(Request::Conversation { conversation: world.key("3003") }), Response::Error { .. }));
-    assert!(matches!(world.ask(Request::Leave { conversation: world.key("4101") }), Response::Error { .. }));
+    assert!(matches!(world.ask(Request::Leave { conversation: world.key("4101"), silent: false }), Response::Error { .. }));
     assert_eq!(world.discord.requests_to("DELETE", "/channels/").len(), 2, "refused here, not asked");
 
     // Pins, from the current route.
@@ -6072,4 +6072,1073 @@ fn thread_settings_rename_archive_lock_delete_notifications_and_members() {
         world.ask(Request::Conversation { conversation: world.key("4500") }),
         Response::Error { code: ErrorCode::NotFound, .. }
     ));
+}
+
+#[test]
+fn group_dm_start_add_friend_filter_limit_and_1to1_escalation() {
+    let world = World::start();
+    let account = AccountKey { network: Network::Discord, account: "1000".into() };
+
+    // 1. Capabilities advertise groups: 9 (up to 9 friends + me = 10 total).
+    let groups_cap = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts
+            .into_iter()
+            .find(|a| a.key == account)
+            .expect("discord account")
+            .can
+            .groups,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(groups_cap, 9);
+    assert!(world.conversation("3003").rights.add_members);
+
+    // 2. Non-friend (2006) is refused locally for StartGroup without touching Discord.
+    match world.ask(Request::StartGroup {
+        account: account.clone(),
+        people: vec![world.key("2001"), world.key("2006")],
+        title: None,
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("friends"), "expected friends error, got: {detail}");
+        }
+        other => panic!("expected Refused for non-friend, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("POST", "/users/@me/channels").is_empty());
+
+    // 3. StartGroup with 2 friends (2001, 2002) and optional title creates a group DM and renames it.
+    world.discord.script(
+        "/users/@me/channels",
+        200,
+        json!({
+            "id": "3100",
+            "type": 3,
+            "name": null,
+            "owner_id": "1000",
+            "recipients": [
+                {"id": "2001", "username": "mara", "global_name": "Mara Okafor"},
+                {"id": "2002", "username": "dev", "global_name": "Dev Patel"}
+            ]
+        }),
+    );
+    world.discord.script(
+        "/channels/3100",
+        200,
+        json!({
+            "id": "3100",
+            "type": 3,
+            "name": "Trail Crew",
+            "owner_id": "1000",
+            "recipients": [
+                {"id": "2001", "username": "mara", "global_name": "Mara Okafor"},
+                {"id": "2002", "username": "dev", "global_name": "Dev Patel"}
+            ]
+        }),
+    );
+    let created = match world.ask(Request::StartGroup {
+        account: account.clone(),
+        people: vec![world.key("2001"), world.key("2002")],
+        title: Some("Trail Crew".into()),
+    }) {
+        Response::Conversation { conversation } => conversation,
+        other => panic!("expected Response::Conversation, got {other:?}"),
+    };
+    assert_eq!(created.key.id, "3100");
+    assert_eq!(created.kind, ConversationKind::Group);
+    assert_eq!(created.title, "Trail Crew");
+    assert!(created.rights.add_members);
+    let post_reqs = world.discord.requests_to("POST", "/users/@me/channels");
+    assert_eq!(post_reqs.len(), 1);
+    assert_eq!(post_reqs[0].body, json!({"recipients": ["2001", "2002"]}));
+    let patch_reqs = world.discord.requests_to("PATCH", "/channels/3100");
+    assert_eq!(patch_reqs.len(), 1);
+    assert_eq!(patch_reqs[0].body, json!({"name": "Trail Crew"}));
+
+    // 4. Add a third friend (2003, promoted via RELATIONSHIP_ADD) to existing group 3003 -> PUT /channels/3003/recipients/2003.
+    world.discord.push(
+        "RELATIONSHIP_ADD",
+        json!({
+            "id": "2003",
+            "type": 1,
+            "user": {"id": "2003", "username": "asker", "global_name": "Asker"}
+        }),
+    );
+    wait("2003 becomes friend", || {
+        match world.ask(Request::People {
+            network: Some(Network::Discord),
+            relation: Some(Relation::Friend),
+            query: None,
+            offset: 0,
+            limit: 50,
+        }) {
+            Response::People { people, .. } if people.iter().any(|p| p.key.id == "2003") => Some(()),
+            _ => None,
+        }
+    });
+    world.discord.script("/channels/3003/recipients/2003", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::MembersAdd {
+            conversation: world.key("3003"),
+            people: vec!["2003".into()],
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("PUT", "/channels/3003/recipients/2003").len(), 1);
+    match world.ask(Request::Members {
+        conversation: world.key("3003"),
+        offset: 0,
+        limit: 50,
+    }) {
+        Response::Members { members, .. } => {
+            assert!(members.iter().any(|m| m.key.id == "2003"), "2003 should be in group members");
+        }
+        other => panic!("expected Response::Members, got {other:?}"),
+    }
+
+    // 5. Adding a non-friend to group 3003 is refused locally.
+    match world.ask(Request::MembersAdd {
+        conversation: world.key("3003"),
+        people: vec!["2006".into()],
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("friends"), "expected friends error, got: {detail}");
+        }
+        other => panic!("expected Refused for non-friend add, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("PUT", "/channels/3003/recipients/2006").is_empty());
+
+    // 6. Adding friend 2002 to 1:1 DM 3001 (with 2001) creates a new group DM with [2001, 2002].
+    world.discord.script(
+        "/users/@me/channels",
+        200,
+        json!({
+            "id": "3101",
+            "type": 3,
+            "name": null,
+            "owner_id": "1000",
+            "recipients": [
+                {"id": "2001", "username": "mara", "global_name": "Mara Okafor"},
+                {"id": "2002", "username": "dev", "global_name": "Dev Patel"}
+            ]
+        }),
+    );
+    assert_eq!(
+        world.ask(Request::MembersAdd {
+            conversation: world.key("3001"),
+            people: vec!["2002".into()],
+        }),
+        Response::Ok
+    );
+    let escalated = world.conversation("3101");
+    assert_eq!(escalated.kind, ConversationKind::Group);
+    let posts = world.discord.requests_to("POST", "/users/@me/channels");
+    assert_eq!(posts.len(), 2);
+    assert_eq!(posts[1].body, json!({"recipients": ["2001", "2002"]}));
+
+    // 7. Exceeding 10 people total (adding 9 more friends to a group that already has 4) is refused locally.
+    let mut extras = Vec::new();
+    for id in 2101..=2107 {
+        let sid = id.to_string();
+        world.discord.push(
+            "RELATIONSHIP_ADD",
+            json!({"id": sid, "type": 1, "user": {"id": sid, "username": format!("f{id}"), "global_name": format!("Friend {id}")}}),
+        );
+        extras.push(sid);
+    }
+    wait("extra friends recorded", || {
+        match world.ask(Request::People {
+            network: Some(Network::Discord),
+            relation: Some(Relation::Friend),
+            query: None,
+            offset: 0,
+            limit: 50,
+        }) {
+            Response::People { people, .. } if people.iter().any(|p| p.key.id == "2107") => Some(()),
+            _ => None,
+        }
+    });
+    match world.ask(Request::MembersAdd {
+        conversation: world.key("3003"),
+        people: extras,
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("10"), "expected 10-person limit error, got: {detail}");
+        }
+        other => panic!("expected Refused over 10-person cap, got {other:?}"),
+    }
+}
+
+#[test]
+fn create_invite_checks_permissions_picks_first_channel_and_supports_friend_invites() {
+    // 1. Default READY: @everyone has permissions "36769344" (bit 0 CREATE_INSTANT_INVITE is unset).
+    let world = World::start();
+    let account = AccountKey { network: Network::Discord, account: "1000".into() };
+    let can_friend_invite = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts
+            .into_iter()
+            .find(|a| a.key == account)
+            .expect("discord account")
+            .can
+            .create_friend_invite,
+        other => panic!("{other:?}"),
+    };
+    assert!(can_friend_invite);
+
+    match world.ask(Request::Spaces { network: Some(Network::Discord) }) {
+        Response::Spaces { spaces } => {
+            let guild = spaces.iter().find(|s| s.key.id == "4000").expect("guild 4000");
+            assert!(!guild.can_create_invites, "guild without CREATE_INSTANT_INVITE must report false");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!world.conversation("4101").rights.create_invite);
+
+    // Channel and server invite creation are refused locally with zero HTTP calls.
+    match world.ask(Request::CreateInvite {
+        conversation: Some(world.key("4101")),
+        space: None,
+        account: None,
+        max_age: 3600,
+        max_uses: 5,
+        temporary: false,
+    }) {
+        Response::Error { code: ErrorCode::Refused, .. } => {}
+        other => panic!("expected Refused for channel without CREATE_INSTANT_INVITE, got {other:?}"),
+    }
+    match world.ask(Request::CreateInvite {
+        conversation: None,
+        space: Some(world.key("4000")),
+        account: None,
+        max_age: 604_800,
+        max_uses: 0,
+        temporary: false,
+    }) {
+        Response::Error { code: ErrorCode::Refused, .. } => {}
+        other => panic!("expected Refused for server without any invite-capable channel, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("POST", "/channels/4101/invites").is_empty());
+
+    // Friend invite hits POST /users/@me/invites and returns a discord.gg link.
+    world.discord.script("/users/@me/invites", 200, json!({"code": "fr1end"}));
+    match world.ask(Request::CreateInvite {
+        conversation: None,
+        space: None,
+        account: Some(account.clone()),
+        max_age: 0,
+        max_uses: 0,
+        temporary: false,
+    }) {
+        Response::Link { url } => assert_eq!(url, "https://discord.gg/fr1end"),
+        other => panic!("expected Response::Link for friend invite, got {other:?}"),
+    }
+    let friend_reqs = world.discord.requests_to("POST", "/users/@me/invites");
+    assert_eq!(friend_reqs.len(), 1);
+    assert_eq!(friend_reqs[0].body, json!({}));
+
+    // A code that is not a single path token is refused and never turned into a link.
+    world.discord.script("/users/@me/invites", 200, json!({"code": "../evil"}));
+    match world.ask(Request::CreateInvite {
+        conversation: None,
+        space: None,
+        account: Some(account.clone()),
+        max_age: 0,
+        max_uses: 0,
+        temporary: false,
+    }) {
+        Response::Error { code: ErrorCode::Refused, .. } => {}
+        other => panic!("expected Refused for a bad invite code, got {other:?}"),
+    }
+
+    // 2. Guild 4000 grants CREATE_INSTANT_INVITE (bit 0) on @everyone, but denies it on 4105 (#rules, first in sidebar).
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    ready["guilds"][0]["roles"][0]["permissions"] = json!("36769345");
+    for ch in ready["guilds"][0]["channels"].as_array_mut().unwrap() {
+        if ch["id"] == "4105" {
+            ch["permission_overwrites"] = json!([
+                {"id": "4000", "type": 0, "allow": "0", "deny": "1"}
+            ]);
+        }
+    }
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    match world.ask(Request::Spaces { network: Some(Network::Discord) }) {
+        Response::Spaces { spaces } => {
+            let guild = spaces.iter().find(|s| s.key.id == "4000").expect("guild 4000");
+            assert!(guild.can_create_invites, "guild with invite-capable channel must report true");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!world.conversation("4105").rights.create_invite, "denied overwrite must clear create_invite");
+    assert!(world.conversation("4101").rights.create_invite);
+    assert!(world.conversation("4102").rights.create_invite);
+
+    // Denied channel 4105 refuses locally.
+    match world.ask(Request::CreateInvite {
+        conversation: Some(world.key("4105")),
+        space: None,
+        account: None,
+        max_age: 3600,
+        max_uses: 0,
+        temporary: false,
+    }) {
+        Response::Error { code: ErrorCode::Refused, .. } => {}
+        other => panic!("expected Refused on denied channel 4105, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("POST", "/channels/4105/invites").is_empty());
+
+    // Explicit channel invite on 4102 sends max_age, max_uses, temporary, flags: 0.
+    world.discord.script("/channels/4102/invites", 200, json!({"code": "chan4102"}));
+    match world.ask(Request::CreateInvite {
+        conversation: Some(world.key("4102")),
+        space: None,
+        account: None,
+        max_age: 3600,
+        max_uses: 5,
+        temporary: true,
+    }) {
+        Response::Link { url } => assert_eq!(url, "https://discord.gg/chan4102"),
+        other => panic!("expected Response::Link, got {other:?}"),
+    }
+    let ch_reqs = world.discord.requests_to("POST", "/channels/4102/invites");
+    assert_eq!(ch_reqs.len(), 1);
+    assert_eq!(
+        ch_reqs[0].body,
+        json!({"max_age": 3600, "max_uses": 5, "temporary": true, "flags": 0})
+    );
+
+    // Server-level invite on 4000 skips denied 4105 and picks first allowed channel 4101 (#general).
+    world.discord.script("/channels/4101/invites", 200, json!({"code": "srv4000"}));
+    match world.ask(Request::CreateInvite {
+        conversation: None,
+        space: Some(world.key("4000")),
+        account: None,
+        max_age: 604_800,
+        max_uses: 0,
+        temporary: false,
+    }) {
+        Response::Link { url } => assert_eq!(url, "https://discord.gg/srv4000"),
+        other => panic!("expected Response::Link for server invite, got {other:?}"),
+    }
+    let srv_reqs = world.discord.requests_to("POST", "/channels/4101/invites");
+    assert_eq!(srv_reqs.len(), 1);
+    assert_eq!(
+        srv_reqs[0].body,
+        json!({"max_age": 604_800, "max_uses": 0, "temporary": false, "flags": 0})
+    );
+
+    // Losing invite on one channel keeps the server flag while another channel still has it.
+    // Deleting the rest, then the last one, clears it. Restoring that channel sets it again.
+    let guild_can_invite = || match world.ask(Request::Spaces { network: Some(Network::Discord) }) {
+        Response::Spaces { spaces } => spaces.iter().any(|space| space.key.id == "4000" && space.can_create_invites),
+        other => panic!("{other:?}"),
+    };
+    world.discord.push(
+        "CHANNEL_UPDATE",
+        json!({
+            "id": "4101",
+            "type": 0,
+            "name": "general",
+            "position": 0,
+            "parent_id": "4100",
+            "guild_id": "4000",
+            "permission_overwrites": [{"id": "4000", "type": 0, "allow": "0", "deny": "1"}]
+        }),
+    );
+    wait("4101 loses create invite", || (!world.conversation("4101").rights.create_invite).then_some(()));
+    assert!(guild_can_invite(), "one channel losing invite must leave the server flag set");
+
+    for (id, kind) in [("4102", 5), ("4106", 15), ("4201", 2)] {
+        world.discord.push("CHANNEL_DELETE", json!({"id": id, "type": kind, "guild_id": "4000"}));
+    }
+    wait("other invite channels deleted but one remains", || {
+        let gone = ["4102", "4106", "4201"].iter().all(|id| {
+            matches!(world.ask(Request::Conversation { conversation: world.key(id) }), Response::Error { .. })
+        });
+        (gone && guild_can_invite()).then_some(())
+    });
+
+    world.discord.push(
+        "CHANNEL_UPDATE",
+        json!({
+            "id": "4202",
+            "type": 13,
+            "name": "Town hall",
+            "guild_id": "4000",
+            "permission_overwrites": [{"id": "4000", "type": 0, "allow": "0", "deny": "1"}]
+        }),
+    );
+    wait("last invite channel update clears the flag", || (!guild_can_invite()).then_some(()));
+
+    world.discord.push(
+        "CHANNEL_UPDATE",
+        json!({
+            "id": "4101",
+            "type": 0,
+            "name": "general",
+            "position": 0,
+            "parent_id": "4100",
+            "guild_id": "4000",
+            "permission_overwrites": []
+        }),
+    );
+    wait("invite flag returns with 4101", || guild_can_invite().then_some(()));
+    world.discord.push("CHANNEL_DELETE", json!({"id": "4101", "type": 0, "guild_id": "4000"}));
+    wait("deleting the last invite channel clears the flag", || (!guild_can_invite()).then_some(()));
+}
+
+#[test]
+fn custom_status_emoji_and_clear_after_round_trip_and_sync() {
+    let world = World::start();
+    let account = world.account();
+
+    let own = || match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts
+            .into_iter()
+            .find(|a| a.key == account)
+            .expect("discord account"),
+        other => panic!("{other:?}"),
+    };
+    assert!(own().can.rich_status, "Discord must advertise rich_status");
+
+    // 1. Set Unicode emoji + text + future expiry.
+    let future_secs = 2_000_000_000i64;
+    let future_ms_bytes = (future_secs as u64 * 1000).to_le_bytes();
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Dnd,
+            status: Some("Focusing".into()),
+            status_emoji: Some("🎯".into()),
+            clear_at: Some(future_secs),
+        }),
+        Response::Ok
+    );
+
+    let patches = world.discord.requests_to("PATCH", "/users/@me/settings-proto/1");
+    assert_eq!(patches.len(), 1);
+    let saved_proto_b64 = patches[0].body["settings"].as_str().unwrap().to_owned();
+    let decoded = base64::engine::general_purpose::STANDARD.decode(&saved_proto_b64).unwrap();
+    assert!(decoded.windows(b"Focusing".len()).any(|w| w == b"Focusing"));
+    assert!(decoded.windows("🎯".len()).any(|w| w == "🎯".as_bytes()));
+    assert!(
+        decoded.windows(8).any(|w| w == future_ms_bytes),
+        "expires_at_ms fixed64 must be encoded in settings protobuf"
+    );
+
+    let frame = wait("gateway op 3 with unicode emoji", || {
+        world
+            .discord
+            .frames_of(3)
+            .into_iter()
+            .find(|f| f["d"]["activities"][0]["state"] == "Focusing")
+    });
+    assert_eq!(frame["d"]["status"], "dnd");
+    assert_eq!(
+        frame["d"]["activities"][0]["emoji"],
+        json!({"id": null, "name": "🎯", "animated": false})
+    );
+
+    let status = own();
+    assert_eq!(status.presence, Presence::Dnd);
+    assert_eq!(status.status, "Focusing");
+    assert_eq!(status.status_emoji, "🎯");
+    assert_eq!(status.status_until, Some(future_secs));
+
+    // 2. Set custom server emoji via :ferris: shortcode (resolves to guild 4000 emoji 7001), no expiry.
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Online,
+            status: Some("Rusting".into()),
+            status_emoji: Some(":ferris:".into()),
+            clear_at: None,
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/users/@me/settings-proto/1");
+    assert_eq!(patches.len(), 2);
+    let decoded2 = base64::engine::general_purpose::STANDARD
+        .decode(patches[1].body["settings"].as_str().unwrap())
+        .unwrap();
+    let ferris_id_bytes = 7001u64.to_le_bytes();
+    assert!(decoded2.windows(8).any(|w| w == ferris_id_bytes), "custom emoji_id fixed64 must be encoded");
+    assert!(decoded2.windows(b"ferris".len()).any(|w| w == b"ferris"));
+
+    let frame2 = wait("gateway op 3 with custom emoji", || {
+        world
+            .discord
+            .frames_of(3)
+            .into_iter()
+            .find(|f| f["d"]["activities"][0]["state"] == "Rusting")
+    });
+    assert_eq!(
+        frame2["d"]["activities"][0]["emoji"],
+        json!({"id": "7001", "name": "ferris", "animated": false})
+    );
+    let status = own();
+    assert_eq!(status.status, "Rusting");
+    assert_eq!(status.status_emoji, "ferris");
+    assert_eq!(status.status_until, None);
+
+    // Re-saving the bare name the UI publishes must keep emoji id 7001.
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Online,
+            status: Some("Rusting".into()),
+            status_emoji: Some("ferris".into()),
+            clear_at: None,
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/users/@me/settings-proto/1");
+    let decoded_bare = base64::engine::general_purpose::STANDARD
+        .decode(patches.last().unwrap().body["settings"].as_str().unwrap())
+        .unwrap();
+    assert!(
+        decoded_bare.windows(8).any(|window| window == ferris_id_bytes),
+        "bare custom emoji name must keep emoji id 7001"
+    );
+
+    // 3. Clear custom status (empty text + empty emoji).
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Online,
+            status: Some(String::new()),
+            status_emoji: Some(String::new()),
+            clear_at: None,
+        }),
+        Response::Ok
+    );
+    let frame3 = wait("gateway op 3 cleared activities", || {
+        world
+            .discord
+            .frames_of(3)
+            .into_iter()
+            .rev()
+            .find(|f| f["d"]["activities"] == json!([]))
+    });
+    assert_eq!(frame3["d"]["activities"], json!([]));
+    let status = own();
+    assert_eq!(status.status, "");
+    assert_eq!(status.status_emoji, "");
+    assert_eq!(status.status_until, None);
+
+    // 4. Receiving USER_SETTINGS_PROTO_UPDATE from another device restores emoji + clear-after live.
+    world.discord.push(
+        "USER_SETTINGS_PROTO_UPDATE",
+        json!({"settings": {"type": 1, "proto": saved_proto_b64}}),
+    );
+    wait("status restored from USER_SETTINGS_PROTO_UPDATE", || {
+        let s = own();
+        (s.status == "Focusing" && s.status_emoji == "🎯" && s.status_until == Some(future_secs)).then_some(())
+    });
+
+    // An already-expired custom status is dropped, and field 2 stays off the stored settings.
+    fn push_varint(into: &mut Vec<u8>, mut value: u64) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value == 0 {
+                into.push(byte);
+                break;
+            }
+            into.push(byte | 0x80);
+        }
+    }
+    fn push_bytes(into: &mut Vec<u8>, number: u64, bytes: &[u8]) {
+        push_varint(into, number << 3 | 2);
+        push_varint(into, bytes.len() as u64);
+        into.extend_from_slice(bytes);
+    }
+    fn push_fixed(into: &mut Vec<u8>, number: u64, value: u64) {
+        push_varint(into, number << 3 | 1);
+        into.extend_from_slice(&value.to_le_bytes());
+    }
+    let mut word = Vec::new();
+    push_bytes(&mut word, 1, b"online");
+    let mut custom = Vec::new();
+    push_bytes(&mut custom, 1, b"gone");
+    push_fixed(&mut custom, 4, 1);
+    let mut status_bytes = Vec::new();
+    push_bytes(&mut status_bytes, 1, &word);
+    push_bytes(&mut status_bytes, 2, &custom);
+    let mut whole = Vec::new();
+    push_bytes(&mut whole, 11, &status_bytes);
+    let expired_b64 = base64::engine::general_purpose::STANDARD.encode(&whole);
+    world.discord.push("USER_SETTINGS_PROTO_UPDATE", json!({"settings": {"type": 1, "proto": expired_b64}}));
+    wait("expired custom status cleared", || {
+        let status = own();
+        (status.status.is_empty() && status.status_emoji.is_empty() && status.status_until.is_none()).then_some(())
+    });
+    let before = world.discord.requests_to("PATCH", "/users/@me/settings-proto/1").len();
+    assert_eq!(
+        world.ask(Request::SetPresence {
+            account: account.clone(),
+            presence: Presence::Idle,
+            status: None,
+            status_emoji: None,
+            clear_at: None,
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/users/@me/settings-proto/1");
+    assert_eq!(patches.len(), before + 1);
+    let decoded_idle = base64::engine::general_purpose::STANDARD
+        .decode(patches.last().unwrap().body["settings"].as_str().unwrap())
+        .unwrap();
+    assert!(
+        !decoded_idle.windows(b"gone".len()).any(|window| window == b"gone"),
+        "expired custom status field must stay cleared"
+    );
+}
+
+#[test]
+fn group_dm_rename_icon_remove_transfer_owner_and_silent_leave() {
+    let world = World::start();
+
+    // 1. Group DM 3003 in READY has owner_id == "1000" (me), so rename, edit_picture, add_members, remove_members are all true.
+    let g = world.conversation("3003");
+    assert!(g.rights.rename);
+    assert!(g.rights.edit_picture);
+    assert!(g.rights.add_members);
+    assert!(g.rights.remove_members);
+    assert!(g.rights.create_invite);
+
+    // 2. Rename group DM -> PATCH /channels/3003 with {"name": "Road Trip"}.
+    world.discord.script(
+        "/channels/3003",
+        200,
+        json!({
+            "id": "3003",
+            "type": 3,
+            "name": "Road Trip",
+            "owner_id": "1000",
+            "icon": null,
+            "recipients": [
+                {"id": "2001", "username": "mara", "global_name": "Mara Okafor"},
+                {"id": "2002", "username": "dev", "global_name": "Dev Patel"}
+            ]
+        }),
+    );
+    assert_eq!(
+        world.ask(Request::ConversationUpdate {
+            conversation: world.key("3003"),
+            title: Some("Road Trip".into()),
+            topic: None,
+            description: None,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.conversation("3003").title, "Road Trip");
+    let patches = world.discord.requests_to("PATCH", "/channels/3003");
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0].body, json!({"name": "Road Trip"}));
+
+    // 3. Set group icon from a temp PNG file -> PATCH /channels/3003 with {"icon": "data:image/png;base64,..."}.
+    let tmp_png = std::env::temp_dir().join(format!("tiny-group-icon-{}.png", std::process::id()));
+    std::fs::write(&tmp_png, b"\x89PNG\r\n\x1a\ntest").unwrap();
+    world.discord.script(
+        "/channels/3003",
+        200,
+        json!({
+            "id": "3003",
+            "type": 3,
+            "name": "Road Trip",
+            "owner_id": "1000",
+            "icon": "newiconhash",
+            "recipients": [
+                {"id": "2001", "username": "mara", "global_name": "Mara Okafor"},
+                {"id": "2002", "username": "dev", "global_name": "Dev Patel"}
+            ]
+        }),
+    );
+    assert_eq!(
+        world.ask(Request::ConversationPicture {
+            conversation: world.key("3003"),
+            path: tmp_png.to_string_lossy().into_owned(),
+        }),
+        Response::Ok
+    );
+    let _ = std::fs::remove_file(&tmp_png);
+    let patches = world.discord.requests_to("PATCH", "/channels/3003");
+    assert_eq!(patches.len(), 2);
+    assert!(
+        patches[1].body["icon"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("data:image/png;base64,")),
+        "expected PNG data URI, got {:?}",
+        patches[1].body
+    );
+    assert!(world.conversation("3003").avatar.is_some());
+
+    // 4. Clear group icon (empty path) -> PATCH /channels/3003 with {"icon": null}.
+    world.discord.script(
+        "/channels/3003",
+        200,
+        json!({
+            "id": "3003",
+            "type": 3,
+            "name": "Road Trip",
+            "owner_id": "1000",
+            "icon": null,
+            "recipients": [
+                {"id": "2001", "username": "mara", "global_name": "Mara Okafor"},
+                {"id": "2002", "username": "dev", "global_name": "Dev Patel"}
+            ]
+        }),
+    );
+    assert_eq!(
+        world.ask(Request::ConversationPicture {
+            conversation: world.key("3003"),
+            path: String::new(),
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/channels/3003");
+    assert_eq!(patches.len(), 3);
+    assert_eq!(patches[2].body, json!({"icon": null}));
+    assert!(world.conversation("3003").avatar.is_none());
+
+    let refused_picture = |path: String| match world.ask(Request::ConversationPicture {
+        conversation: world.key("3003"),
+        path,
+    }) {
+        Response::Error { code: ErrorCode::Refused, .. } => {}
+        other => panic!("expected Refused picture, got {other:?}"),
+    };
+    let tmp_txt = std::env::temp_dir().join(format!("tiny-group-icon-{}.txt", std::process::id()));
+    std::fs::write(&tmp_txt, b"hello").unwrap();
+    refused_picture(tmp_txt.to_string_lossy().into_owned());
+    let _ = std::fs::remove_file(&tmp_txt);
+    let tmp_empty = std::env::temp_dir().join(format!("tiny-group-icon-empty-{}.png", std::process::id()));
+    std::fs::write(&tmp_empty, b"").unwrap();
+    refused_picture(tmp_empty.to_string_lossy().into_owned());
+    let _ = std::fs::remove_file(&tmp_empty);
+    let tmp_big = std::env::temp_dir().join(format!("tiny-group-icon-big-{}.png", std::process::id()));
+    std::fs::File::create(&tmp_big).unwrap().set_len(10 * 1024 * 1024 + 1).unwrap();
+    refused_picture(tmp_big.to_string_lossy().into_owned());
+    let _ = std::fs::remove_file(&tmp_big);
+    let tmp_fake = std::env::temp_dir().join(format!("tiny-group-icon-fake-{}.png", std::process::id()));
+    std::fs::write(&tmp_fake, b"not a png").unwrap();
+    refused_picture(tmp_fake.to_string_lossy().into_owned());
+    let _ = std::fs::remove_file(&tmp_fake);
+    assert_eq!(world.discord.requests_to("PATCH", "/channels/3003").len(), 3, "bad pictures must not be uploaded");
+
+    // 5. Remove member 2002 as owner -> DELETE /channels/3003/recipients/2002.
+    world.discord.script("/channels/3003/recipients/2002", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::MembersRemove {
+            conversation: world.key("3003"),
+            person: "2002".into(),
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("DELETE", "/channels/3003/recipients/2002").len(), 1);
+    match world.ask(Request::Members { conversation: world.key("3003"), offset: 0, limit: 50 }) {
+        Response::Members { members, .. } => {
+            assert!(members.iter().all(|m| m.key.id != "2002"), "2002 should be removed");
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // 6. Transfer ownership to 2001 -> PATCH /channels/3003 with {"owner": "2001"}, drops remove_members right.
+    world.discord.script(
+        "/channels/3003",
+        200,
+        json!({
+            "id": "3003",
+            "type": 3,
+            "name": "Road Trip",
+            "owner_id": "2001",
+            "icon": null,
+            "recipients": [
+                {"id": "2001", "username": "mara", "global_name": "Mara Okafor"}
+            ]
+        }),
+    );
+    assert_eq!(
+        world.ask(Request::TransferOwner {
+            conversation: world.key("3003"),
+            person: "2001".into(),
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/channels/3003");
+    assert_eq!(patches.len(), 4);
+    assert_eq!(patches[3].body, json!({"owner": "2001"}));
+    assert!(!world.conversation("3003").rights.remove_members, "non-owner must lose remove_members right");
+
+    match world.ask(Request::TransferOwner {
+        conversation: world.key("3003"),
+        person: "2001".into(),
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("owner"), "expected owner refusal, got: {detail}");
+        }
+        other => panic!("expected Refused for non-owner transfer, got {other:?}"),
+    }
+    assert_eq!(world.discord.requests_to("PATCH", "/channels/3003").len(), 4, "non-owner transfer must not PATCH");
+
+    // 7. Attempting to remove 2001 after transferring ownership is refused locally with zero HTTP calls.
+    match world.ask(Request::MembersRemove {
+        conversation: world.key("3003"),
+        person: "2001".into(),
+    }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("owner"), "expected owner refusal, got: {detail}");
+        }
+        other => panic!("expected Refused for non-owner remove, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("DELETE", "/channels/3003/recipients/2001").is_empty());
+
+    // 8. Silent leave sends DELETE /channels/3003?silent=true and removes conversation.
+    world.discord.script("/channels/3003", 200, json!({}));
+    assert_eq!(
+        world.ask(Request::Leave { conversation: world.key("3003"), silent: true }),
+        Response::Ok
+    );
+    let deletes = world.discord.requests_to("DELETE", "/channels/3003");
+    assert_eq!(deletes.len(), 1);
+    assert!(
+        deletes[0].path.contains("silent=true"),
+        "expected silent=true query param, got {}",
+        deletes[0].path
+    );
+}
+
+#[test]
+fn profile_parses_banner_badges_connections_nitro_and_server_tag() {
+    let world = World::start();
+
+    // Script GET /users/2001/profile with banner, guild_member_profile banner, 3 badges, 2 connected accounts, Nitro/boost dates, and primary_guild server tag.
+    world.discord.script(
+        "/users/2001/profile",
+        200,
+        json!({
+            "user": {
+                "id": "2001",
+                "username": "mara",
+                "global_name": "Mara Okafor",
+                "avatar": "av2001",
+                "banner": "userban1",
+                "accent_color": 3447003,
+                "primary_guild": {"tag": "RUST", "identity_enabled": true}
+            },
+            "user_profile": {
+                "bio": "Systems programmer",
+                "pronouns": "she/her",
+                "banner": "userban1",
+                "accent_color": 5793266,
+                "theme_colors": [1118481, 2236962]
+            },
+            "guild_member_profile": {
+                "banner": "guildban4000",
+                "accent_color": 15105570
+            },
+            "guild_member": {
+                "nick": "Mara (Mod)",
+                "roles": ["4010"],
+                "joined_at": "2023-03-01T12:00:00+00:00"
+            },
+            "mutual_guilds": [{"id": "4000"}],
+            "badges": [
+                {"id": "premium", "description": "Subscriber since May 2022", "icon": "2ba85e8026a8614b640c2837bcdfe21b"},
+                {"id": "hypesquad_house_1", "description": "HypeSquad Bravery", "icon": "8a88d63823d8a71cd5e390baa45efa02"}
+            ],
+            "guild_badges": [
+                {"id": "guild_booster_lvl3", "description": "Server boosting since Jun 2023", "icon": "ec92202290b48d0879b7413d2dde3bab"}
+            ],
+            "connected_accounts": [
+                {"type": "github", "id": "42", "name": "mara-dev", "verified": true},
+                {"type": "spotify", "id": "sp99", "name": "Mara Beats", "verified": false}
+            ],
+            "premium_since": "2022-05-10T12:00:00+00:00",
+            "premium_guild_since": "2023-06-01T00:00:00+00:00"
+        }),
+    );
+
+    let profile = match world.ask(Request::Profile {
+        person: world.key("2001"),
+        space: Some(world.key("4000")),
+    }) {
+        Response::Profile { profile } => profile,
+        other => panic!("expected Response::Profile, got {other:?}"),
+    };
+
+    // Per-server banner wins over global user banner, and per-server accent wins too.
+    assert_eq!(profile.banner.as_ref().map(|b| b.id.as_str()), Some("mbanner:4000:2001:guildban4000"));
+    assert_eq!(profile.accent, Some(15105570));
+    assert_eq!(profile.server_tag, "RUST");
+
+    // 3 badges (2 user + 1 guild), each with registered icon.
+    assert_eq!(profile.badges.len(), 3);
+    assert_eq!(profile.badges[0].name, "Subscriber since May 2022");
+    assert_eq!(profile.badges[0].icon.as_ref().map(|i| i.id.as_str()), Some("badge:2ba85e8026a8614b640c2837bcdfe21b"));
+    assert_eq!(profile.badges[1].name, "HypeSquad Bravery");
+    assert_eq!(profile.badges[2].name, "Server boosting since Jun 2023");
+
+    // 2 connected accounts with proper service labels, URLs, and verified flags.
+    assert_eq!(profile.connections.len(), 2);
+    assert_eq!(profile.connections[0].service, "GitHub");
+    assert_eq!(profile.connections[0].name, "mara-dev");
+    assert_eq!(profile.connections[0].url, "https://github.com/mara-dev");
+    assert!(profile.connections[0].verified);
+    assert_eq!(profile.connections[1].service, "Spotify");
+    assert_eq!(profile.connections[1].name, "Mara Beats");
+    assert_eq!(profile.connections[1].url, "https://open.spotify.com/user/sp99");
+    assert!(!profile.connections[1].verified);
+
+    // Nitro and boosting dates surfaced in profile fields.
+    assert!(profile.fields.iter().any(|(k, v)| k == "Nitro since" && v == "2022-05-10"));
+    assert!(profile.fields.iter().any(|(k, v)| k == "Boosting since" && v == "2023-06-01"));
+
+    // All parsed from the single existing GET /users/2001/profile request — zero extra HTTP calls.
+    assert_eq!(world.discord.requests_to("GET", "/users/2001/profile").len(), 1);
+}
+
+#[test]
+fn person_note_reads_writes_clears_validates_and_updates_live() {
+    let world = World::start();
+    let account = world.account();
+
+    // 1. Capabilities advertise person_notes: true.
+    let can_notes = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts
+            .into_iter()
+            .find(|a| a.key == account)
+            .expect("discord account")
+            .can
+            .person_notes,
+        other => panic!("{other:?}"),
+    };
+    assert!(can_notes);
+
+    // 2. Profile without inline note fetches GET /users/@me/notes/2001.
+    world.discord.script(
+        "/users/2001/profile",
+        200,
+        json!({
+            "user": {"id": "2001", "username": "mara", "global_name": "Mara Okafor"},
+            "user_profile": {"bio": "hi"}
+        }),
+    );
+    world.discord.script("/users/@me/notes/2001", 200, json!({"note": "Met at RustConf"}));
+    match world.ask(Request::Profile { person: world.key("2001"), space: None }) {
+        Response::Profile { profile } => assert_eq!(profile.note, "Met at RustConf"),
+        other => panic!("expected Profile, got {other:?}"),
+    }
+    assert_eq!(world.discord.requests_to("GET", "/users/@me/notes/2001").len(), 1);
+
+    // 3. 404 on GET /users/@me/notes/2002 resolves cleanly to an empty note.
+    world.discord.script(
+        "/users/2002/profile",
+        200,
+        json!({
+            "user": {"id": "2002", "username": "dev", "global_name": "Dev Patel"},
+            "user_profile": {"bio": ""}
+        }),
+    );
+    world.discord.script("/users/@me/notes/2002", 404, json!({"message": "Unknown Note"}));
+    match world.ask(Request::Profile { person: world.key("2002"), space: None }) {
+        Response::Profile { profile } => assert_eq!(profile.note, ""),
+        other => panic!("expected Profile with empty note on 404, got {other:?}"),
+    }
+
+    // 4. Inline note on profile payload skips GET /users/@me/notes/2003.
+    world.discord.script(
+        "/users/2003/profile",
+        200,
+        json!({
+            "user": {"id": "2003", "username": "asker", "global_name": "Asker"},
+            "user_profile": {"bio": ""},
+            "note": "Inline note"
+        }),
+    );
+    match world.ask(Request::Profile { person: world.key("2003"), space: None }) {
+        Response::Profile { profile } => assert_eq!(profile.note, "Inline note"),
+        other => panic!("expected Profile with inline note, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("GET", "/users/@me/notes/2003").is_empty());
+
+    // 5. Over 256 chars is refused locally with zero PUT HTTP calls.
+    let too_long = "x".repeat(257);
+    match world.ask(Request::SetNote { person: world.key("2001"), text: too_long }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("256"), "expected 256 char error, got: {detail}");
+        }
+        other => panic!("expected Refused over 256 chars, got {other:?}"),
+    }
+    assert!(world.discord.requests_to("PUT", "/users/@me/notes/2001").is_empty());
+
+    // 6. Write and clear private note via PUT /users/@me/notes/2001.
+    world.discord.script("/users/@me/notes/2001", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::SetNote { person: world.key("2001"), text: "Updated note".into() }),
+        Response::Ok
+    );
+    world.discord.script("/users/@me/notes/2001", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::SetNote { person: world.key("2001"), text: String::new() }),
+        Response::Ok
+    );
+    let puts = world.discord.requests_to("PUT", "/users/@me/notes/2001");
+    assert_eq!(puts.len(), 2);
+    assert_eq!(puts[0].body, json!({"note": "Updated note"}));
+    assert_eq!(puts[1].body, json!({"note": ""}));
+
+    // A local save patches the cached profile. It does not GET the profile again.
+    let profile_gets = world.discord.requests_to("GET", "/users/2001/profile").len();
+    match world.ask(Request::Profile { person: world.key("2001"), space: None }) {
+        Response::Profile { profile } => assert_eq!(profile.note, ""),
+        other => panic!("expected cached profile, got {other:?}"),
+    }
+    assert_eq!(
+        world.discord.requests_to("GET", "/users/2001/profile").len(),
+        profile_gets,
+        "a local note save must not refetch the profile"
+    );
+
+    // 256 emoji (1024 bytes) fit. 257 characters do not, and send nothing.
+    let emoji_ok = "🎯".repeat(256);
+    world.discord.script("/users/@me/notes/2001", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::SetNote { person: world.key("2001"), text: emoji_ok.clone() }),
+        Response::Ok
+    );
+    match world.ask(Request::SetNote { person: world.key("2001"), text: "🎯".repeat(257) }) {
+        Response::Error { code: ErrorCode::Refused, detail } => {
+            assert!(detail.contains("256"), "expected 256 char error, got: {detail}");
+        }
+        other => panic!("expected Refused over 256 emoji, got {other:?}"),
+    }
+    let puts = world.discord.requests_to("PUT", "/users/@me/notes/2001");
+    assert_eq!(puts.len(), 3);
+    assert_eq!(puts[2].body, json!({"note": emoji_ok}));
+
+    // 7. Live gateway USER_NOTE_UPDATE updates cache & invalidates cached profiles.
+    world.discord.push("USER_NOTE_UPDATE", json!({"id": "2001", "note": "From phone"}));
+    world.discord.script(
+        "/users/2001/profile",
+        200,
+        json!({
+            "user": {"id": "2001", "username": "mara", "global_name": "Mara Okafor"},
+            "user_profile": {"bio": "hi"}
+        }),
+    );
+    wait("USER_NOTE_UPDATE applied to cached note", || {
+        match world.ask(Request::Profile { person: world.key("2001"), space: None }) {
+            Response::Profile { profile } if profile.note == "From phone" => Some(()),
+            _ => None,
+        }
+    });
+    // Still only 1 GET /users/@me/notes/2001 total (USER_NOTE_UPDATE updated state.notes directly).
+    assert_eq!(world.discord.requests_to("GET", "/users/@me/notes/2001").len(), 1);
+    assert!(
+        world.discord.requests_to("GET", "/users/2001/profile").len() > profile_gets,
+        "USER_NOTE_UPDATE must refetch the profile"
+    );
 }

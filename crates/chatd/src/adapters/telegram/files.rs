@@ -595,7 +595,7 @@ fn keep(ctx: &Context, want: &Want, write: impl FnOnce(&mut std::fs::File, u64) 
         // A picture is part of a row, which named no file while there was none: the row and
         // the people list are read again.
         if want.file.kind == MediaKind::Avatar {
-            ctx.hub.changed(Change::People { account: ctx.account.clone() });
+            ctx.hub.changed(Change::People { account: ctx.account.clone(), person: None });
         }
         if let Some(row) = &want.row {
             ctx.hub.changed(Change::Conversation { conversation: ctx.key(row) });

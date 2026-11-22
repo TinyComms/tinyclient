@@ -36,6 +36,7 @@ pub const STAGE: u8 = 13;
 pub const FORUM: u8 = 15;
 pub const MEDIA_FORUM: u8 = 16;
 
+pub const CREATE_INSTANT_INVITE: u64 = 1 << 0;
 pub const KICK_MEMBERS: u64 = 1 << 1;
 pub const BAN_MEMBERS: u64 = 1 << 2;
 pub const ADMINISTRATOR: u64 = 1 << 3;
@@ -132,6 +133,14 @@ fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de> + Default>(de: D) -> 
 }
 
 #[derive(Deserialize, Default, Clone, Debug)]
+pub struct PrimaryGuild {
+    #[serde(default)]
+    pub tag: Option<String>,
+    #[serde(default)]
+    pub identity_enabled: Option<bool>,
+}
+
+#[derive(Deserialize, Default, Clone, Debug)]
 pub struct User {
     pub id: String,
     #[serde(default, deserialize_with = "nullable")]
@@ -140,6 +149,12 @@ pub struct User {
     pub global_name: Option<String>,
     #[serde(default)]
     pub avatar: Option<String>,
+    #[serde(default)]
+    pub banner: Option<String>,
+    #[serde(default)]
+    pub accent_color: Option<u32>,
+    #[serde(default)]
+    pub primary_guild: Option<PrimaryGuild>,
     #[serde(default, deserialize_with = "nullable")]
     pub discriminator: String,
     #[serde(default, deserialize_with = "nullable")]
@@ -203,7 +218,7 @@ fn moving(hash: &str) -> &'static str {
 
 pub fn avatar(user: &str, hash: Option<&str>, discriminator: &str) -> (MediaFile, String) {
     match hash {
-        Some(hash) if !hash.is_empty() => (
+        Some(hash) if cdn_token(hash) => (
             sized(format!("avatar:{user}:{hash}"), MediaKind::Avatar, 80),
             format!("{}/avatars/{user}/{hash}.webp?size=80{}", cdn(), moving(hash)),
         ),
@@ -227,24 +242,178 @@ pub fn avatar(user: &str, hash: Option<&str>, discriminator: &str) -> (MediaFile
 pub fn avatar_variants(file: &str) -> Option<Vec<(u32, String)>> {
     let mut parts = file.strip_prefix("avatar:")?.split(':');
     let (user, hash) = (parts.next()?, parts.next()?);
-    if user == "default" {
+    if user == "default" || !cdn_token(hash) {
         return None;
     }
     Some([128, 256].into_iter().map(|size| (size, format!("{}/avatars/{user}/{hash}.webp?size={size}{}", cdn(), moving(hash)))).collect())
 }
 
-pub fn member_avatar(guild: &str, user: &str, hash: &str) -> (MediaFile, String) {
-    (
+pub fn member_avatar(guild: &str, user: &str, hash: &str) -> Option<(MediaFile, String)> {
+    if !cdn_token(hash) {
+        return None;
+    }
+    Some((
         sized(format!("mavatar:{guild}:{user}:{hash}"), MediaKind::Avatar, 80),
         format!("{}/guilds/{guild}/users/{user}/avatars/{hash}.webp?size=80{}", cdn(), moving(hash)),
-    )
+    ))
 }
 
-pub fn guild_icon(guild: &str, hash: &str) -> (MediaFile, String) {
-    (
+/// A Discord CDN hash or invite code: non-empty ASCII letters, digits, `_` and `-`.
+pub fn cdn_token(token: &str) -> bool {
+    !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+pub fn user_banner(user: &str, hash: &str) -> Option<(MediaFile, String)> {
+    if !cdn_token(hash) {
+        return None;
+    }
+    Some((
+        MediaFile {
+            width: 600,
+            height: 240,
+            ..MediaFile::new(format!("banner:{user}:{hash}"), MediaKind::Image)
+        },
+        format!("{}/banners/{user}/{hash}.webp?size=600{}", cdn(), moving(hash)),
+    ))
+}
+
+pub fn member_banner(guild: &str, user: &str, hash: &str) -> Option<(MediaFile, String)> {
+    if !cdn_token(hash) {
+        return None;
+    }
+    Some((
+        MediaFile {
+            width: 600,
+            height: 240,
+            ..MediaFile::new(format!("mbanner:{guild}:{user}:{hash}"), MediaKind::Image)
+        },
+        format!("{}/guilds/{guild}/users/{user}/banners/{hash}.webp?size=600{}", cdn(), moving(hash)),
+    ))
+}
+
+pub fn badge_icon(hash: &str) -> Option<(MediaFile, String)> {
+    if !cdn_token(hash) {
+        return None;
+    }
+    Some((
+        sized(format!("badge:{hash}"), MediaKind::Image, 24),
+        format!("{}/badge-icons/{hash}.png", cdn()),
+    ))
+}
+
+pub fn connection_label(kind: &str) -> String {
+    match kind {
+        "github" => "GitHub".to_owned(),
+        "twitter" | "x" => "X".to_owned(),
+        "twitch" => "Twitch".to_owned(),
+        "youtube" => "YouTube".to_owned(),
+        "spotify" => "Spotify".to_owned(),
+        "steam" => "Steam".to_owned(),
+        "reddit" => "Reddit".to_owned(),
+        "bluesky" => "Bluesky".to_owned(),
+        "tiktok" => "TikTok".to_owned(),
+        "instagram" => "Instagram".to_owned(),
+        "facebook" => "Facebook".to_owned(),
+        "domain" => "Website".to_owned(),
+        "xbox" => "Xbox".to_owned(),
+        "playstation" => "PlayStation".to_owned(),
+        "ebay" => "eBay".to_owned(),
+        "paypal" => "PayPal".to_owned(),
+        "epicgames" => "Epic Games".to_owned(),
+        "battlenet" => "Battle.net".to_owned(),
+        "riotgames" => "Riot Games".to_owned(),
+        "leagueoflegends" => "League of Legends".to_owned(),
+        "crunchyroll" => "Crunchyroll".to_owned(),
+        "roblox" => "Roblox".to_owned(),
+        "bungie" => "Bungie".to_owned(),
+        "skype" => "Skype".to_owned(),
+        other => {
+            let mut chars = other.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        }
+    }
+}
+
+/// One path segment of a connection URL. Empty, traversal, or a character that would
+/// change the path or the query is rejected.
+fn path_token(raw: &str) -> Option<&str> {
+    let token = raw.trim().trim_start_matches('@');
+    if token.is_empty()
+        || token.contains('/')
+        || token.contains('\\')
+        || token.contains('?')
+        || token.contains('#')
+        || token.contains('@')
+        || token.contains("..")
+        || token.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    Some(token)
+}
+
+/// A bare hostname for a domain connection: no scheme, user, port, path, or traversal.
+fn bare_host(raw: &str) -> Option<&str> {
+    let host = raw.trim();
+    if host.is_empty()
+        || !host.contains('.')
+        || host.contains("://")
+        || host.contains('@')
+        || host.contains(':')
+        || host.contains('/')
+        || host.contains('\\')
+        || host.contains('?')
+        || host.contains('#')
+        || host.contains("..")
+        || host.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    Some(host)
+}
+
+/// Keeps `url` only when it is an https address with no userinfo.
+fn https_link(url: String) -> String {
+    match protocol::link::Destination::parse(&url) {
+        Some(dest) if dest.url.starts_with("https://") && !dest.has_userinfo => url,
+        _ => String::new(),
+    }
+}
+
+pub fn connection_url(kind: &str, id: &str, name: &str) -> String {
+    let clean = name.trim();
+    let handle = clean.trim_start_matches('@');
+    let url = match kind {
+        "github" => path_token(clean).map(|token| format!("https://github.com/{token}")),
+        "twitter" | "x" => path_token(handle).map(|token| format!("https://x.com/{token}")),
+        "twitch" => path_token(clean).map(|token| format!("https://twitch.tv/{token}")),
+        "youtube" => path_token(id).map(|token| format!("https://www.youtube.com/channel/{token}")),
+        "spotify" => path_token(id).map(|token| format!("https://open.spotify.com/user/{token}")),
+        "steam" => path_token(id).map(|token| format!("https://steamcommunity.com/profiles/{token}")),
+        "reddit" => path_token(clean).map(|token| format!("https://www.reddit.com/u/{token}")),
+        "bluesky" => path_token(handle).map(|token| format!("https://bsky.app/profile/{token}")),
+        "tiktok" => path_token(handle).map(|token| format!("https://www.tiktok.com/@{token}")),
+        "instagram" => path_token(handle).map(|token| format!("https://www.instagram.com/{token}")),
+        "facebook" => path_token(id).map(|token| format!("https://www.facebook.com/{token}")),
+        "domain" => bare_host(clean).map(|host| format!("https://{host}")),
+        "ebay" => path_token(clean).map(|token| format!("https://www.ebay.com/usr/{token}")),
+        "roblox" => path_token(id).map(|token| format!("https://www.roblox.com/users/{token}/profile")),
+        _ => None,
+    };
+    url.map(https_link).unwrap_or_default()
+}
+
+pub fn guild_icon(guild: &str, hash: &str) -> Option<(MediaFile, String)> {
+    if !cdn_token(hash) {
+        return None;
+    }
+    Some((
         sized(format!("icon:{guild}:{hash}"), MediaKind::Icon, 96),
         format!("{}/icons/{guild}/{hash}.webp?size=96{}", cdn(), moving(hash)),
-    )
+    ))
 }
 
 pub fn role_icon(role: &str, hash: &str) -> (MediaFile, String) {
@@ -256,11 +425,14 @@ pub fn role_icon(role: &str, hash: &str) -> (MediaFile, String) {
 
 /// A group direct message's own picture. The address is from the community documentation and
 /// unconfirmed against a real account.
-pub fn group_icon(channel: &str, hash: &str) -> (MediaFile, String) {
-    (
+pub fn group_icon(channel: &str, hash: &str) -> Option<(MediaFile, String)> {
+    if !cdn_token(hash) {
+        return None;
+    }
+    Some((
         sized(format!("gicon:{channel}:{hash}"), MediaKind::Avatar, 80),
         format!("{}/channel-icons/{channel}/{hash}.webp?size=80{}", cdn(), moving(hash)),
-    )
+    ))
 }
 
 /// A custom emoji at 48 px; an animated one as an animated WebP of that size, not its GIF.
@@ -308,10 +480,12 @@ impl Member {
 
     /// Server avatar when set on this guild member, otherwise the user's global avatar.
     pub fn avatar(&self, guild: Option<&str>) -> Option<(MediaFile, String)> {
-        if let (Some(guild), Some(hash)) = (guild, self.avatar.as_deref().filter(|h| !h.is_empty())) {
+        if let (Some(guild), Some(hash)) = (guild, self.avatar.as_deref()) {
             let id = self.id();
             if !id.is_empty() {
-                return Some(member_avatar(guild, id, hash));
+                if let Some(picture) = member_avatar(guild, id, hash) {
+                    return Some(picture);
+                }
             }
         }
         self.user.as_ref().map(User::avatar)
@@ -1146,6 +1320,32 @@ pub struct ProfileText {
     pub pronouns: String,
     #[serde(default)]
     pub accent_color: Option<u32>,
+    #[serde(default)]
+    pub banner: Option<String>,
+    #[serde(default)]
+    pub theme_colors: Option<Vec<u32>>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct ProfileBadge {
+    #[serde(default, deserialize_with = "nullable")]
+    pub id: String,
+    #[serde(default, deserialize_with = "nullable")]
+    pub description: String,
+    #[serde(default)]
+    pub icon: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct ConnectedAccount {
+    #[serde(rename = "type", default, deserialize_with = "nullable")]
+    pub kind: String,
+    #[serde(default, deserialize_with = "nullable")]
+    pub id: String,
+    #[serde(default, deserialize_with = "nullable")]
+    pub name: String,
+    #[serde(default, deserialize_with = "nullable")]
+    pub verified: bool,
 }
 
 /// Their membership of the server asked about (`guild_id` on the profile request).
@@ -1171,10 +1371,24 @@ pub struct Profile {
     pub user: Option<User>,
     #[serde(default)]
     pub user_profile: Option<ProfileText>,
+    #[serde(default)]
+    pub guild_member_profile: Option<ProfileText>,
     #[serde(default, deserialize_with = "nullable")]
     pub mutual_guilds: Vec<MutualGuild>,
     #[serde(default)]
     pub guild_member: Option<ProfileMember>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub badges: Vec<ProfileBadge>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub guild_badges: Vec<ProfileBadge>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub connected_accounts: Vec<ConnectedAccount>,
+    #[serde(default)]
+    pub premium_since: Option<String>,
+    #[serde(default)]
+    pub premium_guild_since: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 impl Profile {
@@ -1230,5 +1444,45 @@ mod tests {
         let index = (175_928_847_299_117_063u64 >> 22) % 6;
         assert_eq!(url, format!("{}/embed/avatars/{index}.png", cdn()));
         assert_eq!(file.id, format!("avatar:default:{index}"));
+    }
+
+    #[test]
+    fn connection_urls_and_cdn_hashes_reject_injection() {
+        assert_eq!(connection_url("github", "", "mara-dev"), "https://github.com/mara-dev");
+        assert_eq!(connection_url("spotify", "sp99", "Spotify"), "https://open.spotify.com/user/sp99");
+        assert_eq!(connection_url("domain", "", "example.com"), "https://example.com");
+        assert_eq!(connection_url("github", "", "evil/../admin"), "");
+        assert_eq!(connection_url("github", "", "name?x=1"), "");
+        assert_eq!(connection_url("github", "", "name#frag"), "");
+        assert_eq!(connection_url("spotify", "a/b", "x"), "");
+        assert_eq!(connection_url("domain", "", "evil.com/foo?x=1"), "");
+        assert_eq!(connection_url("domain", "", "https://evil.com"), "");
+        assert_eq!(connection_url("domain", "", "user@evil.com"), "");
+        assert_eq!(connection_url("domain", "", "evil.com:443"), "");
+        assert_eq!(connection_url("domain", "", "localhost"), "");
+        assert!(user_banner("2001", "userban1").is_some());
+        assert!(user_banner("2001", "../x").is_none());
+        assert!(user_banner("2001", "a/b").is_none());
+        assert!(user_banner("2001", "").is_none());
+        assert!(member_banner("4000", "2001", "guildban4000").is_some());
+        assert!(member_banner("4000", "2001", "bad hash").is_none());
+        assert!(badge_icon("2ba85e8026a8614b640c2837bcdfe21b").is_some());
+        assert!(badge_icon("..").is_none());
+        assert!(badge_icon("").is_none());
+        assert!(!cdn_token("code/../admin"));
+        assert!(cdn_token("fr1end"));
+        let (file, url) = avatar("2001", Some("../x"), "0");
+        assert!(url.contains("/embed/avatars/"), "{url}");
+        assert!(file.id.starts_with("avatar:default:"));
+        let (_, good) = avatar("2001", Some("a_goodhash"), "0");
+        assert!(good.contains("/avatars/2001/a_goodhash.webp"), "{good}");
+        assert!(avatar_variants("avatar:2001:../x").is_none());
+        assert!(avatar_variants("avatar:2001:a_goodhash").is_some());
+        assert!(member_avatar("4000", "2001", "../x").is_none());
+        assert!(member_avatar("4000", "2001", "memhash").is_some());
+        assert!(guild_icon("4000", "a/b").is_none());
+        assert!(guild_icon("4000", "iconhash").is_some());
+        assert!(group_icon("3001", "..").is_none());
+        assert!(group_icon("3001", "ghash").is_some());
     }
 }

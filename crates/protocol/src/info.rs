@@ -20,6 +20,9 @@ pub const ROWS_WATCHED: usize = 100;
 /// Most roles, or contact lines, a profile carries.
 pub const PROFILE_ROLES: usize = 12;
 pub const PROFILE_CONTACTS: usize = 6;
+/// Most badges or connected accounts a profile carries.
+pub const PROFILE_BADGES: usize = 24;
+pub const PROFILE_CONNECTIONS: usize = 16;
 /// Most files one `Send` carries. A network that takes fewer says so in `Capabilities`.
 pub const ATTACHMENTS_LIMIT: usize = 10;
 /// Most items one catalog answer carries.
@@ -293,6 +296,25 @@ pub struct Contact {
     pub masked: bool,
 }
 
+/// One badge on a person's profile (Nitro, HypeSquad, Server Booster, etc.).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileBadge {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<MediaFile>,
+}
+
+/// One external account linked on a person's profile (GitHub, X, Spotify, etc.).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileConnection {
+    pub service: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub verified: bool,
+}
+
 /// The one heads-up line on a profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -473,6 +495,9 @@ pub struct ConversationRights {
     /// Exempt from channel/thread slowmode (Discord `MANAGE_MESSAGES` / `MANAGE_CHANNELS` / `MANAGE_THREADS`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub slowmode_exempt: bool,
+    /// May create an invite link for this conversation (`Request::CreateInvite`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub create_invite: bool,
 }
 
 impl ConversationRights {
@@ -489,6 +514,9 @@ impl ConversationRights {
     const SEND_IN_THREADS: i64 = 1 << 10;
     const MANAGE_THREADS: i64 = 1 << 11;
     const SLOWMODE_EXEMPT: i64 = 1 << 12;
+    // Bits 8..=11 are thread rights and bit 12 is slowmode exemption on the Discord
+    // thread lane, so an invite right cannot share them. The review asked for bit 12.
+    const CREATE_INVITE: i64 = 1 << 13;
 
     pub fn is_none(&self) -> bool {
         *self == ConversationRights::default()
@@ -539,6 +567,9 @@ impl ConversationRights {
         if self.slowmode_exempt {
             bits |= Self::SLOWMODE_EXEMPT;
         }
+        if self.create_invite {
+            bits |= Self::CREATE_INVITE;
+        }
         bits
     }
 
@@ -557,6 +588,7 @@ impl ConversationRights {
             send_in_threads: (bits & Self::SEND_IN_THREADS) != 0,
             manage_threads: (bits & Self::MANAGE_THREADS) != 0,
             slowmode_exempt: (bits & Self::SLOWMODE_EXEMPT) != 0,
+            create_invite: (bits & Self::CREATE_INVITE) != 0,
         }
     }
 }
@@ -778,6 +810,12 @@ pub struct Capabilities {
     /// This account supports following and unfollowing threads (`Request::FollowThread`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub follow_threads: bool,
+    /// This account supports creating a friend-invite link (`Request::CreateInvite` with `account` only).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub create_friend_invite: bool,
+    /// This account supports reading and writing private notes on people (`Request::SetNote`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub person_notes: bool,
     /// This account supports reading and setting out-of-office / automatic replies (`Request::GetOutOfOffice`, `Request::SetOutOfOffice`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub out_of_office: bool,

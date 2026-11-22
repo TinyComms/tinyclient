@@ -219,6 +219,12 @@ pub struct AccountStatus {
     pub presence: Presence,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub status: String,
+    /// Our own status emoji as the network shows it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status_emoji: String,
+    /// Unix seconds when our own status automatically clears (`None` = never).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_until: Option<i64>,
     /// What this account may send: file limits, pickers and options. All off until the adapter
     /// reports them.
     #[serde(default, skip_serializing_if = "Capabilities::is_none")]
@@ -262,6 +268,9 @@ pub struct Space {
     /// The user has permission to create channels in this Space (`Request::CreateChannel`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub can_create_channels: bool,
+    /// The user has permission to create invite links in at least one channel of this Space (`Request::CreateInvite`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_create_invites: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -913,6 +922,15 @@ pub struct Profile {
     pub note: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<Warning>,
+    /// Badges shown on their profile (Nitro, HypeSquad, Booster, etc.), at most [`PROFILE_BADGES`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub badges: Vec<ProfileBadge>,
+    /// External accounts linked on their profile, at most [`PROFILE_CONNECTIONS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connections: Vec<ProfileConnection>,
+    /// Short guild/clan tag beside their name (e.g. Discord's primary guild tag).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub server_tag: String,
 }
 
 impl Profile {
@@ -947,6 +965,9 @@ impl Profile {
             away_until: None,
             note: String::new(),
             warning: None,
+            badges: Vec::new(),
+            connections: Vec::new(),
+            server_tag: String::new(),
         }
     }
 }
@@ -1672,8 +1693,16 @@ pub enum Request {
         seconds: u32,
     },
     /// Leaves a group conversation on the network. The shell asks once to confirm first.
+    /// When `silent` is true on Discord group DMs, leaves without posting a leave system message.
     Leave {
         conversation: Key,
+        #[serde(default, skip_serializing_if = "is_false")]
+        silent: bool,
+    },
+    /// Transfers ownership of a group conversation (e.g., Discord group DM) to another member.
+    TransferOwner {
+        conversation: Key,
+        person: String,
     },
     /// Closes a direct conversation, as the network's own ×: it leaves the list until a new
     /// message brings it back. Nothing is deleted.
@@ -1851,6 +1880,11 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         nickname: Option<String>,
     },
+    /// Sets or clears the user's private note on a person (Discord `/users/@me/notes/{id}`).
+    SetNote {
+        person: Key,
+        text: String,
+    },
     /// Sets (or clears, when `None` or empty) a private nickname for a friend (Discord).
     SetFriendNickname {
         person: Key,
@@ -1870,6 +1904,26 @@ pub enum Request {
     InviteJoin {
         account: AccountKey,
         code: String,
+    },
+    /// Create an invite link for a channel (`conversation`), a Space (`space`, picking the first
+    /// channel that allows invites), or a friend-invite link (`account` alone).
+    /// Answers `Response::Link { url }`.
+    CreateInvite {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation: Option<Key>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<Key>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<AccountKey>,
+        /// Expiry in seconds (`0` = never; Discord default `604_800` = 7 days).
+        #[serde(default)]
+        max_age: u32,
+        /// Maximum uses (`0` = unlimited).
+        #[serde(default)]
+        max_uses: u32,
+        /// Grant temporary membership.
+        #[serde(default, skip_serializing_if = "is_false")]
+        temporary: bool,
     },
     Watch(Watching),
 
@@ -2886,7 +2940,12 @@ pub enum Change {
     /// A Space's groups or conversations: ask `Tree`.
     Tree { space: Key },
     /// The owned lists or a search result: ask `People`.
-    People { account: AccountKey },
+    /// `person` set means only that profile changed (a private note). Unset means the list.
+    People {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        person: Option<Key>,
+    },
     /// Rows of a conversation's member list were added, removed or moved: ask `Members` again
     /// for the rows on screen.
     Members { conversation: Key },
@@ -2965,8 +3024,8 @@ impl Change {
             (Change::Spaces { account: a }, Change::Spaces { account: b })
             | (Change::Folders { account: a }, Change::Folders { account: b })
             | (Change::Searched { account: a, .. }, Change::Searched { account: b, .. })
-            | (Change::People { account: a }, Change::People { account: b })
             | (Change::Tiny { account: a }, Change::Tiny { account: b }) => a == b,
+            (Change::People { account: a, person: pa }, Change::People { account: b, person: pb }) => a == b && pa == pb,
             (Change::Media { account: a, file: x }, Change::Media { account: b, file: y }) => {
                 a == b && x.id == y.id
             }
@@ -3926,6 +3985,7 @@ mod tests {
             send_in_threads: true,
             manage_threads: true,
             slowmode_exempt: true,
+            create_invite: true,
         };
         assert_eq!(ConversationRights::from_bits(all.to_bits()), all);
     }

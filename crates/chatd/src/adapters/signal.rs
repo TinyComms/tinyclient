@@ -3646,7 +3646,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             })();
             let _ = reply.send(outcome);
         }
-        Command::Leave { conversation_id, reply } => {
+        Command::Leave { conversation_id, silent: _, reply } => {
             let outcome = (|| -> Result<(), Refusal> {
                 let Peer::Group(group_id) = peer(&conversation_id).map_err(refused)? else {
                     return Err(Refusal::Refused("Only a group can be left.".to_owned()));
@@ -3868,6 +3868,7 @@ fn group_rights(group: &wire::GroupInfo, me: &str) -> ConversationRights {
         rename: can_edit,
         edit_topic: can_edit,
         edit_picture: can_edit,
+        create_invite: false,
         ..ConversationRights::default()
     }
 }

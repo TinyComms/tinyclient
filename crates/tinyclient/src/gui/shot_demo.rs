@@ -139,6 +139,8 @@ fn account(key: AccountKey, name: &str, attention: u32, unread: bool, presence: 
         avatar: Some(face("robin-vale", "avatar-robin-vale.jpg")),
         presence,
         status: String::new(),
+        status_emoji: String::new(),
+        status_until: None,
         can: Capabilities {
             max_file_bytes: 25 * 1024 * 1024,
             max_files: 10,
@@ -638,6 +640,7 @@ fn build() -> Fixture {
         muted: false,
         hide_muted: false,
         can_create_channels: false,
+        can_create_invites: false,
     };
     let spaces = vec![
         space(&t, premier, "Premier", Some(picture("icon-premier", MediaKind::Icon, "icon-night-shift.webp", 192, 192)), 0, 0),

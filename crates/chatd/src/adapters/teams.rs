@@ -1063,7 +1063,7 @@ impl Teams {
             Command::SetMute { conversation_id, notify, until: _, reply } => {
                 let _ = reply.send(self.set_mute(&conversation_id, notify).map_err(refuse));
             }
-            Command::Leave { conversation_id, reply } => {
+            Command::Leave { conversation_id, silent: _, reply } => {
                 let _ = reply.send(self.leave(&conversation_id).map_err(refuse));
             }
             Command::File { conversation_id, pinned, archived, folder_add: _, folder_remove: _, reply } => {

@@ -17,7 +17,7 @@ use gpui::{
     anchored, deferred, div, point, prelude::*, px, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable,
     KeyDownEvent, Pixels, Point, WeakEntity, Window,
 };
-use protocol::{Conversation, Key, Link, Notify, Person, Profile, RelateAction, Request, Response};
+use protocol::{AccountKey, Conversation, Key, Link, Notify, Person, Profile, RelateAction, Request, Response};
 
 const CARD_WIDTH: f32 = 300.;
 const CONFIRM_WIDTH: f32 = 360.;
@@ -35,8 +35,8 @@ pub enum Float {
     Confirm(Key, RelateAction),
     /// One-line modal to set or clear a friend's private nickname.
     FriendNickname(Key),
-    /// Asked once before leaving a group.
-    Leave(Conversation),
+    /// Asked once before leaving a group (`silent` suppresses Discord's leave notice).
+    Leave { conversation: Conversation, silent: bool },
     /// Asked once before clearing history or deleting a chat on the network.
     ClearHistory { conversation: Conversation, delete_chat: bool, revoke: bool },
     /// Confirm sheet before reporting a message, person, or conversation to the network.
@@ -57,7 +57,7 @@ impl Float {
             | Float::Person { person, .. }
             | Float::Confirm(person, _)
             | Float::FriendNickname(person) => Some(person),
-            Float::Conversation { .. } | Float::Leave(_) | Float::ClearHistory { .. } | Float::Report { .. } => None,
+            Float::Conversation { .. } | Float::Leave { .. } | Float::ClearHistory { .. } | Float::Report { .. } => None,
         }
     }
 }
@@ -145,6 +145,12 @@ pub struct Floating {
     /// One-line input for setting a friend's private nickname (`Float::FriendNickname`).
     nick_input: Option<Entity<TextInput>>,
     nick_error: Option<String>,
+    /// Editable private note on the person whose card is open (`Capabilities::person_notes`).
+    note_input: Option<(Key, Entity<TextInput>)>,
+    note_baseline: String,
+    note_saving: bool,
+    note_saved: bool,
+    note_error: Option<String>,
 }
 
 impl Floating {
@@ -162,6 +168,11 @@ impl Floating {
             direct: None,
             nick_input: None,
             nick_error: None,
+            note_input: None,
+            note_baseline: String::new(),
+            note_saving: false,
+            note_saved: false,
+            note_error: None,
         }
     }
 
@@ -173,7 +184,20 @@ impl Floating {
         self.open.is_some()
     }
 
+    /// The person whose card is up, when the float is a profile card.
+    pub fn card_person(&self) -> Option<&Key> {
+        match self.open.as_ref() {
+            Some((Float::Card(person), _)) => Some(person),
+            _ => None,
+        }
+    }
+
     pub fn open(&mut self, float: Float, anchor: Point<Pixels>, cx: &mut Context<Self>) {
+        let next = match &float {
+            Float::Card(person) => Some(person),
+            _ => None,
+        };
+        self.release_note(next, cx);
         // On a phone a person's card is their Profile page, never a popover over the screen.
         if let (true, Float::Card(person)) = (crate::gui::phone::active(), &float) {
             let person = person.clone();
@@ -228,6 +252,7 @@ impl Floating {
                     let _ = weak.update(cx, |this, cx| {
                         if this.profile_asked == asked {
                             this.hub.learn(std::slice::from_ref(&profile.person));
+                            this.sync_note_input(&profile.person.key, &profile.note, cx);
                             this.profile = Some(*profile);
                             cx.notify();
                         }
@@ -238,8 +263,152 @@ impl Floating {
         .detach();
     }
 
+    fn can_note(&self, person: &Key) -> bool {
+        self.scene.accounts.iter().any(|own| own.key == person.account() && own.can.person_notes)
+    }
+
+    fn sync_note_input(&mut self, person: &Key, note: &str, cx: &mut Context<Self>) {
+        if !self.can_note(person) {
+            self.note_input = None;
+            return;
+        }
+        let same = self.note_input.as_ref().is_some_and(|(k, _)| k == person);
+        if same {
+            let current = self.note_input.as_ref().map(|(_, e)| e.read(cx).text().to_owned()).unwrap_or_default();
+            if current == self.note_baseline {
+                if let Some((_, input)) = &self.note_input {
+                    input.update(cx, |i, cx| i.set_text(note, cx));
+                }
+                self.note_baseline = note.to_owned();
+            }
+            return;
+        }
+        let input = cx.new(|cx| {
+            let mut field = TextInput::new("Add a note…", cx);
+            field.set_text(note, cx);
+            field
+        });
+        cx.subscribe(&input, |this, _, event: &InputEvent, cx| match event {
+            InputEvent::Changed => {
+                this.note_saved = false;
+                this.note_error = None;
+                cx.notify();
+            }
+            InputEvent::Submit => this.save_note(cx),
+        })
+        .detach();
+        self.note_input = Some((person.clone(), input));
+        self.note_baseline = note.to_owned();
+        self.note_saving = false;
+        self.note_saved = false;
+        self.note_error = None;
+    }
+
+    /// Saves a dirty note. `force` sends even when a save is already in flight, so switching
+    /// people does not drop the latest text.
+    fn write_note(&mut self, cx: &mut Context<Self>, force: bool) {
+        let Some((person, input)) = self.note_input.clone() else {
+            return;
+        };
+        let text = input.read(cx).text().to_owned();
+        if text == self.note_baseline || only_draws() || (!force && self.note_saving) {
+            return;
+        }
+        if text.chars().count() > 256 {
+            self.note_error = Some("Notes can be at most 256 characters.".to_owned());
+            cx.notify();
+            return;
+        }
+        self.note_saving = true;
+        self.note_saved = false;
+        self.note_error = None;
+        cx.notify();
+        let this = cx.weak_entity();
+        let saved_text = text.clone();
+        super::ask_later(cx, Request::SetNote { person: person.clone(), text }, move |answer, cx| {
+            let _ = this.update(cx, |this, cx| {
+                let still = this.note_input.as_ref().is_some_and(|(key, _)| key == &person);
+                let profile_hit = this.profile.as_ref().is_some_and(|profile| profile.person.key == person);
+                if still {
+                    this.note_saving = false;
+                    match &answer {
+                        Ok(Response::Ok) => {
+                            this.note_baseline = saved_text.clone();
+                            this.note_saved = true;
+                            this.note_error = None;
+                        }
+                        Ok(Response::Error { detail, .. }) => this.note_error = Some(detail.clone()),
+                        Ok(_) => this.note_error = Some("Could not save note.".to_owned()),
+                        Err(err) => this.note_error = Some(err.to_string()),
+                    }
+                }
+                if profile_hit {
+                    if let Ok(Response::Ok) = &answer {
+                        if let Some(profile) = this.profile.as_mut() {
+                            profile.note = saved_text;
+                        }
+                    }
+                }
+                if still || profile_hit {
+                    cx.notify();
+                }
+            });
+        });
+    }
+
+    fn save_note(&mut self, cx: &mut Context<Self>) {
+        self.write_note(cx, false);
+    }
+
+    /// Sends the latest note for whoever is open, then forgets the editor when `next` is someone else.
+    fn release_note(&mut self, next: Option<&Key>, cx: &mut Context<Self>) {
+        let current = self.note_input.as_ref().map(|(key, _)| key);
+        if current == next {
+            return;
+        }
+        if current.is_some() {
+            self.write_note(cx, true);
+            self.note_input = None;
+            self.note_baseline.clear();
+            self.note_saving = false;
+            self.note_saved = false;
+            self.note_error = None;
+        }
+    }
+
+    /// Re-fetches the open card's profile when `Change::People` signals a live update (e.g. `USER_NOTE_UPDATE`).
+    pub fn refresh_profile(&mut self, account: &AccountKey, cx: &mut Context<Self>) {
+        let Some((Float::Card(person), _)) = self.open.as_ref() else {
+            return;
+        };
+        if person.account() != *account || self.note_saving {
+            return;
+        }
+        let person = person.clone();
+        let space = self.place.as_ref().map(|(key, _)| key.clone());
+        let asked = self.profile_asked;
+        let weak = cx.weak_entity();
+        super::ask_later(cx, Request::Profile { person, space }, move |answer, cx| {
+            let Ok(Response::Profile { profile }) = answer else {
+                return;
+            };
+            let _ = weak.update(cx, |this, cx| {
+                if this.profile_asked == asked {
+                    this.sync_note_input(&profile.person.key, &profile.note, cx);
+                    this.profile = Some(*profile);
+                    cx.notify();
+                }
+            });
+        });
+    }
+
     /// Swaps what floats for something else in the same place.
     fn turn_to(&mut self, float: Float, cx: &mut Context<Self>) {
+        let next = match &float {
+            Float::Card(person) => Some(person),
+            _ => None,
+        };
+        self.release_note(next, cx);
         let anchor = self.open.as_ref().map(|(_, anchor)| *anchor).unwrap_or_default();
         self.open = Some((float, anchor));
         self.opened += 1;
@@ -248,6 +417,7 @@ impl Floating {
 
     /// The shell is told after this update: a float may be closed from inside the shell's own.
     fn close(&mut self, cx: &mut Context<Self>) {
+        self.release_note(None, cx);
         if self.open.take().is_some() {
             self.hub.watch("profile", [], cx);
             let shell = self.shell.clone();
@@ -297,19 +467,38 @@ impl Floating {
         let actions = facts::actions(person, &seen, Surface::Card);
         let place = self.place.as_ref().map(|(_, name)| name.as_str());
         let ring = Ring::on(theme::overlay());
+        let banner_path = profile
+            .and_then(|p| p.banner.as_ref())
+            .and_then(|file| self.hub.file(&person.key.account(), file, cx).path);
         let head = div()
             .relative()
             .h(px(16. + draw::AVATAR))
-            .children(profile.and_then(|profile| profile.accent).map(|color| {
-                div().absolute().top_0().left_0().right_0().h(px(draw::BAND)).bg(draw::band(color, theme::overlay()))
-            }))
+            .children(draw::banner_band(banner_path, profile.and_then(|p| p.accent), theme::overlay()))
             .child(div().absolute().top(px(16.)).left(px(16.)).child(person_avatar(&self.hub, person, draw::AVATAR, &ring, calling, cx)));
+        let badges: Vec<(String, Option<String>)> = profile
+            .map(|p| {
+                p.badges
+                    .iter()
+                    .map(|b| {
+                        let path = b.icon.as_ref().and_then(|file| self.hub.file(&person.key.account(), file, cx).path);
+                        (b.name.clone(), path)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mark = draw::mark_of(person).or_else(|| {
+            profile
+                .map(|p| p.server_tag.as_str())
+                .filter(|t| !t.is_empty())
+                .map(|t| draw::tag(t.to_owned(), false))
+        });
         let mut top = div()
             .px(px(16.))
             .flex()
             .flex_col()
-            .child(draw::name_line(person.name.clone(), draw::mark_of(person)).mt(px(12.)))
+            .child(draw::name_line(person.name.clone(), mark).mt(px(12.)))
             .children(draw::soft_line(facts::handle_line(person, profile)))
+            .children(draw::badge_strip("card-badge", &badges))
             .children(draw::presence_row(&line, theme::overlay(), 2))
             .when(actions.message || actions.request || actions.call.is_some(), |top| {
                 top.child(self.card_actions(person, &actions, cx).mt(px(16.)))
@@ -400,6 +589,64 @@ impl Floating {
                         .gap(px(4.))
                         .children(icons)
                         .child(div().ml(px(4.)).type_small().text_color(theme::text_soft()).child(common.words)),
+                );
+            }
+            if !profile.connections.is_empty() {
+                any = true;
+                let mut conns = div().flex().flex_col();
+                for (ix, conn) in profile.connections.iter().take(4).enumerate() {
+                    let url = conn.url.clone();
+                    let row = draw::connection_row(("card-conn", ix), conn).when(!url.is_empty(), |row| {
+                        row.on_click(cx.listener(move |this, _, window, cx| {
+                            let url = url.clone();
+                            let _ = this.shell.update(cx, |shell, cx| shell.open_web_link(&url, window, cx));
+                        }))
+                    });
+                    conns = conns.child(row);
+                }
+                body = body.child(conns);
+            }
+            if let Some((_, input)) = self.note_input.as_ref().filter(|(k, _)| *k == person.key) {
+                any = true;
+                let focused = input.focus_handle(cx).is_focused(window);
+                let dirty = input.read(cx).text() != self.note_baseline;
+                let status = if self.note_saving {
+                    Some("Saving…")
+                } else if self.note_saved && !dirty {
+                    Some("Saved")
+                } else {
+                    None
+                };
+                body = body.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(div().type_micro().text_color(theme::text_faint()).child("Note · only you see this"))
+                                .children(status.map(|s| div().type_micro().text_color(theme::text_faint()).child(s))),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .child(search_field(focused).flex_1().min_w_0().line_height(px(18.)).child(input.clone()))
+                                .when(dirty && !self.note_saving, |row| {
+                                    row.child(
+                                        button("card-note-save", ButtonKind::Secondary, "Save")
+                                            .h(px(24.))
+                                            .px(px(8.))
+                                            .type_small()
+                                            .on_click(cx.listener(|this, _, _, cx| this.save_note(cx))),
+                                    )
+                                }),
+                        )
+                        .children(self.note_error.as_ref().map(|err| div().type_micro().text_color(theme::danger()).child(err.clone()))),
                 );
             }
         }
@@ -665,7 +912,7 @@ impl Floating {
                 let words = if row.as_ref().is_some_and(|row| row.kind == protocol::ConversationKind::Group) { "Leave group" } else { "Leave" };
                 div().child(menu_item_danger("menu-leave", Some("icons/log-out.svg"), words).on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(row) = row.clone() {
-                        this.turn_to(Float::Leave(row), cx);
+                        this.turn_to(Float::Leave { conversation: row, silent: false }, cx);
                     }
                 })))
             }
@@ -733,6 +980,80 @@ impl Floating {
                         this.shell_do(cx, move |shell, cx| then(shell, cx));
                     }))),
             );
+        div()
+            .w(size.width)
+            .h(size.height)
+            .relative()
+            .child(scrim().id("confirm-scrim").on_click(cx.listener(|this, _, _, cx| this.close(cx))))
+            .child(div().absolute().top_0().left_0().size_full().flex().items_center().justify_center().pb(px(80.)).child(panel))
+    }
+
+    fn confirm_leave(&self, row: &Conversation, silent: bool, window: &Window, cx: &mut Context<Self>) -> Div {
+        let (title, words, verb) = facts::confirm_words(Act::Leave, &row.title, row.key.network);
+        let size = window.viewport_size();
+        let wide = if crate::gui::phone::active() { CONFIRM_WIDTH.min(f32::from(size.width) - 32.) } else { CONFIRM_WIDTH };
+        let can_silent = row.key.network == protocol::Network::Discord && row.kind == protocol::ConversationKind::Group;
+        let toggle_row = row.clone();
+        let target = row.clone();
+        let mut panel = div()
+            .w(px(wide))
+            .p(px(20.))
+            .rounded(px(theme::R_MODAL))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
+            .font_family(theme::FONT)
+            .text_color(theme::text())
+            .occlude()
+            .flex()
+            .flex_col()
+            .child(div().type_title().child(title))
+            .child(modal_body(words));
+        if can_silent {
+            panel = panel.child(
+                div()
+                    .id("confirm-leave-silent")
+                    .mt(px(12.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .cursor_pointer()
+                    .text_size(px(13.))
+                    .text_color(theme::text())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.turn_to(
+                            Float::Leave { conversation: toggle_row.clone(), silent: !silent },
+                            cx,
+                        );
+                    }))
+                    .child(
+                        div()
+                            .w(px(14.))
+                            .h(px(14.))
+                            .flex_none()
+                            .rounded(px(3.))
+                            .border_1()
+                            .border_color(if silent { theme::accent() } else { theme::border() })
+                            .bg(if silent { theme::accent() } else { theme::canvas() })
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(silent, |box_el| {
+                                box_el.child(crate::gui::components::glyph("icons/check.svg", 10., theme::on_accent()))
+                            }),
+                    )
+                    .child("Leave without telling the group"),
+            );
+        }
+        panel = panel.child(
+            modal_buttons()
+                .child(button("confirm-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| this.close(cx))))
+                .child(button("confirm-do", ButtonKind::Danger, verb).on_click(cx.listener(move |this, _, _, cx| {
+                    let target = target.clone();
+                    this.shell_do(cx, move |shell, cx| shell.leave(&target, silent, cx));
+                }))),
+        );
         div()
             .w(size.width)
             .h(size.height)
@@ -1038,9 +1359,8 @@ impl Render for Floating {
                 (self.confirm(act, &person.name, person.key.network, window, cx, move |shell, cx| shell.relate(&target, action, cx)), true)
             }
             (Float::FriendNickname(_), Some(person)) => (self.confirm_friend_nickname(person, window, cx), true),
-            (Float::Leave(row), _) => {
-                let target = row.clone();
-                (self.confirm(Act::Leave, &row.title, row.key.network, window, cx, move |shell, cx| shell.leave(&target, cx)), true)
+            (Float::Leave { conversation, silent }, _) => {
+                (self.confirm_leave(conversation, *silent, window, cx), true)
             }
             (Float::ClearHistory { conversation, delete_chat, revoke }, _) => {
                 (self.confirm_clear_history(conversation, *delete_chat, *revoke, window, cx), true)
@@ -1050,9 +1370,10 @@ impl Render for Floating {
             }
             _ => return div(),
         };
-        // Escape goes to whatever has the keys, so the float takes them while it is up.
+        // Escape goes to whatever has the keys, so the float takes them while it is up,
+        // without stealing focus away from an inline input (like the note or nickname field).
         let focus = self.focus.get_or_insert_with(|| cx.focus_handle()).clone();
-        if !focus.is_focused(window) {
+        if !focus.contains_focused(window, cx) {
             window.focus(&focus, cx);
         }
         let surface = surface.track_focus(&focus).on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {

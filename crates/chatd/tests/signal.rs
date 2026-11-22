@@ -1723,7 +1723,7 @@ fn leaving_a_signal_group_checks_sole_admin_and_removes_the_row() {
     // When we are the sole admin and others remain, Leave refuses with "Choose a new admin first."
     world.steer("group-admins me");
     sleep(Duration::from_millis(200));
-    let refused = world.ask(Request::Leave { conversation: key(CLUB) });
+    let refused = world.ask(Request::Leave { conversation: key(CLUB), silent: false });
     assert!(
         matches!(&refused, Response::Error { detail, .. } if detail.contains("Choose a new admin first")),
         "expected sole-admin refusal, got {refused:?}"
@@ -1733,7 +1733,7 @@ fn leaving_a_signal_group_checks_sole_admin_and_removes_the_row() {
     // Once another admin exists, Leave succeeds, reaches the wire, and removes the row.
     world.steer("group-admins me grace");
     sleep(Duration::from_millis(200));
-    assert_eq!(world.ask(Request::Leave { conversation: key(CLUB) }), Response::Ok);
+    assert_eq!(world.ask(Request::Leave { conversation: key(CLUB), silent: false }), Response::Ok);
     let hex_id = CLUB.strip_prefix("g.").unwrap();
     world.heard(&format!("leave-group {hex_id}"));
     world.until("Club row removed", || world.conversation(CLUB).is_none().then_some(()));

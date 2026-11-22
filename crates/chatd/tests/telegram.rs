@@ -2285,11 +2285,11 @@ fn the_panes_ask_telegram_once_each_and_counts_are_telegrams_own() {
     assert_eq!((links[0].url.as_str(), total), ("https://example.org/route", Some(4)));
 
     // Leaving a channel is Telegram's, and the row goes.
-    assert_eq!(world.ask(Request::Leave { conversation: key("c9001") }), Response::Ok);
+    assert_eq!(world.ask(Request::Leave { conversation: key("c9001"), silent: false }), Response::Ok);
     assert_eq!(world.called("LeaveChannel c9001"), 1);
     assert!(world.conversation("c9001").is_none());
     // A direct chat cannot be left.
-    assert!(matches!(world.ask(Request::Leave { conversation: key("u7002") }), Response::Error { .. }));
+    assert!(matches!(world.ask(Request::Leave { conversation: key("u7002"), silent: false }), Response::Error { .. }));
 }
 
 #[test]

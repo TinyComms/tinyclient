@@ -191,6 +191,9 @@ pub struct About {
     pub away_until: Option<i64>,
     pub note: String,
     pub warning: Option<Warning>,
+    pub badges: Vec<protocol::ProfileBadge>,
+    pub connections: Vec<protocol::ProfileConnection>,
+    pub server_tag: String,
 }
 
 /// What a conversation's info pane says beyond its row, as the network tells it.
@@ -603,6 +606,15 @@ pub enum Command {
         reason: String,
         reply: Reply<()>,
     },
+    /// Create an invite link for a channel (`conversation_id`), Space (`space_id`), or friend invite (both `None`).
+    CreateInvite {
+        conversation_id: Option<String>,
+        space_id: Option<String>,
+        max_age: u32,
+        max_uses: u32,
+        temporary: bool,
+        reply: Reply<String>,
+    },
     /// Set the network's notification setting. `until` is when a mute ends, as Unix seconds.
     /// Absent means muted until it is turned off, or not muted. An adapter with no timed mute
     /// ignores it. Report the new mute through [`Context::muted`] before answering.
@@ -704,7 +716,9 @@ pub enum Command {
     /// Accept or decline/ignore a message request (Discord).
     AnswerMessageRequest { conversation_id: String, accept: bool, reply: Reply<()> },
     /// Leave a group conversation. Report it gone through [`Context::conversation_gone`].
-    Leave { conversation_id: String, reply: Reply<()> },
+    Leave { conversation_id: String, silent: bool, reply: Reply<()> },
+    /// Transfer group conversation ownership to another member (`person` id).
+    TransferOwner { conversation_id: String, person: String, reply: Reply<()> },
     /// Leave a Space (e.g. Discord server `DELETE /users/@me/guilds/{id}`).
     LeaveSpace { space_id: String, reply: Reply<()> },
     /// Close a direct conversation as the network's own × does. Report it through
@@ -938,6 +952,12 @@ pub enum Command {
         nickname: Option<String>,
         reply: Reply<()>,
     },
+    /// Set or clear the user's private note on a person (Discord `PUT /users/@me/notes/{id}`).
+    SetNote {
+        person_id: String,
+        text: String,
+        reply: Reply<()>,
+    },
     /// Set (or clear, when `None` or empty) a private nickname for a friend.
     SetFriendNickname {
         person_id: String,
@@ -1028,11 +1048,13 @@ impl Command {
             Command::SpaceInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateInvite { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetMute { reply, .. }
             | Command::Moderate { reply, .. }
             | Command::Unban { reply, .. }
             | Command::SetDisappearing { reply, .. }
             | Command::Leave { reply, .. }
+            | Command::TransferOwner { reply, .. }
             | Command::LeaveSpace { reply, .. }
             | Command::CloseDirect { reply, .. }
             | Command::ClearHistory { reply, .. }
@@ -1108,6 +1130,7 @@ impl Command {
             | Command::SetProfile { reply, .. }
             | Command::SetAvatar { reply, .. }
             | Command::SetNickname { reply, .. }
+            | Command::SetNote { reply, .. }
             | Command::SetFriendNickname { reply, .. }
             | Command::AnswerMessageRequest { reply, .. }
             | Command::OpenForum { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1252,6 +1275,15 @@ impl Context {
     pub fn set_space_can_create_channels(&self, space_id: &str, can: bool) -> Stores {
         let space = self.key(space_id);
         if self.hub.store().set_space_can_create_channels(&space, can)? {
+            self.hub.changed(Change::Spaces { account: self.account.clone() });
+        }
+        Ok(())
+    }
+
+    /// Sets whether the user can create invite links in `space_id`.
+    pub fn set_space_can_create_invites(&self, space_id: &str, can: bool) -> Stores {
+        let space = self.key(space_id);
+        if self.hub.store().set_space_can_create_invites(&space, can)? {
             self.hub.changed(Change::Spaces { account: self.account.clone() });
         }
         Ok(())
@@ -1781,20 +1813,20 @@ impl Context {
     /// People seen: friends, direct partners, authors, search results. Never a whole directory.
     pub fn people(&self, people: &[PersonRow]) -> Stores {
         self.hub.store().upsert_people(&self.account, people)?;
-        self.hub.changed(Change::People { account: self.account.clone() });
+        self.hub.changed(Change::People { account: self.account.clone(), person: None });
         Ok(())
     }
 
     /// The whole list the user owns, by person id, as sent at connect. Record the people first.
     pub fn relations(&self, relations: &[(String, Relation)]) -> Stores {
         self.hub.store().replace_relations(&self.account, relations)?;
-        self.hub.changed(Change::People { account: self.account.clone() });
+        self.hub.changed(Change::People { account: self.account.clone(), person: None });
         Ok(())
     }
 
     pub fn relation(&self, person_id: &str, relation: Relation) -> Stores {
         if self.hub.store().set_relation(&self.key(person_id), relation)? {
-            self.hub.changed(Change::People { account: self.account.clone() });
+            self.hub.changed(Change::People { account: self.account.clone(), person: None });
         }
         Ok(())
     }
@@ -1803,7 +1835,7 @@ impl Context {
     /// first.
     pub fn details(&self, people: &[(String, PersonDetails)]) -> Stores {
         self.hub.store().set_details(&self.account, people)?;
-        self.hub.changed(Change::People { account: self.account.clone() });
+        self.hub.changed(Change::People { account: self.account.clone(), person: None });
         Ok(())
     }
 
@@ -1811,6 +1843,11 @@ impl Context {
     /// presence: never stored, and only for owned lists and people the shell watches.
     pub fn activity(&self, person_id: &str, emoji: &str, activity: Option<Activity>, owned: bool) {
         self.hub.set_activity(self.key(person_id), emoji, activity, owned);
+    }
+
+    /// When our own custom status automatically clears (`None` = never).
+    pub fn status_until(&self, person_id: &str, until: Option<i64>, owned: bool) {
+        self.hub.set_status_until(self.key(person_id), until, owned);
     }
 
     /// What this account may send: file limits, pickers, options. Say it once the session
@@ -1852,6 +1889,21 @@ impl Context {
     /// The info pane's cached count is no longer true.
     pub fn info_stale(&self, conversation_id: &str) {
         self.hub.infos.forget(&self.key(conversation_id));
+    }
+
+    /// Cached profiles for `person_id` are no longer current (e.g. a note from another device).
+    /// Only that person's open card refetches.
+    pub fn profile_stale(&self, person_id: &str) {
+        let person = self.key(person_id);
+        self.hub.profiles.forget_where(|(key, _)| *key == person);
+        self.hub.changed(Change::People { account: self.account.clone(), person: Some(person) });
+    }
+
+    /// Writes `note` into every cached profile for `person_id` without dropping the cache.
+    pub fn patch_profile_note(&self, person_id: &str, note: &str) {
+        let person = self.key(person_id);
+        let note = note.to_owned();
+        self.hub.profiles.update_where(|(key, _)| *key == person, |profile| profile.note = note.clone());
     }
 
     /// What is held about a person's presence now, for a member row built here.
@@ -1985,7 +2037,7 @@ impl Context {
             self.row_changed(id, None);
         }
         if person {
-            self.hub.changed(Change::People { account: self.account.clone() });
+            self.hub.changed(Change::People { account: self.account.clone(), person: None });
         }
         Ok(())
     }

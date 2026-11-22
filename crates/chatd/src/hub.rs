@@ -83,6 +83,15 @@ impl<K: Eq + Hash + Clone, V: Clone> Recent<K, V> {
     pub fn forget_where(&self, mut predicate: impl FnMut(&K) -> bool) {
         lock(&self.held).retain(|(held, _, _)| !predicate(held));
     }
+
+    /// Updates every cached value whose key matches `predicate`, in place.
+    pub fn update_where(&self, mut predicate: impl FnMut(&K) -> bool, mut update: impl FnMut(&mut V)) {
+        for (key, _, value) in lock(&self.held).iter_mut() {
+            if predicate(key) {
+                update(value);
+            }
+        }
+    }
 }
 
 /// What changed, newest last. `seq` goes up by one per change; an entry is replaced when the same
@@ -98,6 +107,7 @@ struct Shown {
     presence: Presence,
     status: String,
     emoji: String,
+    status_until: Option<i64>,
     /// Boxed: thousands of people are held, and few are doing anything.
     activity: Option<Box<Activity>>,
     /// On a list the user owns, so kept whether or not the shell is watching.
@@ -110,6 +120,7 @@ pub struct Doing {
     pub presence: Presence,
     pub status: String,
     pub emoji: String,
+    pub status_until: Option<i64>,
     pub activity: Option<Activity>,
 }
 
@@ -641,6 +652,16 @@ impl Hub {
         });
     }
 
+    /// Unix seconds when a person's own custom status clears (`None` = never).
+    pub fn set_status_until(&self, person: Key, until: Option<i64>, owned: bool) {
+        self.set_shown(person, owned, |shown| {
+            shown.status_until = until;
+        });
+        if owned {
+            self.changed(Change::Status);
+        }
+    }
+
     fn set_shown(&self, person: Key, owned: bool, change: impl FnOnce(&mut Doing)) {
         let watched = owned || self.watching().people.contains(&person);
         let doing = {
@@ -653,6 +674,7 @@ impl Hub {
                 presence: known.presence,
                 status: known.status.clone(),
                 emoji: known.emoji.clone(),
+                status_until: known.status_until,
                 activity: known.activity.as_deref().cloned(),
             });
             let mut doing = before.clone();
@@ -664,6 +686,7 @@ impl Hub {
                 presence: doing.presence,
                 status: doing.status.clone(),
                 emoji: doing.emoji.clone(),
+                status_until: doing.status_until,
                 activity: doing.activity.clone().map(Box::new),
                 owned: owned || known.is_some_and(|known| known.owned),
             };
@@ -697,6 +720,7 @@ impl Hub {
             presence: shown.presence,
             status: shown.status.clone(),
             emoji: shown.emoji.clone(),
+            status_until: shown.status_until,
             activity: shown.activity.as_deref().cloned(),
         })
     }
