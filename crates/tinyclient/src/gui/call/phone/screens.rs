@@ -233,12 +233,15 @@ mod tests {
             share_view: None,
             picture_source: None,
             video_allowed: true,
+        ringing: Vec::new(),
+        moved_from: None,
+        move_notice: None,
         }
     }
 
     #[test]
     fn a_refused_microphone_names_the_phones_settings_and_offers_a_second_try() {
-        let mara = Subject { title: "Mara Okafor".into(), kind: ConversationKind::Direct, avatar: None, space: None };
+        let mara = Subject { title: "Mara Okafor".into(), kind: ConversationKind::Direct, avatar: None, space: None, occupied: 0 };
         for detail in [
             "Allow it in System Settings › Privacy & Security › Microphone, then call again.",
             "Allow the microphone in the system settings, then call again.",

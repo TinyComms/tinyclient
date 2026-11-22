@@ -6,6 +6,8 @@
 //! call is running), `devices_menu`, `people_menu`, and the failures `failed_noanswer`,
 //! `failed_declined`, `failed_refused`, `failed_lost`, `failed_unreachable`, `failed_udp`,
 //! `failed_mic`, `failed_nomic`, `failed_speaker`, `failed_engine`, `failed_dave`.
+//! `moving` is the dock while a 1:1 call becomes a group call. `moved_notice` is the other
+//! person's sentence. `add_call` opens the picker.
 //!
 //! On a Tiny server (`--mode tiny`), `tiny_` before a state puts the call in the room I sit in
 //! on the demo's server instead: `tiny_joined`, `tiny_connecting`, `tiny_reconnecting`,
@@ -191,7 +193,7 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
         "ringing_out" => CallState::RingingOut,
         "incoming" => CallState::RingingIn { from: snapshot.open.as_ref().map_or_else(|| "Mara Okafor".to_owned(), |open| open.title.clone()) },
         "connecting" => CallState::Connecting,
-        "reconnecting" | "view_reconnecting" => CallState::Reconnecting,
+        "reconnecting" | "view_reconnecting" | "moving" => CallState::Reconnecting,
         "view_failed" => failed(CallFailure::Lost, "The connection dropped and didn't come back. You've left the call."),
         "failed_noanswer" => failed(CallFailure::NoAnswer, "Nobody picked up."),
         "failed_declined" => failed(CallFailure::NoAnswer, "They declined the call."),
@@ -317,7 +319,15 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
         share_view: sharing.then(screen_picture).flatten(),
         picture_source: None,
         video_allowed: true,
+        ringing: Vec::new(),
+        moved_from: matches!(name.as_str(), "moving" | "moved_notice").then(|| key("direct")),
+        move_notice: (name == "moved_notice").then(|| "Bea added Cy. The call moved to Campfire.".to_owned()),
     })
+}
+
+/// `--shot` of adding people to a call, the move, or the notice on the other side.
+pub(super) fn adds_people() -> bool {
+    matches!(named().as_deref(), Some("add_call" | "moving" | "moved_notice"))
 }
 
 /// A made-up picture of my own screen, as mediad paints it for my tile: the demo's schematic
@@ -330,7 +340,7 @@ fn screen_picture() -> Option<protocol::CallPicture> {
 }
 
 fn mara() -> Subject {
-    Subject { title: "Mara Okafor".to_owned(), kind: ConversationKind::Direct, avatar: None, space: None }
+    Subject { title: "Mara Okafor".to_owned(), kind: ConversationKind::Direct, avatar: None, space: None, occupied: 0 }
 }
 
 /// Who the made-up call is with, or the voice channel of the channel shots. `None` with a
@@ -344,7 +354,7 @@ pub(super) fn subject(snapshot: &Snapshot) -> Option<Subject> {
     }
     if channel(&named()?) {
         let space = Some("tinyclient-dev".to_owned());
-        return Some(Subject { title: "Lounge".to_owned(), kind: ConversationKind::Voice, avatar: None, space });
+        return Some(Subject { title: "Lounge".to_owned(), kind: ConversationKind::Voice, avatar: None, space, occupied: 0 });
     }
     snapshot.open.is_none().then(mara)
 }
@@ -465,6 +475,9 @@ fn bare(conversation: Key, state: CallState, participants: Vec<Participant>, joi
         share_view: None,
         picture_source: None,
         video_allowed: true,
+        ringing: Vec::new(),
+        moved_from: None,
+        move_notice: None,
     }
 }
 
@@ -499,11 +512,11 @@ fn tiny_key(id: &str) -> Key {
 }
 
 fn lounge() -> Subject {
-    Subject { title: "Lounge".to_owned(), kind: ConversationKind::Voice, avatar: None, space: Some("Premier".to_owned()) }
+    Subject { title: "Lounge".to_owned(), kind: ConversationKind::Voice, avatar: None, space: Some("Premier".to_owned()), occupied: 0 }
 }
 
 fn direct(title: &str) -> Subject {
-    Subject { title: title.to_owned(), kind: ConversationKind::Direct, avatar: None, space: None }
+    Subject { title: title.to_owned(), kind: ConversationKind::Direct, avatar: None, space: None, occupied: 0 }
 }
 
 /// The four in Lounge: two cameras on, one of them speaking, one person muted.
@@ -588,7 +601,7 @@ pub(super) fn phone_shot() -> Option<PhoneShot> {
                 .map(|(id, name, speaking, muted, deafened)| Participant { speaking: *speaking, muted: *muted, deafened: *deafened, ..seat(id, name) })
                 .collect();
             let call = bare(key("campfire"), CallState::Joined, seats, now() - 1_953);
-            let subject = Subject { title: "Campfire".to_owned(), kind: ConversationKind::Voice, avatar: None, space: Some("Moss & Lichen".to_owned()) };
+            let subject = Subject { title: "Campfire".to_owned(), kind: ConversationKind::Voice, avatar: None, space: Some("Moss & Lichen".to_owned()), occupied: 0 };
             shot(call, subject, screen)
         }
         "phone_share" | "phone_people" => {
