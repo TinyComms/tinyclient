@@ -53,11 +53,14 @@
 
 mod catalog;
 mod content;
+mod open_link;
+mod translate;
 mod fake;
 mod files;
 mod filing;
 mod info;
 mod live;
+mod manage;
 mod members;
 mod peers;
 mod premium;
@@ -286,6 +289,10 @@ struct Live {
     resolved_usernames: HashMap<String, Option<Who>>,
     /// Live pending join-request counts reported by `updatePendingJoinRequests`.
     pending_requests: HashMap<Who, u32>,
+    /// Voice/round messages we already sent `readMessageContents` for on this connection.
+    played_sent: VecDeque<(String, i32)>,
+    /// Messages whose `readMessageContents` mention consumption has already been accounted for.
+    contents_read: VecDeque<(String, i32)>,
 }
 
 /// Telegram's own send options, which Telegram carries out.
@@ -295,6 +302,10 @@ pub(super) struct Options {
     pub no_webpage: bool,
     /// Unix seconds: Telegram sends it then.
     pub schedule: Option<i32>,
+    /// Explicit consent to pay up to this many Stars for a paid message.
+    pub allow_paid_stars: Option<i64>,
+    /// Optional peer to post as (channel or anonymous admin, from `channels.getSendAs`).
+    pub send_as: Option<Who>,
 }
 
 /// One connection's worth of an account: what every thread of the adapter shares.
@@ -755,6 +766,8 @@ fn offline(ctx: &Context, command: Command) {
         Command::JumpToDate { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchCalendar { reply, .. } => drop(reply.send(Err(down()))),
         Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
+        Command::OpenLink { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Translate { reply, .. } => drop(reply.send(Err(down()))),
         Command::SaveGif { reply, .. } | Command::StickerSet { reply, .. } | Command::FaveSticker { reply, .. } => drop(reply.send(Err(down()))),
         Command::PressButton { reply, .. } => drop(reply.send(Err(down()))),
         Command::GetNotifyDefaults { reply }
@@ -877,6 +890,9 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::SetDefaultReaction { emoji, reply } => {
             let _ = reply.send(react::set_default(account, &emoji).map_err(refused));
         }
+        Command::SendRules { conversation_id, reply } => {
+            let _ = reply.send(info::send_rules(account, &conversation_id).map_err(refused));
+        }
         Command::Edit { conversation_id, message_id, text, spans, reply } => {
             let _ = reply.send(edit(account, &conversation_id, &message_id, &text, &spans).map_err(refused));
         }
@@ -897,6 +913,7 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::Typing { conversation_id, activity } => typing(account, &conversation_id, activity),
         Command::FollowLink { conversation_id, message_id } => sync::followed(account, &conversation_id, &message_id),
+        Command::MarkPlayed { conversation_id, message_id } => mark_played(account, &conversation_id, &message_id),
         Command::Draft { conversation_id, text } => save_draft(account, &conversation_id, &text),
         Command::SearchPeople(query) => {
             // `broadcasts` asks for public channels. Bots stay out: the shell hides them.
@@ -943,6 +960,39 @@ fn serve(account: &Arc<Account>, command: Command) {
                 members::create_channel(account, &name, kind, private, description.as_deref(), username.as_deref())
                     .map_err(refused),
             );
+        }
+        Command::MembersRemove { conversation_id, person, reply } => {
+            let _ = reply.send(manage::members_remove(account, &conversation_id, &person).map_err(refused));
+        }
+        Command::ConversationUpdate { conversation_id, title, topic, description, reply } => {
+            let _ = reply.send(
+                manage::update_conversation(account, &conversation_id, title.as_deref(), topic.as_deref(), description.as_deref())
+                    .map_err(refused),
+            );
+        }
+        Command::ConversationPicture { conversation_id, path, reply } => {
+            let _ = reply.send(manage::update_picture(account, &conversation_id, &path).map_err(refused));
+        }
+        Command::ModerateMember { conversation_id, person, action, reply } => {
+            let _ = reply.send(manage::moderate_member(account, &conversation_id, &person, &action).map_err(refused));
+        }
+        Command::SetAdmin { conversation_id, person, rights, reply } => {
+            let _ = reply.send(manage::set_admin(account, &conversation_id, &person, &rights).map_err(refused));
+        }
+        Command::TransferOwnership { conversation_id, person, password, reply } => {
+            let _ = reply.send(manage::transfer_ownership(account, &conversation_id, &person, &password).map_err(refused));
+        }
+        Command::UpdateChatSettings { conversation_id, settings, reply } => {
+            let _ = reply.send(manage::update_settings(account, &conversation_id, &settings).map_err(refused));
+        }
+        Command::AdminLog { conversation_id, limit, reply } => {
+            let _ = reply.send(manage::admin_log(account, &conversation_id, limit).map_err(refused));
+        }
+        Command::SendAsOptions { conversation_id, reply } => {
+            let _ = reply.send(manage::send_as_options(account, &conversation_id).map_err(refused));
+        }
+        Command::SetDefaultSendAs { conversation_id, peer, reply } => {
+            let _ = reply.send(manage::set_default_send_as(account, &conversation_id, &peer).map_err(refused));
         }
         Command::StartDirect { person_id, reply } => {
             // Nothing reaches the other person: the chat exists on Telegram once a message does.
@@ -1095,6 +1145,12 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::Catalog { kind, space_id, query, cursor, reply } => {
             let _ = reply.send(catalog::catalog(account, kind, space_id.as_deref(), &query, cursor.as_deref()).map_err(refused));
+        }
+        Command::OpenLink { url, reply } => {
+            let _ = reply.send(open_link::open(account, &url).map_err(refused));
+        }
+        Command::Translate { conversation_id, message_ids, to, reply } => {
+            let _ = reply.send(translate::translate(account, &conversation_id, &message_ids, &to).map_err(refused));
         }
         Command::SaveGif { id, unsave, reply } => {
             let _ = reply.send(catalog::save_gif(account, &id, unsave).map_err(refused));
@@ -1284,6 +1340,50 @@ fn mark_read(account: &Account, conversation: &str, message: &str) {
     }
 }
 
+/// Tells Telegram a voice or round video message's contents were listened to, once per message.
+/// Follows the same rule as `mark_read`: reported when playback starts, with no opt-out switch.
+fn mark_played(account: &Account, conversation: &str, message: &str) {
+    let (Some((who, _topic)), Ok(id)) = (Who::parse(conversation), message.parse::<i32>()) else {
+        return;
+    };
+    let Ok(Some(stored)) = account.ctx.stored_message(conversation, message) else {
+        return;
+    };
+    if stored.outgoing || !stored.media_unread || stored.attachments.iter().any(|a| a.view_once) {
+        return;
+    }
+    let key = (conversation.to_owned(), id);
+    {
+        let mut live = account.live();
+        if live.played_sent.contains(&key) {
+            return;
+        }
+        if live.played_sent.len() >= 512 {
+            live.played_sent.pop_front();
+        }
+        live.played_sent.push_back(key.clone());
+    }
+    let target = sync::comment_target(account, conversation)
+        .ok()
+        .flatten()
+        .map(|(group, _)| group)
+        .unwrap_or(who);
+    account.here();
+    let told = match target {
+        Who::Channel(_) => account
+            .input_channel(target)
+            .and_then(|channel| account.ask(&tl::functions::channels::ReadMessageContents { channel, id: vec![id] }).map(drop)),
+        _ => account.ask(&tl::functions::messages::ReadMessageContents { id: vec![id] }).map(drop),
+    };
+    match told {
+        Ok(()) => live::mark_contents_read(account, conversation, id),
+        Err(fault) => {
+            account.live().played_sent.retain(|entry| entry != &key);
+            tracing::warn!("chatd: Telegram: readMessageContents: {fault}");
+        }
+    }
+}
+
 /// `messages.markDialogUnread`. A topic has no dialog mark of its own; the forum's does.
 fn mark_dialog_unread(account: &Account, conversation: &str, unread: bool) {
     let Some((who, None)) = Who::parse(conversation) else {
@@ -1391,10 +1491,10 @@ fn send_text(account: &Account, conversation: &str, client_id: &str, text: &str,
         entities,
         schedule_date: opts.schedule,
         schedule_repeat_period: None,
-        send_as: None,
+        send_as: opts.send_as.and_then(|who| account.input(who).ok()),
         quick_reply_shortcut: None,
         effect: None,
-        allow_paid_stars: None,
+        allow_paid_stars: opts.allow_paid_stars,
         suggested_post: None,
         rich_message: None,
     };

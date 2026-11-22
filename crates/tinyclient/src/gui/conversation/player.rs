@@ -328,6 +328,16 @@ impl Pane {
             .gap(px(10.))
             .when_some(reason, |row, reason| row.tooltip(tip(format!("{reason} Click play to try again."), None)));
         let row = if voice {
+            let unplayed = message.media_unread && (message.outgoing || shown.status == Status::Idle);
+            let unplayed_dot = unplayed.then(|| {
+                div()
+                    .id(("unplayed", index))
+                    .size(px(6.))
+                    .flex_none()
+                    .rounded_full()
+                    .bg(theme::accent())
+                    .tooltip(tip(if message.outgoing { "Not listened yet" } else { "Unplayed" }, None))
+            });
             let bars = media::waveform(&attachment.waveform, BARS);
             let wave = self.scrubbable(&file.id, message, index, duration, cx).flex_1().min_w_0().h(px(28.)).flex().items_center().justify_between().overflow_hidden().children(
                 bars.into_iter().enumerate().map(|(bar, tall)| {
@@ -335,7 +345,7 @@ impl Pane {
                     div().w(px(2.)).h(px(tall)).flex_none().rounded(px(1.)).bg(if reached { theme::accent() } else { theme::text_faint() })
                 }),
             );
-            row.h(px(48.)).child(button).child(wave).child(time).child(speed)
+            row.h(px(48.)).child(button).child(wave).children(unplayed_dot).child(time).child(speed)
         } else {
             let track = self.scrubbable(&file.id, message, index, duration, cx).flex_1().min_w_0().h(px(14.)).flex().items_center().child(
                 div()
@@ -376,6 +386,8 @@ mod tests {
             since: 1_000,
             duration: 6_000,
             rate: 200,
+            has_next: false,
+            has_previous: false,
         }
     }
 

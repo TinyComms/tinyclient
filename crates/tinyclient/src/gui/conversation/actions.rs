@@ -418,6 +418,10 @@ enum MenuAct {
     Report,
     /// A sent message: ask, unless the click held Shift.
     Delete,
+    /// This message, in the system language. The original stays underneath.
+    Translate,
+    /// The messages loaded in this chat, one request. Not the live Premium bar.
+    TranslateChat,
 }
 
 /// Maximum number of messages that can be selected at once (matches Telegram's 100-message cap).
@@ -540,6 +544,11 @@ pub fn deletable_selected<'a>(
         .collect()
 }
 
+/// A Telegram secret chat: `e` and digits. `Who` does not parse that prefix.
+fn secret_id(id: &str) -> bool {
+    id.strip_prefix('e').is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 /// What the menu offers, in the order it is drawn and the order Up and Down move.
 /// `quick` is how many quick reactions the menu shows. An unsent message ignores the rest.
 fn menu_acts(
@@ -552,6 +561,8 @@ fn menu_acts(
     can_open_link: bool,
     can_save: bool,
     can_save_gif: bool,
+    translate: bool,
+    translate_chat: bool,
 ) -> Vec<MenuAct> {
     if can.unsent {
         let mut acts = Vec::new();
@@ -586,6 +597,12 @@ fn menu_acts(
     }
     if has_text {
         acts.push(MenuAct::Copy);
+    }
+    if translate {
+        acts.push(MenuAct::Translate);
+    }
+    if translate_chat {
+        acts.push(MenuAct::TranslateChat);
     }
     if has_link {
         acts.push(MenuAct::Link);
@@ -1313,6 +1330,8 @@ impl Pane {
             has_link && self.open.as_ref().is_some_and(|open| open.key.network != Network::Tiny),
             self.saveable_file(message).is_some(),
             self.saveable_gif(message).is_some(),
+            self.can_translate_message(message, cx),
+            self.can_translate_chat(cx),
         );
         let cursor = if acts.is_empty() {
             0
@@ -1441,7 +1460,96 @@ impl Pane {
                 }
             }
             MenuAct::Delete => self.delete(&message, at_once, window, cx),
+            MenuAct::Translate => self.translate_message(&message, cx),
+            MenuAct::TranslateChat => self.translate_chat(cx),
         }
+    }
+
+    /// Telegram, and not a sealed or secret chat. Missing the open row counts as sealed: nothing is sent.
+    fn translation_blocked(&self, cx: &Context<Self>) -> bool {
+        let Some(open) = self.open.as_ref() else {
+            return true;
+        };
+        if open.key.network != Network::Telegram || secret_id(&open.key.id) {
+            return true;
+        }
+        let Some(shell) = self.shell.upgrade() else {
+            return true;
+        };
+        let shell = shell.read(cx);
+        match shell.snapshot.as_ref().and_then(|snap| snap.open.as_ref()) {
+            Some(row) if row.key == open.key => row.encryption.is_sealed(),
+            _ => true,
+        }
+    }
+
+    fn can_translate_message(&self, message: &Message, cx: &Context<Self>) -> bool {
+        !message.deleted && !message.text.trim().is_empty() && !self.translation_blocked(cx)
+    }
+
+    fn can_translate_chat(&self, cx: &Context<Self>) -> bool {
+        !self.translation_blocked(cx)
+            && self.items.iter().filter_map(Item::message).any(|message| !message.deleted && !message.text.trim().is_empty())
+    }
+
+    fn translate_message(&mut self, message: &Message, cx: &mut Context<Self>) {
+        self.translate_ids(vec![message.id.clone()], cx);
+    }
+
+    /// shortcut: one request of the messages on screen, not Telegram's Premium live bar (`togglePeerTranslations`).
+    fn translate_chat(&mut self, cx: &mut Context<Self>) {
+        let mut ids: Vec<String> = self
+            .items
+            .iter()
+            .filter_map(Item::message)
+            .filter(|message| !message.deleted && !message.text.trim().is_empty())
+            .map(|message| message.id.clone())
+            .collect();
+        if ids.len() > 100 {
+            ids.drain(0..ids.len() - 100);
+        }
+        self.translate_ids(ids, cx);
+    }
+
+    fn translate_ids(&mut self, message_ids: Vec<String>, cx: &mut Context<Self>) {
+        if self.translation_blocked(cx) {
+            self.say("A sealed or secret chat is not translated.".into(), cx);
+            return;
+        }
+        if message_ids.is_empty() {
+            self.say("Choose a message to translate.".into(), cx);
+            return;
+        }
+        let Some(conversation) = self.key().cloned() else {
+            return;
+        };
+        // shortcut: the system language fills `to` until a settings row does.
+        let to = time::system_language();
+        let watched = conversation.clone();
+        let request = Request::Translate { conversation, message_ids, to };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| {
+                // The chat changed while Telegram answered. Those ids belong to the chat that asked.
+                if this.key() != Some(&watched) {
+                    return;
+                }
+                match answer {
+                    Ok(Response::Translated { items }) => {
+                        for item in items {
+                            if !item.text.is_empty() {
+                                this.translations.insert(item.message_id, item.text);
+                            }
+                        }
+                        cx.notify();
+                    }
+                    Ok(Response::Error { detail, .. }) => this.say(detail, cx),
+                    Err(err) => this.say(crate::client::trouble_words("translate", &err), cx),
+                    _ => {}
+                }
+            });
+        })
+        .detach();
     }
 
     /// A file attachment already on disk, as `(path, name)`, for Save as….
@@ -1595,6 +1703,12 @@ impl Pane {
             }
             if !message.text.is_empty() {
                 rows.push(row("sheet-copy", "icons/copy.svg", "Copy text".into(), false).on_click(then(|this, message, _, cx| this.copy_text(message, cx))).into_any_element());
+            }
+            if self.can_translate_message(message, cx) {
+                rows.push(row("sheet-translate", "icons/message-square.svg", "Translate".into(), false).on_click(then(|this, message, _, cx| this.translate_message(message, cx))).into_any_element());
+            }
+            if self.can_translate_chat(cx) {
+                rows.push(row("sheet-translate-chat", "icons/messages-square.svg", "Translate chat".into(), false).on_click(then(|this, _, _, cx| this.translate_chat(cx))).into_any_element());
             }
             if let Some(link) = self.link_of(message, cx) {
                 let open = link.clone();
@@ -1879,6 +1993,20 @@ impl Pane {
                     .child(menu_separator())
                     .child(menu_item("copy", Some("icons/copy.svg"), copy, Some("⌘C")).when(lit(MenuAct::Copy), |row| row.bg(theme::selected()))
                         .on_click(go(MenuAct::Copy)));
+            }
+            if self.can_translate_message(&message, cx) {
+                items = items.child(
+                    menu_item("translate", Some("icons/message-square.svg"), "Translate", None)
+                        .when(lit(MenuAct::Translate), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::Translate)),
+                );
+            }
+            if self.can_translate_chat(cx) {
+                items = items.child(
+                    menu_item("translate-chat", Some("icons/messages-square.svg"), "Translate chat", None)
+                        .when(lit(MenuAct::TranslateChat), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::TranslateChat)),
+                );
             }
             if self.link_of(&message, cx).is_some() {
                 items = items
@@ -3127,7 +3255,7 @@ mod tests {
         let said = Message::plain("1", "Mara", "hello", 1, false);
         let on = can(&said, &discord_caps(), rights, channel, false, 10);
         assert_eq!(
-            menu_acts(on, false, 2, true, true, true, true, false, false),
+            menu_acts(on, false, 2, true, true, true, true, false, false, false, false),
             vec![
                 MenuAct::Quick(0),
                 MenuAct::Quick(1),
@@ -3143,7 +3271,7 @@ mod tests {
             ]
         );
         // Tiny has Copy link without Open in Tiny.
-        let tiny_acts = menu_acts(on, false, 0, true, false, true, false, false, false);
+        let tiny_acts = menu_acts(on, false, 0, true, false, true, false, false, false, false, false);
         assert!(tiny_acts.contains(&MenuAct::Link) && !tiny_acts.contains(&MenuAct::Open));
         let mut mine = Message::plain("2", "Robin", "on it", 2, true);
         mine.state = SendState::Failed {
@@ -3151,12 +3279,18 @@ mod tests {
         };
         let failed = can(&mine, &discord_caps(), rights, channel, false, 10);
         assert_eq!(
-            menu_acts(failed, true, 3, true, true, false, false, true, false),
+            menu_acts(failed, true, 3, true, true, false, false, true, false, false, false),
             vec![MenuAct::Retry, MenuAct::Copy, MenuAct::Drop]);
         assert_eq!(
-            menu_acts(on, false, 0, false, false, false, false, true, false),
+            menu_acts(on, false, 0, false, false, false, false, true, false, false, false),
             vec![MenuAct::Reply, MenuAct::Thread, MenuAct::Forward, MenuAct::SaveAs, MenuAct::Unread, MenuAct::Select],
         );
+        let translated = menu_acts(on, false, 0, false, true, true, true, false, false, true, true);
+        let copy = translated.iter().position(|act| *act == MenuAct::Copy).unwrap();
+        let link = translated.iter().position(|act| *act == MenuAct::Link).unwrap();
+        assert!(copy + 1 < link);
+        assert_eq!(translated[copy + 1], MenuAct::Translate);
+        assert_eq!(translated[copy + 2], MenuAct::TranslateChat);
     }
 
     #[test]

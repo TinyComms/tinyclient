@@ -636,6 +636,51 @@ pub(super) fn handle_join_request(
     Ok(())
 }
 
+/// Per-conversation send rules: merges `default_banned_rights` and personal `banned_rights`,
+/// slow mode from `channels.getFullChannel`, and `send_paid_messages_stars` from channel or user.
+pub(super) fn send_rules(account: &Account, conversation: &str) -> Result<protocol::SendRules, Fault> {
+    let (who, _) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;
+    let now = crate::hub::now();
+    match who {
+        Who::User(id) if id == account.me || id == SERVICE => Ok(protocol::SendRules::default()),
+        Who::User(_) => {
+            let id = account.dir().input_user(who).ok_or_else(|| invalid("USER_ID_INVALID"))?;
+            let tl::enums::users::UserFull::Full(full) = account.ask(&tl::functions::users::GetFullUser { id })?;
+            account.learn(&full.users, &full.chats);
+            let tl::enums::UserFull::Full(user) = full.full_user;
+            let mut rules = protocol::SendRules::default();
+            if user.voice_messages_forbidden {
+                rules.send_voices = false;
+            }
+            if let Some(stars) = user.send_paid_messages_stars.filter(|&s| s > 0) {
+                rules.paid_stars = Some(stars as u64);
+            }
+            Ok(rules)
+        }
+        Who::Group(chat_id) => {
+            let tl::enums::messages::ChatFull::Full(full) = account.ask(&tl::functions::messages::GetFullChat { chat_id })?;
+            account.learn(&full.users, &full.chats);
+            let known = account.dir().get(who).cloned().unwrap_or_default();
+            Ok(known.send_rules(now, 0, None, None))
+        }
+        Who::Channel(_) => {
+            let channel = account.input_channel(who)?;
+            let tl::enums::messages::ChatFull::Full(full) = account.ask(&tl::functions::channels::GetFullChannel { channel })?;
+            account.learn(&full.users, &full.chats);
+            let (slowmode_seconds, slowmode_next_send, paid_stars) = match full.full_chat {
+                tl::enums::ChatFull::ChannelFull(channel) => (
+                    channel.slowmode_seconds.filter(|&s| s > 0).map_or(0, |s| s as u32),
+                    channel.slowmode_next_send_date.map(i64::from).filter(|&ts| ts > now),
+                    channel.send_paid_messages_stars.filter(|&s| s > 0).map(|s| s as u64),
+                ),
+                tl::enums::ChatFull::Full(_) => (0, None, None),
+            };
+            let known = account.dir().get(who).cloned().unwrap_or_default();
+            Ok(known.send_rules(now, slowmode_seconds, slowmode_next_send, paid_stars))
+        }
+    }
+}
+
 /// Sets or clears Telegram's auto-delete timer (`messages.setHistoryTTL`).
 pub(super) fn set_disappearing(account: &Account, conversation: &str, seconds: u32) -> Result<(), Fault> {
     let (who, _) = Who::parse(conversation).ok_or_else(|| invalid("PEER_ID_INVALID"))?;

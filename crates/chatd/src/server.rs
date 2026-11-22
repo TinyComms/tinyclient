@@ -161,6 +161,20 @@ fn offline_words(account: &AccountKey, with: &Outgoing) -> String {
     }
 }
 
+/// A language tag Telegram can be asked for: `en`, `pt-BR`. Empty and anything else is refused.
+fn translate_language(raw: &str) -> Option<String> {
+    let to = raw.trim();
+    let bytes = to.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > 16
+        || !bytes[0].is_ascii_alphabetic()
+        || !bytes.iter().all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-' || *byte == b'_')
+    {
+        return None;
+    }
+    Some(to.to_owned())
+}
+
 fn error(code: ErrorCode, detail: impl ToString) -> Response {
     Response::Error {
         code,
@@ -1208,6 +1222,25 @@ impl Chat {
         Response::Ok
     }
 
+    fn mark_played(&self, conversation: Key, message_id: String) {
+        if message_id.is_empty() {
+            return;
+        }
+        let Ok(Some(stored)) = self.hub.store().message(&conversation, &message_id) else {
+            return;
+        };
+        if stored.outgoing || !stored.media_unread {
+            return;
+        }
+        if stored.attachments.iter().any(|attachment| attachment.view_once) {
+            return;
+        }
+        let account = conversation.account();
+        if self.hub.link(&account) == Link::Connected {
+            self.command(&account, Command::MarkPlayed { conversation_id: conversation.id, message_id });
+        }
+    }
+
     fn forget_conversation(&self, conversation: Key) -> Response {
         match self.hub.store().forget_conversation(&conversation) {
             Ok(true) => {
@@ -1275,11 +1308,20 @@ impl Chat {
         for file in &with.files {
             self.hub.player.stop_file(&self.hub, std::path::Path::new(&file.path));
         }
-        let (conversation_id, text) = (conversation.id, message.text.clone());
+        let (conversation_id, text) = (conversation.id.clone(), message.text.clone());
+        let scheduled = with.schedule.is_some();
         let command = match with.is_plain() {
             true => Command::Send { conversation_id, client_id, text, reply_to },
             false => Command::SendWith { conversation_id, client_id, text, reply_to, with: Box::new(with) },
         };
+        if !scheduled {
+            if let Some(mut rules) = self.hub.send_rules.get(&conversation) {
+                if rules.slowmode_seconds > 0 {
+                    rules.slowmode_next_send = Some(now() + i64::from(rules.slowmode_seconds));
+                    self.hub.send_rules.keep(conversation.clone(), rules);
+                }
+            }
+        }
         self.command(&account, command);
         Response::Sent { message }
     }
@@ -1379,12 +1421,37 @@ impl Chat {
     }
 
     /// When this account connects, hand off the text that was written while it was offline.
+    /// Also wires the player's auto-play hooks (fetching the next voice file and marking it listened).
     fn arm_queue(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
         self.hub.on_connected(move |account| {
             let Some(chat) = weak.upgrade() else { return };
             chat.release_queue(account);
         });
+        let weak = Arc::downgrade(self);
+        self.hub.player.on_started(move |conversation, message_id| {
+            let Some(chat) = weak.upgrade() else { return };
+            chat.mark_played(conversation.clone(), message_id.to_owned());
+        });
+        let weak = Arc::downgrade(self);
+        self.hub.player.on_fetch(move |account, file_id| {
+            let Some(chat) = weak.upgrade() else { return };
+            chat.fetch_for_playback(account, file_id);
+        });
+    }
+
+    fn fetch_for_playback(&self, account: &AccountKey, file_id: &str) {
+        let adapter = lock(&self.adapters).get(account).map(Adapter::sender);
+        let ids = [file_id.to_owned()];
+        if let Ok(files) = self.blobs.request(account, &ids, adapter.clone()) {
+            if let Some(found) = files.iter().find(|file| file.id == file_id) {
+                if found.path.is_some() || found.failed.is_some() {
+                    self.hub.player.file_landed(account, found);
+                }
+            } else if let Some(adapter) = adapter {
+                let _ = adapter.send(Command::Wanted(vec![file_id.to_owned()]));
+            }
+        }
     }
 
     /// What the account may send, checked before anything is stored: a file too large or too
@@ -1479,6 +1546,46 @@ impl Chat {
         message
     }
 
+    /// On-demand translation. A sealed or secret chat is refused before any command is sent,
+    /// so the adapter never sees it and the stored text stays as it was.
+    fn translate(&self, conversation: Key, message_ids: Vec<String>, to: String) -> Response {
+        match self.sealed_or_secret(&conversation) {
+            Ok(true) => return error(ErrorCode::Refused, "A sealed or secret chat is not translated."),
+            Ok(false) => {}
+            Err(err) => return internal(err),
+        }
+        let Some(to) = translate_language(&to) else {
+            return error(ErrorCode::Refused, "Choose a language to translate into.");
+        };
+        if message_ids.is_empty() || message_ids.len() > 100 {
+            return error(ErrorCode::Refused, "Choose a message to translate.");
+        }
+        if conversation.network != Network::Telegram {
+            return error(ErrorCode::Unsupported, format!("{} cannot do this yet", conversation.network.label()));
+        }
+        let account = conversation.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let conversation_id = conversation.id.clone();
+        match self.ask(&account, |reply| Command::Translate { conversation_id, message_ids, to, reply }) {
+            Ok(items) => Response::Translated { items },
+            Err(refused) => *refused,
+        }
+    }
+
+    /// A Telegram secret chat (`e` plus digits) or a conversation whose row is end-to-end sealed.
+    fn sealed_or_secret(&self, conversation: &Key) -> Result<bool, rusqlite::Error> {
+        if conversation.network == Network::Telegram {
+            if let Some(rest) = conversation.id.strip_prefix('e') {
+                if !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(self.hub.store().conversation(conversation)?.is_some_and(|row| row.encryption.is_sealed()))
+    }
+
     /// Refuses what needs the network when the account is not connected to it.
     fn online(&self, account: &AccountKey) -> Result<(), Refused> {
         match self.hub.link(account) {
@@ -1503,6 +1610,23 @@ impl Chat {
     fn reactions(&self, conversation: Key) -> Response {
         match self.reaction_rules(&conversation) {
             Ok(rules) => Response::Reactions { conversation, rules },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn send_rules(&self, conversation: Key) -> Response {
+        if let Some(rules) = self.hub.send_rules.get(&conversation) {
+            return Response::SendRules { conversation, rules };
+        }
+        let conversation_id = conversation.id.clone();
+        match self.ask(&conversation.account(), |reply| Command::SendRules { conversation_id, reply }) {
+            Ok(rules) => {
+                self.hub.send_rules.keep(conversation.clone(), rules.clone());
+                Response::SendRules { conversation, rules }
+            }
+            Err(refused) if matches!(&*refused, Response::Error { code: ErrorCode::Unsupported, .. }) => {
+                Response::SendRules { conversation, rules: protocol::SendRules::default() }
+            }
             Err(refused) => *refused,
         }
     }
@@ -2326,6 +2450,21 @@ impl Chat {
     }
 
     fn resolve_link(&self, url: &str) -> Response {
+        if let Some(parsed) = protocol::link::telegram_app_link(url) {
+            return match self.hub.store().resolve_link(&parsed) {
+                Ok(Some(conv)) => Response::Resolved {
+                    conversation: Some(conv.key),
+                    message_id: parsed.message_id,
+                    title: conv.title,
+                },
+                Ok(None) => self.preview_telegram_link(url),
+                Err(err) => internal(err),
+            };
+        }
+        // telegram.dog, tg://, a traversal, or a pack: not an in-app open, and not a command.
+        if protocol::link::telegram_family(url) {
+            return Response::Resolved { conversation: None, message_id: None, title: String::new() };
+        }
         let Some(parsed) = protocol::link::parse_network_link(url) else {
             return Response::Resolved { conversation: None, message_id: None, title: String::new() };
         };
@@ -2360,6 +2499,28 @@ impl Chat {
                 Response::Resolved { conversation: None, message_id: None, title: String::new() }
             }
             Err(err) => internal(err),
+        }
+    }
+
+    /// A `t.me` link the cache does not have. One connected Telegram account may preview it.
+    /// Nothing here joins the chat. No connected account, or no such username, is "not here".
+    fn preview_telegram_link(&self, url: &str) -> Response {
+        let Some(account) = self
+            .hub
+            .links()
+            .into_iter()
+            .find(|linked| linked.account.network == Network::Telegram && linked.link == Link::Connected)
+            .map(|linked| linked.account)
+        else {
+            return Response::Resolved { conversation: None, message_id: None, title: String::new() };
+        };
+        match self.ask(&account, |reply| Command::OpenLink { url: url.to_owned(), reply }) {
+            Ok(Some(opened)) => Response::Resolved {
+                conversation: Some(Key::new(&account, opened.conversation_id)),
+                message_id: opened.message_id,
+                title: opened.title,
+            },
+            _ => Response::Resolved { conversation: None, message_id: None, title: String::new() },
         }
     }
 
@@ -3523,6 +3684,107 @@ impl Chat {
                 }
                 res
             }
+            Request::ModerateMember { conversation, person, action } => {
+                if person.trim().is_empty() {
+                    return error(ErrorCode::Refused, "No person named to moderate.");
+                }
+                let res = self.act(&conversation, |conversation_id, reply| Command::ModerateMember {
+                    conversation_id,
+                    person,
+                    action,
+                    reply,
+                });
+                if res == Response::Ok {
+                    self.hub.infos.forget(&conversation);
+                }
+                res
+            }
+            Request::SetAdmin { conversation, person, rights } => {
+                if person.trim().is_empty() {
+                    return error(ErrorCode::Refused, "No person named to update.");
+                }
+                let res = self.act(&conversation, |conversation_id, reply| Command::SetAdmin {
+                    conversation_id,
+                    person,
+                    rights,
+                    reply,
+                });
+                if res == Response::Ok {
+                    self.hub.infos.forget(&conversation);
+                }
+                res
+            }
+            Request::TransferOwnership { conversation, person, password } => {
+                if person.trim().is_empty() {
+                    return error(ErrorCode::Refused, "No new owner named.");
+                }
+                if password.is_empty() {
+                    return error(ErrorCode::Refused, "Your two-step verification password is required to transfer ownership.");
+                }
+                let res = self.act(&conversation, |conversation_id, reply| Command::TransferOwnership {
+                    conversation_id,
+                    person,
+                    password,
+                    reply,
+                });
+                if res == Response::Ok {
+                    self.hub.infos.forget(&conversation);
+                }
+                res
+            }
+            Request::UpdateChatSettings { conversation, settings } => {
+                let res = self.act(&conversation, |conversation_id, reply| Command::UpdateChatSettings {
+                    conversation_id,
+                    settings,
+                    reply,
+                });
+                if res == Response::Ok {
+                    self.hub.infos.forget(&conversation);
+                    self.hub.send_rules.forget(&conversation);
+                }
+                res
+            }
+            Request::AdminLog { conversation, limit } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let limit = if limit == 0 { 50 } else { limit.min(100) };
+                match self.ask(&account, |reply| Command::AdminLog {
+                    conversation_id: conversation.id.clone(),
+                    limit,
+                    reply,
+                }) {
+                    Ok(entries) => Response::AdminLog { conversation, entries },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SendAsOptions { conversation } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::SendAsOptions {
+                    conversation_id: conversation.id.clone(),
+                    reply,
+                }) {
+                    Ok((peers, default)) => Response::SendAsOptions { conversation, peers, default },
+                    Err(refused) if matches!(&*refused, Response::Error { code: ErrorCode::Unsupported, .. }) => {
+                        Response::SendAsOptions { conversation, peers: Vec::new(), default: None }
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SetDefaultSendAs { conversation, peer } => {
+                if peer.trim().is_empty() {
+                    return error(ErrorCode::Refused, "Choose who to send as.");
+                }
+                self.act(&conversation, |conversation_id, reply| Command::SetDefaultSendAs {
+                    conversation_id,
+                    peer,
+                    reply,
+                })
+            }
             request @ (Request::StartDirect { .. } | Request::StartDirectCall { .. }) => {
                 let (person, call) = match request {
                     Request::StartDirect { person } => (person, false),
@@ -3864,6 +4126,10 @@ impl Chat {
                 }
                 Response::Ok
             }
+            Request::MarkPlayed { conversation, message_id } => {
+                self.mark_played(conversation, message_id);
+                Response::Ok
+            }
 
             Request::React { conversation, message_id, emoji, on, burst } => self.react(conversation, message_id, emoji, on, burst),
             Request::Reactions { conversation } => self.reactions(conversation),
@@ -3922,6 +4188,7 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::SendRules { conversation } => self.send_rules(conversation),
             Request::Reactors { conversation, message_id, emoji, burst, after, limit } => {
                 self.reactors(conversation, message_id, emoji, burst, after, limit)
             }
@@ -4291,6 +4558,7 @@ impl Chat {
                 match self.hub.player.request(&self.hub, &support_dir().join("media"), request) {
                     Ok(()) => {
                         if let Some((conversation, message_id)) = viewed {
+                            self.mark_played(conversation.clone(), message_id.clone());
                             let account = conversation.account();
                             if self.hub.link(&account) == Link::Connected {
                                 self.command(&account, Command::Viewed { conversation_id: conversation.id, message_id });
@@ -4636,6 +4904,7 @@ impl Chat {
                     reply,
                 })
             }
+            Request::Translate { conversation, message_ids, to } => self.translate(conversation, message_ids, to),
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
                     Some(id) => self.hub.settings().custom_sound(id).is_some(),
@@ -6148,5 +6417,190 @@ mod tests {
 
         let commands = seen.lock().unwrap().clone();
         assert_eq!(commands, vec![("ch-1".to_owned(), "m-1".to_owned())]);
+    }
+
+    fn telegram_link_account() -> (std::sync::Arc<super::Chat>, protocol::AccountKey, crate::adapters::Context, std::sync::mpsc::Receiver<crate::adapters::Command>) {
+        use crate::hub::lock;
+        use crate::store::Store;
+        use protocol::{AccountKey, Link, Network};
+        use std::sync::Arc;
+
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let chat = Arc::new(super::Chat::new(store));
+        let account = AccountKey { network: Network::Telegram, account: "tg".into() };
+        let (adapter, ctx, rx) = crate::adapters::local(account.clone(), Arc::clone(&chat.hub));
+        lock(&chat.adapters).insert(account.clone(), adapter);
+        chat.hub.set_link(&account, Link::Connected, "");
+        (chat, account, ctx, rx)
+    }
+
+    #[test]
+    fn a_telegram_link_resolves_a_cached_chat_and_asks_once_when_it_is_missing() {
+        use crate::adapters::{Command, OpenedLink};
+        use crate::hub::lock;
+        use crate::store::ConversationRow;
+        use protocol::{ConversationKind, Key, Request, Response};
+        use std::sync::{Arc, Mutex};
+
+        let (chat, account, ctx, rx) = telegram_link_account();
+        ctx.conversation(&ConversationRow::new("rustlang", ConversationKind::Channel, "Rust")).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_worker = Arc::clone(&seen);
+        let worker_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || {
+            for cmd in rx {
+                match cmd {
+                    Command::OpenLink { url, reply } => {
+                        seen_worker.lock().unwrap().push(url);
+                        let _ = reply.send(Ok(Some(OpenedLink {
+                            conversation_id: "c99".into(),
+                            message_id: None,
+                            title: "Other".into(),
+                        })));
+                    }
+                    Command::Stop => break,
+                    other => other.unsupported(&worker_ctx),
+                }
+            }
+        });
+
+        let Response::Resolved { conversation, message_id, title } = chat.handle(Request::Resolve { url: "https://t.me/rustlang/99".into() }) else {
+            panic!("expected Resolved");
+        };
+        assert_eq!(conversation, Some(Key::new(&account, "rustlang")));
+        assert_eq!(message_id.as_deref(), Some("99"));
+        assert_eq!(title, "Rust");
+        assert!(seen.lock().unwrap().is_empty(), "a cached t.me link does not ask the network");
+
+        let Response::Resolved { conversation, message_id, title } = chat.handle(Request::Resolve { url: "https://telegram.me/othername".into() }) else {
+            panic!("expected Resolved");
+        };
+        assert_eq!(conversation, Some(Key::new(&account, "c99")));
+        assert_eq!(message_id, None);
+        assert_eq!(title, "Other");
+        assert_eq!(seen.lock().unwrap().clone(), vec!["https://telegram.me/othername".to_owned()]);
+
+        lock(&chat.adapters).remove(&account);
+        drop(ctx);
+        let _ = worker.join();
+    }
+
+    #[test]
+    fn a_foreign_host_or_a_traversal_does_not_open_a_telegram_link() {
+        use crate::adapters::Command;
+        use crate::hub::lock;
+        use protocol::{Request, Response};
+        use std::sync::{Arc, Mutex};
+
+        let (chat, account, ctx, rx) = telegram_link_account();
+        let seen = Arc::new(Mutex::new(0u32));
+        let seen_worker = Arc::clone(&seen);
+        let worker_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || {
+            for cmd in rx {
+                match cmd {
+                    Command::OpenLink { reply, .. } => {
+                        *seen_worker.lock().unwrap() += 1;
+                        let _ = reply.send(Ok(None));
+                    }
+                    Command::Stop => break,
+                    other => other.unsupported(&worker_ctx),
+                }
+            }
+        });
+
+        for url in [
+            "https://example.com/rustlang",
+            "https://t.me/%2e%2e/rustlang",
+            "https://t.me/../rustlang",
+            "https://telegram.dog/rustlang",
+            "tg://resolve?domain=rustlang",
+            "https://t.me/ab",
+        ] {
+            let Response::Resolved { conversation, .. } = chat.handle(Request::Resolve { url: url.into() }) else {
+                panic!("expected Resolved for {url}");
+            };
+            assert_eq!(conversation, None, "{url}");
+        }
+        assert_eq!(*seen.lock().unwrap(), 0, "no open command for a foreign host or a bad path");
+
+        lock(&chat.adapters).remove(&account);
+        drop(ctx);
+        let _ = worker.join();
+    }
+
+    #[test]
+    fn a_translation_keeps_the_original_and_a_sealed_chat_is_not_asked() {
+        use crate::adapters::Command;
+        use crate::hub::lock;
+        use crate::store::ConversationRow;
+        use protocol::{ConversationKind, Encryption, ErrorCode, Key, Message, Request, Response, Translation};
+        use std::sync::{Arc, Mutex};
+
+        let (chat, account, ctx, rx) = telegram_link_account();
+        ctx.conversation(&ConversationRow::new("u7", ConversationKind::Direct, "Ada")).unwrap();
+        ctx.message("u7", &Message::plain("42", "Ada", "hola", 1, false)).unwrap();
+        let mut sealed = ConversationRow::new("u8", ConversationKind::Direct, "Bea");
+        sealed.encryption = Encryption::EndToEnd;
+        ctx.conversation(&sealed).unwrap();
+        ctx.conversation(&ConversationRow::new("e9", ConversationKind::Direct, "Secret")).unwrap();
+
+        let seen = Arc::new(Mutex::new(Vec::<(String, Vec<String>, String)>::new()));
+        let seen_worker = Arc::clone(&seen);
+        let worker_ctx = ctx.clone();
+        let worker = std::thread::spawn(move || {
+            for cmd in rx {
+                match cmd {
+                    Command::Translate { conversation_id, message_ids, to, reply } => {
+                        seen_worker.lock().unwrap().push((conversation_id, message_ids, to));
+                        let _ = reply.send(Ok(vec![Translation {
+                            message_id: "42".into(),
+                            text: "hello".into(),
+                            spans: Vec::new(),
+                        }]));
+                    }
+                    Command::Stop => break,
+                    other => other.unsupported(&worker_ctx),
+                }
+            }
+        });
+
+        let Response::Translated { items } = chat.handle(Request::Translate {
+            conversation: Key::new(&account, "u7"),
+            message_ids: vec!["42".into()],
+            to: "en".into(),
+        }) else {
+            panic!("expected Translated");
+        };
+        assert_eq!(items, vec![Translation { message_id: "42".into(), text: "hello".into(), spans: Vec::new() }]);
+        assert_eq!(ctx.stored_message("u7", "42").unwrap().unwrap().text, "hola");
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![("u7".to_owned(), vec!["42".to_owned()], "en".to_owned())]
+        );
+
+        for id in ["u8", "e9"] {
+            let Response::Error { code, .. } = chat.handle(Request::Translate {
+                conversation: Key::new(&account, id),
+                message_ids: vec!["42".into()],
+                to: "en".into(),
+            }) else {
+                panic!("expected a refusal for {id}");
+            };
+            assert_eq!(code, ErrorCode::Refused, "{id}");
+        }
+        let Response::Error { code, .. } = chat.handle(Request::Translate {
+            conversation: Key::new(&account, "u7"),
+            message_ids: vec!["42".into()],
+            to: "  ".into(),
+        }) else {
+            panic!("expected a refusal for an empty language");
+        };
+        assert_eq!(code, ErrorCode::Refused);
+        assert_eq!(seen.lock().unwrap().len(), 1, "sealed, secret, and an empty language send no command");
+
+        lock(&chat.adapters).remove(&account);
+        drop(ctx);
+        let _ = worker.join();
     }
 }

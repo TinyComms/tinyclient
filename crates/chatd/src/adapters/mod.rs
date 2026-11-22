@@ -69,7 +69,7 @@ use protocol::{
     AccountKey, Activity, CallFailure, CallState, Capabilities, CatalogItem, CatalogKind, Change,
     Contact, Group, Key, Link, MediaFile, MemberSection, Message, MessageHit, Network, Notify,
     Occupant, Occupants, Outgoing, Participant, Person, Presence, Reaction, RelateAction, Relation,
-    SendState, SharedItem, SharedKind, Compose, Typist, VoiceJoin, Warning, Watching,
+    SendState, SharedItem, SharedKind, Compose, Translation, Typist, VoiceJoin, Warning, Watching,
 };
 use std::collections::{HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -292,6 +292,14 @@ pub enum Picture {
     Watch(Option<String>),
 }
 
+/// A Telegram link opened inside the app. `None` when the chat is not one this account can show.
+#[derive(Debug, Clone)]
+pub struct OpenedLink {
+    pub conversation_id: String,
+    pub message_id: Option<String>,
+    pub title: String,
+}
+
 /// What chatd asks of an adapter. Ids are the network's own; the account is the adapter's.
 pub enum Command {
     /// Fetch the recent history of a conversation the user opened, and correct what is cached
@@ -379,6 +387,8 @@ pub enum Command {
         emoji: String,
         reply: Reply<()>,
     },
+    /// Per-conversation send permissions, slow mode, timed mute, and paid-message star price.
+    SendRules { conversation_id: String, reply: Reply<protocol::SendRules> },
     /// Who reacted to a message with `emoji`, paged.
     Reactors {
         conversation_id: String,
@@ -457,6 +467,9 @@ pub enum Command {
     /// The user followed a link out of this message (the shell is opening it). Telegram's terms
     /// want a sponsored message's follow told; nothing waits on it.
     FollowLink { conversation_id: String, message_id: String },
+    /// The user started playing a voice or round video message; tell the network its contents
+    /// were listened to (Telegram `readMessageContents`).
+    MarkPlayed { conversation_id: String, message_id: String },
     /// A conversation's cloud draft here changed to `text` (empty clears it). The shell has
     /// already waited out the pauses between the keys, so this is one settled draft and there
     /// is nothing to answer.
@@ -499,6 +512,50 @@ pub enum Command {
     ConversationPicture {
         conversation_id: String,
         path: String,
+        reply: Reply<()>,
+    },
+    /// Kick, ban, unban, or restrict a member of a group or channel.
+    ModerateMember {
+        conversation_id: String,
+        person: String,
+        action: protocol::MemberModeration,
+        reply: Reply<()>,
+    },
+    /// Promote or demote an admin with specific rights and optional custom title.
+    SetAdmin {
+        conversation_id: String,
+        person: String,
+        rights: protocol::AdminRights,
+        reply: Reply<()>,
+    },
+    /// Transfer group/channel ownership using the account's 2FA password.
+    TransferOwnership {
+        conversation_id: String,
+        person: String,
+        password: String,
+        reply: Reply<()>,
+    },
+    /// Update group/channel default send permissions, slow mode, and feature toggles.
+    UpdateChatSettings {
+        conversation_id: String,
+        settings: protocol::ChatSettings,
+        reply: Reply<()>,
+    },
+    /// Read recent admin log events for a supergroup or channel.
+    AdminLog {
+        conversation_id: String,
+        limit: u32,
+        reply: Reply<Vec<protocol::AdminLogEntry>>,
+    },
+    /// List selectable send-as peers for a conversation and the current default peer id.
+    SendAsOptions {
+        conversation_id: String,
+        reply: Reply<(Vec<protocol::SendAs>, Option<String>)>,
+    },
+    /// Save the default send-as peer for a conversation.
+    SetDefaultSendAs {
+        conversation_id: String,
+        peer: String,
         reply: Reply<()>,
     },
     /// The id of the direct conversation with a person, created if there is none.
@@ -1130,6 +1187,16 @@ pub enum Command {
     SignOut(Reply<()>),
     /// The adapter is being dropped. `serve_commands` returns on it; an adapter never sees it.
     Stop,
+    /// Open a `t.me` or `telegram.me` link as a chat this account already has, or a preview of a
+    /// public username. Never joins. Other adapters refuse it.
+    OpenLink { url: String, reply: Reply<Option<OpenedLink>> },
+    /// Translate these messages. The adapter returns the words; it does not replace what is stored.
+    Translate {
+        conversation_id: String,
+        message_ids: Vec<String>,
+        to: String,
+        reply: Reply<Vec<Translation>>,
+    },
 }
 
 impl Command {
@@ -1141,7 +1208,14 @@ impl Command {
             Command::MembersAdd { reply, .. }
             | Command::MembersRemove { reply, .. }
             | Command::ConversationUpdate { reply, .. }
-            | Command::ConversationPicture { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            | Command::ConversationPicture { reply, .. }
+            | Command::ModerateMember { reply, .. }
+            | Command::SetAdmin { reply, .. }
+            | Command::TransferOwnership { reply, .. }
+            | Command::UpdateChatSettings { reply, .. }
+            | Command::SetDefaultSendAs { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AdminLog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SendAsOptions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StartDirect { reply, .. }
             | Command::StartDirectCall { reply, .. }
             | Command::StartGroup { reply, .. }
@@ -1237,6 +1311,7 @@ impl Command {
             Command::SendPaidReaction { reply, .. }
             | Command::TogglePaidReactionPrivacy { reply, .. }
             | Command::SetDefaultReaction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SendRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reactors { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendWith { conversation_id, client_id, .. } => {
                 let why = format!("Sending files and options is not built for {} yet.", ctx.account.network.label());
@@ -1261,6 +1336,8 @@ impl Command {
             | Command::AnswerMessageRequest { reply, .. }
             | Command::OpenForum { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Source { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::OpenLink { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Translate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReportReasons { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             // Nothing to end on the network: the session is simply forgotten.
             Command::SignOut(reply) => drop(reply.send(Ok(()))),
@@ -1781,6 +1858,27 @@ impl Context {
         let conversation = self.key(conversation_id);
         if self.hub.store().set_pinned(&conversation, message_id, pinned)? {
             self.hub.changed(Change::Messages { conversation });
+        }
+        Ok(())
+    }
+
+    /// Clears `media_unread` on a stored message after it is listened to / played.
+    /// Returns true when the flag changed from true to false.
+    pub fn mark_media_played(&self, conversation_id: &str, message_id: &str) -> rusqlite::Result<bool> {
+        let conversation = self.key(conversation_id);
+        let changed = self.hub.store().clear_media_unread(&conversation, message_id)?;
+        if changed {
+            self.hub.changed(Change::Messages { conversation });
+        }
+        Ok(changed)
+    }
+
+    /// Consumes one unread mention in a conversation when a message's contents are marked read.
+    pub fn consume_mention(&self, conversation_id: &str) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().consume_mention(&conversation)? {
+            self.hub.changed(Change::Conversation { conversation });
+            self.hub.changed(Change::Status);
         }
         Ok(())
     }

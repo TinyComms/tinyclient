@@ -215,6 +215,30 @@ pub(super) fn ensure_preview_row(account: &Account, who: Who) -> bool {
     account.ctx.conversation(&fresh).is_ok()
 }
 
+/// Records a public chat a `t.me` link named, without joining it. A row already stored is left
+/// as it is. A person is a normal chat. A group or channel we have not joined is a preview:
+/// readable, absent from the inbox, not a membership.
+pub(super) fn preview(account: &Account, who: Who) -> Result<Option<String>, Fault> {
+    let id = who.text();
+    if super::secret::is_row(&id) {
+        return Ok(None);
+    }
+    if let Some(stored) = account.ctx.known(&id).map_err(|err| Fault::Net(err.to_string()))? {
+        return Ok(Some(stored.title));
+    }
+    let Some(known) = account.dir().get(who).cloned() else {
+        return Ok(None);
+    };
+    let mut fresh = row(account, who, &known);
+    if !matches!(who, Who::User(_)) && known.member != Some(true) {
+        fresh.joined = false;
+        fresh.read_only = true;
+        fresh.listed = false;
+    }
+    account.ctx.conversation(&fresh).map_err(|err| Fault::Net(err.to_string()))?;
+    Ok(Some(fresh.title))
+}
+
 /// A group or channel was renamed, or its picture or our rights in it changed. Its filing is
 /// left as stored.
 pub(super) fn refresh_row(account: &Account, who: Who) {

@@ -510,6 +510,25 @@ pub struct ConversationRights {
     /// May create, edit, close, pin, or delete topics in a forum (`Request::TopicCreate`, `Request::TopicUpdate`, `Request::TopicDelete`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub manage_topics: bool,
+    /// May ban, unban, or restrict members (`Request::ModerateMember`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ban_members: bool,
+    /// May promote or demote admins and set admin custom titles (`Request::SetAdmin`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub promote_admins: bool,
+    /// May edit group/channel settings: default permissions, slow mode, join requests, forum,
+    /// pre-history visibility, signatures, protected content (`Request::UpdateChatSettings`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_settings: bool,
+    /// May read the recent-actions admin log (`Request::AdminLog`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub view_admin_log: bool,
+    /// Owner/creator: may transfer ownership with a 2FA password (`Request::TransferOwnership`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub transfer_owner: bool,
+    /// Admin posts anonymously as the group/channel (`anonymous` admin right).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub anonymous: bool,
 }
 
 impl ConversationRights {
@@ -521,7 +540,13 @@ impl ConversationRights {
     const RENAME: i64 = 1 << 5;
     const EDIT_TOPIC: i64 = 1 << 6;
     const EDIT_PICTURE: i64 = 1 << 7;
-    const MANAGE_TOPICS: i64 = 1 << 8;
+    const BAN_MEMBERS: i64 = 1 << 8;
+    const PROMOTE_ADMINS: i64 = 1 << 9;
+    const MANAGE_SETTINGS: i64 = 1 << 10;
+    const VIEW_ADMIN_LOG: i64 = 1 << 11;
+    const TRANSFER_OWNER: i64 = 1 << 12;
+    const ANONYMOUS: i64 = 1 << 13;
+    const MANAGE_TOPICS: i64 = 1 << 14;
 
     pub fn is_none(&self) -> bool {
         *self == ConversationRights::default()
@@ -560,6 +585,24 @@ impl ConversationRights {
         if self.manage_topics {
             bits |= Self::MANAGE_TOPICS;
         }
+        if self.ban_members {
+            bits |= Self::BAN_MEMBERS;
+        }
+        if self.promote_admins {
+            bits |= Self::PROMOTE_ADMINS;
+        }
+        if self.manage_settings {
+            bits |= Self::MANAGE_SETTINGS;
+        }
+        if self.view_admin_log {
+            bits |= Self::VIEW_ADMIN_LOG;
+        }
+        if self.transfer_owner {
+            bits |= Self::TRANSFER_OWNER;
+        }
+        if self.anonymous {
+            bits |= Self::ANONYMOUS;
+        }
         bits
     }
 
@@ -574,8 +617,104 @@ impl ConversationRights {
             edit_topic: (bits & Self::EDIT_TOPIC) != 0,
             edit_picture: (bits & Self::EDIT_PICTURE) != 0,
             manage_topics: (bits & Self::MANAGE_TOPICS) != 0,
+            ban_members: (bits & Self::BAN_MEMBERS) != 0,
+            promote_admins: (bits & Self::PROMOTE_ADMINS) != 0,
+            manage_settings: (bits & Self::MANAGE_SETTINGS) != 0,
+            view_admin_log: (bits & Self::VIEW_ADMIN_LOG) != 0,
+            transfer_owner: (bits & Self::TRANSFER_OWNER) != 0,
+            anonymous: (bits & Self::ANONYMOUS) != 0,
         }
     }
+}
+
+/// Moderation action against one member of a group or channel (`Request::ModerateMember`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum MemberModeration {
+    /// Remove from the group/channel without permanently banning.
+    Kick,
+    /// Ban from the group/channel (`until`: Unix seconds, `None` = permanent).
+    Ban {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<i64>,
+    },
+    /// Lift an existing ban or restriction.
+    Unban,
+    /// Restrict specific send permissions (`until`: Unix seconds, `None` = permanent).
+    Restrict {
+        rules: SendRules,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<i64>,
+    },
+}
+
+/// Admin permissions and custom title assigned via `Request::SetAdmin`. All booleans false demotes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminRights {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub change_info: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub post_messages: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub edit_messages: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub delete_messages: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ban_users: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub invite_users: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pin_messages: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub add_admins: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub anonymous: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_call: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_topics: bool,
+    /// Custom admin title / rank (e.g. "Moderator"). Empty leaves unset.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rank: String,
+}
+
+/// Partial update to group or channel settings (`Request::UpdateChatSettings`). Unset fields stay.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatSettings {
+    /// Group-wide default member send permissions (`messages.editChatDefaultBannedRights`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_send_rules: Option<SendRules>,
+    /// Slow-mode interval in seconds (`0` disables slow mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slowmode_seconds: Option<u32>,
+    /// Require admin approval for join requests (`channels.toggleJoinRequest`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_request: Option<bool>,
+    /// Enable or disable forum topics (`channels.toggleForum`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forum: Option<bool>,
+    /// Hide prior chat history for new members (`channels.togglePreHistoryHidden`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_history_hidden: Option<bool>,
+    /// Sign channel posts with the posting admin's name (`channels.toggleSignatures`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signatures: Option<bool>,
+    /// Protected content: forbid forwarding and saving media (`messages.toggleNoForwards`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_forwards: Option<bool>,
+}
+
+/// One read-only entry in a channel/supergroup's recent-actions log (`Request::AdminLog`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminLogEntry {
+    pub id: String,
+    /// Unix seconds when the action occurred.
+    pub date: i64,
+    /// Display name of the admin or user who performed the action.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub actor: String,
+    /// Plain-text summary of what changed.
+    pub summary: String,
 }
 
 /// What an account may send and do on messages, as the session says (the plan, the workspace's
@@ -1300,6 +1439,97 @@ pub struct SendAs {
     pub detail: String,
 }
 
+/// What this account may send in one conversation right now: per-chat media restrictions,
+/// slow mode, timed mute expiry, and paid-message star price (`Request::SendRules`).
+///
+/// Every permission defaults to `true`, so an empty JSON object or an adapter that does not
+/// report per-chat rules leaves sending up to account [`Capabilities`] and the network.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendRules {
+    /// May send messages at all (`false` when muted/banned or read-only).
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_messages: bool,
+    /// May send plain text messages.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_plain: bool,
+    /// May send media/attachments in general.
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_media: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_photos: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_videos: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_round_videos: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_audios: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_voices: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_files: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_stickers: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_gifs: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub embed_links: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub send_polls: bool,
+    /// Slow-mode interval in seconds (`0` means slow mode is off).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub slowmode_seconds: u32,
+    /// Unix seconds when the next message may be sent under slow mode (`None` when ready now).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slowmode_next_send: Option<i64>,
+    /// Unix seconds when a timed mute / send ban expires (`None` if permanent or not muted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ban_until: Option<i64>,
+    /// Telegram Stars charged per message (`send_paid_messages_stars`). `None` or `Some(0)` is free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paid_stars: Option<u64>,
+}
+
+impl Default for SendRules {
+    fn default() -> SendRules {
+        SendRules {
+            send_messages: true,
+            send_plain: true,
+            send_media: true,
+            send_photos: true,
+            send_videos: true,
+            send_round_videos: true,
+            send_audios: true,
+            send_voices: true,
+            send_files: true,
+            send_stickers: true,
+            send_gifs: true,
+            embed_links: true,
+            send_polls: true,
+            slowmode_seconds: 0,
+            slowmode_next_send: None,
+            ban_until: None,
+            paid_stars: None,
+        }
+    }
+}
+
+impl SendRules {
+    /// True when at least one file/media attachment category is allowed.
+    pub fn allows_any_attachment(&self) -> bool {
+        self.send_media && (self.send_photos || self.send_videos || self.send_audios || self.send_files)
+    }
+
+    /// Whole seconds remaining before slow mode allows another send at unix timestamp `now`.
+    pub fn slowmode_remaining(&self, now: i64) -> u32 {
+        self.slowmode_next_send
+            .map_or(0, |until| until.saturating_sub(now).max(0).min(i64::from(u32::MAX)) as u32)
+    }
+
+    pub fn is_default(&self) -> bool {
+        *self == SendRules::default()
+    }
+}
+
 /// What a `Send` carries besides its text. All of it is off by default, and a plain text
 /// message leaves it off the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1357,6 +1587,10 @@ pub struct Outgoing {
     /// Optional one-line subject for a new channel post (Teams).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
+    /// Explicit consent to pay up to this many Telegram Stars for a paid message. Never set
+    /// without the user confirming the price first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_paid_stars: Option<u64>,
 }
 
 impl Default for Outgoing {
@@ -1378,6 +1612,7 @@ impl Default for Outgoing {
             send_as: None,
             snippet_type: None,
             subject: None,
+            allow_paid_stars: None,
         }
     }
 }
@@ -1533,5 +1768,37 @@ mod tests {
         };
         let back_opt: SendAs = serde_json::from_str(&serde_json::to_string(&opt).unwrap()).unwrap();
         assert_eq!(back_opt, opt);
+    }
+
+    #[test]
+    fn send_rules_defaults_to_all_allowed_and_round_trips() {
+        let default: SendRules = serde_json::from_str("{}").unwrap();
+        assert_eq!(default, SendRules::default());
+        assert!(default.is_default());
+        assert!(default.allows_any_attachment());
+        assert_eq!(default.slowmode_remaining(1_000), 0);
+        assert_eq!(serde_json::to_string(&default).unwrap(), "{}");
+
+        let restricted = SendRules {
+            send_media: false,
+            send_stickers: false,
+            send_gifs: false,
+            slowmode_seconds: 30,
+            slowmode_next_send: Some(1_025),
+            ban_until: Some(2_000),
+            paid_stars: Some(50),
+            ..SendRules::default()
+        };
+        assert!(!restricted.allows_any_attachment());
+        assert_eq!(restricted.slowmode_remaining(1_000), 25);
+        assert_eq!(restricted.slowmode_remaining(1_030), 0);
+        let wire = serde_json::to_string(&restricted).unwrap();
+        let back: SendRules = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, restricted);
+
+        let paid = Outgoing { allow_paid_stars: Some(50), ..Outgoing::default() };
+        assert!(!paid.is_plain());
+        let back_paid: Outgoing = serde_json::from_str(&serde_json::to_string(&paid).unwrap()).unwrap();
+        assert_eq!(back_paid, paid);
     }
 }

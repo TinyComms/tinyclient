@@ -5,7 +5,7 @@ use super::draw;
 use super::facts::{self, MembersShown, NotifyControl};
 use crate::gui::components::{button, button_with_icon, glyph, icon_button, pair, segment, segmented, tip, Avatar, ButtonKind, Shape as Plate};
 use crate::gui::people::card::Float;
-use crate::gui::people::info::{InfoPane, ManageKind};
+use crate::gui::people::info::{InfoPane, ManageKind, PendingMod};
 use crate::gui::people::presence::{self, Ring, Shape};
 use crate::gui::theme::{self, Type};
 use gpui::{div, prelude::*, px, Context, Div, MouseButton, Window};
@@ -273,8 +273,14 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
     if let Some(timer_row) = disappearing_row(pane, row, info, cx) {
         top = top.child(timer_row.mt(px(8.)));
     }
-    if facts::can_rename(row) || facts::can_edit_topic(row) || facts::can_add_members(row) {
-        let mut manage_bar = div().mt(px(10.)).flex().flex_wrap().gap(px(6.));
+    let show_manage = facts::can_rename(row)
+        || facts::can_edit_topic(row)
+        || facts::can_add_members(row)
+        || facts::can_edit_picture(row)
+        || facts::can_manage_settings(row)
+        || facts::can_view_admin_log(row);
+    if show_manage {
+        let mut manage_bar = div().mt(px(10.)).flex().flex_wrap().items_center().gap(px(6.));
         if facts::can_rename(row) {
             let key = row.key.clone();
             let current = row.title.clone();
@@ -324,7 +330,131 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                     })),
             );
         }
+        if facts::can_edit_picture(row) {
+            let key = row.key.clone();
+            manage_bar = manage_bar.child(
+                button("details-picture", ButtonKind::Secondary, "Change photo")
+                    .h(px(26.))
+                    .px(px(8.))
+                    .type_small()
+                    .on_click(cx.listener(move |pane, _, _, cx| pane.pick_picture(key.clone(), cx))),
+            );
+        }
+        if facts::can_manage_settings(row) {
+            let protect = row.key.clone();
+            let allow = row.key.clone();
+            let approve = row.key.clone();
+            let open = row.key.clone();
+            manage_bar = manage_bar.child(
+                button("details-protect", ButtonKind::Secondary, "Protect content")
+                    .h(px(26.))
+                    .px(px(8.))
+                    .type_small()
+                    .on_click(cx.listener(move |pane, _, _, cx| {
+                        pane.update_chat_settings(
+                            protect.clone(),
+                            protocol::ChatSettings { no_forwards: Some(true), ..protocol::ChatSettings::default() },
+                            cx,
+                        );
+                    })),
+            );
+            manage_bar = manage_bar.child(
+                button("details-forward", ButtonKind::Secondary, "Allow forwarding")
+                    .h(px(26.))
+                    .px(px(8.))
+                    .type_small()
+                    .on_click(cx.listener(move |pane, _, _, cx| {
+                        pane.update_chat_settings(
+                            allow.clone(),
+                            protocol::ChatSettings { no_forwards: Some(false), ..protocol::ChatSettings::default() },
+                            cx,
+                        );
+                    })),
+            );
+            manage_bar = manage_bar.child(
+                button("details-approve", ButtonKind::Secondary, "Require approval")
+                    .h(px(26.))
+                    .px(px(8.))
+                    .type_small()
+                    .on_click(cx.listener(move |pane, _, _, cx| {
+                        pane.update_chat_settings(
+                            approve.clone(),
+                            protocol::ChatSettings { join_request: Some(true), ..protocol::ChatSettings::default() },
+                            cx,
+                        );
+                    })),
+            );
+            manage_bar = manage_bar.child(
+                button("details-open", ButtonKind::Secondary, "Open joining")
+                    .h(px(26.))
+                    .px(px(8.))
+                    .type_small()
+                    .on_click(cx.listener(move |pane, _, _, cx| {
+                        pane.update_chat_settings(
+                            open.clone(),
+                            protocol::ChatSettings { join_request: Some(false), ..protocol::ChatSettings::default() },
+                            cx,
+                        );
+                    })),
+            );
+        }
+        if facts::can_view_admin_log(row) {
+            let key = row.key.clone();
+            let label = if pane.admin_log_for(&row.key).is_some() { "Hide actions" } else { "Recent actions" };
+            manage_bar = manage_bar.child(
+                button("details-admin-log", ButtonKind::Secondary, label)
+                    .h(px(26.))
+                    .px(px(8.))
+                    .type_small()
+                    .on_click(cx.listener(move |pane, _, _, cx| pane.load_admin_log(key.clone(), cx))),
+            );
+        }
         top = top.child(manage_bar);
+        if facts::can_manage_settings(row) {
+            let key = row.key.clone();
+            let speeds = [(0u32, "Off"), (10, "10s"), (30, "30s"), (60, "1m"), (300, "5m"), (900, "15m"), (3_600, "1h")];
+            let mut chips = div().flex().flex_wrap().gap(px(4.));
+            for (ix, &(secs, label)) in speeds.iter().enumerate() {
+                let key = key.clone();
+                chips = chips.child(segment(("details-slow", ix), label, false).on_click(cx.listener(move |pane, _, _, cx| {
+                    pane.update_chat_settings(
+                        key.clone(),
+                        protocol::ChatSettings { slowmode_seconds: Some(secs), ..protocol::ChatSettings::default() },
+                        cx,
+                    );
+                })));
+            }
+            top = top.child(
+                div()
+                    .mt(px(8.))
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(div().type_small().text_color(theme::text_soft()).child("Slow mode"))
+                    .child(chips),
+            );
+        }
+        if facts::can_view_admin_log(row) {
+            if let Some(entries) = pane.admin_log_for(&row.key) {
+                let mut list = div().mt(px(8.)).flex().flex_col().gap(px(4.));
+                if entries.is_empty() {
+                    list = list.child(div().type_small().text_color(theme::text_faint()).child("No recent actions."));
+                } else {
+                    for entry in entries.iter().take(20) {
+                        let line = if entry.actor.is_empty() {
+                            entry.summary.clone()
+                        } else {
+                            format!("{} · {}", entry.actor, entry.summary)
+                        };
+                        list = list.child(div().type_small().text_color(theme::text_soft()).child(line));
+                    }
+                }
+                top = top.child(list);
+            } else if pane.admin_log_loading() {
+                top = top.child(div().mt(px(8.)).type_small().text_color(theme::text_faint()).child("Loading recent actions…"));
+            }
+        }
     }
     if let Some((mkey, _, input)) = pane.managing() {
         if mkey == &row.key {
@@ -380,6 +510,52 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                     ),
             );
         }
+    }
+    if let Some(action) = pane.pending_mod().filter(|action| action.conversation() == &row.key) {
+        let (prompt, field, confirm, kind) = match action {
+            PendingMod::Ban { person_name, .. } => (
+                format!("Ban {person_name} from {}? They cannot rejoin until an admin unbans them.", row.title),
+                None,
+                "Ban",
+                ButtonKind::Danger,
+            ),
+            PendingMod::Promote { person_name, rank, .. } => (
+                format!("Make {person_name} an admin of {}?", row.title),
+                Some(rank.clone()),
+                "Promote",
+                ButtonKind::Primary,
+            ),
+            PendingMod::TransferOwner { person_name, password, .. } => (
+                format!("Transfer ownership of {} to {person_name}?", row.title),
+                Some(password.clone()),
+                "Transfer",
+                ButtonKind::Danger,
+            ),
+        };
+        top = top.child(
+            div()
+                .mt(px(8.))
+                .p(px(8.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(theme::raised())
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(div().type_small().child(prompt))
+                .children(field)
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(6.))
+                        .child(button("mod-cancel", ButtonKind::Ghost, "Cancel").h(px(24.)).px(px(8.)).type_small().on_click(
+                            cx.listener(|pane, _, _, cx| pane.cancel_mod(cx)),
+                        ))
+                        .child(button("mod-confirm", kind, confirm).h(px(24.)).px(px(10.)).type_small().on_click(
+                            cx.listener(|pane, _, _, cx| pane.confirm_mod(cx)),
+                        )),
+                ),
+        );
     }
     if !online {
         let words = facts::heads_up_words(&facts::HeadsUp::Offline, &row.title, network, crate::view::now());
@@ -443,6 +619,7 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                 sections = sections.child(draw::label("Members", !any));
                 any = true;
                 let ring = Ring::on(theme::sidebar());
+                let mods = facts::member_mod_actions(row);
                 for (ix, person) in members.iter().enumerate() {
                     let shown = match hub.presence_of(&person.key) {
                         Presence::Unknown => person.presence,
@@ -480,6 +657,54 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                         .on_click(cx.listener(move |pane, _, _, cx| {
                                             pane.ask_remove_member(remove_conv.clone(), remove_id.clone(), remove_name.clone(), cx);
+                                        })),
+                                )
+                            })
+                            .when(mods.ban && person.title != "Owner", |item| {
+                                let conv = row.key.clone();
+                                let id = person.key.id.clone();
+                                let name = person.name.clone();
+                                item.child(
+                                    button(("details-member-ban", ix), ButtonKind::Ghost, "Ban")
+                                        .h(px(22.))
+                                        .px(px(6.))
+                                        .type_small()
+                                        .tooltip(tip("Ban from group", None))
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                        .on_click(cx.listener(move |pane, _, _, cx| {
+                                            pane.ask_ban_member(conv.clone(), id.clone(), name.clone(), cx);
+                                        })),
+                                )
+                            })
+                            .when(mods.promote && person.title != "Owner", |item| {
+                                let conv = row.key.clone();
+                                let id = person.key.id.clone();
+                                let name = person.name.clone();
+                                item.child(
+                                    button(("details-member-admin", ix), ButtonKind::Ghost, "Admin")
+                                        .h(px(22.))
+                                        .px(px(6.))
+                                        .type_small()
+                                        .tooltip(tip("Make admin", None))
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                        .on_click(cx.listener(move |pane, _, _, cx| {
+                                            pane.ask_promote_admin(conv.clone(), id.clone(), name.clone(), cx);
+                                        })),
+                                )
+                            })
+                            .when(mods.transfer && person.title != "Owner", |item| {
+                                let conv = row.key.clone();
+                                let id = person.key.id.clone();
+                                let name = person.name.clone();
+                                item.child(
+                                    button(("details-member-owner", ix), ButtonKind::Ghost, "Owner")
+                                        .h(px(22.))
+                                        .px(px(6.))
+                                        .type_small()
+                                        .tooltip(tip("Transfer ownership", None))
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                        .on_click(cx.listener(move |pane, _, _, cx| {
+                                            pane.ask_transfer_owner(conv.clone(), id.clone(), name.clone(), cx);
                                         })),
                                 )
                             })

@@ -930,6 +930,9 @@ impl Demo {
             Command::Source { reply, .. } | Command::CreateGroup { reply, .. } => {
                 let _ = reply.send(Err(Refusal::Unsupported));
             }
+            Command::OpenLink { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Translate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SendRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StarMessage { reply, .. } => {
                 let _ = reply.send(Err(Refusal::Unsupported));
             }
@@ -951,8 +954,23 @@ impl Demo {
                 }
                 let _ = reply.send(outcome);
             }
-            Command::MembersAdd { reply, .. } | Command::MembersRemove { reply, .. } | Command::ConversationPicture { reply, .. } => {
+            Command::MembersAdd { reply, .. }
+            | Command::MembersRemove { reply, .. }
+            | Command::ConversationPicture { reply, .. }
+            | Command::ModerateMember { reply, .. }
+            | Command::SetAdmin { reply, .. }
+            | Command::TransferOwnership { reply, .. }
+            | Command::UpdateChatSettings { reply, .. }
+            | Command::SetDefaultSendAs { reply, .. } => {
                 let _ = reply.send(Ok(()));
+            }
+            Command::AdminLog { reply, .. } => {
+                let entries: Vec<protocol::AdminLogEntry> = Vec::new();
+                let _ = reply.send(Ok(entries));
+            }
+            Command::SendAsOptions { reply, .. } => {
+                let peers: Vec<protocol::SendAs> = Vec::new();
+                let _ = reply.send(Ok((peers, None)));
             }
             Command::ConversationUpdate { conversation_id, title, topic, description, reply } => {
                 let outcome = match demo.ctx.known(&conversation_id) {
@@ -1097,6 +1115,7 @@ impl Demo {
             | Command::MarkRead { .. }
             | Command::MarkUnread { .. }
             | Command::Viewed { .. }
+            | Command::MarkPlayed { .. }
             | Command::AckBulk { .. }
             | Command::Collapse { .. }
             | Command::Typing { .. }

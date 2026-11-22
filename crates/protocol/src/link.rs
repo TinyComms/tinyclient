@@ -833,6 +833,147 @@ pub fn parse_network_link(raw: &str) -> Option<NetworkLink> {
     None
 }
 
+/// A `t.me` or `telegram.me` link that can open inside the app: a public chat, a message in it,
+/// or a private `t.me/c/{id}` the account may already know. Invites, sticker packs, `tg://`,
+/// `telegram.dog`, and anything with a traversal or a username Telegram would refuse stay `None`
+/// so the shell opens them outside instead of following them.
+pub fn telegram_app_link(raw: &str) -> Option<NetworkLink> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > LINK_LIMIT || telegram_path_unsafe(trimmed) {
+        return None;
+    }
+    let parsed = Url::parse(trimmed).ok()?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    if !matches!(host.as_str(), "t.me" | "telegram.me") {
+        return None;
+    }
+    let segments: Vec<&str> = parsed.path_segments().map(|s| s.filter(|p| !p.is_empty()).collect()).unwrap_or_default();
+    let first = *segments.first()?;
+    if first.starts_with('+') || telegram_utility(first) {
+        return None;
+    }
+    if first == "c" {
+        if segments.len() > 3 {
+            return None;
+        }
+        let id = *segments.get(1)?;
+        if id.is_empty() || id.len() > 16 || !id.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let message_id = telegram_message_id(segments.get(2).copied())?;
+        return Some(NetworkLink {
+            network: crate::Network::Telegram,
+            space: Some("c".to_owned()),
+            channel: format!("c{id}"),
+            message_id,
+            thread_id: None,
+        });
+    }
+    let (name, msg_seg) = if first == "s" {
+        if segments.len() > 3 {
+            return None;
+        }
+        (*segments.get(1)?, segments.get(2).copied())
+    } else {
+        if segments.len() > 2 {
+            return None;
+        }
+        (first, segments.get(1).copied())
+    };
+    if !telegram_username(name) {
+        return None;
+    }
+    Some(NetworkLink {
+        network: crate::Network::Telegram,
+        space: None,
+        channel: name.to_owned(),
+        message_id: telegram_message_id(msg_seg)?,
+        thread_id: None,
+    })
+}
+
+/// True when `raw` is aimed at Telegram's own link hosts or the `tg:` scheme, including the ones
+/// [`telegram_app_link`] refuses. The shell uses that to keep them out of the generic network
+/// resolver and open them in the browser instead.
+pub fn telegram_family(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > LINK_LIMIT {
+        return false;
+    }
+    if trimmed.to_ascii_lowercase().starts_with("tg:") {
+        return true;
+    }
+    let Ok(parsed) = Url::parse(trimmed) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    let host = parsed.host_str().unwrap_or("").to_ascii_lowercase();
+    matches!(host.as_str(), "t.me" | "telegram.me" | "telegram.dog")
+        || host.ends_with(".t.me")
+        || host.ends_with(".telegram.me")
+        || host.ends_with(".telegram.dog")
+}
+
+fn telegram_utility(segment: &str) -> bool {
+    matches!(
+        segment.to_ascii_lowercase().as_str(),
+        "joinchat"
+            | "addstickers"
+            | "addemoji"
+            | "addlist"
+            | "addtheme"
+            | "proxy"
+            | "socks"
+            | "share"
+            | "login"
+            | "iv"
+            | "bg"
+            | "setlanguage"
+            | "boost"
+            | "giftcode"
+    )
+}
+
+/// Telegram public usernames: 5 to 32 characters, a letter first, then letters, digits, or `_`.
+fn telegram_username(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    (5..=32).contains(&bytes.len())
+        && bytes.first().is_some_and(|b| b.is_ascii_alphabetic())
+        && bytes.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
+}
+
+/// `None` for a missing segment. `Some(None)` is not used: a segment that is not a message id
+/// rejects the whole link.
+fn telegram_message_id(segment: Option<&str>) -> Option<Option<String>> {
+    let Some(segment) = segment else {
+        return Some(None);
+    };
+    if segment.is_empty() || segment.len() > 10 || !segment.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(Some(segment.to_owned()))
+}
+
+/// `..`, an encoded dot or slash, or a backslash in the path. Checked on the raw text so a
+/// parser that normalizes `..` cannot turn it into a username.
+fn telegram_path_unsafe(raw: &str) -> bool {
+    let no_query = raw.split(['?', '#']).next().unwrap_or(raw);
+    let path = match no_query.find("://") {
+        Some(scheme) => no_query[scheme + 3..].find('/').map(|i| &no_query[scheme + 3 + i..]).unwrap_or(""),
+        None => no_query,
+    };
+    let lower = path.to_ascii_lowercase();
+    lower.contains("..") || lower.contains('\\') || lower.contains("%2e") || lower.contains("%2f") || lower.contains("%5c") || lower.contains("%00")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1203,5 +1344,67 @@ mod tests {
         assert_eq!(telegram_invite_hash("+BareHash"), Some("BareHash".into()));
         assert_eq!(telegram_invite_hash("https://t.me/rustlang"), None);
         assert_eq!(telegram_invite_hash("https://example.com/+not_tg"), None);
+    }
+
+    #[test]
+    fn telegram_app_links_open_a_chat_and_refuse_the_rest() {
+        use crate::Network;
+
+        assert_eq!(
+            telegram_app_link("https://t.me/rustlang/99"),
+            Some(NetworkLink {
+                network: Network::Telegram,
+                space: None,
+                channel: "rustlang".into(),
+                message_id: Some("99".into()),
+                thread_id: None,
+            })
+        );
+        assert_eq!(
+            telegram_app_link("https://telegram.me/s/rustlang"),
+            Some(NetworkLink {
+                network: Network::Telegram,
+                space: None,
+                channel: "rustlang".into(),
+                message_id: None,
+                thread_id: None,
+            })
+        );
+        assert_eq!(
+            telegram_app_link("https://t.me/c/1234567890/42"),
+            Some(NetworkLink {
+                network: Network::Telegram,
+                space: Some("c".into()),
+                channel: "c1234567890".into(),
+                message_id: Some("42".into()),
+                thread_id: None,
+            })
+        );
+        for refused in [
+            "https://example.com/rustlang",
+            "https://telegram.dog/rustlang",
+            "https://www.t.me/rustlang",
+            "tg://resolve?domain=rustlang",
+            "https://t.me/+secretInviteHash",
+            "https://t.me/joinchat/abc",
+            "https://t.me/addstickers/Pack",
+            "https://t.me/ab",
+            "https://t.me/1rustlang",
+            "https://t.me/%2e%2e/rustlang",
+            "https://t.me/../rustlang",
+            "https://t.me/rust%2flang",
+            "https://t.me/rustlang\\extra",
+            "https://user:secret@t.me/rustlang",
+            "https://t.me/rustlang/not-a-message",
+        ] {
+            assert_eq!(telegram_app_link(refused), None, "{refused}");
+        }
+        assert!(telegram_family("https://telegram.dog/rustlang"));
+        assert!(telegram_family("tg://resolve?domain=rustlang"));
+        assert!(telegram_family("https://www.t.me/rustlang"));
+        assert!(!telegram_family("https://example.com/rustlang"));
+        // The wider parser still accepts dog and tg. This helper is the in-app gate.
+        assert!(parse_network_link("https://telegram.dog/rustlang").is_some());
+        assert!(parse_network_link("tg://resolve?domain=rustlang").is_some());
     }
 }

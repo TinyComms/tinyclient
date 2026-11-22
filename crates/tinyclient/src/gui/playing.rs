@@ -50,11 +50,14 @@ pub fn now_ms() -> u64 {
 
 /// The speed after `rate` in the order a speed button steps through.
 pub fn next_rate(rate: u16) -> u16 {
-    let at = RATES.iter().position(|known| *known == rate).unwrap_or(0);
+    let at = RATES
+        .iter()
+        .position(|known| *known == rate)
+        .unwrap_or_else(|| RATES.iter().position(|known| *known == 100).unwrap_or(0));
     RATES[(at + 1) % RATES.len()]
 }
 
-/// `1×`, `1.5×`, `2×`.
+/// `0.5×`, `1×`, `1.5×`, `2×`.
 pub fn rate_label(rate: u16) -> String {
     match rate % 100 {
         0 => format!("{}×", rate / 100),
@@ -150,6 +153,8 @@ impl Shell {
             since: now_ms(),
             duration,
             rate,
+            has_next: false,
+            has_previous: false,
         });
         self.playing_state.refused = None;
         self.playing_state.path = Some(play.path.clone());
@@ -211,6 +216,16 @@ impl Shell {
         cx.notify();
     }
 
+    /// Jumps to the previous consecutive voice/round message in the same conversation.
+    pub(super) fn play_previous(&mut self, cx: &mut Context<Self>) {
+        self.play_ask(PlayRequest::Previous, None, cx);
+    }
+
+    /// Jumps to the next consecutive voice/round message in the same conversation.
+    pub(super) fn play_next(&mut self, cx: &mut Context<Self>) {
+        self.play_ask(PlayRequest::Next, None, cx);
+    }
+
     /// The now-playing bar's ✕: stops, and the bar goes.
     pub(super) fn play_stop(&mut self, cx: &mut Context<Self>) {
         self.playing_state.playback = None;
@@ -219,8 +234,8 @@ impl Shell {
         cx.notify();
     }
 
-    /// Above the call dock, in every sidebar mode: what is playing, or paused, with play and
-    /// pause, the time, and a ✕. A click on the words goes back to the conversation.
+    /// Above the call dock, in every sidebar mode: what is playing, or paused, with previous/next,
+    /// play and pause, the time, and a ✕. A click on the words goes back to the conversation.
     pub(super) fn now_playing(&self, cx: &mut Context<Self>) -> Option<Div> {
         let shown = self.playing_state.playback.as_ref()?;
         let failed = match &shown.state {
@@ -238,6 +253,51 @@ impl Shell {
             (None, duration) => format!("{} / {}", clock(at), clock(duration.saturating_add(500))),
         };
         let (key, name) = (shown.conversation.clone(), title.clone());
+        let show_steps = shown.has_previous || shown.has_next;
+        let has_prev = shown.has_previous;
+        let has_next = shown.has_next;
+        let prev = show_steps.then(|| {
+            div()
+                .id("now-playing-prev")
+                .flex_none()
+                .size(px(22.))
+                .rounded(px(theme::R_CONTROL))
+                .flex()
+                .items_center()
+                .justify_center()
+                .when(has_prev, |el| {
+                    el.cursor_pointer()
+                        .hover(|style| style.bg(theme::hover()))
+                        .tooltip(tip("Previous voice message", None))
+                        .on_click(cx.listener(|this, _, _, cx| this.play_previous(cx)))
+                })
+                .child(glyph(
+                    "icons/chevron-left.svg",
+                    13.,
+                    if has_prev { theme::text_soft() } else { theme::text_faint() },
+                ))
+        });
+        let next = show_steps.then(|| {
+            div()
+                .id("now-playing-next")
+                .flex_none()
+                .size(px(22.))
+                .rounded(px(theme::R_CONTROL))
+                .flex()
+                .items_center()
+                .justify_center()
+                .when(has_next, |el| {
+                    el.cursor_pointer()
+                        .hover(|style| style.bg(theme::hover()))
+                        .tooltip(tip("Next voice message", None))
+                        .on_click(cx.listener(|this, _, _, cx| this.play_next(cx)))
+                })
+                .child(glyph(
+                    "icons/chevron-right.svg",
+                    13.,
+                    if has_next { theme::text_soft() } else { theme::text_faint() },
+                ))
+        });
         let button = div()
             .id("now-playing-toggle")
             .flex_none()
@@ -306,8 +366,10 @@ impl Shell {
                         .bg(theme::raised())
                         .flex()
                         .items_center()
-                        .gap(px(8.))
+                        .gap(px(6.))
+                        .children(prev)
                         .child(button)
+                        .children(next)
                         .child(words)
                         .child(close),
                 ),
@@ -350,9 +412,10 @@ mod tests {
     fn the_speed_button_steps_through_the_speeds_and_says_them_plainly() {
         assert_eq!(next_rate(100), 150);
         assert_eq!(next_rate(150), 200);
-        assert_eq!(next_rate(200), 100);
-        assert_eq!(next_rate(130), 150, "an unknown speed starts over");
-        assert_eq!([100, 150, 200].map(rate_label), ["1×", "1.5×", "2×"]);
+        assert_eq!(next_rate(200), 50);
+        assert_eq!(next_rate(50), 100);
+        assert_eq!(next_rate(130), 150, "an unknown speed starts over from normal");
+        assert_eq!([50, 100, 150, 200].map(rate_label), ["0.5×", "1×", "1.5×", "2×"]);
         assert_eq!(clock(0), "0:00");
         assert_eq!(clock(6_999), "0:06");
         assert_eq!(clock(83_000), "1:23");

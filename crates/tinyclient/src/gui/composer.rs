@@ -266,6 +266,25 @@ fn delete_later(paths: Vec<PathBuf>) {
     let _ = std::thread::Builder::new().name("outbox".into()).stack_size(64 * 1024).spawn(move || attach::delete_made(&attach::outbox(), &paths));
 }
 
+/// Formats a slow-mode countdown in seconds as `m:ss` (or `h:mm:ss` for >= 1 hour).
+pub(crate) fn format_countdown(seconds: u32) -> String {
+    if seconds >= 3600 {
+        format!("{}:{:02}:{:02}", seconds / 3600, (seconds % 3600) / 60, seconds % 60)
+    } else {
+        format!("{}:{:02}", seconds / 60, seconds % 60)
+    }
+}
+
+/// Formats a timed mute expiry (`ban_until`) as a human-readable local time sentence.
+pub(crate) fn format_ban_until(until: i64, now: i64) -> String {
+    let at = crate::gui::time::local(until);
+    if until - now >= 24 * 3600 {
+        format!("You can send messages again on {:04}-{:02}-{:02} at {:02}:{:02}.", at.year, at.month, at.day, at.hour, at.minute)
+    } else {
+        format!("You can send messages again at {:02}:{:02}.", at.hour, at.minute)
+    }
+}
+
 /// Where the composer writes to.
 #[derive(Clone, PartialEq)]
 struct Target {
@@ -626,6 +645,12 @@ pub struct Composer {
     /// Cached mentionable team tags per Space (Teams `@tag` completion).
     space_tags: HashMap<Key, Vec<protocol::TeamTag>>,
     space_tags_asked: HashSet<Key>,
+    /// Per-conversation send rules (slow mode, media bans, timed mute, paid Stars) keyed by conversation.
+    send_rules: HashMap<Key, protocol::SendRules>,
+    /// 1-second ticker while the current conversation has an active slow-mode countdown.
+    slowmode_timer: Option<Task<()>>,
+    /// Explicit confirmation for a paid-message Stars send (`(conversation, field text)`).
+    paid_confirmed: Option<(Key, String)>,
 }
 
 impl Composer {
@@ -738,6 +763,9 @@ impl Composer {
             peer_away_gen: HashMap::new(),
             space_tags: HashMap::new(),
             space_tags_asked: HashSet::new(),
+            send_rules: HashMap::new(),
+            slowmode_timer: None,
+            paid_confirmed: None,
         }
     }
 
@@ -750,6 +778,61 @@ impl Composer {
         });
     }
 
+    fn current_send_rules(&self) -> Option<&protocol::SendRules> {
+        self.target.as_ref().and_then(|target| self.send_rules.get(&target.key))
+    }
+
+    fn slowmode_wait(&self) -> u32 {
+        if self.editing.is_some() {
+            return 0;
+        }
+        self.current_send_rules().map_or(0, |rules| rules.slowmode_remaining(now()))
+    }
+
+    fn locked_for(&self, target: &Target) -> Option<Locked> {
+        let rules = self.send_rules.get(&target.key);
+        let timed_mute = rules.and_then(|r| {
+            let until = r.ban_until?;
+            let current = now();
+            (!r.send_messages && until > current).then(|| format_ban_until(until, current))
+        });
+        match target.locked() {
+            Some(Locked::ReadOnly(_)) if timed_mute.is_some() => Some(Locked::ReadOnly(timed_mute.unwrap())),
+            Some(locked) => Some(locked),
+            None => timed_mute.map(Locked::ReadOnly).or_else(|| {
+                rules.filter(|r| !r.send_messages).map(|_| {
+                    Locked::ReadOnly(format!("You can read {} but not post in it.", target.title))
+                })
+            }),
+        }
+    }
+
+    fn ensure_slowmode_timer(&mut self, cx: &mut Context<Self>) {
+        if self.slowmode_wait() == 0 {
+            self.slowmode_timer = None;
+            return;
+        }
+        if self.slowmode_timer.is_some() {
+            return;
+        }
+        self.slowmode_timer = Some(cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            let keep = this.update(cx, |this, cx| {
+                let remaining = this.slowmode_wait();
+                cx.notify();
+                if remaining == 0 {
+                    this.slowmode_timer = None;
+                    false
+                } else {
+                    true
+                }
+            });
+            if !matches!(keep, Ok(true)) {
+                return;
+            }
+        }));
+    }
+
     fn controls(&self) -> Controls {
         match &self.target {
             Some(target) => {
@@ -757,7 +840,10 @@ impl Composer {
                 if target.can.edit_media && target.can.max_file_bytes > 0 && self.editing.as_ref().is_some_and(|e| e.has_media) {
                     c.attach = true;
                 }
-                c
+                match self.send_rules.get(&target.key) {
+                    Some(rules) => c.apply_rules(rules),
+                    None => c,
+                }
             }
             None => Controls::default(),
         }
@@ -791,8 +877,23 @@ impl Composer {
             self.no_preview = false;
             self.broadcast = false;
             self.armed = None;
+            self.paid_confirmed = None;
+            self.slowmode_timer = None;
             self.focus_next = true;
             picker::emoji::set_account(Some(&target.key.account()));
+            if live() && target.link == Link::Connected {
+                let key = target.key.clone();
+                let this = cx.weak_entity();
+                ask_later(cx, Request::SendRules { conversation: key.clone() }, move |answer, cx| {
+                    if let Ok(Response::SendRules { conversation, rules }) = answer {
+                        let _ = this.update(cx, |this, cx| {
+                            this.send_rules.insert(conversation, rules);
+                            this.ensure_slowmode_timer(cx);
+                            cx.notify();
+                        });
+                    }
+                });
+            }
         } else if self.offered != stored {
             // The row was read after the conversation opened: its draft is still wanted if
             // nothing has been typed in the meantime.
@@ -817,6 +918,9 @@ impl Composer {
         });
         self.maybe_fetch_peer_away(&target, cx);
         self.target = Some(target);
+        if moved {
+            self.ensure_slowmode_timer(cx);
+        }
         cx.notify();
     }
 
@@ -986,8 +1090,9 @@ impl Composer {
         self.follow_text(cx);
         self.touched = true;
         self.caption = None;
-        // Any edit disarms the large-ping confirm.
+        // Any edit disarms the large-ping confirm and paid-message confirm.
         self.armed = None;
+        self.paid_confirmed = None;
         self.look_up(cx);
         cx.notify();
         let Some(target) = &self.target else {
@@ -1026,7 +1131,7 @@ impl Composer {
             self.dismissed = Some(list.trigger.start);
         } else if let Some(colon) = colon.filter(|colon| !colon.cells.is_empty()) {
             self.colon_dismissed = Some(colon.trigger.start);
-        } else if self.armed.take().is_some() {
+        } else if self.armed.take().is_some() || self.paid_confirmed.take().is_some() {
             self.caption = None;
             self.schedule_at = None;
         } else if self.chip_menu.take().is_some() || self.send_menu {
@@ -1064,7 +1169,7 @@ impl Composer {
         if self.sending {
             return;
         }
-        if self.scan_blocks(&target.key) || target.locked().is_some() {
+        if self.scan_blocks(&target.key) || self.locked_for(&target).is_some() {
             self.schedule_at = None;
             return;
         }
@@ -1072,6 +1177,15 @@ impl Composer {
             self.schedule_at = None;
             self.save_edit(&target, cx);
             return;
+        }
+        if self.schedule_at.is_none() {
+            let wait = self.slowmode_wait();
+            if wait > 0 {
+                self.caption = Some((format!("Slow mode is on. You can send again in {}.", format_countdown(wait)), Tone::Note));
+                self.ensure_slowmode_timer(cx);
+                cx.notify();
+                return;
+            }
         }
         self.follow_text(cx);
         self.send_menu = false;
@@ -1124,6 +1238,27 @@ impl Composer {
             }
         }
         self.armed = None;
+        let paid_stars = self
+            .current_send_rules()
+            .and_then(|rules| rules.paid_stars)
+            .filter(|&stars| stars > 0);
+        let allow_paid_stars = if let Some(stars) = paid_stars {
+            let paid_ok = self.paid_confirmed.as_ref().is_some_and(|(k, text)| *k == target.key && *text == field);
+            if !paid_ok {
+                self.paid_confirmed = Some((target.key.clone(), field));
+                self.caption = Some((
+                    format!("Sending here costs {stars} Telegram Stars. Press Send again to confirm."),
+                    Tone::Warning,
+                ));
+                cx.notify();
+                return;
+            }
+            self.paid_confirmed = None;
+            Some(stars)
+        } else {
+            self.paid_confirmed = None;
+            None
+        };
         let controls = self.controls();
         let hosts = niceties::link_hosts(&field);
         let reply_to = self.reply.as_ref().map(|reply| reply.id.clone());
@@ -1160,6 +1295,7 @@ impl Composer {
             send_as: self.send_as.get(&target.key).cloned(),
             snippet_type: None,
             subject,
+            allow_paid_stars,
         };
         self.importance = protocol::Importance::Normal;
         self.broadcast = false;
@@ -1218,10 +1354,25 @@ impl Composer {
     /// A GIF or a sticker from the picker: sent at once, with the reply target; what is typed
     /// stays.
     fn send_pick(&mut self, pick: Pick, cx: &mut Context<Self>) {
-        let Some(target) = self.target.clone().filter(|target| target.locked().is_none()) else {
+        let Some(target) = self.target.clone().filter(|target| self.locked_for(target).is_none()) else {
             return;
         };
         if self.sending || !live() {
+            return;
+        }
+        let wait = self.slowmode_wait();
+        if wait > 0 {
+            self.caption = Some((format!("Slow mode is on. You can send again in {}.", format_countdown(wait)), Tone::Note));
+            self.ensure_slowmode_timer(cx);
+            cx.notify();
+            return;
+        }
+        if let Some(stars) = self.current_send_rules().and_then(|r| r.paid_stars).filter(|&s| s > 0) {
+            self.caption = Some((
+                format!("Sending here costs {stars} Telegram Stars. Send a text message to confirm payment."),
+                Tone::Warning,
+            ));
+            cx.notify();
             return;
         }
         let reply_to = self.reply.as_ref().map(|reply| reply.id.clone());
@@ -1476,7 +1627,15 @@ impl Composer {
     /// The message is chatd's or the hold's now: the field empties, the chips that went leave
     /// the tray, and the draft is forgotten.
     fn went(&mut self, out: &Outgoing, cx: &mut Context<Self>) {
+        if let Some(rules) = self.send_rules.get_mut(&out.key) {
+            if rules.slowmode_seconds > 0 {
+                rules.slowmode_next_send = Some(now() + i64::from(rules.slowmode_seconds));
+            }
+        }
         let here = self.target.as_ref().is_some_and(|now| now.key == out.key);
+        if here {
+            self.ensure_slowmode_timer(cx);
+        }
         if !here {
             if let Some(draft) = self.drafts.get_mut(&out.key) {
                 draft.reply_went(out.reply_to.as_deref());
@@ -1599,8 +1758,16 @@ impl Composer {
         if paths.is_empty() {
             return;
         }
-        if !controls(&target.can, false).attach {
-            let why = format!("{} can't take files here.", target.key.network.label());
+        let allowed = match self.send_rules.get(&target.key) {
+            Some(rules) => controls(&target.can, false).apply_rules(rules).attach,
+            None => controls(&target.can, false).attach,
+        };
+        if !allowed {
+            let why = if self.send_rules.get(&target.key).is_some_and(|r| !r.allows_any_attachment()) {
+                "Admins don't allow media in this chat.".to_owned()
+            } else {
+                format!("{} can't take files here.", target.key.network.label())
+            };
             self.tell(&target.key, (why, Tone::Note), cx);
             if owned {
                 delete_later(paths);
@@ -3384,14 +3551,19 @@ impl Composer {
     fn card(&mut self, focused: bool, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let controls = self.controls();
         let editing_media = self.editing.as_ref().is_some_and(|e| e.has_media);
-        let ready = !self.sending && !self.scan_blocks_current() && (editing_media || !self.input.read(cx).text().trim().is_empty() || !self.tray.is_empty());
+        let slowmode_wait = self.slowmode_wait();
+        let ready = !self.sending && slowmode_wait == 0 && !self.scan_blocks_current() && (editing_media || !self.input.read(cx).text().trim().is_empty() || !self.tray.is_empty());
         let focus = self.input.focus_handle(cx);
         let open_tab = self.picking.as_ref().map(|picking| picking.picker.read(cx).tab());
         let send_icon = if self.editing.is_some() { "icons/check.svg" } else { "icons/send-horizontal.svg" };
-        let send_tip = match (self.editing.is_some(), controls.silent) {
-            (true, _) => "Save  ↩",
-            (false, true) => "Send  ↩ · Silently  ⌥↩",
-            (false, false) => "Send  ↩",
+        let send_tip = if slowmode_wait > 0 {
+            format!("Slow mode: wait {}", format_countdown(slowmode_wait))
+        } else {
+            match (self.editing.is_some(), controls.silent) {
+                (true, _) => "Save  ↩".to_owned(),
+                (false, true) => "Send  ↩ · Silently  ⌥↩".to_owned(),
+                (false, false) => "Send  ↩".to_owned(),
+            }
         };
         let attach = controls.attach.then(|| {
             self.card_button("attach", Some("icons/paperclip.svg"), false, None)
@@ -3469,10 +3641,22 @@ impl Composer {
         let phone = crate::gui::phone::active();
         // A phone's send is the desktop's filled square drawn at 36 inside a 44 pt target, so a
         // ready one reads as a button and not as a slab beside the field.
+        let send_body: gpui::AnyElement = if slowmode_wait > 0 {
+            div()
+                .px(px(4.))
+                .type_small()
+                .font_weight(theme::SEMIBOLD)
+                .text_color(theme::text_soft())
+                .child(format_countdown(slowmode_wait))
+                .into_any_element()
+        } else {
+            glyph(send_icon, if crate::gui::phone::active() { 18. } else { 16. }, if ready { theme::on_accent() } else { theme::text_disabled() }).into_any_element()
+        };
         let send = div()
             .id("send")
             .relative()
-            .size(px(card_control()))
+            .h(px(card_control()))
+            .min_w(px(card_control()))
             .flex_none()
             .rounded(px(theme::R_CONTROL))
             .flex()
@@ -3507,7 +3691,7 @@ impl Composer {
                 }),
             )
             .on_click(cx.listener(|this, _, _, cx| this.send(false, cx)))
-            .child(glyph(send_icon, if crate::gui::phone::active() { 18. } else { 16. }, if ready { theme::on_accent() } else { theme::text_disabled() }))
+            .child(send_body)
             .child(canvas(move |bounds, _, _| anchors.send.set(Some(bounds)), |_, _, _, _| {}).absolute().top_0().left_0().size_full());
         // The field: 44 pt at its shortest, growing to five lines at any text size, and never
         // wider than the room the buttons leave it.
@@ -3592,9 +3776,15 @@ impl Composer {
             let name = target.key.network.label();
             (format!("{name} is offline. A message sent now waits up to 60 seconds for it to come back."), Tone::Offline)
         };
-        let unlocked = target.locked().is_none();
+        let unlocked = self.locked_for(target).is_none();
         let text = self.input.read(cx).text().to_owned();
         let note = || attach::sending_note(target.key.network, &target.can, &self.tray, &text).map(|words| (words, Tone::Note));
+        let paid_note = || {
+            unlocked
+                .then(|| self.send_rules.get(&target.key).and_then(|r| r.paid_stars).filter(|&s| s > 0))
+                .flatten()
+                .map(|stars| (format!("Messages here cost {stars} Telegram Stars."), Tone::Note))
+        };
         let recording = rec::foot(&self.recording, &target.key, playing::now_ms(), crate::gui::app::prefs::values().on(protocol::settings::PUSH_TO_TALK));
         let length_note = || {
             // An edit cannot become a file, so the offer is only for a new message. Emoticons
@@ -3610,7 +3800,7 @@ impl Composer {
             let tone = if length::over(counted, target.can.text_limit) { Tone::Warning } else { Tone::Note };
             length::line(counted, target.can.text_limit).map(|words| (words, tone))
         };
-        let said = self.caption.clone().or(recording).or_else(length_note).or_else(note).or_else(|| (unlocked && target.link == Link::Offline).then(offline));
+        let said = self.caption.clone().or(recording).or_else(length_note).or_else(note).or_else(paid_note).or_else(|| (unlocked && target.link == Link::Offline).then(offline));
         let tiny_previews_off = target.key.network == Network::Tiny && !super::app::prefs::choices().send_link_previews;
         let hosts = if self.controls().link_chip && unlocked && !tiny_previews_off { niceties::link_hosts(&text) } else { Vec::new() };
         let chip = niceties::preview_words(&hosts, self.no_preview).map(|words| {
@@ -4270,7 +4460,7 @@ impl Render for Composer {
             return dock;
         };
         let undo = self.undo_join_bar(&target, cx);
-        let body = match target.locked() {
+        let body = match self.locked_for(&target) {
             Some(locked) => self.bar(locked, target.key.network, cx),
             None => self.card(focus.is_focused(window), window, cx),
         };
@@ -5153,5 +5343,17 @@ mod tests {
         assert!(!pasted.exists());
         let _ = std::fs::remove_file(&notes);
         let _ = std::fs::remove_file(&huge);
+    }
+
+    #[test]
+    fn slowmode_countdown_and_timed_mute_format_cleanly() {
+        assert_eq!(format_countdown(5), "0:05");
+        assert_eq!(format_countdown(30), "0:30");
+        assert_eq!(format_countdown(95), "1:35");
+        assert_eq!(format_countdown(3665), "1:01:05");
+        let soon = format_ban_until(1_700_003_600, 1_700_000_000);
+        assert!(soon.starts_with("You can send messages again at "), "{soon}");
+        let later = format_ban_until(1_700_200_000, 1_700_000_000);
+        assert!(later.starts_with("You can send messages again on "), "{later}");
     }
 }

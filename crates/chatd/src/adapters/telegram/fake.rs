@@ -704,6 +704,12 @@ struct World {
     invites: Vec<tl::types::ChatInviteExported>,
     /// Pending join requests awaiting admin approval.
     join_requests: Vec<tl::types::ChatInviteImporter>,
+    /// Per-channel slow-mode seconds for `GetFullChannel`.
+    slowmode_seconds: HashMap<i64, i32>,
+    /// Channels/groups with media, stickers, GIFs, and voices banned in `default_banned_rights`.
+    media_banned: HashSet<i64>,
+    /// Per-peer (`user_id` or `channel_id`) paid-message price in Stars (`send_paid_messages_stars`).
+    paid_stars: HashMap<i64, i64>,
 }
 
 fn key(peer: Who, topic: Option<i32>) -> String {
@@ -842,6 +848,9 @@ impl World {
                     approved_by: None,
                 },
             ],
+            slowmode_seconds: HashMap::new(),
+            media_banned: HashSet::new(),
+            paid_stars: HashMap::new(),
         };
         let odalys = Who::User(ODALYS);
         world.store(None, message(odalys, 10, ODALYS, t0() - 300, "Are you coming to the ridge on Saturday?"));
@@ -2210,7 +2219,250 @@ impl World {
                 self.store(None, message.clone());
                 vec![new(message)]
             }
-            // A small file Telegram keeps on a CDN. The redirect names no checksum; the home
+            "voice-unread" => {
+                let voice = tl::types::Document {
+                    id: 6_101,
+                    access_hash: 6_102,
+                    file_reference: vec![4],
+                    date: t0(),
+                    mime_type: "audio/ogg".to_owned(),
+                    size: 18_000,
+                    thumbs: None,
+                    video_thumbs: None,
+                    dc_id: 2,
+                    attributes: vec![tl::types::DocumentAttributeAudio {
+                        voice: true,
+                        duration: 9,
+                        title: None,
+                        performer: None,
+                        waveform: Some(vec![0b0001_1111, 0b0111_1100, 0b1111_0000]),
+                    }
+                    .into()],
+                };
+                let mut msg = message(odalys, 61, ODALYS, t0() + 61, "");
+                msg.media_unread = true;
+                msg.media = Some(
+                    tl::types::MessageMediaDocument {
+                        nopremium: false,
+                        spoiler: false,
+                        video: false,
+                        round: false,
+                        voice: true,
+                        document: Some(voice.into()),
+                        alt_documents: None,
+                        video_cover: None,
+                        video_timestamp: None,
+                        ttl_seconds: None,
+                    }
+                    .into(),
+                );
+                self.store(None, msg.clone());
+                vec![new(msg)]
+            }
+            "voice-unread-mention" => {
+                let voice = tl::types::Document {
+                    id: 6_102,
+                    access_hash: 6_103,
+                    file_reference: vec![4],
+                    date: t0(),
+                    mime_type: "audio/ogg".to_owned(),
+                    size: 18_000,
+                    thumbs: None,
+                    video_thumbs: None,
+                    dc_id: 2,
+                    attributes: vec![tl::types::DocumentAttributeAudio {
+                        voice: true,
+                        duration: 5,
+                        title: None,
+                        performer: None,
+                        waveform: Some(vec![0b0001_1111, 0b0111_1100]),
+                    }
+                    .into()],
+                };
+                let mut msg = message(Who::Group(CREW), 62, TOBIN, t0() + 62, "");
+                msg.media_unread = true;
+                msg.mentioned = true;
+                msg.media = Some(
+                    tl::types::MessageMediaDocument {
+                        nopremium: false,
+                        spoiler: false,
+                        video: false,
+                        round: false,
+                        voice: true,
+                        document: Some(voice.into()),
+                        alt_documents: None,
+                        video_cover: None,
+                        video_timestamp: None,
+                        ttl_seconds: None,
+                    }
+                    .into(),
+                );
+                self.store(None, msg.clone());
+                vec![new(msg)]
+            }
+            "voice-out-unread" => {
+                let voice = tl::types::Document {
+                    id: 6_103,
+                    access_hash: 6_104,
+                    file_reference: vec![4],
+                    date: t0(),
+                    mime_type: "audio/ogg".to_owned(),
+                    size: 18_000,
+                    thumbs: None,
+                    video_thumbs: None,
+                    dc_id: 2,
+                    attributes: vec![tl::types::DocumentAttributeAudio {
+                        voice: true,
+                        duration: 6,
+                        title: None,
+                        performer: None,
+                        waveform: Some(vec![0b0001_1111, 0b0111_1100]),
+                    }
+                    .into()],
+                };
+                let mut msg = message(odalys, 63, ME, t0() + 63, "");
+                msg.media_unread = true;
+                msg.media = Some(
+                    tl::types::MessageMediaDocument {
+                        nopremium: false,
+                        spoiler: false,
+                        video: false,
+                        round: false,
+                        voice: true,
+                        document: Some(voice.into()),
+                        alt_documents: None,
+                        video_cover: None,
+                        video_timestamp: None,
+                        ttl_seconds: None,
+                    }
+                    .into(),
+                );
+                self.store(None, msg.clone());
+                vec![new(msg)]
+            }
+            "channel-voice-unread" => {
+                let voice = tl::types::Document {
+                    id: 6_104,
+                    access_hash: 6_105,
+                    file_reference: vec![4],
+                    date: t0(),
+                    mime_type: "audio/ogg".to_owned(),
+                    size: 18_000,
+                    thumbs: None,
+                    video_thumbs: None,
+                    dc_id: 2,
+                    attributes: vec![tl::types::DocumentAttributeAudio {
+                        voice: true,
+                        duration: 11,
+                        title: None,
+                        performer: None,
+                        waveform: Some(vec![0b0001_1111, 0b0111_1100]),
+                    }
+                    .into()],
+                };
+                let mut msg = message(Who::Channel(NOTES), 64, 0, t0() + 64, "");
+                msg.media_unread = true;
+                msg.media = Some(
+                    tl::types::MessageMediaDocument {
+                        nopremium: false,
+                        spoiler: false,
+                        video: false,
+                        round: false,
+                        voice: true,
+                        document: Some(voice.into()),
+                        alt_documents: None,
+                        video_cover: None,
+                        video_timestamp: None,
+                        ttl_seconds: None,
+                    }
+                    .into(),
+                );
+                self.store(None, msg.clone());
+                vec![update(tl::types::UpdateNewChannelMessage { message: msg.into(), pts: 0, pts_count: 0 }.into())]
+            }
+            "round-unread" => {
+                let round = tl::types::Document {
+                    id: 6_105,
+                    access_hash: 6_106,
+                    file_reference: vec![4],
+                    date: t0(),
+                    mime_type: "video/mp4".to_owned(),
+                    size: 42_000,
+                    thumbs: None,
+                    video_thumbs: None,
+                    dc_id: 2,
+                    attributes: vec![tl::types::DocumentAttributeVideo {
+                        round_message: true,
+                        supports_streaming: true,
+                        nosound: false,
+                        duration: 8.0,
+                        w: 240,
+                        h: 240,
+                        preload_prefix_size: None,
+                        video_start_ts: None,
+                        video_codec: None,
+                    }
+                    .into()],
+                };
+                let mut msg = message(odalys, 65, ODALYS, t0() + 65, "");
+                msg.media_unread = true;
+                msg.media = Some(
+                    tl::types::MessageMediaDocument {
+                        nopremium: false,
+                        spoiler: false,
+                        video: true,
+                        round: true,
+                        voice: false,
+                        document: Some(round.into()),
+                        alt_documents: None,
+                        video_cover: None,
+                        video_timestamp: None,
+                        ttl_seconds: None,
+                    }
+                    .into(),
+                );
+                self.store(None, msg.clone());
+                vec![new(msg)]
+            }
+            "read-contents" => {
+                let ids: Vec<i32> = words.filter_map(|w| w.parse::<i32>().ok()).collect();
+                vec![update(tl::types::UpdateReadMessagesContents { messages: ids, pts: 5, pts_count: 1, date: None }.into())]
+            }
+            "channel-read-contents" => {
+                let channel_id = words.next().and_then(|w| w.parse::<i64>().ok()).unwrap_or(NOTES);
+                let ids: Vec<i32> = words.filter_map(|w| w.parse::<i32>().ok()).collect();
+                vec![update(
+                    tl::types::UpdateChannelReadMessagesContents {
+                        channel_id,
+                        top_msg_id: None,
+                        saved_peer_id: None,
+                        messages: ids,
+                    }
+                    .into(),
+                )]
+            }
+            "slowmode" => {
+                let seconds = words.next().and_then(|w| w.parse::<i32>().ok()).unwrap_or(30);
+                if seconds > 0 {
+                    self.slowmode_seconds.insert(WORKSHOP, seconds);
+                } else {
+                    self.slowmode_seconds.remove(&WORKSHOP);
+                }
+                Vec::new()
+            }
+            "ban-media" => {
+                self.media_banned.insert(WORKSHOP);
+                Vec::new()
+            }
+            "paid-stars" => {
+                let stars = words.next().and_then(|w| w.parse::<i64>().ok()).unwrap_or(25);
+                if stars > 0 {
+                    self.paid_stars.insert(TOBIN, stars);
+                } else {
+                    self.paid_stars.remove(&TOBIN);
+                }
+                Vec::new()
+            }
             // datacenter does, and the first CDN read asks for the file to be sent again.
             "cdn-file" => {
                 let document = plain_document(9_300, CDN_PLAIN.len() as i64, "ridge.bin");
@@ -3468,13 +3720,24 @@ impl World {
             if request.message == "premium file" {
                 return Err(rpc(403, "PREMIUM_ACCOUNT_REQUIRED", None));
             }
+            let peer_id = match peer {
+                Who::User(id) | Who::Channel(id) | Who::Group(id) => id,
+            };
+            if let Some(&price) = self.paid_stars.get(&peer_id).filter(|&&s| s > 0) {
+                if request.allow_paid_stars.unwrap_or(0) < price {
+                    return Err(rpc(403, "ALLOW_PAYMENT_REQUIRED", Some(price as u32)));
+                }
+            }
             let (topic, reply) = match &request.reply_to {
                 Some(tl::enums::InputReplyTo::Message(reply)) if peer == Who::Channel(WORKSHOP) => (Some(reply.top_msg_id.unwrap_or(reply.reply_to_msg_id)), None),
                 Some(tl::enums::InputReplyTo::Message(reply)) => (None, Some(reply.reply_to_msg_id)),
                 _ => (None, None),
             };
             let options = [("silent", request.silent), ("no-preview", request.no_webpage), ("scheduled", request.schedule_date.is_some())];
-            let options: String = options.iter().filter(|(_, on)| *on).map(|(name, _)| format!(" [{name}]")).collect();
+            let mut options: String = options.iter().filter(|(_, on)| *on).map(|(name, _)| format!(" [{name}]")).collect();
+            if let Some(stars) = request.allow_paid_stars {
+                options.push_str(&format!(" [stars={stars}]"));
+            }
             // A comment names the echo post it answers in its key, as a forum's send names
             // its topic: the two are Telegram's own ways to point at a threaded write.
             let said = match peer == Who::Channel(CHATTERS) {
@@ -3816,6 +4079,19 @@ impl World {
             self.log(&format!("channels.ReadHistory c{} {}", channel.channel_id, request.max_id));
             return answer(true);
         }
+        if let Some(request) = asked::<f::messages::ReadMessageContents>(body) {
+            let ids: Vec<String> = request.id.iter().map(i32::to_string).collect();
+            self.log(&format!("ReadMessageContents {}", ids.join(",")));
+            return answer(tl::enums::messages::AffectedMessages::Messages(tl::types::messages::AffectedMessages { pts: 4, pts_count: 1 }));
+        }
+        if let Some(request) = asked::<f::channels::ReadMessageContents>(body) {
+            let tl::enums::InputChannel::Channel(channel) = &request.channel else {
+                return Err(rpc(400, "CHANNEL_INVALID", None));
+            };
+            let ids: Vec<String> = request.id.iter().map(i32::to_string).collect();
+            self.log(&format!("channels.ReadMessageContents c{} {}", channel.channel_id, ids.join(",")));
+            return answer(true);
+        }
         if let Some(request) = asked::<f::messages::ReadDiscussion>(body) {
             let forum = input_who(&request.peer);
             self.log(&format!("ReadDiscussion {} {}", key(forum, Some(request.msg_id)), request.read_max_id));
@@ -3938,6 +4214,7 @@ impl World {
             full.phone_calls_available = phone_avail;
             full.phone_calls_private = phone_priv;
             full.video_calls_available = video_avail;
+            full.send_paid_messages_stars = self.paid_stars.get(&id).copied();
             let mut people = users();
             if id == ME {
                 full.about = Some(self.me_about.clone());
@@ -4971,7 +5248,24 @@ impl World {
                 full.participants_hidden = true;
             }
             full.online_count = Some(230);
-            let found = tl::types::messages::ChatFull { full_chat: full.into(), chats: chats(), users: users() };
+            full.slowmode_seconds = self.slowmode_seconds.get(&channel.channel_id).copied();
+            full.send_paid_messages_stars = self.paid_stars.get(&channel.channel_id).copied();
+            let mut chat_list = chats();
+            if self.media_banned.contains(&channel.channel_id) {
+                for one in &mut chat_list {
+                    if let tl::enums::Chat::Channel(ch) = one {
+                        if ch.id == channel.channel_id {
+                            let mut banned: tl::types::ChatBannedRights = blank(&[&put(0u32), &put(0i32)]);
+                            banned.send_media = true;
+                            banned.send_stickers = true;
+                            banned.send_gifs = true;
+                            banned.send_voices = true;
+                            ch.default_banned_rights = Some(banned.into());
+                        }
+                    }
+                }
+            }
+            let found = tl::types::messages::ChatFull { full_chat: full.into(), chats: chat_list, users: users() };
             return Some(answer(tl::enums::messages::ChatFull::Full(found)));
         }
         if let Some(answered) = self.roster(body) {

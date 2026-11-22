@@ -691,6 +691,7 @@ pub(super) fn add_members(account: &Account, conversation: &str, people: &[Strin
         }
     }
     account.live().roster = None;
+    let _ = account.ctx.members_changed(conversation);
     if let Some(note) = missing_invitee_words(&missing_names) {
         return Err(Fault::Net(note));
     }

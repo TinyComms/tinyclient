@@ -3869,6 +3869,7 @@ fn group_rights(group: &wire::GroupInfo, me: &str) -> ConversationRights {
         edit_topic: can_edit,
         edit_picture: can_edit,
         manage_topics: false,
+        ..ConversationRights::default()
     }
 }
 

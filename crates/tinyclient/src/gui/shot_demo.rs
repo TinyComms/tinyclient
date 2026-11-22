@@ -1134,6 +1134,24 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
             conversation: conversation.clone(),
             rules: serde_json::from_value(serde_json::json!({})).expect("the default rules"),
         },
+        Request::SendRules { conversation } => Response::SendRules {
+            conversation: conversation.clone(),
+            rules: protocol::SendRules::default(),
+        },
+        Request::ModerateMember { .. }
+        | Request::SetAdmin { .. }
+        | Request::TransferOwnership { .. }
+        | Request::UpdateChatSettings { .. }
+        | Request::SetDefaultSendAs { .. } => Response::Ok,
+        Request::AdminLog { conversation, .. } => Response::AdminLog {
+            conversation: conversation.clone(),
+            entries: Vec::new(),
+        },
+        Request::SendAsOptions { conversation } => Response::SendAsOptions {
+            conversation: conversation.clone(),
+            peers: Vec::new(),
+            default: None,
+        },
         Request::Catalog { .. } => Response::Catalog { items: Vec::new(), cursor: None },
         Request::SaveGif { .. } | Request::StickerSet { .. } | Request::FaveSticker { .. } => Response::Ok,
         Request::Watch(watching) => {

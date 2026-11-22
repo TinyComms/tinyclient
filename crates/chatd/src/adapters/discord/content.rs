@@ -968,6 +968,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         permalink: String::new(),
         controls: Vec::new(),
         buttons: Vec::new(),
+        media_unread: false,
     };
     (message, rich.files)
 }

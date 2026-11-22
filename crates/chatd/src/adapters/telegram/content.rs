@@ -2235,7 +2235,12 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                 }
                 Some(MessageMedia::Document(media)) if media.document.is_some() && media.ttl_seconds.is_none() => {
                     if let Some(tl::enums::Document::Document(file)) = &media.document {
-                        message.attachments.push(document(media, file, &mut wants));
+                        let attachment = document(media, file, &mut wants);
+                        let playable = !attachment.view_once && (attachment.round || attachment.file.kind == MediaKind::Audio);
+                        if raw.media_unread && playable {
+                            message.media_unread = true;
+                        }
+                        message.attachments.push(attachment);
                     }
                 }
                 Some(MessageMedia::WebPage(media)) => {

@@ -3,7 +3,8 @@
 //! The decision is `protocol::link::Destination` (host, registrable domain, punycode, lookalike
 //! check, tracking strip). This file is only the question and what the answer does. The browser
 //! is started with the system's own opener (`cx.open_url`): it is handed the address alone, so no
-//! page is the referrer and no `Referer` is sent. Only http and https ever get that far.
+//! page is the referrer and no `Referer` is sent. Web links are http or https. A `tg://` link
+//! is handed to the system as it is, and `http://t.me` or `http://telegram.me` is opened as https.
 
 use super::Pane;
 use crate::gui::app::prefs;
@@ -82,8 +83,22 @@ pub(super) fn message_link_for(
     message_link(key, open.space.as_deref(), message)
 }
 
+/// `http://t.me` and `http://telegram.me` are the same sites as their https links.
+fn https_telegram_web(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") {
+        return None;
+    }
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host.eq_ignore_ascii_case("t.me") || host.eq_ignore_ascii_case("telegram.me") {
+        Some(format!("https://{rest}"))
+    } else {
+        None
+    }
+}
+
 /// A `mailto:` link, which other networks put on an address. It opens the mail app as it is:
-/// no question, no tracking strip. Every other scheme that is not http or https stays refused.
+/// no question, no tracking strip.
 pub(super) fn is_mailto(url: &str) -> bool {
     url.get(..7).is_some_and(|scheme| scheme.eq_ignore_ascii_case("mailto:"))
         && url.len() <= 2048
@@ -132,6 +147,17 @@ impl Pane {
             cx.open_url(url);
             return;
         }
+        // `tg://` is not http. Destination refuses it, so the click used to do nothing.
+        let trimmed = url.trim();
+        if trimmed.len() <= protocol::link::LINK_LIMIT
+            && trimmed.to_ascii_lowercase().starts_with("tg:")
+            && !trimmed.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"')
+        {
+            cx.open_url(trimmed);
+            return;
+        }
+        let upgraded = https_telegram_web(trimmed);
+        let url = upgraded.as_deref().unwrap_or(trimmed);
         let Some(dest) = Destination::parse(url) else {
             return;
         };
@@ -173,7 +199,11 @@ impl Pane {
                 }
             }
         }
-        if !external && protocol::link::parse_network_link(url).is_some() {
+        // Only t.me and telegram.me open in the app. telegram.dog, tg://, a traversal, or a pack
+        // is still a Telegram address, so it must not fall through to the wider parser.
+        let in_app = protocol::link::telegram_app_link(url).is_some()
+            || (!protocol::link::telegram_family(url) && protocol::link::parse_network_link(url).is_some());
+        if !external && in_app {
             let owned = url.to_owned();
             let request = protocol::Request::Resolve { url: owned.clone() };
             let window_handle = window.window_handle();

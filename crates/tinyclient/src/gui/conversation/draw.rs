@@ -1355,6 +1355,44 @@ impl Pane {
 
     // Words.
 
+    /// The translated line under a message, and Show original. A jumbo emoji uses it too.
+    fn append_translation(&mut self, message: &Message, out: &mut Vec<AnyElement>, cx: &mut Context<Self>) {
+        let Some(said) = self.translations.get(&message.id).cloned() else {
+            return;
+        };
+        let phone = self.metrics == Metrics::PHONE;
+        let id = message.id.clone();
+        out.push(
+            div()
+                .max_w(px(MEASURE))
+                .mt(px(6.))
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(div().type_micro().text_color(theme::text_faint()).child("Translated by Telegram"))
+                .child(
+                    div()
+                        .type_body()
+                        .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
+                        .text_color(theme::text_soft())
+                        .child(said),
+                )
+                .child(
+                    div()
+                        .id(name_id("show-original", &message.id))
+                        .cursor_pointer()
+                        .type_micro()
+                        .text_color(theme::accent())
+                        .child("Show original")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.translations.remove(&id);
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        );
+    }
+
     fn content(&mut self, message: &Rc<Message>, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let phone = self.metrics == Metrics::PHONE;
         // An encrypted message this device can't open says so, quietly, and never as its text.
@@ -1376,7 +1414,9 @@ impl Pane {
             return message.edited.then(|| self.edited_mark(message, cx)).into_iter().collect();
         }
         if let Some(emoji) = rich::jumbo(&message.text, &message.spans) {
-            return vec![self.jumbo(&emoji, window, cx)];
+            let mut out = vec![self.jumbo(&emoji, window, cx)];
+            self.append_translation(message, &mut out, cx);
+            return out;
         }
         let mut blocks = rich::blocks(&message.text, &message.spans);
         let mut edited_alone = message.edited;
@@ -1439,6 +1479,7 @@ impl Pane {
         if edited_alone {
             out.push(self.edited_mark(message, cx));
         }
+        self.append_translation(message, &mut out, cx);
         if let Some(expires_at) = message.expires_at {
             if let Some(label) = expiry_label(expires_at, crate::view::now()) {
                 out.push(
@@ -2316,8 +2357,8 @@ impl Pane {
         // plays here in its tile, and opens in the viewer like a picture.
         let id = message.id.clone();
         let tile = match shape {
-            MediaShape::Video => self.moving(attachment, tile, cx),
-            MediaShape::Gif if media::is_video(attachment) => self.moving(attachment, tile, cx),
+            MediaShape::Video => self.moving(message, attachment, tile, cx),
+            MediaShape::Gif if media::is_video(attachment) => self.moving(message, attachment, tile, cx),
             _ => {
                 // A GIF says so where it does not play by itself. One held still (the setting
                 // is Never, the network sent a still, or there was no room) shows that a click

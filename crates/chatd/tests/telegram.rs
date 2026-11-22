@@ -2901,6 +2901,7 @@ fn a_login_email_a_new_account_and_password_recovery_does_not_sign_in_and_a_pass
     assert!(!said.contains("secret-client-data"), "{said}");
 }
 
+#[test]
 fn conversation_search_asks_telegram_with_the_query_and_maps_its_hits() {
     let world = World::signed_in();
     world.connected();
@@ -5640,4 +5641,158 @@ fn a_search_previews_a_public_channel_until_it_is_joined() {
         "{closed:?}"
     );
     assert!(!world.conversation("c9011").expect("a request does not join").joined);
+}
+
+#[test]
+fn voice_and_round_video_messages_track_listened_state_and_send_read_contents() {
+    let world = World::signed_in();
+    world.connected();
+
+    // 1. Incoming voice message with media_unread arrives flagged unplayed.
+    world.steer("voice-unread");
+    let voice = world.arrived("u7002", "61");
+    assert!(voice.media_unread, "unplayed incoming voice message must carry media_unread");
+    assert!(!voice.outgoing);
+
+    // Playing it sends messages.readMessageContents once and clears media_unread.
+    assert!(matches!(
+        world.ask(Request::MarkPlayed { conversation: key("u7002"), message_id: "61".into() }),
+        Response::Ok
+    ));
+    world.until("media_unread cleared on voice 61", || {
+        world.message("u7002", "61").filter(|m| !m.media_unread)
+    });
+    assert_eq!(world.called("ReadMessageContents 61"), 1, "expected exactly one ReadMessageContents call");
+
+    // Asking MarkPlayed a second time sends nothing further.
+    assert!(matches!(
+        world.ask(Request::MarkPlayed { conversation: key("u7002"), message_id: "61".into() }),
+        Response::Ok
+    ));
+    assert_eq!(world.called("ReadMessageContents 61"), 1, "must not send ReadMessageContents twice");
+
+    // 2. Incoming round video message with media_unread arrives flagged and clears on MarkPlayed.
+    world.steer("round-unread");
+    let round = world.arrived("u7002", "65");
+    assert!(round.media_unread, "unplayed round video must carry media_unread");
+    assert!(round.attachments.first().is_some_and(|a| a.round));
+    assert!(matches!(
+        world.ask(Request::MarkPlayed { conversation: key("u7002"), message_id: "65".into() }),
+        Response::Ok
+    ));
+    world.until("media_unread cleared on round 65", || {
+        world.message("u7002", "65").filter(|m| !m.media_unread)
+    });
+    assert_eq!(world.called("ReadMessageContents 65"), 1);
+
+    // 3. Channel voice message sends channels.readMessageContents and clears on update too.
+    world.steer("channel-voice-unread");
+    let ch_voice = world.arrived("c9001", "64");
+    assert!(ch_voice.media_unread);
+    assert!(matches!(
+        world.ask(Request::MarkPlayed { conversation: key("c9001"), message_id: "64".into() }),
+        Response::Ok
+    ));
+    world.until("media_unread cleared on channel voice 64", || {
+        world.message("c9001", "64").filter(|m| !m.media_unread)
+    });
+    assert_eq!(world.called("channels.ReadMessageContents c9001 64"), 1);
+
+    // 4. Outgoing unplayed voice message: playing it locally does NOT send readMessageContents
+    //    or clear the dot; UpdateReadMessagesContents from the recipient clears it.
+    world.steer("voice-out-unread");
+    let mine = world.arrived("u7002", "63");
+    assert!(mine.outgoing && mine.media_unread);
+    assert!(matches!(
+        world.ask(Request::MarkPlayed { conversation: key("u7002"), message_id: "63".into() }),
+        Response::Ok
+    ));
+    assert_eq!(world.called("ReadMessageContents 63"), 0, "must not mark own outgoing message played");
+    assert!(world.message("u7002", "63").unwrap().media_unread);
+    world.steer("read-contents 63");
+    world.until("UpdateReadMessagesContents clears outgoing voice 63", || {
+        world.message("u7002", "63").filter(|m| !m.media_unread)
+    });
+
+    // 5. Unplayed voice message with a mention decrements the conversation's mention count once.
+    world.steer("voice-unread-mention");
+    let mentioned = world.arrived("g8001", "62");
+    assert!(mentioned.media_unread && mentioned.mentions_me);
+    let before_mentions = world.conversation("g8001").unwrap().mentions;
+    assert!(before_mentions >= 1, "expected mention count >= 1, got {before_mentions}");
+    assert!(matches!(
+        world.ask(Request::MarkPlayed { conversation: key("g8001"), message_id: "62".into() }),
+        Response::Ok
+    ));
+    world.until("mention count decremented after readMessageContents", || {
+        let now_mentions = world.conversation("g8001")?.mentions;
+        (now_mentions == before_mentions - 1).then_some(now_mentions)
+    });
+    // Echoed UpdateReadMessagesContents must not double-decrement mentions.
+    world.steer("read-contents 62");
+    assert_eq!(world.conversation("g8001").unwrap().mentions, before_mentions - 1);
+}
+
+#[test]
+fn send_rules_reflect_media_bans_slow_mode_and_paid_stars() {
+    let world = World::signed_in();
+    world.connected();
+
+    // 1. Group with media banned + 30s slow mode reports those rules and starts countdown on send.
+    world.steer("ban-media");
+    world.steer("slowmode 30");
+    let Response::SendRules { rules, .. } = world.ask(Request::SendRules { conversation: key("c9002_31") }) else {
+        panic!("expected SendRules");
+    };
+    assert!(!rules.send_media && !rules.allows_any_attachment());
+    assert!(!rules.send_stickers && !rules.send_gifs && !rules.send_voices);
+    assert!(rules.send_messages && rules.send_plain);
+    assert_eq!(rules.slowmode_seconds, 30);
+    assert_eq!(rules.slowmode_next_send, None);
+
+    // Sending a message in the slow-mode chat sets the cached next-send timestamp.
+    world.send("c9002_31", "5351", "Checked the bearings", None);
+    let _ = world.until("slowmode message sent", || {
+        world.messages("c9002_31").into_iter().find(|m| m.text == "Checked the bearings" && m.state == SendState::Sent)
+    });
+    let Response::SendRules { rules: after_send, .. } = world.ask(Request::SendRules { conversation: key("c9002_31") }) else {
+        panic!("expected SendRules after send");
+    };
+    assert!(after_send.slowmode_next_send.is_some(), "slow mode cooldown must start after send");
+
+    // 2. Paid messages (send_paid_messages_stars): price is reported, silent send fails, explicit
+    //    allow_paid_stars succeeds and passes allow_paid_stars on the wire.
+    world.steer("paid-stars 25");
+    let Response::SendRules { rules: paid_rules, .. } = world.ask(Request::SendRules { conversation: key("u7003") }) else {
+        panic!("expected SendRules for paid user");
+    };
+    assert_eq!(paid_rules.paid_stars, Some(25));
+
+    // Sending without allow_paid_stars fails with a plain-English Stars error.
+    world.send("u7003", "5352", "unpaid hello", None);
+    let failed = world.until("unpaid send fails", || {
+        world.messages("u7003").into_iter().find(|m| {
+            m.text == "unpaid hello" && matches!(m.state, SendState::Failed { .. })
+        })
+    });
+    let SendState::Failed { reason } = failed.state else { unreachable!() };
+    assert!(reason.contains("25 Telegram Stars"), "{reason}");
+
+    // Sending with explicit allow_paid_stars succeeds and passes allow_paid_stars on the wire.
+    let res = world.ask(Request::Send {
+        conversation: key("u7003"),
+        client_id: "5353".into(),
+        text: "paid hello".into(),
+        reply_to: None,
+        with: protocol::Outgoing { allow_paid_stars: Some(25), ..protocol::Outgoing::default() },
+    });
+    assert!(matches!(res, Response::Sent { .. }), "{res:?}");
+    let _ = world.until("paid send succeeds", || {
+        world.messages("u7003").into_iter().find(|m| m.text == "paid hello" && m.state == SendState::Sent)
+    });
+    assert!(
+        world.calls().iter().any(|c| c.contains("SendMessage u7003 paid hello") && c.contains("[stars=25]")),
+        "{:#?}",
+        world.calls()
+    );
 }

@@ -169,6 +169,7 @@ pub struct Hub {
     pub space_infos: Recent<Key, protocol::SpaceInfo>,
     pub catalogs: Recent<CatalogAsked, (Vec<protocol::CatalogItem>, Option<String>)>,
     pub reactions: Recent<Key, protocol::ReactionRules>,
+    pub send_rules: Recent<Key, protocol::SendRules>,
     pub calls: Calls,
     pub player: crate::playback::Player,
     pub recorder: crate::recorder::Recorder,
@@ -236,6 +237,7 @@ impl Hub {
             space_infos: Recent::new(16),
             catalogs: Recent::new(32),
             reactions: Recent::new(64),
+            send_rules: Recent::new(64),
             calls: Calls::default(),
             player: crate::playback::Player::default(),
             recorder: crate::recorder::Recorder::default(),
@@ -546,6 +548,10 @@ impl Hub {
             Change::Call { call, .. } => self.notify(crate::notify::Event::Call(call.clone())),
             _ => {}
         }
+        let landed = match &change {
+            Change::Media { account, file } => Some((account.clone(), file.clone())),
+            _ => None,
+        };
         let mut changes = lock(&self.changes);
         changes.seq += 1;
         let seq = changes.seq;
@@ -557,6 +563,9 @@ impl Hub {
         }
         drop(changes);
         self.moved.notify_all();
+        if let Some((account, file)) = landed {
+            self.player.file_landed(&account, &file);
+        }
     }
 
     /// Everything a shell holds may be stale (the cache was cleared): its next `Wait` answers

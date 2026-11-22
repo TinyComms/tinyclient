@@ -1289,6 +1289,17 @@ fn default_starred_limit() -> u32 {
     50
 }
 
+/// One message as a network translated it. The stored message is left as it was.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Translation {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spans: Vec<Span>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
@@ -1601,6 +1612,45 @@ pub enum Request {
     ConversationPicture {
         conversation: Key,
         path: String,
+    },
+    /// Moderates one member of a group or channel: kick, ban, unban, or restrict send rights.
+    ModerateMember {
+        conversation: Key,
+        person: String,
+        action: MemberModeration,
+    },
+    /// Promotes or demotes an admin with specific rights and an optional custom title.
+    SetAdmin {
+        conversation: Key,
+        person: String,
+        rights: AdminRights,
+    },
+    /// Transfers group/channel ownership to another user (requires 2FA password proof).
+    TransferOwnership {
+        conversation: Key,
+        person: String,
+        password: String,
+    },
+    /// Updates group/channel settings: default member permissions, slow mode, join approval,
+    /// forum topics, pre-history visibility, post signatures, or protected content.
+    UpdateChatSettings {
+        conversation: Key,
+        settings: ChatSettings,
+    },
+    /// Reads the recent-actions admin log for a supergroup or channel.
+    AdminLog {
+        conversation: Key,
+        #[serde(default)]
+        limit: u32,
+    },
+    /// Lists the peers this account may post as in a group or channel (`channels.getSendAs`).
+    SendAsOptions {
+        conversation: Key,
+    },
+    /// Sets the default peer to post as in a group or channel (`messages.saveDefaultSendAs`).
+    SetDefaultSendAs {
+        conversation: Key,
+        peer: String,
     },
     /// The direct conversation with a person, created if there is none. Nothing reaches the other
     /// person until a message is sent.
@@ -2060,6 +2110,12 @@ pub enum Request {
         conversation: Key,
         message_id: String,
     },
+    /// The user started playing a voice or round video message: tells the network its contents
+    /// were listened to (`messages.readMessageContents` / `channels.readMessageContents`), once.
+    MarkPlayed {
+        conversation: Key,
+        message_id: String,
+    },
     /// Adds (`on`) or takes back our reaction. `emoji` is the emoji itself, or a custom one's
     /// `:name:` as `Reaction::emoji` spells it. Shown at once; what the network then says is
     /// what stays.
@@ -2101,6 +2157,11 @@ pub enum Request {
     SetDefaultReaction {
         account: AccountKey,
         emoji: String,
+    },
+    /// What this account may send in one conversation: per-chat media restrictions, slow mode,
+    /// timed mute expiry, and paid-message star price. Asked when the conversation opens.
+    SendRules {
+        conversation: Key,
     },
     /// Who reacted to a message with `emoji`, paged. Fetched only on demand (clicking or
     /// opening the reactors list), never prefetched.
@@ -2969,6 +3030,15 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         message_ids: Vec<String>,
     },
+    /// Translate these messages into `to` (a language tag such as `en`). On demand: nothing is
+    /// stored over the original, and a sealed or secret chat is refused before the network is asked.
+    Translate {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        message_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        to: String,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -3204,6 +3274,11 @@ pub enum Response {
     Source {
         text: String,
     },
+    /// Answers `Translate`. One item per message the network translated, in the order asked.
+    Translated {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        items: Vec<Translation>,
+    },
     /// Answers `Resolve`: the matching cached conversation and optional message id on a signed-in account.
     Resolved {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3345,6 +3420,23 @@ pub enum Response {
         balance: i64,
         #[serde(default)]
         nanos: i32,
+    },
+    /// Answers `SendRules`: per-conversation send permissions, slow mode, timed mute, paid stars.
+    SendRules {
+        conversation: Key,
+        rules: SendRules,
+    },
+    /// Answers `AdminLog`: recent admin actions in a group or channel, newest first.
+    AdminLog {
+        conversation: Key,
+        entries: Vec<AdminLogEntry>,
+    },
+    /// Answers `SendAsOptions`: selectable posting identities for a conversation.
+    SendAsOptions {
+        conversation: Key,
+        peers: Vec<SendAs>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default: Option<String>,
     },
     /// Answers `Reactors`: one page of people who reacted with `emoji`.
     Reactors {
@@ -4064,8 +4156,34 @@ mod tests {
         assert!(!ujson.contains("description"), "{ujson}");
         assert_eq!(serde_json::from_str::<Request>(&ujson).unwrap(), update);
 
-        let pic = Request::ConversationPicture { conversation: key, path: "/tmp/icon.png".into() };
+        let pic = Request::ConversationPicture { conversation: key.clone(), path: "/tmp/icon.png".into() };
         assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&pic).unwrap()).unwrap(), pic);
+
+        let ban = Request::ModerateMember {
+            conversation: key.clone(),
+            person: "U2".into(),
+            action: MemberModeration::Ban { until: None },
+        };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&ban).unwrap()).unwrap(), ban);
+        let promote = Request::SetAdmin {
+            conversation: key.clone(),
+            person: "U2".into(),
+            rights: AdminRights { ban_users: true, rank: "Mod".into(), ..AdminRights::default() },
+        };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&promote).unwrap()).unwrap(), promote);
+        let give = Request::TransferOwnership { conversation: key.clone(), person: "U2".into(), password: "secret".into() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&give).unwrap()).unwrap(), give);
+        let settings = Request::UpdateChatSettings {
+            conversation: key.clone(),
+            settings: ChatSettings { slowmode_seconds: Some(30), no_forwards: Some(true), ..ChatSettings::default() },
+        };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&settings).unwrap()).unwrap(), settings);
+        let log = Request::AdminLog { conversation: key.clone(), limit: 20 };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&log).unwrap()).unwrap(), log);
+        let send_as = Request::SendAsOptions { conversation: key.clone() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&send_as).unwrap()).unwrap(), send_as);
+        let set_as = Request::SetDefaultSendAs { conversation: key, peer: "c9".into() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&set_as).unwrap()).unwrap(), set_as);
 
         let all = ConversationRights {
             pin: true,
@@ -4077,8 +4195,37 @@ mod tests {
             edit_topic: true,
             edit_picture: true,
             manage_topics: true,
+            ban_members: true,
+            promote_admins: true,
+            manage_settings: true,
+            view_admin_log: true,
+            transfer_owner: true,
+            anonymous: true,
         };
         assert_eq!(ConversationRights::from_bits(all.to_bits()), all);
+    }
+
+    #[test]
+    fn a_translate_frame_missing_its_new_fields_still_reads() {
+        let key = Key::new(&AccountKey { network: Network::Telegram, account: "a".into() }, "u1");
+        let bare: Request = serde_json::from_str(&format!(
+            r#"{{"op":"translate","conversation":{}}}"#,
+            serde_json::to_string(&key).unwrap()
+        ))
+        .unwrap();
+        assert_eq!(bare, Request::Translate { conversation: key.clone(), message_ids: vec![], to: String::new() });
+
+        let full = Request::Translate { conversation: key, message_ids: vec!["9".into()], to: "en".into() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&full).unwrap()).unwrap(), full);
+
+        let empty: Response = serde_json::from_str(r#"{"op":"translated"}"#).unwrap();
+        assert_eq!(empty, Response::Translated { items: vec![] });
+        let item: Translation = serde_json::from_str("{}").unwrap();
+        assert_eq!(item, Translation { message_id: String::new(), text: String::new(), spans: vec![] });
+        let said = Translation { message_id: "9".into(), text: "hi".into(), spans: vec![] };
+        let wire = serde_json::to_string(&Response::Translated { items: vec![said.clone()] }).unwrap();
+        assert!(!wire.contains("spans"), "{wire}");
+        assert_eq!(serde_json::from_str::<Response>(&wire).unwrap(), Response::Translated { items: vec![said] });
     }
 }
 

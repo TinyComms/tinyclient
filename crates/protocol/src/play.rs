@@ -9,7 +9,7 @@ use crate::{AccountKey, Key};
 use serde::{Deserialize, Serialize};
 
 /// Speeds a voice message can play at, in percent.
-pub const RATES: [u16; 3] = [100, 150, 200];
+pub const RATES: [u16; 4] = [50, 100, 150, 200];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -47,6 +47,12 @@ pub struct Playback {
     pub duration: u32,
     /// Percent of normal speed: one of [`RATES`].
     pub rate: u16,
+    /// Another playable voice or round message immediately follows this one in the conversation.
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub has_next: bool,
+    /// Another playable voice or round message immediately precedes this one in the conversation.
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub has_previous: bool,
 }
 
 impl Playback {
@@ -92,6 +98,10 @@ pub enum PlayRequest {
     /// Moves to `at` milliseconds, playing or paused.
     Seek { at: u32 },
     Rate { rate: u16 },
+    /// Jumps to the next consecutive voice or round message in the same conversation, if any.
+    Next,
+    /// Jumps to the previous consecutive voice or round message in the same conversation, if any.
+    Previous,
     /// Stops and forgets it: the now-playing control goes.
     Stop,
 }
@@ -144,6 +154,8 @@ mod tests {
             since: 10_000,
             duration: 5_000,
             rate: 150,
+            has_next: false,
+            has_previous: false,
         }
     }
 
@@ -155,10 +167,14 @@ mod tests {
         assert_eq!(playing.position(12_000), 4_000);
         assert_eq!(playing.position(60_000), 5_000, "never past the end");
         assert_eq!(playback(PlayState::Paused).position(60_000), 1_000);
+        // Two seconds at 0.5x is one second of the file.
+        let half = Playback { rate: 50, ..playback(PlayState::Playing) };
+        assert_eq!(half.position(12_000), 2_000);
     }
 
     #[test]
     fn frames_read_back_as_written() {
+        assert_eq!(RATES, [50, 100, 150, 200]);
         let start = PlayRequest::Start {
             account: AccountKey { network: Network::Telegram, account: "1".into() },
             file: "voice".into(),
@@ -167,15 +183,20 @@ mod tests {
             message: "3".into(),
             title: String::new(),
             at: None,
-            rate: 100,
+            rate: 50,
             output: None,
         };
         let json = serde_json::to_string(&start).unwrap();
         assert!(json.contains(r#""play":"start""#), "{json}");
         assert_eq!(serde_json::from_str::<PlayRequest>(&json).unwrap(), start);
+        for step in [PlayRequest::Next, PlayRequest::Previous] {
+            let wire = serde_json::to_string(&step).unwrap();
+            assert_eq!(serde_json::from_str::<PlayRequest>(&wire).unwrap(), step);
+        }
         let shown = playback(PlayState::Failed { detail: "No speaker.".into() });
         let json = serde_json::to_string(&shown).unwrap();
         assert!(json.contains(r#""state":"failed""#), "{json}");
+        assert!(!json.contains("has_next") && !json.contains("has_previous"), "{json}");
         assert_eq!(serde_json::from_str::<Playback>(&json).unwrap(), shown);
     }
 }

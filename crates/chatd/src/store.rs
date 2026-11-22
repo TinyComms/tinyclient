@@ -3647,6 +3647,31 @@ impl Store {
         Ok(true)
     }
 
+    /// Clears a stored message's `media_unread` flag in place. Returns true if the message existed
+    /// and its flag changed from true to false.
+    pub fn clear_media_unread(&mut self, conversation: &Key, id: &str) -> rusqlite::Result<bool> {
+        let Some(mut message) = self.message(conversation, id)? else {
+            return Ok(false);
+        };
+        if !message.media_unread {
+            return Ok(false);
+        }
+        message.media_unread = false;
+        self.ingest(conversation, &message, false)?;
+        Ok(true)
+    }
+
+    /// Decrements a conversation's unread mention count by one when an individual message's
+    /// mention is consumed (e.g., Telegram's `readMessageContents`).
+    pub fn consume_mention(&mut self, conversation: &Key) -> rusqlite::Result<bool> {
+        let changed = self.db.execute(
+            "UPDATE conversation SET mentions = max(0, mentions - 1)
+              WHERE network = ?1 AND account = ?2 AND id = ?3 AND mentions > 0",
+            params![word(&conversation.network), conversation.account, conversation.id],
+        )?;
+        Ok(changed == 1)
+    }
+
     pub fn delete_message(&mut self, conversation: &Key, id: &str) -> rusqlite::Result<bool> {
         let Some(mut message) = self.message(conversation, id)? else {
             return Ok(false);
