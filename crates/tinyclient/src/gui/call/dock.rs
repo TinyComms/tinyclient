@@ -651,6 +651,95 @@ impl Shell {
             )
     }
 
+    /// Someone in this call started sharing their screen: a 32 px strip on top of the card
+    /// naming who is sharing, with one-click Watch and a dismiss button.
+    fn call_share_strip(
+        &self,
+        call: &Call,
+        subject: &Subject,
+        first_strip: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        if call.state != CallState::Joined {
+            return None;
+        }
+        let sharer_id = self.call_state.share_prompt.as_deref()?;
+        if super::watching(call, sharer_id) {
+            return None;
+        }
+        let sharer = call.participants.iter().find(|p| p.id == sharer_id && !p.ringing && p.sharing)?;
+        let watch_call = call.clone();
+        let watch_id = sharer.id.clone();
+        let watch_title = subject.title.clone();
+        Some(
+            div()
+                .min_h(px(32.))
+                .flex_none()
+                .when(first_strip, |strip| strip.mt(px(-9.)).rounded_t(px(11.)))
+                .mx(px(-9.))
+                .pl(px(10.))
+                .pr(px(8.))
+                .py(px(5.))
+                .bg(theme::accent_soft())
+                .border_b_1()
+                .border_color(theme::hairline())
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .text_size(px(12.))
+                .text_color(theme::text())
+                .child(glyph("icons/monitor-up.svg", 13., theme::accent()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(format!("{} is sharing their screen", sharer.name)),
+                )
+                .child(
+                    div()
+                        .id("call-share-strip-watch")
+                        .flex_none()
+                        .h(px(22.))
+                        .px(px(8.))
+                        .rounded(px(6.))
+                        .bg(theme::accent())
+                        .hover(|s| s.bg(theme::accent_hover()))
+                        .text_color(theme::on_accent())
+                        .text_size(px(11.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.call_watch_stream(&watch_call, watch_id.clone(), &watch_title, cx);
+                        }))
+                        .child("Watch"),
+                )
+                .child(
+                    div()
+                        .id("call-share-strip-dismiss")
+                        .flex_none()
+                        .size(px(20.))
+                        .rounded(px(5.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::hover()))
+                        .tooltip(tip("Dismiss", None))
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.call_dismiss_share_prompt(cx);
+                        }))
+                        .child(glyph("icons/x.svg", 12., theme::text_soft())),
+                ),
+        )
+    }
+
     /// The counter's text, told what it counts. Nothing ticks unless this is on screen.
     fn call_counter(&self, call: &Call, cx: &mut Context<Self>) -> Option<AnyElement> {
         self.call_dock_clock(call, cx)
@@ -691,23 +780,12 @@ impl Shell {
         )
     }
 
-    /// Share and camera belong on a joined call that can carry a picture: a Discord voice
-    /// channel, or a Tiny room that allows video. A Tiny room that has not loaded yet still
-    /// shows them: the server's default is that video is allowed.
+    /// Share and camera belong on a joined call that allows video (`Call::video_allowed`) on a
+    /// network that carries it (Tiny or Discord).
     fn call_pictures(&self, call: &Call) -> bool {
-        if call.state != CallState::Joined {
-            return false;
-        }
-        if call.conversation.network == Network::Discord {
-            return true;
-        }
-        if call.conversation.network != Network::Tiny {
-            return false;
-        }
-        let Some(page) = self.tiny_page_facts().filter(|page| page.account == &call.conversation.account()) else {
-            return true;
-        };
-        page.community.rooms.iter().find(|room| room.id == call.conversation.id).is_none_or(|room| room.video_enabled)
+        call.state == CallState::Joined
+            && call.video_allowed
+            && matches!(call.conversation.network, Network::Discord | Network::Tiny)
     }
 
     /// Over a Tiny server's column: "Voice connected", where, how well, and Disconnect. Mute,
@@ -761,13 +839,45 @@ impl Shell {
                     .text_color(if notice.is_some() { theme::warning() } else { theme::text_soft() })
                     .child(notice.unwrap_or(place)),
             );
+        let people_chip = in_call(call).then(|| {
+            let count = super::call_people_count(call);
+            let open = self.call_menu() == Some(Menu::People);
+            let fg = if open { theme::text() } else { theme::text_soft() };
+            div()
+                .id("call-compact-people")
+                .flex_none()
+                .h(px(24.))
+                .px(px(6.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(if open { theme::selected() } else { theme::hover() })
+                .hover(|style| style.bg(theme::selected()).text_color(theme::text()))
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .cursor_pointer()
+                .tab_index(0)
+                .focus_visible(|style| style.shadow(theme::focus_ring()))
+                .text_size(px(11.5))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(fg)
+                .tooltip(tip("People in this call", None))
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_menu_toggle(Menu::People, cx);
+                }))
+                .child(glyph("icons/users.svg", 12., fg))
+                .child(count.to_string())
+        });
         let disconnect = leave()
             .w(px(36.))
             .on_click(cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
                 this.call_leave(cx);
             }));
-        // The name takes the card's width. Signal, lock and Leave sit on the row above it,
+        let waiting = self.call_waiting_strip();
+        let share_strip = self.call_share_strip(call, subject, waiting.is_none(), cx);
+        // The name takes the card's width. Signal, lock, people and Leave sit on the row above it,
         // and wrap under it when the column is the narrowest sidebar.
         card()
             .id("call-compact-card")
@@ -776,7 +886,8 @@ impl Shell {
             .focus_visible(|style| style.shadow(theme::focus_ring()))
             .tooltip(tip("Open the call", Some("⌘⇧J")))
             .on_click(cx.listener(move |this, _, _, cx| this.call_go(key.clone(), &title, cx)))
-            .children(self.call_waiting_strip().map(|(ring, from)| self.call_strip(&ring, &from, cx)))
+            .children(waiting.map(|(ring, from)| self.call_strip(&ring, &from, cx)))
+            .children(share_strip)
             .child(
                 div()
                     .flex()
@@ -785,9 +896,62 @@ impl Shell {
                     .gap(px(8.))
                     .children(self.call_signal(call, cx))
                     .children(self.call_security(call, Place::TinyBar, cx))
+                    .children(people_chip)
                     .child(disconnect.ml_auto()),
             )
             .child(words)
+            .children(self.call_popover(call, subject, Place::TinyBar, cx))
+    }
+
+    /// The popover hung above the call dock card or the compact voice bar.
+    fn call_popover(
+        &self,
+        call: &Call,
+        subject: &Subject,
+        place: Place,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let joined = call.state == CallState::Joined;
+        let enabled = call.state != CallState::Reconnecting;
+        let menu = self.call_menu().filter(|_| enabled)?;
+        let (width, body) = match (place, menu) {
+            (Place::Dock, Menu::Devices) => (300., self.call_devices_menu(call, cx).p(px(6.))),
+            (Place::Dock, Menu::CameraPreview) if joined => {
+                (284., self.call_camera_preview_menu(call, cx).p(px(8.)))
+            }
+            (_, Menu::People) if joined => (280., self.call_people_list(call, subject, cx).py(px(6.))),
+            (Place::Dock, Menu::AddPeople) if joined => (280., self.call_add_people_menu(call, cx).p(px(6.))),
+            (Place::Dock, Menu::Security) if self.call_security_open(Place::Dock) => {
+                (320., div().child(self.call_security_panel(call, cx)))
+            }
+            (_, Menu::Person { account, user_id, name }) if joined => {
+                (260., self.call_person_menu(account, &user_id, &name, cx).p(px(6.)))
+            }
+            _ => return None,
+        };
+        // Above the card, level with its left edge, on top of whatever the list shows.
+        // The card is as tall as its rows, so the popover hangs off the top of it.
+        Some(
+            deferred(
+                div()
+                    .id("call-popover")
+                    .absolute()
+                    .left(px(-1.))
+                    .bottom(relative(1.))
+                    .pb(px(6.))
+                    .w(px(width))
+                    .rounded(px(12.))
+                    .bg(theme::overlay())
+                    .border_1()
+                    .border_color(theme::border())
+                    .shadow(theme::shadow_popover())
+                    .occlude()
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| this.call_menu_close(cx)))
+                    .child(body),
+            )
+            .priority(1)
+            .into_any_element(),
+        )
     }
 
     /// Who or where, then the server or notice on its own line, then signal, lock and who else
@@ -1052,10 +1216,17 @@ impl Shell {
             })
         });
         let camera = pictures.then(|| {
+            let call_cam = call.clone();
             control(
                 "call-camera",
                 "icons/video.svg",
-                if camera_on { Look::On } else { Look::Rest },
+                if camera_on {
+                    Look::On
+                } else if menu == Some(Menu::CameraPreview) {
+                    Look::Open
+                } else {
+                    Look::Rest
+                },
                 enabled,
             )
             .when(enabled, |camera| {
@@ -1070,7 +1241,7 @@ impl Shell {
                     ))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        this.call_ask(Request::Media(MediaRequest::Camera { on: !camera_on }), cx);
+                        this.call_camera_clicked(&call_cam, camera_on, cx);
                     }))
             })
         });
@@ -1117,7 +1288,7 @@ impl Shell {
         )
         .when(enabled, |devices| {
             devices
-                .tooltip(tip("Microphone and speaker", None))
+                .tooltip(tip("Devices", None))
                 .on_click(cx.listener(|this, _, _, cx| {
                     cx.stop_propagation();
                     this.call_menu_toggle(Menu::Devices, cx);
@@ -1165,18 +1336,8 @@ impl Shell {
                     })),
             );
 
-        let popover = match menu {
-            Some(Menu::Devices) => Some((300., self.call_devices_menu(call, cx).p(px(6.)))),
-            Some(Menu::People) if joined => Some((280., self.call_people_list(call, subject, cx).py(px(6.)))),
-            Some(Menu::AddPeople) if joined => Some((280., self.call_add_people_menu(call, cx).p(px(6.)))),
-            Some(Menu::Security) if self.call_security_open(Place::Dock) => {
-                Some((320., div().child(self.call_security_panel(call, cx))))
-            }
-            Some(Menu::Person { account, user_id, name }) if joined => {
-                Some((260., self.call_person_menu(account, &user_id, &name, cx).p(px(6.))))
-            }
-            _ => None,
-        };
+        let waiting = self.call_waiting_strip();
+        let share_strip = self.call_share_strip(call, subject, waiting.is_none(), cx);
         let card_key = call.conversation.clone();
         let card_title = subject.title.clone();
         card()
@@ -1184,34 +1345,11 @@ impl Shell {
             .cursor_pointer()
             .tooltip(tip("Open the call", Some("⌘⇧J")))
             .on_click(cx.listener(move |this, _, _, cx| this.call_go(card_key.clone(), &card_title, cx)))
-            .children(
-                self.call_waiting_strip()
-                    .map(|(ring, from)| self.call_strip(&ring, &from, cx)),
-            )
+            .children(waiting.map(|(ring, from)| self.call_strip(&ring, &from, cx)))
+            .children(share_strip)
             .child(self.call_title(call, subject, words, cx))
             .child(controls)
-            .children(popover.map(|(width, body)| {
-                // Above the card, level with its left edge, on top of whatever the list shows.
-                // The card is as tall as its rows, so the popover hangs off the top of it.
-                deferred(
-                    div()
-                        .id("call-popover")
-                        .absolute()
-                        .left(px(-1.))
-                        .bottom(relative(1.))
-                        .pb(px(6.))
-                        .w(px(width))
-                        .rounded(px(12.))
-                        .bg(theme::overlay())
-                        .border_1()
-                        .border_color(theme::border())
-                        .shadow(theme::shadow_popover())
-                        .occlude()
-                        .on_mouse_down_out(cx.listener(|this, _, _, cx| this.call_menu_close(cx)))
-                        .child(body),
-                )
-                .priority(1)
-            }))
+            .children(self.call_popover(call, subject, Place::Dock, cx))
     }
 
     /// Someone is calling: the same card with a `positive` edge and two equal buttons. It holds
@@ -1384,11 +1522,16 @@ mod tests {
             device_stuck: false,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            cameras: Vec::new(),
+            camera_id: String::new(),
             security: None,
             picture: None,
+            pictures: Vec::new(),
+            watch_refused: Vec::new(),
             self_view: None,
             share_view: None,
             picture_source: None,
+            video_allowed: true,
         }
     }
 

@@ -403,6 +403,21 @@ pub fn mask(phone: &str) -> String {
         .collect()
 }
 
+/// `t•••@•••.com`: keeps the first character of the local part and the top-level suffix,
+/// masking the rest so an email address stays unreadable on stream.
+pub fn mask_email(email: &str) -> String {
+    let trimmed = email.trim();
+    let Some((local, domain)) = trimmed.split_once('@') else {
+        return "••••••".to_owned();
+    };
+    let head = local.chars().next().map(|ch| ch.to_string()).unwrap_or_default();
+    let domain_masked = match domain.rsplit_once('.') {
+        Some((_, tld)) if !tld.is_empty() && tld.len() <= 8 => format!("•••.{tld}"),
+        _ => "••••••".to_owned(),
+    };
+    format!("{head}•••@{domain_masked}")
+}
+
 /// The Contact section's lines. Never on Discord, which shares neither.
 pub fn contacts(person: &Person, profile: &Profile) -> Vec<Contact> {
     if person.key.network == Network::Discord || person.bot {
@@ -413,6 +428,20 @@ pub fn contacts(person: &Person, profile: &Profile) -> Vec<Contact> {
 
 /// What a contact line reads: masked phones until Show.
 pub fn contact_words(contact: &Contact, shown: bool) -> String {
+    contact_words_for(contact, shown, false)
+}
+
+/// What a contact line reads, respecting Streamer mode (where phones and emails stay masked
+/// even if Show was previously clicked).
+pub fn contact_words_for(contact: &Contact, shown: bool, streamer: bool) -> String {
+    if streamer {
+        return match contact.kind {
+            ContactKind::Email => mask_email(&contact.value),
+            ContactKind::Phone => mask(&contact.value),
+            ContactKind::Other if contact.masked => mask(&contact.value),
+            ContactKind::Other => contact.value.clone(),
+        };
+    }
     let masked = contact.kind == ContactKind::Phone || contact.masked;
     if masked && !shown {
         mask(&contact.value)
@@ -1485,5 +1514,23 @@ mod tests {
         assert_eq!(slack_workspace_url("https://evil.example.com", "T01ALPHA", "admin"), "https://app.slack.com/client/T01ALPHA/admin");
         assert_eq!(slack_workspace_url("javascript:alert(1)", "T01ALPHA", "admin"), "https://app.slack.com/client/T01ALPHA/admin");
         assert_eq!(slack_workspace_url("-bad-", "T01ALPHA", "admin"), "https://app.slack.com/client/T01ALPHA/admin");
+    }
+
+    #[test]
+    fn streamer_mode_keeps_phones_and_emails_masked_even_when_shown() {
+        let phone = Contact { kind: ContactKind::Phone, value: "+44 7700 900142".into(), masked: true };
+        let email = Contact { kind: ContactKind::Email, value: "alice@example.org".into(), masked: false };
+        let other = Contact { kind: ContactKind::Other, value: "https://example.org".into(), masked: false };
+
+        assert_eq!(contact_words(&phone, true), "+44 7700 900142");
+        assert_eq!(contact_words(&email, false), "alice@example.org");
+
+        // In Streamer mode, phone & email stay masked regardless of `shown`.
+        let masked_phone = contact_words_for(&phone, true, true);
+        assert!(masked_phone.contains('•') && masked_phone.ends_with("42"), "{masked_phone}");
+        assert_eq!(contact_words_for(&email, true, true), "a•••@•••.org");
+        assert_eq!(contact_words_for(&email, false, true), "a•••@•••.org");
+        assert_eq!(contact_words_for(&other, false, true), "https://example.org");
+        assert_eq!(mask_email("not-an-email"), "••••••");
     }
 }

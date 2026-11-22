@@ -402,11 +402,35 @@ pub struct Painted {
     pub generation: u64,
 }
 
+/// Maximum painted dimensions for small multi-stream camera tiles.
+pub const SMALL_TILE: (u32, u32) = (320, 180);
+
+/// Scales an RGB24 buffer down to `(dst_w, dst_h)` using nearest-grid box sampling.
+pub(crate) fn scale_rgb(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
+    let (sw, sh) = (src_w.max(1) as usize, src_h.max(1) as usize);
+    let (dw, dh) = (dst_w.max(2) as usize, dst_h.max(2) as usize);
+    let mut out = vec![0u8; dw * dh * 3];
+    for y in 0..dh {
+        let sy = (y * sh / dh).min(sh - 1);
+        for x in 0..dw {
+            let sx = (x * sw / dw).min(sw - 1);
+            let si = (sy * sw + sx) * 3;
+            let di = (y * dw + x) * 3;
+            if si + 3 <= src.len() {
+                out[di..di + 3].copy_from_slice(&src[si..si + 3]);
+            }
+        }
+    }
+    out
+}
+
 /// Whose picture a painted one is: what the window is told with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tag {
     pub user: String,
     pub kind: PictureKind,
+    /// Small multi-stream tile: painted at most [`SMALL_TILE`] (320×180).
+    pub small: bool,
 }
 
 /// The picture a painter last painted, which is one file at a time.
@@ -477,6 +501,16 @@ mod tests {
         let planes = i420(&rgba, 4, 4, 4, 4, false);
         assert_eq!(planes.y[0], 16);
         assert_eq!(planes.y[1], 235);
+    }
+
+    #[test]
+    fn small_tile_scaling_fits_within_320x180() {
+        let (tw, th) = fit(1280, 720, SMALL_TILE.0, SMALL_TILE.1);
+        assert_eq!((tw, th), (320, 180));
+        let src = vec![0x7fu8; 640 * 360 * 3];
+        let out = scale_rgb(&src, 640, 360, tw, th);
+        assert_eq!(out.len(), (tw * th * 3) as usize);
+        assert!(out.iter().all(|&b| b == 0x7f));
     }
 
     #[test]

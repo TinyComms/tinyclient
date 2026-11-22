@@ -879,7 +879,7 @@ fn premier() -> protocol::TinyCommunity {
         online: vec![ME.into(), "halvard".into()],
         media: "up".into(),
         // It speaks end-to-end encrypted text, so Encryption is one of its settings' pages.
-        capabilities: protocol::TinyCapabilities { version: String::new(), features: vec![protocol::TINY_FEATURE_E2EE_TEXT.into()] },
+        capabilities: protocol::TinyCapabilities { version: String::new(), features: vec![protocol::TINY_FEATURE_E2EE_TEXT.into()], multi_video: None },
         access: None,
         me: ME.into(),
         server: None,
@@ -973,11 +973,16 @@ fn demo_call(conversation: &protocol::Key) -> protocol::Call {
         output_level: None,
         inputs: Vec::new(),
         outputs: Vec::new(),
+        cameras: Vec::new(),
+        camera_id: String::new(),
         security: None,
         picture: None,
+        pictures: Vec::new(),
+        watch_refused: Vec::new(),
         self_view: None,
         share_view: None,
         picture_source: None,
+        video_allowed: true,
     }
 }
 

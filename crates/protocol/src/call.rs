@@ -49,7 +49,7 @@ pub enum Content {
 }
 
 /// What the one received picture is, as `call.slots` `video.kind` says.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PictureKind {
     #[default]
@@ -269,13 +269,27 @@ pub struct Call {
     pub inputs: Vec<AudioDevice>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outputs: Vec<AudioDevice>,
+    /// Every camera the system lists (names and ids only), at most [`DEVICES_LIMIT`]. Filled
+    /// while the device menu or camera preview is open.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cameras: Vec<CameraSource>,
+    /// The system's id for the chosen camera, when one is chosen or active.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub camera_id: String,
     /// How the call's media is protected, for the lock in the call's header. `None` for a call
     /// that says nothing about it (every network but a Tiny server today).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security: Option<CallSecurity>,
-    /// The one picture being watched. `None` while nothing is on screen.
+    /// The one picture being watched. `None` while nothing is on screen. Mirrors the primary
+    /// entry of [`Call::pictures`] for single-stream callers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub picture: Option<CallPicture>,
+    /// All active received pictures being decoded and painted (multi-stream video).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pictures: Vec<CallPicture>,
+    /// Sources refused by mediad's decode budget (too many concurrent videos).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watch_refused: Vec<(String, PictureKind)>,
     /// My own camera as it is sent, for my tile. `None` while it is off. Its `user_id` is empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_view: Option<CallPicture>,
@@ -287,6 +301,22 @@ pub struct Call {
     /// has been decoded and painted. `None` when the slot is empty or unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub picture_source: Option<(String, PictureKind)>,
+    /// Whether this call allows camera and screen share (a room's `video_enabled`, or `true` for
+    /// direct calls and Discord). Defaults to `true` when omitted by older builds.
+    #[serde(default = "video_allowed_default", skip_serializing_if = "is_true")]
+    pub video_allowed: bool,
+}
+
+fn video_allowed_default() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
+fn is_zero_u8(value: &u8) -> bool {
+    *value == 0
 }
 
 /// A Tiny server call's protection (tinyserver's `docs/calls.md`, "End-to-end encryption").
@@ -451,6 +481,28 @@ pub struct TinyOffer {
     /// server, and the call is encrypted to the server only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub e2ee: Option<TinyE2ee>,
+    /// Number of receive-only video m-lines to offer (0 or 1 = legacy single video slot).
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub video_slots: u8,
+}
+
+/// Desired display size for a watched video stream (`Large` requests `"high"`, `Small` requests `"low"`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchSize {
+    #[default]
+    Large,
+    Small,
+}
+
+/// One video stream the shell wants decoded and painted.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WatchSource {
+    pub user_id: String,
+    #[serde(default)]
+    pub kind: PictureKind,
+    #[serde(default)]
+    pub size: WatchSize,
 }
 
 /// Whose voice one receive slot carries, as the server's `call.slots` says.
@@ -493,6 +545,8 @@ pub enum MediaRequest {
     },
     /// Watch one participant's share. Replaces any share already being watched.
     ShareWatch { source: Option<String> },
+    /// Watch zero or more video streams at once (multi-stream video). Replaces the watch list.
+    Watch { sources: Vec<WatchSource> },
     /// The active speaker changed. Replaces the previous speaker's decode.
     Speaker { source: Option<String> },
     /// Connect the voice session. Progress and the outcome arrive as events.
@@ -539,8 +593,13 @@ pub enum MediaRequest {
     TinyRenegotiation { sdp: String },
     /// Our camera, on or off. A Tiny room and a Discord call.
     Camera { on: bool },
+    /// Local camera preview before turning the camera on: captures for `SelfView` without sending
+    /// video to peers.
+    CameraPreview { on: bool },
     /// Who the one video slot carries now. `None` when the server sends `video: null`.
     TinyPicture { picture: Option<TinyPicture> },
+    /// Who each active video receive slot carries now, from `call.slots.videos`.
+    TinyPictures { pictures: Vec<TinyPicture> },
     /// One `call.e2ee` frame from the server, as its JSON text, in the order it arrived.
     TinyE2ee { frame: String },
     /// Everyone in the room's call, us included, whenever it changes: whom the MLS group may
@@ -887,6 +946,8 @@ pub enum Cue {
     Moved,
     /// We were put out of the call: kicked, banned, timed out, or the room went (S9).
     Disconnected,
+    /// Someone started sharing their screen in this call (S7, with joins and leaves).
+    ShareStarted,
     /// "Play test sound": the join cue, whatever the switches say.
     Test,
 }
@@ -943,7 +1004,12 @@ pub enum MediaResponse {
     },
     /// Every device the system lists. Sent at start, when `Meter` turns on, and whenever one is
     /// plugged in or removed, or the default moves.
-    DeviceList { inputs: Vec<AudioDevice>, outputs: Vec<AudioDevice> },
+    DeviceList {
+        inputs: Vec<AudioDevice>,
+        outputs: Vec<AudioDevice>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        cameras: Vec<CameraSource>,
+    },
     /// Media stopped and mediad is reconnecting on its own.
     Interrupted,
     /// The call cannot go on. mediad exits after sending this.
@@ -978,6 +1044,8 @@ pub enum MediaResponse {
     },
     /// A picture that could not be captured, in words. The voice call stays.
     Notice { detail: String },
+    /// Sources dropped because the requested watch list exceeded this device's decode budget.
+    WatchRefused { refused: Vec<(String, PictureKind)> },
 }
 
 impl MediaResponse {
@@ -1007,6 +1075,7 @@ impl MediaResponse {
             MediaResponse::Sending { .. } => "Sending",
             MediaResponse::SelfView { .. } => "SelfView",
             MediaResponse::Notice { .. } => "Notice",
+            MediaResponse::WatchRefused { .. } => "WatchRefused",
         }
     }
 
@@ -1075,5 +1144,69 @@ mod tests {
         assert_ne!(SecurityMode::Blocked, SecurityMode::Transport);
         // The default is still the one that says nothing more than holds.
         assert_eq!(SecurityMode::default(), SecurityMode::Transport);
+    }
+
+    #[test]
+    fn call_video_allowed_defaults_true_and_omits_when_true() {
+        let old: Call = serde_json::from_value(serde_json::json!({
+            "conversation": { "network": "tiny", "account": "srv", "id": "room" },
+            "state": "joined", "participants": [], "muted": false, "deafened": false,
+            "joined": 1, "engine_linked": true, "video": []
+        }))
+        .unwrap();
+        assert!(old.video_allowed);
+        let wire = serde_json::to_string(&old).unwrap();
+        assert!(!wire.contains("video_allowed"), "default true stays off the wire: {wire}");
+        let mut disabled = old;
+        disabled.video_allowed = false;
+        let wire = serde_json::to_string(&disabled).unwrap();
+        assert!(wire.contains(r#""video_allowed":false"#), "{wire}");
+        assert!(!serde_json::from_str::<Call>(&wire).unwrap().video_allowed);
+    }
+
+    #[test]
+    fn camera_preview_and_device_list_cameras_round_trip_with_old_wire_compat() {
+        let preview = MediaRequest::CameraPreview { on: true };
+        let json = serde_json::to_string(&preview).unwrap();
+        assert_eq!(serde_json::from_str::<MediaRequest>(&json).unwrap(), preview);
+
+        // Old mediad sends DeviceList without `cameras`: still parses cleanly as empty.
+        let old: MediaResponse = serde_json::from_str(r#"{"media":"device_list","inputs":[],"outputs":[]}"#).unwrap();
+        assert_eq!(old, MediaResponse::DeviceList { inputs: Vec::new(), outputs: Vec::new(), cameras: Vec::new() });
+
+        let with_cams = MediaResponse::DeviceList {
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            cameras: vec![CameraSource { id: "c1".into(), name: "Desk Cam".into(), thumbnail: String::new() }],
+        };
+        let wire = serde_json::to_string(&with_cams).unwrap();
+        assert!(wire.contains(r#""cameras""#), "{wire}");
+        assert_eq!(serde_json::from_str::<MediaResponse>(&wire).unwrap(), with_cams);
+    }
+
+    #[test]
+    fn multi_stream_watch_tiny_pictures_and_watch_refused_round_trip() {
+        let watch = MediaRequest::Watch {
+            sources: vec![
+                WatchSource { user_id: "ada".into(), kind: PictureKind::Share, size: WatchSize::Large },
+                WatchSource { user_id: "bea".into(), kind: PictureKind::Camera, size: WatchSize::Small },
+            ],
+        };
+        let wire = serde_json::to_string(&watch).unwrap();
+        assert_eq!(serde_json::from_str::<MediaRequest>(&wire).unwrap(), watch);
+
+        let pics = MediaRequest::TinyPictures {
+            pictures: vec![
+                TinyPicture { mid: "2".into(), user_id: "ada".into(), kind: PictureKind::Share },
+                TinyPicture { mid: "3".into(), user_id: "bea".into(), kind: PictureKind::Camera },
+            ],
+        };
+        let wire = serde_json::to_string(&pics).unwrap();
+        assert_eq!(serde_json::from_str::<MediaRequest>(&wire).unwrap(), pics);
+
+        let refused = MediaResponse::WatchRefused { refused: vec![("cy".into(), PictureKind::Camera)] };
+        assert_eq!(refused.name(), "WatchRefused");
+        let wire = serde_json::to_string(&refused).unwrap();
+        assert_eq!(serde_json::from_str::<MediaResponse>(&wire).unwrap(), refused);
     }
 }

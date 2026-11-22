@@ -1358,7 +1358,7 @@ fn devices_are_listed_at_start_and_the_meter_runs_only_while_asked_for() {
     let mut mediad = Mediad::start("tone", None);
     // Before any join: the device menu can be opened while a call still rings.
     let stand_in = |name: &str| AudioDevice { id: name.into(), name: name.into(), default: true, auto: true, ..AudioDevice::default() };
-    let listed = MediaResponse::DeviceList { inputs: vec![stand_in("tone")], outputs: vec![stand_in("null")] };
+    let listed = MediaResponse::DeviceList { inputs: vec![stand_in("tone")], outputs: vec![stand_in("null")], cameras: Vec::new() };
     mediad.event("DeviceList", |e| *e == listed);
     mediad.join(&fake.endpoint(), NO_DAVE);
     let mut peer = fake.accept();

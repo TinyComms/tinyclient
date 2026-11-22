@@ -4,7 +4,7 @@
 //! slots the other slices fill.
 
 use super::components::{
-    brand_mark, brand_state, button, button_disabled, divider, fade_in, icon_button, menu, menu_item,
+    brand_mark, brand_state, button, button_disabled, divider, fade_in, glyph, icon_button, menu, menu_item,
     menu_item_check, menu_item_danger, menu_label, menu_separator, network_icon, place, placed, popover, scrim, tip,
     toast, ButtonKind, Layer, Place, NO_GLYPH,
 };
@@ -406,9 +406,11 @@ impl Shell {
             self.close_switcher(window, cx);
         } else if self.layout_state.menu.is_some() {
             self.layout_state.menu = None;
-        } else if self.tiny_unfull(window, cx) {
+        } else if self.call_unfull(window, cx) {
             return true;
         } else if self.tiny_escape(cx) {
+            return true;
+        } else if self.call_escape(cx) {
             return true;
         } else if self.layout_state.floating {
             self.layout_state.floating = false;
@@ -1568,6 +1570,9 @@ impl Render for Shell {
         let phone_form = super::phone::form(super::phone::active(), f32::from(viewport.width), f32::from(viewport.height));
         super::phone::set_active(phone_form);
         super::phone::tokens::set_landscape(phone_form && viewport.width > viewport.height);
+        let sharing = super::streamer::sharing(self.snapshot.as_ref().and_then(|snapshot| snapshot.call.as_ref()));
+        super::streamer::sync(sharing);
+        self.arm_streamer_watch(cx);
         // A phone's window does not shrink for the soft keyboard (Android's NativeActivity and
         // iOS's full-screen view both keep their size and report the keyboard as an inset), so
         // the shell lifts its content above it; the composer then sits on the keyboard's edge
@@ -1659,10 +1664,14 @@ impl Render for Shell {
             chrome::clear_end();
             self.note_room(true, Some(width));
             let screen = self.phone_screen(snapshot, window, cx);
-            return root.child(screen).children(self.toast_layer(width, cx)).children(super::settings::phone_page(window, cx));
+            return root
+                .child(screen)
+                .children(self.toast_layer(width, cx))
+                .children(super::settings::phone_page(window, cx))
+                .children(self.streamer_mark(window, cx));
         }
         if self.snapshot.is_some() && snapshot.signed_in().is_empty() && settled {
-            return root.child(self.first_run(snapshot, cx)).children(window_chrome(window));
+            return root.child(self.first_run(snapshot, cx)).children(window_chrome(window)).children(self.streamer_mark(window, cx));
         }
 
         let state = &self.layout_state;
@@ -1677,9 +1686,12 @@ impl Render for Shell {
         self.note_room(self.pane_narrow(), Some(conversation_width(width - overview, &plan)));
         let floating = plan.sidebar.is_none() && state.floating;
         let replaced = plan.right.is_some_and(|(_, replaces)| replaces);
+        let call_view = self.call_view_active(snapshot);
         // With nothing open on a phone, the list is the whole screen: there is no sidebar
         // column to fall back to, and the conversation only exists when something is open.
-        let list_alone = if phone(width) {
+        let list_alone = if call_view {
+            false
+        } else if phone(width) {
             snapshot.open.is_none()
         } else {
             snapshot.open.is_none() && plan.sidebar.is_none() && !state.sidebar_hidden && !floating && !replaced
@@ -1709,6 +1721,7 @@ impl Render for Shell {
             .when(!replaced && !list_alone, |root| {
                 let pane = match (&snapshot.open, self.keychain_state(window, cx)) {
                     (_, Some(waiting)) => waiting,
+                    (_, None) if call_view => self.call_view_pane(snapshot, window, cx),
                     (Some(_), None) => self.conversation(snapshot, window, cx),
                     (None, None) if self.tiny_open() => self.tiny_page(plan.sidebar.is_some() || floating, window, cx),
                     (None, None) => self.nothing_open(window, cx),
@@ -1744,10 +1757,12 @@ impl Render for Shell {
             .children(self.join_server_modal(cx))
             .children(self.leave_space_modal(cx))
             .children(self.link_ask_modal(window, cx))
+            .children(self.call_full_stage(snapshot, cx))
             .children(self.tiny_layer(window, cx))
             .children(self.menu_layer(snapshot, plan.sidebar.unwrap_or(state.sidebar_width), overview, window, cx))
             .children(self.toast_layer(width, cx))
             .children(window_chrome(window))
+            .children(self.streamer_mark(window, cx))
     }
 }
 
@@ -1847,6 +1862,80 @@ impl Shell {
                 },
             );
         }
+    }
+}
+
+impl Shell {
+    /// One poll while "while sharing" also watches for OBS or Streamlabs. Idle windows otherwise
+    /// would not notice the broadcast app until the next paint.
+    fn arm_streamer_watch(&mut self, cx: &mut Context<Self>) {
+        if !super::streamer::take_watch() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(5)).await;
+                let keep = this
+                    .update(cx, |_, cx| {
+                        let keep = super::streamer::watch_wanted();
+                        if keep {
+                            cx.notify();
+                        }
+                        keep
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    super::streamer::release_watch();
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// The title-bar mark while Streamer mode is on. One click stores Off.
+    fn streamer_mark(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !super::streamer::is_active() {
+            return None;
+        }
+        let chip = div()
+            .id("streamer-off")
+            .absolute()
+            .top(px(12.))
+            .right(px(chrome::width(window) + 12.))
+            .occlude()
+            .h(px(28.))
+            .px(px(10.))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .rounded(px(theme::R_CONTROL))
+            .bg(theme::hover())
+            .border_1()
+            .border_color(theme::border())
+            .type_small()
+            .font_weight(theme::MEDIUM)
+            .text_color(theme::text())
+            .cursor_pointer()
+            .tooltip(tip("Streamer mode is on. Click to turn it off.", None))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _, _, cx| this.streamer_turn_off(cx)))
+            .child(glyph("icons/eye-off.svg", 14., theme::text_soft()))
+            .child("Streamer mode");
+        Some(gpui::deferred(chip).priority(4).into_any_element())
+    }
+
+    fn streamer_turn_off(&mut self, cx: &mut Context<Self>) {
+        let mut values = super::app::prefs::values();
+        values.set(protocol::settings::GLOBAL, protocol::settings::STREAMER_MODE, Some("off".into()));
+        super::app::prefs::set_values(values);
+        let request = protocol::Request::Set {
+            scope: protocol::settings::GLOBAL.to_owned(),
+            key: protocol::settings::STREAMER_MODE.to_owned(),
+            value: Some("off".into()),
+        };
+        cx.background_executor().spawn(async move { crate::client::ask(&request) }).detach();
+        cx.notify();
     }
 }
 

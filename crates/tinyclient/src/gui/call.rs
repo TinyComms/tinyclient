@@ -14,6 +14,8 @@ pub(crate) mod phone;
 pub(in crate::gui) mod security;
 #[cfg(feature = "gui-shot")]
 mod shot;
+pub(in crate::gui) mod stage;
+pub(in crate::gui) mod view;
 
 // The platform's side of a phone call: the mobile layer routes these (`phone::hooks`).
 #[allow(unused_imports)]
@@ -30,9 +32,9 @@ use super::state::{Shell, Snapshot};
 use super::theme::{self, Type};
 use crate::client::ask;
 use gpui::{
-    canvas, div, prelude::*, px, Action, AnyElement, App, Bounds, Context, Div, Entity, FontWeight,
-    Global, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels, Rgba, SharedString,
-    Stateful, Svg, Task, WeakEntity, Window,
+    canvas, div, prelude::*, px, Action, AnyElement, App, Bounds, ClickEvent, Context, Div, Entity,
+    FontWeight, Global, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    Pixels, Rgba, SharedString, Stateful, Svg, Task, WeakEntity, Window,
 };
 use protocol::settings::MUTED_TALK;
 use protocol::{
@@ -102,6 +104,8 @@ fn now() -> i64 {
 #[derive(Clone, PartialEq, Eq)]
 pub(super) enum Menu {
     Devices,
+    /// Camera picker and live preview before turning the camera on.
+    CameraPreview,
     People,
     /// Add friends to a Discord 1:1 or group DM call.
     AddPeople,
@@ -233,6 +237,8 @@ pub(super) struct Confirm {
 pub struct State {
     /// The frames of the picture being watched.
     pub(in crate::gui) feed: super::tiny::feed::Feed<std::sync::Arc<gpui::RenderImage>>,
+    /// Per-source frames for multi-stream video receive, keyed by `(user_id, kind)`.
+    pub(in crate::gui) feeds: HashMap<(String, protocol::PictureKind), super::tiny::feed::Feed<std::sync::Arc<gpui::RenderImage>>>,
     /// The frames of my own camera, for my tile.
     pub(in crate::gui) self_feed: super::tiny::feed::Feed<std::sync::Arc<gpui::RenderImage>>,
     /// The frames of my own share, for my stream's tile and the stage.
@@ -305,9 +311,45 @@ pub struct State {
     /// at 3 s and 10 s without waiting for a frame to arrive.
     pub(in crate::gui) watch_asked: Option<(String, Instant)>,
     watch_timer: Option<Task<()>>,
+    /// The call whose full call view has the main pane (`gui/call/view.rs`).
+    pub(in crate::gui) view: Option<Key>,
+    /// The person drawn large, or the stream filling the stage, pinned by a click on its tile.
+    pub(in crate::gui) focus: Option<stage::Focus>,
+    /// Where the people go while a stream fills the stage.
+    pub(in crate::gui) strip: stage::Strip,
+    /// The focused stream has the whole window. True when the window was made full screen for
+    /// it, and so goes back when it ends.
+    pub(in crate::gui) full: Option<bool>,
+    /// True once the user has turned their camera on at least once in this session.
+    pub(in crate::gui) camera_used: bool,
+    /// The active remote sharer we last saw in this call, so dismissing the notice strip holds
+    /// until they stop sharing and someone starts again.
+    pub(super) sharer: Option<String>,
+    /// The sharer currently offered on the dock's notice strip (cleared on Watch, dismiss, stop,
+    /// or call end).
+    pub(super) share_prompt: Option<String>,
+    /// Last multi-stream watch list the server accepted for this call.
+    pub(in crate::gui) watched: Vec<protocol::WatchSource>,
+    /// The list in flight. It is not applied until chatd says ok.
+    watch_pending: Option<Vec<protocol::WatchSource>>,
+    /// Bumped when the call changes, so a late answer cannot apply.
+    watch_epoch: u64,
+    /// True once `MediaRequest::Watch` has been sent on this call. ShareWatch is then not the
+    /// Tiny subscription.
+    watch_sent: bool,
+    /// A refused list, and when the next picture frame may ask for it again. A click clears it.
+    watch_again: Option<(Vec<protocol::WatchSource>, Instant)>,
 }
 
 const DISCORD_SPEAKER_DEBOUNCE: Duration = Duration::from_millis(800);
+/// How long a refused watch list waits before the next picture frame may ask again.
+const WATCH_AGAIN: Duration = Duration::from_secs(2);
+
+/// ShareWatch replaces mediad's source list with one share. On Tiny, once `call.watch` has been
+/// sent, that list is the subscription.
+fn share_watch_superseded(network: Network, watch_sent: bool) -> bool {
+    network == Network::Tiny && watch_sent
+}
 
 /// Pure camera-speaker selection for Discord calls (where the shell names whose camera to paint).
 /// Returns `Some(Some(id))` to switch camera speaker, `Some(None)` to clear, or `None` for no change.
@@ -352,9 +394,73 @@ pub(in crate::gui) fn watching(call: &Call, user_id: &str) -> bool {
             && stream.content == protocol::Content::Share
             && stream.source == user_id
     }) || call
-        .picture
-        .as_ref()
-        .is_some_and(|picture| !picture.path.is_empty() && picture.user_id == user_id)
+        .pictures
+        .iter()
+        .any(|picture| !picture.path.is_empty() && picture.user_id == user_id)
+        || call
+            .picture
+            .as_ref()
+            .is_some_and(|picture| !picture.path.is_empty() && picture.user_id == user_id)
+}
+
+/// Derives the desired multi-stream watch list from the joined Tiny call and current stage focus:
+/// focused stream or person is `Large`, and visible remote cameras up to `budget_small` are `Small`.
+fn desired_watch_sources(
+    call: &Call,
+    focus: Option<&stage::Focus>,
+    budget_small: usize,
+) -> Vec<protocol::WatchSource> {
+    use protocol::{PictureKind, WatchSize, WatchSource};
+    if call.state != CallState::Joined || call.deafened || call.conversation.network != Network::Tiny {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut push = |user_id: &str, kind: PictureKind, size: WatchSize| {
+        if !out.iter().any(|s: &WatchSource| s.user_id == user_id && s.kind == kind) {
+            out.push(WatchSource { user_id: user_id.to_owned(), kind, size });
+        }
+    };
+    match focus {
+        Some(stage::Focus::Stream(uid)) => {
+            if let Some(p) = call.participants.iter().find(|p| !p.ringing && p.id == *uid) {
+                if p.sharing {
+                    push(&p.id, PictureKind::Share, WatchSize::Large);
+                } else if p.camera {
+                    push(&p.id, PictureKind::Camera, WatchSize::Large);
+                }
+            }
+        }
+        Some(stage::Focus::Person(uid)) => {
+            if let Some(p) = call.participants.iter().find(|p| !p.ringing && p.id == *uid && p.camera) {
+                push(&p.id, PictureKind::Camera, WatchSize::Large);
+            }
+        }
+        None => {
+            // In a 1:1 call, give the peer's screen or camera the primary Large slot.
+            if call.participants.len() == 1 {
+                let p = &call.participants[0];
+                if !p.ringing {
+                    if p.sharing {
+                        push(&p.id, PictureKind::Share, WatchSize::Large);
+                    } else if p.camera {
+                        push(&p.id, PictureKind::Camera, WatchSize::Large);
+                    }
+                }
+            }
+        }
+    }
+    let mut small = 0usize;
+    for p in call.participants.iter().filter(|p| !p.ringing && p.camera) {
+        if small >= budget_small {
+            break;
+        }
+        if out.iter().any(|s| s.user_id == p.id && s.kind == PictureKind::Camera) {
+            continue;
+        }
+        push(&p.id, PictureKind::Camera, WatchSize::Small);
+        small += 1;
+    }
+    out
 }
 
 /// Pure auto-watch decision for a 1:1 Tiny direct call.
@@ -391,6 +497,49 @@ fn auto_watch_step(
         return Some(None);
     }
     None
+}
+
+/// Diffs remote screen sharing in a joined call.
+/// Returns `Some(user_id)` once when a remote participant starts sharing (or another sharer
+/// replaces the previous one). Dismissing the notice clears `prompt` while `prev_sharer` holds
+/// until nobody is sharing.
+fn share_notice_step(
+    call: &Call,
+    prev_sharer: &mut Option<String>,
+    prompt: &mut Option<String>,
+) -> Option<String> {
+    if call.state != CallState::Joined {
+        *prev_sharer = None;
+        *prompt = None;
+        return None;
+    }
+    let current = call
+        .participants
+        .iter()
+        .find(|p| !p.ringing && p.sharing)
+        .map(|p| p.id.clone());
+    match current {
+        None => {
+            *prev_sharer = None;
+            *prompt = None;
+            None
+        }
+        Some(id) => {
+            if prev_sharer.as_deref() == Some(id.as_str()) {
+                None
+            } else {
+                *prev_sharer = Some(id.clone());
+                *prompt = Some(id.clone());
+                Some(id)
+            }
+        }
+    }
+}
+
+/// Whether a newly started screen share should open automatically on the stage:
+/// the setting is on, the user is already looking at the call, and nothing is focused yet.
+fn should_auto_watch_share(auto_watch_pref: bool, looking_at_call: bool, already_focused: bool) -> bool {
+    auto_watch_pref && looking_at_call && !already_focused
 }
 
 /// Someone's volume and mute among what chatd keeps, else 100 % and heard.
@@ -481,11 +630,16 @@ fn bare_call(conversation: Key, state: CallState, muted: bool, deafened: bool) -
         device_stuck: false,
         inputs: Vec::new(),
         outputs: Vec::new(),
+        cameras: Vec::new(),
+        camera_id: String::new(),
         security: None,
         picture: None,
+        pictures: Vec::new(),
+        watch_refused: Vec::new(),
         self_view: None,
         share_view: None,
         picture_source: None,
+        video_allowed: true,
     }
 }
 
@@ -720,6 +874,30 @@ fn call_go_target(key: &Key, is_tiny_room: bool) -> CallGoTarget {
     }
 }
 
+/// Keyboard action on a participant row in the call card's participant list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowKeyAction {
+    Profile,
+    Menu,
+}
+
+fn call_row_key_action(key: &str, shift: bool, other_mod: bool) -> Option<RowKeyAction> {
+    if !shift && !other_mod && key == "enter" {
+        Some(RowKeyAction::Profile)
+    } else if (!other_mod && key == "contextmenu") || (shift && !other_mod && key == "f10") {
+        Some(RowKeyAction::Menu)
+    } else {
+        None
+    }
+}
+
+/// Number of joined people in a call (me plus every participant who is not still ringing).
+pub(super) fn call_people_count(call: &Call) -> usize {
+    call.participants.iter().filter(|p| !p.ringing).count() + 1
+}
+
+/// The call's popover menu for a participant: volume slider, local mute, Message, Profile, and
+/// room moderation when the user has permission on a Tiny server.
 impl Shell {
     /// The speaker chosen (V2), in the call's menu or in Settings, which a voice message plays
     /// through too. `None` is the automatic choice.
@@ -739,6 +917,7 @@ impl Shell {
             self.call_state.last = last;
             self.call_state.since = now();
             self.call_state.error = None;
+            self.call_reset_watch();
         }
         match call {
             None => {
@@ -756,6 +935,16 @@ impl Shell {
                 state.discord_speaker = None;
                 state.watch_asked = None;
                 state.watch_timer = None;
+                state.view = None;
+                state.focus = None;
+                state.full = None;
+                state.sharer = None;
+                state.share_prompt = None;
+                state.watched.clear();
+                state.watch_pending = None;
+                state.watch_again = None;
+                state.watch_sent = false;
+                state.watch_epoch = state.watch_epoch.wrapping_add(1);
                 // A call that was up and went without our asking: the other side ended it.
                 let was = state.was.take();
                 if let Some(was) = was.filter(|_| !std::mem::take(&mut state.leaving)) {
@@ -786,6 +975,8 @@ impl Shell {
                 }
                 self.call_watch_muted_talk(call, cx);
                 self.call_cue_join(call, cx);
+                self.call_share_notice(call, cx);
+                self.call_sync_watch(call, cx);
                 self.call_auto_watch(call, cx);
                 self.call_discord_speaker(call, cx);
                 if let Some((asked_id, _)) = &self.call_state.watch_asked {
@@ -982,8 +1173,8 @@ impl Shell {
         Some((failure.title, failure.line, again))
     }
 
-    /// Goes where the call is: its conversation, or for a Tiny room the server's page on it.
-    /// Only a known Tiny room goes to the server page; any direct call (even unlisted) opens its conversation.
+    /// Goes where the call is: for a Tiny room the server's page on it, else its conversation
+    /// with the main-pane call view open over it.
     pub(in crate::gui) fn call_go(&mut self, key: Key, title: &str, cx: &mut Context<Self>) {
         let is_room = key.network == Network::Tiny && self.tiny_room(&key).is_some();
         match call_go_target(&key, is_room) {
@@ -994,7 +1185,8 @@ impl Shell {
                 self.tiny_pick_channel(Some(room_id), cx);
             }
             CallGoTarget::Conversation => {
-                self.select(key, title, cx);
+                self.select(key.clone(), title, cx);
+                self.call_open_view(key, cx);
             }
         }
     }
@@ -1109,14 +1301,103 @@ impl Shell {
     }
 
     pub(super) fn call_person_menu(&self, account: AccountKey, user_id: &str, name: &str, cx: &mut Context<Self>) -> Div {
-        div()
+        let person_key = Key::new(&account, user_id);
+        let msg_person = protocol::Person::new(person_key.clone(), name.to_owned());
+        let profile_key = person_key.clone();
+        let mut items = div()
             .flex()
             .flex_col()
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| this.call_track(event, cx)))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.call_slide_end(cx)))
             .child(menu_label(name.to_owned()))
             .child(menu_separator().mx(px(8.)))
-            .child(self.call_volume_controls(account, user_id, cx))
+            .child(self.call_volume_controls(account.clone(), user_id, cx))
+            .child(menu_separator().mx(px(8.)))
+            .child(
+                menu_item(
+                    SharedString::from(format!("call-person-message-{user_id}")),
+                    Some("icons/message-square.svg"),
+                    "Message",
+                    None,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.call_menu_close(cx);
+                    this.open_person(&msg_person, cx);
+                })),
+            )
+            .child(
+                menu_item(
+                    SharedString::from(format!("call-person-profile-{user_id}")),
+                    Some("icons/user.svg"),
+                    "Profile",
+                    None,
+                )
+                .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.call_menu_close(cx);
+                    this.open_profile(profile_key.clone(), event.position(), cx);
+                })),
+            );
+        if account.network == Network::Tiny {
+            if let Some(page) = self.tiny_page_facts().filter(|page| page.account == &account) {
+                let facts = super::tiny::model::person_menu(page.community, user_id);
+                if facts.server_mute.is_some() || facts.server_deafen.is_some() || facts.disconnect {
+                    items = items.child(menu_separator().mx(px(8.))).child(menu_label("Moderation"));
+                    if let Some(on) = facts.server_mute {
+                        let id = user_id.to_owned();
+                        let words = super::tiny::model::server_mute_words(on);
+                        items = items.child(
+                            menu_item(
+                                SharedString::from(format!("call-person-server-mute-{user_id}")),
+                                Some(words.icon),
+                                words.label,
+                                None,
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.call_menu_close(cx);
+                                this.tiny_moderate(id.clone(), Some(!on), None, cx);
+                            })),
+                        );
+                    }
+                    if let Some(on) = facts.server_deafen {
+                        let id = user_id.to_owned();
+                        let words = super::tiny::model::server_deafen_words(on);
+                        items = items.child(
+                            menu_item(
+                                SharedString::from(format!("call-person-server-deafen-{user_id}")),
+                                Some(words.icon),
+                                words.label,
+                                None,
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.call_menu_close(cx);
+                                this.tiny_moderate(id.clone(), None, Some(!on), cx);
+                            })),
+                        );
+                    }
+                    if facts.disconnect {
+                        let id = user_id.to_owned();
+                        items = items.child(
+                            menu_item(
+                                SharedString::from(format!("call-person-disconnect-{user_id}")),
+                                Some("icons/phone-off.svg"),
+                                "Disconnect from call",
+                                None,
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.call_menu_close(cx);
+                                this.tiny_disconnect(id.clone(), cx);
+                            })),
+                        );
+                    }
+                }
+            }
+        }
+        items
     }
 
     /// Picture path for a call participant: their avatar reference when present (queued once
@@ -1141,7 +1422,7 @@ impl Shell {
         let account = call.conversation.account();
         let mut people: Vec<&protocol::Participant> = call.participants.iter().collect();
         people.sort_by_key(|who| (who.ringing, who.name.to_lowercase()));
-        let joined_count = people.iter().filter(|p| !p.ringing).count() + 1;
+        let joined_count = call_people_count(call);
         let noun = if joined_count == 1 { "PERSON" } else { "PEOPLE" };
         let own = super::components::Avatar::named("You", 22.).build();
         let heard = call.speaking && !call.muted && !call.deafened;
@@ -1223,32 +1504,107 @@ impl Shell {
             let menu_account = account.clone();
             let menu_id = who.id.clone();
             let menu_name = who.name.clone();
-            let open_person = move |this: &mut Shell, cx: &mut Context<Shell>| {
+            let open_menu = move |this: &mut Shell, cx: &mut Context<Shell>| {
                 cx.stop_propagation();
                 this.call_menu_set(Some(Menu::Person { account: menu_account.clone(), user_id: menu_id.clone(), name: menu_name.clone() }), cx);
             };
-            let open_click = open_person.clone();
+            let open_menu_more = open_menu.clone();
+            let open_menu_key = open_menu.clone();
+            let profile_key = key.clone();
+            let key_enter = key.clone();
+            let row_group: SharedString = format!("call-person-row-{}", who.id).into();
+            let watch_btn = who.sharing.then(|| {
+                let watch_id = who.id.clone();
+                let watch_call = call.clone();
+                let watch_title = subject.title.clone();
+                div()
+                    .id(SharedString::from(format!("call-person-watch-{}", who.id)))
+                    .flex_none()
+                    .size(px(22.))
+                    .rounded(px(5.))
+                    .bg(theme::accent_soft())
+                    .hover(|s| s.bg(theme::accent_wash()))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .tooltip(tip(format!("Watch {}'s screen", who.name), None))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.call_menu_close(cx);
+                        this.call_watch_stream(&watch_call, watch_id.clone(), &watch_title, cx);
+                    }))
+                    .child(glyph("icons/monitor-up.svg", 13., theme::accent()))
+            });
+            let camera_glyph = who.camera.then(|| {
+                div()
+                    .id(SharedString::from(format!("call-person-camera-{}", who.id)))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .tooltip(tip("Camera on", None))
+                    .child(glyph("icons/video.svg", 13., theme::text_soft()))
+            });
+            let more_btn = div()
+                .id(SharedString::from(format!("call-person-more-{}", who.id)))
+                .flex_none()
+                .size(px(22.))
+                .rounded(px(5.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .opacity(0.)
+                .group_hover(row_group.clone(), |s| s.opacity(1.))
+                .hover(|s| s.bg(theme::selected()))
+                .cursor_pointer()
+                .tooltip(tip("Volume and more", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| open_menu_more(this, cx)))
+                .child(glyph("icons/ellipsis.svg", 13., theme::text_soft()));
             rows.push(
                 div()
-                    .id(SharedString::from(format!("call-person-row-{}", who.id)))
+                    .id(row_group.clone())
+                    .group(row_group)
                     .w_full()
                     .h(px(32.))
                     .flex_none()
                     .pl(px(12.))
-                    .pr(px(10.))
+                    .pr(px(8.))
                     .flex()
                     .items_center()
-                    .gap(px(10.))
+                    .gap(px(8.))
                     .cursor_pointer()
+                    .tab_index(0)
+                    .focus_visible(|style| style.shadow(theme::focus_ring()))
                     .hover(|s| s.bg(theme::hover()))
                     .text_size(px(13.))
                     .text_color(if who.speaking { theme::text() } else { theme::text_soft() })
-                    .tooltip(tip("Adjust volume", None))
-                    .on_click(cx.listener(move |this, _, _, cx| open_click(this, cx)))
-                    .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, cx| open_person(this, cx)))
+                    .tooltip(tip("Open profile", None))
+                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.call_menu_close(cx);
+                        this.open_profile(profile_key.clone(), event.position(), cx);
+                    }))
+                    .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, _, cx| open_menu(this, cx)))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        let mods = event.keystroke.modifiers;
+                        let other = mods.control || mods.alt || mods.platform || mods.function;
+                        match call_row_key_action(event.keystroke.key.as_str(), mods.shift, other) {
+                            Some(RowKeyAction::Profile) => {
+                                cx.stop_propagation();
+                                this.call_menu_close(cx);
+                                this.show_info(key_enter.clone(), cx);
+                            }
+                            Some(RowKeyAction::Menu) => open_menu_key(this, cx),
+                            None => {}
+                        }
+                    }))
                     .child(ringed(avatar, 22., who.speaking))
                     .child(div().flex_1().min_w_0().truncate().child(who.name.clone()))
                     .children(gain_tag.map(|tag| div().flex_none().type_micro().text_color(if muted { theme::warning() } else { theme::text_faint() }).child(tag)))
+                    .children(watch_btn)
+                    .children(camera_glyph)
                     .when(who.server_muted, |r| r.child(glyph("icons/mic-off.svg", 13., theme::danger())))
                     .when(!who.server_muted && who.suppressed, |r| r.child(glyph("icons/mic-off.svg", 13., theme::warning())))
                     .when(!who.server_muted && !who.suppressed && who.muted && !who.deafened && !who.server_deafened, |r| {
@@ -1256,6 +1612,7 @@ impl Shell {
                     })
                     .when(who.server_deafened, |r| r.child(glyph("icons/headphone-off.svg", 13., theme::danger())))
                     .when(!who.server_deafened && who.deafened, |r| r.child(glyph("icons/headphone-off.svg", 13., theme::text_faint())))
+                    .child(more_btn)
                     .into_any_element(),
             );
         }
@@ -1344,8 +1701,9 @@ impl Shell {
     }
 
     /// Ask mediad to watch `user_id`'s stream and schedule 3 s / 10 s redraws so the tile never
-    /// stays on "Connecting…" silently.
+    /// stays on "Connecting…" silently. On Tiny the subscription is `call.watch`, not ShareWatch.
     pub(in crate::gui) fn call_watch(&mut self, user_id: String, cx: &mut Context<Self>) {
+        self.call_state.share_prompt = None;
         self.call_state.watch_asked = Some((user_id.clone(), Instant::now()));
         self.call_state.watch_timer = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_secs(3)).await;
@@ -1353,11 +1711,113 @@ impl Shell {
             cx.background_executor().timer(Duration::from_secs(7)).await;
             let _ = this.update(cx, |_, cx| cx.notify());
         }));
+        if self.call_now().is_some_and(|call| call.conversation.network == Network::Tiny) {
+            return;
+        }
         self.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: Some(user_id) }), cx);
+    }
+
+    /// One-click watch from a picture box or a phone tile. Tiny subscribes with `call.watch`.
+    pub(in crate::gui) fn call_watch_user(&mut self, user_id: String, cx: &mut Context<Self>) {
+        if self.call_now().is_some_and(|call| call.conversation.network == Network::Tiny) {
+            self.call_state.focus = Some(stage::Focus::Stream(user_id.clone()));
+            self.call_watch(user_id, cx);
+            self.call_sync_watch_now(cx);
+            return;
+        }
+        self.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: Some(user_id) }), cx);
+    }
+
+    /// Stop the picture-box or phone watch. On Tiny that is a focus change and `call.watch`.
+    pub(in crate::gui) fn call_stop_watch_user(&mut self, cx: &mut Context<Self>) {
+        if self.call_now().is_some_and(|call| call.conversation.network == Network::Tiny) {
+            if matches!(self.call_state.focus, Some(stage::Focus::Stream(_))) {
+                self.call_state.focus = None;
+            }
+            self.call_unwatch(cx);
+            self.call_sync_watch_now(cx);
+            return;
+        }
+        self.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: None }), cx);
+    }
+
+    /// Watch `user_id`'s screen, focus their stream on the stage, dismiss any share notice, and
+    /// open the call view or room stage.
+    pub(in crate::gui) fn call_watch_stream(
+        &mut self,
+        call: &Call,
+        user_id: String,
+        title: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.call_state.share_prompt = None;
+        self.call_state.focus = Some(stage::Focus::Stream(user_id.clone()));
+        if !watching(call, &user_id) {
+            self.call_watch(user_id, cx);
+        }
+        self.call_go(call.conversation.clone(), title, cx);
+        self.call_sync_watch_now(cx);
+    }
+
+    /// Dismiss the dock's screen-share notice strip until the sharer stops and someone shares again.
+    pub(super) fn call_dismiss_share_prompt(&mut self, cx: &mut Context<Self>) {
+        self.call_state.share_prompt = None;
+        cx.notify();
+    }
+
+    /// True when the user is currently looking at `call`'s main-pane call view or Tiny room stage.
+    fn call_looking_at(&self, call: &Call) -> bool {
+        if self.call_state.view.as_ref() == Some(&call.conversation) {
+            return true;
+        }
+        call.conversation.network == Network::Tiny
+            && self.tiny_open()
+            && self.tiny_account() == Some(&call.conversation.account())
+            && self.tiny_state.channel.as_deref() == Some(call.conversation.id.as_str())
+    }
+
+    /// Notices when a remote participant starts sharing their screen: plays a soft cue, offers
+    /// Watch on the dock card, and optionally auto-watches when the user is already looking at the
+    /// call.
+    fn call_share_notice(&mut self, call: &Call, cx: &mut Context<Self>) {
+        let started = share_notice_step(call, &mut self.call_state.sharer, &mut self.call_state.share_prompt);
+        if self.call_state.share_prompt.as_deref().is_some_and(|id| watching(call, id)) {
+            self.call_state.share_prompt = None;
+        }
+        let Some(id) = started else {
+            return;
+        };
+        if !cfg!(feature = "gui-shot") && !super::streamer::is_active() {
+            cx.background_executor()
+                .spawn(async move {
+                    let _ = ask(&Request::Media(protocol::MediaRequest::Cue {
+                        cue: protocol::Cue::ShareStarted,
+                    }));
+                })
+                .detach();
+        }
+        let auto_watch = super::app::prefs::values().on(protocol::settings::AUTO_WATCH_SHARE);
+        if should_auto_watch_share(auto_watch, self.call_looking_at(call), self.call_state.focus.is_some()) {
+            self.call_state.share_prompt = None;
+            self.call_state.focus = Some(stage::Focus::Stream(id.clone()));
+            if !watching(call, &id) {
+                self.call_watch(id, cx);
+            }
+        }
     }
 
     /// Reset the decoder and ask for a fresh keyframe for `user_id`.
     pub(in crate::gui) fn call_retry_watch(&mut self, user_id: String, cx: &mut Context<Self>) {
+        if self.call_now().is_some_and(|call| call.conversation.network == Network::Tiny) {
+            self.call_state.watched.clear();
+            self.call_state.watch_pending = None;
+            self.call_state.watch_again = None;
+            self.call_state.watch_epoch = self.call_state.watch_epoch.wrapping_add(1);
+            self.call_state.focus = Some(stage::Focus::Stream(user_id.clone()));
+            self.call_watch(user_id, cx);
+            self.call_sync_watch_now(cx);
+            return;
+        }
         self.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: None }), cx);
         self.call_watch(user_id, cx);
     }
@@ -1366,14 +1826,21 @@ impl Shell {
     pub(in crate::gui) fn call_unwatch(&mut self, cx: &mut Context<Self>) {
         self.call_state.watch_asked = None;
         self.call_state.watch_timer = None;
+        if self.call_now().is_some_and(|call| share_watch_superseded(call.conversation.network, self.call_state.watch_sent)) {
+            return;
+        }
         self.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: None }), cx);
     }
 
     /// In a 1:1 Tiny direct call, automatically watch the peer's screen share or camera as soon
-    /// as they start sending, and stop decoding when they stop.
+    /// as they start sending, and stop decoding when they stop. Once `call.watch` is the
+    /// subscription, ShareWatch would replace that list with one share.
     fn call_auto_watch(&mut self, call: &Call, cx: &mut Context<Self>) {
         let is_room = self.tiny_room(&call.conversation).is_some();
         if let Some(source) = auto_watch_step(call, is_room, &mut self.call_state.auto_watch) {
+            if share_watch_superseded(call.conversation.network, self.call_state.watch_sent) {
+                return;
+            }
             self.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source }), cx);
         }
     }
@@ -1389,15 +1856,98 @@ impl Shell {
         }
     }
 
-    /// The received video frame on screen, when it belongs to `user_id`.
+    /// Drops the watch bookkeeping so the next sync subscribes again. A late answer sees the
+    /// new epoch and does not apply.
+    fn call_reset_watch(&mut self) {
+        let state = &mut self.call_state;
+        state.watched.clear();
+        state.watch_pending = None;
+        state.watch_again = None;
+        state.watch_sent = false;
+        state.watch_epoch = state.watch_epoch.wrapping_add(1);
+    }
+
+    /// Synchronizes multi-stream `MediaRequest::Watch` when the joined Tiny call's visible
+    /// cameras or focused stream change. The list counts only after chatd says ok. A refusal
+    /// is shown and asked again, but not on every picture frame.
+    pub(in crate::gui) fn call_sync_watch(&mut self, call: &Call, cx: &mut Context<Self>) {
+        if call.conversation.network != Network::Tiny {
+            return;
+        }
+        let budget_small = if super::phone::active() { 2 } else { 4 };
+        let next = desired_watch_sources(call, self.call_state.focus.as_ref(), budget_small);
+        if self.call_state.watch_pending.as_ref() == Some(&next) || self.call_state.watched == next {
+            return;
+        }
+        if self.call_state.watch_again.as_ref().is_some_and(|(sources, until)| sources == &next && Instant::now() < *until) {
+            return;
+        }
+        self.call_state.watch_epoch = self.call_state.watch_epoch.wrapping_add(1);
+        let epoch = self.call_state.watch_epoch;
+        self.call_state.watch_pending = Some(next.clone());
+        self.call_state.watch_sent = true;
+        let request = Request::Media(protocol::MediaRequest::Watch { sources: next.clone() });
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.call_state.watch_epoch != epoch {
+                    return;
+                }
+                this.call_state.watch_pending = None;
+                let detail = match &answer {
+                    Ok(Response::Error { detail, .. }) => Some(detail.clone()),
+                    Err(err) => Some(crate::client::trouble_words("call", err)),
+                    Ok(_) => None,
+                };
+                if let Some(detail) = detail {
+                    this.call_state.watch_again = Some((next, Instant::now() + WATCH_AGAIN));
+                    this.call_state.error = Some(detail.clone());
+                    this.refused = Some(detail);
+                } else {
+                    this.call_state.watched = next;
+                    this.call_state.watch_again = None;
+                    this.call_state.error = None;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Re-evaluates multi-stream watch subscriptions for the currently active call (e.g. after focus changes).
+    /// A click or a focus change retries a refused list immediately.
+    pub(in crate::gui) fn call_sync_watch_now(&mut self, cx: &mut Context<Self>) {
+        self.call_state.watch_again = None;
+        if let Some(call) = self.snapshot.as_ref().and_then(|s| s.call.clone()) {
+            self.call_sync_watch(&call, cx);
+        }
+    }
+
+    /// The received video frame on screen, when it belongs to `(user_id, kind)`.
     pub(in crate::gui) fn call_frame(
         &self,
         call: Option<&Call>,
         user_id: &str,
+        kind: protocol::PictureKind,
     ) -> Option<std::sync::Arc<gpui::RenderImage>> {
-        call?.picture
+        let call = call?;
+        if call
+            .pictures
+            .iter()
+            .any(|p| !p.path.is_empty() && p.user_id == user_id && p.kind == kind)
+        {
+            if let Some(img) = self
+                .call_state
+                .feeds
+                .get(&(user_id.to_owned(), kind))
+                .and_then(|feed| feed.shown().cloned())
+            {
+                return Some(img);
+            }
+        }
+        call.picture
             .as_ref()
-            .filter(|picture| !picture.path.is_empty() && picture.user_id == user_id)?;
+            .filter(|picture| !picture.path.is_empty() && picture.user_id == user_id && picture.kind == kind)?;
         self.call_state.feed.shown().cloned()
     }
 
@@ -1463,7 +2013,8 @@ impl Shell {
             .map(|p| p.kind == protocol::PictureKind::Share)
             .or_else(|| peer_sender.map(|p| p.sharing))
             .unwrap_or(false);
-        let peer_frame = peer_id.and_then(|id| self.call_frame(Some(call), id));
+        let peer_kind = if peer_is_share { protocol::PictureKind::Share } else { protocol::PictureKind::Camera };
+        let peer_frame = peer_id.and_then(|id| self.call_frame(Some(call), id, peer_kind));
         let my_share = self.call_self_frame(Some(call), true);
         let my_camera = self.call_self_frame(Some(call), false);
         let self_frame = my_share.clone().or_else(|| my_camera.clone());
@@ -1509,7 +2060,7 @@ impl Shell {
                             .font_weight(theme::SEMIBOLD)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
-                                this.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: Some(id.clone()) }), cx);
+                                this.call_watch_user(id.clone(), cx);
                             }))
                             .child(label),
                     )
@@ -1555,7 +2106,7 @@ impl Shell {
                     .type_micro()
                     .on_click(cx.listener(|this, _, _, cx| {
                         cx.stop_propagation();
-                        this.call_ask(Request::Media(protocol::MediaRequest::ShareWatch { source: None }), cx);
+                        this.call_stop_watch_user(cx);
                     }))
                     .child("Stop watching"),
             )
@@ -2501,5 +3052,109 @@ mod tests {
         call.participants[0].camera = false;
         call.participants[1].camera = false;
         assert_eq!(discord_speaker_step(&call, None, Some(("u1", t0)), t0 + Duration::from_secs(2)), Some(None));
+    }
+
+    #[test]
+    fn call_people_count_includes_me_and_excludes_ringing() {
+        let mut call = bare_call(key("lounge"), CallState::Joined, false, false);
+        assert_eq!(call_people_count(&call), 1);
+        call.participants = vec![
+            protocol::Participant { id: "u1".into(), name: "Ada".into(), ringing: false, ..Default::default() },
+            protocol::Participant { id: "u2".into(), name: "Bea".into(), ringing: true, ..Default::default() },
+            protocol::Participant { id: "u3".into(), name: "Cam".into(), ringing: false, ..Default::default() },
+        ];
+        assert_eq!(call_people_count(&call), 3);
+    }
+
+    #[test]
+    fn participant_row_keyboard_shortcuts_map_enter_and_context_menu() {
+        assert_eq!(call_row_key_action("enter", false, false), Some(RowKeyAction::Profile));
+        assert_eq!(call_row_key_action("enter", true, false), None);
+        assert_eq!(call_row_key_action("contextmenu", false, false), Some(RowKeyAction::Menu));
+        assert_eq!(call_row_key_action("f10", true, false), Some(RowKeyAction::Menu));
+        assert_eq!(call_row_key_action("f10", false, false), None);
+        assert_eq!(call_row_key_action("f10", true, true), None);
+        assert_eq!(call_row_key_action("space", false, false), None);
+    }
+
+    #[test]
+    fn share_notice_prompts_once_respects_dismiss_and_resets_when_sharing_stops() {
+        let mut call = bare_call(key("lounge"), CallState::Joined, false, false);
+        call.participants = vec![
+            protocol::Participant { id: "u1".into(), name: "Ada".into(), sharing: false, ..Default::default() },
+            protocol::Participant { id: "u2".into(), name: "Bea".into(), sharing: false, ..Default::default() },
+        ];
+        let (mut prev, mut prompt) = (None, None);
+        assert_eq!(share_notice_step(&call, &mut prev, &mut prompt), None);
+        assert_eq!(prompt, None);
+
+        // Ada starts sharing -> prompts once.
+        call.participants[0].sharing = true;
+        assert_eq!(share_notice_step(&call, &mut prev, &mut prompt), Some("u1".into()));
+        assert_eq!(prompt.as_deref(), Some("u1"));
+
+        // Repeated Call snapshots while Ada keeps sharing do not re-trigger.
+        assert_eq!(share_notice_step(&call, &mut prev, &mut prompt), None);
+        assert_eq!(prompt.as_deref(), Some("u1"));
+
+        // Dismissing clears the prompt, and prev holds so it does not immediately reappear.
+        prompt = None;
+        assert_eq!(share_notice_step(&call, &mut prev, &mut prompt), None);
+        assert_eq!(prompt, None);
+
+        // Ada stops sharing -> clears prev so the next share starts fresh.
+        call.participants[0].sharing = false;
+        assert_eq!(share_notice_step(&call, &mut prev, &mut prompt), None);
+        assert_eq!(prev, None);
+
+        // Bea starts sharing -> prompts again.
+        call.participants[1].sharing = true;
+        assert_eq!(share_notice_step(&call, &mut prev, &mut prompt), Some("u2".into()));
+        assert_eq!(prompt.as_deref(), Some("u2"));
+
+        // Leaving / reconnecting clears both.
+        call.state = CallState::Reconnecting;
+        assert_eq!(share_notice_step(&call, &mut prev, &mut prompt), None);
+        assert_eq!((prev, prompt), (None, None));
+    }
+
+    #[test]
+    fn share_watch_is_not_the_tiny_subscription_once_watch_was_sent() {
+        assert!(!share_watch_superseded(Network::Discord, true));
+        assert!(!share_watch_superseded(Network::Discord, false));
+        assert!(!share_watch_superseded(Network::Tiny, false));
+        assert!(share_watch_superseded(Network::Tiny, true));
+    }
+
+    #[test]
+    fn auto_watch_share_requires_pref_active_view_and_no_existing_focus() {
+        assert!(should_auto_watch_share(true, true, false));
+        assert!(!should_auto_watch_share(false, true, false));
+        assert!(!should_auto_watch_share(true, false, false));
+        assert!(!should_auto_watch_share(true, true, true));
+    }
+
+    #[test]
+    fn desired_watch_sources_prioritizes_focused_share_and_fills_small_camera_tiles() {
+        let mut call = bare_call(key("lounge"), CallState::Joined, false, false);
+        call.participants = vec![
+            protocol::Participant { id: "ada".into(), name: "Ada".into(), sharing: true, camera: true, ..Default::default() },
+            protocol::Participant { id: "bea".into(), name: "Bea".into(), camera: true, ..Default::default() },
+            protocol::Participant { id: "cy".into(), name: "Cy".into(), camera: true, ..Default::default() },
+            protocol::Participant { id: "dev".into(), name: "Dev".into(), camera: true, ..Default::default() },
+            protocol::Participant { id: "eli".into(), name: "Eli".into(), camera: true, ..Default::default() },
+        ];
+        // Focused on Ada's share -> Large share + 4 small cameras (Ada's camera + Bea, Cy, Dev).
+        let sources = desired_watch_sources(&call, Some(&stage::Focus::Stream("ada".into())), 4);
+        assert_eq!(sources.len(), 5);
+        assert_eq!(sources[0], protocol::WatchSource { user_id: "ada".into(), kind: protocol::PictureKind::Share, size: protocol::WatchSize::Large });
+        assert_eq!(sources[1], protocol::WatchSource { user_id: "ada".into(), kind: protocol::PictureKind::Camera, size: protocol::WatchSize::Small });
+        assert_eq!(sources[4].user_id, "dev");
+        // Phone budget: 2 small cameras beside focused share.
+        let phone = desired_watch_sources(&call, Some(&stage::Focus::Stream("ada".into())), 2);
+        assert_eq!(phone.len(), 3);
+        // Deafened -> nothing watched.
+        call.deafened = true;
+        assert!(desired_watch_sources(&call, Some(&stage::Focus::Stream("ada".into())), 4).is_empty());
     }
 }

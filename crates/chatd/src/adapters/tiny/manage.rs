@@ -117,6 +117,16 @@ pub(crate) fn room_e2ee_required(saved: &Saved, room_id: &str) -> bool {
     known(saved).rooms.iter().any(|room| room.id == room_id && room.e2ee_required)
 }
 
+/// Whether the room allows camera and screen sharing (`video_enabled`), defaulting to `true`
+/// before the room list has arrived.
+pub(crate) fn room_video_enabled(saved: &Saved, room_id: &str) -> bool {
+    known(saved)
+        .rooms
+        .iter()
+        .find(|room| room.id == room_id)
+        .is_none_or(|room| room.video_enabled)
+}
+
 /// `GET /v1/capabilities`. Anything but a readable 200 is an older server: no features.
 pub(crate) fn capabilities_of(saved: &Saved) -> TinyCapabilities {
     match asked("GET", saved, "/v1/capabilities", None) {

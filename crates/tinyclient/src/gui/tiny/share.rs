@@ -3,8 +3,6 @@
 //! a phone's share has the system's own picker, so it shares at once. A click on someone's stream
 //! watches it and fills the stage with it, and the stage can have the whole window, until Escape.
 
-use super::channel::watching;
-use super::stage::{self, Focus};
 use super::Modal;
 use crate::gui::components::{button, button_disabled, glyph, modal, segment, segmented, ButtonKind};
 use crate::gui::state::Shell;
@@ -55,65 +53,6 @@ impl Shell {
     pub(in crate::gui) fn tiny_stop_share(&mut self, cx: &mut Context<Self>) {
         self.tiny_state.shared = None;
         self.call_ask(Request::Media(MediaRequest::ShareSend { on: false, screen: None, quality: None, show_cursor: None }), cx);
-    }
-
-    /// A click on a stream: watched, and filling the stage; when it already fills it, the grid.
-    pub(super) fn tiny_open_stream(&mut self, user_id: &str, mine: bool, window: &mut Window, cx: &mut Context<Self>) {
-        self.tiny_keep_keys(window, cx);
-        let focus = stage::toggle(self.tiny_state.focus.as_ref(), Focus::Stream(user_id.to_owned()));
-        if focus.is_some() && !mine && !self.tiny_call().is_some_and(|call| watching(&call, user_id)) {
-            self.call_watch(user_id.to_owned(), cx);
-        }
-        self.tiny_state.focus = focus;
-        cx.notify();
-    }
-
-    pub(super) fn tiny_stop_watching(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.tiny_keep_keys(window, cx);
-        if matches!(self.tiny_state.focus, Some(Focus::Stream(_))) {
-            self.tiny_state.focus = None;
-        }
-        self.call_unwatch(cx);
-    }
-
-    /// The people under the focused stream, over it, or gone.
-    pub(super) fn tiny_strip(&mut self, strip: stage::Strip, window: &mut Window, cx: &mut Context<Self>) {
-        self.tiny_keep_keys(window, cx);
-        self.tiny_state.strip = strip;
-        cx.notify();
-    }
-
-    /// The focused stream has the whole window, which goes full screen if it was not.
-    pub(super) fn tiny_full(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.tiny_state.full.is_some() {
-            return;
-        }
-        self.tiny_keep_keys(window, cx);
-        let took = !window.is_fullscreen();
-        if took {
-            window.toggle_fullscreen();
-        }
-        self.tiny_state.full = Some(took);
-        cx.notify();
-    }
-
-    /// Out of the stream's full screen, and the window back as it was. False when it was not.
-    pub(in crate::gui) fn tiny_unfull(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(took) = self.tiny_state.full.take() else {
-            return false;
-        };
-        self.tiny_keep_keys(window, cx);
-        if took && window.is_fullscreen() {
-            window.toggle_fullscreen();
-        }
-        cx.notify();
-        true
-    }
-
-    /// The stage's keys back on the window's root. A click that redraws the stage takes away the
-    /// tile or button it focused, and Escape then finds no binding.
-    pub(super) fn tiny_keep_keys(&self, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.focus, cx);
     }
 
     /// The picker: screens or windows, a picture and a name each, Cancel and Share.

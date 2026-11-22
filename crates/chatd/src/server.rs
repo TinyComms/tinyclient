@@ -607,7 +607,7 @@ impl Chat {
             | settings::AUTO_GAIN
             | settings::INPUT_VOLUME
             | settings::VOICE_QUALITY => self.hub.calls.retune(&self.hub),
-            settings::INPUT | settings::OUTPUT => self.hub.calls.redevice(&self.hub),
+            settings::INPUT | settings::OUTPUT | settings::CAMERA => self.hub.calls.redevice(&self.hub),
             // `set_setting` has already moved chatd's own ceiling.
             settings::LOG_LEVEL => self.hub.calls.relevel(),
             _ => {}
@@ -4150,6 +4150,25 @@ impl Chat {
                 Response::Ok
             }
             Request::Media(request) => {
+                // Tiny `call.watch` reaches mediad from the live socket, and only when that
+                // list is still the newest one accepted. Applying the sources here, after
+                // `ask` returns, lets an older connection thread rewind mediad. A single
+                // video slot never sends `call.watch`; the socket keeps that list locally
+                // and answers ok. ShareWatch is Discord's picture subscription.
+                if let MediaRequest::Watch { sources } = &request {
+                    if let (Some(call), true) = self.hub.calls.describe() {
+                        if call.conversation.network == Network::Tiny {
+                            let sources = sources.clone();
+                            let account = call.conversation.account();
+                            return match self.ask(&account, |reply| {
+                                Command::Tiny(adapters::tiny::live::Ask::Watch { sources, reply })
+                            }) {
+                                Ok(()) => self.status(),
+                                Err(refused) => *refused,
+                            };
+                        }
+                    }
+                }
                 let picture = match &request {
                     MediaRequest::Camera { on } => Some(Picture::Camera(*on)),
                     MediaRequest::ShareSend { on, .. } => Some(Picture::Share(*on)),
@@ -4166,8 +4185,8 @@ impl Chat {
                 };
                 // A refusal never tells Discord we are sending. Other networks ignore the command.
                 if asked.is_ok() {
-                    if let Some(picture) = picture {
-                        if let (Some(call), true) = self.hub.calls.describe() {
+                    if let (Some(call), true) = self.hub.calls.describe() {
+                        if let Some(picture) = picture {
                             if call.conversation.network == Network::Discord {
                                 self.command(&call.conversation.account(), Command::CallPicture(picture));
                             }

@@ -87,6 +87,7 @@ pub struct Controls {
     /// The camera and the share the user asked for, and whether the one picture is watched.
     share: AtomicBool,
     camera: AtomicBool,
+    camera_preview: AtomicBool,
     watch: AtomicBool,
     /// Stops a Go Live leg without hanging up the voice call. The voice loop does not read these.
     share_leg_stop: AtomicBool,
@@ -95,8 +96,10 @@ pub struct Controls {
     speaker: Mutex<Option<String>>,
     /// An answer to the renegotiation offer, or an empty SDP when the server refused it.
     picture_answer: Mutex<Option<String>>,
-    /// Who the one video slot carries. `None` inside means the server sent no picture.
-    picture_slot: Mutex<Option<Option<TinyPicture>>>,
+    /// Who each active video receive slot carries now (`call.slots.videos` or single `video`).
+    picture_slots: Mutex<Option<Vec<TinyPicture>>>,
+    /// Multi-stream watch list accepted by the decode budget.
+    watch_sources: Mutex<Vec<protocol::WatchSource>>,
     /// A Tiny server call's end-to-end encryption (`e2ee`), shared by chatd's requests and the
     /// call's loop.
     pub(crate) tiny_e2ee: Mutex<crate::e2ee::E2ee>,
@@ -170,6 +173,14 @@ impl Controls {
         self.camera.load(Ordering::Relaxed)
     }
 
+    pub fn set_camera_preview(&self, on: bool) {
+        self.camera_preview.store(on, Ordering::Relaxed);
+    }
+
+    pub fn camera_preview(&self) -> bool {
+        self.camera_preview.load(Ordering::Relaxed)
+    }
+
     pub fn set_watch(&self, on: bool) {
         self.watch.store(on, Ordering::Relaxed);
     }
@@ -215,14 +226,26 @@ impl Controls {
         self.picture_answer.lock().unwrap().take()
     }
 
-    /// Who the video slot carries now. The outer `Some` means the server said; the inner is
-    /// `None` when it sent `video: null`.
+    /// Who the single legacy video slot carries now.
     pub fn set_picture(&self, picture: Option<TinyPicture>) {
-        *self.picture_slot.lock().unwrap() = Some(picture);
+        self.set_pictures(picture.into_iter().collect());
     }
 
-    pub(crate) fn take_picture(&self) -> Option<Option<TinyPicture>> {
-        self.picture_slot.lock().unwrap().take()
+    /// Who each active video receive slot carries now, from `call.slots.videos`.
+    pub fn set_pictures(&self, pictures: Vec<TinyPicture>) {
+        *self.picture_slots.lock().unwrap() = Some(pictures);
+    }
+
+    pub(crate) fn take_pictures(&self) -> Option<Vec<TinyPicture>> {
+        self.picture_slots.lock().unwrap().take()
+    }
+
+    pub fn set_watch_sources(&self, sources: Vec<protocol::WatchSource>) {
+        *self.watch_sources.lock().unwrap() = sources;
+    }
+
+    pub(crate) fn watch_sources(&self) -> Vec<protocol::WatchSource> {
+        self.watch_sources.lock().unwrap().clone()
     }
 
     /// The devices chosen so far, for a call that opens them now. Any choice waiting for the
@@ -246,7 +269,7 @@ impl Controls {
         let tuning = self.tuning();
         let wanted = match cue {
             Cue::Test => true,
-            Cue::Joined | Cue::Left => tuning.joins && !self.deafened.load(Ordering::Relaxed),
+            Cue::Joined | Cue::Left | Cue::ShareStarted => tuning.joins && !self.deafened.load(Ordering::Relaxed),
             // Our own room changed: as a join, but heard while deafened, since it is ours.
             Cue::Moved => tuning.joins,
             Cue::Muted | Cue::Unmuted | Cue::Deafened | Cue::Undeafened => tuning.mine,

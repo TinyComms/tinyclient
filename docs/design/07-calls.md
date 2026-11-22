@@ -53,7 +53,7 @@ Sub-line wording: `Ringing… 0:12` · `Connecting…` · `Discord · 12:04` (DM
 | Deafen | `raised`, `headphones` | `danger_soft`, `headphone-off` in `danger`; mute shows on too; undeafen restores the earlier mute | "Deafen  ⌘⇧D" |
 | Share | `raised`, `monitor-up` | `accent_soft`, `accent` glyph | "Share your screen" / "Stop sharing" |
 | Camera | `raised`, `video` | `accent_soft`, `accent` glyph | "Turn camera on" / "Turn camera off" |
-| Devices | `raised`, `settings` | menu open: `selected` fill, `text` glyph | "Microphone and speaker" |
+| Devices | `raised`, `settings` | menu open: `selected` fill, `text` glyph | "Devices" |
 | Leave | `danger_soft`, `phone-off` in `danger`; hover: `danger` fill, `on_accent` glyph | | "Leave  ⌘⇧H" |
 
 Hover on any rest state: `selected` fill, `text` glyph. Disabled: 40 % opacity, no hover; used while reconnecting (all but Leave) and for a moderator's mute ("Muted by a moderator in Lounge"). Ringing and connecting show only mute and devices (both may be preset) and a text **Cancel** button (32 high, `danger_soft`).

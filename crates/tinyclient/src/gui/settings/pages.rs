@@ -16,16 +16,16 @@ use gpui::{canvas, div, img, prelude::*, px, AnyElement, ClipboardItem, Context,
 use crate::gui::hotkeys::{self, Action, Reach};
 use protocol::settings::{
     self as keys, account_scope, DeviceChoice, Values, AUTO_GAIN, CACHE_MB, CAMERA, CACHE_MB_CHOICES, CUE_CONNECTION, CUE_JOINS, CUE_MINE, CUE_VOLUME,
-    ECHO_CANCELLATION, GLOBAL, INPUT, INPUT_VOLUME, JOIN_MUTED, KEEP_DAYS, KEEP_DAYS_CHOICES, KEEP_RUNNING, NOISE_CHOICES, NOISE_SUPPRESSION, OUTPUT,
-    PTT_RELEASE_CHOICES, PTT_RELEASE_MS, PUSH_TO_TALK, PRESENCE_ACTIVITY, QUALITY_CHOICES, RECEIPTS, REQUIRE_CALL_E2EE, SENSITIVITY, SOUNDS, TYPING, VOICE_QUALITY,
-    VOICE_VOLUME,
+    AUTO_WATCH_SHARE, ECHO_CANCELLATION, GLOBAL, INPUT, INPUT_VOLUME, JOIN_MUTED, KEEP_DAYS, KEEP_DAYS_CHOICES, KEEP_RUNNING, NOISE_CHOICES, NOISE_SUPPRESSION, OUTPUT,
+    PTT_RELEASE_CHOICES, PTT_RELEASE_MS, PUSH_TO_TALK, PRESENCE_ACTIVITY, QUALITY_CHOICES, RECEIPTS, REQUIRE_CALL_E2EE, SENSITIVITY, SOUNDS, STREAMER_DETECT_OBS,
+    STREAMER_HIDE_WINDOW, STREAMER_MODE, STREAMER_MODE_CHOICES, TYPING, VOICE_QUALITY, VOICE_VOLUME,
 };
 use protocol::{AccountStatus, Link, Network, Request, Response};
 use std::rc::Rc;
 
 /// Choice sets whose pills do not fit beside their label. Short pairs stay pills.
 pub(super) fn menu_choice(id: &str) -> bool {
-    matches!(id, "S2" | "S3" | "S4" | "N2" | "N4" | "NL" | "N6" | "M5" | "P4" | "D2" | "V8" | "V11" | "V21")
+    matches!(id, "S2" | "S3" | "S4" | "N2" | "N4" | "NL" | "N6" | "M5" | "P4" | "PS1" | "D2" | "V8" | "V11" | "V21")
 }
 
 /// `--settings-choice` names one of these.
@@ -41,6 +41,7 @@ pub(super) fn choice_id(name: &str) -> Option<&'static str> {
         "N7" => "N7",
         "M5" => "M5",
         "P4" => "P4",
+        "PS1" => "PS1",
         "D2" => "D2",
         "V8" => "V8",
         "V11" => "V11",
@@ -62,6 +63,7 @@ fn choice_slot(id: &str) -> usize {
         "N7" => 17,
         "M5" => 25,
         "P4" => 34,
+        "PS1" => 51,
         "D2" => 42,
         "V8" => 48,
         "V11" => 49,
@@ -94,6 +96,21 @@ fn choice_list(id: &str) -> Option<(Vec<(String, String)>, usize, usize)> {
             let days = values.number(KEEP_DAYS);
             let at = KEEP_DAYS_CHOICES.iter().position(|d| *d == days).unwrap_or(2);
             (pairs(&["7 days", "30 days", "90 days"]), at, 2)
+        }
+        "PS1" => {
+            let at = STREAMER_MODE_CHOICES
+                .iter()
+                .position(|w| *w == values.word(GLOBAL, STREAMER_MODE))
+                .unwrap_or(2);
+            (
+                STREAMER_MODE_CHOICES
+                    .iter()
+                    .zip(["Off", "On", "While sharing"])
+                    .map(|(w, l)| ((*w).to_owned(), (*l).to_owned()))
+                    .collect(),
+                at,
+                2,
+            )
         }
         "D2" => {
             let cap = values.number(CACHE_MB);
@@ -407,6 +424,11 @@ impl SettingsWindow {
                         "When a server turns a call's encryption off, the call stops until you choose to carry on unencrypted. With this on you can't: you leave instead, and a Tiny server that cannot encrypt calls is not joined. Always the case on Incognito servers and in rooms that require it. Takes effect the next time you join.",
                     )),
                 );
+                groups.push(
+                    self.group(&["PS1", "PS2", "PS3"], Some("Streamer mode"), window, cx).child(caption(
+                        "While it is on, notification banners and their sounds stay quiet, phone numbers and emails stay hidden, and invite links and sign-in codes in messages stay hidden until you reveal them. Unread counts stay.",
+                    )),
+                );
                 groups
             }
             Section::Audio => vec![
@@ -415,6 +437,7 @@ impl SettingsWindow {
                     .child(caption("Picking a device in a call's menu changes that call only. These are the defaults.")),
                 self.group(&["V22"], Some("Camera"), window, cx).child(self.camera_preview(cx)),
                 self.group(&["V4"], Some("Joining"), window, cx),
+                self.group(&["V23"], Some("Screen sharing"), window, cx),
             ],
             Section::Voice => {
                 let values = prefs::values();
@@ -849,6 +872,24 @@ impl SettingsWindow {
                 let on = values.on(REQUIRE_CALL_E2EE);
                 self.switch_row(id, on, false, None, move |this, on, cx| this.set_switch(id, REQUIRE_CALL_E2EE, on, false, cx), cx)
             }
+            "PS1" => {
+                let at = STREAMER_MODE_CHOICES.iter().position(|word| *word == values.word(GLOBAL, STREAMER_MODE)).unwrap_or(2);
+                let second = Some(match values.word(GLOBAL, STREAMER_MODE) {
+                    "on" => "Notifications stay quiet, and private details stay hidden.".to_owned(),
+                    "off" => "Notifications and private details show as usual.".to_owned(),
+                    _ => "On while you share your screen. Also while OBS or Streamlabs is running, when that switch is on.".to_owned(),
+                });
+                self.menu_choice_row(id, &["Off", "On", "While sharing"], at, 2, second, None, cx)
+            }
+            "PS2" => {
+                let on = values.on(STREAMER_HIDE_WINDOW);
+                let second = Some("The window is black in other apps' captures, including a share of the whole screen.".to_owned());
+                self.switch_row(id, on, false, second, move |this, on, cx| this.set_switch(id, STREAMER_HIDE_WINDOW, on, false, cx), cx)
+            }
+            "PS3" => {
+                let on = values.on(STREAMER_DETECT_OBS);
+                self.switch_row(id, on, false, None, move |this, on, cx| this.set_switch(id, STREAMER_DETECT_OBS, on, false, cx), cx)
+            }
             "P4" => {
                 let days = values.number(KEEP_DAYS);
                 let at = KEEP_DAYS_CHOICES.iter().position(|d| *d == days).unwrap_or(2);
@@ -906,6 +947,10 @@ impl SettingsWindow {
             "V4" => {
                 let on = values.on(JOIN_MUTED);
                 self.switch_row(id, on, false, None, move |this, on, cx| this.set_switch(id, JOIN_MUTED, on, false, cx), cx)
+            }
+            "V23" => {
+                let on = values.on(AUTO_WATCH_SHARE);
+                self.switch_row(id, on, false, None, move |this, on, cx| this.set_switch(id, AUTO_WATCH_SHARE, on, false, cx), cx)
             }
             "D1" => self.usage(cx),
             "D2" => {
@@ -1222,6 +1267,13 @@ impl SettingsWindow {
         match id {
             "M5" => self.set_autoplay([Autoplay::Always, Autoplay::Hover, Autoplay::Never][ix], cx),
             "P4" => self.pick_retention(KEEP_DAYS_CHOICES[ix], cx),
+            "PS1" => {
+                let word = STREAMER_MODE_CHOICES[ix.min(STREAMER_MODE_CHOICES.len() - 1)];
+                let defaults = Values::default();
+                let default = defaults.word(GLOBAL, STREAMER_MODE);
+                let stored = (word != default).then(|| word.to_owned());
+                self.set(id, GLOBAL.into(), STREAMER_MODE, stored, cx);
+            }
             "D2" => {
                 let mb = CACHE_MB_CHOICES[ix];
                 let stored = (mb != Values::default_number(CACHE_MB)).then(|| mb.to_string());
@@ -2568,7 +2620,7 @@ mod tests {
 
     #[test]
     fn long_choice_sets_are_menus_and_the_button_stays_in_the_column() {
-        for id in ["S2", "S3", "S4", "N2", "N4", "NL", "N6", "M5", "P4", "D2", "V8", "V11", "V21"] {
+        for id in ["S2", "S3", "S4", "N2", "N4", "NL", "N6", "M5", "P4", "PS1", "D2", "V8", "V11", "V21"] {
             assert!(menu_choice(id), "{id}");
         }
         for id in ["A3", "M1", "M2", "N5", "N7"] {

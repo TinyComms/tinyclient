@@ -388,6 +388,8 @@ pub struct Pane {
     expanded: HashSet<(String, usize)>,
     /// Blocked channel messages explicitly revealed by clicking "Show".
     revealed_blocked: HashSet<String>,
+    /// Sensitive messages (invite links / sign-in codes) revealed while Streamer mode is active.
+    revealed_sensitive: HashSet<String>,
     /// Coloured code, by message and block, so a scroll does not colour the same block again.
     code_colors: HashMap<(String, usize), (u64, Rc<highlight::Lit>)>,
     /// Blocks whose colouring is already running off this thread.
@@ -548,6 +550,7 @@ impl Pane {
             revealed_contacts: HashSet::new(),
             expanded: HashSet::new(),
             revealed_blocked: HashSet::new(),
+            revealed_sensitive: HashSet::new(),
             code_colors: HashMap::new(),
             code_coloring: HashSet::new(),
             copied: None,
@@ -899,6 +902,7 @@ impl Pane {
         self.transcript_open.clear();
         self.transcripts.clear();
         self.captions_on.clear();
+        self.revealed_sensitive.clear();
         self.code_colors.clear();
         self.multi_select.clear();
         self.code_coloring.clear();

@@ -33,6 +33,7 @@ pub mod quarantine;
 mod react;
 pub mod settings;
 mod signin;
+pub mod streamer;
 pub mod telegram_call_emoji;
 mod tiny;
 pub mod web_sign_in;

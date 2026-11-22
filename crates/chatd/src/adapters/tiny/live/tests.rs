@@ -1650,7 +1650,7 @@ impl Hand {
         let mut hand = Hand { ws, mediad, stdin, frames };
         assert!(matches!(hand.frames.recv_timeout(Duration::from_secs(10)), Ok(protocol::MediaResponse::Ready { .. })));
         let host = tungstenite::http::Uri::try_from(saved.base_url.as_str()).expect("an address").host().unwrap_or("").to_owned();
-        let offer = TinyOffer { user_id: saved.user_id.clone(), host, slots: ROOM_CAP - 1, muted: false, deafened: false, e2ee: None };
+        let offer = TinyOffer { user_id: saved.user_id.clone(), host, slots: ROOM_CAP - 1, muted: false, deafened: false, e2ee: None, video_slots: 0 };
         let protocol::MediaResponse::Offer { sdp } = hand.ask(protocol::MediaRequest::TinyOffer(offer)) else {
             panic!("no offer");
         };
@@ -2345,4 +2345,48 @@ fn the_account_is_described_by_the_person_id_and_a_pending_send_can_name_them() 
     hub.store().upsert_people(&account, &[PersonRow { id: ME.to_owned(), name: "Ada Vale".to_owned(), ..PersonRow::default() }]).unwrap();
     describe_self(&ctx, &saved);
     assert_eq!(hub.store().person(&Key::new(&account, ME)).unwrap().unwrap().name, "Ada Vale");
+}
+
+#[test]
+fn parse_offer_video_mids_and_build_watch_frame_match_tinyserver_contract() {
+    let sdp = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:0\r\na=sendonly\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:cam\r\na=inactive\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:shr\r\na=inactive\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:v0\r\na=recvonly\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:v1\r\na=recvonly\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:v2\r\na=recvonly\r\n";
+    let mids = parse_offer_video_mids(sdp);
+    assert_eq!(mids, vec!["v0", "v1", "v2"]);
+
+    let sources = vec![
+        protocol::WatchSource { user_id: "bea".into(), kind: PictureKind::Camera, size: protocol::WatchSize::Small },
+        protocol::WatchSource { user_id: "ada".into(), kind: PictureKind::Share, size: protocol::WatchSize::Large },
+        protocol::WatchSource { user_id: "cy".into(), kind: PictureKind::Camera, size: protocol::WatchSize::Small },
+    ];
+    let frame = build_watch_frame("42", &mids, &sources);
+    assert_eq!(frame["type"], "call.watch");
+    assert_eq!(frame["ref"], "42");
+    let entries = frame["video"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    // Large always claims slot 0 with max="high", small sources take slots 1.. with max="low".
+    assert_eq!(entries[0], json!({"mid": "v0", "user_id": "ada", "kind": "share", "max": "high"}));
+    assert_eq!(entries[1], json!({"mid": "v1", "user_id": "bea", "kind": "camera", "max": "low"}));
+    assert_eq!(entries[2], json!({"mid": "v2", "user_id": "cy", "kind": "camera", "max": "low"}));
+
+    // Empty watch list sends `"video": []`.
+    let empty = build_watch_frame("43", &mids, &[]);
+    assert_eq!(empty["video"], json!([]));
+}
+
+#[test]
+fn a_late_watch_ack_does_not_replace_a_newer_list() {
+    assert!(watch_ack_keeps(1, 0));
+    assert!(watch_ack_keeps(2, 1));
+    assert!(!watch_ack_keeps(1, 2));
+    assert!(!watch_ack_keeps(4, 4));
+}
+
+#[test]
+fn a_single_video_slot_keeps_the_watch_locally() {
+    assert!(!watch_wire(true, 1, true));
+    assert!(watch_local(true, 1));
+    assert!(watch_wire(true, 5, true));
+    assert!(!watch_local(true, 5));
+    assert!(!watch_wire(true, 5, false), "multi-video without mids is not ready");
+    assert!(!watch_local(false, 1), "a watch before the call is up is not kept locally");
 }

@@ -280,11 +280,16 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         device_stuck: false,
         inputs: Vec::new(),
         outputs: Vec::new(),
+        cameras: Vec::new(),
+        camera_id: String::new(),
         security: None,
         picture: None,
+        pictures: Vec::new(),
+        watch_refused: Vec::new(),
         self_view: None,
         share_view: None,
         picture_source: None,
+        video_allowed: true,
     };
     Live {
         intent: NEXT_INTENT.fetch_add(1, Ordering::Relaxed),
@@ -498,7 +503,7 @@ impl Live {
                 }
                 (self.call.level, self.call.output_level) = levels;
             }
-            MediaResponse::DeviceList { inputs, outputs } => {
+            MediaResponse::DeviceList { inputs, outputs, cameras } => {
                 let bounded = |mut devices: Vec<AudioDevice>| {
                     devices.truncate(DEVICES_LIMIT);
                     for device in &mut devices {
@@ -507,12 +512,22 @@ impl Live {
                     }
                     devices
                 };
-                let (inputs, outputs) = (bounded(inputs), bounded(outputs));
-                if (&self.call.inputs, &self.call.outputs) == (&inputs, &outputs) {
+                let bounded_cameras = |mut devices: Vec<protocol::CameraSource>| {
+                    devices.truncate(DEVICES_LIMIT);
+                    for device in &mut devices {
+                        clip(&mut device.name, 200);
+                        clip(&mut device.id, 400);
+                        clip(&mut device.thumbnail, 600);
+                    }
+                    devices
+                };
+                let (inputs, outputs, cameras) = (bounded(inputs), bounded(outputs), bounded_cameras(cameras));
+                if (&self.call.inputs, &self.call.outputs, &self.call.cameras) == (&inputs, &outputs, &cameras) {
                     return false;
                 }
                 self.call.inputs = inputs;
                 self.call.outputs = outputs;
+                self.call.cameras = cameras;
             }
             // Whom the user verified is chatd's to know; a call that is not a Tiny one never
             // hears this.
@@ -527,11 +542,62 @@ impl Live {
             }
             MediaResponse::Source { .. } | MediaResponse::TinyE2ee { .. } | MediaResponse::TinyRenegotiate { .. } => return false,
             MediaResponse::Picture { path, width, height, generation, user_id, kind } => {
-                let picture = (!path.is_empty()).then(|| CallPicture { path, width, height, generation, user_id, kind });
-                if self.call.picture == picture {
+                let mut changed = false;
+                if path.is_empty() {
+                    if user_id.is_empty() {
+                        if !self.call.pictures.is_empty() || self.call.picture.is_some() {
+                            self.call.pictures.clear();
+                            self.call.picture = None;
+                            changed = true;
+                        }
+                    } else {
+                        let before = self.call.pictures.len();
+                        self.call.pictures.retain(|p| !(p.user_id == user_id && p.kind == kind));
+                        if self.call.pictures.len() != before {
+                            changed = true;
+                        }
+                        if self.call.picture.as_ref().is_some_and(|p| p.user_id == user_id && p.kind == kind) {
+                            self.call.picture = self.call.pictures.first().cloned();
+                            changed = true;
+                        }
+                    }
+                } else {
+                    let picture = CallPicture { path, width, height, generation, user_id, kind };
+                    if let Some(existing) = self
+                        .call
+                        .pictures
+                        .iter_mut()
+                        .find(|p| p.user_id == picture.user_id && p.kind == picture.kind)
+                    {
+                        if *existing != picture {
+                            *existing = picture.clone();
+                            changed = true;
+                        }
+                    } else {
+                        self.call.pictures.push(picture.clone());
+                        changed = true;
+                    }
+                    let primary = self
+                        .call
+                        .pictures
+                        .iter()
+                        .find(|p| p.kind == PictureKind::Share)
+                        .or_else(|| self.call.pictures.first())
+                        .cloned();
+                    if self.call.picture != primary {
+                        self.call.picture = primary;
+                        changed = true;
+                    }
+                }
+                if !changed {
                     return false;
                 }
-                self.call.picture = picture;
+            }
+            MediaResponse::WatchRefused { refused } => {
+                if self.call.watch_refused == refused {
+                    return false;
+                }
+                self.call.watch_refused = refused;
             }
             MediaResponse::SelfView { path, width, height, generation, share } => {
                 let kind = if share { PictureKind::Share } else { PictureKind::Camera };
@@ -747,7 +813,7 @@ impl Handle {
 /// Something mediad said that is no reply, taken into its call `seen` and passed on: to the
 /// shell when it changes what is drawn, to the call's adapter when it is for the network.
 fn heard(hub: &Hub, seen: &Mutex<Live>, frame: MediaResponse) {
-    if let MediaResponse::DeviceList { inputs, outputs } = &frame {
+    if let MediaResponse::DeviceList { inputs, outputs, .. } = &frame {
         learn_devices(hub, inputs, outputs);
     }
     // mediad says its last while it shuts down (I stopped speaking, most often). The call was
@@ -1200,17 +1266,33 @@ impl Calls {
         }
     }
 
-    /// V1 or V2 changed: the call's mediad, or the test's, opens the new choice at once, and
+    /// V1, V2, or V22 changed: the call's mediad, or the test's, opens the new choice at once, and
     /// the next call starts with it too.
     pub fn redevice(&self, hub: &Hub) {
         let (input, output, camera) = {
             let settings = hub.settings();
             (settings.device(INPUT), settings.device(OUTPUT), settings.device(CAMERA))
         };
+        let camera_id = match protocol::settings::DeviceChoice::parse(camera.as_deref()) {
+            protocol::settings::DeviceChoice::Device { id: Some(id), .. } => id,
+            protocol::settings::DeviceChoice::Device { name, id: None } => name,
+            _ => String::new(),
+        };
         let devices = MediaRequest::Devices { input, output, camera };
         let running = crate::hub::lock(&self.slot).handle();
         if let Some(active) = running {
+            let mut changed = false;
+            {
+                let mut live = crate::hub::lock(&active.live);
+                if live.call.camera_id != camera_id {
+                    live.call.camera_id = camera_id;
+                    changed = true;
+                }
+            }
             let _ = active.request(&devices);
+            if changed {
+                self.tell(hub);
+            }
         }
         if let Some(tester) = crate::hub::lock(&self.tester).as_mut() {
             let _ = tester.send(&devices);
@@ -1967,6 +2049,21 @@ impl Calls {
         }
     }
 
+    /// Updates whether camera and screen share are allowed in this call (`video_enabled` on a
+    /// Tiny room, `true` for a direct call).
+    pub fn set_video_allowed(&self, hub: &Hub, conversation: &Key, allowed: bool) {
+        let mut changed = false;
+        if self.update(hub, conversation, |live| {
+            if live.call.video_allowed != allowed {
+                live.call.video_allowed = allowed;
+                changed = true;
+            }
+        }) && changed
+        {
+            self.tell(hub);
+        }
+    }
+
     /// What a Tiny room asks of the call in it: the bitrate to encode at, and whether only
     /// push-to-talk opens the microphone there. Sent when the call joins the room and whenever
     /// the room changes.
@@ -2258,7 +2355,7 @@ mod tests {
             let next = hub.calls.place(&hub, key.clone()).unwrap();
             assert_ne!(old, next);
             let offer = TinyOffer { user_id: "me".into(), host: "127.0.0.1".into(), slots: 1,
-                muted: false, deafened: false, e2ee: None };
+                muted: false, deafened: false, e2ee: None, video_slots: 0 };
             assert!(hub.calls.tiny_direct_offer(&hub, &key, offer, old).is_err());
             hub.calls.fail_ring_attempt(&hub, &key, old, CallFailure::Refused, "old refusal");
             hub.calls.end_intent(&hub, &key, old);
@@ -2272,7 +2369,7 @@ mod tests {
 
     #[test]
     fn an_engine_waiting_for_a_call_draws_and_announces_nothing_but_a_call_that_has_it_does() {
-        let devices = |name: &str| MediaResponse::DeviceList { inputs: vec![AudioDevice { name: name.into(), ..AudioDevice::default() }], outputs: Vec::new() };
+        let devices = |name: &str| MediaResponse::DeviceList { inputs: vec![AudioDevice { name: name.into(), ..AudioDevice::default() }], outputs: Vec::new(), cameras: Vec::new() };
         let mut waiting = live(CallState::Connecting);
         assert!(!waiting.adopted);
         // The first list, and a hot-plug after it: learned, not drawn.
@@ -2421,7 +2518,7 @@ mod tests {
     }
 
     fn tiny_offer(e2ee: Option<protocol::TinyE2ee>) -> TinyOffer {
-        TinyOffer { user_id: "me".into(), host: "127.0.0.1".into(), slots: 11, muted: false, deafened: false, e2ee }
+        TinyOffer { user_id: "me".into(), host: "127.0.0.1".into(), slots: 11, muted: false, deafened: false, e2ee, video_slots: 0 }
     }
 
     fn sealed_offer() -> TinyOffer {
@@ -2508,7 +2605,7 @@ mod tests {
         assert!(live.apply(MediaResponse::Levels { input: 40, output: 90 }), "the speaker has a meter too");
         assert_eq!((live.call.level, live.call.output_level), (Some(40), Some(90)));
         let device = |name: &str| AudioDevice { id: format!("id-{name}"), name: name.into(), ..AudioDevice::default() };
-        let listed = MediaResponse::DeviceList { inputs: vec![device("Mic"); 40], outputs: vec![device("Speakers")] };
+        let listed = MediaResponse::DeviceList { inputs: vec![device("Mic"); 40], outputs: vec![device("Speakers")], cameras: Vec::new() };
         assert!(live.apply(listed.clone()));
         assert!(!live.apply(listed));
         assert_eq!((live.call.inputs.len(), live.call.outputs.len()), (DEVICES_LIMIT, 1));
@@ -2612,5 +2709,26 @@ mod tests {
             CallState::RingingIn { .. }
         ));
         assert!(hub.calls.aside().is_none());
+    }
+
+    #[test]
+    fn camera_setting_is_valid_and_device_list_populates_call_cameras() {
+        let choice = protocol::settings::DeviceChoice::device("Desk USB Camera", "cam-2");
+        assert!(protocol::settings::valid(
+            protocol::settings::GLOBAL,
+            protocol::settings::CAMERA,
+            choice.value().as_deref().unwrap()
+        ));
+        let mut live = live(CallState::Joined);
+        let cams = vec![
+            protocol::CameraSource { id: "cam-1".into(), name: "Built-in".into(), thumbnail: String::new() },
+            protocol::CameraSource { id: "cam-2".into(), name: "Desk USB Camera".into(), thumbnail: String::new() },
+        ];
+        assert!(live.apply(MediaResponse::DeviceList {
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            cameras: cams.clone(),
+        }));
+        assert_eq!(live.call.cameras, cams);
     }
 }
