@@ -1646,6 +1646,9 @@ pub struct Capabilities {
     /// This Tiny server takes archives. Ignored unless `file_scan` is set.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_archives: bool,
+    /// The network takes a description on a picture (`OutgoingFile::alt`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub alt_text: bool,
     /// This Tiny server accepts abuse reports (`POST /v1/reports`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub abuse_reports: bool,
@@ -2420,6 +2423,9 @@ pub struct OutgoingFile {
     /// View-once media (Signal, Telegram): hidden until opened and cannot be kept.
     #[serde(default, skip_serializing_if = "is_false")]
     pub view_once: bool,
+    /// A description of the picture. Empty: none. chatd clips it to [`crate::ALT_LIMIT`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub alt: String,
     /// Optional video/audio metadata and poster thumbnail path staged by the shell.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media: Option<OutgoingMedia>,

@@ -5932,6 +5932,7 @@ mod tests {
         ctx.hub.store().ingest(&ctx.key("direct-1"), &pending, false).unwrap();
         let outgoing = Outgoing {
             files: vec![protocol::OutgoingFile {
+                alt: String::new(),
                 path: path.to_string_lossy().into_owned(),
                 name: "notes.pdf".into(),
                 spoiler: false,

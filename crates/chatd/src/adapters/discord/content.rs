@@ -596,11 +596,14 @@ fn attachment(rich: &mut Rich, attached: &Attached, blur_explicit: bool) -> Atta
         }
         thumb
     });
+    // A title the sender gave the file is the name shown; a blank one is no title.
+    let name = attached.title.as_deref().map(str::trim).filter(|title| !title.is_empty()).unwrap_or(&attached.filename);
     Attachment {
+        alt: protocol::clip_alt(attached.description.as_deref().unwrap_or("")),
         spoiler: attached.spoiler() || (blur_explicit && attached.is_explicit()),
         sticker: false,
         waveform: waveform(attached.waveform.as_deref()),
-        name: attached.filename.clone(),
+        name: name.to_owned(),
         file,
         thumb,
         preview: None,
@@ -635,6 +638,7 @@ fn sticker(rich: &mut Rich, sticker: &model::Sticker) -> Attachment {
     }
     rich.files.push((file.clone(), url));
     Attachment {
+        alt: String::new(),
         spoiler: false,
         sticker: true,
         waveform: Vec::new(),
@@ -1690,6 +1694,7 @@ fn component_media_attachment(
     };
     rich.files.push((file.clone(), fetch_url.to_owned()));
     Some(Attachment {
+        alt: String::new(),
         name,
         file,
         thumb: None,
@@ -2705,6 +2710,7 @@ mod tests {
             channel_id: "c1".into(),
             author: Some(model::User { id: "2001".into(), username: "bea".into(), ..Default::default() }),
             attachments: Some(vec![Attached {
+                title: None, description: None,
                 id: "9001".into(),
                 filename: "pic.png".into(),
                 size: 1024,

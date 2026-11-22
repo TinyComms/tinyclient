@@ -1207,6 +1207,7 @@ impl Discord {
             edit_window: 0,
             file_scan: false,
             allow_archives: false,
+            alt_text: true,
             voice_notes: true,
             direct_calls: false,
             revisions: false,

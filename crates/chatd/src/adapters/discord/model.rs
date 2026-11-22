@@ -1608,6 +1608,12 @@ pub struct Attachment {
     pub height: u32,
     #[serde(default)]
     pub content_type: Option<String>,
+    /// A name the sender gave this file. Missing or blank: [`Self::filename`] is shown.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Alt text for a picture. Missing: none.
+    #[serde(default)]
+    pub description: Option<String>,
     #[serde(default, deserialize_with = "nullable")]
     pub duration_secs: f64,
     /// A voice message's loudness, base64 of one byte a bar.

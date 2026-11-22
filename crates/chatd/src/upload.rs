@@ -82,6 +82,8 @@ pub struct Source {
     pub spoiler: bool,
     pub as_file: bool,
     pub original: bool,
+    /// A description of the picture, already clipped. Empty: none.
+    pub alt: String,
     /// The shell staged it in `outbox/`, so it goes once the message went.
     outbox: bool,
     file: File,
@@ -235,6 +237,7 @@ impl Upload {
                 spoiler: staged.spoiler,
                 as_file: staged.as_file,
                 original: staged.original,
+                alt: protocol::clip_alt(&staged.alt),
                 outbox,
                 file,
                 media: staged.media.clone(),
@@ -840,6 +843,7 @@ mod tests {
     #[test]
     fn names_are_one_plain_file_name_and_types_come_from_the_extension() {
         let staged = |path: &str, name: &str| OutgoingFile {
+            alt: String::new(),
             path: path.to_owned(),
             name: name.to_owned(),
             spoiler: false,

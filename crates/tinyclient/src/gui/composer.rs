@@ -675,6 +675,8 @@ pub struct Composer {
     tray: Vec<Staged>,
     next_chip: u64,
     chip_menu: Option<u64>,
+    /// The chip whose description is being typed, and the field.
+    alt_for: Option<(u64, Entity<TextInput>)>,
     thumbs: Images,
     drag: Option<DragOver>,
     // The picker and `:`.
@@ -952,6 +954,7 @@ impl Composer {
             tray: Vec::new(),
             next_chip: 1,
             chip_menu: None,
+            alt_for: None,
             // Chips and the `:` list are small: each moving one holds little.
             thumbs: Images::with_limits(crate::frames::SMALL),
             drag: None,
@@ -1579,6 +1582,7 @@ impl Composer {
         self.thread_settings = None;
         self.close_picker(cx);
         self.chip_menu = None;
+        self.alt_for = None;
         let files = std::mem::take(&mut self.tray);
         let Some(old) = self.target.as_ref().map(|old| old.key.clone()) else {
             return;
@@ -3520,6 +3524,9 @@ impl Composer {
             delete_later(chip.made());
         }
         self.chip_menu = None;
+        if self.alt_for.as_ref().is_some_and(|(open, _)| !self.tray.iter().any(|chip| chip.id == *open)) {
+            self.alt_for = None;
+        }
         self.caption = None;
         self.focus_next = true;
         cx.notify();

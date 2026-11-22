@@ -347,6 +347,10 @@ impl Discord {
                 return Err(why);
             }
             let mut entry = json!({"id": at.to_string(), "filename": name, "uploaded_filename": slot.upload_filename});
+            // A description goes on the message only, and only when there is one.
+            if let Some(alt) = up.files().get(at).map(|file| file.alt.as_str()).filter(|alt| !alt.is_empty()) {
+                entry["description"] = json!(alt);
+            }
             if let Some(voice) = voice {
                 entry["duration_secs"] = json!(f64::from(voice.duration) / 1000.0);
                 entry["waveform"] = json!(encode_waveform(&voice.waveform));

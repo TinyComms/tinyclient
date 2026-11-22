@@ -2381,7 +2381,7 @@ fn mentions_missed_while_closed_info_mute_seen_hidden_chats_and_files_through_on
     let path = staged.join("notes.txt");
     std::fs::write(&path, b"standup notes").unwrap();
     let with = protocol::Outgoing {
-        files: vec![protocol::OutgoingFile { path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: false, as_file: false, original: false, view_once: false, media: None }],
+        files: vec![protocol::OutgoingFile { alt: String::new(), path: path.to_string_lossy().into_owned(), name: String::new(), spoiler: false, as_file: false, original: false, view_once: false, media: None }],
         ..Default::default()
     };
     let asked = Request::Send { conversation: key(CHAT_ANA), client_id: "88001".into(), text: "notes attached".into(), reply_to: None, with };
@@ -3345,6 +3345,7 @@ fn sending_files_in_channels_uses_sharepoint_folder_and_refused_external_invite_
     // 1. Channel upload goes to the channel's SharePoint filesFolder (no /invite, no /createLink).
     let with = protocol::Outgoing {
         files: vec![protocol::OutgoingFile {
+            alt: String::new(),
             path: report.to_string_lossy().into_owned(),
             name: String::new(),
             spoiler: false,
@@ -3393,6 +3394,7 @@ fn sending_files_in_channels_uses_sharepoint_folder_and_refused_external_invite_
     let dee_chat = dee_row.key;
     let with_guest = protocol::Outgoing {
         files: vec![protocol::OutgoingFile {
+            alt: String::new(),
             path: report.to_string_lossy().into_owned(),
             name: String::new(),
             spoiler: false,
@@ -5001,6 +5003,7 @@ fn inline_pasted_images_upload_to_ams_and_send_as_richtext_html() {
         reply_to: None,
         with: protocol::Outgoing {
             files: vec![protocol::OutgoingFile {
+                alt: String::new(),
                 path: img_path.to_string_lossy().into_owned(),
                 name: "screenshot.png".into(),
                 spoiler: false,
@@ -5405,6 +5408,7 @@ fn voice_messages_and_video_clips_can_be_played_and_recorded() {
         reply_to: None,
         with: protocol::Outgoing {
             files: vec![protocol::OutgoingFile {
+                alt: String::new(),
                 path: clip_path.to_string_lossy().into_owned(),
                 name: "voice-note.opus".to_owned(),
                 spoiler: false,
@@ -5449,6 +5453,7 @@ fn voice_messages_and_video_clips_can_be_played_and_recorded() {
             reply_to: None,
             with: protocol::Outgoing {
                 files: vec![protocol::OutgoingFile {
+                    alt: String::new(),
                     path: clip_path.to_string_lossy().into_owned(),
                     name: name.to_owned(),
                     spoiler: false,
@@ -5482,6 +5487,7 @@ fn voice_messages_and_video_clips_can_be_played_and_recorded() {
         reply_to: None,
         with: protocol::Outgoing {
             files: vec![protocol::OutgoingFile {
+                alt: String::new(),
                 path: clip_path.to_string_lossy().into_owned(),
                 name: "notes.txt".to_owned(),
                 spoiler: false,

@@ -4921,7 +4921,7 @@ fn send_with(world: &World, conversation: &str, client_id: &str, text: &str, rep
 }
 
 fn file(path: &str, spoiler: bool) -> protocol::OutgoingFile {
-    protocol::OutgoingFile { path: path.to_owned(), name: String::new(), spoiler, as_file: false, original: false, view_once: false, media: None }
+    protocol::OutgoingFile { alt: String::new(), path: path.to_owned(), name: String::new(), spoiler, as_file: false, original: false, view_once: false, media: None }
 }
 
 #[test]
@@ -5181,6 +5181,7 @@ fn upload_limit_honors_server_boost_tier() {
     std::fs::File::create(&big).unwrap().set_len(40 << 20).unwrap();
     let outgoing = || protocol::Outgoing {
         files: vec![protocol::OutgoingFile {
+            alt: String::new(),
             path: big.to_string_lossy().into_owned(),
             name: String::new(),
             spoiler: false,
@@ -12896,4 +12897,51 @@ fn a_site_player_stays_a_card_and_a_byte_window_is_not_stored_as_the_file() {
         (windows >= 2).then_some(seen)
     });
     assert_eq!(seen[0].headers.get("range").map(String::as_str), Some("bytes=0-65535"));
+}
+
+/// What the account may do, as the shell is told.
+fn can(world: &World) -> protocol::Capabilities {
+    match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|account| account.key == world.account()).unwrap().can,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A picture's description arrives as its alt text, and a description we type is sent with the
+/// message, clipped, and not with the upload request.
+#[test]
+fn an_image_description_is_kept_on_the_way_in_and_sent_on_the_way_out() {
+    let world = polished();
+    assert!(can(&world).alt_text);
+    open_channel(&world, "4101");
+    let picture = |id: &str, name: &str, title: &str, description: &str| {
+        let url = format!("{}/media/attachments/4101/{id}/{name}", world.api);
+        let attached = json!({"id": id, "filename": name, "title": title, "description": description, "content_type": "image/png",
+            "width": 800, "height": 600, "size": 1200, "url": url, "proxy_url": url});
+        let message = world.incoming("4101", Some("4000"), "", json!({"attachments": [attached]}));
+        wait("the picture", || world.messages("4101").into_iter().find(|found| found.id == message)).attachments.remove(0)
+    };
+    let titled = picture("9301", "map.png", "Trail map", "the north ridge");
+    assert_eq!((titled.name.as_str(), titled.alt.as_str()), ("Trail map", "the north ridge"));
+    // A title of only spaces is no title: the file's own name stays.
+    let untitled = picture("9302", "ridge.png", "   ", "  fog on the ridge  ");
+    assert_eq!((untitled.name.as_str(), untitled.alt.as_str()), ("ridge.png", "fog on the ridge"));
+
+    let photo = staged(&world, "ridge.png", 1000);
+    let mut described = file(&photo, false);
+    described.alt = format!("{}{}", "é", "a".repeat(1024));
+    send_with(&world, "4101", "77010", "", None, protocol::Outgoing { files: vec![described], ..Default::default() });
+    world.outcome("4101", "77010");
+    let named = &world.discord.requests_to("POST", "/channels/4101/attachments")[0].body["files"][0];
+    assert!(named.get("description").is_none(), "the upload request does not carry a description: {named}");
+    let posted = &world.discord.requests_to("POST", "/channels/4101/messages")[0].body["attachments"][0];
+    let description = posted["description"].as_str().unwrap_or("");
+    assert_eq!(description.chars().count(), 1024);
+    assert!(description.starts_with('é'), "{description}");
+
+    let plain = staged(&world, "notes.txt", 4);
+    send_with(&world, "4101", "77011", "", None, protocol::Outgoing { files: vec![file(&plain, false)], ..Default::default() });
+    world.outcome("4101", "77011");
+    let posted = &world.discord.requests_to("POST", "/channels/4101/messages")[1].body["attachments"][0];
+    assert!(posted.get("description").is_none(), "an empty description is left off: {posted}");
 }

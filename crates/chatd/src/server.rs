@@ -7386,6 +7386,7 @@ fn outgoing_files(message: &Message) -> Vec<protocol::OutgoingFile> {
     let ours = message.attachments.iter().filter(|attachment| attachment.file.id.starts_with("upload-"));
     ours.filter_map(|attachment| {
         Some(protocol::OutgoingFile {
+            alt: String::new(),
             path: attachment.file.path.clone()?,
             name: attachment.name.clone(),
             spoiler: attachment.spoiler,
@@ -7749,6 +7750,7 @@ pub fn prove_offline_queue() -> Result<(), String> {
         "pic",
         Outgoing {
             files: vec![protocol::OutgoingFile {
+                alt: String::new(),
                 path: "pic.png".into(),
                 name: "pic.png".into(),
                 spoiler: false,

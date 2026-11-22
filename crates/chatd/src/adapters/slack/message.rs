@@ -1470,6 +1470,7 @@ impl Slack {
         let duration = if duration_ms > 0 { (duration_ms / 1000).max(1) as u32 } else { 0 };
         let transcript = self.clip_transcript(id, file, media);
         Some(Attachment {
+            alt: String::new(),
             // Slack has neither spoilers nor stickers.
             spoiler: false,
             sticker: false,

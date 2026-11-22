@@ -2719,6 +2719,11 @@ impl Pane {
                     (true, true) if anim::badged(Play::Inline) => tile.child(badge("GIF".to_owned()).left(px(6.))),
                     _ => tile,
                 };
+                // A described picture says so, and says what on hover.
+                let tile = match attachment.alt.is_empty() {
+                    true => tile,
+                    false => tile.tooltip(tip(attachment.alt.clone(), None)).child(badge("ALT".to_owned()).right(px(6.))),
+                };
                 tile.on_click(cx.listener(move |this, _, window, cx| this.open_viewer(&id, index, window, cx)))
             }
         };

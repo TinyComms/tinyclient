@@ -418,6 +418,9 @@ pub struct Attachment {
     /// Hidden until the user asks to see it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub spoiler: bool,
+    /// A description of the picture, for a reader who cannot see it. At most [`ALT_LIMIT`] characters.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub alt: String,
     /// A sticker: drawn at its own size with no frame, and its transparency kept.
     #[serde(default, skip_serializing_if = "is_false")]
     pub sticker: bool,
@@ -465,8 +468,17 @@ impl Attachment {
             page: String::new(),
             transcription: None,
             transcript: None,
+            alt: String::new(),
         }
     }
+}
+
+/// Discord's limit for an image description.
+pub const ALT_LIMIT: usize = 1024;
+
+/// The description a network will keep: trimmed, and no longer than [`ALT_LIMIT`] characters.
+pub fn clip_alt(text: &str) -> String {
+    text.trim().chars().take(ALT_LIMIT).collect()
 }
 
 /// A link's card, as the network or sender built it. Readers never fetch the linked site;

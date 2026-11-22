@@ -399,6 +399,7 @@ mod tests {
     #[test]
     fn an_attachment_is_drawn_by_what_it_is() {
         let attachment = |name: &str, kind, mime: &str, thumb: bool, duration| Attachment {
+            alt: String::new(),
             spoiler: false,
             sticker: false,
             waveform: Vec::new(),
