@@ -1098,6 +1098,8 @@ impl Slack {
                 id: stored.id,
                 sender: stored.sender.name,
                 snippet: if stored.deleted { String::new() } else { stored.text.chars().take(120).collect() },
+                thumb: None,
+                story: false,
             },
             None => ReplyTo {
                 deleted: false,
@@ -1105,6 +1107,8 @@ impl Slack {
                 id: root.to_owned(),
                 sender: String::new(),
                 snippet: String::new(),
+                thumb: None,
+                story: false,
             },
         })
     }

@@ -3562,11 +3562,21 @@ impl Pane {
     fn reply_line(&mut self, reply: &protocol::ReplyTo, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let metrics = self.metrics;
         let target = reply.id.clone();
-        let gone = reply.deleted || (reply.sender.is_empty() && reply.snippet.is_empty());
-        let snippet = match (gone, reply.snippet.is_empty()) {
-            (true, _) => "Original message was deleted".to_owned(),
-            (false, true) => "Attachment".to_owned(),
-            (false, false) => reply.snippet.replace('\n', " "),
+        let gone = reply.deleted || (!reply.story && reply.sender.is_empty() && reply.snippet.is_empty());
+        let label = if reply.story {
+            if reply.sender.is_empty() || reply.sender.eq_ignore_ascii_case("You") {
+                "Replied to your story".to_owned()
+            } else {
+                format!("Replied to {}'s story", reply.sender)
+            }
+        } else {
+            reply.sender.clone()
+        };
+        let snippet = match (gone, reply.snippet.is_empty(), reply.story) {
+            (true, _, _) => "Original message was deleted".to_owned(),
+            (false, true, true) => String::new(),
+            (false, true, false) => "Attachment".to_owned(),
+            (false, false, _) => reply.snippet.replace('\n', " "),
         };
         let face = (!gone).then(|| {
             let (_, file) = reply.person.as_ref().map(|person| self.who(person, cx)).unwrap_or_default();
@@ -3576,6 +3586,21 @@ impl Pane {
             };
             self.face(plate, file.as_ref(), 16., Shape::Person, window, cx)
         });
+        let thumb = (!gone).then(|| {
+            let file = reply.thumb.as_ref()?;
+            let edge = media::square_size(18., window.scale_factor());
+            match self.still(file, edge, edge, Some(1.), cx) {
+                Picture::Ready(image) => Some(
+                    div()
+                        .flex_none()
+                        .size(px(18.))
+                        .rounded(px(3.))
+                        .overflow_hidden()
+                        .child(anim::picture(image, ObjectFit::Cover, 3., Play::Hover)),
+                ),
+                _ => None,
+            }
+        }).flatten();
         // The elbow runs from the middle of the avatar column up and across to the quote.
         let reach = metrics.avatar / 2. + metrics.gap - 4.;
         div()
@@ -3607,10 +3632,13 @@ impl Pane {
                 ),
             )
             .children(face)
-            .children((!gone).then(|| {
-                div().flex_none().font_weight(theme::SEMIBOLD).text_color(theme::text_soft()).child(reply.sender.clone())
+            .children((!gone && !label.is_empty()).then(|| {
+                div().flex_none().font_weight(theme::SEMIBOLD).text_color(theme::text_soft()).child(label)
             }))
-            .child(div().min_w_0().truncate().when(gone, |snippet| snippet.italic()).child(snippet))
+            .children(thumb)
+            .children((!snippet.is_empty()).then(|| {
+                div().min_w_0().truncate().when(gone, |snippet| snippet.italic()).child(snippet)
+            }))
     }
 
     /// A channel post's footer: how many people saw it, as Telegram's apps say it. Telegram

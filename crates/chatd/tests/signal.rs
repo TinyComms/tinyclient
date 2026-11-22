@@ -357,9 +357,12 @@ fn a_group_mention_counts_and_what_cannot_be_drawn_says_so() {
     let mention = world.arrived(CLUB, &id(T0 + 2_000, GRACE));
     assert!(mention.mentions_me && mention.text == "@Ada Quill you're dealing", "{mention:?}");
     assert_eq!(world.conversation(CLUB).unwrap().mentions, 1);
-    world.steer(&format!("photo grace {}", T0 + 3_000));
-    let photo = world.arrived(GRACE, &id(T0 + 3_000, GRACE));
-    assert_eq!((photo.text.as_str(), &photo.kind), ("Photo", &MessageKind::Unsupported { link: String::new() }));
+    world.steer(&format!("giftbadge grace {}", T0 + 3_000));
+    let badge = world.arrived(GRACE, &id(T0 + 3_000, GRACE));
+    assert_eq!(
+        (badge.text.as_str(), &badge.kind),
+        ("Gift badge · open Signal on your phone to redeem", &MessageKind::Unsupported { link: String::new() })
+    );
     // The group's reply goes to the group.
     world.send(CLUB, "2001", "I am.", None);
     world.heard(&format!("send {CLUB} text I am."));
@@ -380,10 +383,13 @@ fn a_view_once_message_says_where_it_opens_instead_of_promising_the_media() {
     world.steer(&format!("viewonce-video grace {}", T0 + 5_000));
     let video = world.arrived(GRACE, &id(T0 + 5_000, GRACE));
     assert_eq!(video.text.as_str(), "View-once video · open it on your phone");
-    // A photo without the flag is still only labelled.
+    // A normal photo without the view-once flag arrives as a real image attachment with a BlurHash preview.
     world.steer(&format!("photo grace {}", T0 + 6_000));
     let photo = world.arrived(GRACE, &id(T0 + 6_000, GRACE));
-    assert_eq!(photo.text.as_str(), "Photo");
+    assert_eq!(photo.kind, MessageKind::Normal);
+    assert_eq!(photo.attachments.len(), 1);
+    assert_eq!(photo.attachments[0].file.kind, protocol::MediaKind::Image);
+    assert!(photo.attachments[0].preview.is_some(), "photo should carry an instant BlurHash preview");
 }
 
 #[test]
@@ -2670,5 +2676,742 @@ fn group_at_mentions_send_and_edit_as_ufffc_with_utf16_body_ranges_and_echo_name
             .contains(&format!("send {CLUB} edit {sent_ts} updated \u{FFFC} ranges=Mention({ALAN}):8+1")),
         "expected edit wire body with U+FFFC and Mention(ALAN):8+1, calls: {:?}",
         world.calls()
+    );
+}
+
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Encrypts `plaintext` with Signal's attachment cipher (AES-256-CBC + HMAC-SHA256 + SHA-256 digest).
+fn encrypt_signal_blob(plaintext: &[u8], key: &[u8; 64], iv: &[u8; 16]) -> (Vec<u8>, [u8; 32]) {
+    use aes::cipher::{BlockEncrypt, KeyInit};
+    use aes::Aes256;
+    use hmac::{Hmac, Mac};
+    use sha2::{Digest, Sha256};
+
+    let aes = Aes256::new_from_slice(&key[..32]).unwrap();
+    let pad = 16 - (plaintext.len() % 16);
+    let mut out = Vec::with_capacity(16 + plaintext.len() + pad + 32);
+    out.extend_from_slice(iv);
+    let mut prev = *iv;
+    let mut chunks = plaintext.chunks_exact(16);
+    for chunk in &mut chunks {
+        let mut block = [0u8; 16];
+        for i in 0..16 {
+            block[i] = chunk[i] ^ prev[i];
+        }
+        aes.encrypt_block((&mut block).into());
+        out.extend_from_slice(&block);
+        prev = block;
+    }
+    let rem = chunks.remainder();
+    let mut last = [pad as u8; 16];
+    last[..rem.len()].copy_from_slice(rem);
+    for i in 0..16 {
+        last[i] ^= prev[i];
+    }
+    aes.encrypt_block((&mut last).into());
+    out.extend_from_slice(&last);
+
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key[32..64]).unwrap();
+    mac.update(&out);
+    out.extend_from_slice(&mac.finalize().into_bytes());
+
+    let digest: [u8; 32] = Sha256::digest(&out).into();
+    (out, digest)
+}
+
+/// Spawns a tiny local HTTP stub serving `routes` (path -> body bytes, or 404 when absent).
+fn spawn_cdn_stub(routes: Vec<(String, Vec<u8>)>) -> (String, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    std::thread::spawn(move || {
+        while !flag.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut buf = [0u8; 2048];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    if let Some((_, body)) = routes.iter().find(|(p, _)| p == path) {
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(header.as_bytes());
+                        let _ = stream.write_all(body);
+                    } else {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    }
+                    let _ = stream.flush();
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => sleep(Duration::from_millis(10)),
+                Err(_) => break,
+            }
+        }
+    });
+    (format!("http://{addr}"), stop)
+}
+
+#[test]
+fn received_photos_videos_gifs_albums_files_and_quote_thumbs_decrypt_from_cdn_and_populate_shared_media() {
+    let photo_plain = b"\xff\xd8\xff\xe0FAKE-JPEG-PHOTO-PAYLOAD-740\xff\xd9".to_vec();
+    let video_plain = b"\x00\x00\x00\x18ftypmp42FAKE-VIDEO-PAYLOAD-740".to_vec();
+    let gif_plain = b"\x00\x00\x00\x18ftypmp42FAKE-GIF-PAYLOAD-740".to_vec();
+    let pdf_plain = b"%PDF-1.7\n1 0 obj << /Title (Q4 Report) >> endobj\n%%EOF".to_vec();
+    let album1_plain = b"\xff\xd8\xff\xe0ALBUM-ONE\xff\xd9".to_vec();
+    let album2_plain = b"\xff\xd8\xff\xe0ALBUM-TWO\xff\xd9".to_vec();
+    let quote_thumb_plain = b"\xff\xd8\xff\xe0QUOTED-THUMB\xff\xd9".to_vec();
+
+    let key_photo = [0x11u8; 64];
+    let key_video = [0x22u8; 64];
+    let key_gif = [0x33u8; 64];
+    let key_pdf = [0x44u8; 64];
+    let key_a1 = [0x55u8; 64];
+    let key_a2 = [0x66u8; 64];
+    let key_qt = [0x77u8; 64];
+    let iv = [0xabu8; 16];
+
+    let (photo_enc, photo_dig) = encrypt_signal_blob(&photo_plain, &key_photo, &iv);
+    let (video_enc, video_dig) = encrypt_signal_blob(&video_plain, &key_video, &iv);
+    let (gif_enc, gif_dig) = encrypt_signal_blob(&gif_plain, &key_gif, &iv);
+    let (pdf_enc, pdf_dig) = encrypt_signal_blob(&pdf_plain, &key_pdf, &iv);
+    let (a1_enc, a1_dig) = encrypt_signal_blob(&album1_plain, &key_a1, &iv);
+    let (a2_enc, a2_dig) = encrypt_signal_blob(&album2_plain, &key_a2, &iv);
+    let (qt_enc, qt_dig) = encrypt_signal_blob(&quote_thumb_plain, &key_qt, &iv);
+
+    let (base, stop_cdn) = spawn_cdn_stub(vec![
+        ("/photo.enc".into(), photo_enc),
+        ("/video.enc".into(), video_enc),
+        ("/gif.enc".into(), gif_enc),
+        ("/report.enc".into(), pdf_enc),
+        ("/a1.enc".into(), a1_enc),
+        ("/a2.enc".into(), a2_enc),
+        ("/qt.enc".into(), qt_enc),
+    ]);
+
+    let world = World::linked();
+    world.connected();
+
+    // 1. Photo with BlurHash + caption
+    world.steer(&format!(
+        "media grace {} image/jpeg 1200 900 0 sunset.jpg {base}/photo.enc {} {} 00TI:j | Sunset over the bay",
+        T0 + 1_000,
+        hex_of(&key_photo),
+        hex_of(&photo_dig),
+    ));
+    let photo_msg = world.arrived(GRACE, &id(T0 + 1_000, GRACE));
+    assert_eq!(photo_msg.kind, MessageKind::Normal);
+    assert_eq!(photo_msg.text, "Sunset over the bay");
+    assert_eq!(photo_msg.attachments.len(), 1);
+    let photo_att = &photo_msg.attachments[0];
+    assert_eq!(photo_att.file.kind, protocol::MediaKind::Image);
+    assert_eq!((photo_att.file.width, photo_att.file.height), (1200, 900));
+    assert!(photo_att.preview.as_ref().and_then(|p| p.path.as_ref()).is_some(), "BlurHash preview should land immediately");
+
+    // Trigger download + decrypt via Request::Fetch
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![photo_att.file.id.clone()], size: None, retry: false });
+    let photo_path = world.until("photo decrypted to disk", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == photo_msg.id)
+            .and_then(|m| m.attachments.first().and_then(|a| a.file.path.clone()))
+    });
+    assert_eq!(std::fs::read(&photo_path).unwrap(), photo_plain);
+
+    // 2. Video with BlurHash poster thumb
+    world.steer(&format!(
+        "media grace {} video/mp4 1920 1080 0 clip.mp4 {base}/video.enc {} {} 00TI:j",
+        T0 + 2_000,
+        hex_of(&key_video),
+        hex_of(&video_dig),
+    ));
+    let video_msg = world.arrived(GRACE, &id(T0 + 2_000, GRACE));
+    assert_eq!(video_msg.attachments[0].file.kind, protocol::MediaKind::Video);
+    assert!(video_msg.attachments[0].thumb.is_some(), "video with BlurHash should expose a poster thumb");
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![video_msg.attachments[0].file.id.clone()], size: None, retry: false });
+    let video_path = world.until("video decrypted to disk", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == video_msg.id)
+            .and_then(|m| m.attachments.first().and_then(|a| a.file.path.clone()))
+    });
+    assert_eq!(std::fs::read(&video_path).unwrap(), video_plain);
+
+    // 3. GIF (FLAG_GIF = 8)
+    world.steer(&format!(
+        "media grace {} video/mp4 480 270 8 wave.mp4 {base}/gif.enc {} {}",
+        T0 + 3_000,
+        hex_of(&key_gif),
+        hex_of(&gif_dig),
+    ));
+    let gif_msg = world.arrived(GRACE, &id(T0 + 3_000, GRACE));
+    assert_eq!(gif_msg.attachments[0].file.kind, protocol::MediaKind::Gif);
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![gif_msg.attachments[0].file.id.clone()], size: None, retry: false });
+    let gif_path = world.until("gif decrypted to disk", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == gif_msg.id)
+            .and_then(|m| m.attachments.first().and_then(|a| a.file.path.clone()))
+    });
+    assert_eq!(std::fs::read(&gif_path).unwrap(), gif_plain);
+
+    // 4. Document / PDF file with original filename
+    world.steer(&format!(
+        "media grace {} application/pdf 0 0 0 report.pdf {base}/report.enc {} {} - | Q4 summary",
+        T0 + 4_000,
+        hex_of(&key_pdf),
+        hex_of(&pdf_dig),
+    ));
+    let pdf_msg = world.arrived(GRACE, &id(T0 + 4_000, GRACE));
+    assert_eq!(pdf_msg.attachments[0].file.kind, protocol::MediaKind::File);
+    assert_eq!(pdf_msg.attachments[0].name, "report.pdf");
+    assert_eq!(pdf_msg.text, "Q4 summary");
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![pdf_msg.attachments[0].file.id.clone()], size: None, retry: false });
+    let pdf_path = world.until("pdf decrypted to disk", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == pdf_msg.id)
+            .and_then(|m| m.attachments.first().and_then(|a| a.file.path.clone()))
+    });
+    assert_eq!(std::fs::read(&pdf_path).unwrap(), pdf_plain);
+
+    // 5. Multi-attachment album
+    world.steer(&format!(
+        "album grace {} image/jpeg|one.jpg|{base}/a1.enc|{}|{} ; image/jpeg|two.jpg|{base}/a2.enc|{}|{}",
+        T0 + 5_000,
+        hex_of(&key_a1),
+        hex_of(&a1_dig),
+        hex_of(&key_a2),
+        hex_of(&a2_dig),
+    ));
+    let album_msg = world.arrived(GRACE, &id(T0 + 5_000, GRACE));
+    assert_eq!(album_msg.attachments.len(), 2);
+    for att in &album_msg.attachments {
+        let _ = world.ask(Request::Fetch { account: account(), ids: vec![att.file.id.clone()], size: None, retry: false });
+    }
+    let album_paths = world.until("both album photos decrypted", || {
+        let m = world.messages(GRACE).into_iter().find(|m| m.id == album_msg.id)?;
+        let p0 = m.attachments.first()?.file.path.clone()?;
+        let p1 = m.attachments.get(1)?.file.path.clone()?;
+        Some((p0, p1))
+    });
+    assert_eq!(std::fs::read(&album_paths.0).unwrap(), album1_plain);
+    assert_eq!(std::fs::read(&album_paths.1).unwrap(), album2_plain);
+
+    // 6. Quoted photo reply carries ReplyTo::thumb and decrypts it
+    world.steer(&format!(
+        "quote-photo grace {} {} {base}/qt.enc {} {} | Love this shot!",
+        T0 + 6_000,
+        T0 + 1_000,
+        hex_of(&key_qt),
+        hex_of(&qt_dig),
+    ));
+    let quote_msg = world.arrived(GRACE, &id(T0 + 6_000, GRACE));
+    let reply = quote_msg.reply_to.as_ref().expect("quoted photo reply_to");
+    assert_eq!(reply.snippet, "Photo");
+    let thumb = reply.thumb.as_ref().expect("quoted photo thumbnail");
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![thumb.id.clone()], size: None, retry: false });
+    let thumb_path = world.until("quoted thumbnail decrypted", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == quote_msg.id)
+            .and_then(|m| m.reply_to?.thumb?.path)
+    });
+    assert_eq!(std::fs::read(&thumb_path).unwrap(), quote_thumb_plain);
+
+    // 7. Expired CDN attachment reports "No longer available"
+    world.steer(&format!(
+        "media grace {} image/jpeg 640 480 0 gone.jpg {base}/missing-404.enc {} {}",
+        T0 + 7_000,
+        hex_of(&key_photo),
+        hex_of(&photo_dig),
+    ));
+    let gone_msg = world.arrived(GRACE, &id(T0 + 7_000, GRACE));
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![gone_msg.attachments[0].file.id.clone()], size: None, retry: false });
+    let failed_reason = world.until("expired attachment marked failed", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == gone_msg.id)
+            .and_then(|m| m.attachments.first()?.file.failed.clone())
+    });
+    assert_eq!(failed_reason, "No longer available");
+
+    // 8. Request::Shared returns Media (photos/videos/gifs) and Files (PDF)
+    let Response::Shared { items: media_items, .. } = world.ask(Request::Shared {
+        conversation: key(GRACE),
+        kind: protocol::SharedKind::Media,
+        before: None,
+        limit: 50,
+        search: false,
+    }) else {
+        panic!("expected Response::Shared for SharedKind::Media");
+    };
+    assert!(media_items.iter().any(|m| m.message_id == photo_msg.id), "photo should appear in SharedKind::Media");
+    assert!(media_items.iter().any(|m| m.message_id == video_msg.id), "video should appear in SharedKind::Media");
+    assert!(media_items.iter().any(|m| m.message_id == album_msg.id), "album should appear in SharedKind::Media");
+
+    let Response::Shared { items: file_items, .. } = world.ask(Request::Shared {
+        conversation: key(GRACE),
+        kind: protocol::SharedKind::Files,
+        before: None,
+        limit: 50,
+        search: false,
+    }) else {
+        panic!("expected Response::Shared for SharedKind::Files");
+    };
+    assert!(file_items.iter().any(|m| m.message_id == pdf_msg.id), "PDF should appear in SharedKind::Files");
+
+    stop_cdn.store(true, Ordering::Relaxed);
+}
+
+#[test]
+fn voice_messages_download_populate_waveform_send_viewed_receipt_and_can_be_sent() {
+    let world = World::linked();
+    world.connected();
+
+    // Signal advertises voice_notes capability.
+    let (accounts, _) = world.status();
+    let signal = accounts.iter().find(|s| s.key == account()).expect("Signal account");
+    assert!(signal.can.voice_notes, "Signal should advertise Capabilities::voice_notes");
+
+    // 1. Incoming voice note arrives as MediaKind::Audio with non-empty initial waveform.
+    world.steer(&format!("voice grace {}", T0 + 10_000));
+    let voice_msg = world.arrived(GRACE, &id(T0 + 10_000, GRACE));
+    assert_eq!(voice_msg.kind, MessageKind::Normal);
+    assert_eq!(voice_msg.attachments.len(), 1);
+    assert_eq!(voice_msg.attachments[0].file.kind, protocol::MediaKind::Audio);
+    assert!(!voice_msg.attachments[0].waveform.is_empty(), "voice note should render as Shape::Voice");
+
+    // 2. Fetching the voice note decrypts/lands it and populates exact duration (2s WAV) and waveform.
+    let file_id = voice_msg.attachments[0].file.id.clone();
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![file_id.clone()], size: None, retry: false });
+    let landed = world.until("voice message downloaded with real duration", || {
+        let msg = world.messages(GRACE).into_iter().find(|m| m.id == voice_msg.id)?;
+        let att = msg.attachments.first()?;
+        (att.file.path.is_some() && att.duration == 2 && att.waveform.len() == 48).then(|| att.clone())
+    });
+    let voice_path = landed.file.path.clone().unwrap();
+
+    // 3. Starting playback sends a Signal `viewed` receipt with receipts=true.
+    let play_resp = world.ask(Request::Play(protocol::PlayRequest::Start {
+        account: account(),
+        file: file_id.clone(),
+        path: voice_path.clone(),
+        conversation: key(GRACE),
+        message: voice_msg.id.clone(),
+        title: "Voice message".into(),
+        at: Some(0),
+        rate: 100,
+        output: None,
+    }));
+    assert_eq!(play_resp, Response::Ok);
+    world.heard(&format!("viewed receipts=true {}", voice_msg.id));
+    let _ = world.ask(Request::Play(protocol::PlayRequest::Stop));
+
+    // With receipts off on Signal, playing sends viewed sync with receipts=false.
+    world.steer("receipts off");
+    world.steer(&format!("voice alan {}", T0 + 11_000));
+    let alan_voice = world.arrived(ALAN, &id(T0 + 11_000, ALAN));
+    let _ = world.ask(Request::Fetch {
+        account: account(),
+        ids: vec![alan_voice.attachments[0].file.id.clone()],
+        size: None,
+        retry: false,
+    });
+    let alan_path = world.until("alan voice landed", || {
+        world
+            .messages(ALAN)
+            .into_iter()
+            .find(|m| m.id == alan_voice.id)
+            .and_then(|m| m.attachments.first()?.file.path.clone())
+    });
+    assert_eq!(
+        world.ask(Request::Play(protocol::PlayRequest::Start {
+            account: account(),
+            file: alan_voice.attachments[0].file.id.clone(),
+            path: alan_path,
+            conversation: key(ALAN),
+            message: alan_voice.id.clone(),
+            title: "Voice message".into(),
+            at: Some(0),
+            rate: 100,
+            output: None,
+        })),
+        Response::Ok
+    );
+    world.heard(&format!("viewed receipts=false {}", alan_voice.id));
+    let _ = world.ask(Request::Play(protocol::PlayRequest::Stop));
+
+    // 4. Sending a recorded voice note goes to Signal with voice=true and keeps duration + waveform.
+    let outbox = world.dir.join("outbox");
+    std::fs::create_dir_all(&outbox).unwrap();
+    let recorded_path = outbox.join("note.ogg");
+    std::fs::write(&recorded_path, b"OggSfake-opus-voice-note-payload").unwrap();
+    let sent_resp = world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "voice-send-1".into(),
+        text: String::new(),
+        reply_to: None,
+        with: Outgoing {
+            files: vec![OutgoingFile {
+                path: recorded_path.to_string_lossy().into_owned(),
+                name: "voice-message.ogg".into(),
+                spoiler: false,
+                view_once: false,
+                as_file: false,
+                original: false,
+                media: None,
+            }],
+            voice: Some(protocol::VoiceNote { duration: 4_200, waveform: vec![40, 120, 200, 90] }),
+            ..Outgoing::default()
+        },
+    });
+    assert!(matches!(sent_resp, Response::Sent { .. }), "expected Sent, got {sent_resp:?}");
+    world.heard(&format!("send {GRACE} files voice-message.ogg voice=true"));
+    let echoed = world.until("sent voice note stored with waveform and duration", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("voice-send-1") && m.id != "voice-send-1")
+    });
+    assert_eq!(echoed.attachments.len(), 1);
+    assert_eq!(echoed.attachments[0].file.kind, protocol::MediaKind::Audio);
+    assert_eq!(echoed.attachments[0].duration, 5);
+    assert_eq!(echoed.attachments[0].waveform, vec![40, 120, 200, 90]);
+}
+
+#[test]
+fn voice_note_with_a_bad_digest_fails_and_sends_no_viewed_receipt() {
+    let plain = b"not-a-real-voice-note".to_vec();
+    let media_key = [0x5au8; 64];
+    let iv = [0x11u8; 16];
+    let (enc, digest) = encrypt_signal_blob(&plain, &media_key, &iv);
+    let mut bad = digest;
+    bad[0] ^= 0xff;
+    let (base, stop_cdn) = spawn_cdn_stub(vec![("/bad-voice.enc".into(), enc)]);
+
+    let world = World::linked();
+    world.connected();
+    let sent = T0 + 40_000;
+    world.steer(&format!(
+        "voice grace {sent} {base}/bad-voice.enc {} {}",
+        hex_of(&media_key),
+        hex_of(&bad),
+    ));
+    let voice_msg = world.arrived(GRACE, &id(sent, GRACE));
+    let file_id = voice_msg.attachments[0].file.id.clone();
+    assert!(voice_msg.attachments[0].file.path.is_none());
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![file_id.clone()], size: None, retry: false });
+    let failed = world.until("bad digest marked failed", || {
+        let msg = world.messages(GRACE).into_iter().find(|m| m.id == voice_msg.id)?;
+        let file = msg.attachments.first()?.file.clone();
+        if file.failed.as_deref() == Some("Attachment digest mismatch.") {
+            Some(file)
+        } else {
+            None
+        }
+    });
+    assert!(failed.path.is_none(), "a bad digest must not leave a file to play");
+
+    let play = world.ask(Request::Play(protocol::PlayRequest::Start {
+        account: account(),
+        file: file_id,
+        path: String::new(),
+        conversation: key(GRACE),
+        message: voice_msg.id,
+        title: "Voice message".into(),
+        at: Some(0),
+        rate: 100,
+        output: None,
+    }));
+    assert!(
+        matches!(play, Response::Error { code: ErrorCode::Media, .. }),
+        "playback must not start, got {play:?}"
+    );
+    assert!(
+        world.calls().iter().all(|line| !line.starts_with("viewed ")),
+        "fake wire heard a viewed line: {:?}",
+        world.calls().iter().filter(|line| line.starts_with("viewed ")).collect::<Vec<_>>()
+    );
+    stop_cdn.store(true, Ordering::Relaxed);
+}
+
+#[test]
+fn stickers_render_inline_packs_install_sync_persist_and_stickers_send() {
+    let mut world = World::linked();
+    world.connected();
+
+    let (accounts, _) = world.status();
+    let signal = accounts.iter().find(|s| s.key == account()).expect("Signal account");
+    assert!(signal.can.stickers, "Signal should advertise Capabilities::stickers");
+
+    let pack_id = "0123456789abcdef0123456789abcdef";
+    let pack_key = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let pack_url = format!("https://signal.art/addstickers/#pack_id={pack_id}&pack_key={pack_key}");
+
+    // 1. Incoming encrypted sticker renders inline as Attachment { sticker: true } and decrypts on Fetch.
+    let sticker_plain = b"RIFF\x10\x00\x00\x00WEBPVP8 STICKER-744".to_vec();
+    let att_key = [0x99u8; 64];
+    let (st_enc, st_dig) = encrypt_signal_blob(&sticker_plain, &att_key, &[0x12u8; 16]);
+    let (base, stop_cdn) = spawn_cdn_stub(vec![("/st.enc".into(), st_enc)]);
+
+    world.steer(&format!(
+        "sticker grace {} {pack_id} {pack_key} 0 😺 {base}/st.enc {} {}",
+        T0 + 20_000,
+        hex_of(&att_key),
+        hex_of(&st_dig),
+    ));
+    let st_msg = world.arrived(GRACE, &id(T0 + 20_000, GRACE));
+    assert_eq!(st_msg.kind, MessageKind::Normal);
+    assert_eq!(st_msg.attachments.len(), 1);
+    assert!(st_msg.attachments[0].sticker, "incoming sticker must set attachment.sticker = true");
+    assert_eq!(st_msg.attachments[0].name, "😺");
+    let _ = world.ask(Request::Fetch {
+        account: account(),
+        ids: vec![st_msg.attachments[0].file.id.clone()],
+        size: None,
+        retry: false,
+    });
+    let st_path = world.until("sticker decrypted to disk", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.id == st_msg.id)
+            .and_then(|m| m.attachments.first()?.file.path.clone())
+    });
+    assert_eq!(std::fs::read(&st_path).unwrap(), sticker_plain);
+    stop_cdn.store(true, Ordering::Relaxed);
+
+    // 2. A signal.art/addstickers link attaches an install card; preview and install work via Handoff.
+    world.steer(&format!("incoming grace {} Check out {pack_url}", T0 + 21_000));
+    let link_msg = world.arrived(GRACE, &id(T0 + 21_000, GRACE));
+    assert_eq!(link_msg.card.as_deref().map(|c| c.footer.as_str()), Some("Install sticker pack"));
+
+    let preview_cmd = format!("\u{1}signal-sticker-preview\u{1}{pack_url}");
+    let Response::Link { url: preview_json } = world.ask(Request::Handoff { conversation: key(&preview_cmd) }) else {
+        panic!("expected preview JSON in Response::Link");
+    };
+    assert!(preview_json.contains("Signal Cats"), "preview json: {preview_json}");
+
+    let install_cmd = format!("\u{1}signal-sticker-install\u{1}{pack_url}");
+    let Response::Link { url: install_json } = world.ask(Request::Handoff { conversation: key(&install_cmd) }) else {
+        panic!("expected install JSON in Response::Link");
+    };
+    assert!(install_json.contains("\"installed\":true"), "install json: {install_json}");
+    world.heard(&format!("sticker-pack-install {pack_id}"));
+
+    // 3. Catalog { kind: Stickers } lists installed packs and stickers; fetching a catalog tile downloads it.
+    let Response::Catalog { items, .. } = world.ask(Request::Catalog {
+        account: account(),
+        space: None,
+        kind: protocol::CatalogKind::Stickers,
+        query: String::new(),
+        cursor: None,
+    }) else {
+        panic!("expected Response::Catalog");
+    };
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].pack, "Signal Cats");
+    assert_eq!(items[0].id, format!("{pack_id}:0"));
+    let tile_id = items[0].file.as_ref().expect("catalog sticker tile").id.clone();
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![tile_id], size: None, retry: false });
+    world.heard(&format!("sticker-download {pack_id}:0"));
+
+    // 4. Sending a picked sticker goes out on the wire and stores a local sticker attachment.
+    let send_resp = world.ask(Request::Send {
+        conversation: key(GRACE),
+        client_id: "sticker-send-1".into(),
+        text: String::new(),
+        reply_to: None,
+        with: Outgoing {
+            pick: Some(protocol::Pick { kind: protocol::CatalogKind::Stickers, id: format!("{pack_id}:0") }),
+            ..Outgoing::default()
+        },
+    });
+    assert!(matches!(send_resp, Response::Sent { .. }), "expected Sent, got {send_resp:?}");
+    world.heard(&format!("send {GRACE} sticker {pack_id}:0 😺"));
+    let sent_st = world.until("sent sticker echoed", || {
+        world
+            .messages(GRACE)
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("sticker-send-1") && m.id != "sticker-send-1")
+    });
+    assert_eq!(sent_st.attachments.len(), 1);
+    assert!(sent_st.attachments[0].sticker);
+
+    // 5. Installed packs persist across restart, and phone sync install/remove updates the catalog.
+    world.restart();
+    world.connected();
+    let Response::Catalog { items: after_restart, .. } = world.ask(Request::Catalog {
+        account: account(),
+        space: None,
+        kind: protocol::CatalogKind::Stickers,
+        query: String::new(),
+        cursor: None,
+    }) else {
+        panic!("expected Response::Catalog after restart");
+    };
+    assert_eq!(after_restart.len(), 2, "installed sticker pack must persist across restart");
+
+    let pack2_id = "fedcba9876543210fedcba9876543210";
+    let pack2_key = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    world.steer(&format!("sticker-pack-op install {pack2_id} {pack2_key} Party Pack|Signal"));
+    world.until("synced pack appears in catalog", || {
+        let Response::Catalog { items, .. } = world.ask(Request::Catalog {
+            account: account(),
+            space: None,
+            kind: protocol::CatalogKind::Stickers,
+            query: "Party".into(),
+            cursor: None,
+        }) else {
+            return None;
+        };
+        (!items.is_empty()).then_some(())
+    });
+
+    world.steer(&format!("sticker-pack-op remove {pack2_id} {pack2_key}"));
+    world.until("removed pack disappears from catalog", || {
+        let Response::Catalog { items, .. } = world.ask(Request::Catalog {
+            account: account(),
+            space: None,
+            kind: protocol::CatalogKind::Stickers,
+            query: "Party".into(),
+            cursor: None,
+        }) else {
+            return None;
+        };
+        items.is_empty().then_some(())
+    });
+
+    // Local remove command removes pack_id and tells the wire.
+    let remove_cmd = format!("\u{1}signal-sticker-remove\u{1}{pack_id}");
+    assert_eq!(world.ask(Request::Handoff { conversation: key(&remove_cmd) }), Response::Link { url: "removed".into() });
+    world.heard(&format!("sticker-pack-remove {pack_id}"));
+}
+
+#[test]
+fn stories_receive_expire_reply_react_view_post_with_distribution_lists_and_toggle_off() {
+    let world = World::linked();
+    world.connected();
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let fresh_ts = now_ms - 60_000;
+    let expired_ts = now_ms - 25 * 3_600 * 1_000;
+
+    // 1. Fresh text story from Grace lands in the "stories" conversation with a 24h expiry.
+    world.steer(&format!("story grace {fresh_ts} text replies=on bg=112233 | Good morning from the trail!"));
+    let story_msg = world.arrived("stories", &id(fresh_ts, GRACE));
+    assert_eq!(story_msg.text, "Good morning from the trail!");
+    assert_eq!(story_msg.expires_at, Some((fresh_ts / 1_000) as i64 + 86_400));
+    assert_eq!(story_msg.card.as_deref().map(|c| c.footer.as_str()), Some("Story · replies allowed"));
+
+    // 2. Story older than 24 hours is dropped immediately on arrival.
+    world.steer(&format!("story grace {expired_ts} text | Yesterday's expired story"));
+    let fresh_ts2 = fresh_ts + 1_000;
+    world.steer(&format!("story alan {fresh_ts2} text replies=off | No replies here"));
+    let alan_story = world.arrived("stories", &id(fresh_ts2, ALAN));
+    assert_eq!(alan_story.card.as_deref().map(|c| c.footer.as_str()), Some("Story · replies off"));
+    let all_stories = world.messages("stories");
+    assert!(
+        !all_stories.iter().any(|m| m.id == id(expired_ts, GRACE)),
+        "expired story (>24h old) must not be kept"
+    );
+
+    // 3. Incoming story reply in 1:1 chat sets reply_to.story == true and carries the story snippet.
+    let reply_ts = fresh_ts + 2_000;
+    world.steer(&format!("story-reply grace {reply_ts} grace {fresh_ts} Looks sunny!"));
+    let reply_msg = world.arrived(GRACE, &id(reply_ts, GRACE));
+    let rto = reply_msg.reply_to.as_ref().expect("story reply must set reply_to");
+    assert!(rto.story, "story reply must set reply_to.story = true");
+    assert_eq!(rto.id, id(fresh_ts, GRACE));
+    assert!(rto.snippet.contains("Good morning from the trail!"), "snippet: {}", rto.snippet);
+
+    // 4. Incoming story reaction lands on the story message.
+    world.steer(&format!("story-react alan grace {fresh_ts} 🔥"));
+    world.until("story reaction appears", || {
+        world
+            .messages("stories")
+            .into_iter()
+            .find(|m| m.id == id(fresh_ts, GRACE))
+            .filter(|m| m.reactions.iter().any(|r| r.emoji == "🔥"))
+    });
+
+    // 5. Viewing a story honors storyViewReceiptsEnabled (off -> receipts=false, on -> receipts=true).
+    world.steer("story-receipts off");
+    world.steer(&format!("incoming grace {} sync-fence-1", T0 + 30_000));
+    world.arrived(GRACE, &id(T0 + 30_000, GRACE));
+    let view_cmd = format!("\u{1}signal-story-view\u{1}{GRACE}|{fresh_ts}");
+    assert_eq!(world.ask(Request::Handoff { conversation: key(&view_cmd) }), Response::Link { url: "viewed".into() });
+    world.heard(&format!("viewed receipts=false {fresh_ts}-{GRACE}"));
+
+    world.steer("story-receipts on");
+    world.steer(&format!("incoming grace {} sync-fence-2", T0 + 31_000));
+    world.arrived(GRACE, &id(T0 + 31_000, GRACE));
+    assert_eq!(world.ask(Request::Handoff { conversation: key(&view_cmd) }), Response::Link { url: "viewed".into() });
+    world.heard(&format!("viewed receipts=true {fresh_ts}-{GRACE}"));
+
+    // 6. Replying to a story that allows replies succeeds & records reply_to.story == true;
+    //    replying to a story with allows_replies == false is refused.
+    let reply_cmd = format!("\u{1}signal-story-reply\u{1}{GRACE}|{fresh_ts}||Awesome view!");
+    assert!(matches!(world.ask(Request::Handoff { conversation: key(&reply_cmd) }), Response::Link { .. }));
+    world.heard(&format!("send {GRACE} story-reply {fresh_ts}-{GRACE} Awesome view!"));
+
+    let blocked_reply_cmd = format!("\u{1}signal-story-reply\u{1}{ALAN}|{fresh_ts2}||Should fail");
+    assert!(
+        matches!(world.ask(Request::Handoff { conversation: key(&blocked_reply_cmd) }), Response::Error { .. }),
+        "reply to a story with replies=off must be refused"
+    );
+
+    // 7. Distribution lists enforce allowlist / blocklist privacy when posting a story.
+    // Blocklist excluding Alan -> only Grace receives it (never Alan).
+    world.steer("story-list 00000000000000000000000000000000 My_Story block replies=on alan");
+    world.steer("story-list 11111111111111111111111111111111 Close_Friends allow replies=on alan");
+    world.steer(&format!("incoming grace {} sync-fence-3", T0 + 32_000));
+    world.arrived(GRACE, &id(T0 + 32_000, GRACE));
+
+    let post_my = format!("\u{1}signal-story-post\u{1}My Story|1|224488|Hello My Story");
+    assert!(matches!(world.ask(Request::Handoff { conversation: key(&post_my) }), Response::Link { .. }));
+    world.heard(&format!("post-story recipients={GRACE} replies=true text=Hello My Story"));
+
+    let post_close = format!("\u{1}signal-story-post\u{1}Close Friends|0|aa3344|Secret update");
+    assert!(matches!(world.ask(Request::Handoff { conversation: key(&post_close) }), Response::Link { .. }));
+    world.heard(&format!("post-story recipients={ALAN} replies=false text=Secret update"));
+
+    // 8. Turning stories off removes the stories feed, drops incoming stories, and refuses posting.
+    let toggle_off = "\u{1}signal-story-toggle\u{1}off";
+    assert_eq!(world.ask(Request::Handoff { conversation: key(toggle_off) }), Response::Link { url: "stories_off".into() });
+    let after_off_ts = fresh_ts + 5_000;
+    world.steer(&format!("story grace {after_off_ts} text | Should be ignored"));
+    world.steer(&format!("incoming grace {} sync-fence-4", T0 + 33_000));
+    world.arrived(GRACE, &id(T0 + 33_000, GRACE));
+    assert!(world.messages("stories").is_empty(), "incoming stories must be dropped when stories are off");
+    assert!(
+        matches!(world.ask(Request::Handoff { conversation: key(&post_my) }), Response::Error { .. }),
+        "posting a story must be refused when stories are off"
     );
 }

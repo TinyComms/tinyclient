@@ -1922,7 +1922,7 @@ mod tests {
         assert_eq!(chain.id, "19:general@thread.tacv2;messageid=m1");
         assert_eq!(thread_key(&teams, ConversationKind::Direct, &root), None, "a Teams chat does not start a thread");
         let mut broadcast = root.clone();
-        broadcast.reply_to = Some(ReplyTo { id: "parent".into(), sender: "Ana".into(), snippet: "earlier".into(), person: None, deleted: false });
+        broadcast.reply_to = Some(ReplyTo { id: "parent".into(), sender: "Ana".into(), snippet: "earlier".into(), person: None, deleted: false, thumb: None, story: false });
         assert_eq!(thread_key(&key("C_a"), channel, &broadcast), None);
         root.thread = Some(ThreadSummary { id: "C_a:m1".into(), replies: 2, last: 0, participants: Vec::new(), unread: 0 });
         let thread = thread_key(&key("C_a"), channel, &root).unwrap();

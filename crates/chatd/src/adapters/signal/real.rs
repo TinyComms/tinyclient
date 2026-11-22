@@ -12,7 +12,9 @@ use super::wire::{
     parse_group_invite_link, payment_label, view_once_label, Body, CallKind, CallLink, CallLinkJoin, CallLogKind,
     CallOutcome, ChatFolder, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo,
     GroupMember, GroupMembers, IdentityState, InviteLinkMode, LinkPreview, Linked, Linker, MessageRequestAction, OwnCard,
-    Peer, PersonProfile, Quote, SafetyNumber, StorageAccount, StorageContact, StorageGroup, StorageSnapshot, Text, Wire,
+    Peer, PersonProfile, Pointer, Quote, QuotedAttachment, SafetyNumber, Sticker, StickerEntry, StickerPackInfo,
+    StorageAccount, StorageContact, StorageGroup, StorageSnapshot, StoryContext, StoryDistributionList,
+    StoryMessageData, StoryText, Text, Wire,
 };
 use super::{group_delta, GroupRevisions, GroupSnap, MemberSnap, Saved};
 use futures::StreamExt;
@@ -64,6 +66,7 @@ enum Ask {
     Send { to: Peer, body: Body, answer: Sender<Result<u64, Fault>> },
     Typing { to: Peer, started: bool },
     Read { read: Vec<(String, u64)>, receipts: bool, answer: Sender<Result<(), Fault>> },
+    Viewed { viewed: Vec<(String, u64)>, receipts: bool, answer: Sender<Result<(), Fault>> },
     Unlink { answer: Sender<Result<(), Fault>> },
     Picture { of: Peer, answer: Sender<Result<Option<Vec<u8>>, Fault>> },
     Card { answer: Sender<Result<OwnCard, Fault>> },
@@ -95,6 +98,17 @@ enum Ask {
     SafetyNumber { aci: String, answer: Sender<Result<Option<SafetyNumber>, Fault>> },
     SetVerified { aci: String, state: IdentityState, answer: Sender<Result<(), Fault>> },
     PersonProfile { aci: String, answer: Sender<Result<PersonProfile, Fault>> },
+    DownloadAttachment { pointer: Pointer, dest: std::path::PathBuf, answer: Sender<Result<u64, Fault>> },
+    PreviewStickerPack { pack_id: String, pack_key: String, answer: Sender<Result<StickerPackInfo, Fault>> },
+    InstallStickerPack { pack_id: String, pack_key: String, answer: Sender<Result<StickerPackInfo, Fault>> },
+    RemoveStickerPack { pack_id: String, pack_key: String, answer: Sender<Result<(), Fault>> },
+    DownloadSticker {
+        pack_id: String,
+        pack_key: String,
+        sticker_id: u32,
+        dest: std::path::PathBuf,
+        answer: Sender<Result<u64, Fault>>,
+    },
 }
 
 pub struct Real {
@@ -302,10 +316,62 @@ fn payment_note(payment: &data_message::Payment) -> Option<&str> {
     }
 }
 
+fn pointer_of(ptr: &presage::proto::AttachmentPointer) -> Pointer {
+    let (cdn_id, cdn_key) = match &ptr.attachment_identifier {
+        Some(presage::proto::attachment_pointer::AttachmentIdentifier::CdnId(id)) => (Some(*id), None),
+        Some(presage::proto::attachment_pointer::AttachmentIdentifier::CdnKey(key)) => (None, Some(key.clone())),
+        None => (None, None),
+    };
+    Pointer {
+        cdn_number: ptr.cdn_number.unwrap_or(0),
+        cdn_id,
+        cdn_key,
+        content_type: ptr.content_type.clone().unwrap_or_default(),
+        key: ptr.key.clone().unwrap_or_default(),
+        size: ptr.size.unwrap_or(0),
+        digest: ptr.digest.clone().unwrap_or_default(),
+        file_name: ptr.file_name.clone().unwrap_or_default(),
+        flags: ptr.flags.unwrap_or(0),
+        width: ptr.width.unwrap_or(0),
+        height: ptr.height.unwrap_or(0),
+        caption: ptr.caption.clone().unwrap_or_default(),
+        blurhash: ptr.blur_hash.clone().filter(|h| !h.is_empty()),
+        thumbnail: ptr.thumbnail.clone().unwrap_or_default(),
+        upload_timestamp: ptr.upload_timestamp.unwrap_or(0),
+        url: None,
+    }
+}
+
+fn proto_pointer_of(pointer: &Pointer) -> Option<presage::proto::AttachmentPointer> {
+    let attachment_identifier = if let Some(key) = pointer.cdn_key.as_ref().filter(|k| !k.is_empty()) {
+        Some(presage::proto::attachment_pointer::AttachmentIdentifier::CdnKey(key.clone()))
+    } else {
+        pointer.cdn_id.map(presage::proto::attachment_pointer::AttachmentIdentifier::CdnId)
+    }?;
+    Some(presage::proto::AttachmentPointer {
+        attachment_identifier: Some(attachment_identifier),
+        content_type: (!pointer.content_type.is_empty()).then(|| pointer.content_type.clone()),
+        key: (!pointer.key.is_empty()).then(|| pointer.key.clone()),
+        size: (pointer.size > 0).then_some(pointer.size),
+        digest: (!pointer.digest.is_empty()).then(|| pointer.digest.clone()),
+        file_name: (!pointer.file_name.is_empty()).then(|| pointer.file_name.clone()),
+        flags: (pointer.flags > 0).then_some(pointer.flags),
+        width: (pointer.width > 0).then_some(pointer.width),
+        height: (pointer.height > 0).then_some(pointer.height),
+        caption: (!pointer.caption.is_empty()).then(|| pointer.caption.clone()),
+        blur_hash: pointer.blurhash.clone(),
+        thumbnail: (!pointer.thumbnail.is_empty()).then(|| pointer.thumbnail.clone()),
+        upload_timestamp: (pointer.upload_timestamp > 0).then_some(pointer.upload_timestamp),
+        cdn_number: Some(pointer.cdn_number),
+        ..Default::default()
+    })
+}
+
 /// What a message that is not drawn here says, in words. A view-once photo or video is named
 /// before its attachment: it opens once, on the phone, so "Photo" would promise a file that is
 /// not here to open and say nothing of why (#748). A long text is drawn: it is the message's own
-/// words, not a file (#728).
+/// words, not a file (#728). Downloadable attachments are drawn inline (#740); only a bare
+/// pointer with no CDN identifier falls back to a label.
 fn unsupported_label(message: &DataMessage) -> Option<String> {
     if message.is_view_once.unwrap_or(false) {
         let kind = message.attachments.first().and_then(|attachment| attachment.content_type.as_deref());
@@ -315,6 +381,9 @@ fn unsupported_label(message: &DataMessage) -> Option<String> {
         return None;
     }
     if let Some(attachment) = message.attachments.first() {
+        if attachment.attachment_identifier.is_some() {
+            return None;
+        }
         if attachment.flags.unwrap_or(0) & 8 != 0 {
             return Some("GIF".to_owned());
         }
@@ -329,7 +398,10 @@ fn unsupported_label(message: &DataMessage) -> Option<String> {
             .to_owned(),
         );
     }
-    if message.sticker.is_some() {
+    if let Some(sticker) = message.sticker.as_ref() {
+        if sticker.data.as_ref().is_some_and(|p| p.attachment_identifier.is_some()) {
+            return None;
+        }
         return Some("Sticker".to_owned());
     }
     if let Some(payment) = message.payment.as_ref() {
@@ -453,6 +525,10 @@ impl Wire for Real {
 
     fn read(&self, read: &[(String, u64)], receipts: bool) -> Result<(), Fault> {
         self.ask(|answer| Ask::Read { read: read.to_vec(), receipts, answer })
+    }
+
+    fn viewed(&self, viewed: &[(String, u64)], receipts: bool) -> Result<(), Fault> {
+        self.ask(|answer| Ask::Viewed { viewed: viewed.to_vec(), receipts, answer })
     }
 
     fn unlink(&self) -> Result<(), Fault> {
@@ -646,6 +722,64 @@ impl Wire for Real {
         Ok(fetch_preview_via_signal_proxy(url))
     }
 
+    fn download_attachment(&self, pointer: &Pointer, dest: &std::path::Path) -> Result<u64, Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        let (answer, answered) = channel();
+        self.asks
+            .send(Ask::DownloadAttachment {
+                pointer: pointer.clone(),
+                dest: dest.to_path_buf(),
+                answer,
+            })
+            .map_err(|_| Fault::Net("closed".into()))?;
+        // Large attachments/videos may take longer than a short RPC answer.
+        answered
+            .recv_timeout(Duration::from_secs(300))
+            .map_err(|_| Fault::Net("no answer".into()))?
+    }
+
+    fn preview_sticker_pack(&self, pack_id: &str, pack_key: &str) -> Result<StickerPackInfo, Fault> {
+        self.ask(|answer| Ask::PreviewStickerPack {
+            pack_id: pack_id.to_owned(),
+            pack_key: pack_key.to_owned(),
+            answer,
+        })
+    }
+
+    fn install_sticker_pack(&self, pack_id: &str, pack_key: &str) -> Result<StickerPackInfo, Fault> {
+        self.ask(|answer| Ask::InstallStickerPack {
+            pack_id: pack_id.to_owned(),
+            pack_key: pack_key.to_owned(),
+            answer,
+        })
+    }
+
+    fn remove_sticker_pack(&self, pack_id: &str, pack_key: &str) -> Result<(), Fault> {
+        self.ask(|answer| Ask::RemoveStickerPack {
+            pack_id: pack_id.to_owned(),
+            pack_key: pack_key.to_owned(),
+            answer,
+        })
+    }
+
+    fn download_sticker(
+        &self,
+        pack_id: &str,
+        pack_key: &str,
+        sticker_id: u32,
+        dest: &std::path::Path,
+    ) -> Result<u64, Fault> {
+        self.ask(|answer| Ask::DownloadSticker {
+            pack_id: pack_id.to_owned(),
+            pack_key: pack_key.to_owned(),
+            sticker_id,
+            dest: dest.to_path_buf(),
+            answer,
+        })
+    }
+
     fn close(&self) {
         if let Some(stop) = self.stop.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
             let _ = stop.send(());
@@ -732,6 +866,7 @@ impl Session {
 
     /// Once per link: ask the phone for the contacts and the settings it shares with devices.
     async fn first_run(&mut self) {
+        self.emit_sticker_packs().await;
         if self.vault.flag("asked") {
             self.tell(Event::Contacts(self.contacts().await));
             self.sync_storage().await;
@@ -798,6 +933,7 @@ impl Session {
         let mut groups = Vec::new();
         let mut account_record: Option<StorageAccount> = None;
         let mut folders = Vec::new();
+        let mut distribution_lists = Vec::new();
         for record in records {
             match record.record {
                 Some(storage_record::Record::Contact(contact)) => {
@@ -897,12 +1033,44 @@ impl Session {
                             _ => {}
                         }
                     }
+                    let story_view_receipts = match presage::proto::OptionalBool::try_from(account.story_view_receipts_enabled) {
+                        Ok(presage::proto::OptionalBool::Enabled) => Some(true),
+                        Ok(presage::proto::OptionalBool::Disabled) => Some(false),
+                        _ => None,
+                    };
                     account_record = Some(StorageAccount {
                         pinned: pins,
                         keep_muted_archived: Some(account.keep_muted_chats_archived),
                         link_previews: Some(account.link_previews),
                         universal_expire_timer: account.universal_expire_timer,
                         note_to_self_marked_unread: account.note_to_self_marked_unread,
+                        stories_disabled: Some(account.stories_disabled),
+                        story_view_receipts,
+                    });
+                }
+                Some(storage_record::Record::StoryDistributionList(list)) => {
+                    if list.deleted_at_timestamp != 0 {
+                        continue;
+                    }
+                    let mut recipients: Vec<String> = Vec::new();
+                    for raw in list.recipient_service_ids {
+                        if super::wire::is_aci(&raw) && !recipients.contains(&raw) {
+                            recipients.push(raw);
+                        }
+                    }
+                    for raw in list.recipient_service_ids_binary {
+                        if let Some(aci) = aci_bytes(&raw) {
+                            if !recipients.contains(&aci) {
+                                recipients.push(aci);
+                            }
+                        }
+                    }
+                    distribution_lists.push(StoryDistributionList {
+                        id: hex(&list.identifier),
+                        name: list.name,
+                        recipients,
+                        allows_replies: list.allows_replies,
+                        is_block_list: list.is_block_list,
                     });
                 }
                 Some(storage_record::Record::ChatFolder(folder)) => {
@@ -947,11 +1115,12 @@ impl Session {
                 _ => {}
             }
         }
-        if !contacts.is_empty() || !groups.is_empty() || account_record.is_some() {
+        if !contacts.is_empty() || !groups.is_empty() || account_record.is_some() || !distribution_lists.is_empty() {
             self.tell(Event::StorageSync(StorageSnapshot {
                 contacts,
                 groups,
                 account: account_record,
+                distribution_lists,
             }));
         }
         if !folders.is_empty() {
@@ -1173,10 +1342,45 @@ impl Session {
                 let qbody = quote.text.clone().unwrap_or_default();
                 let qranges = self.ranges_of(&quote.body_ranges).await;
                 let quoted = style::apply(&qbody, &qranges, &self.me);
-                Some(Quote { sent: quote.id.unwrap_or(0), author: quote.author_aci.clone().unwrap_or_default(), text: quoted.text, spans: quoted.spans })
+                let qattachments = quote
+                    .attachments
+                    .iter()
+                    .map(|att| QuotedAttachment {
+                        content_type: att.content_type.clone().unwrap_or_default(),
+                        file_name: att.file_name.clone().unwrap_or_default(),
+                        thumbnail: att.thumbnail.as_ref().map(pointer_of).filter(Pointer::downloadable),
+                    })
+                    .collect();
+                Some(Quote {
+                    sent: quote.id.unwrap_or(0),
+                    author: quote.author_aci.clone().unwrap_or_default(),
+                    text: quoted.text,
+                    spans: quoted.spans,
+                    attachments: qattachments,
+                })
             }
             None => None,
         };
+        let attachments = if message.is_view_once.unwrap_or(false) || long_text(message) {
+            Vec::new()
+        } else {
+            message
+                .attachments
+                .iter()
+                .map(pointer_of)
+                .filter(Pointer::downloadable)
+                .collect()
+        };
+        let sticker = message.sticker.as_ref().and_then(|st| {
+            let data = st.data.as_ref().map(pointer_of).filter(Pointer::downloadable)?;
+            Some(Sticker {
+                pack_id: hex(st.pack_id.as_deref().unwrap_or(&[])),
+                pack_key: hex(st.pack_key.as_deref().unwrap_or(&[])),
+                sticker_id: st.sticker_id.unwrap_or(0),
+                emoji: st.emoji.clone().unwrap_or_default(),
+                data,
+            })
+        });
         let name = if author == self.me { String::new() } else { self.name_of(author).await };
         let contacts = message.contact.iter().map(shared_contact_of).collect();
         let mut previews = Vec::new();
@@ -1209,6 +1413,16 @@ impl Session {
                 image_height,
             });
         }
+        let story_context = message.story_context.as_ref().and_then(|ctx| {
+            let author = ctx
+                .author_aci
+                .as_deref()
+                .filter(|a| super::wire::is_aci(a))
+                .map(str::to_owned)
+                .or_else(|| ctx.author_aci_binary.as_deref().and_then(aci_bytes))?;
+            let sent = ctx.sent_timestamp.filter(|&ts| ts > 0)?;
+            Some(StoryContext { author, sent })
+        });
         Text {
             author: author.to_owned(),
             name,
@@ -1222,6 +1436,9 @@ impl Session {
             expire_timer_version: message.expire_timer_version.unwrap_or(0),
             contacts,
             previews,
+            attachments,
+            sticker,
+            story_context,
         }
     }
 
@@ -1259,6 +1476,27 @@ impl Session {
             return;
         }
         if let Some(reaction) = &message.reaction {
+            if let Some(ctx) = &message.story_context {
+                let story_author = ctx
+                    .author_aci
+                    .as_deref()
+                    .filter(|a| super::wire::is_aci(a))
+                    .map(str::to_owned)
+                    .or_else(|| ctx.author_aci_binary.as_deref().and_then(aci_bytes))
+                    .unwrap_or_default();
+                let story_sent = ctx.sent_timestamp.unwrap_or(0);
+                if !story_author.is_empty() && story_sent > 0 {
+                    self.tell(Event::StoryReaction {
+                        peer,
+                        by: author.to_owned(),
+                        story_author,
+                        story_sent,
+                        emoji: reaction.emoji.clone().unwrap_or_default(),
+                        removed: reaction.remove.unwrap_or(false),
+                    });
+                    return;
+                }
+            }
             let target_author = reaction.target_author_aci.clone().unwrap_or_default();
             self.tell(Event::Reacted {
                 peer,
@@ -1385,8 +1623,86 @@ impl Session {
                 self.tell(Event::Typing { peer, by: sender, name, started });
             }
             ContentBody::CallMessage(message) => self.call_message(message, sender, sent).await,
+            ContentBody::StoryMessage(story) => {
+                let outgoing = sender == self.me;
+                self.story_message(story, &sender, sent, outgoing).await;
+            }
             _ => {}
         }
+    }
+
+    async fn story_message(&mut self, story: presage::proto::StoryMessage, author: &str, sent: u64, outgoing: bool) {
+        let group_id = story
+            .group
+            .as_ref()
+            .and_then(|g| g.master_key.as_deref())
+            .and_then(|k| <[u8; 32]>::try_from(k).ok())
+            .map(|k| group_id(&k));
+        let name = if author == self.me { String::new() } else { self.name_of(author).await };
+        let allows_replies = story.allows_replies.unwrap_or(true);
+        let (file, text) = match story.attachment {
+            Some(presage::proto::story_message::Attachment::FileAttachment(ptr)) => {
+                (Some(pointer_of(&ptr)).filter(Pointer::downloadable), None)
+            }
+            Some(presage::proto::story_message::Attachment::TextAttachment(ta)) => {
+                let style = ta
+                    .text_style
+                    .and_then(|v| presage::proto::text_attachment::Style::try_from(v).ok())
+                    .map(|s| s.as_str_name().to_owned())
+                    .unwrap_or_else(|| "DEFAULT".to_owned());
+                let (bg_color, gradient_colors) = match ta.background {
+                    Some(presage::proto::text_attachment::Background::Color(c)) => (c, Vec::new()),
+                    Some(presage::proto::text_attachment::Background::Gradient(g)) => {
+                        let first = g.colors.first().copied().or(g.start_color).unwrap_or(0);
+                        let colors = if !g.colors.is_empty() {
+                            g.colors
+                        } else {
+                            g.start_color.into_iter().chain(g.end_color).collect()
+                        };
+                        (first, colors)
+                    }
+                    None => (ta.text_background_color.unwrap_or(0), Vec::new()),
+                };
+                let body = ta.text.unwrap_or_default();
+                let preview = ta.preview.and_then(|p| {
+                    let url = p.url.unwrap_or_default();
+                    if !super::wire::story_preview_kept(&body, &url) {
+                        return None;
+                    }
+                    Some(LinkPreview {
+                        url,
+                        title: p.title.unwrap_or_default(),
+                        description: p.description.unwrap_or_default(),
+                        date: p.date.unwrap_or(0),
+                        image: None,
+                        image_width: 0,
+                        image_height: 0,
+                    })
+                });
+                (
+                    None,
+                    Some(StoryText {
+                        text: body,
+                        style,
+                        fg_color: ta.text_foreground_color.unwrap_or(0xffff_ffff),
+                        bg_color,
+                        gradient_colors,
+                        preview,
+                    }),
+                )
+            }
+            None => return,
+        };
+        self.tell(Event::Story(StoryMessageData {
+            author: author.to_owned(),
+            name,
+            sent,
+            group_id,
+            allows_replies,
+            file,
+            text,
+            outgoing,
+        }));
     }
 
     /// A call. The offer rings, and the hangup or busy with its id ends the ring. An offer of
@@ -1422,6 +1738,10 @@ impl Session {
                 let peer = self.peer(message.group_v2.as_ref(), destination.as_deref().unwrap_or(&me)).await;
                 let at = sent.timestamp.or(message.timestamp).unwrap_or(0);
                 self.data(message, &me, peer, at, true).await;
+            }
+            if let Some(story) = &sent.story_message {
+                let at = sent.timestamp.unwrap_or_else(now_ms);
+                self.story_message(story.clone(), &me, at, true).await;
             }
             if let Some(EditMessage { target_sent_timestamp, data_message: Some(message) }) = &sent.edit_message {
                 let peer = self.peer(message.group_v2.as_ref(), destination.as_deref().unwrap_or(&me)).await;
@@ -1538,6 +1858,15 @@ impl Session {
                     admin_passkey: link_update.admin_passkey,
                 });
             }
+        }
+        for op in sync.sticker_pack_operation {
+            let pack_id = hex(op.pack_id.as_deref().unwrap_or(&[]));
+            let pack_key = hex(op.pack_key.as_deref().unwrap_or(&[]));
+            if pack_id.len() != 32 {
+                continue;
+            }
+            let install = op.r#type != Some(sync_message::sticker_pack_operation::Type::Remove.into());
+            self.tell(Event::StickerPackOp { pack_id, pack_key, install });
         }
     }
 
@@ -1657,6 +1986,9 @@ impl Session {
             Ask::Read { read, receipts, answer } => {
                 let _ = answer.send(self.read(read, receipts).await);
             }
+            Ask::Viewed { viewed, receipts, answer } => {
+                let _ = answer.send(self.viewed(viewed, receipts).await);
+            }
             Ask::Unlink { answer } => {
                 let _ = answer.send(self.unlink().await);
             }
@@ -1750,7 +2082,221 @@ impl Session {
             Ask::PersonProfile { aci, answer } => {
                 let _ = answer.send(self.person_profile(&aci).await);
             }
+            Ask::DownloadAttachment { pointer, dest, answer } => {
+                let _ = answer.send(self.download_attachment(&pointer, &dest).await);
+            }
+            Ask::PreviewStickerPack { pack_id, pack_key, answer } => {
+                let _ = answer.send(self.preview_sticker_pack(&pack_id, &pack_key).await);
+            }
+            Ask::InstallStickerPack { pack_id, pack_key, answer } => {
+                let _ = answer.send(self.install_sticker_pack(&pack_id, &pack_key).await);
+            }
+            Ask::RemoveStickerPack { pack_id, pack_key, answer } => {
+                let _ = answer.send(self.remove_sticker_pack(&pack_id, &pack_key).await);
+            }
+            Ask::DownloadSticker { pack_id, pack_key, sticker_id, dest, answer } => {
+                let _ = answer.send(self.download_sticker(&pack_id, &pack_key, sticker_id, &dest).await);
+            }
         }
+    }
+
+    async fn emit_sticker_packs(&mut self) {
+        let Ok(iter) = self.vault.sticker_packs().await else {
+            return;
+        };
+        let packs: Vec<StickerPackInfo> = iter
+            .filter_map(Result::ok)
+            .map(sticker_pack_info_of)
+            .collect();
+        if !packs.is_empty() {
+            self.tell(Event::StickerPacks(packs));
+        }
+    }
+
+    async fn preview_sticker_pack(&mut self, pack_id: &str, pack_key: &str) -> Result<StickerPackInfo, Fault> {
+        use futures::AsyncReadExt;
+        use prost::Message as _;
+
+        let key_bytes = unhex(pack_key)
+            .filter(|b| b.len() == 32)
+            .ok_or_else(|| Fault::Refused("Invalid sticker pack key.".to_owned()))?;
+        if pack_id.len() != 32 || !pack_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(Fault::Refused("Invalid sticker pack id.".to_owned()));
+        }
+        let id_lower = pack_id.to_ascii_lowercase();
+        let mut push = PushService::new(SignalServers::Production, None, "tinyclient");
+        let mut ws = push
+            .ws::<presage::libsignal_service::websocket::Unidentified>("/v1/websocket/", "/v1/keepalive", &[], None)
+            .await
+            .map_err(|err| Fault::Net(err.to_string()))?;
+        let mut stream = ws
+            .get_sticker_pack_manifest(&id_lower)
+            .await
+            .map_err(|err| Fault::Net(err.to_string()))?;
+        let mut enc = Vec::new();
+        stream.read_to_end(&mut enc).await.map_err(|err| Fault::Net(err.to_string()))?;
+        let tmp = tempfile::NamedTempFile::new().map_err(|err| Fault::Net(err.to_string()))?;
+        super::files::decrypt_sticker_stream(std::io::Cursor::new(&enc), &key_bytes, tmp.path())
+            .map_err(Fault::Refused)?;
+        let plain = std::fs::read(tmp.path()).map_err(|err| Fault::Net(err.to_string()))?;
+        let pack = presage::proto::Pack::decode(plain.as_slice())
+            .map_err(|err| Fault::Refused(format!("Invalid sticker pack manifest: {err}")))?;
+        let installed = match unhex(&id_lower) {
+            Some(id) => self.vault.sticker_pack(&id).await.ok().flatten().is_some(),
+            None => false,
+        };
+        Ok(StickerPackInfo {
+            id: id_lower,
+            key: pack_key.to_ascii_lowercase(),
+            title: pack.title.unwrap_or_default(),
+            author: pack.author.unwrap_or_default(),
+            cover_id: pack.cover.and_then(|c| c.id),
+            stickers: pack
+                .stickers
+                .into_iter()
+                .filter_map(|s| {
+                    Some(StickerEntry {
+                        id: s.id?,
+                        emoji: s.emoji.unwrap_or_default(),
+                        content_type: s.content_type.unwrap_or_else(|| "image/webp".to_owned()),
+                    })
+                })
+                .collect(),
+            installed,
+        })
+    }
+
+    async fn install_sticker_pack(&mut self, pack_id: &str, pack_key: &str) -> Result<StickerPackInfo, Fault> {
+        let id_bytes = unhex(pack_id)
+            .filter(|b| b.len() == 16)
+            .ok_or_else(|| Fault::Refused("Invalid sticker pack id.".to_owned()))?;
+        let key_bytes = unhex(pack_key)
+            .filter(|b| b.len() == 32)
+            .ok_or_else(|| Fault::Refused("Invalid sticker pack key.".to_owned()))?;
+        self.manager
+            .install_sticker_pack(&id_bytes, &key_bytes)
+            .await
+            .map_err(fault)?;
+        if let Ok(Some(pack)) = self.vault.sticker_pack(&id_bytes).await {
+            return Ok(sticker_pack_info_of(pack));
+        }
+        let mut info = self.preview_sticker_pack(pack_id, pack_key).await?;
+        info.installed = true;
+        Ok(info)
+    }
+
+    async fn remove_sticker_pack(&mut self, pack_id: &str, pack_key: &str) -> Result<(), Fault> {
+        let id_bytes = unhex(pack_id)
+            .filter(|b| b.len() == 16)
+            .ok_or_else(|| Fault::Refused("Invalid sticker pack id.".to_owned()))?;
+        let key_bytes = unhex(pack_key).unwrap_or_default();
+        self.manager
+            .remove_sticker_pack(&id_bytes, &key_bytes)
+            .await
+            .map_err(fault)?;
+        Ok(())
+    }
+
+    async fn download_sticker(
+        &mut self,
+        pack_id: &str,
+        pack_key: &str,
+        sticker_id: u32,
+        dest: &std::path::Path,
+    ) -> Result<u64, Fault> {
+        use futures::AsyncReadExt;
+
+        let key_bytes = unhex(pack_key)
+            .filter(|b| b.len() == 32)
+            .ok_or_else(|| Fault::Refused("Invalid sticker pack key.".to_owned()))?;
+        let id_lower = pack_id.to_ascii_lowercase();
+        let mut push = PushService::new(SignalServers::Production, None, "tinyclient");
+        let mut ws = push
+            .ws::<presage::libsignal_service::websocket::Unidentified>("/v1/websocket/", "/v1/keepalive", &[], None)
+            .await
+            .map_err(|err| Fault::Net(err.to_string()))?;
+        let mut stream = match ws.get_sticker(&id_lower, sticker_id).await {
+            Ok(s) => s,
+            Err(ServiceError::UnhandledResponseCode { status, .. })
+                if matches!(status.as_u16(), 403 | 404 | 410) =>
+            {
+                return Err(Fault::Refused("No longer available".to_owned()));
+            }
+            Err(err) => return Err(Fault::Net(err.to_string())),
+        };
+        let mut enc = Vec::new();
+        stream.read_to_end(&mut enc).await.map_err(|err| Fault::Net(err.to_string()))?;
+        let dest = dest.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            super::files::decrypt_sticker_stream(std::io::Cursor::new(&enc), &key_bytes, &dest)
+        })
+        .await
+        .map_err(|err| Fault::Net(err.to_string()))?
+        .map_err(Fault::Refused)
+    }
+
+    async fn download_attachment(&mut self, pointer: &Pointer, dest: &std::path::Path) -> Result<u64, Fault> {
+        use futures::AsyncReadExt;
+        use std::io::Write;
+
+        let proto = proto_pointer_of(pointer).ok_or_else(|| Fault::Refused("No longer available".to_owned()))?;
+        let credentials = self.credentials()?;
+        let mut push = PushService::new(SignalServers::Production, Some(credentials), "tinyclient");
+        let mut stream = match push.get_attachment(&proto).await {
+            Ok(s) => s,
+            Err(ServiceError::UnhandledResponseCode { status, .. })
+                if matches!(status.as_u16(), 403 | 404 | 410) =>
+            {
+                return Err(Fault::Refused("No longer available".to_owned()));
+            }
+            Err(ServiceError::SendError { reason })
+                if reason.contains("404") || reason.contains("410") || reason.contains("403") =>
+            {
+                return Err(Fault::Refused("No longer available".to_owned()));
+            }
+            Err(err) => return Err(Fault::Net(err.to_string())),
+        };
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| Fault::Net(err.to_string()))?;
+        }
+        let enc_path = dest.with_extension("sigenc");
+        {
+            let mut enc_file = protocol::private::create(&enc_path).map_err(|err| Fault::Net(err.to_string()))?;
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut total = 0u64;
+            let cap = super::files::MAX_FILE_BYTES + 1024 * 1024;
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        total = total.saturating_add(n as u64);
+                        if total > cap {
+                            drop(enc_file);
+                            let _ = std::fs::remove_file(&enc_path);
+                            return Err(Fault::Refused("Attachment exceeds Signal's size limit.".to_owned()));
+                        }
+                        if let Err(err) = enc_file.write_all(&buf[..n]) {
+                            drop(enc_file);
+                            let _ = std::fs::remove_file(&enc_path);
+                            return Err(Fault::Net(err.to_string()));
+                        }
+                    }
+                    Err(err) => {
+                        drop(enc_file);
+                        let _ = std::fs::remove_file(&enc_path);
+                        return Err(Fault::Net(err.to_string()));
+                    }
+                }
+            }
+        }
+        let key = pointer.key.clone();
+        let digest = pointer.digest.clone();
+        let size = pointer.size;
+        let dest = dest.to_path_buf();
+        tokio::task::spawn_blocking(move || super::files::decrypt_attachment_file(&enc_path, &key, &digest, size, &dest))
+            .await
+            .map_err(|err| Fault::Net(err.to_string()))?
+            .map_err(Fault::Refused)
     }
 
     async fn person_profile(&mut self, aci: &str) -> Result<PersonProfile, Fault> {
@@ -2659,6 +3205,7 @@ impl Session {
                 for file in files {
                     let name = file.name.clone();
                     let gif = file.gif || file.mime == "image/gif";
+                    let voice = file.voice;
                     let thumb = file.thumb;
                     let spec = AttachmentSpec {
                         content_type: file.mime,
@@ -2667,6 +3214,7 @@ impl Session {
                         width: (file.width > 0).then_some(file.width),
                         height: (file.height > 0).then_some(file.height),
                         blur_hash: file.blurhash,
+                        voice_note: voice.then_some(true),
                         ..AttachmentSpec::default()
                     };
                     let uploaded = self.manager.upload_attachment(spec, file.bytes).await.map_err(fault)?;
@@ -2676,7 +3224,11 @@ impl Session {
                     }
                     if gif {
                         // SignalService.proto AttachmentPointer.Flags.GIF.
-                        pointer.flags = Some(pointer.flags.unwrap_or(0) | 8);
+                        pointer.flags = Some(pointer.flags.unwrap_or(0) | super::wire::FLAG_GIF);
+                    }
+                    if voice {
+                        // SignalService.proto AttachmentPointer.Flags.VOICE_MESSAGE.
+                        pointer.flags = Some(pointer.flags.unwrap_or(0) | super::wire::FLAG_VOICE_MESSAGE);
                     }
                     attachments.push(pointer);
                 }
@@ -2800,6 +3352,144 @@ impl Session {
                     ..Default::default()
                 })
             }
+            Body::Sticker { pack_id, pack_key, sticker_id, emoji, bytes, content_type, quote, timer } => {
+                let id_bytes = unhex(&pack_id)
+                    .filter(|b| b.len() == 16)
+                    .ok_or_else(|| Fault::Refused("Invalid sticker pack id.".to_owned()))?;
+                let key_bytes = unhex(&pack_key)
+                    .filter(|b| b.len() == 32)
+                    .ok_or_else(|| Fault::Refused("Invalid sticker pack key.".to_owned()))?;
+                let spec = AttachmentSpec {
+                    content_type: if content_type.is_empty() { "image/webp".to_owned() } else { content_type },
+                    length: bytes.len(),
+                    file_name: Some("sticker.webp".to_owned()),
+                    ..AttachmentSpec::default()
+                };
+                let uploaded = self.manager.upload_attachment(spec, bytes).await.map_err(fault)?;
+                let pointer = uploaded.map_err(|err| attachment_refused("sticker", &err))?;
+                ContentBody::DataMessage(DataMessage {
+                    sticker: Some(data_message::Sticker {
+                        pack_id: Some(id_bytes),
+                        pack_key: Some(key_bytes),
+                        sticker_id: Some(sticker_id),
+                        data: Some(pointer),
+                        emoji: (!emoji.is_empty()).then_some(emoji),
+                    }),
+                    quote: quoted(quote),
+                    timestamp: Some(at),
+                    group_v2,
+                    expire_timer: (timer.seconds > 0).then_some(timer.seconds),
+                    expire_timer_version: (timer.version > 0).then_some(timer.version),
+                    ..Default::default()
+                })
+            }
+            Body::StoryReply { story_author, story_sent, text, ranges, timer } => {
+                let author_bin = Uuid::parse_str(&story_author).ok().map(|u| u.as_bytes().to_vec());
+                ContentBody::DataMessage(DataMessage {
+                    body: Some(text),
+                    body_ranges: proto_ranges(&ranges),
+                    story_context: Some(data_message::StoryContext {
+                        author_aci: Some(story_author),
+                        author_aci_binary: author_bin,
+                        sent_timestamp: Some(story_sent),
+                    }),
+                    timestamp: Some(at),
+                    group_v2,
+                    expire_timer: (timer.seconds > 0).then_some(timer.seconds),
+                    expire_timer_version: (timer.version > 0).then_some(timer.version),
+                    ..Default::default()
+                })
+            }
+            Body::StoryReact { story_author, story_sent, emoji, remove } => {
+                let author_bin = Uuid::parse_str(&story_author).ok().map(|u| u.as_bytes().to_vec());
+                ContentBody::DataMessage(DataMessage {
+                    reaction: Some(data_message::Reaction {
+                        emoji: Some(emoji),
+                        remove: Some(remove),
+                        target_author_aci: Some(story_author.clone()),
+                        target_sent_timestamp: Some(story_sent),
+                        ..Default::default()
+                    }),
+                    story_context: Some(data_message::StoryContext {
+                        author_aci: Some(story_author),
+                        author_aci_binary: author_bin,
+                        sent_timestamp: Some(story_sent),
+                    }),
+                    timestamp: Some(at),
+                    group_v2,
+                    ..Default::default()
+                })
+            }
+            Body::PostStory { recipients, group_id, text, file, allows_replies } => {
+                let attachment = if let Some(file) = file {
+                    let name = file.name.clone();
+                    let spec = AttachmentSpec {
+                        content_type: file.mime,
+                        length: file.bytes.len(),
+                        file_name: Some(name.clone()),
+                        width: (file.width > 0).then_some(file.width),
+                        height: (file.height > 0).then_some(file.height),
+                        blur_hash: file.blurhash,
+                        ..AttachmentSpec::default()
+                    };
+                    let uploaded = self.manager.upload_attachment(spec, file.bytes).await.map_err(fault)?;
+                    let pointer = uploaded.map_err(|err| attachment_refused(&name, &err))?;
+                    Some(presage::proto::story_message::Attachment::FileAttachment(pointer))
+                } else if let Some(st) = text {
+                    let style = presage::proto::text_attachment::Style::from_str_name(&st.style)
+                        .unwrap_or(presage::proto::text_attachment::Style::Default);
+                    let background = if st.gradient_colors.len() >= 2 {
+                        Some(presage::proto::text_attachment::Background::Gradient(
+                            presage::proto::text_attachment::Gradient {
+                                start_color: st.gradient_colors.first().copied(),
+                                end_color: st.gradient_colors.last().copied(),
+                                angle: Some(180),
+                                colors: st.gradient_colors,
+                                positions: Vec::new(),
+                            },
+                        ))
+                    } else {
+                        Some(presage::proto::text_attachment::Background::Color(st.bg_color))
+                    };
+                    Some(presage::proto::story_message::Attachment::TextAttachment(
+                        presage::proto::TextAttachment {
+                            text: Some(st.text),
+                            text_style: Some(style.into()),
+                            text_foreground_color: Some(st.fg_color),
+                            text_background_color: None,
+                            preview: st.preview.map(|p| presage::proto::Preview {
+                                url: Some(p.url),
+                                title: (!p.title.is_empty()).then_some(p.title),
+                                description: (!p.description.is_empty()).then_some(p.description),
+                                date: (p.date > 0).then_some(p.date),
+                                image: None,
+                            }),
+                            background,
+                        },
+                    ))
+                } else {
+                    return Err(Fault::Refused("A story needs text or a photo/video.".to_owned()));
+                };
+                let story_group = match &group_id {
+                    Some(gid) => self.group_context(&Peer::Group(gid.clone()))?,
+                    None => None,
+                };
+                let story_msg = presage::proto::StoryMessage {
+                    profile_key: Some(self.manager.registration_data().profile_key().bytes.to_vec()),
+                    group: story_group,
+                    allows_replies: Some(allows_replies),
+                    body_ranges: Vec::new(),
+                    attachment,
+                };
+                if let Some(gid) = group_id {
+                    self.deliver(&Peer::Group(gid), ContentBody::StoryMessage(story_msg), at).await?;
+                } else {
+                    for aci in recipients {
+                        let _ = self.deliver(&Peer::Direct(aci), ContentBody::StoryMessage(story_msg.clone()), at).await;
+                    }
+                }
+                return Ok(at);
+            }
         };
         self.deliver(to, content, at).await?;
         Ok(at)
@@ -2821,6 +3511,33 @@ impl Session {
         }
         let sync = SyncMessage {
             read: read.into_iter().map(|(author, sent)| sync_message::Read { sender_aci: Some(author), timestamp: Some(sent), ..Default::default() }).collect(),
+            ..SyncMessage::with_padding(&mut rand::rng())
+        };
+        self.sync_to_self(sync).await
+    }
+
+    /// Viewed receipts for played voice notes or stories (when receipts are enabled), plus a
+    /// `SyncMessage.viewed` sync to our other linked devices.
+    async fn viewed(&mut self, viewed: Vec<(String, u64)>, receipts: bool) -> Result<(), Fault> {
+        if receipts {
+            let mut by_author: HashMap<String, Vec<u64>> = HashMap::new();
+            for (author, sent) in &viewed {
+                by_author.entry(author.clone()).or_default().push(*sent);
+            }
+            for (author, timestamp) in by_author {
+                let receipt = ReceiptMessage { r#type: Some(receipt_message::Type::Viewed.into()), timestamp };
+                let _ = self.deliver(&Peer::Direct(author), ContentBody::ReceiptMessage(receipt), now_ms()).await;
+            }
+        }
+        let sync = SyncMessage {
+            viewed: viewed
+                .into_iter()
+                .map(|(author, sent)| sync_message::Viewed {
+                    sender_aci: Some(author),
+                    timestamp: Some(sent),
+                    ..Default::default()
+                })
+                .collect(),
             ..SyncMessage::with_padding(&mut rand::rng())
         };
         self.sync_to_self(sync).await
@@ -2900,6 +3617,27 @@ fn mark_of(style: i32) -> Option<Mark> {
 fn aci_of(bytes: &[u8]) -> Option<String> {
     let bytes: [u8; 16] = bytes.try_into().ok()?;
     Some(Uuid::from_bytes(bytes).to_string())
+}
+
+fn sticker_pack_info_of(pack: presage::store::StickerPack) -> StickerPackInfo {
+    StickerPackInfo {
+        id: hex(&pack.id),
+        key: hex(&pack.key),
+        title: pack.manifest.title,
+        author: pack.manifest.author,
+        cover_id: pack.manifest.cover.map(|c| c.id),
+        stickers: pack
+            .manifest
+            .stickers
+            .into_iter()
+            .map(|s| StickerEntry {
+                id: s.id,
+                emoji: s.emoji.unwrap_or_default(),
+                content_type: s.content_type.unwrap_or_else(|| "image/webp".to_owned()),
+            })
+            .collect(),
+        installed: true,
+    }
 }
 
 fn shared_contact_of(contact: &data_message::Contact) -> protocol::SharedContact {

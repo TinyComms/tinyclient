@@ -74,6 +74,11 @@ impl<K: Eq + Hash + Clone, V: Clone> Recent<K, V> {
         lock(&self.held).retain(|(held, _, _)| held != key);
     }
 
+    /// Forgets every cached entry matching `predicate` (e.g. an account's sticker catalog after a pack install/remove).
+    pub fn forget_matching(&self, predicate: impl FnMut(&K) -> bool) {
+        self.forget_where(predicate);
+    }
+
     /// Forgets every cached entry whose key matches `predicate`.
     pub fn forget_where(&self, mut predicate: impl FnMut(&K) -> bool) {
         lock(&self.held).retain(|(held, _, _)| !predicate(held));

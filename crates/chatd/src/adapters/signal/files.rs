@@ -35,12 +35,12 @@ pub fn refused(with: &Outgoing) -> Option<String> {
     if with.schedule.is_some() {
         return Some("Signal can't send a message later.".into());
     }
-    if with.voice.is_some() {
-        return Some("A voice note can't be sent to Signal from here.".into());
+    if with.voice.is_some() && with.files.len() != 1 {
+        return Some("A voice note needs one audio file.".into());
     }
     if let Some(pick) = &with.pick {
-        if pick.kind != protocol::CatalogKind::Gifs {
-            return Some("Signal can't send a chosen sticker from here.".into());
+        if !matches!(pick.kind, protocol::CatalogKind::Gifs | protocol::CatalogKind::Stickers) {
+            return Some("Signal can't send that item from here.".into());
         }
     }
     if with.files.iter().any(|file| file.spoiler) {
@@ -89,12 +89,72 @@ pub fn call_line(
 
 /// What a conversation draws this file as.
 pub fn kind(mime: &str) -> MediaKind {
-    match mime {
-        "image/png" | "image/jpeg" | "image/webp" => MediaKind::Image,
-        "image/gif" => MediaKind::Gif,
-        "video/mp4" | "video/quicktime" | "video/webm" => MediaKind::Video,
-        "audio/mpeg" | "audio/mp4" | "audio/ogg" | "audio/wav" => MediaKind::Audio,
-        _ => MediaKind::File,
+    attachment_kind(mime, 0)
+}
+
+/// Maps a Signal attachment's MIME type and `AttachmentPointer.Flags` bitmask to `MediaKind`.
+pub fn attachment_kind(mime: &str, flags: u32) -> MediaKind {
+    if flags & super::wire::FLAG_GIF != 0 || mime.eq_ignore_ascii_case("image/gif") {
+        return MediaKind::Gif;
+    }
+    if flags & super::wire::FLAG_VOICE_MESSAGE != 0 || mime.starts_with("audio/") {
+        return MediaKind::Audio;
+    }
+    if mime.starts_with("image/") {
+        return MediaKind::Image;
+    }
+    if mime.starts_with("video/") {
+        return MediaKind::Video;
+    }
+    MediaKind::File
+}
+
+/// Fallback display filename when a Signal attachment pointer omits `file_name`.
+pub fn default_filename(mime: &str, flags: u32) -> &'static str {
+    if flags & super::wire::FLAG_VOICE_MESSAGE != 0 {
+        return "voice-message.m4a";
+    }
+    if flags & super::wire::FLAG_GIF != 0 || mime.eq_ignore_ascii_case("image/gif") {
+        return "animation.gif";
+    }
+    match mime.to_ascii_lowercase().as_str() {
+        "image/jpeg" | "image/jpg" => "photo.jpg",
+        "image/png" => "photo.png",
+        "image/webp" => "photo.webp",
+        "video/mp4" => "video.mp4",
+        "video/quicktime" => "video.mov",
+        "video/webm" => "video.webm",
+        "audio/mp4" | "audio/aac" | "audio/m4a" => "audio.m4a",
+        "audio/ogg" => "audio.ogg",
+        "audio/mpeg" => "audio.mp3",
+        "application/pdf" => "document.pdf",
+        _ if mime.starts_with("image/") => "photo.jpg",
+        _ if mime.starts_with("video/") => "video.mp4",
+        _ if mime.starts_with("audio/") => "audio.m4a",
+        _ => "file",
+    }
+}
+
+/// Human-readable short label for a quoted attachment when the quoted message had no text.
+pub fn attachment_label(mime: &str, file_name: &str, flags: u32) -> String {
+    if !file_name.trim().is_empty() && matches!(attachment_kind(mime, flags), MediaKind::File) {
+        return file_name.trim().to_owned();
+    }
+    if flags & super::wire::FLAG_VOICE_MESSAGE != 0 {
+        return "Voice message".to_owned();
+    }
+    match attachment_kind(mime, flags) {
+        MediaKind::Image => "Photo".to_owned(),
+        MediaKind::Video => "Video".to_owned(),
+        MediaKind::Gif => "GIF".to_owned(),
+        MediaKind::Audio => "Audio".to_owned(),
+        _ => {
+            if !file_name.trim().is_empty() {
+                file_name.trim().to_owned()
+            } else {
+                "File".to_owned()
+            }
+        }
     }
 }
 
@@ -132,6 +192,7 @@ pub fn prepare(name: &str, mime: &str, bytes: Vec<u8>, keep: bool) -> File {
         thumb,
         blurhash,
         gif,
+        voice: false,
     }
 }
 
@@ -330,6 +391,679 @@ fn push83(out: &mut String, mut value: u32, length: usize) {
     out.extend(chars.iter().map(|byte| char::from(*byte)));
 }
 
+fn decode83(text: &str) -> Option<u32> {
+    let mut value = 0u32;
+    for byte in text.bytes() {
+        let digit = DIGITS.iter().position(|&d| d == byte)? as u32;
+        value = value.checked_mul(83)?.checked_add(digit)?;
+    }
+    Some(value)
+}
+
+fn decode_dc(value: u32) -> (f32, f32, f32) {
+    (
+        linear(((value >> 16) & 0xff) as u8),
+        linear(((value >> 8) & 0xff) as u8),
+        linear((value & 0xff) as u8),
+    )
+}
+
+fn decode_ac(value: u32, maximum: f32) -> (f32, f32, f32) {
+    let quant_r = (value / (19 * 19)) as i32;
+    let quant_g = ((value / 19) % 19) as i32;
+    let quant_b = (value % 19) as i32;
+    let unquant = |q: i32| -> f32 {
+        let s = (q as f32 - 9.0) / 9.0;
+        s.signum() * s * s * maximum
+    };
+    (unquant(quant_r), unquant(quant_g), unquant(quant_b))
+}
+
+/// Decodes a BlurHash string into a tiny JPEG preview image (at most 32 px on the longest side)
+/// for immediate display before the full encrypted attachment finishes downloading.
+pub fn decode_blurhash_jpeg(hash: &str, width: u32, height: u32) -> Option<Vec<u8>> {
+    if hash.len() < 6 || !hash.is_ascii() {
+        return None;
+    }
+    let size_flag = decode83(&hash[0..1])?;
+    let ny = (size_flag / 9) + 1;
+    let nx = (size_flag % 9) + 1;
+    let expected_len = 4 + 2 * (nx * ny) as usize;
+    if hash.len() != expected_len {
+        return None;
+    }
+    let quant_max = decode83(&hash[1..2])?;
+    let max_val = (quant_max as f32 + 1.0) / 166.0;
+    let mut colors = Vec::with_capacity((nx * ny) as usize);
+    colors.push(decode_dc(decode83(&hash[2..6])?));
+    for i in 1..(nx * ny) as usize {
+        let off = 4 + i * 2;
+        colors.push(decode_ac(decode83(&hash[off..off + 2])?, max_val));
+    }
+    let (pw, ph) = if width > 0 && height > 0 {
+        let long = width.max(height);
+        let pw = ((u64::from(width) * 32) / u64::from(long)).clamp(4, 32) as u32;
+        let ph = ((u64::from(height) * 32) / u64::from(long)).clamp(4, 32) as u32;
+        (pw, ph)
+    } else {
+        (32, 24)
+    };
+    let mut img = image::RgbImage::new(pw, ph);
+    for y in 0..ph {
+        for x in 0..pw {
+            let mut r = 0.0f32;
+            let mut g = 0.0f32;
+            let mut b = 0.0f32;
+            for j in 0..ny {
+                let cos_y = (std::f32::consts::PI * y as f32 * j as f32 / ph as f32).cos();
+                for i in 0..nx {
+                    let basis = (std::f32::consts::PI * x as f32 * i as f32 / pw as f32).cos() * cos_y;
+                    let (cr, cg, cb) = colors[(j * nx + i) as usize];
+                    r += cr * basis;
+                    g += cg * basis;
+                    b += cb * basis;
+                }
+            }
+            img.put_pixel(x, y, image::Rgb([srgb(r) as u8, srgb(g) as u8, srgb(b) as u8]));
+        }
+    }
+    let bytes = jpeg(&DynamicImage::ImageRgb8(img));
+    (!bytes.is_empty()).then_some(bytes)
+}
+
+/// Encrypts `plaintext` with Signal's attachment cipher:
+/// `IV (16) || AES-256-CBC-PKCS7(key[..32], IV, plaintext) || HMAC-SHA256(key[32..], IV || ct)`.
+/// Returns `(ciphertext, sha256_digest_of_ciphertext)`.
+pub fn encrypt_attachment(iv: [u8; 16], key: [u8; 64], plaintext: &[u8]) -> (Vec<u8>, [u8; 32]) {
+    use aes::cipher::{BlockEncrypt, KeyInit};
+    use aes::Aes256;
+    use hmac::{Hmac, Mac};
+    use sha2::{Digest, Sha256};
+
+    let aes = Aes256::new_from_slice(&key[..32]).expect("32-byte AES key");
+    let pad = 16 - (plaintext.len() % 16);
+    let mut out = Vec::with_capacity(16 + plaintext.len() + pad + 32);
+    out.extend_from_slice(&iv);
+    let mut prev = iv;
+    let mut chunks = plaintext.chunks_exact(16);
+    for chunk in &mut chunks {
+        let mut block = [0u8; 16];
+        for i in 0..16 {
+            block[i] = chunk[i] ^ prev[i];
+        }
+        aes.encrypt_block((&mut block).into());
+        out.extend_from_slice(&block);
+        prev = block;
+    }
+    let rem = chunks.remainder();
+    let mut last = [pad as u8; 16];
+    last[..rem.len()].copy_from_slice(rem);
+    for i in 0..16 {
+        last[i] ^= prev[i];
+    }
+    aes.encrypt_block((&mut last).into());
+    out.extend_from_slice(&last);
+
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key[32..64]).expect("32-byte HMAC key");
+    mac.update(&out);
+    out.extend_from_slice(&mac.finalize().into_bytes());
+    let digest: [u8; 32] = Sha256::digest(&out).into();
+    (out, digest)
+}
+
+/// Streams an encrypted Signal attachment from `reader` onto disk at `dest` without holding the
+/// whole file in memory:
+/// 1. Streams ciphertext to a temporary `.enc` file beside `dest`, computing SHA-256 and
+///    HMAC-SHA256 on the fly (keeping a 32-byte trailing MAC window).
+/// 2. Verifies SHA-256 digest (when non-empty) and HMAC-SHA256.
+/// 3. Streams AES-256-CBC decryption in 64 KiB chunks from `.enc` to `dest`, removes PKCS#7
+///    padding, truncates to `plaintext_size` (when > 0), and deletes `.enc`.
+pub fn decrypt_attachment_stream<R: std::io::Read>(
+    mut reader: R,
+    key: &[u8],
+    expected_digest: &[u8],
+    plaintext_size: u32,
+    dest: &std::path::Path,
+) -> Result<u64, String> {
+    use hmac::{Hmac, Mac};
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+
+    const STREAM_CAP: u64 = MAX_FILE_BYTES + 1024 * 1024;
+    if key.len() != 64 {
+        return Err("Invalid attachment key.".to_owned());
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let enc_path = dest.with_extension("sigenc");
+    let cleanup = || {
+        let _ = std::fs::remove_file(&enc_path);
+    };
+
+    // Pass 1: stream encrypted bytes to disk while computing SHA-256 and HMAC-SHA256.
+    let mut sha = Sha256::new();
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key[32..64]).map_err(|_| "Invalid HMAC key.".to_owned())?;
+    let mut total_enc = 0u64;
+    let mut tail = Vec::<u8>::with_capacity(64);
+    {
+        let mut enc_file = protocol::private::create(&enc_path).map_err(|err| err.to_string())?;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(err) => {
+                    drop(enc_file);
+                    cleanup();
+                    return Err(format!("Attachment download failed: {err}"));
+                }
+            };
+            total_enc = total_enc.saturating_add(n as u64);
+            if total_enc > STREAM_CAP {
+                drop(enc_file);
+                cleanup();
+                return Err("Attachment exceeds Signal's size limit.".to_owned());
+            }
+            let slice = &buf[..n];
+            sha.update(slice);
+            if let Err(err) = enc_file.write_all(slice) {
+                drop(enc_file);
+                cleanup();
+                return Err(err.to_string());
+            }
+            // Feed everything except the final 32 bytes (the trailing MAC) into HMAC.
+            if slice.len() >= 32 {
+                if !tail.is_empty() {
+                    mac.update(&tail);
+                    tail.clear();
+                }
+                let cut = slice.len() - 32;
+                if cut > 0 {
+                    mac.update(&slice[..cut]);
+                }
+                tail.extend_from_slice(&slice[cut..]);
+            } else {
+                tail.extend_from_slice(slice);
+                if tail.len() > 32 {
+                    let flush = tail.len() - 32;
+                    mac.update(&tail[..flush]);
+                    tail.drain(..flush);
+                }
+            }
+        }
+    }
+
+    if total_enc < 16 + 16 + 32 || tail.len() != 32 {
+        cleanup();
+        return Err("Encrypted attachment is truncated.".to_owned());
+    }
+    let body_len = total_enc - 16 - 32;
+    if !body_len.is_multiple_of(16) {
+        cleanup();
+        return Err("Encrypted attachment is not block-aligned.".to_owned());
+    }
+    if !expected_digest.is_empty() {
+        let actual_digest = sha.finalize();
+        if actual_digest.as_slice() != expected_digest {
+            cleanup();
+            return Err("Attachment digest mismatch.".to_owned());
+        }
+    }
+    if mac.verify_slice(&tail).is_err() {
+        cleanup();
+        return Err("Attachment MAC verification failed.".to_owned());
+    }
+
+    // Pass 2: stream AES-256-CBC decryption in 64 KiB chunks to `dest`.
+    let res = decrypt_verified_enc_file(&enc_path, body_len, key, plaintext_size, dest);
+    cleanup();
+    res
+}
+
+/// Verifies SHA-256 digest and HMAC-SHA256 of an already-downloaded encrypted blob at `enc_path`,
+/// then streams AES-256-CBC decryption in 64 KiB chunks into `dest`. Removes `enc_path` before returning.
+pub fn decrypt_attachment_file(
+    enc_path: &std::path::Path,
+    key: &[u8],
+    expected_digest: &[u8],
+    plaintext_size: u32,
+    dest: &std::path::Path,
+) -> Result<u64, String> {
+    use hmac::{Hmac, Mac};
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let cleanup = || {
+        let _ = std::fs::remove_file(enc_path);
+    };
+    if key.len() != 64 {
+        cleanup();
+        return Err("Invalid attachment key.".to_owned());
+    }
+    let meta = match std::fs::metadata(enc_path) {
+        Ok(m) => m,
+        Err(err) => {
+            cleanup();
+            return Err(err.to_string());
+        }
+    };
+    let total_enc = meta.len();
+    if total_enc < 16 + 16 + 32 {
+        cleanup();
+        return Err("Encrypted attachment is truncated.".to_owned());
+    }
+    let body_len = total_enc - 16 - 32;
+    if !body_len.is_multiple_of(16) {
+        cleanup();
+        return Err("Encrypted attachment is not block-aligned.".to_owned());
+    }
+    let mut sha = Sha256::new();
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&key[32..64]).map_err(|_| {
+        cleanup();
+        "Invalid HMAC key.".to_owned()
+    })?;
+    let mut tail = Vec::<u8>::with_capacity(64);
+    {
+        let mut file = match std::fs::File::open(enc_path) {
+            Ok(f) => f,
+            Err(err) => {
+                cleanup();
+                return Err(err.to_string());
+            }
+        };
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(err) => {
+                    drop(file);
+                    cleanup();
+                    return Err(err.to_string());
+                }
+            };
+            let slice = &buf[..n];
+            sha.update(slice);
+            if slice.len() >= 32 {
+                if !tail.is_empty() {
+                    mac.update(&tail);
+                    tail.clear();
+                }
+                let cut = slice.len() - 32;
+                if cut > 0 {
+                    mac.update(&slice[..cut]);
+                }
+                tail.extend_from_slice(&slice[cut..]);
+            } else {
+                tail.extend_from_slice(slice);
+                if tail.len() > 32 {
+                    let flush = tail.len() - 32;
+                    mac.update(&tail[..flush]);
+                    tail.drain(..flush);
+                }
+            }
+        }
+    }
+    if !expected_digest.is_empty() && sha.finalize().as_slice() != expected_digest {
+        cleanup();
+        return Err("Attachment digest mismatch.".to_owned());
+    }
+    if tail.len() != 32 || mac.verify_slice(&tail).is_err() {
+        cleanup();
+        return Err("Attachment MAC verification failed.".to_owned());
+    }
+    let res = decrypt_verified_enc_file(enc_path, body_len, key, plaintext_size, dest);
+    cleanup();
+    res
+}
+
+fn decrypt_verified_enc_file(
+    enc_path: &std::path::Path,
+    body_len: u64,
+    key: &[u8],
+    plaintext_size: u32,
+    dest: &std::path::Path,
+) -> Result<u64, String> {
+    use aes::cipher::{BlockDecrypt, KeyInit};
+    use aes::Aes256;
+    use std::io::{Read, Write};
+
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let aes = Aes256::new_from_slice(&key[..32]).map_err(|_| "Invalid AES key.".to_owned())?;
+    let mut enc_in = std::fs::File::open(enc_path).map_err(|err| err.to_string())?;
+    let mut iv = [0u8; 16];
+    enc_in.read_exact(&mut iv).map_err(|err| err.to_string())?;
+    let mut out_file = protocol::private::create(dest).map_err(|err| err.to_string())?;
+
+    let mut remaining = body_len;
+    let mut prev = iv;
+    let mut written = 0u64;
+    let limit = if plaintext_size > 0 { Some(u64::from(plaintext_size)) } else { None };
+    let mut chunk_buf = vec![0u8; 64 * 1024];
+
+    while remaining > 0 {
+        let to_read = (remaining as usize).min(chunk_buf.len());
+        let to_read = (to_read / 16) * 16;
+        if let Err(err) = enc_in.read_exact(&mut chunk_buf[..to_read]) {
+            drop(out_file);
+            let _ = std::fs::remove_file(dest);
+            return Err(err.to_string());
+        }
+        remaining -= to_read as u64;
+        for block_slice in chunk_buf[..to_read].chunks_exact_mut(16) {
+            let ct_copy: [u8; 16] = block_slice.try_into().expect("16 bytes");
+            aes.decrypt_block(block_slice.into());
+            for i in 0..16 {
+                block_slice[i] ^= prev[i];
+            }
+            prev = ct_copy;
+        }
+        let plain_slice = if remaining == 0 {
+            let pad = chunk_buf[to_read - 1] as usize;
+            if pad == 0 || pad > 16 || !chunk_buf[to_read - pad..to_read].iter().all(|&b| b as usize == pad) {
+                drop(out_file);
+                let _ = std::fs::remove_file(dest);
+                return Err("Attachment padding is invalid.".to_owned());
+            }
+            &chunk_buf[..to_read - pad]
+        } else {
+            &chunk_buf[..to_read]
+        };
+        let to_write = match limit {
+            Some(max) => {
+                let left = max.saturating_sub(written) as usize;
+                &plain_slice[..plain_slice.len().min(left)]
+            }
+            None => plain_slice,
+        };
+        if !to_write.is_empty() {
+            if let Err(err) = out_file.write_all(to_write) {
+                drop(out_file);
+                let _ = std::fs::remove_file(dest);
+                return Err(err.to_string());
+            }
+            written += to_write.len() as u64;
+        }
+    }
+    Ok(written)
+}
+
+/// Derives the 64-byte AES-256 + HMAC-SHA256 key for a Signal sticker pack or sticker from its
+/// 32-byte `pack_key` using HKDF-SHA256 (`info = b"Sticker Pack"`).
+pub fn derive_sticker_key(pack_key: &[u8]) -> Result<[u8; 64], String> {
+    if pack_key.len() != 32 {
+        return Err("Invalid sticker pack key.".to_owned());
+    }
+    let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, pack_key);
+    let mut out = [0u8; 64];
+    hk.expand(b"Sticker Pack", &mut out)
+        .map_err(|_| "Could not derive sticker key.".to_owned())?;
+    Ok(out)
+}
+
+/// Streams and decrypts an encrypted Signal sticker manifest or sticker image using `pack_key`.
+pub fn decrypt_sticker_stream<R: std::io::Read>(
+    reader: R,
+    pack_key: &[u8],
+    dest: &std::path::Path,
+) -> Result<u64, String> {
+    let key = derive_sticker_key(pack_key)?;
+    decrypt_attachment_stream(reader, &key, &[], 0, dest)
+}
+
+/// Extracts `(duration_secs, waveform_bars)` from a decrypted voice note (WAV, Ogg/Opus, or
+/// MP4/M4A). Always returns a non-zero duration (>= 1 s) and non-empty waveform bars bounded to
+/// `protocol::WAVEFORM_LIMIT` so the UI renders every Signal voice note with a waveform player.
+pub fn voice_facts(_mime: &str, bytes: &[u8]) -> (u32, Vec<u8>) {
+    const BARS: usize = 48;
+    if bytes.is_empty() {
+        return (1, vec![20; 32]);
+    }
+    if let Some(parsed) = wav_facts(bytes, BARS) {
+        return parsed;
+    }
+    if let Some(parsed) = ogg_facts(bytes, BARS) {
+        return parsed;
+    }
+    if let Some(parsed) = mp4_facts(bytes, BARS) {
+        return parsed;
+    }
+    // Generic fallback: estimate duration (~4 KB/s for voice AAC/Opus) and compute chunk energy.
+    let dur = ((bytes.len() as u64 + 3_999) / 4_000).max(1) as u32;
+    (dur, byte_energy_bars(bytes, BARS))
+}
+
+fn wav_facts(bytes: &[u8], bars: usize) -> Option<(u32, Vec<u8>)> {
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut pos = 12usize;
+    let mut sample_rate = 0u32;
+    let mut channels = 1u16;
+    let mut bits_per_sample = 16u16;
+    let mut data: Option<&[u8]> = None;
+    while pos + 8 <= bytes.len() {
+        let tag = &bytes[pos..pos + 4];
+        let size = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().ok()?) as usize;
+        let body_start = pos + 8;
+        let body_end = body_start.saturating_add(size).min(bytes.len());
+        let body = &bytes[body_start..body_end];
+        if tag == b"fmt " && body.len() >= 16 {
+            channels = u16::from_le_bytes(body[2..4].try_into().ok()?).max(1);
+            sample_rate = u32::from_le_bytes(body[4..8].try_into().ok()?);
+            bits_per_sample = u16::from_le_bytes(body[14..16].try_into().ok()?).max(8);
+        } else if tag == b"data" {
+            data = Some(body);
+        }
+        pos = body_start.saturating_add(size).saturating_add(size & 1);
+    }
+    let pcm = data?;
+    let bytes_per_sec = u64::from(sample_rate) * u64::from(channels) * u64::from(bits_per_sample / 8);
+    if bytes_per_sec == 0 {
+        return None;
+    }
+    let dur = ((pcm.len() as u64 + bytes_per_sec / 2) / bytes_per_sec).max(1) as u32;
+    let wave = if bits_per_sample == 16 && pcm.len() >= 2 {
+        pcm16_waveform(pcm, bars)
+    } else {
+        byte_energy_bars(pcm, bars)
+    };
+    Some((dur, wave))
+}
+
+fn pcm16_waveform(pcm: &[u8], bars: usize) -> Vec<u8> {
+    let total_samples = pcm.len() / 2;
+    let count = bars.min(protocol::WAVEFORM_LIMIT).max(1);
+    let step = (total_samples / count).max(1);
+    let mut peaks = Vec::with_capacity(count);
+    let mut max_peak = 1.0f32;
+    for i in 0..count {
+        let start = i * step;
+        let end = ((i + 1) * step).min(total_samples);
+        if start >= end {
+            peaks.push(0.0);
+            continue;
+        }
+        let mut sum_sq = 0.0f64;
+        for s in start..end {
+            let sample = i16::from_le_bytes([pcm[s * 2], pcm[s * 2 + 1]]) as f64;
+            sum_sq += sample * sample;
+        }
+        let rms = (sum_sq / (end - start) as f64).sqrt() as f32;
+        max_peak = max_peak.max(rms);
+        peaks.push(rms);
+    }
+    peaks
+        .into_iter()
+        .map(|p| ((p / max_peak * 235.0) as u8).saturating_add(20))
+        .collect()
+}
+
+fn ogg_facts(bytes: &[u8], bars: usize) -> Option<(u32, Vec<u8>)> {
+    if bytes.len() < 28 || &bytes[0..4] != b"OggS" {
+        return None;
+    }
+    let mut pos = 0usize;
+    let mut max_granule = 0u64;
+    let mut page_energies: Vec<u32> = Vec::new();
+    while pos + 27 <= bytes.len() && &bytes[pos..pos + 4] == b"OggS" {
+        let granule = u64::from_le_bytes(bytes[pos + 6..pos + 14].try_into().ok()?);
+        if granule != u64::MAX {
+            max_granule = max_granule.max(granule);
+        }
+        let segments = bytes[pos + 26] as usize;
+        if pos + 27 + segments > bytes.len() {
+            break;
+        }
+        let payload_len: usize = bytes[pos + 27..pos + 27 + segments].iter().map(|&b| b as usize).sum();
+        let payload_start = pos + 27 + segments;
+        let payload_end = payload_start.saturating_add(payload_len).min(bytes.len());
+        if payload_end > payload_start {
+            page_energies.push((payload_end - payload_start) as u32);
+        }
+        pos = payload_end;
+    }
+    // Opus in Ogg always uses a 48 kHz granule clock (RFC 7845).
+    let dur = if max_granule > 0 {
+        ((max_granule + 24_000) / 48_000).max(1) as u32
+    } else {
+        ((bytes.len() as u64 + 3_999) / 4_000).max(1) as u32
+    };
+    let wave = if page_energies.len() >= 4 {
+        resample_u32_bars(&page_energies, bars)
+    } else {
+        byte_energy_bars(bytes, bars)
+    };
+    Some((dur, wave))
+}
+
+fn mp4_facts(bytes: &[u8], bars: usize) -> Option<(u32, Vec<u8>)> {
+    if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
+        return None;
+    }
+    let mut duration_secs: Option<u32> = None;
+    let mut mdat_slice: Option<&[u8]> = None;
+    let mut stsz_samples: Vec<u32> = Vec::new();
+    scan_mp4_boxes(bytes, 0, &mut duration_secs, &mut mdat_slice, &mut stsz_samples);
+    let dur = duration_secs.unwrap_or_else(|| ((bytes.len() as u64 + 3_999) / 4_000).max(1) as u32);
+    let wave = if stsz_samples.len() >= 4 {
+        resample_u32_bars(&stsz_samples, bars)
+    } else if let Some(mdat) = mdat_slice.filter(|s| !s.is_empty()) {
+        byte_energy_bars(mdat, bars)
+    } else {
+        byte_energy_bars(bytes, bars)
+    };
+    Some((dur.max(1), wave))
+}
+
+fn scan_mp4_boxes<'a>(
+    bytes: &'a [u8],
+    depth: u8,
+    duration_secs: &mut Option<u32>,
+    mdat: &mut Option<&'a [u8]>,
+    stsz_samples: &mut Vec<u32>,
+) {
+    if depth > 6 {
+        return;
+    }
+    let mut pos = 0usize;
+    while pos + 8 <= bytes.len() {
+        let size32 = u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]) as usize;
+        let tag = &bytes[pos + 4..pos + 8];
+        let (hdr, size) = if size32 == 1 && pos + 16 <= bytes.len() {
+            let size64 = u64::from_be_bytes(bytes[pos + 8..pos + 16].try_into().unwrap_or([0; 8])) as usize;
+            (16usize, size64)
+        } else if size32 == 0 {
+            (8usize, bytes.len() - pos)
+        } else {
+            (8usize, size32)
+        };
+        if size < hdr || pos.saturating_add(size) > bytes.len() {
+            break;
+        }
+        let body = &bytes[pos + hdr..pos + size];
+        match tag {
+            b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" => {
+                scan_mp4_boxes(body, depth + 1, duration_secs, mdat, stsz_samples);
+            }
+            b"mvhd" if body.len() >= 20 => {
+                let version = body[0];
+                if version == 0 && body.len() >= 20 {
+                    let timescale = u32::from_be_bytes([body[12], body[13], body[14], body[15]]);
+                    let dur = u32::from_be_bytes([body[16], body[17], body[18], body[19]]);
+                    if timescale > 0 {
+                        *duration_secs = Some(((u64::from(dur) + u64::from(timescale) / 2) / u64::from(timescale)).max(1) as u32);
+                    }
+                } else if version == 1 && body.len() >= 32 {
+                    let timescale = u32::from_be_bytes([body[20], body[21], body[22], body[23]]);
+                    let dur = u64::from_be_bytes(body[24..32].try_into().unwrap_or([0; 8]));
+                    if timescale > 0 {
+                        *duration_secs = Some(((dur + u64::from(timescale) / 2) / u64::from(timescale)).max(1) as u32);
+                    }
+                }
+            }
+            b"stsz" if body.len() >= 12 && stsz_samples.is_empty() => {
+                let sample_size = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+                let count = u32::from_be_bytes([body[8], body[9], body[10], body[11]]) as usize;
+                if sample_size == 0 {
+                    let avail = ((body.len() - 12) / 4).min(count).min(8_192);
+                    for i in 0..avail {
+                        let off = 12 + i * 4;
+                        stsz_samples.push(u32::from_be_bytes([body[off], body[off + 1], body[off + 2], body[off + 3]]));
+                    }
+                }
+            }
+            b"mdat" if mdat.is_none() => {
+                *mdat = Some(body);
+            }
+            _ => {}
+        }
+        pos += size;
+    }
+}
+
+fn resample_u32_bars(values: &[u32], bars: usize) -> Vec<u8> {
+    let count = bars.min(protocol::WAVEFORM_LIMIT).max(1);
+    let mut buckets = Vec::with_capacity(count);
+    let mut max_val = 1u64;
+    for i in 0..count {
+        let start = i * values.len() / count;
+        let end = ((i + 1) * values.len() / count).max(start + 1).min(values.len());
+        let avg = values[start..end].iter().map(|&v| u64::from(v)).sum::<u64>() / (end - start).max(1) as u64;
+        max_val = max_val.max(avg);
+        buckets.push(avg);
+    }
+    buckets
+        .into_iter()
+        .map(|v| ((v * 235 / max_val) as u8).saturating_add(20))
+        .collect()
+}
+
+fn byte_energy_bars(bytes: &[u8], bars: usize) -> Vec<u8> {
+    let count = bars.min(protocol::WAVEFORM_LIMIT).max(1);
+    let mut buckets = Vec::with_capacity(count);
+    let mut max_val = 1u64;
+    for i in 0..count {
+        let start = i * bytes.len() / count;
+        let end = ((i + 1) * bytes.len() / count).max(start + 1).min(bytes.len());
+        let slice = &bytes[start..end];
+        let mut energy = 0u64;
+        for w in slice.windows(2) {
+            energy += u64::from(w[0].abs_diff(w[1]));
+        }
+        let avg = energy / slice.len().max(1) as u64;
+        max_val = max_val.max(avg);
+        buckets.push(avg);
+    }
+    buckets
+        .into_iter()
+        .map(|v| ((v * 235 / max_val) as u8).saturating_add(20))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +1084,7 @@ mod tests {
             author: "a1a1a1a1-0000-4000-8000-000000000001".into(),
             text: String::new(),
             spans: Vec::new(),
+            attachments: Vec::new(),
         };
         assert_eq!(
             call_line(
@@ -364,5 +1099,122 @@ mod tests {
             call_line("c", &["a.png".into(), "b.png".into()], "", Some(&quote)),
             "send c files a.png,b.png (answering 5-a1a1a1a1-0000-4000-8000-000000000001)"
         );
+    }
+
+    #[test]
+    fn streaming_attachment_cipher_round_trips_and_rejects_tampering() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("plain.bin");
+        let iv = [0x42u8; 16];
+        let mut key = [0u8; 64];
+        for (i, b) in key.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(7).wrapping_add(3);
+        }
+        // Multi-chunk payload (> 64 KiB) to prove streaming across chunk boundaries.
+        let plaintext: Vec<u8> = (0..140_000).map(|i| (i % 251) as u8).collect();
+        let (ct, digest) = encrypt_attachment(iv, key, &plaintext);
+
+        let len = decrypt_attachment_stream(std::io::Cursor::new(&ct), &key, &digest, plaintext.len() as u32, &dest)
+            .expect("valid encrypted attachment");
+        assert_eq!(len, plaintext.len() as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), plaintext);
+        assert!(!dest.with_extension("sigenc").exists(), "temp ciphertext file removed");
+
+        // Tampered digest is rejected and leaves no partial plaintext.
+        let mut bad_digest = digest;
+        bad_digest[0] ^= 0xff;
+        let bad_dest = dir.path().join("bad.bin");
+        assert!(decrypt_attachment_stream(std::io::Cursor::new(&ct), &key, &bad_digest, 0, &bad_dest).is_err());
+        assert!(!bad_dest.exists());
+
+        // Tampered ciphertext fails MAC check.
+        let mut bad_ct = ct.clone();
+        bad_ct[20] ^= 1;
+        assert!(decrypt_attachment_stream(std::io::Cursor::new(&bad_ct), &key, &[], 0, &bad_dest).is_err());
+    }
+
+    #[test]
+    fn blurhash_decodes_to_a_valid_jpeg_preview() {
+        let jpeg = decode_blurhash_jpeg("00TI:j", 640, 480).expect("valid blurhash jpeg");
+        assert!(jpeg.starts_with(&[0xff, 0xd8, 0xff]), "JPEG SOI marker");
+        assert!(decode_blurhash_jpeg("bad", 10, 10).is_none());
+    }
+
+    #[test]
+    fn voice_facts_extracts_duration_and_waveform_for_wav_ogg_and_mp4() {
+        // 1. WAV (3 seconds at 8 kHz 16-bit mono)
+        let sr: u32 = 8_000;
+        let samples = 24_000usize;
+        let data_len = (samples * 2) as u32;
+        let mut wav = Vec::with_capacity(44 + data_len as usize);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&sr.to_le_bytes());
+        wav.extend_from_slice(&(sr * 2).to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        for i in 0..samples {
+            let s = ((i as f32 * 0.1).sin() * 12_000.0) as i16;
+            wav.extend_from_slice(&s.to_le_bytes());
+        }
+        let (dur, wave) = voice_facts("audio/wav", &wav);
+        assert_eq!(dur, 3);
+        assert!(!wave.is_empty() && wave.len() <= protocol::WAVEFORM_LIMIT);
+
+        // 2. Ogg/Opus (granule = 48_000 * 5 => 5 seconds)
+        let mut ogg = Vec::new();
+        for page in 0..4u64 {
+            ogg.extend_from_slice(b"OggS");
+            ogg.push(0); // version
+            ogg.push(0); // header type
+            ogg.extend_from_slice(&((page + 1) * 60_000).to_le_bytes()); // granule -> last is 240_000 = 5s
+            ogg.extend_from_slice(&1u32.to_le_bytes()); // serial
+            ogg.extend_from_slice(&(page as u32).to_le_bytes()); // seq
+            ogg.extend_from_slice(&0u32.to_le_bytes()); // crc
+            ogg.push(1); // 1 segment
+            ogg.push((40 + page * 20) as u8);
+            ogg.extend(std::iter::repeat_n(0x55u8, 40 + (page as usize) * 20));
+        }
+        let (ogg_dur, ogg_wave) = voice_facts("audio/ogg", &ogg);
+        assert_eq!(ogg_dur, 5);
+        assert!(!ogg_wave.is_empty() && ogg_wave.len() <= protocol::WAVEFORM_LIMIT);
+
+        // 3. MP4/M4A (ftyp + moov/mvhd timescale=1000, duration=7000 => 7 seconds)
+        let mut mp4 = Vec::new();
+        mp4.extend_from_slice(&16u32.to_be_bytes());
+        mp4.extend_from_slice(b"ftypM4A \x00\x00\x00\x00");
+        let mut mvhd = vec![0u8; 28];
+        mvhd[0..4].copy_from_slice(&28u32.to_be_bytes());
+        mvhd[4..8].copy_from_slice(b"mvhd");
+        mvhd[20..24].copy_from_slice(&1000u32.to_be_bytes()); // timescale at body[12..16]
+        mvhd[24..28].copy_from_slice(&7000u32.to_be_bytes()); // duration at body[16..20]
+        let moov_len = (8 + mvhd.len()) as u32;
+        mp4.extend_from_slice(&moov_len.to_be_bytes());
+        mp4.extend_from_slice(b"moov");
+        mp4.extend_from_slice(&mvhd);
+        let (mp4_dur, mp4_wave) = voice_facts("audio/mp4", &mp4);
+        assert_eq!(mp4_dur, 7);
+        assert!(!mp4_wave.is_empty() && mp4_wave.len() <= protocol::WAVEFORM_LIMIT);
+    }
+
+    #[test]
+    fn sticker_hkdf_derivation_and_decrypt_stream_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("sticker.webp");
+        let pack_key = [0x3cu8; 32];
+        let derived = derive_sticker_key(&pack_key).expect("64-byte derived key");
+        assert!(derive_sticker_key(&[0u8; 16]).is_err());
+
+        let plain = b"RIFF\x10\x00\x00\x00WEBPVP8 FAKE-STICKER";
+        let (ct, _) = encrypt_attachment([0x5au8; 16], derived, plain);
+        let len = decrypt_sticker_stream(std::io::Cursor::new(&ct), &pack_key, &dest).expect("decrypt sticker");
+        assert_eq!(len, plain.len() as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), plain);
     }
 }

@@ -76,6 +76,8 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
         snippet: text.to_owned(),
         person: Some(Key::new(&key.account(), who.id.clone())),
         deleted: false,
+        thumb: None,
+        story: false,
     };
 
     // A walk being planned: a reply, a reaction of ours, two unread.

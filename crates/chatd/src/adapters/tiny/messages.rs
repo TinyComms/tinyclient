@@ -3814,7 +3814,7 @@ fn reply_of(value: Option<&Value>) -> Option<ReplyTo> {
         Value::Object(map) => map.get("id").and_then(Value::as_str)?.to_owned(),
         _ => return None,
     };
-    if id.is_empty() { None } else { Some(ReplyTo { id, sender: String::new(), snippet: String::new(), person: None, deleted: false }) }
+    if id.is_empty() { None } else { Some(ReplyTo { id, sender: String::new(), snippet: String::new(), person: None, deleted: false, thumb: None, story: false }) }
 }
 
 fn as_u32(value: &Value) -> u32 {

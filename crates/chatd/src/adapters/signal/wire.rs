@@ -445,6 +445,58 @@ pub struct StorageAccount {
     pub universal_expire_timer: u32,
     #[serde(default)]
     pub note_to_self_marked_unread: bool,
+    /// True when the user turned Signal Stories off in their account settings.
+    #[serde(default)]
+    pub stories_disabled: Option<bool>,
+    /// True when story view receipts (`storyViewReceiptsEnabled`) are enabled on the account.
+    #[serde(default)]
+    pub story_view_receipts: Option<bool>,
+}
+
+/// One Signal story distribution list (`StoryDistributionListRecord` from Storage Service).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoryDistributionList {
+    /// Hex-encoded 16-byte distribution list identifier (`00000000...` is "My Story").
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    /// Recipient ACIs named in this list (excluded when `is_block_list == true`, included otherwise).
+    #[serde(default)]
+    pub recipients: Vec<String>,
+    #[serde(default)]
+    pub allows_replies: bool,
+    /// When true (the default for "My Story" with exceptions), send to all contacts EXCEPT
+    /// `recipients`. When false (an allowlist / custom list), send ONLY to `recipients`.
+    #[serde(default)]
+    pub is_block_list: bool,
+}
+
+/// Resolves the exact sorted, deduplicated set of recipient ACIs permitted to receive a story
+/// posted to `list`, strictly enforcing allowlist vs blocklist semantics and never leaking to
+/// blocked contacts or ourselves.
+pub fn resolve_story_recipients(
+    list: &StoryDistributionList,
+    all_contacts: &[String],
+    blocked: &std::collections::HashSet<String>,
+    me: &str,
+) -> Vec<String> {
+    let mut out: Vec<String> = if list.is_block_list {
+        let excluded: std::collections::HashSet<&str> = list.recipients.iter().map(String::as_str).collect();
+        all_contacts
+            .iter()
+            .filter(|aci| is_aci(aci) && aci.as_str() != me && !blocked.contains(aci.as_str()) && !excluded.contains(aci.as_str()))
+            .cloned()
+            .collect()
+    } else {
+        list.recipients
+            .iter()
+            .filter(|aci| is_aci(aci) && aci.as_str() != me && !blocked.contains(aci.as_str()))
+            .cloned()
+            .collect()
+    };
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Full read-only snapshot decrypted from Signal's Storage Service manifest.
@@ -456,6 +508,8 @@ pub struct StorageSnapshot {
     pub groups: Vec<StorageGroup>,
     #[serde(default)]
     pub account: Option<StorageAccount>,
+    #[serde(default)]
+    pub distribution_lists: Vec<StoryDistributionList>,
 }
 
 /// One Signal chat folder from the storage service (`ChatFolderRecord`).
@@ -483,6 +537,63 @@ pub enum MessageRequestAction {
     BlockAndSpam,
 }
 
+/// Signal `AttachmentPointer.Flags` bitmask constants (`SignalService.proto`).
+pub const FLAG_VOICE_MESSAGE: u32 = 1;
+pub const FLAG_BORDERLESS: u32 = 2;
+pub const FLAG_GIF: u32 = 8;
+
+/// An encrypted attachment pointer carried on a Signal `DataMessage` or `Quote`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Pointer {
+    pub cdn_number: u32,
+    pub cdn_id: Option<u64>,
+    pub cdn_key: Option<String>,
+    pub content_type: String,
+    /// 64-byte attachment key (`aes_key[0..32] || hmac_key[32..64]`).
+    pub key: Vec<u8>,
+    /// Unpadded plaintext size in bytes (0 when omitted).
+    pub size: u32,
+    /// SHA-256 digest of the encrypted blob on Signal's CDN.
+    pub digest: Vec<u8>,
+    pub file_name: String,
+    /// Bitmask of `FLAG_VOICE_MESSAGE`, `FLAG_BORDERLESS`, `FLAG_GIF`.
+    pub flags: u32,
+    pub width: u32,
+    pub height: u32,
+    pub caption: String,
+    pub blurhash: Option<String>,
+    /// Inline small thumbnail bytes if the sender included them.
+    pub thumbnail: Vec<u8>,
+    pub upload_timestamp: u64,
+    /// Direct URL override used by local CDN stubs in scripted tests (never set by real Signal).
+    pub url: Option<String>,
+}
+
+impl Pointer {
+    /// True when this pointer identifies a downloadable blob on Signal's CDN or a local stub.
+    pub fn downloadable(&self) -> bool {
+        self.cdn_id.is_some()
+            || self.cdn_key.as_deref().is_some_and(|k| !k.is_empty())
+            || self.url.as_deref().is_some_and(|u| !u.is_empty())
+    }
+
+    pub fn is_voice(&self) -> bool {
+        self.flags & FLAG_VOICE_MESSAGE != 0
+    }
+
+    pub fn is_gif(&self) -> bool {
+        self.flags & FLAG_GIF != 0 || self.content_type.eq_ignore_ascii_case("image/gif")
+    }
+}
+
+/// An attachment preview inside a Signal `DataMessage.quote`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuotedAttachment {
+    pub content_type: String,
+    pub file_name: String,
+    pub thumbnail: Option<Pointer>,
+}
+
 /// The earlier message a message answers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Quote {
@@ -491,6 +602,8 @@ pub struct Quote {
     pub text: String,
     /// Styles of `text` after any mention in the quote was substituted.
     pub spans: Vec<Span>,
+    /// Quoted attachment metadata and optional thumbnail pointers (`Quote.attachments`).
+    pub attachments: Vec<QuotedAttachment>,
 }
 
 /// One link preview carried on a Signal `DataMessage.preview`.
@@ -541,6 +654,13 @@ pub fn preview_url_in_body(body: &str, url: &str) -> bool {
     false
 }
 
+/// A story text preview is kept only for an `https://` URL that appears in the story text.
+/// `http://` is not enough: story fetches go through Signal's content proxy, which is https-only.
+pub fn story_preview_kept(body: &str, url: &str) -> bool {
+    let url = url.trim();
+    url.starts_with("https://") && preview_url_in_body(body, url)
+}
+
 /// One message's words.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Text {
@@ -565,6 +685,130 @@ pub struct Text {
     pub contacts: Vec<protocol::SharedContact>,
     /// Link previews attached to this message (`DataMessage.preview`).
     pub previews: Vec<LinkPreview>,
+    /// Encrypted media/file attachments carried on this message (`DataMessage.attachments`).
+    pub attachments: Vec<Pointer>,
+    /// Optional Signal sticker (`DataMessage.sticker`).
+    pub sticker: Option<Sticker>,
+    /// Story this message replies to (`DataMessage.story_context`).
+    pub story_context: Option<StoryContext>,
+}
+
+/// Reference to the Signal story that a reply or reaction targets (`DataMessage.story_context`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoryContext {
+    pub author: String,
+    pub sent: u64,
+}
+
+/// Text content and styling of a Signal text story (`TextAttachment`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoryText {
+    pub text: String,
+    pub style: String,
+    pub fg_color: u32,
+    pub bg_color: u32,
+    pub gradient_colors: Vec<u32>,
+    pub preview: Option<LinkPreview>,
+}
+
+/// One incoming or synced Signal Story (`ContentBody::StoryMessage`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoryMessageData {
+    pub author: String,
+    pub name: String,
+    pub sent: u64,
+    /// Public hex group id when posted to a group story (`StoryMessage.group`).
+    pub group_id: Option<String>,
+    pub allows_replies: bool,
+    pub file: Option<Pointer>,
+    pub text: Option<StoryText>,
+    pub outgoing: bool,
+}
+
+/// One sticker carried on a Signal `DataMessage.sticker`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sticker {
+    /// 16-byte sticker pack id, lowercase hex (32 chars).
+    pub pack_id: String,
+    /// 32-byte sticker pack key, lowercase hex (64 chars).
+    pub pack_key: String,
+    pub sticker_id: u32,
+    pub emoji: String,
+    pub data: Pointer,
+}
+
+/// One sticker entry inside a Signal sticker pack manifest.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StickerEntry {
+    pub id: u32,
+    #[serde(default)]
+    pub emoji: String,
+    #[serde(default)]
+    pub content_type: String,
+}
+
+/// A decrypted Signal sticker pack manifest and installation state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StickerPackInfo {
+    /// 16-byte pack id, lowercase hex (32 chars).
+    pub id: String,
+    /// 32-byte pack key, lowercase hex (64 chars).
+    pub key: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub author: String,
+    #[serde(default)]
+    pub cover_id: Option<u32>,
+    #[serde(default)]
+    pub stickers: Vec<StickerEntry>,
+    #[serde(default)]
+    pub installed: bool,
+}
+
+fn is_hex_of_len(s: &str, len: usize) -> bool {
+    s.len() == len && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Formats a `https://signal.art/addstickers/#pack_id=...&pack_key=...` share link.
+pub fn format_sticker_pack_url(pack_id: &str, pack_key: &str) -> String {
+    format!(
+        "https://signal.art/addstickers/#pack_id={}&pack_key={}",
+        pack_id.to_ascii_lowercase(),
+        pack_key.to_ascii_lowercase()
+    )
+}
+
+/// Strictly parses an HTTPS Signal sticker pack link (`https://signal.art/addstickers/#pack_id=<32 hex>&pack_key=<64 hex>`).
+/// Rejects non-HTTPS schemes, other hosts, and invalid hex lengths.
+pub fn parse_sticker_pack_url(url: &str) -> Option<(String, String)> {
+    let trimmed = url.trim();
+    let frag = trimmed
+        .strip_prefix("https://signal.art/addstickers/#")
+        .or_else(|| trimmed.strip_prefix("https://signal.art/addstickers#"))?;
+    let mut pack_id: Option<String> = None;
+    let mut pack_key: Option<String> = None;
+    for pair in frag.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            match k {
+                "pack_id" if is_hex_of_len(v, 32) => pack_id = Some(v.to_ascii_lowercase()),
+                "pack_key" if is_hex_of_len(v, 64) => pack_key = Some(v.to_ascii_lowercase()),
+                _ => {}
+            }
+        }
+    }
+    Some((pack_id?, pack_key?))
+}
+
+/// Finds the first valid `https://signal.art/addstickers/#...` link in `text`.
+pub fn find_sticker_pack_url(text: &str) -> Option<(&str, String, String)> {
+    let start = text.find("https://signal.art/addstickers")?;
+    let rest = &text[start..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || matches!(c, ')' | ']' | '>' | '"' | '\''))
+        .unwrap_or(rest.len());
+    let candidate = rest[..end].trim_end_matches(|c: char| matches!(c, '.' | ',' | ';' | '!' | '?'));
+    parse_sticker_pack_url(candidate).map(|(id, key)| (candidate, id, key))
 }
 
 /// Longest payment note shown in its label: what a sender typed joins the words after an em dash.
@@ -718,6 +962,16 @@ pub enum Event {
     Pinned { peer: Peer, by: String, author: String, target: u64, duration_secs: Option<u32> },
     /// `by` unpinned `author`'s message sent at `target`.
     Unpinned { peer: Peer, by: String, author: String, target: u64 },
+    /// Initial list of installed Signal sticker packs loaded from the vault.
+    StickerPacks(Vec<StickerPackInfo>),
+    /// Another linked device installed or removed a sticker pack (`SyncMessage.stickerPackOperation`).
+    StickerPackOp { pack_id: String, pack_key: String, install: bool },
+    /// A Signal story (`ContentBody::StoryMessage`), lasting 24 hours from `sent`.
+    Story(StoryMessageData),
+    /// A reaction to a Signal story (`DataMessage.reaction` + `DataMessage.story_context`).
+    StoryReaction { peer: Peer, by: String, story_author: String, story_sent: u64, emoji: String, removed: bool },
+    /// Account-level story toggles (`stories_disabled`, `story_view_receipts`).
+    StoriesSettings { disabled: bool, view_receipts: bool },
     /// Everything that waited while we were away has arrived.
     Caught,
     /// The connection is gone; a new wire is needed.
@@ -839,6 +1093,8 @@ pub struct File {
     pub blurhash: Option<String>,
     /// True for animated GIFs (including looping MP4 GIFs from the GIF picker).
     pub gif: bool,
+    /// True for recorded voice messages (`AttachmentPointer.Flags.VOICE_MESSAGE`).
+    pub voice: bool,
 }
 
 /// What is sent.
@@ -865,6 +1121,40 @@ pub enum Body {
     Pin { author: String, target: u64, duration_secs: Option<u32> },
     /// Unpin a message in a conversation.
     Unpin { author: String, target: u64 },
+    /// Send an encrypted Signal sticker from an installed pack.
+    Sticker {
+        pack_id: String,
+        pack_key: String,
+        sticker_id: u32,
+        emoji: String,
+        bytes: Vec<u8>,
+        content_type: String,
+        quote: Option<Quote>,
+        timer: Timer,
+    },
+    /// Reply to a Signal story (`DataMessage.story_context`).
+    StoryReply {
+        story_author: String,
+        story_sent: u64,
+        text: String,
+        ranges: Vec<Range>,
+        timer: Timer,
+    },
+    /// React to a Signal story (`DataMessage.reaction` + `DataMessage.story_context`).
+    StoryReact {
+        story_author: String,
+        story_sent: u64,
+        emoji: String,
+        remove: bool,
+    },
+    /// Post a new Signal story (`ContentBody::StoryMessage`) to resolved recipients or a group.
+    PostStory {
+        recipients: Vec<String>,
+        group_id: Option<String>,
+        text: Option<StoryText>,
+        file: Option<File>,
+        allows_replies: bool,
+    },
 }
 
 /// Why something failed.
@@ -914,6 +1204,11 @@ pub trait Wire: Send + Sync {
     /// The user read these (author, sent): the user's other devices are told, and with `receipts`
     /// the authors too.
     fn read(&self, read: &[(String, u64)], receipts: bool) -> Result<(), Fault>;
+    /// The user played/viewed these (author, sent) voice notes or stories: synced to our other
+    /// devices, and with `receipts` sends `ReceiptMessage::Type::Viewed` to the authors too.
+    fn viewed(&self, _viewed: &[(String, u64)], _receipts: bool) -> Result<(), Fault> {
+        Ok(())
+    }
     /// Removes this device from the account, and what it kept here with it.
     fn unlink(&self) -> Result<(), Fault>;
     /// A person's profile picture or a group's, opened: `None` when they have none, or we hold
@@ -1030,6 +1325,34 @@ pub trait Wire: Send + Sync {
     /// Fetches a link preview strictly through Signal's content proxy (NEVER directly).
     fn fetch_link_preview(&self, _url: &str) -> Result<Option<LinkPreview>, Fault> {
         Ok(None)
+    }
+    /// Streams an encrypted attachment from Signal's CDN, verifies its SHA-256 digest and
+    /// HMAC-SHA256, and writes the decrypted plaintext to `dest` without buffering the whole
+    /// file in memory. Returns the decrypted plaintext byte length.
+    fn download_attachment(&self, _pointer: &Pointer, _dest: &std::path::Path) -> Result<u64, Fault> {
+        Err(Fault::Refused("No longer available".to_owned()))
+    }
+    /// Fetches and decrypts a Signal sticker pack manifest without installing it.
+    fn preview_sticker_pack(&self, _pack_id: &str, _pack_key: &str) -> Result<StickerPackInfo, Fault> {
+        Err(Fault::Refused("Sticker packs are not available.".to_owned()))
+    }
+    /// Installs a Signal sticker pack locally and syncs the install operation to other devices.
+    fn install_sticker_pack(&self, _pack_id: &str, _pack_key: &str) -> Result<StickerPackInfo, Fault> {
+        Err(Fault::Refused("Sticker packs are not available.".to_owned()))
+    }
+    /// Removes an installed Signal sticker pack locally and syncs the removal to other devices.
+    fn remove_sticker_pack(&self, _pack_id: &str, _pack_key: &str) -> Result<(), Fault> {
+        Err(Fault::Refused("Sticker packs are not available.".to_owned()))
+    }
+    /// Downloads and decrypts one sticker image (`pack_id`, `pack_key`, `sticker_id`) into `dest`.
+    fn download_sticker(
+        &self,
+        _pack_id: &str,
+        _pack_key: &str,
+        _sticker_id: u32,
+        _dest: &std::path::Path,
+    ) -> Result<u64, Fault> {
+        Err(Fault::Refused("No longer available".to_owned()))
     }
     /// Ends the connection: the events end, and every later request fails.
     fn close(&self);
@@ -1188,5 +1511,66 @@ mod tests {
         assert!(!preview_url_in_body("No links here", "https://example.org/post"));
         assert!(!preview_url_in_body("javascript:alert(1)", "javascript:alert(1)"));
         assert!(!preview_url_in_body("anything", ""));
+        assert!(story_preview_kept("See https://example.org/post for details", "https://example.org/post"));
+        assert!(!story_preview_kept("See https://example.org/post for details", "https://evil.example.net/phish"));
+        assert!(!story_preview_kept("See http://example.org/post for details", "http://example.org/post"));
+        assert!(!story_preview_kept("No links here", "https://example.org/post"));
+    }
+
+    #[test]
+    fn sticker_pack_url_strictly_validates_https_and_hex_lengths() {
+        let pack_id = "0123456789abcdef0123456789abcdef";
+        let pack_key = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let url = format_sticker_pack_url(pack_id, pack_key);
+        assert_eq!(parse_sticker_pack_url(&url), Some((pack_id.to_owned(), pack_key.to_owned())));
+        // Reversed fragment order also parses.
+        let reversed = format!("https://signal.art/addstickers/#pack_key={pack_key}&pack_id={pack_id}");
+        assert_eq!(parse_sticker_pack_url(&reversed), Some((pack_id.to_owned(), pack_key.to_owned())));
+        // Found inside a message sentence.
+        let msg = format!("Check out this pack: {url}!");
+        let (found, id, key) = find_sticker_pack_url(&msg).expect("sticker url");
+        assert_eq!((found, id.as_str(), key.as_str()), (url.as_str(), pack_id, pack_key));
+        // Non-HTTPS, wrong host, or bad hex lengths are rejected.
+        assert!(parse_sticker_pack_url(&url.replace("https://", "http://")).is_none());
+        assert!(parse_sticker_pack_url(&url.replace("signal.art", "evil.example")).is_none());
+        assert!(parse_sticker_pack_url("https://signal.art/addstickers/#pack_id=1234&pack_key=abcd").is_none());
+    }
+
+    #[test]
+    fn story_distribution_list_enforces_allowlist_blocklist_and_blocked_privacy() {
+        let me = "0f6c2a3e-1b4d-4e5f-8a9b-0c1d2e3f4a5b";
+        let alice = "11111111-0000-4000-8000-000000000001";
+        let bob = "22222222-0000-4000-8000-000000000002";
+        let carol = "33333333-0000-4000-8000-000000000003";
+        let dave = "44444444-0000-4000-8000-000000000004";
+        let contacts = vec![me.to_owned(), alice.to_owned(), bob.to_owned(), carol.to_owned(), dave.to_owned()];
+        let mut blocked = std::collections::HashSet::new();
+        blocked.insert(dave.to_owned());
+
+        // Blocklist mode ("My Story except Bob"): includes Alice and Carol, excludes Bob, blocked Dave, and self.
+        let my_story = StoryDistributionList {
+            id: "00000000000000000000000000000000".into(),
+            name: "My Story".into(),
+            recipients: vec![bob.to_owned()],
+            allows_replies: true,
+            is_block_list: true,
+        };
+        assert_eq!(
+            resolve_story_recipients(&my_story, &contacts, &blocked, me),
+            vec![alice.to_owned(), carol.to_owned()]
+        );
+
+        // Allowlist mode ("Close friends: Alice & Dave"): includes only Alice (Dave is blocked; Bob & Carol never receive it).
+        let custom = StoryDistributionList {
+            id: "abcdef0123456789abcdef0123456789".into(),
+            name: "Close friends".into(),
+            recipients: vec![alice.to_owned(), dave.to_owned(), alice.to_owned(), me.to_owned()],
+            allows_replies: false,
+            is_block_list: false,
+        };
+        assert_eq!(
+            resolve_story_recipients(&custom, &contacts, &blocked, me),
+            vec![alice.to_owned()]
+        );
     }
 }

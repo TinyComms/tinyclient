@@ -51,7 +51,9 @@ use super::wire::{
     parse_group_invite_link, payment_label, view_once_label, Body, CallKind, CallLink, CallLinkJoin, CallLogKind,
     CallOutcome, ChatFolder, ChatState, Contact, CONTINUES, Event, Fault, GifEntry, GroupAccess, GroupEdit, GroupInfo,
     GroupMember, GroupMembers, IdentityState, InviteLinkMode, LinkPreview, Linked, Linker, MessageRequestAction, OwnCard,
-    Peer, PersonProfile, Quote, SafetyNumber, StorageSnapshot, Text, Wire,
+    Peer, PersonProfile, Pointer, Quote, QuotedAttachment, SafetyNumber, Sticker, StickerEntry, StickerPackInfo,
+    StorageSnapshot, StoryContext, StoryDistributionList, StoryMessageData, StoryText, Text, Wire, FLAG_GIF,
+    FLAG_VOICE_MESSAGE,
 };
 use super::Saved;
 use crate::adapters::script;
@@ -216,6 +218,8 @@ pub struct Fake {
     identities: Arc<Mutex<HashMap<String, FakeIdentity>>>,
     /// Scripted decrypted profiles for other Signal accounts.
     profiles: Arc<Mutex<HashMap<String, PersonProfile>>>,
+    /// Known sticker packs (installed or available to preview/install in tests).
+    sticker_packs: Arc<Mutex<HashMap<String, StickerPackInfo>>>,
 }
 
 impl Fake {
@@ -258,6 +262,7 @@ impl Fake {
             call_links: Arc::default(),
             identities: Arc::new(Mutex::new(initial_identities())),
             profiles: Arc::new(Mutex::new(initial_profiles())),
+            sticker_packs: Arc::default(),
         };
         fake.listen();
         fake
@@ -265,7 +270,7 @@ impl Fake {
 
     /// Reads the test's lines for as long as this wire lives; closing the wire ends it.
     fn listen(&self) {
-        let (events, closed, refuse, fail_one, control, lookups, club, identities, profiles) = (
+        let (events, closed, refuse, fail_one, control, lookups, club, identities, profiles, sticker_packs) = (
             self.events.clone(),
             self.closed.clone(),
             self.refuse.clone(),
@@ -275,6 +280,7 @@ impl Fake {
             self.club.clone(),
             self.identities.clone(),
             self.profiles.clone(),
+            self.sticker_packs.clone(),
         );
         let _ = std::thread::Builder::new().name("signal-fake".into()).spawn(move || {
             script::follow(&control, |line| {
@@ -313,6 +319,39 @@ impl Fake {
                             .filter(|s| !s.is_empty())
                             .map(str::to_owned)
                             .collect();
+                    }
+                    return true;
+                }
+                if let Some(rest) = line.strip_prefix("sticker-pack-op ") {
+                    // Format: sticker-pack-op install|remove PACK_HEX KEY_HEX [TITLE|AUTHOR]
+                    let mut toks = rest.splitn(4, ' ');
+                    let op = toks.next().unwrap_or("");
+                    let pack_id = toks.next().unwrap_or("").to_ascii_lowercase();
+                    let pack_key = toks.next().unwrap_or("").to_ascii_lowercase();
+                    let meta = toks.next().unwrap_or("");
+                    let install = op == "install";
+                    if pack_id.len() == 32 {
+                        let (title, author) = meta.split_once('|').unwrap_or((if meta.is_empty() { "Synced Pack" } else { meta }, "Signal"));
+                        if install {
+                            sticker_packs.lock().unwrap_or_else(|p| p.into_inner()).insert(
+                                pack_id.clone(),
+                                StickerPackInfo {
+                                    id: pack_id.clone(),
+                                    key: pack_key.clone(),
+                                    title: title.trim().to_owned(),
+                                    author: author.trim().to_owned(),
+                                    cover_id: Some(0),
+                                    stickers: vec![
+                                        StickerEntry { id: 0, emoji: "👋".into(), content_type: "image/webp".into() },
+                                        StickerEntry { id: 1, emoji: "🎉".into(), content_type: "image/webp".into() },
+                                    ],
+                                    installed: true,
+                                },
+                            );
+                        } else {
+                            sticker_packs.lock().unwrap_or_else(|p| p.into_inner()).remove(&pack_id);
+                        }
+                        let _ = events.send(Event::StickerPackOp { pack_id, pack_key, install });
                     }
                     return true;
                 }
@@ -457,7 +496,18 @@ fn steer(line: &str, identities: &Mutex<HashMap<String, FakeIdentity>>) -> Vec<E
             let sent = next().parse().unwrap_or(T0);
             let mut text = Text { author: author.into(), name: name.into(), sent, ..Text::default() };
             match command {
-                "photo" => text.unsupported = Some("Photo".into()),
+                "photo" => {
+                    text.attachments.push(Pointer {
+                        cdn_key: Some("fake-photo".to_owned()),
+                        content_type: "image/jpeg".to_owned(),
+                        file_name: "photo.jpg".to_owned(),
+                        width: 640,
+                        height: 480,
+                        size: 67,
+                        blurhash: Some("00TI:j".to_owned()),
+                        ..Pointer::default()
+                    });
+                }
                 "payment" => {
                     let note = rest(line, 3);
                     text.unsupported = Some(payment_label((!note.is_empty()).then_some(note.as_str())));
@@ -467,7 +517,13 @@ fn steer(line: &str, identities: &Mutex<HashMap<String, FakeIdentity>>) -> Vec<E
                 "viewonce-video" => text.unsupported = Some(view_once_label(Some("video/mp4")).to_owned()),
                 "quote" => {
                     let quoted = next().parse().unwrap_or(0);
-                    text.quote = Some(Quote { sent: quoted, author: ME.into(), text: String::new(), spans: Vec::new() });
+                    text.quote = Some(Quote {
+                        sent: quoted,
+                        author: ME.into(),
+                        text: String::new(),
+                        spans: Vec::new(),
+                        attachments: Vec::new(),
+                    });
                     text.text = rest(line, 4);
                 }
                 "mention" => {
@@ -1004,10 +1060,414 @@ fn steer(line: &str, identities: &Mutex<HashMap<String, FakeIdentity>>) -> Vec<E
                 vec![Event::Unpinned { peer, by, author, target }]
             }
         }
+        "media" => {
+            // Format: media WHO SENT MIME WIDTH HEIGHT FLAGS NAME URL KEY_HEX DIGEST_HEX [BLURHASH] [| CAPTION]
+            let Some((author, name)) = who(next()) else {
+                return Vec::new();
+            };
+            let sent = next().parse().unwrap_or(T0);
+            let payload = rest(line, 3);
+            let (meta_part, caption) = match payload.split_once('|') {
+                Some((m, c)) => (m.trim(), c.trim().to_owned()),
+                None => (payload.trim(), String::new()),
+            };
+            let mut toks = meta_part.split_whitespace();
+            let mime = toks.next().unwrap_or("application/octet-stream").to_owned();
+            let width = toks.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let height = toks.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let flags = toks.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let file_name = toks.next().unwrap_or("").to_owned();
+            let url_or_key = toks.next().unwrap_or("").to_owned();
+            let key = unhex_bytes(toks.next().unwrap_or(""));
+            let digest = unhex_bytes(toks.next().unwrap_or(""));
+            let blurhash = toks.next().filter(|s| *s != "-").map(str::to_owned);
+            let (url, cdn_key) = if url_or_key.starts_with("http://") {
+                (Some(url_or_key), None)
+            } else {
+                (None, Some(url_or_key))
+            };
+            let ptr = Pointer {
+                cdn_key,
+                content_type: mime,
+                key,
+                digest,
+                file_name: if file_name == "-" { String::new() } else { file_name },
+                flags,
+                width,
+                height,
+                blurhash,
+                url,
+                ..Pointer::default()
+            };
+            let text = Text {
+                author: author.into(),
+                name: name.into(),
+                sent,
+                text: caption,
+                attachments: vec![ptr],
+                ..Text::default()
+            };
+            vec![Event::Message { peer: direct(author), text, outgoing: false }]
+        }
+        "album" => {
+            // Format: album WHO SENT MIME1:NAME1:URL1:KEY1:DIGEST1 ; MIME2:NAME2:URL2:KEY2:DIGEST2
+            let Some((author, name)) = who(next()) else {
+                return Vec::new();
+            };
+            let sent = next().parse().unwrap_or(T0);
+            let spec = rest(line, 3);
+            let mut attachments = Vec::new();
+            for item in spec.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                let parts: Vec<&str> = item.split('|').collect();
+                let mime = parts.first().copied().unwrap_or("image/jpeg").to_owned();
+                let file_name = parts.get(1).copied().unwrap_or("photo.jpg").to_owned();
+                let url_or_key = parts.get(2).copied().unwrap_or("fake-photo").to_owned();
+                let key = unhex_bytes(parts.get(3).copied().unwrap_or(""));
+                let digest = unhex_bytes(parts.get(4).copied().unwrap_or(""));
+                let (url, cdn_key) = if url_or_key.starts_with("http://") {
+                    (Some(url_or_key), None)
+                } else {
+                    (None, Some(url_or_key))
+                };
+                attachments.push(Pointer {
+                    cdn_key,
+                    content_type: mime,
+                    key,
+                    digest,
+                    file_name,
+                    width: 400,
+                    height: 300,
+                    url,
+                    ..Pointer::default()
+                });
+            }
+            let text = Text {
+                author: author.into(),
+                name: name.into(),
+                sent,
+                attachments,
+                ..Text::default()
+            };
+            vec![Event::Message { peer: direct(author), text, outgoing: false }]
+        }
+        "quote-photo" => {
+            // Format: quote-photo WHO SENT QUOTED_SENT URL KEY_HEX DIGEST_HEX | REPLY_TEXT
+            let Some((author, name)) = who(next()) else {
+                return Vec::new();
+            };
+            let sent = next().parse().unwrap_or(T0);
+            let quoted = next().parse().unwrap_or(0);
+            let payload = rest(line, 4);
+            let (meta, reply_text) = match payload.split_once('|') {
+                Some((m, r)) => (m.trim(), r.trim().to_owned()),
+                None => (payload.trim(), String::new()),
+            };
+            let mut toks = meta.split_whitespace();
+            let url_or_key = toks.next().unwrap_or("fake-photo").to_owned();
+            let key = unhex_bytes(toks.next().unwrap_or(""));
+            let digest = unhex_bytes(toks.next().unwrap_or(""));
+            let (url, cdn_key) = if url_or_key.starts_with("http://") {
+                (Some(url_or_key), None)
+            } else {
+                (None, Some(url_or_key))
+            };
+            let thumb_ptr = Pointer {
+                cdn_key,
+                content_type: "image/jpeg".to_owned(),
+                key,
+                digest,
+                width: 120,
+                height: 90,
+                url,
+                ..Pointer::default()
+            };
+            let text = Text {
+                author: author.into(),
+                name: name.into(),
+                sent,
+                text: reply_text,
+                quote: Some(Quote {
+                    sent: quoted,
+                    author: ME.into(),
+                    text: String::new(),
+                    spans: Vec::new(),
+                    attachments: vec![QuotedAttachment {
+                        content_type: "image/jpeg".to_owned(),
+                        file_name: "sunset.jpg".to_owned(),
+                        thumbnail: Some(thumb_ptr),
+                    }],
+                }),
+                ..Text::default()
+            };
+            vec![Event::Message { peer: direct(author), text, outgoing: false }]
+        }
+        "expired-photo" => {
+            let Some((author, name)) = who(next()) else {
+                return Vec::new();
+            };
+            let sent = next().parse().unwrap_or(T0);
+            let text = Text {
+                author: author.into(),
+                name: name.into(),
+                sent,
+                attachments: vec![Pointer {
+                    cdn_key: Some("expired".to_owned()),
+                    content_type: "image/jpeg".to_owned(),
+                    file_name: "old.jpg".to_owned(),
+                    width: 800,
+                    height: 600,
+                    ..Pointer::default()
+                }],
+                ..Text::default()
+            };
+            vec![Event::Message { peer: direct(author), text, outgoing: false }]
+        }
+        "voice" => {
+            // Format: voice WHO SENT [URL KEY_HEX DIGEST_HEX]
+            let Some((author, name)) = who(next()) else {
+                return Vec::new();
+            };
+            let sent = next().parse().unwrap_or(T0);
+            let url_or_key = next();
+            let key = unhex_bytes(next());
+            let digest = unhex_bytes(next());
+            let (url, cdn_key) = if url_or_key.starts_with("http://") {
+                (Some(url_or_key.to_owned()), None)
+            } else if !url_or_key.is_empty() {
+                (None, Some(url_or_key.to_owned()))
+            } else {
+                (None, Some("fake-voice".to_owned()))
+            };
+            let text = Text {
+                author: author.into(),
+                name: name.into(),
+                sent,
+                attachments: vec![Pointer {
+                    cdn_key,
+                    content_type: "audio/mp4".to_owned(),
+                    file_name: "voice-message.m4a".to_owned(),
+                    flags: FLAG_VOICE_MESSAGE,
+                    key,
+                    digest,
+                    url,
+                    ..Pointer::default()
+                }],
+                ..Text::default()
+            };
+            vec![Event::Message { peer: direct(author), text, outgoing: false }]
+        }
+        "sticker" => {
+            // Format: sticker WHO SENT PACK_HEX KEY_HEX STICKER_ID EMOJI [URL ATT_KEY_HEX DIGEST_HEX]
+            let Some((author, name)) = who(next()) else {
+                return Vec::new();
+            };
+            let sent = next().parse().unwrap_or(T0);
+            let pack_id = next().to_ascii_lowercase();
+            let pack_key = next().to_ascii_lowercase();
+            let sticker_id: u32 = next().parse().unwrap_or(0);
+            let emoji = next().to_owned();
+            let url_or_key = next();
+            let att_key = unhex_bytes(next());
+            let digest = unhex_bytes(next());
+            let (url, cdn_key) = if url_or_key.starts_with("http://") {
+                (Some(url_or_key.to_owned()), None)
+            } else if !url_or_key.is_empty() {
+                (None, Some(url_or_key.to_owned()))
+            } else {
+                (None, Some(format!("fake-sticker-{pack_id}-{sticker_id}")))
+            };
+            let text = Text {
+                author: author.into(),
+                name: name.into(),
+                sent,
+                sticker: Some(Sticker {
+                    pack_id,
+                    pack_key,
+                    sticker_id,
+                    emoji,
+                    data: Pointer {
+                        cdn_key,
+                        content_type: "image/webp".to_owned(),
+                        key: att_key,
+                        digest,
+                        width: 512,
+                        height: 512,
+                        url,
+                        ..Pointer::default()
+                    },
+                }),
+                ..Text::default()
+            };
+            vec![Event::Message { peer: direct(author), text, outgoing: false }]
+        }
+        "story" => {
+            // Format: story WHO SENT text|file [group=club] [replies=on|off] [bg=RRGGBB] | PAYLOAD
+            let Some((author, name)) = who(next()) else {
+                return Vec::new();
+            };
+            let sent = next().parse().unwrap_or(T0);
+            let kind = next();
+            let payload = rest(line, 4);
+            let (opts_str, body_str) = match payload.split_once('|') {
+                Some((o, b)) => (o.trim(), b.trim()),
+                None => ("", payload.trim()),
+            };
+            let mut group_id = None;
+            let mut allows_replies = true;
+            let mut bg_color = 0xff22_4488u32;
+            for tok in opts_str.split_whitespace() {
+                if let Some((k, v)) = tok.split_once('=') {
+                    match (k, v) {
+                        ("group", "club") => group_id = Some(CLUB.to_owned()),
+                        ("group", hex) if !hex.is_empty() => group_id = Some(hex.to_owned()),
+                        ("replies", "off" | "false" | "0") => allows_replies = false,
+                        ("replies", "on" | "true" | "1") => allows_replies = true,
+                        ("bg", hex) => {
+                            if let Ok(c) = u32::from_str_radix(hex.trim_start_matches('#'), 16) {
+                                bg_color = c;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let (text, file) = if kind == "file" {
+                let mut toks = body_str.split_whitespace();
+                let mime = toks.next().unwrap_or("image/jpeg").to_owned();
+                let url_or_key = toks.next().unwrap_or("fake-story-photo").to_owned();
+                let key = unhex_bytes(toks.next().unwrap_or(""));
+                let digest = unhex_bytes(toks.next().unwrap_or(""));
+                let (url, cdn_key) = if url_or_key.starts_with("http://") {
+                    (Some(url_or_key), None)
+                } else {
+                    (None, Some(url_or_key))
+                };
+                (
+                    None,
+                    Some(Pointer {
+                        cdn_key,
+                        content_type: mime,
+                        key,
+                        digest,
+                        file_name: "story.jpg".to_owned(),
+                        width: 1080,
+                        height: 1920,
+                        url,
+                        ..Pointer::default()
+                    }),
+                )
+            } else {
+                (
+                    Some(StoryText {
+                        text: body_str.to_owned(),
+                        style: "BOLD".to_owned(),
+                        fg_color: 0xffff_ffff,
+                        bg_color,
+                        gradient_colors: Vec::new(),
+                        preview: None,
+                    }),
+                    None,
+                )
+            };
+            vec![Event::Story(StoryMessageData {
+                author: author.into(),
+                name: name.into(),
+                sent,
+                group_id,
+                allows_replies,
+                file,
+                text,
+                outgoing: false,
+            })]
+        }
+        "story-reply" => {
+            // Format: story-reply WHO SENT STORY_AUTHOR STORY_SENT TEXT...
+            let Some((author, name)) = who(next()) else {
+                return Vec::new();
+            };
+            let sent = next().parse().unwrap_or(T0);
+            let story_author = match next() {
+                "me" => ME.to_owned(),
+                other => who(other).map(|(id, _)| id.to_owned()).unwrap_or_else(|| other.to_owned()),
+            };
+            let story_sent = next().parse().unwrap_or(T0);
+            let body = rest(line, 5);
+            let text = Text {
+                author: author.into(),
+                name: name.into(),
+                sent,
+                text: body,
+                story_context: Some(StoryContext { author: story_author, sent: story_sent }),
+                ..Text::default()
+            };
+            vec![Event::Message { peer: direct(author), text, outgoing: false }]
+        }
+        "story-react" => {
+            // Format: story-react WHO STORY_AUTHOR STORY_SENT EMOJI
+            let Some((by, _)) = who(next()) else {
+                return Vec::new();
+            };
+            let story_author = match next() {
+                "me" => ME.to_owned(),
+                other => who(other).map(|(id, _)| id.to_owned()).unwrap_or_else(|| other.to_owned()),
+            };
+            let story_sent = next().parse().unwrap_or(T0);
+            let emoji = next().to_owned();
+            vec![Event::StoryReaction {
+                peer: direct(by),
+                by: by.into(),
+                story_author,
+                story_sent,
+                emoji,
+                removed: false,
+            }]
+        }
+        "stories-off" => vec![Event::StoriesSettings { disabled: true, view_receipts: false }],
+        "stories-on" => vec![Event::StoriesSettings { disabled: false, view_receipts: true }],
+        "story-receipts" => {
+            let on = next() != "off";
+            vec![Event::StoriesSettings { disabled: false, view_receipts: on }]
+        }
+        "story-list" => {
+            // Format: story-list ID NAME block|allow replies=on|off who1,who2
+            let id = next().to_owned();
+            let name = next().replace('_', " ");
+            let is_block_list = next() == "block";
+            let allows_replies = next() != "replies=off";
+            let recipients: Vec<String> = next()
+                .split(',')
+                .filter(|s| !s.is_empty() && *s != "-")
+                .filter_map(|tok| {
+                    who(tok)
+                        .map(|(id, _)| id.to_owned())
+                        .or_else(|| super::wire::is_aci(tok).then(|| tok.to_owned()))
+                })
+                .collect();
+            vec![Event::StorageSync(StorageSnapshot {
+                distribution_lists: vec![StoryDistributionList {
+                    id,
+                    name,
+                    recipients,
+                    allows_replies,
+                    is_block_list,
+                }],
+                ..StorageSnapshot::default()
+            })]
+        }
         "drop" => vec![Event::Closed("the fake dropped the connection".into())],
         "unlinked" => vec![Event::Ended("This computer was removed from your Signal account.".into())],
         _ => Vec::new(),
     }
+}
+
+fn unhex_bytes(text: &str) -> Vec<u8> {
+    if text.len() % 2 != 0 {
+        return Vec::new();
+    }
+    (0..text.len())
+        .step_by(2)
+        .filter_map(|at| u8::from_str_radix(&text[at..at + 2], 16).ok())
+        .collect()
 }
 
 fn describe(to: &Peer) -> String {
@@ -1072,7 +1532,8 @@ impl Wire for Fake {
             }
             Body::Files { text, quote, ranges, files, timer } => {
                 let names: Vec<String> = files.iter().map(|file| file.name.clone()).collect();
-                format!("{}{}{}", super::files::call_line(&describe(to), &names, text, quote.as_ref()), noted(ranges), exp(*timer))
+                let voice = if files.iter().any(|f| f.voice) { " voice=true" } else { "" };
+                format!("{}{}{}{voice}", super::files::call_line(&describe(to), &names, text, quote.as_ref()), noted(ranges), exp(*timer))
             }
             Body::React { author, target, emoji, remove } => format!("send {} react {target}-{author} {emoji} remove={remove}", describe(to)),
             Body::Edit { target, text, ranges, timer } => format!("send {} edit {target} {text}{}{}", describe(to), noted(ranges), exp(*timer)),
@@ -1090,6 +1551,34 @@ impl Wire for Fake {
                 format!("send {} pin {target}-{author} dur={dur}", describe(to))
             }
             Body::Unpin { author, target } => format!("send {} unpin {target}-{author}", describe(to)),
+            Body::Sticker { pack_id, sticker_id, emoji, timer, .. } => {
+                format!("send {} sticker {pack_id}:{sticker_id} {emoji}{}", describe(to), exp(*timer))
+            }
+            Body::StoryReply { story_author, story_sent, text, ranges, timer } => {
+                format!(
+                    "send {} story-reply {story_sent}-{story_author} {text}{}{}",
+                    describe(to),
+                    noted(ranges),
+                    exp(*timer)
+                )
+            }
+            Body::StoryReact { story_author, story_sent, emoji, remove } => {
+                format!("send {} story-react {story_sent}-{story_author} {emoji} remove={remove}", describe(to))
+            }
+            Body::PostStory { recipients, group_id, text, file, allows_replies } => {
+                let target = match group_id {
+                    Some(g) => format!("group=g.{g}"),
+                    None => format!("recipients={}", recipients.join(",")),
+                };
+                let body_desc = if let Some(t) = text {
+                    format!("text={}", t.text)
+                } else if let Some(f) = file {
+                    format!("file={}", f.name)
+                } else {
+                    "empty".to_owned()
+                };
+                format!("post-story {target} replies={allows_replies} {body_desc}")
+            }
         };
         record(&line);
         if let Peer::Direct(aci) = to {
@@ -1113,6 +1602,12 @@ impl Wire for Fake {
                 self.missed.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(person);
             }
         }
+        if matches!(body, Body::PostStory { .. }) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(T0, |d| d.as_millis() as u64);
+            return Ok(now);
+        }
         Ok(self.clock.fetch_add(1_000, Ordering::Relaxed))
     }
 
@@ -1128,6 +1623,12 @@ impl Wire for Fake {
     fn read(&self, read: &[(String, u64)], receipts: bool) -> Result<(), Fault> {
         let read: Vec<String> = read.iter().map(|(author, sent)| format!("{sent}-{author}")).collect();
         record(&format!("read receipts={receipts} {}", read.join(",")));
+        Ok(())
+    }
+
+    fn viewed(&self, viewed: &[(String, u64)], receipts: bool) -> Result<(), Fault> {
+        let items: Vec<String> = viewed.iter().map(|(author, sent)| format!("{sent}-{author}")).collect();
+        record(&format!("viewed receipts={receipts} {}", items.join(",")));
         Ok(())
     }
 
@@ -1680,6 +2181,149 @@ impl Wire for Fake {
             image_width: 0,
             image_height: 0,
         }))
+    }
+
+    fn download_attachment(&self, pointer: &Pointer, dest: &std::path::Path) -> Result<u64, Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        if let Some(url) = pointer.url.as_deref() {
+            if !(url.starts_with("http://127.0.0.1:") || url.starts_with("http://localhost:")) {
+                return Err(Fault::Refused("Invalid local CDN stub URL.".into()));
+            }
+            record(&format!("attachment-download {url}"));
+            let config = ureq::Agent::config_builder().http_status_as_error(false).build();
+            let agent = ureq::Agent::new_with_config(config);
+            let resp = agent.get(url).call().map_err(|err| Fault::Net(err.to_string()))?;
+            let status = resp.status().as_u16();
+            if matches!(status, 403 | 404 | 410) {
+                return Err(Fault::Refused("No longer available".to_owned()));
+            }
+            if !(200..300).contains(&status) {
+                return Err(Fault::Net(format!("CDN returned {status}")));
+            }
+            let reader = resp.into_body().into_reader();
+            return super::files::decrypt_attachment_stream(reader, &pointer.key, &pointer.digest, pointer.size, dest)
+                .map_err(Fault::Refused);
+        }
+        match pointer.cdn_key.as_deref() {
+            Some("expired") => {
+                record("attachment-download expired");
+                Err(Fault::Refused("No longer available".to_owned()))
+            }
+            Some(key) => {
+                record(&format!("attachment-download {key}"));
+                let bytes: Vec<u8> = if pointer.flags & FLAG_VOICE_MESSAGE != 0 || pointer.content_type.starts_with("audio/") {
+                    // Valid 2-second 8 kHz 16-bit mono PCM WAV so both voice_facts and mediad parse real duration & waveform.
+                    let sample_rate: u32 = 8_000;
+                    let num_samples: usize = 16_000;
+                    let data_len = (num_samples * 2) as u32;
+                    let mut wav = Vec::with_capacity(44 + data_len as usize);
+                    wav.extend_from_slice(b"RIFF");
+                    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+                    wav.extend_from_slice(b"WAVEfmt ");
+                    wav.extend_from_slice(&16u32.to_le_bytes());
+                    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+                    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+                    wav.extend_from_slice(&sample_rate.to_le_bytes());
+                    wav.extend_from_slice(&(sample_rate * 2).to_le_bytes());
+                    wav.extend_from_slice(&2u16.to_le_bytes());
+                    wav.extend_from_slice(&16u16.to_le_bytes());
+                    wav.extend_from_slice(b"data");
+                    wav.extend_from_slice(&data_len.to_le_bytes());
+                    for i in 0..num_samples {
+                        let env = ((i % 2000) as f32 / 2000.0 * std::f32::consts::PI).sin();
+                        let sample = (env * 18_000.0 * ((i as f32) * 0.25).sin()) as i16;
+                        wav.extend_from_slice(&sample.to_le_bytes());
+                    }
+                    wav
+                } else if pointer.flags & FLAG_GIF != 0 || pointer.content_type == "image/gif" {
+                    b"GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;".to_vec()
+                } else if pointer.content_type.starts_with("image/") {
+                    // Valid 1x1 PNG
+                    const PNG: &str = "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c4944415408d763f8cfc0000000020001e221bc330000000049454e44ae426082";
+                    unhex_bytes(PNG)
+                } else {
+                    b"%PDF-1.4\nfake-file\n".to_vec()
+                };
+                if let Some(parent) = dest.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                std::fs::write(dest, &bytes).map_err(|err| Fault::Net(err.to_string()))?;
+                Ok(bytes.len() as u64)
+            }
+            None => Err(Fault::Refused("No longer available".to_owned())),
+        }
+    }
+
+    fn preview_sticker_pack(&self, pack_id: &str, pack_key: &str) -> Result<StickerPackInfo, Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        let id = pack_id.to_ascii_lowercase();
+        let key = pack_key.to_ascii_lowercase();
+        if id.len() != 32 || key.len() != 64 {
+            return Err(Fault::Refused("Invalid sticker pack link.".to_owned()));
+        }
+        record(&format!("sticker-pack-preview {id}"));
+        let map = self.sticker_packs.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(existing) = map.get(&id) {
+            return Ok(existing.clone());
+        }
+        Ok(StickerPackInfo {
+            id,
+            key,
+            title: "Signal Cats".into(),
+            author: "Signal".into(),
+            cover_id: Some(0),
+            stickers: vec![
+                StickerEntry { id: 0, emoji: "😺".into(), content_type: "image/webp".into() },
+                StickerEntry { id: 1, emoji: "🐾".into(), content_type: "image/webp".into() },
+            ],
+            installed: false,
+        })
+    }
+
+    fn install_sticker_pack(&self, pack_id: &str, pack_key: &str) -> Result<StickerPackInfo, Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        let mut info = self.preview_sticker_pack(pack_id, pack_key)?;
+        info.installed = true;
+        record(&format!("sticker-pack-install {}", info.id));
+        self.sticker_packs.lock().unwrap_or_else(|p| p.into_inner()).insert(info.id.clone(), info.clone());
+        Ok(info)
+    }
+
+    fn remove_sticker_pack(&self, pack_id: &str, _pack_key: &str) -> Result<(), Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        let id = pack_id.to_ascii_lowercase();
+        record(&format!("sticker-pack-remove {id}"));
+        self.sticker_packs.lock().unwrap_or_else(|p| p.into_inner()).remove(&id);
+        Ok(())
+    }
+
+    fn download_sticker(
+        &self,
+        pack_id: &str,
+        _pack_key: &str,
+        sticker_id: u32,
+        dest: &std::path::Path,
+    ) -> Result<u64, Fault> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(Fault::Net("closed".into()));
+        }
+        record(&format!("sticker-download {pack_id}:{sticker_id}"));
+        // Valid 1x1 PNG bytes for sticker preview/attachment in tests.
+        const PNG: &str = "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de0000000c4944415408d763f8cfc0000000020001e221bc330000000049454e44ae426082";
+        let bytes = unhex_bytes(PNG);
+        if let Some(parent) = dest.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(dest, &bytes).map_err(|err| Fault::Net(err.to_string()))?;
+        Ok(bytes.len() as u64)
     }
 
     fn close(&self) {

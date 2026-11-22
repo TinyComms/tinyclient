@@ -41,7 +41,7 @@ pub mod signin;
 mod vault;
 mod wire;
 
-use super::{keep_connected, serve_commands, About, CatalogPage, Command, Context, ConversationAbout, Failure, Members, Refusal, Signed};
+use super::{keep_connected, serve_commands, About, CatalogPage, Command, Context, ConversationAbout, Failure, Members, Refusal, SharedPage, Signed};
 use crate::blobs::upload::{self, Upload};
 use crate::session;
 use crate::store::{ConversationRow, Filing, FolderRow, PersonDetails, PersonRow};
@@ -123,6 +123,64 @@ const CALL_LINK_DELETE: &str = "\u{1}signal-call-link-delete\u{1}";
 const SAFETY_VERIFY: &str = "\u{1}signal-safety-verify\u{1}";
 const SAFETY_APPROVE: &str = "\u{1}signal-safety-approve\u{1}";
 const SAFETY_UNVERIFY: &str = "\u{1}signal-safety-unverify\u{1}";
+/// Signal sticker-pack actions packed into `Handoff.conversation_id`:
+/// - `\u{1}signal-sticker-preview\u{1}<url_or_id|key>` -> returns JSON of `StickerPackInfo`
+/// - `\u{1}signal-sticker-install\u{1}<url_or_id|key>` -> installs & syncs pack, returns JSON of `StickerPackInfo`
+/// - `\u{1}signal-sticker-remove\u{1}<pack_id>` -> removes & syncs pack, returns `"removed"`
+const STICKER_PACK_PREVIEW: &str = "\u{1}signal-sticker-preview\u{1}";
+const STICKER_PACK_INSTALL: &str = "\u{1}signal-sticker-install\u{1}";
+const STICKER_PACK_REMOVE: &str = "\u{1}signal-sticker-remove\u{1}";
+
+/// Dedicated conversation id holding active Signal Stories (24h lifetime).
+pub const STORIES_CONVERSATION: &str = "stories";
+/// Signal Stories expire 24 hours after they were posted.
+const STORY_LIFETIME_SECS: i64 = 86_400;
+/// Signal Story actions packed into `Handoff.conversation_id`:
+const STORY_VIEW: &str = "\u{1}signal-story-view\u{1}";
+const STORY_REPLY: &str = "\u{1}signal-story-reply\u{1}";
+const STORY_REACT: &str = "\u{1}signal-story-react\u{1}";
+const STORY_POST: &str = "\u{1}signal-story-post\u{1}";
+const STORY_TOGGLE: &str = "\u{1}signal-story-toggle\u{1}";
+
+/// Packs a Signal story view request (marks viewed & sends `Viewed` receipt when enabled) for `Request::Handoff`.
+pub fn story_view_command(author: &str, sent: u64) -> String {
+    format!("{STORY_VIEW}{author}|{sent}")
+}
+
+/// Packs a Signal story reply (`DataMessage.story_context`) for `Request::Handoff`.
+pub fn story_reply_command(author: &str, sent: u64, group_id: Option<&str>, text: &str) -> String {
+    format!("{STORY_REPLY}{author}|{sent}|{}|{text}", group_id.unwrap_or(""))
+}
+
+/// Packs a Signal story reaction (`DataMessage.reaction` + `story_context`) for `Request::Handoff`.
+pub fn story_react_command(author: &str, sent: u64, group_id: Option<&str>, emoji: &str) -> String {
+    format!("{STORY_REACT}{author}|{sent}|{}|{emoji}", group_id.unwrap_or(""))
+}
+
+/// Packs a Signal story post (distribution list id/name or `g.<hex>` group) for `Request::Handoff`.
+pub fn story_post_command(target: &str, allows_replies: bool, bg_hex: &str, text: &str) -> String {
+    format!("{STORY_POST}{target}|{}|{bg_hex}|{text}", u8::from(allows_replies))
+}
+
+/// Packs a Signal stories on/off toggle for `Request::Handoff`.
+pub fn story_toggle_command(enabled: bool) -> String {
+    format!("{STORY_TOGGLE}{}", if enabled { "on" } else { "off" })
+}
+
+/// Packs a Signal sticker-pack preview request for `Request::Handoff`.
+pub fn sticker_pack_preview_command(url_or_pair: &str) -> String {
+    format!("{STICKER_PACK_PREVIEW}{url_or_pair}")
+}
+
+/// Packs a Signal sticker-pack install request for `Request::Handoff`.
+pub fn sticker_pack_install_command(url_or_pair: &str) -> String {
+    format!("{STICKER_PACK_INSTALL}{url_or_pair}")
+}
+
+/// Packs a Signal sticker-pack remove request for `Request::Handoff`.
+pub fn sticker_pack_remove_command(pack_id: &str) -> String {
+    format!("{STICKER_PACK_REMOVE}{pack_id}")
+}
 
 /// Packs a Signal safety-number verify request for `Request::Handoff`.
 pub fn safety_verify_command(aci: &str) -> String {
@@ -736,6 +794,57 @@ struct Live {
     /// `{support}/signal/{aci}.pins`. Empty when nothing is kept on disk.
     pins_path: PathBuf,
     pins_loaded: bool,
+    /// Received encrypted attachment pointers waiting to be downloaded on `Command::Wanted`.
+    held_attachments: HashMap<String, HeldAttachment>,
+    held_order: VecDeque<String>,
+    /// Installed Signal sticker packs (persisted to `{support}/signal/{aci}.stickers`).
+    sticker_packs: Vec<wire::StickerPackInfo>,
+    stickers_path: PathBuf,
+    stickers_loaded: bool,
+    /// Sticker catalog preview tiles waiting to be downloaded on `Command::Wanted`.
+    held_stickers: HashMap<String, HeldSticker>,
+    /// True when Signal Stories are turned off on this account.
+    stories_disabled: bool,
+    /// True when story view receipts (`storyViewReceiptsEnabled`) are enabled.
+    story_view_receipts: bool,
+    /// Synced Signal story distribution lists (`StoryDistributionListRecord`).
+    story_lists: Vec<wire::StoryDistributionList>,
+    /// Active stories remembered for reply snippet attribution, permission checks, audience, and viewer tracking.
+    stories: HashMap<String, HeldStory>,
+}
+
+/// Metadata for one active Signal story (expires 24 hours after `sent`).
+#[derive(Clone)]
+struct HeldStory {
+    author: String,
+    sent: u64,
+    group_id: Option<String>,
+    allows_replies: bool,
+    snippet: String,
+    expires_at: i64,
+    /// Recipient ACIs for a direct story. A group story leaves this empty; its members are the audience.
+    audience: Vec<String>,
+    viewed_by: Vec<String>,
+}
+
+/// One sticker catalog preview tile remembered for lazy download/decrypt on `Command::Wanted`.
+#[derive(Clone)]
+struct HeldSticker {
+    pack_id: String,
+    pack_key: String,
+    sticker_id: u32,
+    file: MediaFile,
+    address: String,
+}
+
+/// One received Signal attachment pointer remembered for lazy download/decrypt on `Command::Wanted`.
+#[derive(Clone)]
+struct HeldAttachment {
+    pointer: wire::Pointer,
+    file: MediaFile,
+    address: String,
+    conversation: String,
+    message_id: String,
 }
 
 /// What [`Event::Call`] told of, for [`Event::CallEnded`] to end it.
@@ -989,6 +1098,18 @@ impl Live {
         expired
     }
 
+    fn remember_attachment(&mut self, id: String, held: HeldAttachment) {
+        if !self.held_attachments.contains_key(&id) {
+            while self.held_order.len() >= REACTIONS_KEPT {
+                if let Some(old) = self.held_order.pop_front() {
+                    self.held_attachments.remove(&old);
+                }
+            }
+            self.held_order.push_back(id.clone());
+        }
+        self.held_attachments.insert(id, held);
+    }
+
     fn pins_for(&mut self, conversation: &str) -> Vec<PinRecord> {
         self.load_pins();
         let mut out: Vec<PinRecord> = self
@@ -1063,6 +1184,35 @@ struct KeptReaction {
 
 fn reactions_path(aci: &str) -> PathBuf {
     protocol::support_dir().join("signal").join(format!("{aci}.reactions"))
+}
+
+fn stickers_path(aci: &str) -> PathBuf {
+    protocol::support_dir().join("signal").join(format!("{aci}.stickers"))
+}
+
+fn read_sticker_packs(path: &Path) -> Vec<wire::StickerPackInfo> {
+    if path.as_os_str().is_empty() {
+        return Vec::new();
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    serde_json::from_slice::<Vec<wire::StickerPackInfo>>(&bytes).unwrap_or_default()
+}
+
+fn write_sticker_packs(path: &Path, packs: &[wire::StickerPackInfo]) {
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec(packs) {
+        let temp = path.with_extension("tmp");
+        if std::fs::write(&temp, bytes).and_then(|()| std::fs::rename(&temp, path)).is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+    }
 }
 
 fn read_reactions(path: &Path) -> Vec<KeptReaction> {
@@ -1168,6 +1318,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
     let live = Arc::new(Mutex::new(Live {
         reactions_path: reactions_path(&saved.aci),
         pins_path: pins_path(&saved.aci),
+        stickers_path: stickers_path(&saved.aci),
         ..Live::default()
     }));
     let current: Arc<Mutex<Option<Arc<Account>>>> = Arc::default();
@@ -1328,7 +1479,7 @@ fn row(peer: &Peer, title: &str) -> ConversationRow {
 }
 
 /// A message as the contract has it.
-fn message(account: &Account, text: &Text, outgoing: bool) -> Message {
+fn message(account: &Account, conversation: &str, text: &Text, outgoing: bool) -> Message {
     let author = if outgoing { account.me.as_str() } else { text.author.as_str() };
     let name = if outgoing {
         account.name.clone()
@@ -1343,7 +1494,8 @@ fn message(account: &Account, text: &Text, outgoing: bool) -> Message {
         (None, _) => (text.text.clone(), Some(0)),
     };
     let sent = i64::try_from(text.sent / 1_000).unwrap_or(0);
-    let mut message = Message::plain(wire::message_id(text.sent, author), name, words, sent, outgoing);
+    let msg_id = wire::message_id(text.sent, author);
+    let mut message = Message::plain(msg_id.clone(), name, words, sent, outgoing);
     message.sender.id = author.to_owned();
     message.mentions_me = text.mentions_me && !outgoing;
     if let Some(shift) = shift {
@@ -1351,6 +1503,93 @@ fn message(account: &Account, text: &Text, outgoing: bool) -> Message {
     }
     if text.unsupported.is_some() {
         message.kind = MessageKind::Unsupported { link: String::new() };
+    }
+    if !text.attachments.is_empty() {
+        let mut to_register = Vec::with_capacity(text.attachments.len());
+        for (idx, ptr) in text.attachments.iter().enumerate() {
+            let media_id = format!("signal:att:{}:{}:{idx}", text.sent, author);
+            let address = format!("signal://attachment/{media_id}");
+            let kind = files::attachment_kind(&ptr.content_type, ptr.flags);
+            let mut media = MediaFile::new(media_id.clone(), kind);
+            media.width = ptr.width;
+            media.height = ptr.height;
+            media.bytes = u64::from(ptr.size);
+            to_register.push((media.clone(), address.clone()));
+            account.live().remember_attachment(
+                media_id.clone(),
+                HeldAttachment {
+                    pointer: ptr.clone(),
+                    file: media.clone(),
+                    address,
+                    conversation: conversation.to_owned(),
+                    message_id: msg_id.clone(),
+                },
+            );
+            let preview_bytes = if !ptr.thumbnail.is_empty() && crate::blobs::is_picture(&ptr.thumbnail) {
+                Some(ptr.thumbnail.clone())
+            } else if let Some(hash) = ptr.blurhash.as_deref() {
+                files::decode_blurhash_jpeg(hash, ptr.width, ptr.height)
+            } else {
+                None
+            };
+            let preview = preview_bytes.and_then(|bytes| {
+                let mut prev = MediaFile::new(format!("{media_id}:preview"), MediaKind::Image);
+                prev.bytes = bytes.len() as u64;
+                account
+                    .ctx
+                    .landed(&prev, &format!("signal://preview/{media_id}"), &bytes)
+            });
+            let att_name = if !ptr.file_name.trim().is_empty() {
+                ptr.file_name.trim().to_owned()
+            } else {
+                files::default_filename(&ptr.content_type, ptr.flags).to_owned()
+            };
+            if message.text.is_empty() && !ptr.caption.is_empty() {
+                message.text = ptr.caption.clone();
+            }
+            let mut attachment = Attachment::new(att_name, media);
+            attachment.mime = ptr.content_type.clone();
+            if kind == MediaKind::Video {
+                attachment.thumb = preview.clone();
+            }
+            if ptr.is_voice() {
+                attachment.duration = 1;
+                attachment.waveform = vec![24; 32];
+            }
+            attachment.preview = preview;
+            message.attachments.push(attachment);
+        }
+        if !to_register.is_empty() {
+            let _ = account.ctx.media(&to_register);
+        }
+    }
+    if let Some(st) = &text.sticker {
+        let media_id = format!("signal:att:{}:{}:sticker", text.sent, author);
+        let address = format!("signal://attachment/{media_id}");
+        let mut media = MediaFile::new(media_id.clone(), MediaKind::Image);
+        media.width = if st.data.width > 0 { st.data.width } else { 512 };
+        media.height = if st.data.height > 0 { st.data.height } else { 512 };
+        media.bytes = u64::from(st.data.size);
+        let _ = account.ctx.media(&[(media.clone(), address.clone())]);
+        account.live().remember_attachment(
+            media_id,
+            HeldAttachment {
+                pointer: st.data.clone(),
+                file: media.clone(),
+                address,
+                conversation: conversation.to_owned(),
+                message_id: msg_id.clone(),
+            },
+        );
+        let name = if !st.emoji.is_empty() { st.emoji.clone() } else { "sticker.webp".to_owned() };
+        let mut attachment = Attachment::new(name, media);
+        attachment.mime = if st.data.content_type.is_empty() {
+            "image/webp".to_owned()
+        } else {
+            st.data.content_type.clone()
+        };
+        attachment.sticker = true;
+        message.attachments.push(attachment);
     }
     message.contacts = text.contacts.clone();
     for (idx, preview) in text.previews.iter().enumerate() {
@@ -1399,20 +1638,87 @@ fn message(account: &Account, text: &Text, outgoing: bool) -> Message {
             footer: "Join call".to_owned(),
             ..protocol::Card::default()
         }));
+    } else if wire::find_sticker_pack_url(&message.text).is_some() {
+        message.card = Some(Box::new(protocol::Card {
+            title: "Signal sticker pack".to_owned(),
+            text: "Install this encrypted sticker pack on Signal.".to_owned(),
+            footer: "Install sticker pack".to_owned(),
+            ..protocol::Card::default()
+        }));
     }
-    message.reply_to = text.quote.as_ref().map(|quote| reply_to(account, quote));
+    message.reply_to = text
+        .quote
+        .as_ref()
+        .map(|quote| reply_to(account, conversation, &msg_id, quote))
+        .or_else(|| {
+            let ctx = text.story_context.as_ref()?;
+            let story_id = wire::message_id(ctx.sent, &ctx.author);
+            let sender = if ctx.author == account.me {
+                account.name.clone()
+            } else {
+                account.live().name(&ctx.author)
+            };
+            let snippet = account
+                .live()
+                .stories
+                .get(&story_id)
+                .map(|s| s.snippet.clone())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "Story".to_owned());
+            Some(ReplyTo {
+                id: story_id,
+                sender,
+                snippet: snippet.chars().take(200).collect(),
+                person: Some(account.ctx.key(&ctx.author)),
+                deleted: false,
+                thumb: None,
+                story: true,
+            })
+        });
     message
 }
 
-fn reply_to(account: &Account, quote: &Quote) -> ReplyTo {
+fn reply_to(account: &Account, conversation: &str, msg_id: &str, quote: &Quote) -> ReplyTo {
     let sender = if quote.author == account.me { account.name.clone() } else { account.live().name(&quote.author) };
-    let snippet = crate::store::without_spoilers(&quote.text, &quote.spans);
+    let mut snippet = crate::store::without_spoilers(&quote.text, &quote.spans);
+    let mut thumb = None;
+    if let Some(first) = quote.attachments.first() {
+        if snippet.trim().is_empty() {
+            snippet = files::attachment_label(&first.content_type, &first.file_name, 0);
+        }
+        if let Some(ptr) = &first.thumbnail {
+            let thumb_id = format!("signal:quote:{}:{}:{msg_id}", quote.sent, quote.author);
+            let address = format!("signal://attachment/{thumb_id}");
+            let mut mf = MediaFile::new(thumb_id.clone(), MediaKind::Image);
+            mf.width = ptr.width;
+            mf.height = ptr.height;
+            mf.bytes = u64::from(ptr.size);
+            if !ptr.thumbnail.is_empty() && crate::blobs::is_picture(&ptr.thumbnail) {
+                thumb = account.ctx.landed(&mf, &address, &ptr.thumbnail);
+            } else {
+                let _ = account.ctx.media(&[(mf.clone(), address.clone())]);
+                account.live().remember_attachment(
+                    thumb_id,
+                    HeldAttachment {
+                        pointer: ptr.clone(),
+                        file: mf.clone(),
+                        address,
+                        conversation: conversation.to_owned(),
+                        message_id: msg_id.to_owned(),
+                    },
+                );
+                thumb = Some(mf);
+            }
+        }
+    }
     ReplyTo {
         id: wire::message_id(quote.sent, &quote.author),
         sender,
         snippet: snippet.chars().take(200).collect(),
         person: Some(account.ctx.key(&quote.author)),
         deleted: false,
+        thumb,
+        story: false,
     }
 }
 
@@ -1581,7 +1887,7 @@ fn apply(account: &Account, event: Event) {
             if outgoing && (account.live().echoed_file(text.sent) || files::replace_outgoing_sync(had_file)) {
                 return;
             }
-            let mut message = message(account, &text, outgoing);
+            let mut message = message(account, &conversation, &text, outgoing);
             let mut needs_filing = false;
             if !outgoing {
                 let (suppress_mention, unarchived) = {
@@ -1681,7 +1987,7 @@ fn apply(account: &Account, event: Event) {
                     }
                 }
             }
-            let message = with_poll(account, &author, &name, sent, outgoing, Poll::open(question, options, multiple));
+            let message = with_poll(account, &conversation, &author, &name, sent, outgoing, Poll::open(question, options, multiple));
             if outgoing {
                 account.live().sent(sent, &conversation);
             } else {
@@ -1724,6 +2030,14 @@ fn apply(account: &Account, event: Event) {
             // Every time in the receipt, not only the newest: one receipt can name several messages.
             let at = i64::try_from(at).unwrap_or(0);
             for sent_at in sent {
+                if viewed {
+                    match story_view_from(account, &by, sent_at) {
+                        Some(true) => note_story_viewer(account, sent_at, &by),
+                        // Held story, but this person was not in its audience or its group.
+                        Some(false) => continue,
+                        None => {}
+                    }
+                }
                 file_receipt(account, &by, sent_at, read, viewed, at);
             }
         }
@@ -2061,8 +2375,101 @@ fn apply(account: &Account, event: Event) {
                 let _ = ctx.message(&conv, &stored);
             }
         }
+        Event::StickerPacks(packs) => {
+            let mut live = account.live();
+            if !live.stickers_loaded {
+                live.sticker_packs = read_sticker_packs(&live.stickers_path);
+                live.stickers_loaded = true;
+            }
+            for pack in packs {
+                if let Some(existing) = live.sticker_packs.iter_mut().find(|p| p.id == pack.id) {
+                    *existing = pack;
+                } else if live.sticker_packs.len() < 128 {
+                    live.sticker_packs.push(pack);
+                }
+            }
+            write_sticker_packs(&live.stickers_path, &live.sticker_packs);
+            account.ctx.hub.catalogs.forget_matching(|(acct, kind, ..)| *acct == account.ctx.account && *kind == CatalogKind::Stickers);
+        }
+        Event::StickerPackOp { pack_id, pack_key, install } => {
+            if install {
+                let mut pack = account
+                    .wire
+                    .preview_sticker_pack(&pack_id, &pack_key)
+                    .unwrap_or_else(|_| wire::StickerPackInfo {
+                        id: pack_id.clone(),
+                        key: pack_key.clone(),
+                        title: "Sticker pack".to_owned(),
+                        author: String::new(),
+                        cover_id: Some(0),
+                        stickers: Vec::new(),
+                        installed: true,
+                    });
+                pack.installed = true;
+                let mut live = account.live();
+                if !live.stickers_loaded {
+                    live.sticker_packs = read_sticker_packs(&live.stickers_path);
+                    live.stickers_loaded = true;
+                }
+                if let Some(existing) = live.sticker_packs.iter_mut().find(|p| p.id == pack.id) {
+                    *existing = pack;
+                } else if live.sticker_packs.len() < 128 {
+                    live.sticker_packs.push(pack);
+                }
+                write_sticker_packs(&live.stickers_path, &live.sticker_packs);
+            } else {
+                let mut live = account.live();
+                if !live.stickers_loaded {
+                    live.sticker_packs = read_sticker_packs(&live.stickers_path);
+                    live.stickers_loaded = true;
+                }
+                live.sticker_packs.retain(|p| p.id != pack_id);
+                write_sticker_packs(&live.stickers_path, &live.sticker_packs);
+            }
+            account.ctx.hub.catalogs.forget_matching(|(acct, kind, ..)| *acct == account.ctx.account && *kind == CatalogKind::Stickers);
+        }
+        Event::Story(story) => apply_story(account, story),
+        Event::StoryReaction { by, story_author, story_sent, emoji, removed, .. } => {
+            if account.live().stories_disabled {
+                return;
+            }
+            let story_id = wire::message_id(story_sent, &story_author);
+            if visible_story(account, &story_id).is_none() {
+                return;
+            }
+            let mine = by == account.me;
+            let prior = account.live().react(&story_id, &by, (!removed).then_some(emoji.as_str()));
+            if let Some(old) = prior {
+                let _ = ctx.reacted(
+                    STORIES_CONVERSATION,
+                    &story_id,
+                    &Reaction { emoji: old, file: None, count: 1, mine, who: vec![by.clone()] },
+                    false,
+                );
+            }
+            let _ = ctx.reacted(
+                STORIES_CONVERSATION,
+                &story_id,
+                &Reaction { emoji, file: None, count: 1, mine, who: vec![by] },
+                !removed,
+            );
+        }
+        Event::StoriesSettings { disabled, view_receipts } => {
+            {
+                let mut live = account.live();
+                live.stories_disabled = disabled;
+                live.story_view_receipts = view_receipts;
+                if disabled {
+                    live.stories.clear();
+                }
+            }
+            if disabled {
+                let _ = ctx.forget_conversation(STORIES_CONVERSATION);
+            }
+        }
         Event::Caught => {
             prune_expired_pins(account);
+            prune_expired_stories(account);
         }
         Event::Closed(_) | Event::Ended(_) => {}
     }
@@ -2078,9 +2485,29 @@ fn apply_storage_sync(account: &Account, snapshot: wire::StorageSnapshot) {
     let mut people_rows: Vec<PersonRow> = Vec::new();
     let mut seed_rows: Vec<(Peer, String)> = Vec::new();
     let mut updated_link_previews: Option<bool> = None;
+    let mut disabled_stories = false;
     {
         let mut live = account.live();
+        if !snapshot.distribution_lists.is_empty() {
+            for list in snapshot.distribution_lists {
+                if let Some(existing) = live.story_lists.iter_mut().find(|l| l.id == list.id) {
+                    *existing = list;
+                } else if live.story_lists.len() < 64 {
+                    live.story_lists.push(list);
+                }
+            }
+        }
         if let Some(acct) = snapshot.account {
+            if let Some(disabled) = acct.stories_disabled {
+                live.stories_disabled = disabled;
+                if disabled {
+                    live.stories.clear();
+                    disabled_stories = true;
+                }
+            }
+            if let Some(receipts) = acct.story_view_receipts {
+                live.story_view_receipts = receipts;
+            }
             if let Some(keep) = acct.keep_muted_archived {
                 live.keep_muted_archived = keep;
             }
@@ -2270,6 +2697,161 @@ fn apply_storage_sync(account: &Account, snapshot: wire::StorageSnapshot) {
     if let Some(lp) = updated_link_previews {
         ctx.capabilities(capabilities(lp));
     }
+    if disabled_stories {
+        let _ = ctx.forget_conversation(STORIES_CONVERSATION);
+    }
+}
+
+fn ensure_stories_row(account: &Account) {
+    if matches!(account.ctx.known(STORIES_CONVERSATION), Ok(Some(_))) {
+        return;
+    }
+    let mut row = ConversationRow::new(STORIES_CONVERSATION.to_owned(), ConversationKind::Channel, "Stories");
+    row.listed = true;
+    row.private = true;
+    row.topic = "Active Signal stories expire after 24 hours".to_owned();
+    let _ = account.ctx.conversation(&row);
+}
+
+fn prune_expired_stories(account: &Account) {
+    let now_secs = crate::hub::now();
+    let mut expired = Vec::new();
+    account.live().stories.retain(|id, story| {
+        if story.expires_at <= now_secs {
+            expired.push(id.clone());
+            false
+        } else {
+            true
+        }
+    });
+    for id in expired {
+        let _ = account.ctx.deleted(STORIES_CONVERSATION, &id);
+    }
+}
+
+fn apply_story(account: &Account, story: wire::StoryMessageData) {
+    {
+        let live = account.live();
+        if live.stories_disabled || live.blocked.contains(&story.author) {
+            return;
+        }
+        if let Some(gid) = &story.group_id {
+            if live.blocked.contains(&Peer::Group(gid.clone()).conversation()) {
+                return;
+            }
+        }
+    }
+    let sent_secs = i64::try_from(story.sent / 1_000).unwrap_or(0);
+    let expires_at = sent_secs.saturating_add(STORY_LIFETIME_SECS);
+    if expires_at <= crate::hub::now() {
+        return;
+    }
+    ensure_stories_row(account);
+    let msg_id = wire::message_id(story.sent, &story.author);
+    let author_name = if story.outgoing || story.author == account.me {
+        account.name.clone()
+    } else if !story.name.is_empty() {
+        story.name.clone()
+    } else {
+        account.live().name(&story.author)
+    };
+    let group_label = story.group_id.as_deref().map(|gid| {
+        let conv = Peer::Group(gid.to_owned()).conversation();
+        account
+            .live()
+            .group_info
+            .get(&conv)
+            .map(|g| g.title.clone())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "Group story".to_owned())
+    });
+
+    let mut body_text = String::new();
+    let mut snippet = String::new();
+    let mut msg = Message::plain(msg_id.clone(), author_name, "", sent_secs, story.outgoing);
+    msg.sender.id = story.author.clone();
+    msg.expires_at = Some(expires_at);
+
+    if let Some(st) = &story.text {
+        body_text = st.text.clone();
+        snippet = st.text.clone();
+        msg.text = body_text;
+        msg.card = Some(Box::new(protocol::Card {
+            author: group_label.unwrap_or_else(|| "Story".to_owned()),
+            title: String::new(),
+            text: st.text.clone(),
+            color: Some(st.bg_color & 0x00ff_ffff),
+            footer: if story.allows_replies {
+                "Story · replies allowed".to_owned()
+            } else {
+                "Story · replies off".to_owned()
+            },
+            ..protocol::Card::default()
+        }));
+        if let Some(preview) = &st.preview {
+            if wire::story_preview_kept(&st.text, &preview.url) {
+                msg.previews.push(protocol::Preview {
+                    url: preview.url.clone(),
+                    site: crate::adapters::tiny::preview::real_host(&preview.url),
+                    title: preview.title.clone(),
+                    description: preview.description.clone(),
+                    image: None,
+                });
+            }
+        }
+    } else if let Some(ptr) = &story.file {
+        let kind = files::attachment_kind(&ptr.content_type, ptr.flags);
+        let file_id = format!("signal:story:{}:{}", story.sent, story.author);
+        let address = format!("signal://attachment/{file_id}");
+        let mut mf = MediaFile::new(file_id.clone(), kind);
+        mf.width = ptr.width;
+        mf.height = ptr.height;
+        mf.bytes = u64::from(ptr.size);
+        let _ = account.ctx.media(&[(mf.clone(), address.clone())]);
+        account.live().remember_attachment(
+            file_id,
+            HeldAttachment {
+                pointer: ptr.clone(),
+                file: mf.clone(),
+                address,
+                conversation: STORIES_CONVERSATION.to_owned(),
+                message_id: msg_id.clone(),
+            },
+        );
+        let name = if !ptr.file_name.is_empty() {
+            ptr.file_name.clone()
+        } else {
+            files::attachment_label(&ptr.content_type, "", ptr.flags)
+        };
+        snippet = if !ptr.caption.is_empty() { ptr.caption.clone() } else { name.clone() };
+        msg.text = ptr.caption.clone();
+        let mut att = Attachment::new(name, mf);
+        att.mime = ptr.content_type.clone();
+        msg.attachments.push(att);
+    }
+
+    {
+        let mut live = account.live();
+        let (audience, viewed_by) = live
+            .stories
+            .get(&msg_id)
+            .map(|old| (old.audience.clone(), old.viewed_by.clone()))
+            .unwrap_or_default();
+        live.stories.insert(
+            msg_id.clone(),
+            HeldStory {
+                author: story.author,
+                sent: story.sent,
+                group_id: story.group_id,
+                allows_replies: story.allows_replies,
+                snippet,
+                expires_at,
+                audience,
+                viewed_by,
+            },
+        );
+    }
+    let _ = account.ctx.message(STORIES_CONVERSATION, &msg);
 }
 
 /// The user read messages on another device: the rows they were in are read up to there.
@@ -2645,6 +3227,15 @@ fn offline(ctx: &Context, command: Command) {
         Command::Catalog { reply, .. } => drop(reply.send(Err(down()))),
         Command::StartDirect { reply, .. } | Command::StartGroup { reply, .. } => drop(reply.send(Err(down()))),
         Command::SearchPeople(query) => ctx.searched(&query),
+        Command::SearchShared { conversation_id, kind, before, limit, reply } => {
+            let key = ctx.key(&conversation_id);
+            let res = match ctx.hub.store().shared(&key, kind, before.as_deref(), limit) {
+                Ok(Some((items, more))) => Ok(SharedPage { items, more, total: None }),
+                Ok(None) => Err(Refusal::Refused("no such conversation".into())),
+                Err(err) => Err(Refusal::Refused(err.to_string())),
+            };
+            let _ = reply.send(res);
+        }
         Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
         other => other.unsupported(ctx),
     }
@@ -2667,7 +3258,9 @@ fn capabilities(link_previews: bool) -> protocol::Capabilities {
         edit_window: (SEND_WINDOW_MS / 1_000) as u32,
         max_file_bytes: files.max_file_bytes,
         max_files: files.max_files,
+        voice_notes: true,
         gifs: true,
+        stickers: true,
         reply: true,
         edit: true,
         delete: true,
@@ -2712,6 +3305,9 @@ fn serve(account: &Arc<Account>, command: Command) {
             if !account.live().folders.is_empty() {
                 sync_filing(account, &conversation_id);
             }
+        }
+        Command::Viewed { conversation_id, message_id } => {
+            viewed(account, &conversation_id, &message_id);
         }
         Command::SetMute { conversation_id, notify, until, reply } => {
             let outcome = (|| -> Result<(), Refusal> {
@@ -2934,6 +3530,10 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::Handoff { conversation_id, reply } => {
             let _ = reply.send(call_link_handoff(account, &conversation_id));
+        }
+        Command::Wanted(ids) => wanted(account, &ids),
+        Command::SearchShared { conversation_id, kind, before, limit, reply } => {
+            let _ = reply.send(shared(account, &conversation_id, kind, before.as_deref(), limit));
         }
         Command::Watch(watching) => pictures(account, &watching),
         Command::SignOut(reply) => {
@@ -3615,6 +4215,68 @@ fn pin_message(account: &Account, conversation_id: &str, message_id: &str, pinne
 }
 
 fn catalog(account: &Account, kind: CatalogKind, query: &str, cursor: Option<&str>) -> Result<CatalogPage, Refusal> {
+    if kind == CatalogKind::Stickers {
+        let q = query.trim().to_ascii_lowercase();
+        let packs = {
+            let mut live = account.live();
+            if !live.stickers_loaded {
+                live.sticker_packs = read_sticker_packs(&live.stickers_path);
+                live.stickers_loaded = true;
+            }
+            live.sticker_packs.clone()
+        };
+        let mut items = Vec::new();
+        let mut media = Vec::new();
+        {
+            let mut live = account.live();
+            if live.held_stickers.len() > 2_048 {
+                live.held_stickers.clear();
+            }
+            for pack in packs {
+                let pack_matches = q.is_empty()
+                    || pack.title.to_ascii_lowercase().contains(&q)
+                    || pack.author.to_ascii_lowercase().contains(&q);
+                for entry in pack.stickers {
+                    if !pack_matches && !entry.emoji.to_ascii_lowercase().contains(&q) {
+                        continue;
+                    }
+                    let tile_id = format!("signal:sticker:{}:{}", pack.id, entry.id);
+                    let address = format!("signal://sticker/{}/{}", pack.id, entry.id);
+                    let mut file = MediaFile::new(tile_id.clone(), MediaKind::Image);
+                    file.width = 512;
+                    file.height = 512;
+                    media.push((file.clone(), address.clone()));
+                    live.held_stickers.insert(
+                        tile_id,
+                        HeldSticker {
+                            pack_id: pack.id.clone(),
+                            pack_key: pack.key.clone(),
+                            sticker_id: entry.id,
+                            file: file.clone(),
+                            address,
+                        },
+                    );
+                    items.push(CatalogItem {
+                        id: format!("{}:{}", pack.id, entry.id),
+                        name: entry.emoji,
+                        file: Some(file),
+                        pack: pack.title.clone(),
+                        animated: entry.content_type.contains("apng") || entry.content_type.contains("gif"),
+                    });
+                    if items.len() >= protocol::CATALOG_LIMIT {
+                        break;
+                    }
+                }
+                if items.len() >= protocol::CATALOG_LIMIT {
+                    break;
+                }
+            }
+        }
+        if !media.is_empty() {
+            let _ = account.ctx.media(&media);
+        }
+        return Ok(CatalogPage { items, cursor: None });
+    }
     if kind != CatalogKind::Gifs {
         return Err(Refusal::Unsupported);
     }
@@ -3699,7 +4361,305 @@ fn call_link_handoff(account: &Account, raw: &str) -> Result<String, Refusal> {
     if let Some(aci) = raw.strip_prefix(SAFETY_UNVERIFY) {
         return set_safety_state(account, aci.trim(), wire::IdentityState::Default);
     }
+    if let Some(arg) = raw.strip_prefix(STICKER_PACK_PREVIEW) {
+        let Some((pack_id, pack_key)) = parse_sticker_pack_arg(arg) else {
+            return Err(Refusal::Refused("That is not a valid Signal sticker pack link.".into()));
+        };
+        let info = account.wire.preview_sticker_pack(&pack_id, &pack_key).map_err(refused)?;
+        return serde_json::to_string(&info).map_err(|err| Refusal::Refused(err.to_string()));
+    }
+    if let Some(arg) = raw.strip_prefix(STICKER_PACK_INSTALL) {
+        let Some((pack_id, pack_key)) = parse_sticker_pack_arg(arg) else {
+            return Err(Refusal::Refused("That is not a valid Signal sticker pack link.".into()));
+        };
+        let mut info = account.wire.install_sticker_pack(&pack_id, &pack_key).map_err(refused)?;
+        info.installed = true;
+        {
+            let mut live = account.live();
+            if !live.stickers_loaded {
+                live.sticker_packs = read_sticker_packs(&live.stickers_path);
+                live.stickers_loaded = true;
+            }
+            if let Some(existing) = live.sticker_packs.iter_mut().find(|p| p.id == info.id) {
+                *existing = info.clone();
+            } else if live.sticker_packs.len() < 128 {
+                live.sticker_packs.push(info.clone());
+            }
+            write_sticker_packs(&live.stickers_path, &live.sticker_packs);
+        }
+        account.ctx.hub.catalogs.forget_matching(|(acct, kind, ..)| *acct == account.ctx.account && *kind == CatalogKind::Stickers);
+        return serde_json::to_string(&info).map_err(|err| Refusal::Refused(err.to_string()));
+    }
+    if let Some(pack_id) = raw.strip_prefix(STICKER_PACK_REMOVE) {
+        let id = pack_id.trim().to_ascii_lowercase();
+        let pack_key = {
+            let mut live = account.live();
+            if !live.stickers_loaded {
+                live.sticker_packs = read_sticker_packs(&live.stickers_path);
+                live.stickers_loaded = true;
+            }
+            live.sticker_packs.iter().find(|p| p.id == id).map(|p| p.key.clone()).unwrap_or_default()
+        };
+        account.wire.remove_sticker_pack(&id, &pack_key).map_err(refused)?;
+        {
+            let mut live = account.live();
+            live.sticker_packs.retain(|p| p.id != id);
+            write_sticker_packs(&live.stickers_path, &live.sticker_packs);
+        }
+        account.ctx.hub.catalogs.forget_matching(|(acct, kind, ..)| *acct == account.ctx.account && *kind == CatalogKind::Stickers);
+        return Ok("removed".to_owned());
+    }
+    if let Some(arg) = raw.strip_prefix(STORY_VIEW) {
+        let mut parts = arg.splitn(2, '|');
+        let author = parts.next().unwrap_or("").trim();
+        let sent: u64 = parts
+            .next()
+            .and_then(|s| s.trim().parse().ok())
+            .ok_or_else(|| Refusal::Refused("Invalid story timestamp.".into()))?;
+        if !wire::is_aci(author) {
+            return Err(Refusal::Refused("Invalid story author.".into()));
+        }
+        let story_id = wire::message_id(sent, author);
+        let send_receipts = {
+            let live = account.live();
+            if live.stories_disabled {
+                return Err(Refusal::Refused("Stories are turned off.".into()));
+            }
+            live.story_view_receipts
+        };
+        if visible_story(account, &story_id).is_none() {
+            return Err(Refusal::Refused("That story is no longer available.".into()));
+        }
+        if author != account.me {
+            account
+                .wire
+                .viewed(&[(author.to_owned(), sent)], send_receipts)
+                .map_err(refused)?;
+        }
+        return Ok("viewed".to_owned());
+    }
+    if let Some(arg) = raw.strip_prefix(STORY_REPLY) {
+        let mut parts = arg.splitn(4, '|');
+        let author = parts.next().unwrap_or("").trim();
+        let sent: u64 = parts
+            .next()
+            .and_then(|s| s.trim().parse().ok())
+            .ok_or_else(|| Refusal::Refused("Invalid story timestamp.".into()))?;
+        // The handoff's group is not the destination. Only the held story's group is.
+        let _group = parts.next().unwrap_or("");
+        let reply_text = parts.next().unwrap_or("").trim();
+        if !wire::is_aci(author) || reply_text.is_empty() {
+            return Err(Refusal::Refused("A story reply needs text.".into()));
+        }
+        let story_id = wire::message_id(sent, author);
+        if account.live().stories_disabled {
+            return Err(Refusal::Refused("Stories are turned off.".into()));
+        }
+        let Some(story) = visible_story(account, &story_id) else {
+            return Err(Refusal::Refused("That story is no longer available.".into()));
+        };
+        if !story.allows_replies {
+            return Err(Refusal::Refused("Replies are turned off for this story.".into()));
+        }
+        let snippet = if story.snippet.is_empty() { "Story".to_owned() } else { story.snippet.clone() };
+        let to = match story.group_id.as_deref() {
+            Some(gid) => Peer::Group(gid.to_owned()),
+            None => Peer::Direct(author.to_owned()),
+        };
+        let conv = to.conversation();
+        let timer = account.live().timer_of(&conv);
+        let (wire_body, ranges, shown) = format_outgoing_body(account, &to, reply_text, &[]);
+        let reply_sent = account
+            .wire
+            .send(
+                &to,
+                Body::StoryReply {
+                    story_author: author.to_owned(),
+                    story_sent: sent,
+                    text: wire_body,
+                    ranges,
+                    timer,
+                },
+            )
+            .map_err(refused)?;
+        let target_name = if author == account.me { account.name.clone() } else { account.live().name(author) };
+        ensure_row(account, &to, &target_name);
+        let msg_id = wire::message_id(reply_sent, &account.me);
+        let mut msg = Message::plain(msg_id.clone(), account.name.clone(), shown.text, (reply_sent / 1_000) as i64, true);
+        msg.sender.id = account.me.clone();
+        msg.spans = shown.spans;
+        msg.reply_to = Some(ReplyTo {
+            id: story_id,
+            sender: target_name,
+            snippet: snippet.chars().take(200).collect(),
+            person: Some(account.ctx.key(author)),
+            deleted: false,
+            thumb: None,
+            story: true,
+        });
+        let _ = account.ctx.message(&conv, &msg);
+        return Ok(msg_id);
+    }
+    if let Some(arg) = raw.strip_prefix(STORY_REACT) {
+        let mut parts = arg.splitn(4, '|');
+        let author = parts.next().unwrap_or("").trim();
+        let sent: u64 = parts
+            .next()
+            .and_then(|s| s.trim().parse().ok())
+            .ok_or_else(|| Refusal::Refused("Invalid story timestamp.".into()))?;
+        // The handoff's group is not the destination. Only the held story's group is.
+        let _group = parts.next().unwrap_or("");
+        let emoji = parts.next().unwrap_or("").trim();
+        if !wire::is_aci(author) || emoji.is_empty() {
+            return Err(Refusal::Refused("A story reaction needs an emoji.".into()));
+        }
+        if account.live().stories_disabled {
+            return Err(Refusal::Refused("Stories are turned off.".into()));
+        }
+        let story_id = wire::message_id(sent, author);
+        let Some(story) = visible_story(account, &story_id) else {
+            return Err(Refusal::Refused("That story is no longer available.".into()));
+        };
+        let to = match story.group_id.as_deref() {
+            Some(gid) => Peer::Group(gid.to_owned()),
+            None => Peer::Direct(author.to_owned()),
+        };
+        account
+            .wire
+            .send(
+                &to,
+                Body::StoryReact {
+                    story_author: author.to_owned(),
+                    story_sent: sent,
+                    emoji: emoji.to_owned(),
+                    remove: false,
+                },
+            )
+            .map_err(refused)?;
+        let _ = account.ctx.reacted(
+            STORIES_CONVERSATION,
+            &story_id,
+            &Reaction { emoji: emoji.to_owned(), file: None, count: 1, mine: true, who: vec![account.me.clone()] },
+            true,
+        );
+        return Ok(story_id);
+    }
+    if let Some(arg) = raw.strip_prefix(STORY_POST) {
+        let mut parts = arg.splitn(4, '|');
+        let target = parts.next().unwrap_or("").trim();
+        let allows_replies = parts.next().unwrap_or("1").trim() != "0";
+        let bg_hex = parts.next().unwrap_or("224488").trim().trim_start_matches('#');
+        let text = parts.next().unwrap_or("").trim();
+        if text.is_empty() {
+            return Err(Refusal::Refused("A text story can't be empty.".into()));
+        }
+        let bg_color = u32::from_str_radix(bg_hex, 16).unwrap_or(0x0022_4488) | 0xff00_0000;
+        let (group_id, recipients) = {
+            let live = account.live();
+            if live.stories_disabled {
+                return Err(Refusal::Refused("Stories are turned off.".into()));
+            }
+            if let Some(Peer::Group(gid)) = Peer::parse(target) {
+                (Some(gid), Vec::new())
+            } else {
+                // No matching list: do not invent "My Story" with an empty blocklist. That sends to everyone.
+                let Some(list) = live
+                    .story_lists
+                    .iter()
+                    .find(|l| {
+                        l.id.eq_ignore_ascii_case(target)
+                            || l.name.eq_ignore_ascii_case(target)
+                            || (target.is_empty() || target.eq_ignore_ascii_case("my-story"))
+                                && (l.id == "00000000000000000000000000000000" || l.name.eq_ignore_ascii_case("My Story"))
+                    })
+                    .cloned()
+                else {
+                    return Err(Refusal::Refused("That story audience isn't on this account.".into()));
+                };
+                let accepted: Vec<String> = live.accepted.iter().cloned().collect();
+                let resolved = wire::resolve_story_recipients(&list, &accepted, &live.blocked, &account.me);
+                (None, resolved)
+            }
+        };
+        if group_id.is_none() && recipients.is_empty() {
+            return Err(Refusal::Refused("No recipients in this story audience.".into()));
+        }
+        let story_text = wire::StoryText {
+            text: text.to_owned(),
+            style: "BOLD".to_owned(),
+            fg_color: 0xffff_ffff,
+            bg_color,
+            gradient_colors: Vec::new(),
+            preview: None,
+        };
+        let direct = group_id.is_none();
+        let peer_anchor = match &group_id {
+            Some(gid) => Peer::Group(gid.clone()),
+            None => Peer::Direct(account.me.clone()),
+        };
+        let posted_ms = account
+            .wire
+            .send(
+                &peer_anchor,
+                Body::PostStory {
+                    recipients: recipients.clone(),
+                    group_id: group_id.clone(),
+                    text: Some(story_text.clone()),
+                    file: None,
+                    allows_replies,
+                },
+            )
+            .map_err(refused)?;
+        apply_story(
+            account,
+            wire::StoryMessageData {
+                author: account.me.clone(),
+                name: account.name.clone(),
+                sent: posted_ms,
+                group_id,
+                allows_replies,
+                file: None,
+                text: Some(story_text),
+                outgoing: true,
+            },
+        );
+        let id = wire::message_id(posted_ms, &account.me);
+        if let Some(held) = account.live().stories.get_mut(&id) {
+            held.audience = if direct { recipients } else { Vec::new() };
+        }
+        return Ok(id);
+    }
+    if let Some(arg) = raw.strip_prefix(STORY_TOGGLE) {
+        let on = arg.trim().eq_ignore_ascii_case("on") || arg.trim() == "1" || arg.trim().eq_ignore_ascii_case("true");
+        {
+            let mut live = account.live();
+            live.stories_disabled = !on;
+            if !on {
+                live.stories.clear();
+            }
+        }
+        if !on {
+            let _ = account.ctx.forget_conversation(STORIES_CONVERSATION);
+            return Ok("stories_off".to_owned());
+        }
+        return Ok("stories_on".to_owned());
+    }
     Err(Refusal::Unsupported)
+}
+
+fn parse_sticker_pack_arg(arg: &str) -> Option<(String, String)> {
+    let trimmed = arg.trim();
+    if let Some(pair) = wire::parse_sticker_pack_url(trimmed) {
+        return Some(pair);
+    }
+    let (id, key) = trimmed.split_once('|')?;
+    let id = id.trim();
+    let key = key.trim();
+    if id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()) && key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some((id.to_ascii_lowercase(), key.to_ascii_lowercase()))
+    } else {
+        None
+    }
 }
 
 fn set_safety_state(account: &Account, aci: &str, state: wire::IdentityState) -> Result<String, Refusal> {
@@ -3745,6 +4705,7 @@ fn send_gif(account: &Account, conversation: &str, client_id: &str, text: &str, 
         thumb: Vec::new(),
         blurhash: None,
         gif: true,
+        voice: false,
     };
     let quote = quote_of(account, conversation, reply_to)?;
     let attachment = show_file(account, client_id, 0, &gif_file);
@@ -3768,12 +4729,180 @@ fn send_gif(account: &Account, conversation: &str, client_id: &str, text: &str, 
         quote,
         ..Text::default()
     };
-    let mut message = message(account, &words, true);
+    let mut message = message(account, conversation, &words, true);
     if timer.seconds > 0 {
         message.expires_at = Some(crate::hub::now() + i64::from(timer.seconds));
     }
     message.attachments = vec![attachment];
     Ok(message)
+}
+
+fn send_sticker(
+    account: &Account,
+    conversation: &str,
+    client_id: &str,
+    reply_to: Option<&str>,
+    pick_id: &str,
+) -> Result<Message, Fault> {
+    let to = peer(conversation)?;
+    let (pack_id, sticker_id_str) = pick_id
+        .split_once(':')
+        .ok_or_else(|| Fault::Refused("That sticker isn't installed.".to_owned()))?;
+    let sticker_id: u32 = sticker_id_str
+        .parse()
+        .map_err(|_| Fault::Refused("That sticker isn't installed.".to_owned()))?;
+    let pack = {
+        let mut live = account.live();
+        if !live.stickers_loaded {
+            live.sticker_packs = read_sticker_packs(&live.stickers_path);
+            live.stickers_loaded = true;
+        }
+        live.sticker_packs.iter().find(|p| p.id == pack_id).cloned()
+    }
+    .ok_or_else(|| Fault::Refused("That sticker pack isn't installed.".to_owned()))?;
+    let entry = pack.stickers.iter().find(|s| s.id == sticker_id);
+    let emoji = entry.map(|s| s.emoji.clone()).unwrap_or_default();
+    let content_type = entry
+        .map(|s| s.content_type.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "image/webp".to_owned());
+    let tmp = tempfile::NamedTempFile::new().map_err(|err| Fault::Net(err.to_string()))?;
+    account
+        .wire
+        .download_sticker(&pack.id, &pack.key, sticker_id, tmp.path())?;
+    let bytes = std::fs::read(tmp.path()).map_err(|err| Fault::Net(err.to_string()))?;
+    let quote = quote_of(account, conversation, reply_to)?;
+    let timer = account.live().timer_of(conversation);
+    let sent = account.wire.send(
+        &to,
+        Body::Sticker {
+            pack_id: pack.id.clone(),
+            pack_key: pack.key.clone(),
+            sticker_id,
+            emoji: emoji.clone(),
+            bytes: bytes.clone(),
+            content_type: content_type.clone(),
+            quote: quote.clone(),
+            timer,
+        },
+    )?;
+    account.live().echoed(sent);
+    account.live().sent(sent, conversation);
+    let mut media = MediaFile::new(format!("signal:{client_id}:sticker"), MediaKind::Image);
+    media.width = 512;
+    media.height = 512;
+    media.bytes = bytes.len() as u64;
+    if let Some(landed) = account.ctx.landed(&media, &format!("signal://sticker/{}/{sticker_id}", pack.id), &bytes) {
+        media = landed;
+    }
+    let name = if !emoji.is_empty() { emoji } else { "sticker.webp".to_owned() };
+    let mut attachment = Attachment::new(name, media);
+    attachment.mime = content_type;
+    attachment.sticker = true;
+    let words = Text {
+        author: account.me.clone(),
+        name: account.name.clone(),
+        sent,
+        quote,
+        ..Text::default()
+    };
+    let mut message = message(account, conversation, &words, true);
+    if timer.seconds > 0 {
+        message.expires_at = Some(crate::hub::now() + i64::from(timer.seconds));
+    }
+    message.attachments = vec![attachment];
+    Ok(message)
+}
+
+/// Streams and decrypts wanted Signal attachments and sticker tiles off the command thread into chatd's media cache.
+fn wanted(account: &Arc<Account>, ids: &[String]) {
+    let (jobs, sticker_jobs): (Vec<(String, HeldAttachment)>, Vec<(String, HeldSticker)>) = {
+        let live = account.live();
+        let jobs = ids
+            .iter()
+            .filter_map(|id| live.held_attachments.get(id).cloned().map(|h| (id.clone(), h)))
+            .collect();
+        let sticker_jobs = ids
+            .iter()
+            .filter_map(|id| live.held_stickers.get(id).cloned().map(|h| (id.clone(), h)))
+            .collect();
+        (jobs, sticker_jobs)
+    };
+    if jobs.is_empty() && sticker_jobs.is_empty() {
+        return;
+    }
+    let account = Arc::clone(account);
+    let spawned = std::thread::Builder::new().name("signal-media".into()).spawn(move || {
+        let media_root = protocol::support_dir().join("media");
+        for (id, held) in jobs {
+            let dest = crate::blobs::path_of(&media_root, &account.ctx.account, &id).with_extension("sigpart");
+            match account.wire.download_attachment(&held.pointer, &dest) {
+                Ok(bytes) => {
+                    if let Some(landed) = account.ctx.landed_from_part(&held.file, &held.address, &dest, bytes) {
+                        if held.pointer.is_voice() {
+                            if let Some(path) = landed.path.as_deref() {
+                                if let Ok(raw) = std::fs::read(path) {
+                                    let (duration, waveform) = files::voice_facts(&held.pointer.content_type, &raw);
+                                    if let Ok(Some(mut msg)) = account.ctx.stored_message(&held.conversation, &held.message_id) {
+                                        if let Some(att) = msg.attachments.iter_mut().find(|a| a.file.id == id) {
+                                            att.duration = duration;
+                                            att.waveform = waveform;
+                                            att.file.path = Some(path.to_owned());
+                                            att.file.bytes = bytes;
+                                            let _ = account.ctx.message(&held.conversation, &msg);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(Fault::Refused(why)) => {
+                    let _ = std::fs::remove_file(&dest);
+                    account.ctx.media_failed(&id, &why);
+                }
+                Err(fault) => {
+                    let _ = std::fs::remove_file(&dest);
+                    tracing::warn!("chatd: Signal: attachment {id}: {}", super::net::redact(&fault.to_string()));
+                }
+            }
+        }
+        for (id, held) in sticker_jobs {
+            let dest = crate::blobs::path_of(&media_root, &account.ctx.account, &id).with_extension("sigpart");
+            match account.wire.download_sticker(&held.pack_id, &held.pack_key, held.sticker_id, &dest) {
+                Ok(bytes) => {
+                    let _ = account.ctx.landed_from_part(&held.file, &held.address, &dest, bytes);
+                }
+                Err(Fault::Refused(why)) => {
+                    let _ = std::fs::remove_file(&dest);
+                    account.ctx.media_failed(&id, &why);
+                }
+                Err(fault) => {
+                    let _ = std::fs::remove_file(&dest);
+                    tracing::warn!("chatd: Signal: sticker {id}: {}", super::net::redact(&fault.to_string()));
+                }
+            }
+        }
+    });
+    if let Err(err) = spawned {
+        tracing::warn!("chatd: Signal: media thread: {err}");
+    }
+}
+
+/// Answers the shared Media / Files / Links tab from chatd's local message store for Signal.
+fn shared(
+    account: &Account,
+    conversation: &str,
+    kind: protocol::SharedKind,
+    before: Option<&str>,
+    limit: u32,
+) -> Result<SharedPage, Refusal> {
+    let key = account.ctx.key(conversation);
+    match account.ctx.hub.store().shared(&key, kind, before, limit) {
+        Ok(Some((items, more))) => Ok(SharedPage { items, more, total: None }),
+        Ok(None) => Err(Refusal::Refused("no such conversation".into())),
+        Err(err) => Err(Refusal::Refused(err.to_string())),
+    }
 }
 
 /// The pictures of the people and groups on screen (rows, people, the open conversation): each
@@ -3843,7 +4972,7 @@ fn quote_of(account: &Account, conversation: &str, reply_to: Option<&str>) -> Re
         Some((sent, author)) => {
             let stored = account.ctx.stored_message(conversation, &wire::message_id(sent, &author)).ok().flatten();
             let (text, spans) = stored.map_or_else(|| (String::new(), Vec::new()), |message| (quoted_words(&message.text), message.spans));
-            Some(Quote { sent, author, text, spans })
+            Some(Quote { sent, author, text, spans, attachments: Vec::new() })
         }
         None => None,
     })
@@ -3916,7 +5045,7 @@ fn send_text(
         previews,
         ..Text::default()
     };
-    let mut message = message(account, &words, true);
+    let mut message = message(account, conversation, &words, true);
     if timer.seconds > 0 {
         message.expires_at = Some(crate::hub::now() + i64::from(timer.seconds));
     }
@@ -3948,8 +5077,12 @@ fn send_with(account: &Arc<Account>, conversation: &str, client_id: &str, text: 
         return;
     }
     if with.files.is_empty() {
-        if let Some(pick) = with.pick.filter(|p| p.kind == CatalogKind::Gifs) {
-            let outcome = send_gif(account, conversation, client_id, text, reply_to, &pick.id).map_err(|fault| fault.words());
+        if let Some(pick) = with.pick {
+            let outcome = match pick.kind {
+                CatalogKind::Gifs => send_gif(account, conversation, client_id, text, reply_to, &pick.id).map_err(|fault| fault.words()),
+                CatalogKind::Stickers => send_sticker(account, conversation, client_id, reply_to, &pick.id).map_err(|fault| fault.words()),
+                _ => Err("Signal can't send that item from here.".to_owned()),
+            };
             account.ctx.sent(conversation, client_id, outcome);
             return;
         }
@@ -3962,14 +5095,23 @@ fn send_with(account: &Arc<Account>, conversation: &str, client_id: &str, text: 
     let text = text.to_owned();
     let reply_to = reply_to.map(str::to_owned);
     let client_id_owned = client_id.to_owned();
+    let voice = with.voice;
     let ctx = account.ctx.clone();
     let conversation_id = conversation.clone();
     upload::spawn(&ctx, &conversation_id, client_id, &with.files, move |upload| {
-        send_files(&account, &conversation, &client_id_owned, &text, reply_to.as_deref(), upload)
+        send_files(&account, &conversation, &client_id_owned, &text, reply_to.as_deref(), voice, upload)
     });
 }
 
-fn send_files(account: &Account, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, upload: &mut Upload) -> Result<Message, String> {
+fn send_files(
+    account: &Account,
+    conversation: &str,
+    client_id: &str,
+    text: &str,
+    reply_to: Option<&str>,
+    voice: Option<protocol::VoiceNote>,
+    upload: &mut Upload,
+) -> Result<Message, String> {
     if upload.files().len() > files::MAX_FILES as usize {
         return Err(format!("Signal takes at most {} files in one message.", files::MAX_FILES));
     }
@@ -3978,7 +5120,7 @@ fn send_files(account: &Account, conversation: &str, client_id: &str, text: &str
     for at in 0..count {
         let name = upload.files()[at].name.clone();
         let mime = upload.files()[at].mime.to_owned();
-        let keep = upload.files()[at].as_file || upload.files()[at].original;
+        let keep = upload.files()[at].as_file || upload.files()[at].original || voice.is_some();
         let len = upload.files()[at].bytes;
         if let Some(why) = files::too_big(&name, len) {
             return Err(why);
@@ -3988,14 +5130,26 @@ fn send_files(account: &Account, conversation: &str, client_id: &str, text: &str
             bytes.extend_from_slice(part.bytes);
             Ok(())
         })?;
-        prepared.push(files::prepare(&name, &mime, bytes, keep));
+        let mut file = files::prepare(&name, &mime, bytes, keep);
+        if voice.is_some() && at + 1 == count {
+            file.voice = true;
+            if !file.mime.starts_with("audio/") {
+                file.mime = "audio/ogg".to_owned();
+            }
+        }
+        prepared.push(file);
     }
     upload.check()?;
     let to = peer(conversation).map_err(|fault| fault.words())?;
     let quote = quote_of(account, conversation, reply_to).map_err(|fault| fault.words())?;
     // Write each file to disk first, then move that one copy to Signal. Cloning `prepared`
     // would keep every payload in memory a second time for the whole upload.
-    let attachments: Vec<_> = prepared.iter().enumerate().map(|(index, file)| show_file(account, client_id, index, file)).collect();
+    let mut attachments: Vec<_> = prepared.iter().enumerate().map(|(index, file)| show_file(account, client_id, index, file)).collect();
+    if let (Some(note), Some(att)) = (voice, attachments.last_mut()) {
+        att.file.kind = MediaKind::Audio;
+        att.duration = ((note.duration + 999) / 1_000).max(1);
+        att.waveform = if note.waveform.is_empty() { vec![24; 32] } else { note.waveform };
+    }
     let timer = account.live().timer_of(conversation);
     let (wire_body, ranges, shown) = format_outgoing_body(account, &to, text, &[]);
     let sent = match account.wire.send(&to, Body::Files { text: wire_body, quote: quote.clone(), ranges, files: prepared, timer }) {
@@ -4016,7 +5170,7 @@ fn send_files(account: &Account, conversation: &str, client_id: &str, text: &str
         quote,
         ..Text::default()
     };
-    let mut message = message(account, &words, true);
+    let mut message = message(account, conversation, &words, true);
     if timer.seconds > 0 {
         message.expires_at = Some(crate::hub::now() + i64::from(timer.seconds));
     }
@@ -4173,6 +5327,25 @@ fn mark_read(account: &Account, conversation: &str, message_id: &str) {
     }
 }
 
+/// The user played a voice message or viewed a story: syncs to other linked devices and sends a
+/// `Viewed` receipt to the author when read receipts are enabled on both the Signal account and
+/// this device.
+fn viewed(account: &Account, conversation: &str, message_id: &str) {
+    if account.live().requests.contains(conversation) {
+        return;
+    }
+    let Ok((sent, author)) = target(message_id) else {
+        return;
+    };
+    if author == account.me {
+        return;
+    }
+    let receipts = account.live().read_receipts && account.ctx.hub.settings().receipts(&account.ctx.account);
+    if let Err(fault) = account.wire.viewed(&[(author, sent)], receipts) {
+        tracing::warn!("chatd: Signal: viewed: {}", super::net::redact(&fault.to_string()));
+    }
+}
+
 /// What a `Request::Poll` asked for, once the sentinel is read back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PollAct {
@@ -4251,10 +5424,10 @@ fn checked_draft(draft: &PollDraft) -> Result<(String, Vec<String>, bool), Fault
     Ok((question.to_owned(), options, draft.multiple))
 }
 
-fn with_poll(account: &Account, author: &str, name: &str, sent: u64, outgoing: bool, mut poll: Poll) -> Message {
+fn with_poll(account: &Account, conversation: &str, author: &str, name: &str, sent: u64, outgoing: bool, mut poll: Poll) -> Message {
     protocol::clip(&mut poll.question, POLL_CHARS);
     let words = Text { author: author.to_owned(), name: name.to_owned(), sent, text: format!("Poll: {}", poll.question), ..Text::default() };
-    let mut message = message(account, &words, outgoing);
+    let mut message = message(account, conversation, &words, outgoing);
     message.poll = Some(Box::new(poll));
     message
 }
@@ -4330,7 +5503,7 @@ fn send_contact(account: &Account, conversation: &str, contact: protocol::Shared
     let sent = account.wire.send(&to, Body::Contact { contact: contact.clone(), timer })?;
     account.live().sent(sent, conversation);
     let words = Text { author: account.me.clone(), name: account.name.clone(), sent, contacts: vec![contact], ..Text::default() };
-    let mut message = message(account, &words, true);
+    let mut message = message(account, conversation, &words, true);
     if timer.seconds > 0 {
         message.expires_at = Some(crate::hub::now() + i64::from(timer.seconds));
     }
@@ -4343,7 +5516,7 @@ fn send_poll(account: &Account, conversation: &str, draft: &PollDraft, _reply_to
     let timer = account.live().timer_of(conversation);
     let sent = account.wire.send(&to, Body::Poll { question: question.clone(), options: options.clone(), multiple, timer })?;
     account.live().sent(sent, conversation);
-    let mut message = with_poll(account, &account.me, &account.name, sent, true, Poll::open(question, options, multiple));
+    let mut message = with_poll(account, conversation, &account.me, &account.name, sent, true, Poll::open(question, options, multiple));
     if timer.seconds > 0 {
         message.expires_at = Some(crate::hub::now() + i64::from(timer.seconds));
     }
@@ -4406,6 +5579,51 @@ fn typing(account: &Account, conversation: &str) {
         live.typed.insert(conversation.to_owned(), Instant::now());
     }
     let _ = account.wire.typing(&to, true);
+}
+
+/// A story still on this device: held, unexpired, and not from a blocked author or group.
+fn visible_story(account: &Account, id: &str) -> Option<HeldStory> {
+    let live = account.live();
+    let story = live.stories.get(id)?.clone();
+    if story.expires_at <= crate::hub::now() || live.blocked.contains(&story.author) {
+        return None;
+    }
+    if let Some(gid) = &story.group_id {
+        if live.blocked.contains(&Peer::Group(gid.clone()).conversation()) {
+            return None;
+        }
+    }
+    Some(story)
+}
+
+/// `Some(true)` when `by` may have seen our story sent at `sent_at`.
+/// `Some(false)` when that story is held but `by` is not in its audience or its group.
+/// `None` when this time is not one of our held stories (a voice note, for example).
+fn story_view_from(account: &Account, by: &str, sent_at: u64) -> Option<bool> {
+    let id = wire::message_id(sent_at, &account.me);
+    let live = account.live();
+    let story = live.stories.get(&id)?;
+    if story.expires_at <= crate::hub::now() || by.is_empty() || by == account.me {
+        return Some(false);
+    }
+    if let Some(gid) = &story.group_id {
+        let conv = Peer::Group(gid.clone()).conversation();
+        if live.blocked.contains(&conv) {
+            return Some(false);
+        }
+        return Some(live.groups.get(&conv).is_some_and(|members| members.iter().any(|id| id == by)));
+    }
+    Some(story.audience.iter().any(|aci| aci == by))
+}
+
+fn note_story_viewer(account: &Account, sent_at: u64, by: &str) {
+    let id = wire::message_id(sent_at, &account.me);
+    let mut live = account.live();
+    if let Some(story) = live.stories.get_mut(&id) {
+        if !story.viewed_by.iter().any(|seen| seen == by) {
+            story.viewed_by.push(by.to_owned());
+        }
+    }
 }
 
 /// One receipt for one of our messages. A direct chat's tick moves on that one receipt. A

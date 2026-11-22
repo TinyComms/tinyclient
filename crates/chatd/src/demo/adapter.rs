@@ -118,6 +118,8 @@ impl Demo {
             sender: quoted.sender.name,
             snippet: quoted.text.chars().take(120).collect(),
             deleted: quoted.deleted,
+            thumb: None,
+            story: false,
         });
         message
     }
@@ -1064,6 +1066,7 @@ impl Demo {
             | Command::OpenThreads(_)
             | Command::MarkRead { .. }
             | Command::MarkUnread { .. }
+            | Command::Viewed { .. }
             | Command::AckBulk { .. }
             | Command::Collapse { .. }
             | Command::Typing { .. }

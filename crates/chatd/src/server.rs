@@ -1442,6 +1442,8 @@ impl Chat {
             sender: quoted.sender.name,
             snippet: quoted.text.chars().take(120).collect(),
             deleted: quoted.deleted,
+            thumb: None,
+            story: false,
         });
         if let Some(draft) = &with.poll {
             let mut question = draft.question.clone();
@@ -3763,10 +3765,26 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
-            Request::Play(request) => match self.hub.player.request(&self.hub, &support_dir().join("media"), request) {
-                Ok(()) => Response::Ok,
-                Err(detail) => error(ErrorCode::Media, detail),
-            },
+            Request::Play(request) => {
+                let viewed = match &request {
+                    protocol::PlayRequest::Start { conversation, message, .. } if !message.is_empty() => {
+                        Some((conversation.clone(), message.clone()))
+                    }
+                    _ => None,
+                };
+                match self.hub.player.request(&self.hub, &support_dir().join("media"), request) {
+                    Ok(()) => {
+                        if let Some((conversation, message_id)) = viewed {
+                            let account = conversation.account();
+                            if self.hub.link(&account) == Link::Connected {
+                                self.command(&account, Command::Viewed { conversation_id: conversation.id, message_id });
+                            }
+                        }
+                        Response::Ok
+                    }
+                    Err(detail) => error(ErrorCode::Media, detail),
+                }
+            }
             // Answered `Ok` whatever became of it: the recording's own word is `Change::Recording`.
             Request::Record(request) => {
                 self.hub.recorder.request(&self.hub, request);
