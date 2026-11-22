@@ -6,7 +6,8 @@ use super::model::{
     self, number, seconds, Channel, Guild, GuildSettings, Kept, Member, MuteConfig, PresenceUpdate,
     ReadState, Relationship, Role, User, Versioned, VoiceState, ADMINISTRATOR, BAN_MEMBERS, CONNECT,
     CREATE_INSTANT_INVITE, CREATE_PRIVATE_THREADS, CREATE_PUBLIC_THREADS, KICK_MEMBERS, MANAGE_CHANNELS, MANAGE_EVENTS, MANAGE_GUILD,
-    MANAGE_MESSAGES, MANAGE_ROLES, MANAGE_THREADS, MANAGE_WEBHOOKS, PIN_MESSAGES, SEND_MESSAGES, SEND_MESSAGES_IN_THREADS, VIEW_CHANNEL,
+    MANAGE_MESSAGES, MANAGE_ROLES, MANAGE_THREADS, MANAGE_WEBHOOKS, PIN_MESSAGES, SEND_MESSAGES, SEND_MESSAGES_IN_THREADS, VIEW_AUDIT_LOG,
+    VIEW_CHANNEL,
 };
 use super::{proto, Discord, GuildInfo, Quiet, Resumable, RoleInfo, WARM};
 use crate::hub::now;
@@ -114,6 +115,12 @@ pub(super) fn quiet(settings: &GuildSettings) -> Quiet {
         mute_scheduled_events: settings.mute_scheduled_events,
         opt_in: settings.flags & model::OPT_IN_CHANNELS_ON != 0,
         opted_in: opted.map(|channel| channel.channel_id.clone()).collect(),
+        raw_flags: settings.flags,
+        channel_flags: overrides
+            .iter()
+            .filter(|channel| channel.flags != 0)
+            .map(|channel| (channel.channel_id.clone(), channel.flags))
+            .collect(),
         level: settings.message_notifications,
         levels: levels.map(|channel| (channel.channel_id.clone(), channel.message_notifications)).collect(),
         collapsed: collapsed.map(|channel| channel.channel_id.clone()).collect(),
@@ -132,12 +139,13 @@ impl Quiet {
         self.muted_until.is_some_and(|until| until > now)
     }
 
-    /// Not opted in to, where the user turned "Show all channels" off: neither the channel nor
-    /// its category is opted in. Unverified against a real account: the flag bits are the
-    /// community's, and the channels a server's onboarding always shows are not known here, so
-    /// such a server may show fewer channels than Discord does until they are opted in.
-    pub(super) fn opted_out(&self, channel: &str, parent: Option<&str>) -> bool {
-        self.opt_in && !self.opted_in.contains(channel) && !parent.is_some_and(|parent| self.opted_in.contains(parent))
+    /// Not opted in to, where the user turned "Show all channels" off: neither an onboarding
+    /// default channel nor opted in (directly or via its category).
+    pub(super) fn opted_out(&self, channel: &str, parent: Option<&str>, defaults: &HashSet<String>) -> bool {
+        self.opt_in
+            && !defaults.contains(channel)
+            && !self.opted_in.contains(channel)
+            && !parent.is_some_and(|parent| self.opted_in.contains(parent))
     }
 
     /// The network's notification setting for one conversation, mute first.
@@ -181,7 +189,7 @@ fn kind_of(channel: &Channel) -> Option<ConversationKind> {
 }
 
 /// A category's header: just above the first row `place` puts under it.
-fn header(id: &str, name: &str, position: i32) -> Group {
+pub(super) fn header(id: &str, name: &str, position: i32) -> Group {
     Group::new(id, name, place(Some(position), false, 0) - 1)
 }
 
@@ -255,14 +263,18 @@ impl GuildInfo {
         allowed
     }
 
-    /// Management rights advertised to the shell on `protocol::Space`.
-    pub(super) fn space_rights(&self, guild: &str) -> protocol::SpaceRights {
-        let perms = self.base_permissions(guild);
+    /// Server-level management flags exposed on [`protocol::Space`].
+    pub(super) fn space_rights(&self, guild: &str, now: i64) -> protocol::SpaceRights {
+        let perms = self.guild_permissions(guild);
+        let not_timed_out = self.timed_out(now).is_none();
         protocol::SpaceRights {
             manage_space: self.owner || perms & MANAGE_GUILD != 0,
-            manage_roles: self.owner || perms & MANAGE_ROLES != 0,
             manage_events: self.owner || perms & MANAGE_EVENTS != 0,
             owner: self.owner,
+            manage_channels: not_timed_out && (perms & MANAGE_CHANNELS != 0),
+            manage_roles: not_timed_out && (perms & MANAGE_ROLES != 0),
+            view_audit_log: perms & VIEW_AUDIT_LOG != 0,
+            manage_server: not_timed_out && (perms & MANAGE_GUILD != 0),
         }
     }
 
@@ -291,12 +303,12 @@ impl GuildInfo {
         allowed
     }
 
-    fn can_view(&self, guild: &str, me: &str, channel: &Channel) -> bool {
+    pub(super) fn can_view(&self, guild: &str, me: &str, channel: &Channel) -> bool {
         self.permissions(guild, me, channel) & VIEW_CHANNEL != 0
     }
 
     /// True for a channel someone with no role cannot see: it is drawn with a lock.
-    fn private(&self, guild: &str, channel: &Channel) -> bool {
+    pub(super) fn private(&self, guild: &str, channel: &Channel) -> bool {
         let everyone = number(guild);
         let mut allowed = self.roles.get(&everyone).map_or(0, |role| role.permissions);
         let overwrites = &channel.permission_overwrites;
@@ -330,6 +342,10 @@ impl GuildInfo {
             slowmode_exempt: slowmode_exempt(perms, false),
             create_invite: timed_out.is_none() && (perms & CREATE_INSTANT_INVITE != 0),
             manage_webhooks: timed_out.is_none() && (perms & MANAGE_WEBHOOKS != 0),
+            rename: timed_out.is_none() && (perms & MANAGE_CHANNELS != 0),
+            edit_topic: timed_out.is_none() && (perms & MANAGE_CHANNELS != 0),
+            delete_channel: timed_out.is_none() && (perms & MANAGE_CHANNELS != 0),
+            manage_permissions: timed_out.is_none() && (perms & MANAGE_ROLES != 0),
             ..protocol::ConversationRights::default()
         };
         let call = if timed_out.is_some() || (channel.kind == model::VOICE && !can_connect) {
@@ -348,7 +364,7 @@ impl GuildInfo {
             read_only_reason,
             rights,
             private: self.private(guild, channel) || (channel.kind == model::VOICE && !can_connect),
-            opted_out: self.quiet.opted_out(&channel.id, parent),
+            opted_out: self.quiet.opted_out(&channel.id, parent, &self.onboarding_defaults),
             max_file_bytes: super::send::tier_upload_limit(self.premium_tier),
             slowmode_seconds: channel.rate_limit_per_user,
             age_restricted: channel.nsfw,
@@ -412,6 +428,8 @@ impl Discord {
             afk_timeout: guild.afk_timeout().unwrap_or(300),
             default_message_notifications: guild.default_message_notifications().unwrap_or(0),
             timeout_until: member.and_then(|member| member.communication_disabled_until.as_deref()).and_then(model::iso_seconds),
+            onboarding_defaults: HashSet::new(),
+            onboarding_fetched: false,
             emojis: guild.emojis.iter().filter(|emoji| emoji.available).filter_map(|emoji| {
                 Some(super::Pickable {
                     id: emoji.id.clone()?,
@@ -639,7 +657,7 @@ impl Discord {
     }
 
     /// Changes what is kept of a server's channels.
-    fn keep(&self, guild: &str, change: impl FnOnce(&mut Vec<Kept>)) {
+    pub(super) fn keep(&self, guild: &str, change: impl FnOnce(&mut Vec<Kept>)) {
         let note = format!("kept:{guild}");
         let mut kept: Vec<Kept> = self.ctx.note(&note).and_then(|kept| serde_json::from_str(&kept).ok()).unwrap_or_default();
         change(&mut kept);
@@ -647,7 +665,7 @@ impl Discord {
     }
 
     /// Computes our effective Discord permission bitmask for a kept channel in `guild`.
-    pub(super) fn channel_permissions(&self, guild: &str, channel_id: &str) -> Option<u64> {
+    pub(super) fn channel_permission_bits(&self, guild: &str, channel_id: &str) -> Option<u64> {
         let kept: Vec<Kept> = self
             .ctx
             .note(&format!("kept:{guild}"))
@@ -662,7 +680,7 @@ impl Discord {
     /// Works out a server's visible channels again from what is kept of them, after a role's
     /// permissions or our own roles changed. Unread counts stay. Child threads keep their
     /// messages and their slowmode interval, and pick up the new rights.
-    fn replant(&self, guild_id: &str) -> rusqlite::Result<()> {
+    pub(super) fn replant(&self, guild_id: &str) -> rusqlite::Result<()> {
         let kept: Vec<Kept> = match self.ctx.note(&format!("kept:{guild_id}")).map(|kept| serde_json::from_str(&kept)) {
             Some(Ok(kept)) => kept,
             _ => return Ok(()),
@@ -699,13 +717,16 @@ impl Discord {
         for (row, muted) in tree.rows.iter().zip(muted) {
             self.ctx.muted(&row.id, muted)?;
         }
+        let clock = now();
         let flags = self.state.lock().unwrap().guilds.get(guild_id).map(|info| {
-            (info.quiet.server_muted(now()), info.quiet.hide_muted, info.can_invite, info.space_rights(guild_id))
+            (info.quiet.server_muted(clock), info.quiet.hide_muted, info.quiet.opt_in, info.can_invite, info.space_rights(guild_id, clock))
         });
-        if let Some((muted, hide, can_invite, rights)) = flags {
+        if let Some((muted, hide, opt_in, can_invite, rights)) = flags {
             self.ctx.space_flags(guild_id, muted, hide)?;
             self.ctx.set_space_can_create_invites(guild_id, can_invite)?;
             self.ctx.space_rights(guild_id, rights)?;
+            self.ctx.set_space_opt_in(guild_id, opt_in)?;
+            self.ctx.set_space_can_create_channels(guild_id, rights.manage_channels)?;
         }
         Ok(())
     }
@@ -807,7 +828,7 @@ impl Discord {
         let (rows, files): (Vec<SpaceRow>, Vec<(MediaFile, String)>) = {
             let state = self.state.lock().unwrap();
             flags.extend(state.guilds.iter().map(|(id, info)| {
-                (id.clone(), info.quiet.server_muted(now), info.quiet.hide_muted, info.can_invite, info.space_rights(id))
+                (id.clone(), info.quiet.server_muted(now), info.quiet.hide_muted, info.quiet.opt_in, info.can_invite, info.space_rights(id, now))
             }));
             let mut rows = Vec::with_capacity(state.guilds.len());
             let mut files = Vec::new();
@@ -835,11 +856,13 @@ impl Discord {
         };
         self.ctx.media(&files)?;
         self.ctx.spaces(&rows)?;
-        // A server's own mute, "hide muted channels", invite permission, and management rights once its Space exists.
-        for (id, muted, hide, can_invite, rights) in flags {
+        // A server's own mute, "hide muted channels", opt-in filter, invite permission and management rights, once its Space exists.
+        for (id, muted, hide, opt_in, can_invite, rights) in flags {
             self.ctx.space_flags(&id, muted, hide)?;
             self.ctx.set_space_can_create_invites(&id, can_invite)?;
             self.ctx.space_rights(&id, rights)?;
+            self.ctx.set_space_opt_in(&id, opt_in)?;
+            self.ctx.set_space_can_create_channels(&id, rights.manage_channels)?;
         }
         Ok(())
     }
@@ -1600,7 +1623,7 @@ impl Discord {
         let exempt = parent
             .space
             .as_deref()
-            .and_then(|guild| self.channel_permissions(guild, &parent.key.id))
+            .and_then(|guild| self.channel_permission_bits(guild, &parent.key.id))
             .map_or(parent.rights.slowmode_exempt || parent.rights.manage_threads, |perms| slowmode_exempt(perms, true));
         let me = self.me();
         let is_owner = thread.owner_id.as_deref() == Some(me.as_str());
@@ -1693,7 +1716,7 @@ impl Discord {
         if children.is_empty() {
             return Ok(());
         }
-        let perms = parent.space.as_deref().and_then(|guild| self.channel_permissions(guild, parent_id));
+        let perms = parent.space.as_deref().and_then(|guild| self.channel_permission_bits(guild, parent_id));
         let clock = now();
         let timed_out = parent.space.as_deref().and_then(|guild| {
             let state = self.state.lock().unwrap();
@@ -1762,7 +1785,7 @@ impl Discord {
     }
 
     /// Writes the mute of every row a settings entry covers.
-    fn apply_quiet(&self, guild: Option<&str>) -> rusqlite::Result<()> {
+    pub(super) fn apply_quiet(&self, guild: Option<&str>) -> rusqlite::Result<()> {
         let now = now();
         let rows: Vec<(String, bool)> = {
             let state = self.state.lock().unwrap();

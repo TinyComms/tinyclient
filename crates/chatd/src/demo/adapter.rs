@@ -1069,6 +1069,7 @@ impl Demo {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::LeaveSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetSpaceNotify { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CancelScheduled { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1087,6 +1088,22 @@ impl Demo {
             Command::ThreadUpdate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::DeleteThread { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Publish { reply, .. } | Command::Follow { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::FollowChannel { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetSpaceView { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateCategory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::EditChannel { reply, .. }
+            | Command::MoveChannels { reply, .. }
+            | Command::DeleteChannel { reply, .. }
+            | Command::SetOverwrite { reply, .. }
+            | Command::DeleteOverwrite { reply, .. }
+            | Command::SyncChannelPermissions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ChannelPermissions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AuditLog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AutomodRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SaveAutomodRule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DeleteAutomodRule { reply, .. } | Command::SaveSpaceSafety { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
             Command::Backfill(_)
             | Command::Warm(_)
             | Command::History { .. }

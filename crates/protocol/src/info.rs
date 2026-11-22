@@ -755,6 +755,12 @@ pub struct ConversationRights {
     /// May manage webhooks in this channel (Discord `MANAGE_WEBHOOKS`, required to follow an announcement channel here).
     #[serde(default, skip_serializing_if = "is_false")]
     pub manage_webhooks: bool,
+    /// May delete this channel (`Request::DeleteChannel`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub delete_channel: bool,
+    /// May edit this channel's permission overwrites (`Request::SetOverwrite`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_permissions: bool,
 }
 
 impl ConversationRights {
@@ -776,6 +782,8 @@ impl ConversationRights {
     const CREATE_INVITE: i64 = 1 << 13;
     /// Bit 14. Bits 8–12 are already conversation rights on other Discord branches.
     const MANAGE_WEBHOOKS: i64 = 1 << 14;
+    const DELETE_CHANNEL: i64 = 1 << 8;
+    const MANAGE_PERMISSIONS: i64 = 1 << 9;
 
     pub fn is_none(&self) -> bool {
         *self == ConversationRights::default()
@@ -832,6 +840,12 @@ impl ConversationRights {
         if self.manage_webhooks {
             bits |= Self::MANAGE_WEBHOOKS;
         }
+        if self.delete_channel {
+            bits |= Self::DELETE_CHANNEL;
+        }
+        if self.manage_permissions {
+            bits |= Self::MANAGE_PERMISSIONS;
+        }
         bits
     }
 
@@ -852,8 +866,23 @@ impl ConversationRights {
             slowmode_exempt: (bits & Self::SLOWMODE_EXEMPT) != 0,
             create_invite: (bits & Self::CREATE_INVITE) != 0,
             manage_webhooks: (bits & Self::MANAGE_WEBHOOKS) != 0,
+            delete_channel: (bits & Self::DELETE_CHANNEL) != 0,
+            manage_permissions: (bits & Self::MANAGE_PERMISSIONS) != 0,
         }
     }
+}
+
+/// One channel or category's target position in a bulk reorder (`Request::MoveChannels`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelPosition {
+    pub id: String,
+    pub position: i32,
+    /// `Some(Some(cat))` moves under that category; `Some(None)` uncategorises; `None` leaves parent unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<Option<String>>,
+    /// When moving under a category, sync overwrites with the new category's permissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_permissions: Option<bool>,
 }
 
 /// What an account may send and do on messages, as the session says (the plan, the workspace's
@@ -1618,6 +1647,42 @@ impl Outgoing {
     }
 }
 
+/// One changed field inside a server audit log entry (`#394`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AuditChange {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new: Option<String>,
+}
+
+/// One entry in a server's audit log (`Request::AuditLog`, `#394`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AuditEntry {
+    pub id: String,
+    #[serde(default)]
+    pub action_type: u32,
+    #[serde(default)]
+    pub action_label: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<String>,
+    #[serde(default)]
+    pub actor_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
+    #[serde(default)]
+    pub target_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+    #[serde(default)]
+    pub time: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<AuditChange>,
+}
+
 /// One custom emoji, sticker or GIF in a picker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogItem {
@@ -1665,6 +1730,132 @@ impl Keychain {
     pub fn is_settled(&self) -> bool {
         *self == Keychain::default()
     }
+}
+
+/// A server's safety setup (`Request::AutomodRules`, `#395`).
+///
+/// `verification_level` is Discord's 0–4 (none through highest). `explicit_filter` is
+/// `explicit_content_filter`, 0–2. The pause fields are unix seconds from incident actions;
+/// `0` means that pause is off.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SpaceSafety {
+    #[serde(default)]
+    pub verification_level: u8,
+    #[serde(default)]
+    pub explicit_filter: u8,
+    #[serde(default)]
+    pub invites_paused_until: i64,
+    #[serde(default)]
+    pub dms_paused_until: i64,
+}
+
+/// What an AutoMod rule watches. Unknown triggers stay `Other` and are saved back untouched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomodTrigger {
+    Keyword {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        keywords: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        regex: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        allow: Vec<String>,
+    },
+    Spam,
+    Preset {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        presets: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        allow: Vec<String>,
+    },
+    Mention {
+        #[serde(default)]
+        limit: u32,
+        #[serde(default, skip_serializing_if = "is_false")]
+        raid_protection: bool,
+    },
+    Profile {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        keywords: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        regex: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        allow: Vec<String>,
+    },
+    /// A trigger this build does not edit. `metadata` is the original JSON object.
+    Other {
+        #[serde(default)]
+        code: u8,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        metadata: String,
+    },
+}
+
+// `#[default]` only takes a unit variant, so the empty keyword rule is spelled out.
+impl Default for AutomodTrigger {
+    fn default() -> Self {
+        Self::Keyword { keywords: Vec::new(), regex: Vec::new(), allow: Vec::new() }
+    }
+}
+
+/// What an AutoMod rule does when it matches. The block message is display text only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomodAction {
+    Block {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        message: String,
+    },
+    Alert {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        channel_id: String,
+    },
+    Timeout {
+        #[serde(default)]
+        seconds: u32,
+    },
+    /// Discord `BLOCK_MEMBER_INTERACTION`.
+    Quarantine,
+    /// An action this build does not edit. `metadata` is the original JSON object.
+    Other {
+        #[serde(default)]
+        code: u8,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        metadata: String,
+    },
+}
+
+impl Default for AutomodAction {
+    fn default() -> Self {
+        Self::Block { message: String::new() }
+    }
+}
+
+/// One AutoMod rule (`#395`). An empty `id` creates a rule. `read_only` rules are shown and,
+/// if saved, written back from `raw` without tinyclient interpreting their trigger or actions.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AutomodRule {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub event_type: u8,
+    #[serde(default)]
+    pub trigger: AutomodTrigger,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<AutomodAction>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exempt_roles: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exempt_channels: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub read_only: bool,
+    /// Original Discord rule object when the trigger or an action is not one this build edits.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub raw: String,
 }
 
 #[cfg(test)]
@@ -1764,6 +1955,33 @@ mod tests {
     }
 
     #[test]
+    fn automod_rules_default_when_a_field_is_missing() {
+        let bare: AutomodRule = serde_json::from_str(r#"{"name":"spam"}"#).unwrap();
+        assert_eq!(bare.name, "spam");
+        assert!(!bare.enabled);
+        assert!(bare.id.is_empty());
+        assert_eq!(bare.trigger, AutomodTrigger::default());
+        assert!(bare.actions.is_empty());
+        assert!(!bare.read_only);
+        let round: AutomodRule = serde_json::from_str(&serde_json::to_string(&AutomodRule::default()).unwrap()).unwrap();
+        assert_eq!(round, AutomodRule::default());
+
+        let safety: SpaceSafety = serde_json::from_str("{}").unwrap();
+        assert_eq!(safety, SpaceSafety::default());
+
+        let space = Key::new(&AccountKey { network: Network::Discord, account: "1".into() }, "4000");
+        let bare_req = Request::SaveAutomodRule { space: space.clone(), rule: AutomodRule::default() };
+        let mut value = serde_json::to_value(&bare_req).unwrap();
+        value.as_object_mut().unwrap().remove("rule");
+        let back: Request = serde_json::from_value(value).unwrap();
+        assert_eq!(back, bare_req);
+
+        let listed = Request::AutomodRules { space };
+        let again: Request = serde_json::from_str(&serde_json::to_string(&listed).unwrap()).unwrap();
+        assert_eq!(again, listed);
+    }
+
+    #[test]
     fn space_info_banner_boosts_and_mark_round_trip_and_default_cleanly() {
         let account = AccountKey { network: Network::Discord, account: "1".into() };
         let space = Space {
@@ -1778,6 +1996,7 @@ mod tests {
             hide_muted: false,
             can_create_channels: false,
             can_create_invites: false,
+            opt_in_channels: false,
             rights: crate::SpaceRights::default(),
         };
         let legacy = serde_json::json!({
@@ -1877,6 +2096,7 @@ mod tests {
             manage_roles: false,
             manage_events: true,
             owner: true,
+            ..SpaceRights::default()
         };
         assert_eq!(SpaceRights::from_bits(rights.to_bits()), rights);
         assert!(rights.any_settings());

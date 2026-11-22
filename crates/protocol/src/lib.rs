@@ -15,6 +15,7 @@ pub mod browser;
 mod call;
 pub mod crash;
 pub mod device_approval;
+pub mod discord_perms;
 mod e2ee;
 pub mod highlight;
 pub mod hotkey;
@@ -39,6 +40,7 @@ pub mod web_sign_in;
 
 pub use call::*;
 pub use crash::redact;
+pub use discord_perms::*;
 pub use e2ee::*;
 pub use info::*;
 pub use ipc::{ChatListener, ChatStream};
@@ -252,7 +254,7 @@ pub struct SpaceRights {
     /// Manage Server (`MANAGE_GUILD` on Discord): overview settings and invites.
     #[serde(default, skip_serializing_if = "is_false")]
     pub manage_space: bool,
-    /// Manage Roles (`MANAGE_ROLES` on Discord).
+    /// Manage Roles (`MANAGE_ROLES` on Discord): roles and permission overwrites.
     #[serde(default, skip_serializing_if = "is_false")]
     pub manage_roles: bool,
     /// Manage Events (`MANAGE_EVENTS` on Discord).
@@ -261,11 +263,20 @@ pub struct SpaceRights {
     /// Server owner (transfer ownership / delete server).
     #[serde(default, skip_serializing_if = "is_false")]
     pub owner: bool,
+    /// May create, edit, reorder, or delete channels and categories (Discord `MANAGE_CHANNELS`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_channels: bool,
+    /// May read the server's audit log (Discord `VIEW_AUDIT_LOG`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub view_audit_log: bool,
+    /// May edit server safety setup and AutoMod rules (Discord `MANAGE_GUILD`, and not timed out).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_server: bool,
 }
 
 impl SpaceRights {
     pub fn is_empty(&self) -> bool {
-        !self.manage_space && !self.manage_roles && !self.manage_events && !self.owner
+        *self == SpaceRights::default()
     }
 
     pub fn any_settings(&self) -> bool {
@@ -277,6 +288,9 @@ impl SpaceRights {
             | (u32::from(self.manage_roles) << 1)
             | (u32::from(self.manage_events) << 2)
             | (u32::from(self.owner) << 3)
+            | (u32::from(self.manage_channels) << 4)
+            | (u32::from(self.view_audit_log) << 5)
+            | (u32::from(self.manage_server) << 6)
     }
 
     pub fn from_bits(bits: u32) -> Self {
@@ -285,6 +299,9 @@ impl SpaceRights {
             manage_roles: bits & 2 != 0,
             manage_events: bits & 4 != 0,
             owner: bits & 8 != 0,
+            manage_channels: bits & 16 != 0,
+            view_audit_log: bits & 32 != 0,
+            manage_server: bits & 64 != 0,
         }
     }
 }
@@ -317,7 +334,10 @@ pub struct Space {
     /// The user has permission to create invite links in at least one channel of this Space (`Request::CreateInvite`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub can_create_invites: bool,
-    /// Management permissions held by the signed-in user in this Space.
+    /// Opt-in channel filter is active ("Show all channels" is off, Discord `OPT_IN_CHANNELS_ON`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub opt_in_channels: bool,
+    /// Server-level management permissions for this account inside this Space.
     #[serde(default, skip_serializing_if = "SpaceRights::is_empty")]
     pub rights: SpaceRights,
 }
@@ -1602,6 +1622,21 @@ pub enum Request {
     DeleteThread {
         conversation: Key,
     },
+    /// Follow (`on: true`) or unfollow (`on: false`) a channel or category in a Space's
+    /// channel list (Discord Browse Channels opt-in flag bit 12).
+    FollowChannel {
+        conversation: Key,
+        on: bool,
+    },
+    /// Toggle a Space's channel-list view filters (Discord "Show all channels" and
+    /// "Hide muted channels"). Unset fields are left unchanged.
+    SetSpaceView {
+        space: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        show_all: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hide_muted: Option<bool>,
+    },
     /// The topics of a forum (a Telegram forum group, a Discord forum), the network's pins
     /// first, then newest first. From the cache; opening a topic is opening a conversation.
     /// With `landing`, not a page but the one topic opening the forum lands on: the newest
@@ -1696,6 +1731,99 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         group: Option<String>,
     },
+    /// Create a category inside a Space where the user has Manage Channels. Answers `Response::Group`.
+    CreateCategory {
+        space: Key,
+        name: String,
+    },
+    /// Edit a channel's or category's properties (name, topic, slow mode, age restriction,
+    /// voice user limit, or parent category). Unset fields are left unchanged.
+    EditChannel {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        topic: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rate_limit_per_user: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nsfw: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_id: Option<Option<String>>,
+    },
+    /// Bulk-reorder channels and categories (and optionally move channels between categories)
+    /// in a Space in one request (`PATCH /guilds/{id}/channels`).
+    MoveChannels {
+        space: Key,
+        order: Vec<ChannelPosition>,
+    },
+    /// Permanently delete a channel or category in a Space (`DELETE /channels/{id}`).
+    DeleteChannel {
+        conversation: Key,
+    },
+    /// Read a channel's or category's permission overwrites and role list (`#397`).
+    /// Answers `Response::ChannelPermissions`.
+    ChannelPermissions {
+        conversation: Key,
+    },
+    /// Create or update one role/member permission overwrite on a channel or category
+    /// (`PUT /channels/{id}/permissions/{target}`).
+    SetOverwrite {
+        conversation: Key,
+        target_id: String,
+        target_kind: OverwriteTargetKind,
+        allow: u64,
+        deny: u64,
+    },
+    /// Delete one role/member permission overwrite from a channel or category
+    /// (`DELETE /channels/{id}/permissions/{target}`).
+    DeleteOverwrite {
+        conversation: Key,
+        target_id: String,
+    },
+    /// Copy the parent category's permission overwrites onto a channel (`PATCH /channels/{id}`).
+    SyncChannelPermissions {
+        conversation: Key,
+    },
+    /// Read a server's audit log (`GET /guilds/{id}/audit-logs`, `#394`).
+    /// Answers `Response::AuditLog`.
+    AuditLog {
+        space: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        person: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
+        #[serde(default)]
+        limit: u32,
+    },
+    /// A server's AutoMod rules and safety setup (`#395`). Answers `Response::AutomodRules`.
+    AutomodRules {
+        space: Key,
+    },
+    /// Create or replace one AutoMod rule. An empty `rule.id` creates it.
+    /// Answers `Response::AutomodRule`.
+    SaveAutomodRule {
+        space: Key,
+        #[serde(default)]
+        rule: AutomodRule,
+    },
+    /// Delete one AutoMod rule. Answers `Response::Ok`.
+    DeleteAutomodRule {
+        space: Key,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        id: String,
+    },
+    /// Save verification, the explicit-content filter, and raid pauses (`#395`).
+    /// Answers `Response::Ok`.
+    SaveSpaceSafety {
+        space: Key,
+        #[serde(default)]
+        safety: SpaceSafety,
+    },
     /// Starts a new group conversation with two or more members (by person id or phone number)
     /// and an optional group name. Answers `Response::Conversation`.
     CreateGroup {
@@ -1745,6 +1873,17 @@ pub enum Request {
         notify: Notify,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         until: Option<i64>,
+    },
+    /// The network's notification setting for a whole Space (or one category inside it, when
+    /// `category` is set). `until` is when a mute ends, as Unix seconds; absent means until
+    /// turned off or not muted.
+    SetSpaceNotify {
+        space: Key,
+        notify: Notify,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        category: Option<String>,
     },
     /// Sets or clears a conversation's disappearing-messages timer (`seconds == 0` turns it off).
     /// Separate from local cache retention (`keep_days`).
@@ -3330,6 +3469,9 @@ pub enum Response {
     Conversation {
         conversation: Conversation,
     },
+    Group {
+        group: Group,
+    },
     Spaces {
         spaces: Vec<Space>,
     },
@@ -3733,6 +3875,28 @@ pub enum Response {
     /// Unread mention or reaction message IDs in a conversation (`Request::UnreadItems`).
     UnreadItems {
         message_ids: Vec<String>,
+    },
+    /// Permission overwrites and role list for a channel or category (`Request::ChannelPermissions`).
+    ChannelPermissions {
+        info: Box<ChannelPermissionsInfo>,
+    },
+    /// One page of a server's audit log (`Request::AuditLog`).
+    AuditLog {
+        entries: Vec<AuditEntry>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        more: bool,
+    },
+    /// A server's AutoMod rules and safety setup (`Request::AutomodRules`).
+    AutomodRules {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        rules: Vec<AutomodRule>,
+        #[serde(default)]
+        safety: SpaceSafety,
+    },
+    /// One created or edited AutoMod rule (`Request::SaveAutomodRule`).
+    AutomodRule {
+        #[serde(default)]
+        rule: AutomodRule,
     },
 }
 
@@ -4233,6 +4397,8 @@ mod tests {
             slowmode_exempt: true,
             create_invite: true,
             manage_webhooks: true,
+            delete_channel: true,
+            manage_permissions: true,
         };
         assert_eq!(ConversationRights::from_bits(all.to_bits()), all);
         let webhooks = ConversationRights { manage_webhooks: true, ..ConversationRights::default() };
@@ -4250,6 +4416,14 @@ mod tests {
             into: Key { network: Network::Discord, account: "1".into(), id: "5101".into() },
         };
         assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&follow_req).unwrap()).unwrap(), follow_req);
+        let space_all = SpaceRights {
+            manage_channels: true,
+            manage_roles: true,
+            view_audit_log: true,
+            manage_server: true,
+            ..SpaceRights::default()
+        };
+        assert_eq!(SpaceRights::from_bits(space_all.to_bits()), space_all);
     }
 }
 

@@ -866,6 +866,264 @@ impl Discord {
         }
     }
 
+    /// Sets a server's or category's notifications (`PATCH /users/@me/guilds/{id}/settings`).
+    /// When `category` is `Some(id)`, writes `channel_overrides[id]`; otherwise writes the
+    /// top-level server `muted`, `mute_config`, and `message_notifications`.
+    pub(super) fn set_space_notify(
+        &self,
+        guild: &str,
+        notify: Notify,
+        until: Option<i64>,
+        category: Option<&str>,
+    ) -> Result<(), Refusal> {
+        if !crate::hub::lock(&self.state).guilds.contains_key(guild) {
+            return Err(refused("This server is gone."));
+        }
+        let clock = now();
+        let body = space_notify_body(notify, until, category, clock);
+        let path = format!("/users/@me/guilds/{guild}/settings");
+        let answer = self.call("PATCH", &path, Some(body)).map_err(refusal)?;
+        match serde_json::from_str::<GuildSettings>(&answer) {
+            Ok(settings) if settings.guild_id.as_deref() == Some(guild) => {
+                self.settings_changed(settings).map_err(|failed| match failed {
+                    super::Failure::SignedOut(why) | super::Failure::Dropped(why) => refused(why),
+                })
+            }
+            _ => {
+                let end = until.filter(|&t| t > clock).unwrap_or(i64::MAX);
+                {
+                    let mut state = crate::hub::lock(&self.state);
+                    if let Some(info) = state.guilds.get_mut(guild) {
+                        if let Some(cat) = category.filter(|c| !c.is_empty()) {
+                            match notify {
+                                Notify::Nothing => {
+                                    info.quiet.channels.insert(cat.to_owned(), end);
+                                }
+                                Notify::All => {
+                                    info.quiet.channels.remove(cat);
+                                    info.quiet.levels.insert(cat.to_owned(), 0);
+                                }
+                                Notify::Mentions => {
+                                    info.quiet.channels.remove(cat);
+                                    info.quiet.levels.insert(cat.to_owned(), 1);
+                                }
+                            }
+                        } else {
+                            match notify {
+                                Notify::Nothing => {
+                                    info.quiet.muted_until = Some(end);
+                                    if until.is_none() {
+                                        info.quiet.level = 2;
+                                    }
+                                }
+                                Notify::All => {
+                                    info.quiet.muted_until = None;
+                                    info.quiet.level = 0;
+                                }
+                                Notify::Mentions => {
+                                    info.quiet.muted_until = None;
+                                    info.quiet.level = 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                self.apply_quiet(Some(guild)).map_err(refused)?;
+                self.replant(guild).map_err(refused)?;
+                self.reschedule_unmute();
+                Ok(())
+            }
+        }
+    }
+
+    /// Opts a channel or category in (`on: true`) or out (`on: false`) of the server's channel
+    /// list (`channel_overrides[id].flags`, bit 12 `OPT_IN_ENABLED`) via
+    /// `PATCH /users/@me/guilds/{id}/settings`.
+    pub(super) fn follow_channel(&self, channel: &str, on: bool) -> Result<(), Refusal> {
+        let guild = if let Some(known) = self.ctx.known(channel).map_err(refused)? {
+            self.guild_of(&known)
+        } else {
+            let state = crate::hub::lock(&self.state);
+            state
+                .guilds
+                .iter()
+                .find(|(_, info)| info.categories.contains_key(channel))
+                .map(|(id, _)| id.clone())
+        };
+        let Some(guild) = guild else {
+            return Err(refused("Only a server channel or category can be followed."));
+        };
+        let existing_flags = {
+            let state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get(&guild) else {
+                return Err(refused("This server is gone."));
+            };
+            info.quiet.channel_flags.get(channel).copied().unwrap_or(0)
+        };
+        let body = follow_channel_body(channel, existing_flags, on);
+        let path = format!("/users/@me/guilds/{guild}/settings");
+        let answer = self.call("PATCH", &path, Some(body)).map_err(refusal)?;
+        match serde_json::from_str::<GuildSettings>(&answer) {
+            Ok(settings) if settings.guild_id.as_deref() == Some(guild.as_str()) => {
+                self.settings_changed(settings).map_err(|failed| match failed {
+                    super::Failure::SignedOut(why) | super::Failure::Dropped(why) => refused(why),
+                })
+            }
+            _ => {
+                let next_flags = if on {
+                    existing_flags | model::OPT_IN_ENABLED
+                } else {
+                    existing_flags & !model::OPT_IN_ENABLED
+                };
+                {
+                    let mut state = crate::hub::lock(&self.state);
+                    if let Some(info) = state.guilds.get_mut(&guild) {
+                        if on {
+                            info.quiet.opted_in.insert(channel.to_owned());
+                        } else {
+                            info.quiet.opted_in.remove(channel);
+                        }
+                        info.quiet.channel_flags.insert(channel.to_owned(), next_flags);
+                    }
+                }
+                self.replant(&guild).map_err(refused)
+            }
+        }
+    }
+
+    /// Toggles "Show All Channels" (guild `flags`, bit 14 `OPT_IN_CHANNELS_ON`) and/or
+    /// `hide_muted_channels` on `PATCH /users/@me/guilds/{id}/settings`.
+    pub(super) fn set_space_view(
+        &self,
+        guild: &str,
+        show_all: Option<bool>,
+        hide_muted: Option<bool>,
+    ) -> Result<(), Refusal> {
+        let existing_flags = {
+            let state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get(guild) else {
+                return Err(refused("This server is gone."));
+            };
+            info.quiet.raw_flags
+        };
+        if show_all.is_none() && hide_muted.is_none() {
+            return Ok(());
+        }
+        let body = space_view_body(existing_flags, show_all, hide_muted);
+        let path = format!("/users/@me/guilds/{guild}/settings");
+        let answer = self.call("PATCH", &path, Some(body)).map_err(refusal)?;
+        match serde_json::from_str::<GuildSettings>(&answer) {
+            Ok(settings) if settings.guild_id.as_deref() == Some(guild) => {
+                self.settings_changed(settings).map_err(|failed| match failed {
+                    super::Failure::SignedOut(why) | super::Failure::Dropped(why) => refused(why),
+                })
+            }
+            _ => {
+                {
+                    let mut state = crate::hub::lock(&self.state);
+                    if let Some(info) = state.guilds.get_mut(guild) {
+                        if let Some(show_all) = show_all {
+                            info.quiet.opt_in = !show_all;
+                            info.quiet.raw_flags = if show_all {
+                                existing_flags & !model::OPT_IN_CHANNELS_ON
+                            } else {
+                                existing_flags | model::OPT_IN_CHANNELS_ON
+                            };
+                        }
+                        if let Some(hide_muted) = hide_muted {
+                            info.quiet.hide_muted = hide_muted;
+                        }
+                    }
+                }
+                self.replant(guild).map_err(refused)
+            }
+        }
+    }
+
+    /// Lists every viewable channel in a Discord server for "Browse Channels", fetching the
+    /// server's onboarding default channels (`GET /guilds/{id}/onboarding`) once per session so
+    /// the hidden set matches Discord's.
+    pub(super) fn browse_channels(
+        &self,
+        guild: &str,
+        query: &str,
+        limit: u32,
+    ) -> Result<super::super::BrowsedPage, Refusal> {
+        let need_onboarding = {
+            let mut state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get_mut(guild) else {
+                return Err(refused("This server is gone."));
+            };
+            let need = !info.onboarding_fetched;
+            info.onboarding_fetched = true;
+            need
+        };
+        if need_onboarding {
+            if let Ok(answer) = self.call("GET", &format!("/guilds/{guild}/onboarding"), None) {
+                if let Ok(onboarding) = serde_json::from_str::<model::Onboarding>(&answer) {
+                    let changed = {
+                        let mut state = crate::hub::lock(&self.state);
+                        if let Some(info) = state.guilds.get_mut(guild) {
+                            let next: std::collections::HashSet<String> =
+                                onboarding.default_channel_ids.into_iter().collect();
+                            let diff = info.onboarding_defaults != next;
+                            info.onboarding_defaults = next;
+                            diff
+                        } else {
+                            false
+                        }
+                    };
+                    if changed {
+                        let _ = self.replant(guild);
+                    }
+                }
+            }
+        }
+        let kept: Vec<model::Kept> = self
+            .ctx
+            .note(&format!("kept:{guild}"))
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        let needle = query.trim().to_lowercase();
+        let me = self.me();
+        let state = crate::hub::lock(&self.state);
+        let Some(info) = state.guilds.get(guild) else {
+            return Err(refused("This server is gone."));
+        };
+        let cap = if limit == 0 { 200 } else { limit as usize };
+        let mut channels = Vec::new();
+        for item in kept {
+            let ch = item.channel();
+            if ch.kind == model::CATEGORY || !info.can_view(guild, &me, &ch) {
+                continue;
+            }
+            let name = ch.name.clone().unwrap_or_else(|| "channel".to_owned());
+            let topic = ch.topic.clone().unwrap_or_default();
+            if !needle.is_empty()
+                && !name.to_lowercase().contains(&needle)
+                && !topic.to_lowercase().contains(&needle)
+            {
+                continue;
+            }
+            let opted_out = info
+                .quiet
+                .opted_out(&ch.id, ch.parent_id.as_deref(), &info.onboarding_defaults);
+            channels.push(protocol::BrowsedChannel {
+                key: self.ctx.key(&ch.id),
+                name,
+                topic,
+                members: 0,
+                joined: !opted_out,
+                private: info.private(guild, &ch),
+                archived: false,
+            });
+            if channels.len() >= cap {
+                break;
+            }
+        }
+        Ok(super::super::BrowsedPage { channels, cursor: None })
+    }
+
     /// Leaves a group DM (`close` false) or closes a DM as Discord's × does (`close` true). Both
     /// are one `DELETE` of the channel; a server's channel is neither. The row goes, as it does
     /// in Discord; a closed DM comes back with its next message.
@@ -1273,7 +1531,7 @@ impl Discord {
             let Some(info) = state.guilds.get(guild) else {
                 return Err(refused("This server is gone."));
             };
-            if !info.space_rights(guild).manage_space {
+            if !info.space_rights(guild, now()).manage_space {
                 return Err(refused("You need the Manage Server permission to edit server settings."));
             }
         }
@@ -1462,7 +1720,7 @@ impl Discord {
             let Some(info) = state.guilds.get(guild) else {
                 return Err(refused("This server is gone."));
             };
-            if !info.space_rights(guild).manage_events {
+            if !info.space_rights(guild, now()).manage_events {
                 return Err(refused("You need the Manage Events permission to create events."));
             }
         }
@@ -1499,7 +1757,7 @@ impl Discord {
             let Some(info) = state.guilds.get(guild) else {
                 return Err(refused("This server is gone."));
             };
-            if !info.space_rights(guild).manage_events {
+            if !info.space_rights(guild, now()).manage_events {
                 return Err(refused("You need the Manage Events permission to edit events."));
             }
         }
@@ -1535,7 +1793,7 @@ impl Discord {
             let Some(info) = state.guilds.get(guild) else {
                 return Err(refused("This server is gone."));
             };
-            if !info.space_rights(guild).manage_events {
+            if !info.space_rights(guild, now()).manage_events {
                 return Err(refused("You need the Manage Events permission to delete events."));
             }
         }
@@ -1559,7 +1817,7 @@ impl Discord {
             let Some(info) = state.guilds.get(guild) else {
                 return Err(refused("This server is gone."));
             };
-            if !info.space_rights(guild).manage_space {
+            if !info.space_rights(guild, now()).manage_space {
                 return Err(refused("You need the Manage Server permission to view server invites."));
             }
             (
@@ -1661,7 +1919,7 @@ impl Discord {
             let Some(info) = state.guilds.get(guild) else {
                 return Err(refused("This server is gone."));
             };
-            if !info.space_rights(guild).manage_space {
+            if !info.space_rights(guild, now()).manage_space {
                 return Err(refused("You need the Manage Server permission to revoke invites."));
             }
             if info.vanity_url_code.as_deref() == Some(code) {
@@ -1680,7 +1938,7 @@ impl Discord {
             let Some(info) = state.guilds.get(guild) else {
                 return Err(refused("This server is gone."));
             };
-            if !info.space_rights(guild).manage_space {
+            if !info.space_rights(guild, now()).manage_space {
                 return Err(refused("You need the Manage Server permission to pause or resume invites."));
             }
             toggle_invites_disabled_feature(&info.features, paused)
@@ -1715,7 +1973,7 @@ impl Discord {
         Ok(RoleGate {
             owner,
             highest: highest_of(owner, info),
-            manage: info.space_rights(guild).manage_roles,
+            manage: info.space_rights(guild, now()).manage_roles,
             actor: info.base_permissions(guild),
             guild_num: number(guild),
         })
@@ -1744,7 +2002,7 @@ impl Discord {
         let Some(info) = state.guilds.get(&guild) else {
             return Err(refused("This server is gone."));
         };
-        if !info.space_rights(&guild).manage_roles {
+        if !info.space_rights(&guild, now()).manage_roles {
             return Err(refused("You need the Manage Roles permission to view roles."));
         }
         let owner = info.owner;
@@ -2422,5 +2680,145 @@ mod moderation_tests {
         assert!(parsed.mutes("4101", None, one_hour - 1), "still muted before end_time");
         assert!(!parsed.mutes("4101", None, one_hour), "unmuted at end_time");
         assert!(!parsed.mutes("4101", None, one_hour + 60), "unmuted after end_time");
+    }
+}
+
+/// Builds the `PATCH /users/@me/guilds/{id}/settings` body for muting or changing the
+/// notification level of a server (when `category` is `None`) or a category (`Some(id)`).
+pub(super) fn space_notify_body(
+    notify: Notify,
+    until: Option<i64>,
+    category: Option<&str>,
+    now: i64,
+) -> serde_json::Value {
+    let timed = notify == Notify::Nothing && until.is_some_and(|t| t > now);
+    let mute_config = match until.filter(|&t| notify == Notify::Nothing && t > now) {
+        Some(end) => json!({
+            "end_time": model::seconds_iso(end),
+            "selected_time_window": (end - now).max(1),
+        }),
+        None => json!({"end_time": null, "selected_time_window": -1}),
+    };
+    if let Some(cat) = category.filter(|c| !c.is_empty()) {
+        let mut setting = match notify {
+            Notify::All => json!({"muted": false, "message_notifications": 0}),
+            Notify::Mentions => json!({"muted": false, "message_notifications": 1}),
+            Notify::Nothing => json!({"muted": true}),
+        };
+        setting["mute_config"] = mute_config;
+        json!({"channel_overrides": {cat: setting}})
+    } else {
+        match notify {
+            Notify::All => json!({
+                "muted": false,
+                "message_notifications": 0,
+                "mute_config": mute_config,
+            }),
+            Notify::Mentions => json!({
+                "muted": false,
+                "message_notifications": 1,
+                "mute_config": mute_config,
+            }),
+            Notify::Nothing if timed => json!({
+                "muted": true,
+                "mute_config": mute_config,
+            }),
+            Notify::Nothing => json!({
+                "muted": true,
+                "message_notifications": 2,
+                "mute_config": mute_config,
+            }),
+        }
+    }
+}
+
+/// Builds the `PATCH /users/@me/guilds/{id}/settings` body to opt a channel or category in
+/// (`on: true`) or out (`on: false`), toggling only bit 12 (`OPT_IN_ENABLED`) while preserving
+/// all other override flag bits.
+pub(super) fn follow_channel_body(channel: &str, existing_flags: u32, on: bool) -> serde_json::Value {
+    let flags = if on {
+        existing_flags | model::OPT_IN_ENABLED
+    } else {
+        existing_flags & !model::OPT_IN_ENABLED
+    };
+    json!({"channel_overrides": {channel: {"flags": flags}}})
+}
+
+/// Builds the `PATCH /users/@me/guilds/{id}/settings` body to toggle "Show All Channels"
+/// (guild `flags` bit 14 `OPT_IN_CHANNELS_ON`) and/or `hide_muted_channels`, preserving all
+/// other guild flag bits.
+pub(super) fn space_view_body(
+    existing_flags: u32,
+    show_all: Option<bool>,
+    hide_muted: Option<bool>,
+) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    if let Some(show_all) = show_all {
+        let flags = if show_all {
+            existing_flags & !model::OPT_IN_CHANNELS_ON
+        } else {
+            existing_flags | model::OPT_IN_CHANNELS_ON
+        };
+        map.insert("flags".to_owned(), json!(flags));
+    }
+    if let Some(hide_muted) = hide_muted {
+        map.insert("hide_muted_channels".to_owned(), json!(hide_muted));
+    }
+    serde_json::Value::Object(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn follow_and_space_view_bodies_toggle_only_their_flag_bits() {
+        let base = 0b101u32;
+        let follow = follow_channel_body("4102", base, true);
+        assert_eq!(follow["channel_overrides"]["4102"]["flags"], base | model::OPT_IN_ENABLED);
+        let unfollow = follow_channel_body("4102", base | model::OPT_IN_ENABLED, false);
+        assert_eq!(unfollow["channel_overrides"]["4102"]["flags"], base);
+
+        let opt_in_on = space_view_body(base, Some(false), None);
+        assert_eq!(opt_in_on["flags"], base | model::OPT_IN_CHANNELS_ON);
+        assert!(opt_in_on.get("hide_muted_channels").is_none());
+
+        let show_all = space_view_body(base | model::OPT_IN_CHANNELS_ON, Some(true), Some(true));
+        assert_eq!(show_all["flags"], base);
+        assert_eq!(show_all["hide_muted_channels"], true);
+    }
+
+    #[test]
+    fn space_notify_body_shapes_server_levels_timed_mute_and_category_overrides() {
+        let clock = 1_760_000_000;
+        let all = space_notify_body(Notify::All, None, None, clock);
+        assert_eq!(all["muted"], false);
+        assert_eq!(all["message_notifications"], 0);
+        assert_eq!(all["mute_config"]["end_time"], serde_json::Value::Null);
+        assert_eq!(all["mute_config"]["selected_time_window"], -1);
+
+        let mentions = space_notify_body(Notify::Mentions, None, None, clock);
+        assert_eq!(mentions["muted"], false);
+        assert_eq!(mentions["message_notifications"], 1);
+
+        let nothing = space_notify_body(Notify::Nothing, None, None, clock);
+        assert_eq!(nothing["muted"], true);
+        assert_eq!(nothing["message_notifications"], 2);
+        assert_eq!(nothing["mute_config"]["end_time"], serde_json::Value::Null);
+
+        let timed = space_notify_body(Notify::Nothing, Some(clock + 3600), None, clock);
+        assert_eq!(timed["muted"], true);
+        assert!(timed.get("message_notifications").is_none());
+        assert_eq!(timed["mute_config"]["selected_time_window"], 3600);
+        assert_eq!(timed["mute_config"]["end_time"], model::seconds_iso(clock + 3600));
+
+        let cat = space_notify_body(Notify::Nothing, Some(clock + 900), Some("4050"), clock);
+        assert_eq!(cat["channel_overrides"]["4050"]["muted"], true);
+        assert_eq!(cat["channel_overrides"]["4050"]["mute_config"]["selected_time_window"], 900);
+        assert_eq!(cat["channel_overrides"]["4050"]["mute_config"]["end_time"], model::seconds_iso(clock + 900));
+
+        let cat_unmute = space_notify_body(Notify::All, None, Some("4050"), clock);
+        assert_eq!(cat_unmute["channel_overrides"]["4050"]["muted"], false);
+        assert_eq!(cat_unmute["channel_overrides"]["4050"]["message_notifications"], 0);
     }
 }

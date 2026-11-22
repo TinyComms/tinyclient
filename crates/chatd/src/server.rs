@@ -3833,6 +3833,209 @@ impl Chat {
                     Err(err) => internal(err),
                 }
             }
+            Request::CreateCategory { space, name } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let mut name = name.trim().to_owned();
+                protocol::clip(&mut name, 100);
+                if name.is_empty() {
+                    return error(ErrorCode::Refused, "Category name cannot be empty.");
+                }
+                let space_id = space.id.clone();
+                match self.ask(&account, |reply| Command::CreateCategory { space_id, name, reply }) {
+                    Ok(group) => Response::Group { group },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::EditChannel {
+                conversation,
+                name,
+                topic,
+                rate_limit_per_user,
+                nsfw,
+                user_limit,
+                parent_id,
+            } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let name = match name {
+                    Some(raw) => {
+                        let mut trimmed = raw.trim().to_owned();
+                        protocol::clip(&mut trimmed, 100);
+                        if trimmed.is_empty() {
+                            return error(ErrorCode::Refused, "Channel name cannot be empty.");
+                        }
+                        Some(trimmed)
+                    }
+                    None => None,
+                };
+                let topic = topic.map(|mut t| {
+                    protocol::clip(&mut t, 1024);
+                    t
+                });
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::EditChannel {
+                    conversation_id,
+                    name,
+                    topic,
+                    rate_limit_per_user,
+                    nsfw,
+                    user_limit,
+                    parent_id,
+                    reply,
+                }) {
+                    Ok(()) => {
+                        self.hub.infos.forget(&conversation);
+                        Response::Ok
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::MoveChannels { space, order } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                if order.is_empty() {
+                    return Response::Ok;
+                }
+                let space_id = space.id.clone();
+                match self.ask(&account, |reply| Command::MoveChannels { space_id, order, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::DeleteChannel { conversation } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::DeleteChannel { conversation_id, reply }) {
+                    Ok(()) => {
+                        self.hub.infos.forget(&conversation);
+                        Response::Ok
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::ChannelPermissions { conversation } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::ChannelPermissions { conversation_id, reply }) {
+                    Ok(info) => Response::ChannelPermissions { info: Box::new(info) },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SetOverwrite { conversation, target_id, target_kind, allow, deny } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::SetOverwrite {
+                    conversation_id,
+                    target_id,
+                    target_kind,
+                    allow,
+                    deny,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::DeleteOverwrite { conversation, target_id } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::DeleteOverwrite { conversation_id, target_id, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SyncChannelPermissions { conversation } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id.clone();
+                match self.ask(&account, |reply| Command::SyncChannelPermissions { conversation_id, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::AuditLog { space, person, action, before, limit } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id.clone();
+                match self.ask(&account, |reply| Command::AuditLog {
+                    space_id,
+                    person,
+                    action,
+                    before,
+                    limit,
+                    reply,
+                }) {
+                    Ok(page) => Response::AuditLog { entries: page.entries, more: page.more },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::AutomodRules { space } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id.clone();
+                match self.ask(&account, |reply| Command::AutomodRules { space_id, reply }) {
+                    Ok(page) => Response::AutomodRules { rules: page.rules, safety: page.safety },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SaveAutomodRule { space, rule } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id.clone();
+                match self.ask(&account, |reply| Command::SaveAutomodRule { space_id, rule, reply }) {
+                    Ok(rule) => Response::AutomodRule { rule },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::DeleteAutomodRule { space, id } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id.clone();
+                match self.ask(&account, |reply| Command::DeleteAutomodRule { space_id, rule_id: id, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SaveSpaceSafety { space, safety } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id.clone();
+                match self.ask(&account, |reply| Command::SaveSpaceSafety { space_id, safety, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::CreateGroup { account, members, name } => {
                 let started = self.ask(&account, |reply| Command::CreateGroup {
                     members,
@@ -3862,6 +4065,34 @@ impl Chat {
             Request::SpaceInfo { space } => self.space_info(space),
             Request::SetMute { conversation, notify, until } => {
                 self.act(&conversation, |conversation_id, reply| Command::SetMute { conversation_id, notify, until, reply })
+            }
+            Request::SetSpaceNotify { space, notify, until, category } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id.clone();
+                match self.ask(&account, |reply| Command::SetSpaceNotify { space_id, notify, until, category, reply }) {
+                    Ok(()) => {
+                        self.hub.space_infos.forget(&space);
+                        Response::Ok
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::FollowChannel { conversation, on } => {
+                self.act(&conversation, |conversation_id, reply| Command::FollowChannel { conversation_id, on, reply })
+            }
+            Request::SetSpaceView { space, show_all, hide_muted } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id.clone();
+                match self.ask(&account, |reply| Command::SetSpaceView { space_id, show_all, hide_muted, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
             }
             Request::SetDisappearing { conversation, seconds } => {
                 let res = self.act(&conversation, |conversation_id, reply| Command::SetDisappearing { conversation_id, seconds, reply });

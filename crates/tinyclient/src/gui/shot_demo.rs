@@ -641,6 +641,7 @@ fn build() -> Fixture {
         hide_muted: false,
         can_create_channels: false,
         can_create_invites: false,
+        opt_in_channels: false,
         rights: protocol::SpaceRights::default(),
     };
     let spaces = vec![

@@ -43,6 +43,7 @@ pub const ADMINISTRATOR: u64 = 1 << 3;
 pub const MANAGE_CHANNELS: u64 = 1 << 4;
 pub const MANAGE_GUILD: u64 = 1 << 5;
 pub const ADD_REACTIONS: u64 = 1 << 6;
+pub const VIEW_AUDIT_LOG: u64 = 1 << 7;
 #[allow(dead_code)]
 pub const STREAM: u64 = 1 << 9;
 pub const VIEW_CHANNEL: u64 = 1 << 10;
@@ -580,6 +581,12 @@ pub struct Channel {
     pub icon: Option<String>,
     #[serde(default)]
     pub topic: Option<String>,
+    /// Slow mode interval in seconds (0 = off).
+    #[serde(default, deserialize_with = "nullable")]
+    pub rate_limit_per_user: u32,
+    /// Age-restricted channel flag.
+    #[serde(default, deserialize_with = "nullable")]
+    pub nsfw: bool,
     #[serde(default)]
     pub thread_metadata: Option<ThreadMetadata>,
     #[serde(default)]
@@ -593,15 +600,9 @@ pub struct Channel {
     pub is_message_request: bool,
     #[serde(default, deserialize_with = "nullable")]
     pub is_spam: bool,
-    /// Slowmode interval in seconds, 0 when off.
-    #[serde(default, deserialize_with = "nullable")]
-    pub rate_limit_per_user: u32,
     /// Default slowmode interval for newly created threads under this channel.
     #[serde(default, deserialize_with = "nullable")]
     pub default_thread_rate_limit_per_user: u32,
-    /// Marked age-restricted (`nsfw`) by the server.
-    #[serde(default, deserialize_with = "nullable")]
-    pub nsfw: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -1169,6 +1170,15 @@ pub const OPT_IN_CHANNELS_ON: u32 = 1 << 14;
 /// Channel override flags: this channel (or category) is opted in.
 pub const OPT_IN_ENABLED: u32 = 1 << 12;
 
+/// Server onboarding configuration (`GET /guilds/{id}/onboarding`).
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct Onboarding {
+    #[serde(default, deserialize_with = "nullable")]
+    pub default_channel_ids: Vec<String>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub enabled: bool,
+}
+
 #[derive(Deserialize, Clone, Debug)]
 pub struct GuildSettings {
     /// Null for the entry that holds direct messages.
@@ -1725,6 +1735,25 @@ pub fn format_iso_utc(unix: i64) -> String {
     }
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
+/// ISO 8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SS.000Z`) from Unix seconds (inverse of [`iso_seconds`]).
+pub fn seconds_iso(unix: i64) -> String {
+    let days = unix.div_euclid(86_400);
+    let secs = unix.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    let hour = secs / 3_600;
+    let minute = (secs % 3_600) / 60;
+    let second = secs % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.000Z")
+}
 
 #[cfg(test)]
 mod tests {
@@ -1735,6 +1764,8 @@ mod tests {
         // The example id from Discord's documentation, created 2016-04-30 11:18:25 UTC.
         assert_eq!(seconds("175928847299117063"), 1_462_015_105);
         assert_eq!(iso_seconds("2016-04-30T11:18:25.796000+00:00"), Some(1_462_015_105));
+        assert_eq!(seconds_iso(1_462_015_105), "2016-04-30T11:18:25.000Z");
+        assert_eq!(iso_seconds(&seconds_iso(1_760_343_300)), Some(1_760_343_300));
     }
 
     #[test]

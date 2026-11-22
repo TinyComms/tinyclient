@@ -299,6 +299,11 @@ impl Discord {
             "GUILD_SCHEDULED_EVENT_DELETE" => self.scheduled_event_deleted(from_str(data)?),
             "GUILD_SCHEDULED_EVENT_USER_ADD" => self.scheduled_event_user(from_str(data)?, true),
             "GUILD_SCHEDULED_EVENT_USER_REMOVE" => self.scheduled_event_user(from_str(data)?, false),
+            // Live audit log entries arrive when the user has VIEW_AUDIT_LOG; parse leniently
+            // so unknown fields or future action types never disrupt the gateway session.
+            "GUILD_AUDIT_LOG_ENTRY_CREATE" => {
+                let _ = from_str::<super::audit::RawAuditEntry>(data);
+            }
             _ => {}
         }
         Ok(())

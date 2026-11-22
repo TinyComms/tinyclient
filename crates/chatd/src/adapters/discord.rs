@@ -10,6 +10,8 @@
 //! the user owns, one visible member window, the voice states of the servers. Trees, people and
 //! messages go to the store as READY and the events arrive.
 
+mod audit;
+mod automod;
 mod content;
 mod events;
 
@@ -19,6 +21,7 @@ pub(super) fn prove_code_colors() -> Result<(), String> {
 /// Its socket waits are shared with the Tiny server's live socket.
 pub(super) mod gateway;
 mod info;
+mod manage;
 mod members;
 mod model;
 mod picker;
@@ -170,6 +173,10 @@ struct Quiet {
     opt_in: bool,
     /// Channels and categories opted in.
     opted_in: HashSet<String>,
+    /// Raw guild settings `flags`, kept so toggling one bit preserves all others.
+    raw_flags: u32,
+    /// Raw per-channel override `flags`, kept so toggling one bit preserves all others.
+    channel_flags: HashMap<String, u32>,
     /// The server's notification level (0 all, 1 mentions, 2 nothing), and the channels and
     /// categories that set their own.
     level: u8,
@@ -323,6 +330,10 @@ struct GuildInfo {
     default_message_notifications: u8,
     /// Unix seconds until our own server timeout ends, if timed out.
     timeout_until: Option<i64>,
+    /// Channels always shown by the server's onboarding (`GET /guilds/{id}/onboarding`).
+    onboarding_defaults: HashSet<String>,
+    /// Whether `GET /guilds/{id}/onboarding` has already been fetched in this session.
+    onboarding_fetched: bool,
     emojis: Vec<Pickable>,
     stickers: Vec<Pickable>,
     events: HashMap<String, StoredEvent>,
@@ -2668,7 +2679,7 @@ impl Discord {
         let guild = self.guild_of(&parent);
         let exempt = guild
             .as_deref()
-            .and_then(|g| self.channel_permissions(g, &parent.key.id))
+            .and_then(|g| self.channel_permission_bits(g, &parent.key.id))
             .map_or(parent.rights.slowmode_exempt || parent.rights.manage_threads, |perms| ready::slowmode_exempt(perms, true));
         let clock = crate::hub::now();
         let timed_out = guild.as_deref().and_then(|g| {
@@ -2851,7 +2862,7 @@ impl Discord {
         let guild = self.guild_of(parent);
         let exempt = guild
             .as_deref()
-            .and_then(|g| self.channel_permissions(g, &parent.key.id))
+            .and_then(|g| self.channel_permission_bits(g, &parent.key.id))
             .map_or(parent.rights.slowmode_exempt || parent.rights.manage_threads, |perms| ready::slowmode_exempt(perms, true));
         let clock = crate::hub::now();
         let timed_out = guild.as_deref().and_then(|g| {
@@ -3189,6 +3200,70 @@ impl Discord {
             Command::SetMemberRoles { space_id, person_id, roles, reply } => {
                 answer(reply, self.set_member_roles(&space_id, &person_id, &roles))
             }
+            Command::SetSpaceNotify { space_id, notify, until, category, reply } => {
+                answer(reply, self.set_space_notify(&space_id, notify, until, category.as_deref()))
+            }
+            Command::FollowChannel { conversation_id, on, reply } => {
+                answer(reply, self.follow_channel(&conversation_id, on))
+            }
+            Command::SetSpaceView { space_id, show_all, hide_muted, reply } => {
+                answer(reply, self.set_space_view(&space_id, show_all, hide_muted))
+            }
+            Command::BrowseChannels { space_id, query, cursor: _, limit, reply } => {
+                answer(reply, self.browse_channels(&space_id, &query, limit))
+            }
+            Command::CreateChannel { space_id, name, kind, private, group, reply } => {
+                answer(reply, self.create_channel(&space_id, &name, kind, private, group.as_deref()))
+            }
+            Command::CreateCategory { space_id, name, reply } => {
+                answer(reply, self.create_category(&space_id, &name))
+            }
+            Command::EditChannel {
+                conversation_id,
+                name,
+                topic,
+                rate_limit_per_user,
+                nsfw,
+                user_limit,
+                parent_id,
+                reply,
+            } => answer(
+                reply,
+                self.edit_channel(
+                    &conversation_id,
+                    name.as_deref(),
+                    topic.as_deref(),
+                    rate_limit_per_user,
+                    nsfw,
+                    user_limit,
+                    parent_id.as_ref().map(|p| p.as_deref()),
+                ),
+            ),
+            Command::MoveChannels { space_id, order, reply } => {
+                answer(reply, self.move_channels(&space_id, &order))
+            }
+            Command::DeleteChannel { conversation_id, reply } => {
+                answer(reply, self.delete_channel(&conversation_id))
+            }
+            Command::ChannelPermissions { conversation_id, reply } => {
+                answer(reply, self.channel_permissions(&conversation_id))
+            }
+            Command::SetOverwrite { conversation_id, target_id, target_kind, allow, deny, reply } => {
+                answer(reply, self.set_overwrite(&conversation_id, &target_id, target_kind, allow, deny))
+            }
+            Command::DeleteOverwrite { conversation_id, target_id, reply } => {
+                answer(reply, self.delete_overwrite(&conversation_id, &target_id))
+            }
+            Command::SyncChannelPermissions { conversation_id, reply } => {
+                answer(reply, self.sync_channel_permissions(&conversation_id))
+            }
+            Command::AuditLog { space_id, person, action, before, limit, reply } => {
+                answer(reply, self.audit_log(&space_id, person.as_deref(), action, before.as_deref(), limit))
+            }
+            Command::AutomodRules { space_id, reply } => answer(reply, self.automod_rules(&space_id)),
+            Command::SaveAutomodRule { space_id, rule, reply } => answer(reply, self.save_automod_rule(&space_id, &rule)),
+            Command::DeleteAutomodRule { space_id, rule_id, reply } => answer(reply, self.delete_automod_rule(&space_id, &rule_id)),
+            Command::SaveSpaceSafety { space_id, safety, reply } => answer(reply, self.save_space_safety(&space_id, &safety)),
             Command::LeaveSpace { space_id, reply } => answer(reply, self.leave_space(&space_id)),
             Command::CloseDirect { conversation_id, reply } => answer(reply, self.leave(&conversation_id, true, false)),
             Command::AnswerMessageRequest { conversation_id, accept, reply } => {
@@ -3234,8 +3309,15 @@ impl Discord {
             Command::MembersRemove { conversation_id, person, reply } => {
                 answer(reply, self.remove_from_group(&conversation_id, &person))
             }
-            Command::ConversationUpdate { conversation_id, title, topic: _, description: _, reply } => {
-                answer(reply, self.update_group(&conversation_id, title.as_deref()))
+            Command::ConversationUpdate { conversation_id, title, topic, description: _, reply } => {
+                // A group DM is renamed; anything else is a server channel's name and topic.
+                let group = self.ctx.known(&conversation_id).ok().flatten().is_some_and(|row| row.kind == ConversationKind::Group);
+                let done = if group {
+                    self.update_group(&conversation_id, title.as_deref())
+                } else {
+                    self.edit_channel(&conversation_id, title.as_deref(), topic.as_deref(), None, None, None, None)
+                };
+                answer(reply, done)
             }
             Command::ConversationPicture { conversation_id, path, reply } => {
                 answer(reply, self.set_group_icon(&conversation_id, &path))

@@ -345,6 +345,25 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
         }
         top = top.child(manage_bar);
     }
+    if network == Network::Discord
+        && row.rights.manage_permissions
+        && !row.kind.is_direct()
+        && row.kind != ConversationKind::Thread
+    {
+        let perm_key = row.key.clone();
+        top = top.child(
+            div().mt(px(8.)).child(
+                button_with_icon("details-discord-perms", ButtonKind::Secondary, "icons/lock.svg", "Permissions…")
+                    .h(px(28.))
+                    .px(px(10.))
+                    .type_small()
+                    .on_click(cx.listener(move |pane, _, _, cx| {
+                        let key = perm_key.clone();
+                        pane.shell_do(cx, move |shell, cx| shell.open_channel_permissions(key, cx));
+                    })),
+            ),
+        );
+    }
     if let Some((mkey, mkind, input)) = pane.managing() {
         if mkey == &row.key {
             let discord_friends_hint = *mkind == ManageKind::AddMembers && row.key.network == Network::Discord;
@@ -735,20 +754,25 @@ pub fn space(pane: &InfoPane, key: &Key, cx: &mut Context<InfoPane>) -> Div {
         .child(draw::name_line(name.clone(), mark).mt(px(12.)))
         .children(line.map(|line| line.type_ui().text_color(theme::text_soft())))
         .children(boost_line.map(|words| div().mt(px(2.)).type_small().text_color(theme::text_faint()).child(words)));
-    // CONTRACT: no request sets a Space's notifications, so the setting `SpaceInfo` gives is
-    // shown as it is, read-only, and changed in the network's app.
-    let notify = info.as_ref().filter(|_| key.network == Network::Discord).map(|info| info.notify);
+    let notify = info
+        .as_ref()
+        .filter(|_| key.network == Network::Discord)
+        .map(|info| pane.space_notify_shown(key, info.notify));
     let top = top.children(notify.map(|notify| {
-        let shown = |ix: usize, words: &'static str, at: Notify| segment(("space-notify", ix), words, notify == at).px(px(8.)).cursor_default();
+        let choice = |ix: usize, words: &'static str, at: Notify, cx: &mut Context<InfoPane>| {
+            let space_key = key.clone();
+            segment(("space-notify", ix), words, notify == at)
+                .px(px(8.))
+                .on_click(cx.listener(move |pane, _, _, cx| pane.space_notify_to(space_key.clone(), at, cx)))
+        };
         div()
             .id("space-notify-row")
             .mt(px(12.))
-            .tooltip(tip(format!("Change this in {}", key.network.label()), None))
             .child(draw::notifications_row(
                 segmented()
-                    .child(shown(0, "All", Notify::All))
-                    .child(shown(1, "Mentions", Notify::Mentions))
-                    .child(shown(2, "Nothing", Notify::Nothing)),
+                    .child(choice(0, "All", Notify::All, cx))
+                    .child(choice(1, "Mentions", Notify::Mentions, cx))
+                    .child(choice(2, "Nothing", Notify::Nothing, cx)),
             ))
     }));
     let mut body = div()

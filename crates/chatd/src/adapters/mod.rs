@@ -282,6 +282,20 @@ pub struct ReactorsPage {
     pub more: bool,
 }
 
+/// A page of a server's audit log (`Command::AuditLog`).
+#[derive(Debug, Clone, Default)]
+pub struct AuditPage {
+    pub entries: Vec<protocol::AuditEntry>,
+    pub more: bool,
+}
+
+/// A server's AutoMod rules and safety setup (`Command::AutomodRules`).
+#[derive(Debug, Clone, Default)]
+pub struct AutomodPage {
+    pub rules: Vec<protocol::AutomodRule>,
+    pub safety: protocol::SpaceSafety,
+}
+
 /// A picture on the call the user is in. Discord is the network that acts on it.
 pub enum Picture {
     /// Our camera, on or off.
@@ -497,6 +511,91 @@ pub enum Command {
         private: bool,
         group: Option<String>,
         reply: Reply<String>,
+    },
+    /// Create a category in a Space; record it and answer with its group header.
+    CreateCategory {
+        space_id: String,
+        name: String,
+        reply: Reply<Group>,
+    },
+    /// Edit a channel's or category's properties (name, topic, slow mode, NSFW, user limit, parent).
+    EditChannel {
+        conversation_id: String,
+        name: Option<String>,
+        topic: Option<String>,
+        rate_limit_per_user: Option<u32>,
+        nsfw: Option<bool>,
+        user_limit: Option<u32>,
+        parent_id: Option<Option<String>>,
+        reply: Reply<()>,
+    },
+    /// Bulk-reorder channels/categories in a Space in one request.
+    MoveChannels {
+        space_id: String,
+        order: Vec<protocol::ChannelPosition>,
+        reply: Reply<()>,
+    },
+    /// Permanently delete a channel or category.
+    DeleteChannel {
+        conversation_id: String,
+        reply: Reply<()>,
+    },
+    /// Read a channel's or category's permission overwrites and roles.
+    ChannelPermissions {
+        conversation_id: String,
+        reply: Reply<protocol::ChannelPermissionsInfo>,
+    },
+    /// Set a role or member permission overwrite on a channel or category.
+    SetOverwrite {
+        conversation_id: String,
+        target_id: String,
+        target_kind: protocol::OverwriteTargetKind,
+        allow: u64,
+        deny: u64,
+        reply: Reply<()>,
+    },
+    /// Delete a role or member permission overwrite from a channel or category.
+    DeleteOverwrite {
+        conversation_id: String,
+        target_id: String,
+        reply: Reply<()>,
+    },
+    /// Sync a channel's permission overwrites with its parent category.
+    SyncChannelPermissions {
+        conversation_id: String,
+        reply: Reply<()>,
+    },
+    /// Read one page of a Space's audit log.
+    AuditLog {
+        space_id: String,
+        person: Option<String>,
+        action: Option<u32>,
+        before: Option<String>,
+        limit: u32,
+        reply: Reply<AuditPage>,
+    },
+    /// Read a server's AutoMod rules and safety setup.
+    AutomodRules {
+        space_id: String,
+        reply: Reply<AutomodPage>,
+    },
+    /// Create or replace one AutoMod rule.
+    SaveAutomodRule {
+        space_id: String,
+        rule: protocol::AutomodRule,
+        reply: Reply<protocol::AutomodRule>,
+    },
+    /// Delete one AutoMod rule.
+    DeleteAutomodRule {
+        space_id: String,
+        rule_id: String,
+        reply: Reply<()>,
+    },
+    /// Save verification, the explicit-content filter, and raid pauses.
+    SaveSpaceSafety {
+        space_id: String,
+        safety: protocol::SpaceSafety,
+        reply: Reply<()>,
     },
     /// Create a group conversation with two or more members (person ids or phone numbers) and an optional name.
     CreateGroup {
@@ -750,6 +849,14 @@ pub enum Command {
         until: Option<i64>,
         reply: Reply<()>,
     },
+    /// Set the network's notification setting for a whole Space, or one category inside it.
+    SetSpaceNotify {
+        space_id: String,
+        notify: Notify,
+        until: Option<i64>,
+        category: Option<String>,
+        reply: Reply<()>,
+    },
     /// Set or clear a conversation's disappearing-messages timer (`seconds == 0` turns it off).
     /// Report the new timer through [`Context::disappearing`] before answering.
     SetDisappearing {
@@ -837,6 +944,19 @@ pub enum Command {
     /// Delete a thread channel (Discord `DELETE /channels/{thread}`).
     DeleteThread {
         conversation_id: String,
+        reply: Reply<()>,
+    },
+    /// Follow (`on: true`) or unfollow (`on: false`) a channel or category (Discord opt-in bit 12).
+    FollowChannel {
+        conversation_id: String,
+        on: bool,
+        reply: Reply<()>,
+    },
+    /// Toggle Space channel-list view settings (Discord Show All Channels / Hide Muted Channels).
+    SetSpaceView {
+        space_id: String,
+        show_all: Option<bool>,
+        hide_muted: Option<bool>,
         reply: Reply<()>,
     },
     /// Accept or decline/ignore a message request (Discord).
@@ -1167,7 +1287,21 @@ impl Command {
             Command::MembersAdd { reply, .. }
             | Command::MembersRemove { reply, .. }
             | Command::ConversationUpdate { reply, .. }
-            | Command::ConversationPicture { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            | Command::ConversationPicture { reply, .. }
+            | Command::EditChannel { reply, .. }
+            | Command::MoveChannels { reply, .. }
+            | Command::DeleteChannel { reply, .. }
+            | Command::SetOverwrite { reply, .. }
+            | Command::DeleteOverwrite { reply, .. }
+            | Command::SyncChannelPermissions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ChannelPermissions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AuditLog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AutomodRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SaveAutomodRule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DeleteAutomodRule { reply, .. } | Command::SaveSpaceSafety { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::CreateCategory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StartDirect { reply, .. }
             | Command::StartDirectCall { reply, .. }
             | Command::StartGroup { reply, .. }
@@ -1208,6 +1342,7 @@ impl Command {
             Command::SetMute { reply, .. }
             | Command::Moderate { reply, .. }
             | Command::Unban { reply, .. }
+            | Command::SetSpaceNotify { reply, .. }
             | Command::SetDisappearing { reply, .. }
             | Command::Leave { reply, .. }
             | Command::TransferOwner { reply, .. }
@@ -1223,7 +1358,9 @@ impl Command {
             | Command::ThreadUpdate { reply, .. }
             | Command::DeleteThread { reply, .. }
             | Command::Publish { reply, .. }
-            | Command::Follow { reply, .. } => {
+            | Command::Follow { reply, .. }
+            | Command::FollowChannel { reply, .. }
+            | Command::SetSpaceView { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
             Command::ChannelThreads { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1442,6 +1579,23 @@ impl Context {
     pub fn set_space_can_create_invites(&self, space_id: &str, can: bool) -> Stores {
         let space = self.key(space_id);
         if self.hub.store().set_space_can_create_invites(&space, can)? {
+            self.hub.changed(Change::Spaces { account: self.account.clone() });
+        }
+        Ok(())
+    }
+    /// Sets whether the Space's opt-in channel filter ("Show all channels" off) is active.
+    pub fn set_space_opt_in(&self, space_id: &str, opt_in: bool) -> Stores {
+        let space = self.key(space_id);
+        if self.hub.store().set_space_opt_in(&space, opt_in)? {
+            self.hub.changed(Change::Spaces { account: self.account.clone() });
+        }
+        Ok(())
+    }
+
+    /// Sets server-level management rights for this account in `space_id`.
+    pub fn set_space_rights(&self, space_id: &str, rights: protocol::SpaceRights) -> Stores {
+        let space = self.key(space_id);
+        if self.hub.store().set_space_rights(&space, rights)? {
             self.hub.changed(Change::Spaces { account: self.account.clone() });
         }
         Ok(())
