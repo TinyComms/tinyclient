@@ -138,10 +138,11 @@ fn one_line(raw: &str) -> bool {
     !raw.chars().any(|c| c == '\n' || c == '\r' || c == '\0')
 }
 
+// A line break anywhere in what was typed is refused, the ends included: these go into multipart fields.
 pub(super) fn validate_sticker_name(raw: &str) -> Result<String, Refusal> {
     let name = raw.trim();
     let len = name.chars().count();
-    if !(2..=30).contains(&len) || !one_line(name) {
+    if !(2..=30).contains(&len) || !one_line(raw) {
         return Err(Refusal::Refused("Sticker name must be between 2 and 30 characters.".to_owned()));
     }
     Ok(name.to_owned())
@@ -150,7 +151,7 @@ pub(super) fn validate_sticker_name(raw: &str) -> Result<String, Refusal> {
 pub(super) fn validate_sticker_tags(raw: &str) -> Result<String, Refusal> {
     let tags = raw.trim();
     let len = tags.chars().count();
-    if len == 0 || len > 200 || !one_line(tags) {
+    if len == 0 || len > 200 || !one_line(raw) {
         return Err(Refusal::Refused("Sticker needs a related emoji or tag (1 to 200 characters).".to_owned()));
     }
     Ok(tags.to_owned())
@@ -158,7 +159,7 @@ pub(super) fn validate_sticker_tags(raw: &str) -> Result<String, Refusal> {
 
 pub(super) fn validate_sticker_description(raw: &str) -> Result<String, Refusal> {
     let desc = raw.trim();
-    if desc.chars().count() > 100 || !one_line(desc) {
+    if desc.chars().count() > 100 || !one_line(raw) {
         return Err(Refusal::Refused("Sticker description must be 100 characters or fewer.".to_owned()));
     }
     Ok(desc.to_owned())
