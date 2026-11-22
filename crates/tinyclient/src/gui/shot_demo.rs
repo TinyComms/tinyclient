@@ -139,6 +139,8 @@ fn account(key: AccountKey, name: &str, attention: u32, unread: bool, presence: 
         avatar: Some(face("robin-vale", "avatar-robin-vale.jpg")),
         presence,
         status: String::new(),
+        status_emoji: String::new(),
+        status_until: None,
         can: Capabilities {
             max_file_bytes: 25 * 1024 * 1024,
             max_files: 10,
@@ -288,7 +290,7 @@ fn span(text: &str, part: &str, style: Style) -> Span {
 }
 
 fn reaction(emoji: &str, count: u32, mine: bool) -> Reaction {
-    Reaction { emoji: emoji.into(), file: None, count, mine, who: Vec::new() }
+    Reaction { emoji: emoji.into(), file: None, count, mine, who: Vec::new(), ..Reaction::default() }
 }
 
 /// The conversation worth opening: four people planning a Saturday, over yesterday and today,
@@ -341,6 +343,8 @@ fn carpool(key: &Key) -> Vec<Message> {
         title: "Weir Creek loop · 6.2 km".into(),
         description: "An easy loop along the creek, past two footbridges and the old fence line. Muddy after rain.".into(),
         image: Some(picture("preview-creek", MediaKind::Image, "preview-creek.webp", 640, 336)),
+        duration: 0,
+        opens_in_browser: false,
     }];
     let i = at(&mut all, "m10");
     all[i].attachments = vec![Attachment {
@@ -638,6 +642,12 @@ fn build() -> Fixture {
         muted: false,
         hide_muted: false,
         can_create_channels: false,
+        can_create_invites: false,
+        opt_in_channels: false,
+        rights: protocol::SpaceRights::default(),
+        can_manage_webhooks: false,
+        can_manage_guild: false,
+        can_manage_expressions: false,
     };
     let spaces = vec![
         space(&t, premier, "Premier", Some(picture("icon-premier", MediaKind::Icon, "icon-night-shift.webp", 192, 192)), 0, 0),
@@ -833,6 +843,7 @@ fn hits(query: &str, only: Option<&Key>) -> Vec<MessageHit> {
                 title: row.map(|r| r.title.clone()).unwrap_or_default(),
                 space_title: row.map(|r| r.space_title.clone()).unwrap_or_default(),
                 outgoing: m.outgoing,
+                age_restricted: row.is_some_and(|r| r.age_restricted),
             })
         })
         .collect();
@@ -1123,11 +1134,26 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
             conversations(rows, *offset, *limit)
         }
         Request::Topics { .. } | Request::InVoice { .. } => conversations(Vec::new(), 0, 1),
+        Request::ForumInfo { forum } => Response::ForumInfo {
+            info: protocol::ForumInfo {
+                forum: forum.clone(),
+                guidelines: String::new(),
+                tags: Vec::new(),
+                require_tag: false,
+                media: false,
+                default_slowmode: 0,
+            },
+        },
+        Request::ForumPost { .. } => Response::Error {
+            code: protocol::ErrorCode::Unsupported,
+            detail: "Creating forum posts is not supported in demo mode.".into(),
+        },
         Request::Folders { .. } => Response::Folders { folders: Vec::new() },
         Request::SearchMessages { conversation, query, limit, .. } => {
-            Response::MessageHits { hits: hits(query, conversation.as_ref()).into_iter().take(*limit as usize).collect(), cursor: None, not_searched: Vec::new() }
+            Response::MessageHits { hits: hits(query, conversation.as_ref()).into_iter().take(*limit as usize).collect(), cursor: None, not_searched: Vec::new(), total: None }
         }
-        Request::SearchNetwork { conversation, query, .. } => Response::MessageHits { hits: hits(query, conversation.as_ref()), cursor: None, not_searched: Vec::new() },
+        Request::SearchNetwork { conversation, query, .. } => Response::MessageHits { hits: hits(query, conversation.as_ref()), cursor: None, not_searched: Vec::new(), total: None },
+        Request::SearchCalendar { .. } => Response::SearchCalendar { days: Vec::new() },
         Request::Messages { conversation, page: at, limit } => page(conversation, at, *limit),
         Request::Pinned { conversation } => Response::Pinned {
             conversation: conversation.clone(),
@@ -1138,8 +1164,28 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
             conversation: conversation.clone(),
             rules: serde_json::from_value(serde_json::json!({})).expect("the default rules"),
         },
+        Request::SendRules { conversation } => Response::SendRules {
+            conversation: conversation.clone(),
+            rules: protocol::SendRules::default(),
+        },
+        Request::ModerateMember { .. }
+        | Request::SetAdmin { .. }
+        | Request::TransferOwnership { .. }
+        | Request::UpdateChatSettings { .. }
+        | Request::SetDefaultSendAs { .. } => Response::Ok,
+        Request::AdminLog { conversation, .. } => Response::AdminLog {
+            conversation: conversation.clone(),
+            entries: Vec::new(),
+        },
+        Request::SendAsOptions { conversation } => Response::SendAsOptions {
+            conversation: conversation.clone(),
+            peers: Vec::new(),
+            default: None,
+        },
         Request::Catalog { .. } => Response::Catalog { items: Vec::new(), cursor: None },
         Request::SaveGif { .. } | Request::StickerSet { .. } | Request::FaveSticker { .. } => Response::Ok,
+        Request::Transcribe { .. } => Response::Transcription { transcription: protocol::Transcription::default() },
+        Request::RateTranscript { .. } => Response::Ok,
         Request::Translate { conversation, message_id, to } => {
             let target_lang = protocol::normalize_language_tag(to);
             let original = messages_of(conversation)
@@ -1218,6 +1264,7 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
                     link: String::new(),
                     disappearing: row.disappearing,
                     bookmarks: Vec::new(),
+                    pending_requests: 0,
                     tabs: Vec::new(),
                     meeting: None,
                 }),
@@ -1235,6 +1282,24 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
                     roles: vec!["Member".into()],
                     notify: Notify::Mentions,
                     tags: Vec::new(),
+                    banner: None,
+                    boost_level: 0,
+                    boosts: 0,
+                    mark: None,
+                    system_channel_id: None,
+                    afk_channel_id: None,
+                    afk_timeout: 0,
+                    default_notify: None,
+                    vanity_url: None,
+                    invites_disabled: false,
+                    can_change_nickname: found.key.network == Network::Discord,
+                    suppress_everyone: false,
+                    suppress_roles: false,
+                    highlights: true,
+                    events: true,
+                    mobile_push: true,
+                    channel_overrides: Vec::new(),
+                    privacy: Some(protocol::SpacePrivacy::default()),
                     link: String::new(),
                     domain: String::new(),
                     url: String::new(),
@@ -1242,9 +1307,16 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
             },
             None => Response::Error { code: protocol::ErrorCode::NotFound, detail: "Not in the demo.".into() },
         },
-        Request::Fetch { .. } => Response::Media { files: Vec::new() },
+        Request::SetSpaceOptions { .. } => Response::Ok,
+        Request::GetNetworkPrivacy { .. } => Response::NetworkPrivacy { privacy: protocol::NetworkPrivacy::default() },
+        Request::SetNetworkPrivacy { privacy, .. } => Response::NetworkPrivacy { privacy: privacy.clone() },
+        Request::SetSpacePrivacy { .. } => Response::Ok,
+        Request::Fetch { .. } | Request::FetchPreview { .. } => Response::Media { files: Vec::new() },
         Request::Settings => Response::Settings { values: Vec::new() },
-        Request::Storage => Response::Storage { messages: 48_213, files: 734_003_200 },
+        Request::GetDefaultDisappearing { .. } => Response::DefaultDisappearing { seconds: 0 },
+        Request::SuggestedFolders { .. } => Response::SuggestedFolders { folders: Vec::new() },
+        Request::TopicIcons { .. } => Response::Catalog { items: Vec::new(), cursor: None },
+        Request::Storage => Response::Storage { messages: 48_213, files: 734_003_200, chats: Vec::new() },
         Request::Prunable { .. } => Response::Prunable { messages: 0, bytes: 0 },
         Request::SignIn { .. } => Response::Error { code: protocol::ErrorCode::SignIn, detail: "The sign-in window was closed.".into() },
         Request::TinyCommunity { .. } => Response::TinyCommunity { community: premier() },

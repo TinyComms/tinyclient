@@ -1613,6 +1613,8 @@ fn message(account: &Account, conversation: &str, text: &Text, outgoing: bool) -
             title: preview.title.clone(),
             description: preview.description.clone(),
             image,
+            duration: 0,
+            opens_in_browser: false,
         });
     }
     if wire::find_group_invite_link(&message.text).is_some() {
@@ -2023,9 +2025,9 @@ fn apply(account: &Account, event: Event) {
             let mine = by == account.me;
             let replaced = account.live().react(&id, &by, (!removed).then_some(emoji.as_str()));
             if let Some(old) = replaced {
-                let _ = ctx.reacted(&conversation, &id, &Reaction { emoji: old, file: None, count: 1, mine, who: vec![by.clone()] }, false);
+                let _ = ctx.reacted(&conversation, &id, &Reaction { emoji: old, file: None, count: 1, mine, who: vec![by.clone()], ..Reaction::default() }, false);
             }
-            let _ = ctx.reacted(&conversation, &id, &Reaction { emoji, file: None, count: 1, mine, who: vec![by] }, !removed);
+            let _ = ctx.reacted(&conversation, &id, &Reaction { emoji, file: None, count: 1, mine, who: vec![by], ..Reaction::default() }, !removed);
         }
         Event::ReadElsewhere(read) => read_elsewhere(account, &read),
         Event::Receipt { by, sent, read, viewed, at } => {
@@ -2445,14 +2447,14 @@ fn apply(account: &Account, event: Event) {
                 let _ = ctx.reacted(
                     STORIES_CONVERSATION,
                     &story_id,
-                    &Reaction { emoji: old, file: None, count: 1, mine, who: vec![by.clone()] },
+                    &Reaction { emoji: old, file: None, count: 1, mine, who: vec![by.clone()], burst: 0, mine_burst: false, burst_colors: Vec::new() },
                     false,
                 );
             }
             let _ = ctx.reacted(
                 STORIES_CONVERSATION,
                 &story_id,
-                &Reaction { emoji, file: None, count: 1, mine, who: vec![by] },
+                &Reaction { emoji, file: None, count: 1, mine, who: vec![by], burst: 0, mine_burst: false, burst_colors: Vec::new() },
                 !removed,
             );
         }
@@ -2793,6 +2795,8 @@ fn apply_story(account: &Account, story: wire::StoryMessageData) {
         if let Some(preview) = &st.preview {
             if wire::story_preview_kept(&st.text, &preview.url) {
                 msg.previews.push(protocol::Preview {
+                    duration: 0,
+                    opens_in_browser: false,
                     url: preview.url.clone(),
                     site: crate::adapters::tiny::preview::real_host(&preview.url),
                     title: preview.title.clone(),
@@ -3416,7 +3420,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             let _ = reply.send(react(account, &conversation_id, &message_id, &emoji, on).map_err(refused));
         }
         Command::ReactionRules { reply, .. } => drop(reply.send(Ok(reaction_rules()))),
-        Command::Edit { conversation_id, message_id, text, spans, reply } => {
+        Command::Edit { conversation_id, message_id, text, spans, suppress_embeds: _, keep_attachments: _, reply } => {
             let answered = match poll_action(&text) {
                 Some(act) => poll_act(account, &conversation_id, &message_id, act),
                 None => edit(account, &conversation_id, &message_id, &text, &spans),
@@ -3661,7 +3665,7 @@ fn serve(account: &Arc<Account>, command: Command) {
             })();
             let _ = reply.send(outcome);
         }
-        Command::Leave { conversation_id, reply } => {
+        Command::Leave { conversation_id, silent: _, reply } => {
             let outcome = (|| -> Result<(), Refusal> {
                 let Peer::Group(group_id) = peer(&conversation_id).map_err(refused)? else {
                     return Err(Refusal::Refused("Only a group can be left.".to_owned()));
@@ -3883,6 +3887,10 @@ fn group_rights(group: &wire::GroupInfo, me: &str) -> ConversationRights {
         rename: can_edit,
         edit_topic: can_edit,
         edit_picture: can_edit,
+        manage_webhooks: false,
+        create_invite: false,
+        manage_topics: false,
+        ..ConversationRights::default()
     }
 }
 
@@ -4558,7 +4566,7 @@ fn call_link_handoff(account: &Account, raw: &str) -> Result<String, Refusal> {
         let _ = account.ctx.reacted(
             STORIES_CONVERSATION,
             &story_id,
-            &Reaction { emoji: emoji.to_owned(), file: None, count: 1, mine: true, who: vec![account.me.clone()] },
+            &Reaction { emoji: emoji.to_owned(), file: None, count: 1, mine: true, who: vec![account.me.clone()], burst: 0, mine_burst: false, burst_colors: Vec::new() },
             true,
         );
         return Ok(story_id);
@@ -5241,7 +5249,7 @@ fn react(account: &Account, conversation: &str, message_id: &str, emoji: &str, o
     account.wire.send(&to, Body::React { author, target: sent, emoji: emoji.to_owned(), remove: !on })?;
     let replaced = account.live().react(message_id, &account.me, on.then_some(emoji));
     if let Some(old) = replaced.filter(|_| on) {
-        let _ = account.ctx.reacted(conversation, message_id, &Reaction { emoji: old, file: None, count: 1, mine: true, who: vec![account.me.clone()] }, false);
+        let _ = account.ctx.reacted(conversation, message_id, &Reaction { emoji: old, file: None, count: 1, mine: true, who: vec![account.me.clone()], ..Reaction::default() }, false);
     }
     Ok(())
 }

@@ -426,7 +426,7 @@ impl SettingsWindow {
                 let lock_rows: &[&str] = if cfg!(target_os = "linux") { &["LK", "LS", "LP"] } else { &["LK", "LS"] };
                 let mut groups = vec![self.group(lock_rows, Some("Lock"), window, cx).child(caption(crate::gui::lock::CAPTION))];
                 groups.extend(self.per_account(window, cx));
-                groups.push(self.group(&["P3"], None, window, cx));
+                groups.push(self.group(&["P3", "P3T"], None, window, cx));
                 let trusted = prefs::trusted_links();
                 let link_rows: &[&str] = if trusted.is_empty() { &["PL", "PS"] } else { &["PL", "PS", "PF"] };
                 groups.push(self.group(link_rows, Some("Links"), window, cx).child(caption(
@@ -870,6 +870,10 @@ impl SettingsWindow {
             "P3" => {
                 let second = (!choices.images).then(|| "Nothing is fetched until you click it.".to_owned());
                 self.switch_row(id, choices.images, true, second, |this, on, cx| this.choose(|c| c.images = on, cx), cx)
+            }
+            "P3T" => {
+                let second = (!choices.text_previews).then(|| "Text attachments stay as file rows until you download them.".to_owned());
+                self.switch_row(id, choices.text_previews, true, second, |this, on, cx| this.choose(|c| c.text_previews = on, cx), cx)
             }
             "PL" => self.switch_row(id, choices.confirm_links, true, None, |this, on, cx| this.choose(|c| c.confirm_links = on, cx), cx),
             "PS" => self.switch_row(id, choices.strip_tracking, false, None, |this, on, cx| this.choose(|c| c.strip_tracking = on, cx), cx),
@@ -1601,7 +1605,8 @@ impl SettingsWindow {
             let network = account.key.network;
             // Fixed rows say what the network decides; Discord and Slack have no receipts.
             let (fixed, reason): (Option<&str>, Option<&str>) = match (id, network) {
-                ("P1", Network::Telegram) | ("P2", Network::Telegram) => (Some("Always on"), Some("Telegram does not let an app turn this off.")),
+                ("P1", Network::Telegram) => (Some("Always on"), Some("Telegram always shares typing and recording status and does not let an app turn this off.")),
+                ("P2", Network::Telegram) => (Some("Always on"), Some("Telegram does not let an app turn this off.")),
                 ("P1", Network::Messages) => (Some("Sent to the phone"), Some("Messages shows typing on your other devices.")),
                 ("P2", Network::Messages) => (Some("On your devices"), Some("Messages does not let tinyclient change read receipts.")),
                 ("P2", Network::Discord | Network::Slack) => continue,
@@ -2106,7 +2111,7 @@ impl SettingsWindow {
 
     /// D1: what tinyclient keeps on this Mac, as a two-part bar.
     fn usage(&mut self, cx: &mut Context<Self>) -> Div {
-        let Some((messages, files)) = self.storage else {
+        let Some((messages, files, chats)) = self.storage.clone() else {
             return row("Storage used", None, div().type_ui().text_color(theme::text_soft()).child("Counting…"));
         };
         let (message_words, file_words, total_words) = usage_words(messages, files);
@@ -2161,6 +2166,26 @@ impl SettingsWindow {
                     .child(legend(theme::accent(), format!("Messages {message_words}")))
                     .child(legend(theme::positive(), format!("Images and files {file_words}"))),
             )
+            .children((!chats.is_empty()).then(|| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .pt(px(4.))
+                    .child(div().type_small().text_color(theme::text_faint()).child("By chat"))
+                    .children(chats.iter().take(12).map(|chat| {
+                        let name = if chat.title.is_empty() { chat.conversation.id.clone() } else { chat.title.clone() };
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(12.))
+                            .type_small()
+                            .text_color(theme::text_soft())
+                            .child(div().flex_1().min_w_0().child(name))
+                            .child(megabytes(chat.bytes))
+                    }))
+            }))
     }
 
     /// P4: a longer time applies at once; a shorter one asks first, with what it deletes.

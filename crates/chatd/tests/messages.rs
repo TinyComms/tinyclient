@@ -448,6 +448,7 @@ fn a_named_file_stays_a_line_a_caption_keeps_the_photo_and_a_later_file_is_fetch
         ids: vec![id.clone()],
         size: None,
         retry: false,
+        span: None,
     });
     world.heard(&format!("fetch {} fake-photo", remote.id));
     world.until("the file on disk", || {
@@ -456,6 +457,7 @@ fn a_named_file_stays_a_line_a_caption_keeps_the_photo_and_a_later_file_is_fetch
             ids: vec![id.clone()],
             size: None,
             retry: false,
+            span: None,
         }) {
             Response::Media { files } => files
                 .into_iter()
@@ -1762,6 +1764,8 @@ fn rcs_messages_can_be_edited_inside_window_and_incoming_edits_are_marked() {
         message_id: sent.id.clone(),
         text: "Edited text".into(),
         spans: Vec::new(),
+        suppress_embeds: false,
+        keep_attachments: None,
     }) {
         Response::Ok => {}
         other => panic!("expected Edit Ok, got {other:?}"),
@@ -1783,6 +1787,8 @@ fn rcs_messages_can_be_edited_inside_window_and_incoming_edits_are_marked() {
         message_id: old.id.clone(),
         text: "Cannot edit".into(),
         spans: Vec::new(),
+        suppress_embeds: false,
+        keep_attachments: None,
     }) {
         Response::Error { detail, .. } => assert!(detail.contains("no longer be edited"), "{detail}"),
         other => panic!("expected stale edit refusal, got {other:?}"),
@@ -1800,6 +1806,8 @@ fn rcs_messages_can_be_edited_inside_window_and_incoming_edits_are_marked() {
         message_id: sent.id.clone(),
         text: "SMS edit".into(),
         spans: Vec::new(),
+        suppress_embeds: false,
+        keep_attachments: None,
     }) {
         Response::Error { detail, .. } => assert!(detail.contains("RCS"), "{detail}"),
         other => panic!("expected SMS edit refusal, got {other:?}"),
@@ -2153,6 +2161,7 @@ fn shared_location_and_vcard_render_as_cards_without_leaking_coordinates() {
         ids: vec![file_id],
         size: None,
         retry: false,
+        span: None,
     });
     let upgraded = world.until("fetched vcard card", || {
         world

@@ -50,6 +50,15 @@ const WATCH: &str = "sidebar";
 /// Drafts remembered ahead of their rows being read again.
 const DRAFTS_HELD: usize = 256;
 
+/// The id to ask before on the next mention page. `None` when this page is the last.
+/// A page that was filtered down to nothing still moves on, using the raw page's last id.
+fn mention_cursor(items: &[protocol::MentionHit], more: bool, cursor: Option<String>) -> Option<String> {
+    if !more {
+        return None;
+    }
+    cursor.filter(|id| !id.is_empty()).or_else(|| items.last().map(|item| item.message_id.clone()))
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Mode {
     Inbox,
@@ -78,12 +87,33 @@ pub struct Location {
     tiny_channel: Option<String>,
 }
 
+pub struct FolderEdit {
+    pub key: Key,
+    pub name: gpui::Entity<crate::gui::input::TextInput>,
+}
+
 pub struct CreateChannelModal {
     pub space: Key,
     pub group: Option<String>,
     pub name: gpui::Entity<crate::gui::input::TextInput>,
+    pub description: gpui::Entity<crate::gui::input::TextInput>,
+    pub username: gpui::Entity<crate::gui::input::TextInput>,
     pub kind: ConversationKind,
     pub private: bool,
+}
+
+pub struct ForumPostModal {
+    pub forum: Key,
+    pub title: gpui::Entity<crate::gui::input::TextInput>,
+    pub text: gpui::Entity<crate::gui::input::TextInput>,
+    pub tags: Vec<protocol::ForumTag>,
+    pub picked: Vec<String>,
+    pub files: Vec<protocol::OutgoingFile>,
+    pub require_tag: bool,
+    pub media: bool,
+    pub guidelines: String,
+    pub error: Option<String>,
+    pub busy: bool,
 }
 
 pub struct State {
@@ -116,6 +146,14 @@ pub struct State {
     /// Activity rows whose invite or sign-in code the user chose to reveal in Streamer mode.
     activity_revealed: HashSet<String>,
     activity_epoch: u64,
+    /// Recent mentions fetched from the network on demand (`Request::Mentions`, Discord).
+    pub(super) mentions_items: Vec<protocol::MentionHit>,
+    /// One cursor per account that still has another page.
+    pub(super) mentions_more: Vec<(AccountKey, String)>,
+    pub(super) mentions_loading: bool,
+    pub(super) mentions_everyone: bool,
+    pub(super) mentions_roles: bool,
+    mentions_epoch: u64,
     /// The network home on show: what chatd said, and the user's folds.
     pub home: home::Home,
     saved_homes: HashMap<Network, home::Home>,
@@ -167,15 +205,143 @@ pub struct State {
     pub spaces_pending: bool,
     pub switcher: Option<switcher::Switcher>,
     pub create_channel: Option<CreateChannelModal>,
+    pub create_invite: Option<CreateInviteModal>,
+    /// Rename of a Discord server folder.
+    pub folder_edit: Option<FolderEdit>,
+    pub forum_post: Option<ForumPostModal>,
     pub join_server: Option<JoinServerModal>,
+    pub create_server: Option<CreateServerModal>,
+    /// Cached scheduled & active events per Discord Space.
+    pub space_events: HashMap<Key, Vec<protocol::SpaceEvent>>,
+    /// Scheduled events modal when open for a Space.
+    pub events_modal: Option<EventsModal>,
+    /// The search field on Discord's Discover list.
+    discover_input: Option<Entity<crate::gui::input::TextInput>>,
+    /// A server's rules and onboarding, opened from the composer or the conversation header.
+    pub server_gate: Option<ServerGate>,
     /// Confirmation modal before leaving a Space (`(space_key, space_name)`).
     pub leave_space: Option<(Key, String)>,
+    /// Discord "Browse channels" modal with follow/unfollow checkboxes.
+    pub browse_channels: Option<BrowseChannelsModal>,
+    /// Discord "Create category" modal.
+    pub create_category: Option<CreateCategoryModal>,
+    /// Discord "Edit channel" / "Rename category" modal.
+    pub edit_channel: Option<EditChannelModal>,
+    /// Discord bulk channel/category reorder modal.
+    pub move_channels: Option<MoveChannelsModal>,
+    /// Confirmation modal requiring typing the channel/category name before deleting.
+    pub delete_channel: Option<DeleteChannelModal>,
+}
+
+pub struct CreateCategoryModal {
+    pub space: Key,
+    pub name: Entity<crate::gui::input::TextInput>,
+    pub busy: bool,
+    pub error: Option<String>,
+}
+
+pub struct EditChannelModal {
+    pub target: Key,
+    pub space: Key,
+    pub is_category: bool,
+    pub kind: ConversationKind,
+    pub name: Entity<crate::gui::input::TextInput>,
+    pub topic: Entity<crate::gui::input::TextInput>,
+    pub slow_mode: Entity<crate::gui::input::TextInput>,
+    pub user_limit: Entity<crate::gui::input::TextInput>,
+    pub nsfw: bool,
+    pub parent_id: Option<String>,
+    pub initial_parent_id: Option<String>,
+    pub categories: Vec<(String, String)>,
+    pub busy: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct MoveChannelItem {
+    pub id: String,
+    pub name: String,
+    pub is_category: bool,
+    pub parent_id: Option<String>,
+}
+
+pub struct MoveChannelsModal {
+    pub space: Key,
+    pub items: Vec<MoveChannelItem>,
+    pub categories: Vec<(String, String)>,
+    pub busy: bool,
+    pub error: Option<String>,
+}
+
+pub struct DeleteChannelModal {
+    pub target: Key,
+    pub name: String,
+    pub is_category: bool,
+    pub confirm: Entity<crate::gui::input::TextInput>,
+    pub busy: bool,
+    pub error: Option<String>,
+}
+
+pub struct BrowseChannelsModal {
+    pub space: Key,
+    pub space_name: String,
+    pub filter: Entity<crate::gui::input::TextInput>,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub channels: Vec<protocol::BrowsedChannel>,
+}
+
+#[derive(Clone, Debug)]
+pub enum CreateInviteTarget {
+    Space(Key, String),
+    Channel(Key, String),
+    Friend(AccountKey),
+}
+
+pub struct CreateInviteModal {
+    pub target: CreateInviteTarget,
+    pub max_age: u32,
+    pub max_uses: u32,
+    pub temporary: bool,
+    pub url: Option<String>,
+    pub error: Option<String>,
+    pub busy: bool,
+    pub sent: HashSet<Key>,
+    pub epoch: u64,
+}
+pub struct EventsModal {
+    pub space: Key,
+    pub error: Option<String>,
+    pub busy_event: Option<String>,
+}
+
+const DISCORD_APP: &str = "https://discord.com/app";
+
+pub struct ServerGate {
+    pub space: Key,
+    pub loaded: bool,
+    pub gate: Option<protocol::SpaceGate>,
+    pub agreed: Vec<bool>,
+    pub choice: Vec<Option<u32>>,
+    pub texts: Vec<Option<Entity<crate::gui::input::TextInput>>>,
+    pub picked: Vec<String>,
+    pub error: Option<String>,
+    pub busy: bool,
 }
 
 pub struct JoinServerModal {
     pub account: AccountKey,
     pub input: Entity<crate::gui::input::TextInput>,
     pub preview: Option<protocol::InvitePreview>,
+    pub error: Option<String>,
+    pub busy: bool,
+}
+
+pub struct CreateServerModal {
+    pub account: AccountKey,
+    pub name: Entity<crate::gui::input::TextInput>,
+    pub icon_path: Option<String>,
+    pub template: String,
     pub error: Option<String>,
     pub busy: bool,
 }
@@ -267,6 +433,12 @@ impl State {
             activity_loading: false,
             activity_revealed: HashSet::new(),
             activity_epoch: 0,
+            mentions_items: Vec::new(),
+            mentions_more: Vec::new(),
+            mentions_loading: false,
+            mentions_everyone: true,
+            mentions_roles: true,
+            mentions_epoch: 0,
             home: home::Home::default(),
             saved_homes: HashMap::new(),
             home_list: list_state(),
@@ -301,8 +473,21 @@ impl State {
             spaces_pending: false,
             switcher: None,
             create_channel: None,
+            create_invite: None,
+            folder_edit: None,
+            forum_post: None,
             join_server: None,
+            create_server: None,
+            space_events: HashMap::new(),
+            events_modal: None,
+            server_gate: None,
             leave_space: None,
+            browse_channels: None,
+            create_category: None,
+            edit_channel: None,
+            move_channels: None,
+            delete_channel: None,
+            discover_input: None,
         }
     }
 
@@ -645,6 +830,11 @@ impl Shell {
             _ => None,
         };
         self.people_state.hub().watch_space(watched.as_ref(), cx);
+        if let Mode::Space(space) = &self.sidebar_state.mode {
+            if space.network == Network::Discord {
+                self.load_space_events(space.clone(), cx);
+            }
+        }
         self.trees.retain(|space, _| wanted.contains(space));
         for space in wanted {
             if !self.trees.contains_key(&space) {
@@ -809,6 +999,110 @@ impl Shell {
         });
     }
 
+    /// Discord lets this account move and rename server folders.
+    pub(super) fn manages_space_folders(&self, account: &AccountKey) -> bool {
+        self.snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.accounts.iter().any(|row| row.key == *account && row.link == Link::Connected && row.can.manage_space_folders)
+        })
+    }
+
+    fn known_discord_folder(&self, folder: &Key) -> bool {
+        self.sidebar_state.home.folders.iter().any(|known| &known.key == folder)
+    }
+
+    /// Moves `dragged` into `folder` (the end of that folder). Same account only.
+    fn drop_discord_on_folder(&mut self, folder: Key, dragged: &home_view::MovedSpace, cx: &mut Context<Self>) {
+        if dragged.key.account() != folder.account() || !self.manages_space_folders(&folder.account()) || !self.known_discord_folder(&folder) {
+            return;
+        }
+        self.send_move_space(
+            Request::MoveSpace { space: dragged.key.clone(), before: None, folder: Some(folder.id.clone()), into_space: None },
+            cx,
+        );
+    }
+
+    /// Drops `dragged` onto a server row: into that server's folder, ahead of it, or onto the
+    /// server itself to make a folder of the two.
+    fn drop_discord_space(&mut self, target: Key, dragged: &home_view::MovedSpace, cx: &mut Context<Self>) {
+        if dragged.key == target || dragged.key.account() != target.account() || !self.manages_space_folders(&target.account()) {
+            return;
+        }
+        let account = target.account();
+        let folder_id = self.spaces.iter().find(|space| space.key == target).and_then(|space| space.folder.clone());
+        let grouped = folder_id.as_ref().is_some_and(|id| {
+            self.sidebar_state.home.folders.iter().any(|folder| {
+                folder.key.account() == account && folder.key.id == *id && folder.spaces.len() > 1
+            })
+        });
+        let request = if grouped {
+            Request::MoveSpace {
+                space: dragged.key.clone(),
+                before: Some(target.id.clone()),
+                folder: folder_id,
+                into_space: None,
+            }
+        } else {
+            Request::MoveSpace {
+                space: dragged.key.clone(),
+                before: None,
+                folder: None,
+                into_space: Some(target.id.clone()),
+            }
+        };
+        self.send_move_space(request, cx);
+    }
+
+    fn send_move_space(&mut self, request: Request, cx: &mut Context<Self>) {
+        self.off_thread(cx, move || ask(&request), |this, answer, cx| {
+            if let Some(words) = refused(&answer) {
+                this.toast(Some(("icons/circle-alert.svg", theme::danger())), words, cx);
+                return;
+            }
+            this.load_home(cx);
+        });
+    }
+
+    /// Renames or recolors a Discord server folder. `name` absent leaves it; empty clears it.
+    /// `color` absent leaves it; `Some(None)` clears it.
+    pub(super) fn set_discord_folder(&mut self, folder: Key, name: Option<String>, color: Option<Option<u32>>, cx: &mut Context<Self>) {
+        if !self.manages_space_folders(&folder.account()) || !self.known_discord_folder(&folder) {
+            return;
+        }
+        let request = Request::SetFolder { folder, name, color };
+        self.off_thread(cx, move || ask(&request), |this, answer, cx| {
+            if let Some(words) = refused(&answer) {
+                this.toast(Some(("icons/circle-alert.svg", theme::danger())), words, cx);
+                return;
+            }
+            this.load_home(cx);
+        });
+    }
+
+    pub(super) fn open_folder_rename(&mut self, folder: Key, cx: &mut Context<Self>) {
+        if !self.manages_space_folders(&folder.account()) || !self.known_discord_folder(&folder) {
+            return;
+        }
+        let current = self.sidebar_state.home.folders.iter().find(|known| known.key == folder).map(|known| known.name.clone()).unwrap_or_default();
+        let name = cx.new(|cx| {
+            let mut input = crate::gui::input::TextInput::new("Folder name", cx);
+            if !current.is_empty() {
+                input.set_text(&current, cx);
+            }
+            input
+        });
+        self.sidebar_state.folder_edit = Some(FolderEdit { key: folder, name });
+        cx.notify();
+    }
+
+    fn submit_folder_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.sidebar_state.folder_edit.take() else {
+            return;
+        };
+        let name = edit.name.read(cx).text().trim().to_owned();
+        cx.notify();
+        self.set_discord_folder(edit.key, Some(name), None, cx);
+    }
+
     /// Removes a direct or group conversation from this Inbox. The network keeps the messages.
     pub(super) fn forget_conversation(&mut self, conversation: Conversation, cx: &mut Context<Self>) {
         let title = conversation.title.clone();
@@ -892,8 +1186,167 @@ impl Shell {
         self.load_inbox(vec![0], cx);
         if filter == InboxFilter::Activity {
             self.load_activity_feed(cx);
+        } else if filter == InboxFilter::Mentions {
+            self.load_mentions_history(cx);
         }
         cx.notify();
+    }
+
+    pub(super) fn toggle_mentions_everyone(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_state.mentions_everyone = !self.sidebar_state.mentions_everyone;
+        self.load_mentions_history(cx);
+        cx.notify();
+    }
+
+    pub(super) fn toggle_mentions_roles(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_state.mentions_roles = !self.sidebar_state.mentions_roles;
+        self.load_mentions_history(cx);
+        cx.notify();
+    }
+
+    pub(super) fn load_mentions_history(&mut self, cx: &mut Context<Self>) {
+        let accounts: Vec<AccountKey> = self
+            .snapshot
+            .as_ref()
+            .map(|s| {
+                s.accounts
+                    .iter()
+                    .filter(|a| a.can.mentions_history && a.link == Link::Connected)
+                    .map(|a| a.key.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.sidebar_state.mentions_epoch += 1;
+        let epoch = self.sidebar_state.mentions_epoch;
+        self.sidebar_state.mentions_items.clear();
+        self.sidebar_state.mentions_more.clear();
+        if accounts.is_empty() {
+            self.sidebar_state.mentions_loading = false;
+            return;
+        }
+        self.sidebar_state.mentions_loading = true;
+        let everyone = self.sidebar_state.mentions_everyone;
+        let roles = self.sidebar_state.mentions_roles;
+        cx.spawn(async move |this, cx| {
+            let (merged, more) = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut merged = Vec::new();
+                    let mut more = Vec::new();
+                    for account in accounts {
+                        let req = Request::Mentions {
+                            account: account.clone(),
+                            before: None,
+                            everyone,
+                            roles,
+                            space: None,
+                            limit: 25,
+                        };
+                        if let Ok(Response::Mentions { items, more: has_more, cursor }) = ask(&req) {
+                            if let Some(before) = mention_cursor(&items, has_more, cursor) {
+                                more.push((account, before));
+                            }
+                            merged.extend(items);
+                        }
+                    }
+                    merged.sort_by_key(|item| std::cmp::Reverse(item.sent));
+                    (merged, more)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.sidebar_state.mentions_epoch != epoch {
+                    return;
+                }
+                this.sidebar_state.mentions_loading = false;
+                this.sidebar_state.mentions_items = merged;
+                this.sidebar_state.mentions_more = more;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn load_more_mentions(&mut self, cx: &mut Context<Self>) {
+        let pending = std::mem::take(&mut self.sidebar_state.mentions_more);
+        if pending.is_empty() {
+            return;
+        }
+        let epoch = self.sidebar_state.mentions_epoch;
+        let everyone = self.sidebar_state.mentions_everyone;
+        let roles = self.sidebar_state.mentions_roles;
+        self.sidebar_state.mentions_loading = true;
+        cx.spawn(async move |this, cx| {
+            let (extra, next) = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut extra = Vec::new();
+                    let mut next = Vec::new();
+                    for (account, before) in pending {
+                        let req = Request::Mentions {
+                            account: account.clone(),
+                            before: Some(before.clone()),
+                            everyone,
+                            roles,
+                            space: None,
+                            limit: 25,
+                        };
+                        match ask(&req) {
+                            Ok(Response::Mentions { items, more, cursor }) => {
+                                if let Some(before) = mention_cursor(&items, more, cursor) {
+                                    next.push((account, before));
+                                }
+                                extra.extend(items);
+                            }
+                            _ => next.push((account, before)),
+                        }
+                    }
+                    (extra, next)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.sidebar_state.mentions_epoch != epoch {
+                    return;
+                }
+                this.sidebar_state.mentions_loading = false;
+                this.sidebar_state.mentions_items.extend(extra);
+                this.sidebar_state.mentions_items.sort_by_key(|item| std::cmp::Reverse(item.sent));
+                this.sidebar_state.mentions_more = next;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn open_mention_hit(&mut self, hit: protocol::MentionHit, cx: &mut Context<Self>) {
+        let title = if !hit.title.is_empty() {
+            hit.title.clone()
+        } else {
+            self.sidebar_state
+                .inbox
+                .all()
+                .iter()
+                .find(|c| c.key == hit.conversation)
+                .map(|c| c.title.clone())
+                .unwrap_or_else(|| hit.conversation.id.clone())
+        };
+        self.open_resolved_link(hit.conversation, Some(hit.message_id), &title, cx);
+        cx.notify();
+    }
+
+    pub(super) fn dismiss_mention_hit(&mut self, account: AccountKey, message_id: String, cx: &mut Context<Self>) {
+        let req = Request::DismissMention { account: account.clone(), message_id: message_id.clone() };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = this.update(cx, |this, cx| {
+                if matches!(answer, Ok(Response::Ok)) {
+                    this.sidebar_state.mentions_items.retain(|hit| {
+                        hit.conversation.account() != account || hit.message_id != message_id
+                    });
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(super) fn set_activity_filter(&mut self, kind: Option<protocol::ActivityItemKind>, cx: &mut Context<Self>) {
@@ -1034,6 +1487,10 @@ impl Shell {
                         state.muted_shown.insert(space);
                     }
                     (tree::Reveal::OptedOut, Some(space)) => {
+                        if space.network == Network::Discord {
+                            self.open_browse_channels(space, cx);
+                            return;
+                        }
                         state.opted_shown.insert(space);
                     }
                     (tree::Reveal::Threads(channel), _) => {
@@ -1215,20 +1672,32 @@ impl Shell {
         if row.key.network == Network::Discord && row.kind.is_direct() && matches!(&self.sidebar_state.mode, Mode::Space(space) if space.network == Network::Discord) {
             self.go(Mode::Network(Network::Discord), cx);
         }
-        if row.kind == ConversationKind::Forum && matches!(row.key.network, Network::Telegram | Network::Discord) {
+        if row.kind == ConversationKind::Forum && row.key.network == Network::Discord {
+            // The main pane is the post list. The sidebar still drills into the posts.
+            self.drill(home::Drill::Topics(Rc::new(row.clone())), cx);
+            self.select(row.key.clone(), &row.title, cx);
+            return;
+        }
+        if row.kind == ConversationKind::Forum && row.key.network == Network::Telegram {
             self.drill(home::Drill::Topics(Rc::new(row.clone())), cx);
             // The topics drill reads what the store holds; opening the forum asks once for
             // the landing. Telegram lists its topics only on demand, and lands on the newest
-            // unread topic, else General (`03` §2); Discord's posts came on the socket, so
-            // the ask is answered from the store and lands on the newest activity post
-            // (`01` §3, N14). The network catching up behind a later open cannot loop a
-            // change back into a request.
+            // unread topic, else General (`03` §2). The network catching up behind a later
+            // open cannot loop a change back into a request.
             let forum = row.key.clone();
             // Only this visit may choose the landing. Opening another forum (including this
             // same one again), picking a topic, or leaving the drill supersedes its reply.
             let navigation = self.sidebar_state.navigation;
             let requested_forum = forum.clone();
-            let landing = move || ask(&Request::Topics { forum, offset: 0, limit: 1, landing: true });
+            let landing = move || ask(&Request::Topics {
+                forum,
+                offset: 0,
+                limit: 1,
+                landing: true,
+                sort: protocol::TopicSort::Activity,
+                tag: None,
+                query: None,
+            });
             self.off_thread(cx, landing, move |this, answer, cx| {
                 let Ok(Response::Conversations { conversations, .. }) = answer else {
                     return;
@@ -1478,7 +1947,7 @@ impl Shell {
                 list_row(row_id("occupant", &occupant.person), height, false, false, content)
                     .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, _, cx| this.activate(ix, cx), cx))
             }
-            Row::Group { space, id, name, collapsed, rollup, depth, .. } => {
+            Row::Group { space, id, name, collapsed, muted, rollup, depth, .. } => {
                 let lit = *collapsed && (rollup.attention > 0 || rollup.unread);
                 let dot = rollup_badge(rollup.attention, rollup.unread).filter(|_| *collapsed);
                 let chevron = if *collapsed { "icons/chevron-right.svg" } else { "icons/chevron-down.svg" };
@@ -1486,6 +1955,10 @@ impl Shell {
                 let can_create = self.spaces.iter().any(|s| &s.key == space && s.can_create_channels);
                 let add_space = space.clone();
                 let add_group = id.clone();
+                let menu_space = space.clone();
+                let menu_id = id.clone();
+                let menu_name = name.clone();
+                let menu_muted = *muted;
                 let add_btn = can_create.then(|| {
                     div()
                         .id((gpui::ElementId::from("group-add"), id.clone()))
@@ -1516,6 +1989,23 @@ impl Shell {
                     .children(dot);
                 list_row((gpui::ElementId::from("group"), id.clone()), height, false, focused, content)
                     .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, _, cx| this.activate(ix, cx), cx))
+                    .when(space.network == Network::Discord, |row| {
+                        row.on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                this.open_menu(
+                                    Menu::Group {
+                                        space: menu_space.clone(),
+                                        id: menu_id.clone(),
+                                        name: menu_name.clone(),
+                                        muted: menu_muted,
+                                        at: event.position,
+                                    },
+                                    cx,
+                                );
+                            }),
+                        )
+                    })
             }
             Row::Conversation { conversation: c, depth } => self.place_row(c, *depth, focused, cx),
         }
@@ -1791,6 +2281,17 @@ impl Shell {
                 .on_click(cx.listener(|this, _, _, cx| this.up_level(cx)))
         };
         if let Some(drill) = &self.sidebar_state.drill {
+            let new_post = match drill {
+                home::Drill::Topics(forum) if matches!(forum.key.network, Network::Discord | Network::Telegram) && !forum.read_only => {
+                    let forum = Rc::clone(forum);
+                    Some(
+                        quiet(icon_button("new-post", "icons/plus.svg", false))
+                            .tooltip(tip("New post", None))
+                            .on_click(cx.listener(move |this, _, _, cx| this.begin_forum_post(&forum, cx))),
+                    )
+                }
+                _ => None,
+            };
             let title = match drill {
                 home::Drill::Unreads(_) => "All unreads".to_owned(),
                 home::Drill::Threads(_) => "Threads".to_owned(),
@@ -1799,7 +2300,9 @@ impl Shell {
                 home::Drill::Calls => "Calls".to_owned(),
                 home::Drill::Requests => "Message requests".to_owned(),
                 home::Drill::Topics(forum) => forum.title.clone(),
+                home::Drill::Discover => "Discover".to_owned(),
             };
+            let field = matches!(drill, home::Drill::Discover).then(|| self.sidebar_state.discover_input.clone()).flatten();
             let place = match drill {
                 home::Drill::Unreads(Some(space)) | home::Drill::Threads(space) | home::Drill::Drafts(space) => {
                     self.spaces.iter().find(|s| &s.key == space).map(|s| s.name.clone())
@@ -1810,7 +2313,22 @@ impl Shell {
                 .pl(px(10.))
                 .child(back("drill-up", "Back".into(), cx))
                 .child(pane_title(title))
-                .children(place.map(|place| div().flex_none().max_w(px(120.)).truncate().type_small().text_color(theme::text_faint()).child(place)));
+                .children(place.map(|place| div().flex_none().max_w(px(120.)).truncate().type_small().text_color(theme::text_faint()).child(place)))
+                .children(new_post)
+                .when_some(field, |strip, input| {
+                    strip.child(
+                        div()
+                            .w(px(180.))
+                            .flex_none()
+                            .px(px(8.))
+                            .py(px(4.))
+                            .rounded(px(theme::R_CONTROL))
+                            .bg(theme::canvas())
+                            .border_1()
+                            .border_color(theme::border())
+                            .child(input),
+                    )
+                });
         }
         match mode {
             Mode::Inbox => {
@@ -2235,7 +2753,329 @@ impl Shell {
         }
     }
 
-    /// Open the "Create channel…" modal for a Space (optionally inside a section/group).
+    pub(super) fn open_browse_channels(&mut self, space: Key, cx: &mut Context<Self>) {
+        let space_name = self
+            .spaces
+            .iter()
+            .find(|s| s.key == space)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "Server".to_owned());
+        let filter = cx.new(|cx| crate::gui::input::TextInput::new("Filter channels…", cx));
+        let initial: Vec<protocol::BrowsedChannel> = self
+            .trees
+            .get(&space)
+            .map(|tree| {
+                tree.conversations
+                    .iter()
+                    .filter(|c| c.kind != ConversationKind::Thread)
+                    .map(|c| protocol::BrowsedChannel {
+                        key: c.key.clone(),
+                        name: c.title.clone(),
+                        topic: c.topic.clone(),
+                        members: 0,
+                        joined: !c.opted_out,
+                        private: c.private,
+                        archived: false,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.sidebar_state.browse_channels = Some(BrowseChannelsModal {
+            space: space.clone(),
+            space_name,
+            filter,
+            loading: true,
+            error: None,
+            channels: initial,
+        });
+        cx.notify();
+        let req = Request::BrowseChannels {
+            space: space.clone(),
+            query: String::new(),
+            cursor: None,
+            limit: 200,
+        };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                let Some(modal) = this.sidebar_state.browse_channels.as_mut().filter(|m| m.space == space) else {
+                    return;
+                };
+                modal.loading = false;
+                match answer {
+                    Ok(Response::BrowsedChannels { channels, .. }) => {
+                        modal.channels = channels;
+                        modal.error = None;
+                    }
+                    Ok(Response::Error { detail, .. }) => modal.error = Some(detail),
+                    Ok(_) => modal.error = Some("Could not load channels.".to_owned()),
+                    Err(err) => modal.error = Some(err.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn toggle_follow_channel(&mut self, conversation: Key, on: bool, cx: &mut Context<Self>) {
+        if let Some(modal) = self.sidebar_state.browse_channels.as_mut() {
+            if let Some(ch) = modal.channels.iter_mut().find(|c| c.key == conversation) {
+                ch.joined = on;
+            }
+        }
+        cx.notify();
+        let revert_key = conversation.clone();
+        let req = Request::FollowChannel { conversation, on };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| match answer {
+                Ok(Response::Ok) => {}
+                Ok(Response::Error { detail, .. }) => {
+                    if let Some(modal) = this.sidebar_state.browse_channels.as_mut() {
+                        if let Some(ch) = modal.channels.iter_mut().find(|c| c.key == revert_key) {
+                            ch.joined = !on;
+                        }
+                    }
+                    this.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                    cx.notify();
+                }
+                _ => {
+                    if let Some(modal) = this.sidebar_state.browse_channels.as_mut() {
+                        if let Some(ch) = modal.channels.iter_mut().find(|c| c.key == revert_key) {
+                            ch.joined = !on;
+                        }
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn set_space_view(
+        &mut self,
+        space: Key,
+        show_all: Option<bool>,
+        hide_muted: Option<bool>,
+        cx: &mut Context<Self>,
+    ) {
+        let req = Request::SetSpaceView { space, show_all, hide_muted };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                if let Ok(Response::Error { detail, .. }) = answer {
+                    this.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                } else if let Err(err) = answer {
+                    this.toast(Some(("icons/circle-alert.svg", theme::danger())), err.to_string(), cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(in crate::gui) fn browse_channels_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let modal = self.sidebar_state.browse_channels.as_ref()?;
+        let space_row = self.spaces.iter().find(|s| s.key == modal.space);
+        let opt_in_on = space_row.is_some_and(|s| s.opt_in_channels);
+        let hide_muted = space_row.is_some_and(|s| s.hide_muted);
+        let needle = modal.filter.read(cx).text().trim().to_lowercase();
+        let tree = self.trees.get(&modal.space);
+
+        // Group viewable channels by their category in tree order.
+        let mut group_order: Vec<(Option<String>, String)> = vec![(None, "Channels".to_owned())];
+        if let Some(tree) = tree {
+            let mut groups: Vec<&protocol::Group> = tree.groups.iter().collect();
+            groups.sort_by_key(|g| g.position);
+            for g in groups {
+                group_order.push((Some(g.id.clone()), g.name.clone()));
+            }
+        }
+        let group_of = |key: &Key| -> Option<String> {
+            tree.and_then(|t| t.conversations.iter().find(|c| &c.key == key).and_then(|c| c.group.clone()))
+        };
+
+        let mut list = div()
+            .id("browse-channels-list")
+            .flex_1()
+            .min_h(px(120.))
+            .max_h(px(340.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(4.));
+
+        let mut any_shown = false;
+        for (cat_id, cat_name) in &group_order {
+            let matching: Vec<&protocol::BrowsedChannel> = modal
+                .channels
+                .iter()
+                .filter(|ch| {
+                    let in_cat = group_of(&ch.key) == *cat_id
+                        || (cat_id.is_none()
+                            && group_of(&ch.key)
+                                .as_ref()
+                                .is_none_or(|gid| !group_order.iter().any(|(id, _)| id.as_deref() == Some(gid.as_str()))));
+                    let matches_query = needle.is_empty()
+                        || ch.name.to_lowercase().contains(&needle)
+                        || ch.topic.to_lowercase().contains(&needle);
+                    in_cat && matches_query
+                })
+                .collect();
+            if matching.is_empty() {
+                continue;
+            }
+            any_shown = true;
+            if group_order.len() > 1 {
+                list = list.child(
+                    div()
+                        .pt(px(6.))
+                        .pb(px(2.))
+                        .type_micro()
+                        .text_color(theme::text_faint())
+                        .child(cat_name.clone()),
+                );
+            }
+            for (ix, ch) in matching.into_iter().enumerate() {
+                let key = ch.key.clone();
+                let following = ch.joined;
+                let row_key = SharedString::from(format!("browse-ch-{}-{ix}", ch.key.id));
+                list = list.child(
+                    div()
+                        .id(row_key)
+                        .px(px(8.))
+                        .py(px(6.))
+                        .rounded(px(theme::R_CONTROL))
+                        .hover(|s| s.bg(theme::hover()))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(glyph(
+                            if ch.private { "icons/lock.svg" } else { "icons/hash.svg" },
+                            14.,
+                            theme::text_soft(),
+                        ))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .child(div().min_w_0().truncate().type_ui().text_color(theme::text()).child(ch.name.clone()))
+                                .when(!ch.topic.is_empty(), |col| {
+                                    col.child(div().min_w_0().truncate().type_small().text_color(theme::text_faint()).child(ch.topic.clone()))
+                                }),
+                        )
+                        .child(
+                            button(
+                                SharedString::from(format!("browse-toggle-{}", ch.key.id)),
+                                if following { ButtonKind::Secondary } else { ButtonKind::Primary },
+                                if following { "Following" } else { "Follow" },
+                            )
+                            .h(px(26.))
+                            .px(px(10.))
+                            .type_small()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_follow_channel(key.clone(), !following, cx);
+                            })),
+                        ),
+                );
+            }
+        }
+        if !any_shown {
+            let msg = if modal.loading { "Loading channels…" } else { "No matching channels." };
+            list = list.child(div().py(px(20.)).type_small().text_color(theme::text_faint()).child(msg));
+        }
+
+        let space_all = modal.space.clone();
+        let space_muted = modal.space.clone();
+        let card = div()
+            .id("browse-channels-card")
+            .w(px(480.))
+            .max_w_full()
+            .p(px(16.))
+            .rounded(px(theme::R_FLOAT))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().type_title().text_color(theme::text()).child(format!("Browse channels · {}", modal.space_name)))
+                    .child(icon_button("browse-channels-close", "icons/x.svg", false).on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_state.browse_channels = None;
+                        cx.notify();
+                    }))),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        button(
+                            "browse-show-all",
+                            if !opt_in_on { ButtonKind::Primary } else { ButtonKind::Secondary },
+                            if !opt_in_on { "Showing all channels" } else { "Show all channels" },
+                        )
+                        .h(px(26.))
+                        .px(px(10.))
+                        .type_small()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_space_view(space_all.clone(), Some(opt_in_on), None, cx);
+                        })),
+                    )
+                    .child(
+                        button(
+                            "browse-hide-muted",
+                            if hide_muted { ButtonKind::Primary } else { ButtonKind::Secondary },
+                            if hide_muted { "Muted hidden" } else { "Hide muted channels" },
+                        )
+                        .h(px(26.))
+                        .px(px(10.))
+                        .type_small()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_space_view(space_muted.clone(), None, Some(!hide_muted), cx);
+                        })),
+                    ),
+            )
+            .child(
+                div()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::canvas())
+                    .border_1()
+                    .border_color(theme::border())
+                    .type_ui()
+                    .child(modal.filter.clone()),
+            )
+            .children(modal.error.as_ref().map(|err| div().type_small().text_color(theme::danger()).child(err.clone())))
+            .child(list);
+
+        Some(
+            div()
+                .id("browse-channels-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(gpui::rgba(0x0000_0066))
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.sidebar_state.browse_channels = None;
+                    cx.notify();
+                }))
+                .child(card),
+        )
+    }
+
+    /// Open the "Leave server" confirmation modal for a Space.
     pub(super) fn open_leave_space(&mut self, space: Key, name: String, cx: &mut Context<Self>) {
         self.sidebar_state.leave_space = Some((space, name));
         cx.notify();
@@ -2325,13 +3165,429 @@ impl Shell {
         )
     }
 
+    pub(in crate::gui) fn open_create_invite(&mut self, target: CreateInviteTarget, cx: &mut Context<Self>) {
+        self.sidebar_state.create_invite = Some(CreateInviteModal {
+            target,
+            max_age: 604_800,
+            max_uses: 0,
+            temporary: false,
+            url: None,
+            error: None,
+            busy: false,
+            sent: HashSet::new(),
+            epoch: 0,
+        });
+        self.generate_invite(cx);
+    }
+
+    fn generate_invite(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.sidebar_state.create_invite.as_mut() else {
+            return;
+        };
+        modal.epoch = modal.epoch.wrapping_add(1);
+        modal.busy = true;
+        modal.error = None;
+        modal.sent.clear();
+        let epoch = modal.epoch;
+        let req = match &modal.target {
+            CreateInviteTarget::Channel(key, _) => Request::CreateInviteLink {
+                conversation: Some(key.clone()),
+                space: None,
+                account: None,
+                max_age: modal.max_age,
+                max_uses: modal.max_uses,
+                temporary: modal.temporary,
+            },
+            CreateInviteTarget::Space(key, _) => Request::CreateInviteLink {
+                conversation: None,
+                space: Some(key.clone()),
+                account: None,
+                max_age: modal.max_age,
+                max_uses: modal.max_uses,
+                temporary: modal.temporary,
+            },
+            CreateInviteTarget::Friend(account) => Request::CreateInviteLink {
+                conversation: None,
+                space: None,
+                account: Some(account.clone()),
+                max_age: 0,
+                max_uses: 0,
+                temporary: false,
+            },
+        };
+        cx.notify();
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                let Some(modal) = this.sidebar_state.create_invite.as_mut() else {
+                    return;
+                };
+                if modal.epoch != epoch {
+                    return;
+                }
+                modal.busy = false;
+                match answer {
+                    Ok(Response::Link { url }) => {
+                        modal.url = Some(url);
+                        modal.error = None;
+                    }
+                    Ok(Response::Error { detail, .. }) => {
+                        modal.url = None;
+                        modal.error = Some(detail);
+                    }
+                    Ok(_) => {
+                        modal.url = None;
+                        modal.error = Some("Could not create invite link.".to_owned());
+                    }
+                    Err(err) => {
+                        modal.url = None;
+                        modal.error = Some(err.to_string());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn send_invite_to(&mut self, conversation: Key, title: String, cx: &mut Context<Self>) {
+        let Some(url) = self.sidebar_state.create_invite.as_ref().and_then(|m| m.url.clone()) else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        let req = Request::Send {
+            conversation: conversation.clone(),
+            client_id: format!("invite-{now}"),
+            text: url,
+            reply_to: None,
+            with: protocol::Outgoing::default(),
+        };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| match answer {
+                Ok(Response::Error { detail, .. }) => {
+                    this.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                }
+                Err(err) => {
+                    this.toast(Some(("icons/circle-alert.svg", theme::danger())), err.to_string(), cx);
+                }
+                Ok(_) => {
+                    if let Some(modal) = this.sidebar_state.create_invite.as_mut() {
+                        modal.sent.insert(conversation);
+                    }
+                    this.toast(Some(("icons/check.svg", theme::text_soft())), format!("Sent invite to {title}"), cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(in crate::gui) fn create_invite_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let modal = self.sidebar_state.create_invite.as_ref()?;
+        let (heading, is_friend) = match &modal.target {
+            CreateInviteTarget::Space(_, name) => (format!("Invite people to {name}"), false),
+            CreateInviteTarget::Channel(_, name) => (format!("Invite people to #{}", name.trim_start_matches('#')), false),
+            CreateInviteTarget::Friend(_) => ("Create friend invite".to_owned(), true),
+        };
+
+        let link_text = if modal.busy && modal.url.is_none() {
+            "Creating invite…".to_owned()
+        } else {
+            modal.url.clone().unwrap_or_else(|| "No invite link yet".to_owned())
+        };
+        let copy_url = modal.url.clone();
+
+        let mut card = div()
+            .id("create-invite-card")
+            .w(px(420.))
+            .max_w_full()
+            .p(px(16.))
+            .rounded(px(theme::R_FLOAT))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().type_title().text_color(theme::text()).child(heading))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .px(px(10.))
+                            .py(px(7.))
+                            .rounded(px(theme::R_CONTROL))
+                            .bg(theme::canvas())
+                            .border_1()
+                            .border_color(theme::border())
+                            .type_code()
+                            .text_color(if modal.url.is_some() { theme::text() } else { theme::text_soft() })
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(link_text),
+                    )
+                    .child(
+                        button("create-invite-copy", ButtonKind::Primary, "Copy").when_some(copy_url, |b, url| {
+                            b.on_click(cx.listener(move |this, _, _, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(url.clone()));
+                                this.toast(Some(("icons/check.svg", theme::text_soft())), "Invite link copied", cx);
+                            }))
+                        }),
+                    ),
+            );
+
+        if is_friend {
+            card = card.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .type_small()
+                            .text_color(theme::text_soft())
+                            .child("Anyone with this link can add you as a Discord friend."),
+                    )
+                    .child(
+                        button("create-invite-refresh", ButtonKind::Secondary, if modal.busy { "Creating…" } else { "New link" })
+                            .when(!modal.busy, |b| b.on_click(cx.listener(|this, _, _, cx| this.generate_invite(cx)))),
+                    ),
+            );
+        } else {
+            let ages: &[(u32, &str)] = &[
+                (1_800, "30m"),
+                (3_600, "1h"),
+                (21_600, "6h"),
+                (43_200, "12h"),
+                (86_400, "1d"),
+                (604_800, "7d"),
+                (0, "Never"),
+            ];
+            let mut age_row = div().flex().flex_wrap().items_center().gap(px(4.));
+            for &(secs, label) in ages {
+                let selected = modal.max_age == secs;
+                age_row = age_row.child(
+                    div()
+                        .id(("invite-age", secs as usize))
+                        .px(px(8.))
+                        .py(px(3.))
+                        .rounded(px(theme::R_CONTROL))
+                        .cursor_pointer()
+                        .type_small()
+                        .bg(if selected { theme::accent_soft() } else { theme::canvas() })
+                        .text_color(if selected { theme::accent_text() } else { theme::text_soft() })
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(m) = this.sidebar_state.create_invite.as_mut() {
+                                if m.max_age != secs {
+                                    m.max_age = secs;
+                                    this.generate_invite(cx);
+                                }
+                            }
+                        })),
+                );
+            }
+
+            let uses: &[(u32, &str)] = &[
+                (0, "Unlimited"),
+                (1, "1"),
+                (5, "5"),
+                (10, "10"),
+                (25, "25"),
+                (50, "50"),
+                (100, "100"),
+            ];
+            let mut uses_row = div().flex().flex_wrap().items_center().gap(px(4.));
+            for &(limit, label) in uses {
+                let selected = modal.max_uses == limit;
+                uses_row = uses_row.child(
+                    div()
+                        .id(("invite-uses", limit as usize))
+                        .px(px(8.))
+                        .py(px(3.))
+                        .rounded(px(theme::R_CONTROL))
+                        .cursor_pointer()
+                        .type_small()
+                        .bg(if selected { theme::accent_soft() } else { theme::canvas() })
+                        .text_color(if selected { theme::accent_text() } else { theme::text_soft() })
+                        .child(label)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(m) = this.sidebar_state.create_invite.as_mut() {
+                                if m.max_uses != limit {
+                                    m.max_uses = limit;
+                                    this.generate_invite(cx);
+                                }
+                            }
+                        })),
+                );
+            }
+
+            let temp = modal.temporary;
+            card = card
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .child(div().type_small().text_color(theme::text_soft()).child("Expire after"))
+                        .child(age_row),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .child(div().type_small().text_color(theme::text_soft()).child("Max uses"))
+                        .child(uses_row),
+                )
+                .child(
+                    div()
+                        .id("invite-temporary")
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(m) = this.sidebar_state.create_invite.as_mut() {
+                                m.temporary = !m.temporary;
+                                this.generate_invite(cx);
+                            }
+                        }))
+                        .child(
+                            div()
+                                .w(px(14.))
+                                .h(px(14.))
+                                .rounded(px(3.))
+                                .border_1()
+                                .border_color(if temp { theme::accent() } else { theme::border() })
+                                .bg(if temp { theme::accent() } else { theme::canvas() })
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .when(temp, |box_el| box_el.child(glyph("icons/check.svg", 10., theme::on_accent()))),
+                        )
+                        .child(div().type_small().text_color(theme::text()).child("Grant temporary membership")),
+                );
+        }
+
+        if modal.url.is_some() {
+            let mut seen = HashSet::new();
+            let mut targets: Vec<(Key, String)> = Vec::new();
+            for row in self.held_rows() {
+                if matches!(row.kind, ConversationKind::Direct | ConversationKind::Group | ConversationKind::Channel)
+                    && seen.insert(row.key.clone())
+                {
+                    targets.push((row.key.clone(), row.title.clone()));
+                    if targets.len() >= 5 {
+                        break;
+                    }
+                }
+            }
+            if !targets.is_empty() {
+                let mut list = div().flex().flex_col().gap(px(4.));
+                for (ix, (key, title)) in targets.into_iter().enumerate() {
+                    let already = modal.sent.contains(&key);
+                    let send_key = key.clone();
+                    let send_title = title.clone();
+                    list = list.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.))
+                            .px(px(8.))
+                            .py(px(4.))
+                            .rounded(px(theme::R_CONTROL))
+                            .bg(theme::canvas())
+                            .child(div().type_small().text_color(theme::text()).truncate().child(title))
+                            .child(
+                                button(
+                                    ("invite-send-to", ix),
+                                    if already { ButtonKind::Ghost } else { ButtonKind::Secondary },
+                                    if already { "Sent" } else { "Send" },
+                                )
+                                .when(!already, |b| {
+                                    b.on_click(cx.listener(move |this, _, _, cx| {
+                                        this.send_invite_to(send_key.clone(), send_title.clone(), cx);
+                                    }))
+                                }),
+                            ),
+                    );
+                }
+                card = card.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .child(div().type_small().text_color(theme::text_soft()).child("Send to…"))
+                        .child(list),
+                );
+            }
+        }
+
+        card = card
+            .children(modal.error.as_ref().map(|err| div().type_small().text_color(theme::danger()).child(err.clone())))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(button("create-invite-close", ButtonKind::Secondary, "Done").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.sidebar_state.create_invite = None;
+                            cx.notify();
+                        },
+                    ))),
+            );
+
+        Some(
+            div()
+                .id("create-invite-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(gpui::rgba(0x0000_0066))
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.sidebar_state.create_invite = None;
+                    cx.notify();
+                }))
+                .child(card),
+        )
+    }
+
     pub(super) fn open_join_server(&mut self, account: AccountKey, cx: &mut Context<Self>) {
-        let placeholder = if account.network == Network::Teams {
+        self.open_join_invite(account, None, cx);
+    }
+
+    pub(in crate::gui) fn open_join_invite(&mut self, account: AccountKey, link: Option<String>, cx: &mut Context<Self>) {
+        let placeholder = if account.network == Network::Telegram {
+            "t.me/+… or invite link"
+        } else if account.network == Network::Teams {
             "Team join code or link"
         } else {
             "discord.gg/… or invite code"
         };
-        let input = cx.new(|cx| crate::gui::input::TextInput::new(placeholder, cx));
+        let prefill = link.clone();
+        let input = cx.new(|cx| {
+            let mut field = crate::gui::input::TextInput::new(placeholder, cx);
+            if let Some(ref text) = prefill {
+                field.set_text(text, cx);
+            }
+            field
+        });
         self.sidebar_state.join_server = Some(JoinServerModal {
             account,
             input,
@@ -2339,7 +3595,41 @@ impl Shell {
             error: None,
             busy: false,
         });
-        cx.notify();
+        if link.is_some() {
+            self.preview_join_server(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Opens the Telegram invite join sheet for a clicked `t.me/+…` or `t.me/joinchat/…` link.
+    /// Returns `true` if a connected Telegram account was found to preview the invite.
+    pub(in crate::gui) fn open_telegram_invite(
+        &mut self,
+        preferred: Option<AccountKey>,
+        url: String,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let account = preferred
+            .filter(|k| {
+                self.snapshot
+                    .as_ref()
+                    .and_then(|s| s.account(k))
+                    .is_some_and(|a| a.link == Link::Connected)
+            })
+            .or_else(|| {
+                self.snapshot.as_ref().and_then(|s| {
+                    s.accounts
+                        .iter()
+                        .find(|a| a.key.network == Network::Telegram && a.link == Link::Connected)
+                        .map(|a| a.key.clone())
+                })
+            });
+        let Some(account) = account else {
+            return false;
+        };
+        self.open_join_invite(account, Some(url), cx);
+        true
     }
 
     fn preview_join_server(&mut self, cx: &mut Context<Self>) {
@@ -2359,7 +3649,7 @@ impl Shell {
         modal.error = None;
         let account = modal.account.clone();
         cx.notify();
-        let req = Request::InvitePreview { account, code };
+        let req = Request::InvitePreview { account, code, event_id: None };
         cx.spawn(async move |shell, cx| {
             let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
             let _ = shell.update(cx, |this, cx| {
@@ -2407,12 +3697,23 @@ impl Shell {
         cx.spawn(async move |shell, cx| {
             let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
             let _ = shell.update(cx, |this, cx| match answer {
-                Ok(Response::InviteJoined { space, .. }) => {
+                Ok(Response::InviteJoined { space, conversation, pending }) => {
                     this.sidebar_state.join_server = None;
-                    if let Some(space) = space {
+                    if pending {
+                        this.toast(
+                            Some(("icons/check.svg", theme::text_soft())),
+                            "Join request sent — waiting for admin approval",
+                            cx,
+                        );
+                    } else if let Some(conv) = conversation {
+                        this.open_now(conv, "", cx);
+                        this.toast(Some(("icons/check.svg", theme::text_soft())), "Joined chat", cx);
+                    } else if let Some(space) = space {
                         this.go(Mode::Space(space), cx);
+                        this.toast(Some(("icons/check.svg", theme::text_soft())), format!("Joined {noun}"), cx);
+                    } else {
+                        this.toast(Some(("icons/check.svg", theme::text_soft())), "Joined", cx);
                     }
-                    this.toast(Some(("icons/check.svg", theme::text_soft())), format!("Joined {noun}"), cx);
                     cx.notify();
                 }
                 Ok(Response::Error { detail, .. }) => {
@@ -2471,6 +3772,16 @@ impl Shell {
                     box_el.child(div().type_small().text_color(theme::text_soft()).child(meta.join(" · ")))
                 })
         });
+        let is_telegram = modal.account.network == Network::Telegram;
+        let request_needed = modal.preview.as_ref().is_some_and(|p| p.request_needed);
+        let title = if is_telegram { "Join Telegram chat" } else { modal_title };
+        let join_label = if modal.busy {
+            if request_needed { "Requesting…" } else { "Joining…" }
+        } else if request_needed {
+            "Request to join"
+        } else {
+            "Join"
+        };
         let card = div()
             .id("join-server-card")
             .w(px(380.))
@@ -2484,7 +3795,7 @@ impl Shell {
             .flex_col()
             .gap(px(10.))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(div().type_title().text_color(theme::text()).child(modal_title))
+            .child(div().type_title().text_color(theme::text()).child(title))
             .child(
                 div()
                     .px(px(8.))
@@ -2517,7 +3828,7 @@ impl Shell {
                         button(
                             "join-server-submit",
                             ButtonKind::Primary,
-                            if modal.busy { "Joining…" } else { "Join" },
+                            join_label,
                         )
                         .when(ready, |b| {
                             b.on_click(cx.listener(|this, _, _, cx| this.submit_join_server(cx)))
@@ -2541,12 +3852,969 @@ impl Shell {
         )
     }
 
+    pub(super) fn open_create_server(&mut self, account: AccountKey, cx: &mut Context<Self>) {
+        let name = cx.new(|cx| crate::gui::input::TextInput::new("Server name", cx));
+        self.sidebar_state.create_server = Some(CreateServerModal {
+            account,
+            name,
+            icon_path: None,
+            template: String::new(),
+            error: None,
+            busy: false,
+        });
+        cx.notify();
+    }
+
+    fn pick_create_server_icon(&mut self, cx: &mut Context<Self>) {
+        let asked = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose server picture".into()),
+        });
+        cx.spawn(async move |shell, cx| {
+            if let Ok(Ok(Some(paths))) = asked.await {
+                if let Some(path) = paths.into_iter().next() {
+                    let _ = shell.update(cx, |this, cx| {
+                        if let Some(modal) = this.sidebar_state.create_server.as_mut() {
+                            modal.icon_path = Some(path.to_string_lossy().into_owned());
+                            modal.error = None;
+                            cx.notify();
+                        }
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn submit_create_server(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.sidebar_state.create_server.as_mut() else {
+            return;
+        };
+        if modal.busy {
+            return;
+        }
+        let name = modal.name.read(cx).text().trim().to_owned();
+        if !(2..=100).contains(&name.chars().count()) {
+            modal.error = Some("Server name must be between 2 and 100 characters.".to_owned());
+            cx.notify();
+            return;
+        }
+        modal.busy = true;
+        modal.error = None;
+        let account = modal.account.clone();
+        let icon = modal.icon_path.clone();
+        let template = (!modal.template.is_empty()).then(|| modal.template.clone());
+        cx.notify();
+        let req = Request::CreateSpace { account, name, icon, template };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| match answer {
+                Ok(Response::SpaceCreated { space, .. }) => {
+                    this.sidebar_state.create_server = None;
+                    this.go(Mode::Space(space), cx);
+                    this.toast(Some(("icons/check.svg", theme::text_soft())), "Server created", cx);
+                    cx.notify();
+                }
+                Ok(Response::Error { detail, .. }) => {
+                    if let Some(modal) = this.sidebar_state.create_server.as_mut() {
+                        modal.busy = false;
+                        modal.error = Some(detail);
+                    }
+                    cx.notify();
+                }
+                Ok(_) => {
+                    if let Some(modal) = this.sidebar_state.create_server.as_mut() {
+                        modal.busy = false;
+                        modal.error = Some("Could not create server.".to_owned());
+                    }
+                    cx.notify();
+                }
+                Err(err) => {
+                    if let Some(modal) = this.sidebar_state.create_server.as_mut() {
+                        modal.busy = false;
+                        modal.error = Some(err.to_string());
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(in crate::gui) fn create_server_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let modal = self.sidebar_state.create_server.as_ref()?;
+        let trimmed = modal.name.read(cx).text().trim().chars().count();
+        let ready = (2..=100).contains(&trimmed) && !modal.busy;
+        let icon_label = modal
+            .icon_path
+            .as_deref()
+            .and_then(|p| std::path::Path::new(p).file_name())
+            .map(|n| n.to_string_lossy().into_owned());
+        let templates = [
+            ("", "Blank"),
+            ("gaming", "Gaming"),
+            ("study", "Study Group"),
+            ("friends", "Friends"),
+            ("community", "Community"),
+        ];
+        let mut template_bar = div().flex().flex_wrap().gap(px(6.));
+        for (ix, (id, label)) in templates.into_iter().enumerate() {
+            let selected = modal.template == id;
+            let value = id.to_owned();
+            template_bar = template_bar.child(
+                segment(("create-server-tpl", ix), label, selected)
+                    .px(px(8.))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(modal) = this.sidebar_state.create_server.as_mut() {
+                            modal.template = value.clone();
+                            cx.notify();
+                        }
+                    })),
+            );
+        }
+        let icon_row = div()
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .child(
+                button("create-server-icon", ButtonKind::Secondary, "Choose picture…").on_click(
+                    cx.listener(|this, _, _, cx| this.pick_create_server_icon(cx)),
+                ),
+            )
+            .children(icon_label.map(|name| {
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .type_small()
+                    .text_color(theme::text_soft())
+                    .child(name)
+            }))
+            .when(modal.icon_path.is_some(), |row| {
+                row.child(button("create-server-icon-clear", ButtonKind::Ghost, "Clear").on_click(
+                    cx.listener(|this, _, _, cx| {
+                        if let Some(modal) = this.sidebar_state.create_server.as_mut() {
+                            modal.icon_path = None;
+                            cx.notify();
+                        }
+                    }),
+                ))
+            });
+        let card = div()
+            .id("create-server-card")
+            .w(px(400.))
+            .max_w_full()
+            .p(px(16.))
+            .rounded(px(theme::R_FLOAT))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().type_title().text_color(theme::text()).child("Create a server"))
+            .child(div().type_small().text_color(theme::text_soft()).child("Name"))
+            .child(
+                div()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::canvas())
+                    .border_1()
+                    .border_color(theme::border())
+                    .type_ui()
+                    .child(modal.name.clone()),
+            )
+            .child(div().type_small().text_color(theme::text_soft()).child("Picture (optional)"))
+            .child(icon_row)
+            .child(div().type_small().text_color(theme::text_soft()).child("Template"))
+            .child(template_bar)
+            .children(modal.error.as_ref().map(|err| div().type_small().text_color(theme::danger()).child(err.clone())))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(button("create-server-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_state.create_server = None;
+                        cx.notify();
+                    })))
+                    .child(
+                        button(
+                            "create-server-submit",
+                            ButtonKind::Primary,
+                            if modal.busy { "Creating…" } else { "Create" },
+                        )
+                        .when(ready, |b| {
+                            b.on_click(cx.listener(|this, _, _, cx| this.submit_create_server(cx)))
+                        }),
+                    ),
+            );
+        Some(
+            div()
+                .id("create-server-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(gpui::rgba(0x0000_0066))
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.sidebar_state.create_server = None;
+                    cx.notify();
+                }))
+                .child(card),
+        )
+    }
+
+    pub(in crate::gui) fn load_space_events(&mut self, space: Key, cx: &mut Context<Self>) {
+        let req = Request::Events { space: space.clone() };
+        self.off_thread(cx, move || ask(&req), move |this, answer, cx| {
+            if let Ok(Response::Events { space, events }) = answer {
+                this.sidebar_state.space_events.insert(space, events);
+                cx.notify();
+            }
+        });
+    }
+
+    pub(in crate::gui) fn open_space_events(&mut self, space: Key, cx: &mut Context<Self>) {
+        self.sidebar_state.events_modal = Some(EventsModal {
+            space: space.clone(),
+            error: None,
+            busy_event: None,
+        });
+        self.load_space_events(space, cx);
+        cx.notify();
+    }
+
+    fn toggle_event_interest(&mut self, space: Key, event: Key, on: bool, cx: &mut Context<Self>) {
+        if let Some(modal) = self.sidebar_state.events_modal.as_mut() {
+            if modal.busy_event.is_some() {
+                return;
+            }
+            modal.busy_event = Some(event.id.clone());
+            modal.error = None;
+        }
+        cx.notify();
+        let req = Request::EventInterest {
+            space: space.clone(),
+            event: event.clone(),
+            on,
+        };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| {
+                if let Some(modal) = this.sidebar_state.events_modal.as_mut() {
+                    modal.busy_event = None;
+                }
+                match answer {
+                    Ok(Response::Ok) => {
+                        if let Some(list) = this.sidebar_state.space_events.get_mut(&space) {
+                            if let Some(ev) = list.iter_mut().find(|e| e.key == event) {
+                                if ev.interested != on {
+                                    ev.interested = on;
+                                    ev.count = if on { ev.count.saturating_add(1) } else { ev.count.saturating_sub(1) };
+                                }
+                            }
+                        }
+                    }
+                    Ok(Response::Error { detail, .. }) => {
+                        if let Some(modal) = this.sidebar_state.events_modal.as_mut() {
+                            modal.error = Some(detail);
+                        }
+                    }
+                    Err(err) => {
+                        if let Some(modal) = this.sidebar_state.events_modal.as_mut() {
+                            modal.error = Some(err.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn join_space_event(&mut self, event: &protocol::SpaceEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match event.place_kind {
+            protocol::EventPlaceKind::Voice => {
+                if let Some(conv) = &event.conversation {
+                    self.call_start(conv.clone(), cx);
+                }
+            }
+            protocol::EventPlaceKind::Stage => {
+                if let Some(conv) = &event.conversation {
+                    self.call_handoff(conv.clone(), cx);
+                }
+            }
+            protocol::EventPlaceKind::External => {
+                if !event.place.is_empty() {
+                    self.open_external_url(&event.place, window, cx);
+                }
+            }
+        }
+    }
+
+    fn space_events_strip(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let Mode::Space(space) = &self.sidebar_state.mode else {
+            return None;
+        };
+        if space.network != Network::Discord {
+            return None;
+        }
+        let events = self.sidebar_state.space_events.get(space)?;
+        if events.is_empty() {
+            return None;
+        }
+        let live = events.iter().find(|e| e.status == protocol::EventStatus::Active).cloned();
+        let count = events.len();
+        let open_key = space.clone();
+        let mut strip = div()
+            .flex_none()
+            .px(px(theme::INSET))
+            .pb(px(6.))
+            .flex()
+            .flex_col()
+            .gap(px(4.));
+        if let Some(active) = live {
+            let can_join = active.conversation.is_some()
+                || (active.place_kind == protocol::EventPlaceKind::External
+                    && protocol::link::Destination::parse(&active.place).is_some());
+            let join_event = active.clone();
+            let place = active.place.clone();
+            strip = strip.child(
+                div()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::raised())
+                    .border_1()
+                    .border_color(theme::border())
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(div().size(px(8.)).flex_none().rounded(px(4.)).bg(theme::online()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(div().min_w_0().truncate().type_small().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(active.name))
+                            .when(!place.is_empty(), |col| {
+                                col.child(div().min_w_0().truncate().type_micro().text_color(theme::text_soft()).child(place))
+                            }),
+                    )
+                    .when(can_join, |row| {
+                        row.child(
+                            button("space-live-event-join", ButtonKind::Primary, "Join")
+                                .h(px(22.))
+                                .px(px(8.))
+                                .type_small()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.join_space_event(&join_event, window, cx);
+                                })),
+                        )
+                    }),
+            );
+        }
+        strip = strip.child(
+            div()
+                .id("space-events-row")
+                .h(px(28.))
+                .px(px(8.))
+                .rounded(px(theme::R_CONTROL))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::hover()))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .on_click(cx.listener(move |this, _, _, cx| this.open_space_events(open_key.clone(), cx)))
+                .child(glyph("icons/calendar.svg", 15., theme::text_soft()))
+                .child(div().flex_1().type_ui().text_color(theme::text()).child("Events"))
+                .child(
+                    div()
+                        .type_small()
+                        .text_color(theme::text_soft())
+                        .child(count.to_string()),
+                ),
+        );
+        Some(strip)
+    }
+
+    pub(in crate::gui) fn events_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let modal = self.sidebar_state.events_modal.as_ref()?;
+        let space = modal.space.clone();
+        let space_name = self
+            .spaces
+            .iter()
+            .find(|s| s.key == space)
+            .map(|s| s.name.clone())
+            .unwrap_or_else(|| "Server".to_owned());
+        let events = self.sidebar_state.space_events.get(&space).cloned().unwrap_or_default();
+        let now = crate::view::now();
+        let mut list = div()
+            .id("space-events-list")
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .max_h(px(420.))
+            .overflow_y_scroll();
+        if events.is_empty() {
+            list = list.child(div().py(px(16.)).type_ui().text_color(theme::text_soft()).child("No upcoming events."));
+        } else {
+            for (ix, ev) in events.into_iter().enumerate() {
+                let is_live = ev.status == protocol::EventStatus::Active;
+                let when_line = if is_live {
+                    "Live now".to_owned()
+                } else if ev.start > 0 {
+                    format!("{} · {}", super::time::day(now, ev.start), super::time::clock(ev.start))
+                } else {
+                    "Scheduled".to_owned()
+                };
+                let cover = ev
+                    .cover
+                    .as_ref()
+                    .and_then(|file| self.people_state.hub().file(&ev.key.account(), file, cx).path)
+                    .map(std::path::PathBuf::from);
+                let interested = ev.interested;
+                let busy = modal.busy_event.as_deref() == Some(ev.key.id.as_str());
+                let toggle_space = space.clone();
+                let toggle_event = ev.key.clone();
+                let can_join = is_live
+                    && (ev.conversation.is_some()
+                        || (ev.place_kind == protocol::EventPlaceKind::External
+                            && protocol::link::Destination::parse(&ev.place).is_some()));
+                let join_event = ev.clone();
+                let count_text = if ev.count == 1 {
+                    "1 interested".to_owned()
+                } else {
+                    format!("{} interested", ev.count)
+                };
+                let mut item = div()
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::canvas())
+                    .border_1()
+                    .border_color(theme::border())
+                    .overflow_hidden()
+                    .flex()
+                    .flex_col();
+                if let Some(path) = cover {
+                    item = item.child(
+                        div()
+                            .w_full()
+                            .h(px(112.))
+                            .overflow_hidden()
+                            .bg(theme::raised())
+                            .child(gpui::img(path).size_full().object_fit(gpui::ObjectFit::Cover)),
+                    );
+                }
+                let mut inner = div()
+                    .p(px(10.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .when(is_live, |row| row.child(div().size(px(8.)).rounded(px(4.)).bg(theme::online())))
+                            .child(div().type_small().text_color(if is_live { theme::online() } else { theme::text_soft() }).child(when_line)),
+                    )
+                    .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(ev.name.clone()));
+                if !ev.description.trim().is_empty() {
+                    inner = inner.child(div().type_small().text_color(theme::text_soft()).line_clamp(3).child(ev.description.trim().to_owned()));
+                }
+                if !ev.place.is_empty() {
+                    let place_icon = match ev.place_kind {
+                        protocol::EventPlaceKind::Voice => "icons/volume-2.svg",
+                        protocol::EventPlaceKind::Stage => "icons/radio.svg",
+                        protocol::EventPlaceKind::External => "icons/external-link.svg",
+                    };
+                    inner = inner.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(5.))
+                            .type_small()
+                            .text_color(theme::text_soft())
+                            .child(glyph(place_icon, 13., theme::text_faint()))
+                            .child(div().min_w_0().truncate().child(ev.place.clone())),
+                    );
+                }
+                inner = inner.child(
+                    div()
+                        .mt(px(4.))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.))
+                        .child(div().type_small().text_color(theme::text_faint()).child(count_text))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(
+                                    button(
+                                        ("event-interest", ix),
+                                        if interested { ButtonKind::Primary } else { ButtonKind::Secondary },
+                                        if interested { "Interested" } else { "Mark interested" },
+                                    )
+                                    .h(px(26.))
+                                    .px(px(10.))
+                                    .type_small()
+                                    .when(!busy, |b| {
+                                        b.on_click(cx.listener(move |this, _, _, cx| {
+                                            this.toggle_event_interest(
+                                                toggle_space.clone(),
+                                                toggle_event.clone(),
+                                                !interested,
+                                                cx,
+                                            );
+                                        }))
+                                    }),
+                                )
+                                .when(can_join, |bar| {
+                                    bar.child(
+                                        button(("event-join", ix), ButtonKind::Primary, "Join")
+                                            .h(px(26.))
+                                            .px(px(10.))
+                                            .type_small()
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.sidebar_state.events_modal = None;
+                                                this.join_space_event(&join_event, window, cx);
+                                                cx.notify();
+                                            })),
+                                    )
+                                }),
+                        ),
+                );
+                item = item.child(inner);
+                list = list.child(item);
+            }
+        }
+        let card = div()
+            .id("space-events-card")
+            .w(px(440.))
+            .max_w_full()
+            .p(px(16.))
+            .rounded(px(theme::R_FLOAT))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().type_title().text_color(theme::text()).child(format!("{space_name} · Events")))
+                    .child(icon_button("space-events-close", "icons/x.svg", false).on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_state.events_modal = None;
+                        cx.notify();
+                    }))),
+            )
+            .children(modal.error.as_ref().map(|err| div().type_small().text_color(theme::danger()).child(err.clone())))
+            .child(list);
+        Some(
+            div()
+                .id("space-events-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(gpui::rgba(0x0000_0066))
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.sidebar_state.events_modal = None;
+                    cx.notify();
+                }))
+                .child(card),
+        )
+    }
+
+    pub(super) fn open_server_gate(&mut self, space: Key, cx: &mut Context<Self>) {
+        if space.network != Network::Discord {
+            return;
+        }
+        self.sidebar_state.server_gate = Some(ServerGate {
+            space: space.clone(),
+            loaded: false,
+            gate: None,
+            agreed: Vec::new(),
+            choice: Vec::new(),
+            texts: Vec::new(),
+            picked: Vec::new(),
+            error: None,
+            busy: true,
+        });
+        cx.notify();
+        self.off_thread(cx, move || ask(&Request::SpaceGate { space }), |this, answer, cx| {
+            this.install_gate_answer(answer, cx);
+        });
+    }
+
+    fn install_gate_answer(&mut self, answer: std::io::Result<Response>, cx: &mut Context<Self>) {
+        {
+            let Some(modal) = self.sidebar_state.server_gate.as_mut() else {
+                return;
+            };
+            modal.busy = false;
+            modal.loaded = true;
+        }
+        match answer {
+            Ok(Response::SpaceGate { gate, .. }) => self.install_gate(gate, cx),
+            Ok(Response::Error { detail, .. }) => {
+                if let Some(modal) = self.sidebar_state.server_gate.as_mut() {
+                    modal.error = Some(detail);
+                }
+            }
+            Ok(_) => {
+                if let Some(modal) = self.sidebar_state.server_gate.as_mut() {
+                    modal.error = Some("Could not load this server's setup.".to_owned());
+                }
+            }
+            Err(err) => {
+                if let Some(modal) = self.sidebar_state.server_gate.as_mut() {
+                    modal.error = Some(err.to_string());
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn install_gate(&mut self, mut gate: protocol::SpaceGate, cx: &mut Context<Self>) {
+        if gate.prompts.is_empty() {
+            if let Some(old) = self.sidebar_state.server_gate.as_ref().and_then(|modal| modal.gate.as_ref()) {
+                gate.prompts = old.prompts.clone();
+            }
+        }
+        let same = self.sidebar_state.server_gate.as_ref().is_some_and(|modal| {
+            modal.gate.as_ref().is_some_and(|old| {
+                old.fields.len() == gate.fields.len() && old.fields.iter().zip(&gate.fields).all(|(left, right)| left.kind == right.kind)
+            })
+        });
+        let texts = if same {
+            None
+        } else {
+            Some(
+                gate.fields
+                    .iter()
+                    .map(|field| {
+                        matches!(field.kind.as_str(), "TEXT_INPUT" | "PARAGRAPH").then(|| {
+                            let hint = if field.kind == "PARAGRAPH" { "Write a paragraph" } else { "Write an answer" };
+                            cx.new(|cx| crate::gui::input::TextInput::new(hint, cx))
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let Some(modal) = self.sidebar_state.server_gate.as_mut() else {
+            return;
+        };
+        if let Some(texts) = texts {
+            modal.agreed = vec![false; gate.fields.len()];
+            modal.choice = vec![None; gate.fields.len()];
+            modal.texts = texts;
+        }
+        modal.gate = Some(gate);
+        modal.loaded = true;
+        modal.busy = false;
+        modal.error = None;
+    }
+
+    fn accept_server_rules(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.sidebar_state.server_gate.as_mut() else {
+            return;
+        };
+        if modal.busy {
+            return;
+        }
+        let Some(gate) = modal.gate.as_ref() else {
+            return;
+        };
+        if gate.fields.is_empty() {
+            return;
+        }
+        let answers = gate
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(index, field)| match field.kind.as_str() {
+                "TERMS" => {
+                    if modal.agreed.get(index).copied().unwrap_or(false) {
+                        "true".to_owned()
+                    } else {
+                        "false".to_owned()
+                    }
+                }
+                "MULTIPLE_CHOICE" => modal.choice.get(index).and_then(|choice| *choice).map(|choice| choice.to_string()).unwrap_or_default(),
+                "TEXT_INPUT" | "PARAGRAPH" => modal
+                    .texts
+                    .get(index)
+                    .and_then(|input| input.as_ref())
+                    .map(|input| input.read(cx).text().to_string())
+                    .unwrap_or_default(),
+                _ => String::new(),
+            })
+            .collect::<Vec<_>>();
+        let space = modal.space.clone();
+        modal.busy = true;
+        modal.error = None;
+        cx.notify();
+        self.off_thread(cx, move || ask(&Request::AcceptRules { space, answers }), |this, answer, cx| {
+            match answer {
+                Ok(Response::SpaceGate { gate, .. }) => {
+                    let pending = gate.pending;
+                    this.install_gate(gate, cx);
+                    if !pending {
+                        this.toast(Some(("icons/check.svg", theme::text_soft())), "Rules accepted", cx);
+                    }
+                }
+                other => this.install_gate_answer(other, cx),
+            }
+            cx.notify();
+        });
+    }
+
+    fn submit_server_onboarding(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.sidebar_state.server_gate.as_mut() else {
+            return;
+        };
+        if modal.busy {
+            return;
+        }
+        let space = modal.space.clone();
+        let options = modal.picked.clone();
+        modal.busy = true;
+        modal.error = None;
+        cx.notify();
+        self.off_thread(cx, move || ask(&Request::SubmitOnboarding { space, options }), |this, answer, cx| {
+            let finished = matches!(answer, Ok(Response::Ok));
+            if let Some(modal) = this.sidebar_state.server_gate.as_mut() {
+                modal.busy = false;
+                match answer {
+                    Ok(Response::Ok) => modal.error = None,
+                    Ok(Response::Error { detail, .. }) => modal.error = Some(detail),
+                    Ok(_) => modal.error = Some("Could not finish setup.".to_owned()),
+                    Err(err) => modal.error = Some(err.to_string()),
+                }
+            }
+            if finished {
+                this.toast(Some(("icons/check.svg", theme::text_soft())), "Setup finished", cx);
+            }
+            cx.notify();
+        });
+    }
+
+    pub(in crate::gui) fn server_gate_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let modal = self.sidebar_state.server_gate.as_ref()?;
+        let gate = modal.gate.clone();
+        let busy = modal.busy;
+        let loaded = modal.loaded;
+        let error = modal.error.clone();
+        let agreed = modal.agreed.clone();
+        let choice = modal.choice.clone();
+        let texts = modal.texts.clone();
+        let picked = modal.picked.clone();
+        let body = match &gate {
+            None if !loaded => div().type_ui().text_color(theme::text_soft()).child("Loading server setup…"),
+            None => div().type_ui().text_color(theme::text_soft()).child("Nothing to finish on this server."),
+            Some(gate) if gate.fields.is_empty() && gate.prompts.is_empty() && gate.description.is_empty() && gate.reason.is_empty() => {
+                div().type_ui().text_color(theme::text_soft()).child("Nothing to finish on this server.")
+            }
+            Some(gate) => {
+                let mut column = div().flex().flex_col().gap(px(8.));
+                if !gate.reason.is_empty() {
+                    column = column.child(div().type_ui().text_color(theme::text()).child(gate.reason.clone()));
+                }
+                if !gate.description.is_empty() {
+                    column = column.child(div().type_small().text_color(theme::text_soft()).child(gate.description.clone()));
+                }
+                if gate.manual {
+                    column = column.child(div().type_small().text_color(theme::text_soft()).child("A moderator still has to approve you."));
+                }
+                for (index, field) in gate.fields.iter().take(5).enumerate() {
+                    let mut row = div().flex().flex_col().gap(px(4.));
+                    if !field.label.is_empty() {
+                        row = row.child(div().type_ui().text_color(theme::text()).child(field.label.clone()));
+                    }
+                    if !field.values.is_empty() {
+                        row = row.child(div().type_small().text_color(theme::text_soft()).child(field.values.join("\n")));
+                    }
+                    match field.kind.as_str() {
+                        "TERMS" => {
+                            let on = agreed.get(index).copied().unwrap_or(false);
+                            row = row.child(
+                                button(SharedString::from(format!("gate-terms-{index}")), ButtonKind::Secondary, if on { "Agreed" } else { "Agree" })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(modal) = this.sidebar_state.server_gate.as_mut() {
+                                            if let Some(flag) = modal.agreed.get_mut(index) {
+                                                *flag = !*flag;
+                                            }
+                                        }
+                                        cx.notify();
+                                    })),
+                            );
+                        }
+                        "MULTIPLE_CHOICE" => {
+                            let chosen = choice.get(index).copied().flatten();
+                            for (choice_index, label) in field.choices.iter().enumerate() {
+                                let on = chosen == Some(choice_index as u32);
+                                let words = if on { format!("Selected: {label}") } else { label.clone() };
+                                row = row.child(
+                                    button(SharedString::from(format!("gate-choice-{index}-{choice_index}")), ButtonKind::Secondary, words).on_click(
+                                        cx.listener(move |this, _, _, cx| {
+                                            if let Some(modal) = this.sidebar_state.server_gate.as_mut() {
+                                                if let Some(slot) = modal.choice.get_mut(index) {
+                                                    *slot = Some(choice_index as u32);
+                                                }
+                                            }
+                                            cx.notify();
+                                        }),
+                                    ),
+                                );
+                            }
+                        }
+                        "TEXT_INPUT" | "PARAGRAPH" => {
+                            if let Some(input) = texts.get(index).and_then(|input| input.clone()) {
+                                row = row.child(
+                                    div()
+                                        .px(px(8.))
+                                        .py(px(6.))
+                                        .rounded(px(theme::R_CONTROL))
+                                        .bg(theme::canvas())
+                                        .border_1()
+                                        .border_color(theme::border())
+                                        .child(input),
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                    column = column.child(row);
+                }
+                for prompt in &gate.prompts {
+                    let mut block = div().flex().flex_col().gap(px(4.));
+                    if !prompt.label.is_empty() {
+                        block = block.child(div().type_ui().text_color(theme::text()).child(prompt.label.clone()));
+                    }
+                    for option in &prompt.options {
+                        let on = picked.iter().any(|id| id == &option.id);
+                        let id = option.id.clone();
+                        let words = if on { format!("Selected: {}", option.label) } else { option.label.clone() };
+                        block = block.child(
+                            button(SharedString::from(format!("gate-option-{}", option.id)), ButtonKind::Secondary, words).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    if let Some(modal) = this.sidebar_state.server_gate.as_mut() {
+                                        if let Some(place) = modal.picked.iter().position(|kept| kept == &id) {
+                                            modal.picked.remove(place);
+                                        } else {
+                                            modal.picked.push(id.clone());
+                                        }
+                                    }
+                                    cx.notify();
+                                }),
+                            ),
+                        );
+                    }
+                    column = column.child(block);
+                }
+                column
+            }
+        };
+        let has_fields = gate.as_ref().is_some_and(|gate| !gate.fields.is_empty());
+        let has_prompts = gate.as_ref().is_some_and(|gate| !gate.prompts.is_empty());
+        let external = gate.as_ref().is_some_and(|gate| gate.external == DISCORD_APP);
+        let card = div()
+            .id("server-gate-card")
+            .w(px(420.))
+            .max_w_full()
+            .max_h(px(560.))
+            .p(px(16.))
+            .rounded(px(theme::R_FLOAT))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .overflow_y_scroll()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().type_title().text_color(theme::text()).child("Server setup"))
+            .child(body)
+            .children(error.map(|err| div().type_small().text_color(theme::danger()).child(err)))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(8.))
+                    .flex_wrap()
+                    .child(button("server-gate-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_state.server_gate = None;
+                        cx.notify();
+                    })))
+                    .when(external, |row| {
+                        row.child(button("server-gate-discord", ButtonKind::Secondary, "Open Discord").on_click(cx.listener(
+                            |this, _, window, cx| {
+                                this.open_external_link(DISCORD_APP, window, cx);
+                            },
+                        )))
+                    })
+                    .when(has_fields, |row| {
+                        row.child(
+                            button("server-gate-accept", ButtonKind::Primary, if busy { "Sending…" } else { "Accept the rules" }).when(!busy, |button| {
+                                button.on_click(cx.listener(|this, _, _, cx| this.accept_server_rules(cx)))
+                            }),
+                        )
+                    })
+                    .when(has_prompts, |row| {
+                        row.child(
+                            button("server-gate-finish", ButtonKind::Primary, if busy { "Sending…" } else { "Finish setup" }).when(!busy, |button| {
+                                button.on_click(cx.listener(|this, _, _, cx| this.submit_server_onboarding(cx)))
+                            }),
+                        )
+                    }),
+            );
+        Some(
+            div()
+                .id("server-gate-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(gpui::rgba(0x0000_0066))
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.sidebar_state.server_gate = None;
+                    cx.notify();
+                }))
+                .child(card),
+        )
+    }
+
     pub(super) fn open_create_channel(&mut self, space: Key, group: Option<String>, cx: &mut Context<Self>) {
-        let name = cx.new(|cx| crate::gui::input::TextInput::new("channel-name", cx));
+        let placeholder = if space.network == Network::Telegram { "Channel name" } else { "channel-name" };
+        let name = cx.new(|cx| crate::gui::input::TextInput::new(placeholder, cx));
+        let description = cx.new(|cx| crate::gui::input::TextInput::new("Description (optional)", cx));
+        let username = cx.new(|cx| crate::gui::input::TextInput::new("@public_link (optional)", cx));
         self.sidebar_state.create_channel = Some(CreateChannelModal {
             space,
             group,
             name,
+            description,
+            username,
             kind: ConversationKind::Channel,
             private: false,
         });
@@ -2562,6 +4830,16 @@ impl Shell {
             self.sidebar_state.create_channel = Some(modal);
             return;
         }
+        let description = {
+            let d = modal.description.read(cx).text().trim().to_owned();
+            (!d.is_empty()).then_some(d)
+        };
+        let username = if modal.private {
+            None
+        } else {
+            let u = modal.username.read(cx).text().trim().to_owned();
+            (!u.is_empty()).then_some(u)
+        };
         cx.notify();
         let req = Request::CreateChannel {
             space: modal.space,
@@ -2569,6 +4847,8 @@ impl Shell {
             kind: modal.kind,
             private: modal.private,
             group: modal.group,
+            description,
+            username,
         };
         cx.spawn(async move |shell, cx| {
             let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
@@ -2583,11 +4863,199 @@ impl Shell {
         .detach();
     }
 
+    /// Asks the forum's posting rules, then opens the shared New post form. A network that
+    /// cannot describe a forum yet (Telegram, until it answers) still gets the empty form.
+    fn begin_forum_post(&mut self, forum: &Conversation, cx: &mut Context<Self>) {
+        if forum.read_only || !matches!(forum.key.network, Network::Discord | Network::Telegram) {
+            return;
+        }
+        let key = forum.key.clone();
+        cx.spawn(async move |shell, cx| {
+            let asked = key.clone();
+            let req = Request::ForumInfo { forum: key };
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| match answer {
+                Ok(Response::ForumInfo { info }) => this.show_forum_post(info, cx),
+                Ok(Response::Error { code: protocol::ErrorCode::Unsupported, .. }) => this.show_forum_post(
+                    protocol::ForumInfo {
+                        forum: asked,
+                        guidelines: String::new(),
+                        tags: Vec::new(),
+                        require_tag: false,
+                        media: false,
+                        default_slowmode: 0,
+                    },
+                    cx,
+                ),
+                Ok(Response::Error { detail, .. }) => this.toast(None, detail, cx),
+                Err(err) => this.toast(None, err.to_string(), cx),
+                _ => {}
+            });
+        })
+        .detach();
+    }
+
+    fn show_forum_post(&mut self, info: protocol::ForumInfo, cx: &mut Context<Self>) {
+        let title = cx.new(|cx| crate::gui::input::TextInput::new("Title", cx));
+        let text = cx.new(|cx| crate::gui::input::TextInput::multiline("Message", cx));
+        self.sidebar_state.forum_post = Some(ForumPostModal {
+            forum: info.forum,
+            title,
+            text,
+            tags: info.tags,
+            picked: Vec::new(),
+            files: Vec::new(),
+            require_tag: info.require_tag,
+            media: info.media,
+            guidelines: info.guidelines,
+            error: None,
+            busy: false,
+        });
+        cx.notify();
+    }
+
+    fn toggle_forum_tag(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(modal) = self.sidebar_state.forum_post.as_mut() else { return };
+        if modal.busy {
+            return;
+        }
+        if let Some(at) = modal.picked.iter().position(|picked| picked == id) {
+            modal.picked.remove(at);
+        } else {
+            modal.picked.push(id.to_owned());
+        }
+        modal.error = None;
+        cx.notify();
+    }
+
+    fn attach_forum_files(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_state.forum_post.as_ref().is_some_and(|modal| modal.busy) {
+            return;
+        }
+        let asked = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = asked.await {
+                let _ = this.update(cx, |this, cx| {
+                    let Some(modal) = this.sidebar_state.forum_post.as_mut() else { return };
+                    for path in paths {
+                        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("file").to_owned();
+                        modal.files.push(protocol::OutgoingFile {
+                            path: path.to_string_lossy().into_owned(),
+                            name,
+                            ..Default::default()
+                        });
+                    }
+                    modal.error = None;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn remove_forum_file(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(modal) = self.sidebar_state.forum_post.as_mut() else { return };
+        if modal.busy || index >= modal.files.len() {
+            return;
+        }
+        modal.files.remove(index);
+        modal.error = None;
+        cx.notify();
+    }
+
+    fn submit_forum_post(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.sidebar_state.forum_post.as_mut() else { return };
+        if modal.busy {
+            return;
+        }
+        let title = modal.title.read(cx).text().trim().to_owned();
+        let text = modal.text.read(cx).text().trim().to_owned();
+        if title.is_empty() {
+            modal.error = Some("A post needs a title.".into());
+            cx.notify();
+            return;
+        }
+        if modal.require_tag && modal.picked.is_empty() {
+            modal.error = Some("This forum requires a tag.".into());
+            cx.notify();
+            return;
+        }
+        if modal.media && modal.files.is_empty() {
+            modal.error = Some("A media channel needs a file.".into());
+            cx.notify();
+            return;
+        }
+        if text.is_empty() && modal.files.is_empty() {
+            modal.error = Some("Write a message or attach a file.".into());
+            cx.notify();
+            return;
+        }
+        modal.busy = true;
+        modal.error = None;
+        let forum = modal.forum.clone();
+        let tags = modal.picked.clone();
+        let files = modal.files.clone();
+        cx.notify();
+        let req = Request::ForumPost {
+            forum,
+            title,
+            text,
+            tags,
+            with: protocol::Outgoing { files, ..Default::default() },
+        };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| match answer {
+                Ok(Response::Conversation { conversation }) => {
+                    this.sidebar_state.forum_post = None;
+                    this.open_now(conversation.key, &conversation.title, cx);
+                }
+                Ok(Response::Error { detail, .. }) => {
+                    if let Some(modal) = this.sidebar_state.forum_post.as_mut() {
+                        modal.busy = false;
+                        modal.error = Some(detail.clone());
+                    }
+                    this.toast(None, detail, cx);
+                }
+                _ => {
+                    if let Some(modal) = this.sidebar_state.forum_post.as_mut() {
+                        modal.busy = false;
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     pub(in crate::gui) fn create_channel_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let modal = self.sidebar_state.create_channel.as_ref()?;
         let ready = !modal.name.read(cx).text().trim().is_empty();
-        let is_voice = modal.kind == ConversationKind::Voice;
+        let is_discord = modal.space.network == Network::Discord;
+        let kind_label = match modal.kind {
+            ConversationKind::Voice => "Kind: Voice",
+            ConversationKind::Announcement => "Kind: Announcement",
+            ConversationKind::Forum => "Kind: Forum",
+            _ => "Kind: Text",
+        };
+        let is_telegram = modal.space.network == Network::Telegram;
         let is_private = modal.private;
+        let field_wrap = |input: Entity<crate::gui::input::TextInput>| {
+            div()
+                .px(px(8.))
+                .py(px(6.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(theme::canvas())
+                .border_1()
+                .border_color(theme::border())
+                .type_ui()
+                .child(input)
+        };
         let is_teams = modal.space.network == Network::Teams;
         let card = div()
             .id("create-channel-card")
@@ -2602,24 +5070,16 @@ impl Shell {
             .flex_col()
             .gap(px(10.))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(div().type_title().text_color(theme::text()).child("Create channel"))
-            .child(
-                div()
-                    .px(px(8.))
-                    .py(px(6.))
-                    .rounded(px(theme::R_CONTROL))
-                    .bg(theme::canvas())
-                    .border_1()
-                    .border_color(theme::border())
-                    .type_ui()
-                    .child(modal.name.clone()),
-            )
+            .child(div().type_title().text_color(theme::text()).child(if is_telegram { "New channel" } else { "Create channel" }))
+            .child(field_wrap(modal.name.clone()))
+            .when(is_telegram, |card| card.child(field_wrap(modal.description.clone())))
+            .when(is_telegram && !is_private, |card| card.child(field_wrap(modal.username.clone())))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(12.))
-                    .when(modal.space.network != Network::Slack && !is_teams, |row| {
+                    .when(modal.space.network != Network::Slack && !is_telegram && !is_teams, |row| {
                         row.child(
                             div()
                                 .id("create-chan-kind")
@@ -2627,9 +5087,16 @@ impl Shell {
                                 .text_color(theme::accent_text())
                                 .cursor_pointer()
                                 .hover(|s| s.underline())
-                                .on_click(cx.listener(|this, _, _, cx| {
+                                .on_click(cx.listener(move |this, _, _, cx| {
                                     if let Some(m) = this.sidebar_state.create_channel.as_mut() {
-                                        m.kind = if m.kind == ConversationKind::Voice {
+                                        m.kind = if is_discord {
+                                            match m.kind {
+                                                ConversationKind::Channel => ConversationKind::Voice,
+                                                ConversationKind::Voice => ConversationKind::Announcement,
+                                                ConversationKind::Announcement => ConversationKind::Forum,
+                                                _ => ConversationKind::Channel,
+                                            }
+                                        } else if m.kind == ConversationKind::Voice {
                                             ConversationKind::Channel
                                         } else {
                                             ConversationKind::Voice
@@ -2637,7 +5104,7 @@ impl Shell {
                                         cx.notify();
                                     }
                                 }))
-                                .child(if is_voice { "Kind: Voice" } else { "Kind: Text" }),
+                                .child(kind_label),
                         )
                     })
                     .child(
@@ -2696,6 +5163,1072 @@ impl Shell {
                 .justify_center()
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                     this.sidebar_state.create_channel = None;
+                    cx.notify();
+                }))
+                .child(card),
+        )
+    }
+
+    pub(super) fn open_create_category(&mut self, space: Key, cx: &mut Context<Self>) {
+        let name = cx.new(|cx| crate::gui::input::TextInput::new("Category name", cx));
+        self.sidebar_state.create_category = Some(CreateCategoryModal {
+            space,
+            name,
+            busy: false,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    fn submit_create_category(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.sidebar_state.create_category.as_mut() else {
+            return;
+        };
+        if modal.busy {
+            return;
+        }
+        let name = modal.name.read(cx).text().trim().to_owned();
+        if name.is_empty() {
+            modal.error = Some("Enter a category name.".to_owned());
+            cx.notify();
+            return;
+        }
+        modal.busy = true;
+        modal.error = None;
+        let space = modal.space.clone();
+        cx.notify();
+        let req = Request::CreateCategory { space: space.clone(), name };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| match answer {
+                Ok(Response::Group { .. }) => {
+                    this.sidebar_state.create_category = None;
+                    this.load_tree(space, cx);
+                    this.toast(Some(("icons/check.svg", theme::text_soft())), "Category created", cx);
+                    cx.notify();
+                }
+                Ok(Response::Error { detail, .. }) => {
+                    if let Some(m) = this.sidebar_state.create_category.as_mut() {
+                        m.busy = false;
+                        m.error = Some(detail);
+                    }
+                    cx.notify();
+                }
+                Ok(_) => {
+                    if let Some(m) = this.sidebar_state.create_category.as_mut() {
+                        m.busy = false;
+                        m.error = Some("Could not create category.".to_owned());
+                    }
+                    cx.notify();
+                }
+                Err(err) => {
+                    if let Some(m) = this.sidebar_state.create_category.as_mut() {
+                        m.busy = false;
+                        m.error = Some(err.to_string());
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(in crate::gui) fn create_category_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let modal = self.sidebar_state.create_category.as_ref()?;
+        let ready = !modal.name.read(cx).text().trim().is_empty() && !modal.busy;
+        let card = div()
+            .id("create-category-card")
+            .w(px(360.))
+            .max_w_full()
+            .p(px(16.))
+            .rounded(px(theme::R_FLOAT))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().type_title().text_color(theme::text()).child("Create category"))
+            .child(
+                div()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::canvas())
+                    .border_1()
+                    .border_color(theme::border())
+                    .type_ui()
+                    .child(modal.name.clone()),
+            )
+            .children(modal.error.as_ref().map(|e| div().type_small().text_color(theme::danger()).child(e.clone())))
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(button("create-cat-cancel", ButtonKind::Ghost, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_state.create_category = None;
+                        cx.notify();
+                    })))
+                    .child(
+                        button(
+                            "create-cat-submit",
+                            if ready { ButtonKind::Primary } else { ButtonKind::Ghost },
+                            if modal.busy { "Creating…" } else { "Create" },
+                        )
+                        .when(ready, |b| b.on_click(cx.listener(|this, _, _, cx| this.submit_create_category(cx)))),
+                    ),
+            );
+        Some(
+            div()
+                .id("create-category-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(theme::scrim())
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.sidebar_state.create_category = None;
+                    cx.notify();
+                }))
+                .child(card),
+        )
+    }
+
+    pub(super) fn open_edit_channel(&mut self, conversation: &Conversation, cx: &mut Context<Self>) {
+        let space = match &conversation.space {
+            Some(id) => Key { id: id.clone(), ..conversation.key.clone() },
+            None => return,
+        };
+        let categories: Vec<(String, String)> = self
+            .trees
+            .get(&space)
+            .map(|t| t.groups.iter().map(|g| (g.id.clone(), g.name.clone())).collect())
+            .unwrap_or_default();
+        let initial_name = conversation.title.trim_start_matches('#').to_owned();
+        let initial_topic = conversation.topic.clone();
+        let initial_limit = if conversation.limit > 0 { conversation.limit.to_string() } else { String::new() };
+        let name = cx.new(|cx| {
+            let mut input = crate::gui::input::TextInput::new("Channel name", cx);
+            input.set_text(&initial_name, cx);
+            input
+        });
+        let topic = cx.new(|cx| {
+            let mut input = crate::gui::input::TextInput::new("Topic (optional)", cx);
+            input.set_text(&initial_topic, cx);
+            input
+        });
+        let slow_mode = cx.new(|cx| crate::gui::input::TextInput::new("Slow mode seconds (0 = off)", cx));
+        let user_limit = cx.new(|cx| {
+            let mut input = crate::gui::input::TextInput::new("User limit (0 = unlimited)", cx);
+            input.set_text(&initial_limit, cx);
+            input
+        });
+        self.sidebar_state.edit_channel = Some(EditChannelModal {
+            target: conversation.key.clone(),
+            space,
+            is_category: false,
+            kind: conversation.kind,
+            name,
+            topic,
+            slow_mode,
+            user_limit,
+            nsfw: false,
+            parent_id: conversation.group.clone(),
+            initial_parent_id: conversation.group.clone(),
+            categories,
+            busy: false,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    pub(super) fn open_edit_category(&mut self, space: Key, id: String, current_name: String, cx: &mut Context<Self>) {
+        let target = Key { id, ..space.clone() };
+        let name = cx.new(|cx| {
+            let mut input = crate::gui::input::TextInput::new("Category name", cx);
+            input.set_text(&current_name, cx);
+            input
+        });
+        let topic = cx.new(|cx| crate::gui::input::TextInput::new("", cx));
+        let slow_mode = cx.new(|cx| crate::gui::input::TextInput::new("", cx));
+        let user_limit = cx.new(|cx| crate::gui::input::TextInput::new("", cx));
+        self.sidebar_state.edit_channel = Some(EditChannelModal {
+            target,
+            space,
+            is_category: true,
+            kind: ConversationKind::Channel,
+            name,
+            topic,
+            slow_mode,
+            user_limit,
+            nsfw: false,
+            parent_id: None,
+            initial_parent_id: None,
+            categories: Vec::new(),
+            busy: false,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    fn submit_edit_channel(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.sidebar_state.edit_channel.as_mut() else {
+            return;
+        };
+        if modal.busy {
+            return;
+        }
+        let name_val = modal.name.read(cx).text().trim().to_owned();
+        if name_val.is_empty() {
+            modal.error = Some("Name cannot be empty.".to_owned());
+            cx.notify();
+            return;
+        }
+        let is_category = modal.is_category;
+        let is_voice = modal.kind == ConversationKind::Voice;
+        let topic_val = if is_category || is_voice {
+            None
+        } else {
+            Some(modal.topic.read(cx).text().trim().to_owned())
+        };
+        let slow_str = modal.slow_mode.read(cx).text().trim().to_owned();
+        let rate_limit_per_user = if is_category || slow_str.is_empty() {
+            None
+        } else {
+            match slow_str.parse::<u32>() {
+                Ok(n) if n <= 21_600 => Some(n),
+                _ => {
+                    modal.error = Some("Slow mode must be a number of seconds (0–21600).".to_owned());
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+        let limit_str = modal.user_limit.read(cx).text().trim().to_owned();
+        let user_limit = if !is_voice || is_category || limit_str.is_empty() {
+            None
+        } else {
+            match limit_str.parse::<u32>() {
+                Ok(n) if n <= 99 => Some(n),
+                _ => {
+                    modal.error = Some("User limit must be between 0 and 99.".to_owned());
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+        let nsfw = if is_category || is_voice { None } else { Some(modal.nsfw) };
+        let parent_id = if !is_category && modal.parent_id != modal.initial_parent_id {
+            Some(modal.parent_id.clone())
+        } else {
+            None
+        };
+        modal.busy = true;
+        modal.error = None;
+        let target = modal.target.clone();
+        let space = modal.space.clone();
+        cx.notify();
+        let req = Request::EditChannel {
+            conversation: target,
+            name: Some(name_val),
+            topic: topic_val,
+            rate_limit_per_user,
+            nsfw,
+            user_limit,
+            parent_id,
+        };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| match answer {
+                Ok(Response::Ok) => {
+                    this.sidebar_state.edit_channel = None;
+                    this.load_tree(space, cx);
+                    this.toast(
+                        Some(("icons/check.svg", theme::text_soft())),
+                        if is_category { "Category updated" } else { "Channel updated" },
+                        cx,
+                    );
+                    cx.notify();
+                }
+                Ok(Response::Error { detail, .. }) => {
+                    if let Some(m) = this.sidebar_state.edit_channel.as_mut() {
+                        m.busy = false;
+                        m.error = Some(detail);
+                    }
+                    cx.notify();
+                }
+                Ok(_) => {
+                    if let Some(m) = this.sidebar_state.edit_channel.as_mut() {
+                        m.busy = false;
+                        m.error = Some("Could not save changes.".to_owned());
+                    }
+                    cx.notify();
+                }
+                Err(err) => {
+                    if let Some(m) = this.sidebar_state.edit_channel.as_mut() {
+                        m.busy = false;
+                        m.error = Some(err.to_string());
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(in crate::gui) fn edit_channel_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let modal = self.sidebar_state.edit_channel.as_ref()?;
+        let ready = !modal.name.read(cx).text().trim().is_empty() && !modal.busy;
+        let is_category = modal.is_category;
+        let is_voice = modal.kind == ConversationKind::Voice;
+        let nsfw = modal.nsfw;
+        let parent_label = match modal.parent_id.as_deref() {
+            Some(pid) => modal
+                .categories
+                .iter()
+                .find(|(id, _)| id == pid)
+                .map(|(_, name)| format!("Category: {name}"))
+                .unwrap_or_else(|| "Category: None".to_owned()),
+            None => "Category: None".to_owned(),
+        };
+        let field = |label: &'static str, input: Entity<crate::gui::input::TextInput>| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(div().type_small().text_color(theme::text_soft()).child(label))
+                .child(
+                    div()
+                        .px(px(8.))
+                        .py(px(6.))
+                        .rounded(px(theme::R_CONTROL))
+                        .bg(theme::canvas())
+                        .border_1()
+                        .border_color(theme::border())
+                        .type_ui()
+                        .child(input),
+                )
+        };
+        let card = div()
+            .id("edit-channel-card")
+            .w(px(400.))
+            .max_w_full()
+            .p(px(16.))
+            .rounded(px(theme::R_FLOAT))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().type_title().text_color(theme::text()).child(if is_category { "Rename category" } else { "Edit channel" }))
+            .child(field("Name", modal.name.clone()))
+            .when(!is_category && !is_voice, |card| card.child(field("Topic", modal.topic.clone())))
+            .when(!is_category, |card| card.child(field("Slow mode (seconds)", modal.slow_mode.clone())))
+            .when(!is_category && is_voice, |card| card.child(field("User limit", modal.user_limit.clone())))
+            .when(!is_category, |card| {
+                card.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.))
+                        .when(!modal.categories.is_empty(), |row| {
+                            row.child(
+                                div()
+                                    .id("edit-chan-parent")
+                                    .type_small()
+                                    .text_color(theme::accent_text())
+                                    .cursor_pointer()
+                                    .hover(|s| s.underline())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(m) = this.sidebar_state.edit_channel.as_mut() {
+                                            let next = match m.parent_id.as_deref() {
+                                                None => m.categories.first().map(|(id, _)| id.clone()),
+                                                Some(cur) => {
+                                                    let pos = m.categories.iter().position(|(id, _)| id == cur);
+                                                    match pos {
+                                                        Some(i) if i + 1 < m.categories.len() => Some(m.categories[i + 1].0.clone()),
+                                                        _ => None,
+                                                    }
+                                                }
+                                            };
+                                            m.parent_id = next;
+                                            cx.notify();
+                                        }
+                                    }))
+                                    .child(parent_label),
+                            )
+                        })
+                        .when(!is_voice, |row| {
+                            row.child(
+                                div()
+                                    .id("edit-chan-nsfw")
+                                    .type_small()
+                                    .text_color(if nsfw { theme::accent_text() } else { theme::text_faint() })
+                                    .cursor_pointer()
+                                    .hover(|s| s.underline())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let Some(m) = this.sidebar_state.edit_channel.as_mut() {
+                                            m.nsfw = !m.nsfw;
+                                            cx.notify();
+                                        }
+                                    }))
+                                    .child(if nsfw { "☑ Age-restricted (NSFW)" } else { "☐ Age-restricted (NSFW)" }),
+                            )
+                        }),
+                )
+            })
+            .children(modal.error.as_ref().map(|e| div().type_small().text_color(theme::danger()).child(e.clone())))
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(button("edit-chan-cancel", ButtonKind::Ghost, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_state.edit_channel = None;
+                        cx.notify();
+                    })))
+                    .child(
+                        button(
+                            "edit-chan-save",
+                            if ready { ButtonKind::Primary } else { ButtonKind::Ghost },
+                            if modal.busy { "Saving…" } else { "Save" },
+                        )
+                        .when(ready, |b| b.on_click(cx.listener(|this, _, _, cx| this.submit_edit_channel(cx)))),
+                    ),
+            );
+        Some(
+            div()
+                .id("edit-channel-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(theme::scrim())
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.sidebar_state.edit_channel = None;
+                    cx.notify();
+                }))
+                .child(card),
+        )
+    }
+
+    pub(super) fn open_move_channels(&mut self, space: Key, cx: &mut Context<Self>) {
+        let Some(tree) = self.trees.get(&space) else {
+            self.load_tree(space, cx);
+            return;
+        };
+        let categories: Vec<(String, String)> = tree.groups.iter().map(|g| (g.id.clone(), g.name.clone())).collect();
+        let mut items = Vec::new();
+        for group in &tree.groups {
+            items.push(MoveChannelItem {
+                id: group.id.clone(),
+                name: group.name.clone(),
+                is_category: true,
+                parent_id: None,
+            });
+        }
+        for conv in &tree.conversations {
+            if conv.kind == ConversationKind::Thread {
+                continue;
+            }
+            items.push(MoveChannelItem {
+                id: conv.key.id.clone(),
+                name: conv.title.trim_start_matches('#').to_owned(),
+                is_category: false,
+                parent_id: conv.group.clone(),
+            });
+        }
+        self.sidebar_state.move_channels = Some(MoveChannelsModal {
+            space,
+            items,
+            categories,
+            busy: false,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    fn submit_move_channels(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.sidebar_state.move_channels.as_mut() else {
+            return;
+        };
+        if modal.busy {
+            return;
+        }
+        modal.busy = true;
+        modal.error = None;
+        let space = modal.space.clone();
+        let mut cat_pos = 0i32;
+        let mut ch_pos = 0i32;
+        let order: Vec<protocol::ChannelPosition> = modal
+            .items
+            .iter()
+            .map(|item| {
+                if item.is_category {
+                    let pos = cat_pos;
+                    cat_pos += 1;
+                    protocol::ChannelPosition {
+                        id: item.id.clone(),
+                        position: pos,
+                        parent_id: None,
+                        lock_permissions: None,
+                    }
+                } else {
+                    let pos = ch_pos;
+                    ch_pos += 1;
+                    protocol::ChannelPosition {
+                        id: item.id.clone(),
+                        position: pos,
+                        parent_id: Some(item.parent_id.clone()),
+                        lock_permissions: None,
+                    }
+                }
+            })
+            .collect();
+        cx.notify();
+        let req = Request::MoveChannels { space: space.clone(), order };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| match answer {
+                Ok(Response::Ok) => {
+                    this.sidebar_state.move_channels = None;
+                    this.load_tree(space, cx);
+                    this.toast(Some(("icons/check.svg", theme::text_soft())), "Channel order saved", cx);
+                    cx.notify();
+                }
+                Ok(Response::Error { detail, .. }) => {
+                    if let Some(m) = this.sidebar_state.move_channels.as_mut() {
+                        m.busy = false;
+                        m.error = Some(detail);
+                    }
+                    cx.notify();
+                }
+                Ok(_) => {
+                    if let Some(m) = this.sidebar_state.move_channels.as_mut() {
+                        m.busy = false;
+                        m.error = Some("Could not save channel order.".to_owned());
+                    }
+                    cx.notify();
+                }
+                Err(err) => {
+                    if let Some(m) = this.sidebar_state.move_channels.as_mut() {
+                        m.busy = false;
+                        m.error = Some(err.to_string());
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(in crate::gui) fn move_channels_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let modal = self.sidebar_state.move_channels.as_ref()?;
+        let categories = modal.categories.clone();
+        let len = modal.items.len();
+        let rows: Vec<_> = modal
+            .items
+            .iter()
+            .enumerate()
+            .map(|(ix, item)| {
+                let parent_name = item.parent_id.as_deref().and_then(|pid| {
+                    categories.iter().find(|(id, _)| id == pid).map(|(_, name)| name.clone())
+                });
+                let prefix = if item.is_category { "Category" } else { "#" };
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
+                    .px(px(8.))
+                    .py(px(6.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::canvas())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(div().type_small().text_color(theme::text_faint()).child(prefix))
+                            .child(div().min_w_0().truncate().type_ui().text_color(theme::text()).child(item.name.clone())),
+                    )
+                    .when(!item.is_category && !categories.is_empty(), |row| {
+                        let cat_label = parent_name.unwrap_or_else(|| "No category".to_owned());
+                        row.child(
+                            div()
+                                .id(("move-cat", ix))
+                                .type_small()
+                                .text_color(theme::accent_text())
+                                .cursor_pointer()
+                                .hover(|s| s.underline())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(m) = this.sidebar_state.move_channels.as_mut() {
+                                        if let Some(entry) = m.items.get_mut(ix) {
+                                            entry.parent_id = match entry.parent_id.as_deref() {
+                                                None => m.categories.first().map(|(id, _)| id.clone()),
+                                                Some(cur) => {
+                                                    let pos = m.categories.iter().position(|(id, _)| id == cur);
+                                                    match pos {
+                                                        Some(i) if i + 1 < m.categories.len() => Some(m.categories[i + 1].0.clone()),
+                                                        _ => None,
+                                                    }
+                                                }
+                                            };
+                                            cx.notify();
+                                        }
+                                    }
+                                }))
+                                .child(cat_label),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.))
+                            .child(
+                                icon_button(("move-up", ix), "icons/chevron-up.svg", false)
+                                    .size(px(24.))
+                                    .when(ix > 0, |btn| {
+                                        btn.on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Some(m) = this.sidebar_state.move_channels.as_mut() {
+                                                if ix > 0 && ix < m.items.len() {
+                                                    m.items.swap(ix - 1, ix);
+                                                    cx.notify();
+                                                }
+                                            }
+                                        }))
+                                    }),
+                            )
+                            .child(
+                                icon_button(("move-down", ix), "icons/chevron-down.svg", false)
+                                    .size(px(24.))
+                                    .when(ix + 1 < len, |btn| {
+                                        btn.on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Some(m) = this.sidebar_state.move_channels.as_mut() {
+                                                if ix + 1 < m.items.len() {
+                                                    m.items.swap(ix, ix + 1);
+                                                    cx.notify();
+                                                }
+                                            }
+                                        }))
+                                    }),
+                            ),
+                    )
+            })
+            .collect();
+        let card = div()
+            .id("move-channels-card")
+            .w(px(480.))
+            .max_w_full()
+            .max_h(px(560.))
+            .p(px(16.))
+            .rounded(px(theme::R_FLOAT))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().type_title().text_color(theme::text()).child("Reorder channels"))
+            .child(
+                div()
+                    .id("move-channels-list")
+                    .flex_1()
+                    .min_h(px(160.))
+                    .max_h(px(380.))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .children(rows),
+            )
+            .children(modal.error.as_ref().map(|e| div().type_small().text_color(theme::danger()).child(e.clone())))
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(button("move-ch-cancel", ButtonKind::Ghost, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_state.move_channels = None;
+                        cx.notify();
+                    })))
+                    .child(
+                        button(
+                            "move-ch-save",
+                            if !modal.busy { ButtonKind::Primary } else { ButtonKind::Ghost },
+                            if modal.busy { "Saving…" } else { "Save order" },
+                        )
+                        .when(!modal.busy, |b| b.on_click(cx.listener(|this, _, _, cx| this.submit_move_channels(cx)))),
+                    ),
+            );
+        Some(
+            div()
+                .id("move-channels-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(theme::scrim())
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.sidebar_state.move_channels = None;
+                    cx.notify();
+                }))
+                .child(card),
+        )
+    }
+
+    pub(super) fn open_delete_channel(&mut self, target: Key, name: String, is_category: bool, cx: &mut Context<Self>) {
+        let clean = name.trim_start_matches('#').to_owned();
+        let placeholder = format!("Type \"{clean}\" to confirm");
+        let confirm = cx.new(|cx| crate::gui::input::TextInput::new(placeholder, cx));
+        self.sidebar_state.delete_channel = Some(DeleteChannelModal {
+            target,
+            name: clean,
+            is_category,
+            confirm,
+            busy: false,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    fn submit_delete_channel(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.sidebar_state.delete_channel.as_mut() else {
+            return;
+        };
+        if modal.busy {
+            return;
+        }
+        let typed = modal.confirm.read(cx).text().trim();
+        if typed != modal.name {
+            modal.error = Some(format!("Type \"{}\" exactly to confirm deletion.", modal.name));
+            cx.notify();
+            return;
+        }
+        modal.busy = true;
+        modal.error = None;
+        let target = modal.target.clone();
+        let is_category = modal.is_category;
+        cx.notify();
+        let req = Request::DeleteChannel { conversation: target.clone() };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| match answer {
+                Ok(Response::Ok) => {
+                    this.sidebar_state.delete_channel = None;
+                    if this.open.as_ref() == Some(&target) {
+                        this.open = None;
+                    }
+                    this.toast(
+                        Some(("icons/trash-2.svg", theme::text_soft())),
+                        if is_category { "Category deleted" } else { "Channel deleted" },
+                        cx,
+                    );
+                    cx.notify();
+                }
+                Ok(Response::Error { detail, .. }) => {
+                    if let Some(m) = this.sidebar_state.delete_channel.as_mut() {
+                        m.busy = false;
+                        m.error = Some(detail);
+                    }
+                    cx.notify();
+                }
+                Ok(_) => {
+                    if let Some(m) = this.sidebar_state.delete_channel.as_mut() {
+                        m.busy = false;
+                        m.error = Some("Could not delete.".to_owned());
+                    }
+                    cx.notify();
+                }
+                Err(err) => {
+                    if let Some(m) = this.sidebar_state.delete_channel.as_mut() {
+                        m.busy = false;
+                        m.error = Some(err.to_string());
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(in crate::gui) fn delete_channel_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let modal = self.sidebar_state.delete_channel.as_ref()?;
+        let matches_name = modal.confirm.read(cx).text().trim() == modal.name && !modal.busy;
+        let kind_word = if modal.is_category { "category" } else { "channel" };
+        let card = div()
+            .id("delete-channel-card")
+            .w(px(400.))
+            .max_w_full()
+            .p(px(16.))
+            .rounded(px(theme::R_FLOAT))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().type_title().text_color(theme::text()).child(format!("Delete {kind_word} {}?", modal.name)))
+            .child(
+                div()
+                    .type_small()
+                    .text_color(theme::text_soft())
+                    .child(format!("This permanently deletes the {kind_word}. Type \"{}\" to confirm.", modal.name)),
+            )
+            .child(
+                div()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::canvas())
+                    .border_1()
+                    .border_color(theme::border())
+                    .type_ui()
+                    .child(modal.confirm.clone()),
+            )
+            .children(modal.error.as_ref().map(|e| div().type_small().text_color(theme::danger()).child(e.clone())))
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(button("delete-ch-cancel", ButtonKind::Ghost, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_state.delete_channel = None;
+                        cx.notify();
+                    })))
+                    .child(
+                        button(
+                            "delete-ch-confirm",
+                            if matches_name { ButtonKind::Danger } else { ButtonKind::Ghost },
+                            if modal.busy { "Deleting…" } else { "Delete" },
+                        )
+                        .when(matches_name, |b| b.on_click(cx.listener(|this, _, _, cx| this.submit_delete_channel(cx)))),
+                    ),
+            );
+        Some(
+            div()
+                .id("delete-channel-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(theme::scrim())
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.sidebar_state.delete_channel = None;
+                    cx.notify();
+                }))
+                .child(card),
+        )
+    }
+
+    pub(in crate::gui) fn folder_edit_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let modal = self.sidebar_state.folder_edit.as_ref()?;
+        let card = div()
+            .id("folder-edit-card")
+            .w(px(360.))
+            .max_w_full()
+            .p(px(16.))
+            .rounded(px(theme::R_FLOAT))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().type_title().text_color(theme::text()).child("Rename folder"))
+            .child(div().type_small().text_color(theme::text_faint()).child("An empty name clears the folder name."))
+            .child(
+                div()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::canvas())
+                    .border_1()
+                    .border_color(theme::border())
+                    .type_ui()
+                    .child(modal.name.clone()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(
+                        crate::gui::components::button("folder-edit-cancel", crate::gui::components::ButtonKind::Ghost, "Cancel").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.sidebar_state.folder_edit = None;
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        crate::gui::components::button("folder-edit-save", crate::gui::components::ButtonKind::Primary, "Save")
+                            .on_click(cx.listener(|this, _, _, cx| this.submit_folder_rename(cx))),
+                    ),
+            );
+        Some(
+            div()
+                .id("folder-edit-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(theme::scrim())
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.sidebar_state.folder_edit = None;
+                    cx.notify();
+                }))
+                .child(card),
+        )
+    }
+
+    pub(in crate::gui) fn forum_post_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let modal = self.sidebar_state.forum_post.as_ref()?;
+        let title = modal.title.clone();
+        let text = modal.text.clone();
+        let guidelines = modal.guidelines.clone();
+        let tags = modal.tags.clone();
+        let picked = modal.picked.clone();
+        let files = modal.files.clone();
+        let require_tag = modal.require_tag;
+        let media = modal.media;
+        let error = modal.error.clone();
+        let busy = modal.busy;
+        let title_text = title.read(cx).text().trim().to_owned();
+        let body_text = text.read(cx).text().trim().to_owned();
+        let ready = !busy
+            && !title_text.is_empty()
+            && (!require_tag || !picked.is_empty())
+            && (!media || !files.is_empty())
+            && !(body_text.is_empty() && files.is_empty());
+        let mut chips = div().flex().flex_wrap().gap(px(6.));
+        for (ix, tag) in tags.iter().enumerate() {
+            let on = picked.iter().any(|id| id == &tag.id);
+            let id = tag.id.clone();
+            let label = if tag.emoji.is_empty() { tag.name.clone() } else { format!("{} {}", tag.emoji, tag.name) };
+            chips = chips.child(
+                div()
+                    .id(("forum-tag", ix))
+                    .px(px(8.))
+                    .py(px(4.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(if on { theme::accent() } else { theme::canvas() })
+                    .border_1()
+                    .border_color(if on { theme::accent() } else { theme::border() })
+                    .type_small()
+                    .text_color(if on { theme::on_accent() } else { theme::text() })
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_forum_tag(&id, cx)))
+                    .child(label),
+            );
+        }
+        let mut attached = div().flex().flex_col().gap(px(4.));
+        for (index, file) in files.iter().enumerate() {
+            let name = file.name.clone();
+            attached = attached.child(
+                div()
+                    .id(("forum-file", index))
+                    .type_small()
+                    .text_color(theme::text_soft())
+                    .cursor_pointer()
+                    .hover(|style| style.underline())
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| this.remove_forum_file(index, cx)))
+                    .child(format!("{name}  ×")),
+            );
+        }
+        let card = div()
+            .id("forum-post-card")
+            .w(px(420.))
+            .max_w_full()
+            .p(px(16.))
+            .rounded(px(theme::R_FLOAT))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().type_title().text_color(theme::text()).child("New post"))
+            .when(!guidelines.is_empty(), |card| {
+                card.child(div().type_small().text_color(theme::text_soft()).child(guidelines))
+            })
+            .child(
+                div()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::canvas())
+                    .border_1()
+                    .border_color(theme::border())
+                    .type_ui()
+                    .child(title),
+            )
+            .child(
+                div()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .h(px(96.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::canvas())
+                    .border_1()
+                    .border_color(theme::border())
+                    .type_ui()
+                    .child(text),
+            )
+            .child(chips)
+            .child(attached)
+            .children(error.map(|err| div().type_small().text_color(theme::danger()).child(err)))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(
+                        button("forum-post-attach", ButtonKind::Ghost, "Attach")
+                            .when(!busy, |button| button.on_click(cx.listener(|this, _, _, cx| this.attach_forum_files(cx)))),
+                    )
+                    .child(
+                        button("forum-post-cancel", ButtonKind::Ghost, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                            this.sidebar_state.forum_post = None;
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        button("forum-post-submit", if ready { ButtonKind::Primary } else { ButtonKind::Ghost }, if busy { "Posting…" } else { "Post" })
+                            .when(ready, |button| button.on_click(cx.listener(|this, _, _, cx| this.submit_forum_post(cx)))),
+                    ),
+            );
+        Some(
+            div()
+                .id("forum-post-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(theme::scrim())
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.sidebar_state.forum_post = None;
                     cx.notify();
                 }))
                 .child(card),
@@ -2761,6 +6294,7 @@ impl Shell {
             .when(!people && !tiny, |sidebar| sidebar.child(self.jump_strip(cx)))
             .children(tabs)
             .when(!banners.is_empty(), |sidebar| sidebar.child(div().flex_none().px(px(theme::INSET)).pb(px(8.)).flex().flex_col().gap(px(4.)).children(banners)))
+            .children(self.space_events_strip(cx))
             .child(
                 div()
                     .id("sidebar-list")
@@ -3040,6 +6574,8 @@ pub(crate) mod tests {
             avatar: None,
             presence: Presence::Unknown,
             status: String::new(),
+            status_emoji: String::new(),
+            status_until: None,
             can: Default::default(),
             send_as: Vec::new(),
         }

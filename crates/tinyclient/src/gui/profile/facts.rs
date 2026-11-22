@@ -474,6 +474,14 @@ pub fn place_word(network: Network, count: u32) -> &'static str {
     }
 }
 
+pub fn mutual_friends_words(count: u32) -> String {
+    if count == 1 {
+        "1 mutual friend".to_owned()
+    } else {
+        format!("{count} mutual friends")
+    }
+}
+
 pub fn in_common(network: Network, profile: &Profile) -> Option<InCommon> {
     let listed = profile.mutual_spaces.len() as u32;
     let total = profile.mutual_total.max(listed);
@@ -495,10 +503,35 @@ pub struct Fact {
     pub words: String,
     pub soft: String,
     pub opens: Option<protocol::Key>,
+    /// Validated external URL (e.g. a streaming link) opened via `open_external_link`.
+    pub url: Option<String>,
+    /// Optional thumbnail artwork (e.g. Spotify album cover) shown on profile cards/panes.
+    pub art: Option<protocol::MediaFile>,
+}
+
+fn elapsed_words(started: i64, now: i64) -> Option<String> {
+    if started <= 0 || now <= started {
+        return None;
+    }
+    let mins = (now - started) / 60;
+    if mins < 1 {
+        return None;
+    }
+    if mins >= 60 {
+        let hours = mins / 60;
+        let rem = mins % 60;
+        if rem == 0 {
+            Some(format!("{hours} h"))
+        } else {
+            Some(format!("{hours} h {rem} min"))
+        }
+    } else {
+        Some(format!("{mins} min"))
+    }
 }
 
 // CONTRACT: `gamepad-2`, `music` and `calendar` are not in the asset list either.
-fn activity_fact(activity: &Activity) -> Fact {
+fn activity_fact(activity: &Activity, now: i64) -> Fact {
     let name = activity.name.clone();
     let (glyph, words) = match activity.kind {
         ActivityKind::InVoice => ("icons/volume-2.svg", if name.is_empty() { "In voice".to_owned() } else { format!("In voice · {name}") }),
@@ -512,8 +545,37 @@ fn activity_fact(activity: &Activity) -> Fact {
         ActivityKind::Presenting => ("icons/monitor-up.svg", "Presenting".to_owned()),
         ActivityKind::Huddle => ("icons/headphones.svg", if name.is_empty() { "In a huddle".to_owned() } else { format!("In a huddle in {name}") }),
     };
-    let soft = if activity.place.is_empty() { String::new() } else { format!(" · {}", activity.place) };
-    Fact { glyph, words: words.trim().to_owned(), soft, opens: activity.conversation.clone() }
+    let soft = if !activity.place.is_empty() {
+        format!(" · {}", activity.place)
+    } else {
+        let mut parts = Vec::new();
+        let detail = match (activity.details.trim(), activity.state.trim()) {
+            ("", "") => String::new(),
+            (d, "") => d.to_owned(),
+            ("", s) => s.to_owned(),
+            (d, s) => format!("{d} · {s}"),
+        };
+        if !detail.is_empty() {
+            parts.push(detail);
+        }
+        if let Some(elapsed) = activity.started.and_then(|start| elapsed_words(start, now)) {
+            parts.push(elapsed);
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", parts.join(", "))
+        }
+    };
+    let url = (activity.kind == ActivityKind::Streaming && !activity.url.is_empty()).then(|| activity.url.clone());
+    Fact {
+        glyph,
+        words: words.trim().to_owned(),
+        soft,
+        opens: activity.conversation.clone(),
+        url,
+        art: activity.art.clone(),
+    }
 }
 
 /// Right now: what they are doing, and their clock. At most three rows; none for an app.
@@ -526,13 +588,20 @@ pub fn right_now(person: &Person, profile: Option<&Profile>, said: &PresenceLine
     let mut facts: Vec<Fact> = person
         .activity
         .iter()
-        .map(|activity| activity_fact(activity))
+        .map(|activity| activity_fact(activity, now))
         .filter(|fact| !head.contains(&fact.words.split(" · ").next().unwrap_or("").to_lowercase()))
         .collect();
     let offset = profile.and_then(|profile| profile.utc_offset).or(person.utc_offset);
     if let Some(offset) = offset.filter(|offset| *offset != ours) {
         let (clock, apart) = crate::gui::people::card::local_time_parts(now, offset, ours);
-        facts.push(Fact { glyph: "icons/clock.svg", words: format!("{clock} local"), soft: format!(" · {apart}"), opens: None });
+        facts.push(Fact {
+            glyph: "icons/clock.svg",
+            words: format!("{clock} local"),
+            soft: format!(" · {apart}"),
+            opens: None,
+            url: None,
+            art: None,
+        });
     }
     facts.truncate(RIGHT_NOW);
     facts
@@ -572,7 +641,9 @@ pub fn sections(person: &Person, profile: &Profile, place: Option<&str>, now: i6
         role: role(person, profile, place).is_some(),
         about: !profile.bio.trim().is_empty() || !profile.note.trim().is_empty(),
         contact: !contacts(person, profile).is_empty(),
-        in_common: in_common(person.key.network, profile).is_some(),
+        in_common: in_common(person.key.network, profile).is_some()
+            || profile.mutual_friends > 0
+            || !profile.mutual_people.is_empty(),
         foot: !foot(person, profile, place).is_empty(),
     }
 }
@@ -755,6 +826,66 @@ pub fn can_edit_picture(conversation: &Conversation) -> bool {
     conversation.kind != ConversationKind::Direct && conversation.rights.edit_picture
 }
 
+/// Whether this account may ban, unban, or restrict members of this group or channel.
+pub fn can_ban_members(conversation: &Conversation) -> bool {
+    conversation.kind != ConversationKind::Direct && conversation.rights.ban_members
+}
+
+/// Whether this account may promote or demote admins in this group or channel.
+pub fn can_promote_admins(conversation: &Conversation) -> bool {
+    conversation.kind != ConversationKind::Direct && conversation.rights.promote_admins
+}
+
+/// Whether this account may change group/channel settings (slow mode, defaults, toggles).
+pub fn can_manage_settings(conversation: &Conversation) -> bool {
+    conversation.kind != ConversationKind::Direct && conversation.rights.manage_settings
+}
+
+/// Whether this account may view the recent-actions admin log.
+pub fn can_view_admin_log(conversation: &Conversation) -> bool {
+    conversation.kind != ConversationKind::Direct && conversation.rights.view_admin_log
+}
+
+/// Whether this account is the owner and may transfer ownership.
+pub fn can_transfer_ownership(conversation: &Conversation) -> bool {
+    conversation.kind != ConversationKind::Direct && conversation.rights.transfer_owner
+}
+
+/// Whether the Details pane should show the "Manage" section at all. Non-admins always get `false`.
+pub fn can_manage_conversation(conversation: &Conversation) -> bool {
+    can_rename(conversation)
+        || can_edit_topic(conversation)
+        || can_edit_picture(conversation)
+        || can_add_members(conversation)
+        || can_manage_settings(conversation)
+        || can_view_admin_log(conversation)
+        || can_transfer_ownership(conversation)
+}
+
+/// Moderation actions offered in a member's menu for this conversation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemberModActions {
+    pub remove: bool,
+    pub ban: bool,
+    pub promote: bool,
+    pub transfer: bool,
+}
+
+impl MemberModActions {
+    pub fn any(self) -> bool {
+        self.remove || self.ban || self.promote || self.transfer
+    }
+}
+
+pub fn member_mod_actions(conversation: &Conversation) -> MemberModActions {
+    MemberModActions {
+        remove: can_remove_members(conversation),
+        ban: can_ban_members(conversation),
+        promote: can_promote_admins(conversation),
+        transfer: can_transfer_ownership(conversation),
+    }
+}
+
 /// Confirmation sentence for removing a member; names the person explicitly.
 pub fn remove_member_confirm_text(person_name: &str, group_title: &str) -> String {
     format!("Remove {person_name} from {group_title}? Others in the conversation may see this.")
@@ -820,6 +951,19 @@ pub fn space_link(space: &protocol::Key) -> Option<String> {
     }
 }
 
+/// A server's boost tier and count as one quiet line ("Level 2 · 14 boosts"), omitted when
+/// unboosted so ordinary servers keep a calm header.
+pub fn space_boost_line(boost_level: u8, boosts: u32) -> Option<String> {
+    if boost_level == 0 && boosts == 0 {
+        return None;
+    }
+    let noun = if boosts == 1 { "boost" } else { "boosts" };
+    match (boost_level, boosts) {
+        (0, count) => Some(format!("{} {noun}", thousands(count))),
+        (level, 0) => Some(format!("Level {level}")),
+        (level, count) => Some(format!("Level {level} · {} {noun}", thousands(count))),
+    }
+}
 /// Validates a Slack workspace subdomain or base URL and builds an exact HTTPS workspace settings URL.
 /// Only allows `https://` with valid ASCII hostname labels (never arbitrary hosts or non-HTTP schemes).
 pub fn slack_workspace_url(domain_or_url: &str, team_id: &str, path: &str) -> String {
@@ -894,7 +1038,10 @@ pub fn confirm_words(act: Act, name: &str, network: Network) -> (String, String,
         ),
         Act::Leave => (
             format!("Leave {name} on {net}?"),
-            "You'll stop getting its messages. To come back, someone in it has to add you.".to_owned(),
+            match network {
+                Network::Telegram => "You'll stop getting its messages. A public one can be found and joined again. A private one needs someone in it to add you.".to_owned(),
+                _ => "You'll stop getting its messages. To come back, someone in it has to add you.".to_owned(),
+            },
             "Leave",
         ),
     }
@@ -930,6 +1077,7 @@ pub fn notify_control(conversation: &Conversation) -> NotifyControl {
                 NotifyControl::LocalSwitch
             }
         }
+        Network::Discord if conversation.kind == ConversationKind::Thread => NotifyControl::Segmented,
         _ => {
             if channel && conversation.key.network != Network::Telegram {
                 NotifyControl::Segmented
@@ -951,7 +1099,10 @@ pub fn conversation_line(conversation: &Conversation, info: Option<&Conversation
         },
         (Network::Telegram, kind) => {
             let link = info.map(|info| info.link.as_str()).unwrap_or("");
-            let handle = link.rsplit('/').next().filter(|_| link.contains("t.me/")).map(|name| format!("@{name}"));
+            // A private invite (`t.me/+…`, `t.me/joinchat/…`) is not a public @username.
+            let handle = link.rsplit('/').next().filter(|name| {
+                !name.is_empty() && protocol::link::telegram_invite_hash(link).is_none() && link.contains("t.me/")
+            }).map(|name| format!("@{name}"));
             let (noun, people) = match kind {
                 ConversationKind::Announcement => ("Channel", "subscribers"),
                 _ => ("Group", "members"),
@@ -1109,6 +1260,17 @@ mod tests {
             moderate: false,
             can_pin: false,
             joined: true,
+            slowmode_seconds: 0,
+            slowmode_until: None,
+            locked: false,
+            age_restricted: false,
+            tags: Vec::new(),
+            message_count: 0,
+            total_message_sent: 0,
+            thumbnail: None,
+            reaction: String::new(),
+            owner: String::new(),
+            voice_notes_forbidden: String::new(),
         }
     }
 
@@ -1340,6 +1502,42 @@ mod tests {
         dm_with_rights.rights = grp.rights;
         assert!(!can_add_members(&dm_with_rights) && !can_rename(&dm_with_rights), "direct chats are not managed as groups");
         assert!(remove_member_confirm_text("Mina", "Design").contains("Mina"));
+
+        // Non-admin in a Telegram group or channel sees no Manage section and no member mod actions.
+        let non_admin = row(Network::Telegram, ConversationKind::Channel);
+        assert!(!can_manage_conversation(&non_admin), "non-admin must see no Manage section");
+        assert!(!can_ban_members(&non_admin));
+        assert!(!can_promote_admins(&non_admin));
+        assert!(!can_manage_settings(&non_admin));
+        assert!(!can_view_admin_log(&non_admin));
+        assert!(!can_transfer_ownership(&non_admin));
+        assert!(!member_mod_actions(&non_admin).any());
+
+        // An admin with change_info + ban_users sees only those actions, not ownership transfer.
+        let mut admin = row(Network::Telegram, ConversationKind::Channel);
+        admin.rights = protocol::ConversationRights {
+            rename: true,
+            edit_topic: true,
+            edit_picture: true,
+            remove_members: true,
+            ban_members: true,
+            manage_settings: true,
+            view_admin_log: true,
+            ..Default::default()
+        };
+        assert!(can_manage_conversation(&admin));
+        assert!(can_ban_members(&admin) && can_manage_settings(&admin) && can_view_admin_log(&admin));
+        assert!(!can_promote_admins(&admin) && !can_transfer_ownership(&admin));
+        let acts = member_mod_actions(&admin);
+        assert!(acts.remove && acts.ban && !acts.promote && !acts.transfer);
+
+        // The creator sees ownership transfer as well.
+        let mut owner = admin;
+        owner.rights.promote_admins = true;
+        owner.rights.transfer_owner = true;
+        assert!(can_transfer_ownership(&owner));
+        let owner_acts = member_mod_actions(&owner);
+        assert!(owner_acts.remove && owner_acts.ban && owner_acts.promote && owner_acts.transfer);
     }
 
     #[test]
@@ -1357,11 +1555,15 @@ mod tests {
             link: "https://t.me/riverbend_news".into(),
             disappearing: None,
             bookmarks: Vec::new(),
+            pending_requests: 0,
             tabs: Vec::new(),
             meeting: None,
         };
         let channel = info.conversation.clone();
         assert_eq!(conversation_line(&channel, Some(&info)), "@riverbend_news · Channel · 12,408 subscribers");
+        info.link = "https://t.me/+alpine_invite".into();
+        assert_eq!(conversation_line(&channel, Some(&info)), "Channel · 12,408 subscribers");
+        info.link = "https://t.me/riverbend_news".into();
         assert_eq!(members_shown(&channel, Some(&info)), MembersShown::None);
         assert_eq!(notify_control(&channel), NotifyControl::Switch);
         let group = row(Network::Discord, ConversationKind::Group);
@@ -1394,6 +1596,7 @@ mod tests {
         assert_eq!(notify_control(&row(Network::Teams, ConversationKind::Channel)), NotifyControl::Segmented);
         assert_eq!(notify_control(&row(Network::Tiny, ConversationKind::Channel)), NotifyControl::LocalSegmented);
         assert_eq!(notify_control(&row(Network::Tiny, ConversationKind::Direct)), NotifyControl::LocalSwitch);
+        assert_eq!(notify_control(&row(Network::Discord, ConversationKind::Thread)), NotifyControl::Segmented);
         info.external = "Northwind".into();
         assert_eq!(conversation_tag(&slack, Some(&info)).as_deref(), Some("External · Northwind"));
         let teams_dm = row(Network::Teams, ConversationKind::Direct);
@@ -1428,7 +1631,32 @@ mod tests {
     }
 
     fn act(kind: ActivityKind) -> Activity {
-        Activity { kind, name: String::new(), place: String::new(), conversation: None }
+        Activity::new(kind, "")
+    }
+
+    #[test]
+    fn activity_fact_formats_details_elapsed_time_and_streaming_url() {
+        let now = 1_760_356_800;
+        let mut p = person(Network::Discord, Relation::Friend);
+        p.activity = Some(Box::new(Activity {
+            details: "Elysium".into(),
+            started: Some(now - 42 * 60),
+            ..Activity::new(ActivityKind::Playing, "Hades")
+        }));
+        let facts = right_now(&p, None, &PresenceLine::default(), now, 0);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].words, "Playing Hades");
+        assert_eq!(facts[0].soft, " — Elysium, 42 min");
+        assert_eq!(facts[0].url, None);
+
+        p.activity = Some(Box::new(Activity {
+            details: "Speedrun".into(),
+            url: "https://twitch.tv/streamer".into(),
+            ..Activity::new(ActivityKind::Streaming, "Hades")
+        }));
+        let stream_facts = right_now(&p, None, &PresenceLine::default(), now, 0);
+        assert_eq!(stream_facts[0].words, "Streaming Hades");
+        assert_eq!(stream_facts[0].url.as_deref(), Some("https://twitch.tv/streamer"));
     }
 
     #[test]
@@ -1504,6 +1732,15 @@ mod tests {
         p.relation = Relation::None;
         p.bot = true;
         assert!(!person_menu(&p, &with_blocks, false, false).contains(&Item::Block));
+    }
+
+    #[test]
+    fn space_boost_line_formats_levels_and_counts() {
+        assert_eq!(space_boost_line(0, 0), None);
+        assert_eq!(space_boost_line(0, 1), Some("1 boost".into()));
+        assert_eq!(space_boost_line(1, 0), Some("Level 1".into()));
+        assert_eq!(space_boost_line(2, 14), Some("Level 2 · 14 boosts".into()));
+        assert_eq!(space_boost_line(3, 1_250), Some("Level 3 · 1,250 boosts".into()));
     }
 
     #[test]

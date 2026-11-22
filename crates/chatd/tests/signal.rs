@@ -504,13 +504,13 @@ fn reactions_edits_deletes_and_receipts_land_on_the_right_message() {
     assert!(matches!(&custom, Response::Error { code: protocol::ErrorCode::Refused, .. }), "{custom:?}");
     assert!(!world.calls().iter().any(|call| call.contains(":party:")));
     assert_eq!(
-        world.ask(Request::Edit { conversation: key(GRACE), message_id: ours.id.clone(), text: "Sure!".into(), spans: Vec::new() }),
+        world.ask(Request::Edit { conversation: key(GRACE), message_id: ours.id.clone(), text: "Sure!".into(), spans: Vec::new(), suppress_embeds: false, keep_attachments: None }),
         Response::Ok
     );
 
     world.heard(&format!("send {GRACE} edit {ours_at} Sure!"));
     assert!(world.messages(GRACE).iter().any(|m| m.id == ours.id && m.edited && m.text == "Sure!"));
-    let refused = world.ask(Request::Edit { conversation: key(GRACE), message_id: again.id.clone(), text: "Not mine".into(), spans: Vec::new() });
+    let refused = world.ask(Request::Edit { conversation: key(GRACE), message_id: again.id.clone(), text: "Not mine".into(), spans: Vec::new(), suppress_embeds: false, keep_attachments: None });
     assert!(matches!(&refused, Response::Error { detail, .. } if detail.contains("own messages")), "{refused:?}");
     // Grace's phone has ours, then Grace read it.
     assert!(!world.conversation(GRACE).unwrap().delivered);
@@ -826,7 +826,11 @@ fn my_own_profile_shows_and_an_edit_reaches_the_wire() {
             pronouns: None,
             emoji: None,
             username: None,
+            birthday: None,
             photo: false,
+            accent: None,
+            banner: None,
+            space: None,
         }),
         Response::Ok
     );
@@ -850,7 +854,11 @@ fn my_own_profile_shows_and_an_edit_reaches_the_wire() {
         pronouns: None,
         emoji: None,
         username: Some("nope".into()),
+        birthday: None,
         photo: false,
+        accent: None,
+        banner: None,
+        space: None,
     });
     match username {
         Response::Error { code: ErrorCode::Refused, detail } if detail.to_lowercase().contains("phone") => {}
@@ -863,7 +871,11 @@ fn my_own_profile_shows_and_an_edit_reaches_the_wire() {
         pronouns: None,
         emoji: None,
         username: None,
+        birthday: None,
         photo: true,
+        accent: None,
+        banner: None,
+        space: None,
     });
     match photo {
         Response::Error { code: ErrorCode::Refused, detail } if detail.to_lowercase().contains("phone") => {}
@@ -941,7 +953,7 @@ fn styled_text_is_sent_as_ranges_and_a_spoiler_stays_out_of_the_preview() {
         world.messages(GRACE).into_iter().find(|message| message.client_id.as_deref() == Some("5002") && message.id != "5002")
     });
     assert_eq!(answered.reply_to.as_ref().map(|reply| reply.snippet.as_str()), Some("Hold Spoiler"));
-    assert_eq!(world.ask(Request::Edit { conversation: key(GRACE), message_id: styled.id, text: "~~no~~".into(), spans: Vec::new() }), Response::Ok);
+    assert_eq!(world.ask(Request::Edit { conversation: key(GRACE), message_id: styled.id, text: "~~no~~".into(), spans: Vec::new(), suppress_embeds: false, keep_attachments: None }), Response::Ok);
     world.heard(&format!("send {GRACE} edit {styled_at} no ranges=Strike:0+2"));
     let edited = world.until("the strike", || {
         world.messages(GRACE).into_iter().find(|message| message.text == "no" && message.spans.iter().any(|span| span.style == protocol::Style::Strike))
@@ -1080,7 +1092,7 @@ fn deleting_an_old_message_is_delete_for_me() {
     world.connected();
     world.steer(&format!("mine {T0} From the phone"));
     let old = world.arrived(GRACE, &id(T0, ME));
-    let refused = world.ask(Request::Edit { conversation: key(GRACE), message_id: old.id.clone(), text: "Too late".into(), spans: Vec::new() });
+    let refused = world.ask(Request::Edit { conversation: key(GRACE), message_id: old.id.clone(), text: "Too late".into(), spans: Vec::new(), suppress_embeds: false, keep_attachments: None });
     assert!(matches!(&refused, Response::Error { detail, .. } if detail.contains("no longer")), "{refused:?}");
     assert!(!world.calls().iter().any(|call| call.contains(&format!("edit {T0}"))));
     assert_eq!(world.ask(Request::Delete { conversation: key(GRACE), message_id: old.id.clone(), scope: protocol::DeleteScope::Everyone }), Response::Ok);
@@ -1723,7 +1735,7 @@ fn leaving_a_signal_group_checks_sole_admin_and_removes_the_row() {
     // When we are the sole admin and others remain, Leave refuses with "Choose a new admin first."
     world.steer("group-admins me");
     sleep(Duration::from_millis(200));
-    let refused = world.ask(Request::Leave { conversation: key(CLUB) });
+    let refused = world.ask(Request::Leave { conversation: key(CLUB), silent: false });
     assert!(
         matches!(&refused, Response::Error { detail, .. } if detail.contains("Choose a new admin first")),
         "expected sole-admin refusal, got {refused:?}"
@@ -1733,7 +1745,7 @@ fn leaving_a_signal_group_checks_sole_admin_and_removes_the_row() {
     // Once another admin exists, Leave succeeds, reaches the wire, and removes the row.
     world.steer("group-admins me grace");
     sleep(Duration::from_millis(200));
-    assert_eq!(world.ask(Request::Leave { conversation: key(CLUB) }), Response::Ok);
+    assert_eq!(world.ask(Request::Leave { conversation: key(CLUB), silent: false }), Response::Ok);
     let hex_id = CLUB.strip_prefix("g.").unwrap();
     world.heard(&format!("leave-group {hex_id}"));
     world.until("Club row removed", || world.conversation(CLUB).is_none().then_some(()));
@@ -2653,6 +2665,8 @@ fn group_at_mentions_send_and_edit_as_ufffc_with_utf16_body_ranges_and_echo_name
         message_id: echoed.id.clone(),
         text: format!("updated <@{ALAN}>"),
         spans: Vec::new(),
+        suppress_embeds: false,
+        keep_attachments: None,
     });
     assert!(matches!(edit_resp, Response::Ok), "expected edit Ok, got {edit_resp:?}");
     let edited = world.until("edited mention updated locally", || {
@@ -2825,7 +2839,7 @@ fn received_photos_videos_gifs_albums_files_and_quote_thumbs_decrypt_from_cdn_an
     assert!(photo_att.preview.as_ref().and_then(|p| p.path.as_ref()).is_some(), "BlurHash preview should land immediately");
 
     // Trigger download + decrypt via Request::Fetch
-    let _ = world.ask(Request::Fetch { account: account(), ids: vec![photo_att.file.id.clone()], size: None, retry: false });
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![photo_att.file.id.clone()], size: None, retry: false, span: None });
     let photo_path = world.until("photo decrypted to disk", || {
         world
             .messages(GRACE)
@@ -2845,7 +2859,7 @@ fn received_photos_videos_gifs_albums_files_and_quote_thumbs_decrypt_from_cdn_an
     let video_msg = world.arrived(GRACE, &id(T0 + 2_000, GRACE));
     assert_eq!(video_msg.attachments[0].file.kind, protocol::MediaKind::Video);
     assert!(video_msg.attachments[0].thumb.is_some(), "video with BlurHash should expose a poster thumb");
-    let _ = world.ask(Request::Fetch { account: account(), ids: vec![video_msg.attachments[0].file.id.clone()], size: None, retry: false });
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![video_msg.attachments[0].file.id.clone()], size: None, retry: false, span: None });
     let video_path = world.until("video decrypted to disk", || {
         world
             .messages(GRACE)
@@ -2864,7 +2878,7 @@ fn received_photos_videos_gifs_albums_files_and_quote_thumbs_decrypt_from_cdn_an
     ));
     let gif_msg = world.arrived(GRACE, &id(T0 + 3_000, GRACE));
     assert_eq!(gif_msg.attachments[0].file.kind, protocol::MediaKind::Gif);
-    let _ = world.ask(Request::Fetch { account: account(), ids: vec![gif_msg.attachments[0].file.id.clone()], size: None, retry: false });
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![gif_msg.attachments[0].file.id.clone()], size: None, retry: false, span: None });
     let gif_path = world.until("gif decrypted to disk", || {
         world
             .messages(GRACE)
@@ -2885,7 +2899,7 @@ fn received_photos_videos_gifs_albums_files_and_quote_thumbs_decrypt_from_cdn_an
     assert_eq!(pdf_msg.attachments[0].file.kind, protocol::MediaKind::File);
     assert_eq!(pdf_msg.attachments[0].name, "report.pdf");
     assert_eq!(pdf_msg.text, "Q4 summary");
-    let _ = world.ask(Request::Fetch { account: account(), ids: vec![pdf_msg.attachments[0].file.id.clone()], size: None, retry: false });
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![pdf_msg.attachments[0].file.id.clone()], size: None, retry: false, span: None });
     let pdf_path = world.until("pdf decrypted to disk", || {
         world
             .messages(GRACE)
@@ -2907,7 +2921,7 @@ fn received_photos_videos_gifs_albums_files_and_quote_thumbs_decrypt_from_cdn_an
     let album_msg = world.arrived(GRACE, &id(T0 + 5_000, GRACE));
     assert_eq!(album_msg.attachments.len(), 2);
     for att in &album_msg.attachments {
-        let _ = world.ask(Request::Fetch { account: account(), ids: vec![att.file.id.clone()], size: None, retry: false });
+        let _ = world.ask(Request::Fetch { account: account(), ids: vec![att.file.id.clone()], size: None, retry: false, span: None });
     }
     let album_paths = world.until("both album photos decrypted", || {
         let m = world.messages(GRACE).into_iter().find(|m| m.id == album_msg.id)?;
@@ -2930,7 +2944,7 @@ fn received_photos_videos_gifs_albums_files_and_quote_thumbs_decrypt_from_cdn_an
     let reply = quote_msg.reply_to.as_ref().expect("quoted photo reply_to");
     assert_eq!(reply.snippet, "Photo");
     let thumb = reply.thumb.as_ref().expect("quoted photo thumbnail");
-    let _ = world.ask(Request::Fetch { account: account(), ids: vec![thumb.id.clone()], size: None, retry: false });
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![thumb.id.clone()], size: None, retry: false, span: None });
     let thumb_path = world.until("quoted thumbnail decrypted", || {
         world
             .messages(GRACE)
@@ -2948,7 +2962,7 @@ fn received_photos_videos_gifs_albums_files_and_quote_thumbs_decrypt_from_cdn_an
         hex_of(&photo_dig),
     ));
     let gone_msg = world.arrived(GRACE, &id(T0 + 7_000, GRACE));
-    let _ = world.ask(Request::Fetch { account: account(), ids: vec![gone_msg.attachments[0].file.id.clone()], size: None, retry: false });
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![gone_msg.attachments[0].file.id.clone()], size: None, retry: false, span: None });
     let failed_reason = world.until("expired attachment marked failed", || {
         world
             .messages(GRACE)
@@ -3006,7 +3020,7 @@ fn voice_messages_download_populate_waveform_send_viewed_receipt_and_can_be_sent
 
     // 2. Fetching the voice note decrypts/lands it and populates exact duration (2s WAV) and waveform.
     let file_id = voice_msg.attachments[0].file.id.clone();
-    let _ = world.ask(Request::Fetch { account: account(), ids: vec![file_id.clone()], size: None, retry: false });
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![file_id.clone()], size: None, retry: false, span: None });
     let landed = world.until("voice message downloaded with real duration", || {
         let msg = world.messages(GRACE).into_iter().find(|m| m.id == voice_msg.id)?;
         let att = msg.attachments.first()?;
@@ -3024,6 +3038,9 @@ fn voice_messages_download_populate_waveform_send_viewed_receipt_and_can_be_sent
         title: "Voice message".into(),
         at: Some(0),
         rate: 100,
+        round: false,
+        muted: false,
+        looped: false,
         output: None,
     }));
     assert_eq!(play_resp, Response::Ok);
@@ -3039,6 +3056,7 @@ fn voice_messages_download_populate_waveform_send_viewed_receipt_and_can_be_sent
         ids: vec![alan_voice.attachments[0].file.id.clone()],
         size: None,
         retry: false,
+        span: None,
     });
     let alan_path = world.until("alan voice landed", || {
         world
@@ -3057,6 +3075,9 @@ fn voice_messages_download_populate_waveform_send_viewed_receipt_and_can_be_sent
             title: "Voice message".into(),
             at: Some(0),
             rate: 100,
+            round: false,
+            muted: false,
+            looped: false,
             output: None,
         })),
         Response::Ok
@@ -3123,7 +3144,7 @@ fn voice_note_with_a_bad_digest_fails_and_sends_no_viewed_receipt() {
     let voice_msg = world.arrived(GRACE, &id(sent, GRACE));
     let file_id = voice_msg.attachments[0].file.id.clone();
     assert!(voice_msg.attachments[0].file.path.is_none());
-    let _ = world.ask(Request::Fetch { account: account(), ids: vec![file_id.clone()], size: None, retry: false });
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![file_id.clone()], size: None, retry: false, span: None });
     let failed = world.until("bad digest marked failed", || {
         let msg = world.messages(GRACE).into_iter().find(|m| m.id == voice_msg.id)?;
         let file = msg.attachments.first()?.file.clone();
@@ -3144,6 +3165,9 @@ fn voice_note_with_a_bad_digest_fails_and_sends_no_viewed_receipt() {
         title: "Voice message".into(),
         at: Some(0),
         rate: 100,
+        round: false,
+        muted: false,
+        looped: false,
         output: None,
     }));
     assert!(
@@ -3193,6 +3217,7 @@ fn stickers_render_inline_packs_install_sync_persist_and_stickers_send() {
         ids: vec![st_msg.attachments[0].file.id.clone()],
         size: None,
         retry: false,
+        span: None,
     });
     let st_path = world.until("sticker decrypted to disk", || {
         world
@@ -3236,7 +3261,7 @@ fn stickers_render_inline_packs_install_sync_persist_and_stickers_send() {
     assert_eq!(items[0].pack, "Signal Cats");
     assert_eq!(items[0].id, format!("{pack_id}:0"));
     let tile_id = items[0].file.as_ref().expect("catalog sticker tile").id.clone();
-    let _ = world.ask(Request::Fetch { account: account(), ids: vec![tile_id], size: None, retry: false });
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![tile_id], size: None, retry: false, span: None });
     world.heard(&format!("sticker-download {pack_id}:0"));
 
     // 4. Sending a picked sticker goes out on the wire and stores a local sticker attachment.

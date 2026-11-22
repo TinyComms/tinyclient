@@ -36,6 +36,13 @@ struct Reacting {
     message_id: String,
     #[serde(default)]
     emoji: Option<Emoji>,
+    /// True for a Discord super (burst) reaction event; `type == 1` carries the same fact.
+    #[serde(default)]
+    burst: bool,
+    #[serde(rename = "type", default)]
+    kind: u8,
+    #[serde(default)]
+    burst_colors: Vec<String>,
     /// `MESSAGE_REACTION_ADD_MANY`: several people at once. Its shape is from the community
     /// documentation and unconfirmed against a real account.
     #[serde(default)]
@@ -98,6 +105,33 @@ struct ThreadList {
 }
 
 #[derive(Deserialize)]
+struct ThreadMemberUpdate {
+    id: String,
+    #[serde(default)]
+    muted: bool,
+    #[serde(default)]
+    user_id: Option<String>,
+    /// Discord thread notification flags. Absent on older events.
+    #[serde(default)]
+    flags: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct ThreadMemberEntry {
+    #[serde(default)]
+    user_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ThreadMembersUpdate {
+    id: String,
+    #[serde(default)]
+    added_members: Vec<ThreadMemberEntry>,
+    #[serde(default)]
+    removed_member_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
 struct SettingsProto {
     #[serde(default)]
     proto: String,
@@ -132,6 +166,17 @@ struct MemberChange {
 struct RequiredAction {
     #[serde(default)]
     required_action: Option<String>,
+    /// Set when this event names the account. A bare challenge leaves it out.
+    #[serde(default)]
+    user: Option<User>,
+}
+
+#[derive(Deserialize)]
+struct NoteUpdate {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    note: Option<String>,
 }
 
 impl Discord {
@@ -160,6 +205,28 @@ impl Discord {
                     self.thread_changed(thread, true)?;
                 }
             }
+            "THREAD_MEMBER_UPDATE" => {
+                let update: ThreadMemberUpdate = from_str(data)?;
+                let me = self.me();
+                if update.user_id.as_deref().is_none_or(|id| id.is_empty() || id == me) {
+                    self.set_thread_membership(&update.id, true)?;
+                    if let Some(word) = update.flags.and_then(super::info::thread_notify_word) {
+                        self.note_thread_notify(&update.id, word);
+                    }
+                    self.thread_member_updated(update)?;
+                }
+            }
+            "THREAD_MEMBERS_UPDATE" => {
+                let update: ThreadMembersUpdate = from_str(data)?;
+                let me = self.me();
+                if update.added_members.iter().any(|m| m.user_id.as_deref() == Some(me.as_str())) {
+                    self.set_thread_membership(&update.id, true)?;
+                } else if update.removed_member_ids.iter().any(|id| id == &me) {
+                    self.set_thread_membership(&update.id, false)?;
+                }
+                self.ctx.members_changed(&update.id);
+                self.ctx.info_stale(&update.id);
+            }
             "GUILD_CREATE" => self.guild_created(from_str(data)?)?,
             "GUILD_UPDATE" => self.guild_updated(from_str(data)?)?,
             "GUILD_DELETE" => self.guild_deleted(from_str(data)?)?,
@@ -180,16 +247,37 @@ impl Discord {
             "CHANNEL_UNREAD_UPDATE" | "PASSIVE_UPDATE_V2" => self.passive(from_str(data)?)?,
             "USER_UPDATE" => {
                 let user: User = from_str(data)?;
-                // Ours: a new name or picture.
+                // Ours: a new name or picture, and a phone or email that just became verified.
                 if user.id == self.me() {
                     self.myself(&user)?;
+                    if user.nsfw_allowed.is_some() {
+                        self.capabilities(user.premium_type, user.nsfw_allowed == Some(false));
+                    }
+                    self.note_verified(&user)?;
                 }
             }
             "USER_SETTINGS_PROTO_UPDATE" => self.settings_proto(from_str(data)?)?,
+            "USER_NOTE_UPDATE" => {
+                let update: NoteUpdate = from_str(data)?;
+                if !update.id.is_empty() {
+                    self.state
+                        .lock()
+                        .unwrap()
+                        .notes
+                        .insert(update.id.clone(), update.note.unwrap_or_default());
+                    self.ctx.profile_stale(&update.id);
+                }
+            }
             // Discord wants a phone number, an email check or a captcha: nothing more is asked of
-            // it until the user has dealt with that in Discord's own app.
+            // it until the user has dealt with that in Discord's own app. Clearing that flag does
+            // not say the phone or email is verified. A user on this payload does.
             "USER_REQUIRED_ACTION_UPDATE" => {
                 let action: RequiredAction = from_str(data)?;
+                if let Some(user) = action.user.as_ref().filter(|user| user.id == self.me()) {
+                    self.note_verified(user)?;
+                } else if let Some(user) = from_str::<User>(data).ok().filter(|user| user.id == self.me()) {
+                    self.note_verified(&user)?;
+                }
                 match action.required_action.as_deref() {
                     Some(action) => {
                         let what = match action {
@@ -225,8 +313,142 @@ impl Discord {
             "STREAM_DELETE" => self.stream_deleted(data)?,
             "CALL_CREATE" | "CALL_UPDATE" => self.call_changed(from_str(data)?),
             "CALL_DELETE" => self.call_deleted(from_str(data)?),
+            "GUILD_SCHEDULED_EVENT_CREATE" | "GUILD_SCHEDULED_EVENT_UPDATE" => {
+                self.scheduled_event_changed(from_str(data)?)?;
+            }
+            "GUILD_SCHEDULED_EVENT_DELETE" => self.scheduled_event_deleted(from_str(data)?),
+            "GUILD_SCHEDULED_EVENT_USER_ADD" => self.scheduled_event_user(from_str(data)?, true),
+            "GUILD_SCHEDULED_EVENT_USER_REMOVE" => self.scheduled_event_user(from_str(data)?, false),
+            // Live audit log entries arrive when the user has VIEW_AUDIT_LOG; parse leniently
+            // so unknown fields or future action types never disrupt the gateway session.
+            "GUILD_AUDIT_LOG_ENTRY_CREATE" => {
+                let _ = from_str::<super::audit::RawAuditEntry>(data);
+            }
+            "INTERACTION_CREATE" | "INTERACTION_SUCCESS" => self.interaction_settled(from_str(data)?),
+            "INTERACTION_FAILURE" => self.interaction_failed(from_str(data)?),
+            "INTERACTION_MODAL_CREATE" => self.interaction_modal_create(from_str(data)?),
+            "APPLICATION_COMMAND_AUTOCOMPLETE_RESPONSE" => self.autocomplete_response(data),
             _ => {}
         }
+        Ok(())
+    }
+
+    fn scheduled_event_changed(&self, ev: model::ScheduledEvent) -> Result<(), Failure> {
+        let guild = ev.guild_id.clone();
+        if guild.is_empty() || ev.id.is_empty() {
+            return Ok(());
+        }
+        let cover = ev
+            .image
+            .as_deref()
+            .filter(|h| !h.is_empty())
+            .map(|h| model::event_cover(&ev.id, h));
+        let mut notify_info: Option<(String, String, String, String)> = None;
+        {
+            let mut state = self.state.lock().unwrap();
+            let Some(info) = state.guilds.get_mut(&guild) else {
+                return Ok(());
+            };
+            let prev = info.events.get(&ev.id);
+            let was_status = prev.map_or(0, |s| s.event.status);
+            let interested = prev.is_some_and(|s| s.interested);
+            if matches!(ev.status, 3 | 4) {
+                info.events.remove(&ev.id);
+            } else {
+                if super::should_notify_scheduled_event(
+                    was_status,
+                    ev.status,
+                    interested,
+                    info.quiet.mute_scheduled_events,
+                    info.quiet.server_muted(crate::hub::now()),
+                ) {
+                    let place = ev
+                        .entity_metadata
+                        .as_ref()
+                        .and_then(|m| m.location.clone())
+                        .unwrap_or_default();
+                    notify_info = Some((info.name.clone(), ev.id.clone(), ev.name.clone(), place));
+                }
+                info.events.insert(
+                    ev.id.clone(),
+                    super::StoredEvent {
+                        event: ev,
+                        interested,
+                    },
+                );
+            }
+        }
+        if let Some((file, url)) = cover {
+            let _ = self.ctx.media(&[(file, url)]);
+        }
+        if let Some((space_name, event_id, name, mut place)) = notify_info {
+            if place.is_empty() {
+                if let Some(ch) = self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .guilds
+                    .get(&guild)
+                    .and_then(|g| g.events.get(&event_id))
+                    .and_then(|s| s.event.channel_id.clone())
+                {
+                    if let Ok(Some(row)) = self.ctx.known(&ch) {
+                        place = row.title;
+                    }
+                }
+            }
+            self.ctx.scheduled_event_started(&guild, &space_name, &event_id, &name, &place);
+        }
+        self.ctx.events_changed(&guild);
+        Ok(())
+    }
+
+    fn scheduled_event_deleted(&self, ev: model::ScheduledEvent) {
+        if ev.guild_id.is_empty() || ev.id.is_empty() {
+            return;
+        }
+        let removed = {
+            let mut state = self.state.lock().unwrap();
+            state
+                .guilds
+                .get_mut(&ev.guild_id)
+                .is_some_and(|info| info.events.remove(&ev.id).is_some())
+        };
+        if removed {
+            self.ctx.events_changed(&ev.guild_id);
+        }
+    }
+
+    fn scheduled_event_user(&self, change: model::ScheduledEventUser, added: bool) {
+        let changed = {
+            let mut state = self.state.lock().unwrap();
+            let me = state.me.clone();
+            if let Some(stored) = state
+                .guilds
+                .get_mut(&change.guild_id)
+                .and_then(|info| info.events.get_mut(&change.guild_scheduled_event_id))
+            {
+                if change.user_id == me {
+                    stored.interested = added;
+                }
+                let count = stored.event.user_count.unwrap_or(0);
+                stored.event.user_count = Some(if added { count.saturating_add(1) } else { count.saturating_sub(1) });
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            self.ctx.events_changed(&change.guild_id);
+        }
+    }
+    /// Our own thread-member notification settings changed on another device.
+    fn thread_member_updated(&self, update: ThreadMemberUpdate) -> Result<(), Failure> {
+        let member = model::ThreadMember { flags: update.flags.unwrap_or(0), muted: update.muted };
+        let muted = member.notify() == Some(protocol::Notify::Nothing);
+        self.state.lock().unwrap().thread_members.insert(update.id.clone(), member);
+        self.ctx.muted(&update.id, muted)?;
+        self.ctx.info_stale(&update.id);
         Ok(())
     }
 
@@ -306,7 +528,8 @@ impl Discord {
         let guild = posted.guild_id.clone().or_else(|| self.guild_of(&conversation));
         let (message, files) = self.convert(&posted, guild.as_deref(), conversation.kind);
         let always = conversation.kind.is_direct() || conversation.kind == ConversationKind::Thread;
-        if always || message.mentions_me || message.outgoing || self.ctx.newest(&channel)?.is_some() {
+        let opened = crate::hub::lock(&self.state).opened.contains(&channel);
+        if always || message.mentions_me || message.outgoing || opened || self.ctx.newest(&channel)?.is_some() {
             files.register(&self.ctx)?;
             self.thread_of(&posted, &conversation)?;
             self.ctx.message(&channel, &message)?;
@@ -348,12 +571,14 @@ impl Discord {
                 guild: guild.as_deref(),
                 mentions: &posted.mentions,
             };
+            let blur_explicit = !crate::hub::lock(&self.state).show_explicit_media;
             let place = Place {
                 account: &self.ctx.account,
                 me: &me,
                 guild: guild.as_deref(),
                 names: &lookup,
                 author: None,
+                blur_explicit,
             };
             content::patch(&mut stored, &posted, &place)
         };
@@ -364,6 +589,7 @@ impl Discord {
 
     fn reacted(&self, reacting: Reacting, added: bool) -> Result<(), Failure> {
         let me = self.me();
+        let is_burst = reacting.burst || reacting.kind == 1;
         let single = reacting.emoji.iter().map(|emoji| (emoji, std::slice::from_ref(&reacting.user_id)));
         let many = reacting.reactions.iter().map(|many| (&many.emoji, many.users.as_slice()));
         for (emoji, users) in single.chain(many) {
@@ -375,11 +601,14 @@ impl Discord {
                 let reaction = Reaction {
                     emoji: spelled.clone(),
                     file: file.as_ref().map(|(file, _)| file.clone()),
-                    count: 1,
-                    mine: *user == me,
+                    count: if is_burst { 0 } else { 1 },
+                    mine: !is_burst && *user == me,
                     // An event names one id, but a message read from history carries counts
                     // only, so the store keeps no list for Discord.
                     who: Vec::new(),
+                    burst: if is_burst { 1 } else { 0 },
+                    mine_burst: is_burst && *user == me,
+                    burst_colors: if is_burst { reacting.burst_colors.clone() } else { Vec::new() },
                 };
                 self.ctx.reacted(&reacting.channel_id, &reacting.message_id, &reaction, added)?;
             }
@@ -492,16 +721,38 @@ impl Discord {
     /// update carries only what changed, so the status is read from either kind and the order
     /// only from a whole one.
     fn settings_proto(&self, update: SettingsUpdate) -> Result<(), Failure> {
+        // Type 2 is `FrecencyUserSettings`: favourites and frecency for the picker. A partial
+        // update still carries the whole proto Discord sent, so the blob is replaced whole.
+        if update.settings.kind == 2 {
+            if let Some(bytes) = proto::decode_settings(&update.settings.proto) {
+                let mut state = self.state.lock().unwrap();
+                state.frecency = bytes;
+                state.frecency_loaded = true;
+            }
+            self.forget_gif_pages();
+            return Ok(());
+        }
         if update.settings.kind != 1 {
             return Ok(());
         }
         if let Some(status) = proto::status_settings(&update.settings.proto) {
             self.own_status(status);
         }
+        if let Some(privacy) = proto::privacy_settings(&update.settings.proto) {
+            self.state.lock().unwrap().privacy_settings = privacy;
+        }
+        if let Some(text) = proto::text_and_images_settings(&update.settings.proto) {
+            self.state.lock().unwrap().text_and_images = text;
+        }
         if update.partial {
             return Ok(());
         }
+        self.state.lock().unwrap().show_explicit_media = !proto::blur_explicit_media(&update.settings.proto);
+        if let Some(raw_block) = proto::guild_folders_settings(&update.settings.proto) {
+            self.state.lock().unwrap().guild_folders_settings = raw_block;
+        }
         if let Some(folders) = proto::guild_folders(&update.settings.proto) {
+            self.state.lock().unwrap().folders = folders.clone();
             self.record_folders(&folders)?;
         }
         let Some(order) = proto::guild_order(&update.settings.proto) else {

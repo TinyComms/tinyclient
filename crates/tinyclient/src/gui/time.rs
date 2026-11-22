@@ -165,8 +165,23 @@ fn windows_clock() -> Style {
         }
         Some(String::from_utf16_lossy(&buf[..count as usize - 1]))
     }
-    // 0x5c LOCALE_SNAME, 0x23 LOCALE_ITIME, 0x21 LOCALE_IDATE.
-    style_from_locale(&info(0x5c).unwrap_or_default(), info(0x23).as_deref(), info(0x21).as_deref())
+    // 0x23 LOCALE_ITIME, 0x21 LOCALE_IDATE. The name is `user_locale_name` (0x5c LOCALE_SNAME).
+    style_from_locale(&user_locale_name(), info(0x23).as_deref(), info(0x21).as_deref())
+}
+
+#[cfg(windows)]
+fn user_locale_name() -> String {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLocaleInfoW(locale: u32, kind: u32, buf: *mut u16, size: i32) -> i32;
+    }
+    let mut buf = [0u16; 85];
+    // SAFETY: the buffer is writable and its length is passed. 0x400 is LOCALE_USER_DEFAULT, 0x5c is LOCALE_SNAME.
+    let count = unsafe { GetLocaleInfoW(0x400, 0x5c, buf.as_mut_ptr(), buf.len() as i32) };
+    if count <= 1 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buf[..count as usize - 1])
 }
 
 fn clock_in(t: Local, style: Style) -> String {
@@ -180,6 +195,34 @@ fn clock_in(t: Local, style: Style) -> String {
         _ => (t.hour - 12, "PM"),
     };
     format!("{hour}:{:02} {half}", t.minute)
+}
+
+/// The language a translation asks for: the system locale's primary tag, or `en`.
+pub fn system_language() -> String {
+    language_tag(&system_locale())
+}
+
+fn system_locale() -> String {
+    #[cfg(windows)]
+    {
+        return user_locale_name();
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("LC_ALL").or_else(|_| std::env::var("LC_MESSAGES")).or_else(|_| std::env::var("LANG")).unwrap_or_default()
+    }
+}
+
+/// `en-US`, `pt_BR.UTF-8`, and `C` become `en`, `pt`, and `en`.
+fn language_tag(raw: &str) -> String {
+    let primary = raw.trim().split(['-', '_', '.']).next().unwrap_or("");
+    let tag: String = primary.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+    let tag = tag.to_ascii_lowercase();
+    if (2..=3).contains(&tag.len()) {
+        tag
+    } else {
+        "en".to_owned()
+    }
 }
 
 /// `10:37 PM` or `22:37`: a message's time, whatever its age.
@@ -272,6 +315,105 @@ pub fn date(unix: i64) -> String {
     format!("{} {}, {}", MONTHS[t.month % 12], t.day, t.year)
 }
 
+fn clock_long_in(t: Local, second: i32, style: Style) -> String {
+    let sec = second.clamp(0, 59);
+    if style.hour24 {
+        return format!("{:02}:{:02}:{sec:02}", t.hour, t.minute);
+    }
+    let (hour, half) = match t.hour {
+        0 => (12, "AM"),
+        1..=11 => (t.hour, "AM"),
+        12 => (12, "PM"),
+        _ => (t.hour - 12, "PM"),
+    };
+    format!("{hour}:{:02}:{sec:02} {half}", t.minute)
+}
+
+/// Relative words for a `<t:unix:R>` timestamp at `now`, coarse to the minute so a 60-second
+/// redraw timer stays accurate without waking every second.
+pub fn relative(unix: i64, now: i64) -> String {
+    let diff = unix.saturating_sub(now);
+    let future = diff >= 0;
+    let abs = diff.unsigned_abs();
+    let format_unit = |n: u64, unit: &str| {
+        let s = if n == 1 { "" } else { "s" };
+        if future {
+            format!("in {n} {unit}{s}")
+        } else {
+            format!("{n} {unit}{s} ago")
+        }
+    };
+    if abs < 60 {
+        if diff == 0 {
+            "just now".to_owned()
+        } else if future {
+            "in less than a minute".to_owned()
+        } else {
+            "just now".to_owned()
+        }
+    } else if abs < 3_600 {
+        format_unit(abs / 60, "minute")
+    } else if abs < 86_400 {
+        format_unit(abs / 3_600, "hour")
+    } else if abs < 2_592_000 {
+        format_unit(abs / 86_400, "day")
+    } else if abs < 31_536_000 {
+        format_unit((abs / 2_592_000).max(1), "month")
+    } else {
+        format_unit((abs / 31_536_000).max(1), "year")
+    }
+}
+
+/// Formats a Discord `<t:unix:form>` timestamp in the given local breakdown and clock/date style.
+pub fn discord_timestamp_in(then: Local, second: i32, form: char, unix: i64, now: i64, style: Style) -> String {
+    match form {
+        't' => clock_in(then, style),
+        'T' => clock_long_in(then, second, style),
+        'd' => {
+            let (m, d, y) = (then.month + 1, then.day, then.year);
+            if style.month_first {
+                format!("{m:02}/{d:02}/{y}")
+            } else {
+                format!("{d:02}/{m:02}/{y}")
+            }
+        }
+        'D' => {
+            let month = MONTHS_LONG[then.month % 12];
+            if style.month_first {
+                format!("{month} {}, {}", then.day, then.year)
+            } else {
+                format!("{} {month} {}", then.day, then.year)
+            }
+        }
+        'F' => tooltip_in(then, style),
+        'R' => relative(unix, now),
+        _ => {
+            let month = MONTHS_LONG[then.month % 12];
+            let time = clock_in(then, style);
+            if style.month_first {
+                format!("{month} {}, {} at {time}", then.day, then.year)
+            } else {
+                format!("{} {month} {} {time}", then.day, then.year)
+            }
+        }
+    }
+}
+
+/// Formats a Discord `<t:unix:form>` timestamp in the machine's local time zone and clock style.
+pub fn discord_timestamp(unix: i64, form: char, now: i64) -> String {
+    let tm = broken_down_local(unix as libc::time_t);
+    let then = Local {
+        year: 1900 + tm.tm_year,
+        day_of_year: tm.tm_yday,
+        month: tm.tm_mon as usize,
+        day: tm.tm_mday,
+        weekday: tm.tm_wday as usize,
+        hour: tm.tm_hour,
+        minute: tm.tm_min,
+    };
+    discord_timestamp_in(then, tm.tm_sec, form, unix, now, style())
+}
+
 /// A length of time in words: "less than a minute", "1 minute", "14 minutes", "2 hours",
 /// "1 hour 5 minutes", "3 days".
 #[allow(dead_code)]
@@ -362,6 +504,15 @@ mod tests {
     }
 
     #[test]
+    fn a_language_tag_is_the_primary_subtag() {
+        assert_eq!(language_tag("en-US"), "en");
+        assert_eq!(language_tag("pt_BR.UTF-8"), "pt");
+        assert_eq!(language_tag("EN"), "en");
+        assert_eq!(language_tag("C"), "en");
+        assert_eq!(language_tag(""), "en");
+    }
+
+    #[test]
     fn a_row_says_the_time_today_then_yesterday_then_the_weekday_then_the_date() {
         assert_eq!(stamp_in(today(), today(), US), "10:37 PM");
         assert_eq!(stamp_in(today(), today(), UK), "22:37");
@@ -433,5 +584,29 @@ mod tests {
         assert_eq!(duration(3900), "1 hour 5 minutes");
         assert_eq!(duration(7200), "2 hours");
         assert_eq!(duration(3 * 86_400), "3 days");
+    }
+
+    #[test]
+    fn discord_timestamp_follows_locale_style_and_relative_ticks() {
+        let moment = today(); // Tuesday, October 13, 2026, 22:37
+        let unix = 1_791_931_020;
+        assert_eq!(discord_timestamp_in(moment, 5, 't', unix, unix, US), "10:37 PM");
+        assert_eq!(discord_timestamp_in(moment, 5, 't', unix, unix, UK), "22:37");
+        assert_eq!(discord_timestamp_in(moment, 5, 'T', unix, unix, US), "10:37:05 PM");
+        assert_eq!(discord_timestamp_in(moment, 5, 'T', unix, unix, UK), "22:37:05");
+        assert_eq!(discord_timestamp_in(moment, 5, 'd', unix, unix, US), "10/13/2026");
+        assert_eq!(discord_timestamp_in(moment, 5, 'd', unix, unix, UK), "13/10/2026");
+        assert_eq!(discord_timestamp_in(moment, 5, 'D', unix, unix, US), "October 13, 2026");
+        assert_eq!(discord_timestamp_in(moment, 5, 'D', unix, unix, UK), "13 October 2026");
+        assert_eq!(discord_timestamp_in(moment, 5, 'f', unix, unix, US), "October 13, 2026 at 10:37 PM");
+        assert_eq!(discord_timestamp_in(moment, 5, 'f', unix, unix, UK), "13 October 2026 22:37");
+        assert_eq!(discord_timestamp_in(moment, 5, 'F', unix, unix, US), "Tuesday, October 13, 2026 at 10:37 PM");
+
+        // Relative form changes as the clock advances.
+        assert_eq!(discord_timestamp_in(moment, 0, 'R', unix, unix - 7_200, US), "in 2 hours");
+        assert_eq!(discord_timestamp_in(moment, 0, 'R', unix, unix - 300, US), "in 5 minutes");
+        assert_eq!(discord_timestamp_in(moment, 0, 'R', unix, unix + 180, US), "3 minutes ago");
+        assert_eq!(relative(unix, unix - 172_800), "in 2 days");
+        assert_eq!(relative(unix, unix + 31_536_000), "1 year ago");
     }
 }

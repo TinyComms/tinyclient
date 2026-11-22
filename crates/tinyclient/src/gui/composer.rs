@@ -9,8 +9,9 @@
 //!
 //! For the other views, all on `Shell`:
 //! - `composer(open, link, cx)` is the whole dock: the 20 pt typing row, the card, and the line
-//!   under it. Nothing else needs to reserve the typing slot. `thread_composer(thread, title,
-//!   link, cx)` is the same for the thread pane; it sends to the thread's key.
+//!   under it. Nothing else needs to reserve the typing slot. `thread_composer(key, title, rights, link, cx)`
+//!   is the same for the thread pane; it sends to the thread's key and follows that thread's
+//!   slowmode, lock, and archive.
 //! - `composer_edit(message, cx)` and `composer_reply(message, cx)` put the open conversation's
 //!   composer in edit or reply mode; `composer_editing(cx)` is the id of the message being
 //!   edited, for tinting its row.
@@ -39,18 +40,19 @@ mod mention;
 mod niceties;
 mod rec;
 mod schedule;
+mod slash;
 // The picker is the composer's and the reactions'; it lives in `gui/picker`.
 #[path = "picker/mod.rs"]
 pub(in crate::gui) mod picker;
 mod tray;
 mod typing;
 
-pub use typing::preview as typing_preview;
+pub use typing::preview_for as typing_preview_for;
 
 use super::components::place::{max_height, placed, Layer, Place};
 use super::components::{button, glyph, menu, menu_item, menu_item_disabled, menu_label, menu_separator, tip, ButtonKind};
 use super::input::{InputEvent, InputKey, InputList, InputPaste, PickEmoji, PickGifs, SubmitSilently, TextInput};
-use super::people::{ask_later, Hub};
+use super::people::{ask_later, rough_last_seen, Hub};
 use super::playing;
 use super::state::Shell;
 use super::theme::{self, Type};
@@ -69,8 +71,10 @@ use picker::emoji::Custom;
 use picker::images::Images;
 use picker::{Picker, PickerEvent, Setup, Tab};
 use protocol::{
-    AccountKey, Capabilities, CatalogKind, Change, Conversation, ConversationKind, EmojiScope, ErrorCode, Key, Link, Message, MessageKind,
-    Network, OutgoingFile, Page, Person, Pick, RecordRequest, RecordState, Request, Response, SendState, DRAFT_LIMIT,
+    AccountKey, BotCommand, BotKey, BotKeyKind, Capabilities, CatalogKind, Change, Conversation, ConversationKind, ConversationRights, EmojiScope, ErrorCode, Key,
+    Link,
+    Message, MessageKind, Network, OutgoingFile, Page, Person, Pick, RecordRequest, RecordState, ReplyKeyboard, Request, Response,
+    SendState, DRAFT_LIMIT,
 };
 use std::cell::{Cell, OnceCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -230,6 +234,11 @@ fn placeholder_for(target: &Target, thread: bool, replying: bool) -> String {
     }
 }
 
+/// A bot menu button opens only an http or https address.
+fn http_menu(url: &str) -> Option<&str> {
+    (url.starts_with("https://") || url.starts_with("http://")).then_some(url)
+}
+
 /// Slack has no reply outside a thread, so its composer has no reply mode.
 fn replies_inline(network: Network) -> bool {
     network != Network::Slack
@@ -268,6 +277,63 @@ fn delete_later(paths: Vec<PathBuf>) {
     let _ = std::thread::Builder::new().name("outbox".into()).stack_size(64 * 1024).spawn(move || attach::delete_made(&attach::outbox(), &paths));
 }
 
+/// Remaining slowmode cooldown in seconds, or 0 when clear.
+fn slowmode_remaining(until: Option<i64>, now: i64) -> u32 {
+    until.map_or(0, |end| {
+        let left = end.saturating_sub(now).max(0);
+        u32::try_from(left).unwrap_or(u32::MAX)
+    })
+}
+
+/// Formats a slowmode duration in concise units (`30 s`, `2 m`, `1 m 30 s`, `1 h`, `1 h 1 m`).
+fn format_slowmode(seconds: u32) -> String {
+    if seconds >= 3600 {
+        let hours = seconds / 3600;
+        let minutes = (seconds % 3600) / 60;
+        if minutes == 0 {
+            format!("{hours} h")
+        } else {
+            format!("{hours} h {minutes} m")
+        }
+    } else if seconds >= 60 && seconds % 60 == 0 {
+        format!("{} m", seconds / 60)
+    } else if seconds >= 60 {
+        format!("{} m {} s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds} s")
+    }
+}
+
+/// Quiet line under the composer describing slowmode, or `None` when off.
+fn slowmode_words(seconds: u32, until: Option<i64>, now: i64) -> Option<String> {
+    let left = slowmode_remaining(until, now);
+    if left > 0 {
+        Some(format!("Slowmode · {} remaining", format_slowmode(left)))
+    } else if seconds > 0 {
+        Some(format!("Slowmode · {}", format_slowmode(seconds)))
+    } else {
+        None
+    }
+}
+/// Formats a slow-mode countdown in seconds as `m:ss` (or `h:mm:ss` for >= 1 hour).
+pub(crate) fn format_countdown(seconds: u32) -> String {
+    if seconds >= 3600 {
+        format!("{}:{:02}:{:02}", seconds / 3600, (seconds % 3600) / 60, seconds % 60)
+    } else {
+        format!("{}:{:02}", seconds / 60, seconds % 60)
+    }
+}
+
+/// Formats a timed mute expiry (`ban_until`) as a human-readable local time sentence.
+pub(crate) fn format_ban_until(until: i64, now: i64) -> String {
+    let at = crate::gui::time::local(until);
+    if until - now >= 24 * 3600 {
+        format!("You can send messages again on {:04}-{:02}-{:02} at {:02}:{:02}.", at.year, at.month, at.day, at.hour, at.minute)
+    } else {
+        format!("You can send messages again at {:02}:{:02}.", at.hour, at.minute)
+    }
+}
+
 /// Where the composer writes to.
 #[derive(Clone, PartialEq)]
 struct Target {
@@ -281,14 +347,30 @@ struct Target {
     peer: Option<String>,
     read_only: bool,
     read_only_reason: String,
+    /// Why voice and round video messages are not allowed in this conversation. Empty when allowed.
+    voice_notes_forbidden: String,
     joined: bool,
     /// When this direct conversation's peer is blocked, the composer is replaced by an unblock bar.
     blocked_peer: Option<protocol::Person>,
     special: protocol::Special,
+    /// A Telegram bot, so `/` lists its commands and an empty chat can Start.
+    bot: bool,
+    /// The direct peer hides an exact last-seen time (Telegram's rough "last seen …" words).
+    hidden_last_seen: bool,
     /// What the account may send.
     can: Capabilities,
     /// Selectable sending identities or lines (e.g. dual-SIM cards on Messages).
     send_as: Vec<protocol::SendAs>,
+    /// Slowmode interval in seconds (the raw interval; 0 when off). Exemption is `rights.slowmode_exempt`.
+    slowmode_seconds: u32,
+    /// Unix seconds until the next send is allowed in this conversation.
+    slowmode_until: Option<i64>,
+    /// Per-conversation rights (used for Discord thread creation in the composer).
+    rights: protocol::ConversationRights,
+    /// Thread is archived (Discord).
+    archived: bool,
+    /// Thread is locked by a moderator (Discord).
+    locked: bool,
 }
 
 /// Why nothing can be typed here, when that is so.
@@ -309,7 +391,6 @@ impl Target {
             _ if !self.joined => Some(Locked::NotJoined),
             _ if self.special == protocol::Special::Request => Some(Locked::MessageRequest),
             _ if self.blocked_peer.is_some() => Some(Locked::Blocked(self.blocked_peer.clone().unwrap())),
-            (_, ConversationKind::Forum) => Some(Locked::ReadOnly("Posts in a forum are started in the network's app.".to_owned())),
             _ if self.read_only => {
                 let why = if self.read_only_reason.is_empty() {
                     format!("You can read {} but not post in it.", self.title)
@@ -318,6 +399,7 @@ impl Target {
                 };
                 Some(Locked::ReadOnly(why))
             }
+            (_, ConversationKind::Forum) => Some(Locked::ReadOnly("Start a post with New post.".to_owned())),
             _ => None,
         }
     }
@@ -457,10 +539,30 @@ struct PollComposer {
     max_options: usize,
 }
 
+struct ThreadComposer {
+    name: Entity<TextInput>,
+    first_message: Entity<TextInput>,
+    private: bool,
+    allow_private: bool,
+    auto_archive_minutes: u32,
+}
+
+struct ThreadSettings {
+    name: Entity<TextInput>,
+    confirm_delete: bool,
+}
+
 struct Editing {
     id: String,
     /// The message as it was put in the field: saving this unchanged is a cancel.
     original: String,
+    /// Removable attachments present when edit mode started: `(file_id, display_name)`.
+    original_attachments: Vec<(String, String)>,
+    /// Remaining attachments kept by the user during this edit.
+    attachments: Vec<(String, String)>,
+    /// The message being edited carries media (photo/file), so an empty caption is allowed
+    /// and networks with `Capabilities::edit_media` may replace the attachment.
+    has_media: bool,
     /// What was in the field before, and the reply it was for. Back on save or cancel.
     stash: Draft,
     reply: Option<Reply>,
@@ -492,6 +594,8 @@ struct Outgoing {
     made: Vec<PathBuf>,
     /// The send carried a voice note, so its facts and file can leave with it.
     note: bool,
+    /// Recorded voice note & chip kept until chatd confirms the send succeeded (so a refusal keeps the note in the tray).
+    voice_chip: Option<(Rec, Staged)>,
 }
 
 /// A drag of files over the window, while it is over this composer's conversation.
@@ -552,6 +656,12 @@ pub struct Composer {
     /// One line under the card, until the text changes: why something did not happen.
     caption: Option<(String, Tone)>,
     sending: bool,
+    /// A join is already on its way. Another click does not send a second one.
+    joining: bool,
+    /// Which click `joining` belongs to. A late answer for an older click does not clear a newer one.
+    join_epoch: u64,
+    /// The conversation just joined, until the user leaves it or undoes the join.
+    undo_join: Option<Key>,
     /// The conversation the network was last told we are typing in, and when.
     told_typing: Option<(Key, Instant)>,
     list: Option<List>,
@@ -591,6 +701,8 @@ pub struct Composer {
     anchors: Rc<Anchors>,
     /// The recording of this conversation, as chatd said it (`Change::Recording`).
     recording: Option<Rec>,
+    /// The mic records a round video message instead of a voice note. Telegram only.
+    video_note: bool,
     /// The mic held down (push-to-talk), and the conversation the hold began in: the next
     /// release stops that one's recording after the grace, wherever the composer has gone since.
     holding: Option<Key>,
@@ -603,6 +715,8 @@ pub struct Composer {
     /// The facts of the note that arrived (`Recorded`): a send is sent with them, and this
     /// composer answers a removed chip with them.
     note: Option<Rec>,
+    /// Voice note send waiting on network settlement: restored to the tray if Telegram refuses it.
+    held_voice: Option<(Key, String, Rec, Staged)>,
     /// Tiny file sends whose chips stay until the upload and the message have both settled.
     /// One hold per client id, so a second channel does not discard the first.
     held_files: crate::tiny_attach::Holds<Outgoing>,
@@ -611,6 +725,10 @@ pub struct Composer {
     pending_file: Option<(Key, String)>,
     /// Inline poll creation form when the user clicks "Create poll".
     poll_composer: Option<PollComposer>,
+    /// Inline Discord thread creation form when the user clicks "Create thread".
+    thread_composer: Option<ThreadComposer>,
+    /// Inline Discord thread management panel when the user clicks "Thread settings".
+    thread_settings: Option<ThreadSettings>,
     /// Explicit per-conversation `send_as` choice (e.g. SIM card on a dual-SIM phone).
     /// Never changed unless the user explicitly clicks the selector.
     send_as: HashMap<Key, String>,
@@ -627,11 +745,45 @@ pub struct Composer {
     /// Cached mentionable team tags per Space (Teams `@tag` completion).
     space_tags: HashMap<Key, Vec<protocol::TeamTag>>,
     space_tags_asked: HashSet<Key>,
+    /// One-second ticker while a slowmode countdown is active; never auto-sends.
+    discord_slowmode_timer: Option<Task<()>>,
+    /// Slash command completion popover (`/` at start of composer) and cached commands per conversation.
+    app_slash: Option<slash::List>,
+    app_commands: HashMap<Key, Vec<protocol::AppCommand>>,
+    slash_loaded: HashSet<Key>,
+    app_slash_dismissed: bool,
+    slash_lookup: Option<Task<()>>,
+    /// Per-conversation send rules (slow mode, media bans, timed mute, paid Stars) keyed by conversation.
+    send_rules: HashMap<Key, protocol::SendRules>,
+    /// 1-second ticker while the current conversation has an active slow-mode countdown.
+    slowmode_timer: Option<Task<()>>,
+    /// Explicit confirmation for a paid-message Stars send (`(conversation, field text)`).
+    paid_confirmed: Option<(Key, String)>,
+    /// Bot commands for `/` completion, loaded when a bot chat is opened.
+    commands: Vec<BotCommand>,
+    menu_label: String,
+    menu_url: String,
+    /// Escape closed the slash list for this query. A different query shows it again.
+    slash_closed: Option<String>,
+    slash_at: usize,
+    /// Message id of a single-use reply keyboard already pressed in this chat.
+    used_keyboard: Option<(Key, String)>,
+    /// Phone, location, or chat share waiting on an explicit confirm.
+    bot_confirm: Option<BotAsk>,
+    /// Reply-keyboard placeholder last applied, so a frame does not reset it.
+    keyboard_hint: Option<String>,
     /// Slack `/` slash-command completion state and cached workspace commands (#602).
     slash: Option<SlashList>,
     slash_dismissed: bool,
     slash_commands: HashMap<AccountKey, Vec<protocol::SlashCommand>>,
     slash_asked: HashSet<AccountKey>,
+}
+
+/// A reply-keyboard button that shares something, held until the person confirms.
+struct BotAsk {
+    kind: BotKeyKind,
+    message_id: String,
+    single_use: bool,
 }
 
 struct SlashList {
@@ -788,6 +940,9 @@ impl Composer {
             editing: None,
             caption: None,
             sending: false,
+            joining: false,
+            join_epoch: 0,
+            undo_join: None,
             told_typing: None,
             list: None,
             dismissed: None,
@@ -814,13 +969,17 @@ impl Composer {
             schedule_at: None,
             anchors: Rc::new(Anchors::default()),
             recording: None,
+            video_note: false,
             holding: None,
             release: None,
             owed_stop: None,
             note: None,
+            held_voice: None,
             held_files: crate::tiny_attach::Holds::default(),
             pending_file: None,
             poll_composer: None,
+            thread_composer: None,
+            thread_settings: None,
             send_as: HashMap::new(),
             importance: protocol::Importance::Normal,
             broadcast: false,
@@ -830,6 +989,23 @@ impl Composer {
             peer_away_gen: HashMap::new(),
             space_tags: HashMap::new(),
             space_tags_asked: HashSet::new(),
+            discord_slowmode_timer: None,
+            app_slash: None,
+            app_commands: HashMap::new(),
+            slash_loaded: HashSet::new(),
+            app_slash_dismissed: false,
+            slash_lookup: None,
+            send_rules: HashMap::new(),
+            slowmode_timer: None,
+            paid_confirmed: None,
+            commands: Vec::new(),
+            menu_label: String::new(),
+            menu_url: String::new(),
+            slash_closed: None,
+            slash_at: 0,
+            used_keyboard: None,
+            bot_confirm: None,
+            keyboard_hint: None,
             slash: None,
             slash_dismissed: false,
             slash_commands: HashMap::new(),
@@ -846,9 +1022,73 @@ impl Composer {
         });
     }
 
+    fn current_send_rules(&self) -> Option<&protocol::SendRules> {
+        self.target.as_ref().and_then(|target| self.send_rules.get(&target.key))
+    }
+
+    fn slowmode_wait(&self) -> u32 {
+        if self.editing.is_some() {
+            return 0;
+        }
+        self.current_send_rules().map_or(0, |rules| rules.slowmode_remaining(now()))
+    }
+
+    fn locked_for(&self, target: &Target) -> Option<Locked> {
+        let rules = self.send_rules.get(&target.key);
+        let timed_mute = rules.and_then(|r| {
+            let until = r.ban_until?;
+            let current = now();
+            (!r.send_messages && until > current).then(|| format_ban_until(until, current))
+        });
+        match target.locked() {
+            Some(Locked::ReadOnly(_)) if timed_mute.is_some() => Some(Locked::ReadOnly(timed_mute.unwrap())),
+            Some(locked) => Some(locked),
+            None => timed_mute.map(Locked::ReadOnly).or_else(|| {
+                rules.filter(|r| !r.send_messages).map(|_| {
+                    Locked::ReadOnly(format!("You can read {} but not post in it.", target.title))
+                })
+            }),
+        }
+    }
+
+    fn ensure_slowmode_timer(&mut self, cx: &mut Context<Self>) {
+        if self.slowmode_wait() == 0 {
+            self.slowmode_timer = None;
+            return;
+        }
+        if self.slowmode_timer.is_some() {
+            return;
+        }
+        self.slowmode_timer = Some(cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            let keep = this.update(cx, |this, cx| {
+                let remaining = this.slowmode_wait();
+                cx.notify();
+                if remaining == 0 {
+                    this.slowmode_timer = None;
+                    false
+                } else {
+                    true
+                }
+            });
+            if !matches!(keep, Ok(true)) {
+                return;
+            }
+        }));
+    }
+
     fn controls(&self) -> Controls {
         match &self.target {
-            Some(target) => controls(&target.can, self.editing.is_some()),
+            Some(target) => {
+                let mut c = controls(&target.can, self.editing.is_some());
+                if target.can.edit_media && target.can.max_file_bytes > 0 && self.editing.as_ref().is_some_and(|e| e.has_media) {
+                    c.attach = true;
+                }
+                match self.send_rules.get(&target.key) {
+                    Some(rules) => c.apply_rules(rules),
+                    None => c,
+                }
+            }
             None => Controls::default(),
         }
     }
@@ -879,11 +1119,36 @@ impl Composer {
             self.reply = draft.reply;
             self.caption = self.scan_caption_for(&target.key).or(note);
             self.sending = false;
+            self.joining = false;
+            self.undo_join = None;
             self.no_preview = false;
             self.broadcast = false;
             self.armed = None;
+            self.paid_confirmed = None;
+            self.slowmode_timer = None;
+            self.commands.clear();
+            self.menu_label.clear();
+            self.menu_url.clear();
+            self.slash_closed = None;
+            self.slash_at = 0;
+            self.bot_confirm = None;
+            self.keyboard_hint = None;
+            self.used_keyboard = None;
             self.focus_next = true;
             picker::emoji::set_account(Some(&target.key.account()));
+            if live() && target.link == Link::Connected {
+                let key = target.key.clone();
+                let this = cx.weak_entity();
+                ask_later(cx, Request::SendRules { conversation: key.clone() }, move |answer, cx| {
+                    if let Ok(Response::SendRules { conversation, rules }) = answer {
+                        let _ = this.update(cx, |this, cx| {
+                            this.send_rules.insert(conversation, rules);
+                            this.ensure_slowmode_timer(cx);
+                            cx.notify();
+                        });
+                    }
+                });
+            }
         } else if self.offered != stored {
             // The row was read after the conversation opened: its draft is still wanted if
             // nothing has been typed in the meantime.
@@ -908,6 +1173,11 @@ impl Composer {
         });
         self.maybe_fetch_peer_away(&target, cx);
         self.target = Some(target);
+        self.schedule_slowmode_tick(cx);
+        if moved {
+            self.ensure_slowmode_timer(cx);
+            self.load_bot_menu(cx);
+        }
         cx.notify();
     }
 
@@ -987,6 +1257,315 @@ impl Composer {
         }
     }
 
+    fn slowmode_left(&self) -> u32 {
+        self.target
+            .as_ref()
+            .map_or(0, |target| slowmode_remaining(target.slowmode_until, now()))
+    }
+
+    /// True while a non-exempt account is still inside its slowmode cooldown.
+    fn slowmode_blocks(&self) -> bool {
+        let exempt = self.target.as_ref().is_some_and(|target| target.rights.slowmode_exempt);
+        !exempt && self.slowmode_left() > 0
+    }
+
+    /// Runs a 1-second repaint ticker only while a slowmode countdown is active. Never auto-sends.
+    fn schedule_slowmode_tick(&mut self, cx: &mut Context<Self>) {
+        if self.slowmode_left() == 0 {
+            self.discord_slowmode_timer = None;
+            return;
+        }
+        if self.discord_slowmode_timer.is_some() {
+            return;
+        }
+        self.discord_slowmode_timer = Some(cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            let keep = this.update(cx, |this, cx| {
+                let left = this.slowmode_left();
+                let _ = this.shell.update(cx, |_, cx| cx.notify());
+                cx.notify();
+                if left == 0 {
+                    this.discord_slowmode_timer = None;
+                    false
+                } else {
+                    true
+                }
+            });
+            if !matches!(keep, Ok(true)) {
+                return;
+            }
+        }));
+    }
+
+    fn load_bot_menu(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.target.clone() else {
+            return;
+        };
+        if !target.bot || target.key.network != Network::Telegram {
+            return;
+        }
+        let key = target.key.clone();
+        let this = cx.weak_entity();
+        ask_later(cx, Request::GetBotMenu { conversation: key }, move |answer, cx| {
+            let _ = this.update(cx, |this, cx| {
+                let Ok(Response::BotMenu { conversation, menu }) = answer else {
+                    return;
+                };
+                if this.target.as_ref().is_some_and(|target| target.key == conversation) {
+                    this.commands = menu.commands;
+                    this.menu_label = menu.menu_label;
+                    this.menu_url = menu.menu_url;
+                    this.sync_slash_keys(cx);
+                    cx.notify();
+                }
+            });
+        });
+    }
+
+    fn slash_query(&self, cx: &App) -> Option<String> {
+        let rest = self.input.read(cx).text().strip_prefix('/')?;
+        if rest.chars().any(char::is_whitespace) {
+            return None;
+        }
+        Some(rest.to_owned())
+    }
+
+    fn slash_rows(&self, query: &str) -> Vec<BotCommand> {
+        let query = query.trim_start_matches('/').to_ascii_lowercase();
+        self.commands
+            .iter()
+            .filter(|cmd| query.is_empty() || cmd.command.to_ascii_lowercase().starts_with(&query))
+            .take(8)
+            .cloned()
+            .collect()
+    }
+
+    fn slash_open(&self, cx: &App) -> bool {
+        if self.editing.is_some() {
+            return false;
+        }
+        let Some(query) = self.slash_query(cx) else {
+            return false;
+        };
+        self.slash_closed.as_deref() != Some(query.as_str()) && !self.slash_rows(&query).is_empty()
+    }
+
+    /// Return and the arrows belong to the command list while it has a row.
+    fn sync_slash_keys(&mut self, cx: &mut Context<Self>) {
+        if self.list.is_some() || self.colon.is_some() {
+            return;
+        }
+        let open = self.slash_open(cx);
+        if open {
+            let n = self.slash_rows(&self.slash_query(cx).unwrap_or_default()).len();
+            if n == 0 || self.slash_at >= n {
+                self.slash_at = 0;
+            }
+        }
+        self.input.update(cx, |input, _| input.set_list_open(open));
+    }
+
+    fn highlighted_slash(&self, cx: &App) -> Option<String> {
+        if !self.slash_open(cx) {
+            return None;
+        }
+        let query = self.slash_query(cx)?;
+        self.slash_rows(&query).get(self.slash_at).map(|cmd| cmd.command.clone())
+    }
+
+    fn accept_slash(&mut self, command: String, cx: &mut Context<Self>) {
+        self.slash_closed = Some(command.clone());
+        let text = format!("/{command}");
+        self.input.update(cx, |input, cx| input.set_text(&text, cx));
+        self.input.update(cx, |input, _| input.set_list_open(false));
+        self.follow_text(cx);
+        self.send(false, cx);
+    }
+
+    fn open_bot_url(&self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            return;
+        }
+        let url = url.to_owned();
+        let _ = self.shell.update(cx, |shell, cx| shell.open_pane_link(&url, window, cx));
+    }
+
+    fn note_keyboard_hint(&mut self, hint: Option<String>, cx: &mut Context<Self>) {
+        if self.keyboard_hint == hint {
+            return;
+        }
+        self.keyboard_hint = hint.clone();
+        let target = self.target.clone();
+        let thread = self.thread;
+        let replying = self.reply.is_some();
+        let this = cx.weak_entity();
+        cx.defer(move |cx| {
+            let _ = this.update(cx, |this, cx| {
+                let shown = hint.filter(|hint| !hint.is_empty()).unwrap_or_else(|| {
+                    target.as_ref().map(|target| placeholder_for(target, thread, replying)).unwrap_or_default()
+                });
+                this.input.update(cx, |input, cx| {
+                    input.set_placeholder(shown);
+                    cx.notify();
+                });
+            });
+        });
+    }
+
+    fn shown_keyboard(&self, cx: &App) -> Option<(String, ReplyKeyboard)> {
+        let target = self.target.as_ref()?;
+        if target.key.network != Network::Telegram {
+            return None;
+        }
+        let shell = self.shell.upgrade()?;
+        let found = shell.read(cx).bot_reply_keyboard(&target.key, cx)?;
+        if self.used_keyboard.as_ref().is_some_and(|(key, id)| key == &target.key && id == &found.0) {
+            return None;
+        }
+        Some(found)
+    }
+
+    fn press_bot_key(&mut self, key: BotKey, message_id: String, single_use: bool, window: &mut Window, cx: &mut Context<Self>) {
+        match key.kind {
+            BotKeyKind::Url => {
+                if let Some(url) = key.url.clone() {
+                    self.open_bot_url(&url, window, cx);
+                }
+                if single_use {
+                    self.mark_keyboard(message_id);
+                }
+            }
+            BotKeyKind::Phone | BotKeyKind::Location | BotKeyKind::Peer => {
+                self.bot_confirm = Some(BotAsk { kind: key.kind, message_id, single_use });
+                cx.notify();
+            }
+            BotKeyKind::Text => {
+                self.mark_keyboard_if(message_id, single_use);
+                self.input.update(cx, |input, cx| input.set_text(&key.text, cx));
+                self.follow_text(cx);
+                self.send(false, cx);
+            }
+        }
+    }
+
+    fn mark_keyboard_if(&mut self, message_id: String, single_use: bool) {
+        if single_use {
+            self.mark_keyboard(message_id);
+        }
+    }
+
+    fn mark_keyboard(&mut self, message_id: String) {
+        if let Some(key) = self.target.as_ref().map(|target| target.key.clone()) {
+            self.used_keyboard = Some((key, message_id));
+        }
+    }
+
+    fn confirm_bot_share(&mut self, cx: &mut Context<Self>) {
+        let Some(ask) = self.bot_confirm.take() else {
+            return;
+        };
+        let Some(target) = self.target.clone() else {
+            return;
+        };
+        self.mark_keyboard_if(ask.message_id, ask.single_use);
+        match ask.kind {
+            BotKeyKind::Phone => {
+                let this = cx.weak_entity();
+                ask_later(cx, Request::SharePhone { conversation: target.key }, move |answer, cx| {
+                    let _ = this.update(cx, |this, cx| {
+                        let detail = match answer {
+                            Ok(Response::Error { detail, .. }) => Some(detail),
+                            Err(err) => Some(err.to_string()),
+                            _ => None,
+                        };
+                        if let Some(detail) = detail {
+                            this.caption = Some((detail, Tone::Refused));
+                            cx.notify();
+                        }
+                    });
+                });
+            }
+            BotKeyKind::Location => {
+                self.caption = Some(("This app has no location to share.".to_owned(), Tone::Note));
+            }
+            BotKeyKind::Peer => {
+                self.caption = Some(("This app cannot pick a chat to share.".to_owned(), Tone::Note));
+            }
+            BotKeyKind::Text | BotKeyKind::Url => {}
+        }
+        cx.notify();
+    }
+
+    fn bot_strip(&mut self, target: &Target, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if target.key.network != Network::Telegram {
+            return None;
+        }
+        if let Some(ask) = self.bot_confirm.as_ref() {
+            let words = match ask.kind {
+                BotKeyKind::Phone => "Share your phone number with this bot?",
+                BotKeyKind::Location => "Share your location with this bot?",
+                BotKeyKind::Peer => "Share a chat with this bot?",
+                BotKeyKind::Text | BotKeyKind::Url => "Send this?",
+            };
+            let row = div()
+                .mt(px(8.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(div().flex_1().min_w_0().type_small().child(words))
+                .child(button("bot-share", ButtonKind::Primary, "Share").on_click(cx.listener(|this, _, _, cx| this.confirm_bot_share(cx))))
+                .child(button("bot-share-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                    this.bot_confirm = None;
+                    cx.notify();
+                })));
+            return Some(row.into_any_element());
+        }
+        let mut column = div().flex().flex_col().gap(px(6.));
+        let mut any = false;
+        if target.bot && self.shell.upgrade().is_some_and(|shell| shell.read(cx).bot_can_start(&target.key, cx)) {
+            any = true;
+            column = column.child(
+                button("bot-start", ButtonKind::Primary, "Start").on_click(cx.listener(|this, _, _, cx| {
+                    let Some(key) = this.target.as_ref().map(|target| target.key.clone()) else {
+                        return;
+                    };
+                    let _ = this.shell.update(cx, |shell, cx| shell.start_bot(key, String::new(), cx));
+                })),
+            );
+        }
+        if let Some(url) = http_menu(&self.menu_url) {
+            any = true;
+            let label: gpui::SharedString = if self.menu_label.is_empty() { "Menu".into() } else { self.menu_label.clone().into() };
+            let url = url.to_owned();
+            column = column.child(button("bot-menu", ButtonKind::Secondary, label).on_click(cx.listener(move |this, _, window, cx| {
+                let url = url.clone();
+                this.open_bot_url(&url, window, cx);
+            })));
+        }
+        if let Some((message_id, board)) = self.shown_keyboard(cx) {
+            any = true;
+            let hint = board.placeholder.clone().filter(|hint| self.input.read(cx).text().is_empty());
+            self.note_keyboard_hint(hint, cx);
+            let single_use = board.single_use;
+            let mut keys = div().flex().gap(px(6.)).when(board.resize, |row| row.flex_wrap());
+            for (row_ix, row) in board.rows.iter().enumerate() {
+                for (col, key) in row.iter().enumerate() {
+                    let pressed = key.clone();
+                    let id = message_id.clone();
+                    keys = keys.child(button(("bot-key", row_ix * 8 + col), ButtonKind::Secondary, key.text.clone()).on_click(cx.listener(
+                        move |this, _, window, cx| {
+                            this.press_bot_key(pressed.clone(), id.clone(), single_use, window, cx);
+                        },
+                    )));
+                }
+            }
+            column = column.child(keys);
+        } else if self.keyboard_hint.is_some() {
+            self.note_keyboard_hint(None, cx);
+        }
+        any.then(|| column.mt(px(8.)).into_any_element())
+    }
+
     /// Leaving a conversation: an edit ends, and the draft is saved and kept for the way back,
     /// its chips and the message it answers with it.
     fn leave(&mut self, cx: &mut Context<Self>) {
@@ -996,6 +1575,8 @@ impl Composer {
         self.schedule_day = None;
         self.schedule_at = None;
         self.draft_timer = None;
+        self.thread_composer = None;
+        self.thread_settings = None;
         self.close_picker(cx);
         self.chip_menu = None;
         let files = std::mem::take(&mut self.tray);
@@ -1156,9 +1737,11 @@ impl Composer {
         self.follow_text(cx);
         self.touched = true;
         self.caption = None;
-        // Any edit disarms the large-ping confirm.
+        // Any edit disarms the large-ping confirm and paid-message confirm.
         self.armed = None;
+        self.paid_confirmed = None;
         self.look_up(cx);
+        self.sync_slash_keys(cx);
         cx.notify();
         let Some(target) = &self.target else {
             return;
@@ -1188,23 +1771,34 @@ impl Composer {
 
     /// Escape: the first that applies. It never clears what was typed.
     fn escape(&mut self, cx: &mut Context<Self>) {
+        let app_slash = self.app_slash.take();
+        if self.slash_open(cx) {
+            self.slash_closed = self.slash_query(cx);
+            self.input.update(cx, |input, _| input.set_list_open(false));
+            cx.notify();
+            return;
+        }
         let slash = self.slash.take();
         let list = self.list.take();
         let colon = self.colon.take();
         self.close_list(cx);
         // A list with no row was never on screen, so Escape is not spent on it.
-        if slash.is_some_and(|slash| !slash.rows.is_empty()) {
+        if app_slash.is_some_and(|s| !s.is_empty()) {
+            self.app_slash_dismissed = true;
+        } else if slash.is_some_and(|slash| !slash.rows.is_empty()) {
             self.slash_dismissed = true;
         } else if let Some(list) = list.filter(|list| !list.rows.is_empty()) {
             self.dismissed = Some(list.trigger.start);
         } else if let Some(colon) = colon.filter(|colon| !colon.cells.is_empty()) {
             self.colon_dismissed = Some(colon.trigger.start);
-        } else if self.armed.take().is_some() {
+        } else if self.armed.take().is_some() || self.paid_confirmed.take().is_some() {
             self.caption = None;
             self.schedule_at = None;
         } else if self.chip_menu.take().is_some() || self.send_menu {
             self.send_menu = false;
             self.schedule_day = None;
+        } else if self.thread_composer.take().is_some() || self.thread_settings.take().is_some() {
+            // Closed inline thread panel.
         } else if self.editing.is_some() {
             self.end_edit(cx);
         } else if self.reply.take().is_some() {
@@ -1229,6 +1823,15 @@ impl Composer {
     /// stored by chatd. A refusal (signed out, or a file) stays here: text is held for a
     /// minute, and files wait in the tray.
     pub fn send(&mut self, silent: bool, cx: &mut Context<Self>) {
+        // Return on an open command list sends that command. The list is closed first, so this
+        // does not ask the list again.
+        if let Some(command) = self.highlighted_slash(cx) {
+            self.slash_closed = Some(command.clone());
+            let text = format!("/{command}");
+            self.input.update(cx, |input, cx| input.set_text(&text, cx));
+            self.input.update(cx, |input, _| input.set_list_open(false));
+            self.follow_text(cx);
+        }
         let Some(target) = self.target.clone() else {
             self.schedule_at = None;
             return;
@@ -1237,7 +1840,7 @@ impl Composer {
         if self.sending {
             return;
         }
-        if self.scan_blocks(&target.key) || target.locked().is_some() {
+        if self.scan_blocks(&target.key) || self.locked_for(&target).is_some() {
             self.schedule_at = None;
             return;
         }
@@ -1245,6 +1848,21 @@ impl Composer {
             self.schedule_at = None;
             self.save_edit(&target, cx);
             return;
+        }
+        if self.slowmode_blocks() {
+            self.schedule_at = None;
+            self.schedule_slowmode_tick(cx);
+            cx.notify();
+            return;
+        }
+        if self.schedule_at.is_none() {
+            let wait = self.slowmode_wait();
+            if wait > 0 {
+                self.caption = Some((format!("Slow mode is on. You can send again in {}.", format_countdown(wait)), Tone::Note));
+                self.ensure_slowmode_timer(cx);
+                cx.notify();
+                return;
+            }
         }
         self.follow_text(cx);
         self.send_menu = false;
@@ -1266,6 +1884,18 @@ impl Composer {
         if !live() {
             self.schedule_at = None;
             return;
+        }
+        if field.trim_start().starts_with('/') {
+            let matched = self
+                .app_commands
+                .get(&target.key)
+                .and_then(|cmds| slash::parse_invocation(&field, cmds))
+                .map(|(cmd, args)| (cmd.clone(), args));
+            if let Some((cmd, arguments)) = matched {
+                self.schedule_at = None;
+                self.run_slash_command(target.key.clone(), cmd, arguments, cx);
+                return;
+            }
         }
         let network = target.key.network;
         let emoticons = super::app::prefs::choices().emoticons;
@@ -1297,11 +1927,50 @@ impl Composer {
             }
         }
         self.armed = None;
+        let paid_stars = self
+            .current_send_rules()
+            .and_then(|rules| rules.paid_stars)
+            .filter(|&stars| stars > 0);
+        let allow_paid_stars = if let Some(stars) = paid_stars {
+            let paid_ok = self.paid_confirmed.as_ref().is_some_and(|(k, text)| *k == target.key && *text == field);
+            if !paid_ok {
+                self.paid_confirmed = Some((target.key.clone(), field));
+                self.caption = Some((
+                    format!("Sending here costs {stars} Telegram Stars. Press Send again to confirm."),
+                    Tone::Warning,
+                ));
+                cx.notify();
+                return;
+            }
+            self.paid_confirmed = None;
+            Some(stars)
+        } else {
+            self.paid_confirmed = None;
+            None
+        };
         let controls = self.controls();
         let hosts = niceties::link_hosts(&field);
         let reply_to = self.reply.as_ref().map(|reply| reply.id.clone());
-        let files: Vec<OutgoingFile> = self.tray.iter().filter_map(Staged::outgoing).collect();
+        let mut files: Vec<OutgoingFile> = self.tray.iter().filter_map(Staged::outgoing).collect();
         let voice = rec::sent_as(&self.note, &files);
+        let voice_chip = voice.as_ref().and_then(|_| {
+            let rec = self.note.clone()?;
+            let chip = self.tray.iter().find(|chip| rec::holds_the_note(&self.note, chip)).cloned()?;
+            Some((rec, chip))
+        });
+        let video = rec::sent_video(&self.note, &files);
+        if let Some(note) = &video {
+            if let Some(file) = files.first_mut() {
+                file.as_file = false;
+                file.media = Some(protocol::OutgoingMedia {
+                    duration_ms: Some(note.duration),
+                    width: Some(note.side),
+                    height: Some(note.side),
+                    thumb: self.note.as_ref().and_then(|recording| recording.frame.clone()),
+                    ..protocol::OutgoingMedia::default()
+                });
+            }
+        }
         let chosen = self.schedule_at.take();
         let schedule = match schedule::for_send(controls.schedule, chosen, now()) {
             Ok(at) => at,
@@ -1319,6 +1988,7 @@ impl Composer {
         let with = protocol::Outgoing {
             files,
             voice: voice.clone(),
+            video: video.clone(),
             silent: silent && controls.silent,
             suppress_embeds: tiny_previews_off || (self.no_preview && controls.link_chip && !hosts.is_empty()),
             ping: reply_to.is_none() || !controls.ping || !self.ping_off.contains(&target.key.account()),
@@ -1333,6 +2003,7 @@ impl Composer {
             send_as: self.send_as.get(&target.key).cloned(),
             snippet_type: None,
             subject,
+            allow_paid_stars,
         };
         self.importance = protocol::Importance::Normal;
         self.broadcast = false;
@@ -1356,7 +2027,8 @@ impl Composer {
             reply: self.reply.clone(),
             chips: self.tray.iter().map(|chip| chip.id).collect(),
             made: self.tray.iter().flat_map(Staged::made).collect(),
-            note: voice.is_some(),
+            note: voice.is_some() || video.is_some(),
+            voice_chip,
         };
         self.dispatch(out, with, cx);
     }
@@ -1391,10 +2063,25 @@ impl Composer {
     /// A GIF or a sticker from the picker: sent at once, with the reply target; what is typed
     /// stays.
     fn send_pick(&mut self, pick: Pick, cx: &mut Context<Self>) {
-        let Some(target) = self.target.clone().filter(|target| target.locked().is_none()) else {
+        let Some(target) = self.target.clone().filter(|target| self.locked_for(target).is_none()) else {
             return;
         };
-        if self.sending || !live() {
+        if self.sending || self.slowmode_blocks() || !live() {
+            return;
+        }
+        let wait = self.slowmode_wait();
+        if wait > 0 {
+            self.caption = Some((format!("Slow mode is on. You can send again in {}.", format_countdown(wait)), Tone::Note));
+            self.ensure_slowmode_timer(cx);
+            cx.notify();
+            return;
+        }
+        if let Some(stars) = self.current_send_rules().and_then(|r| r.paid_stars).filter(|&s| s > 0) {
+            self.caption = Some((
+                format!("Sending here costs {stars} Telegram Stars. Send a text message to confirm payment."),
+                Tone::Warning,
+            ));
+            cx.notify();
             return;
         }
         let reply_to = self.reply.as_ref().map(|reply| reply.id.clone());
@@ -1411,6 +2098,7 @@ impl Composer {
             chips: Vec::new(),
             made: Vec::new(),
             note: false,
+            voice_chip: None,
         };
         self.dispatch(out, protocol::Outgoing { pick: Some(pick), ping, ..protocol::Outgoing::default() }, cx);
     }
@@ -1510,8 +2198,12 @@ impl Composer {
         let refused = match answer {
             Ok(Response::Sent { .. }) => {
                 let (key, client_id, made) = (out.key.clone(), out.client_id.clone(), out.made.clone());
-                // The note went out with the send: chatd's facts and file go with it.
-                if out.note {
+                // Hold the recorded note until the network accepts it so a refusal (e.g. Telegram's
+                // VOICE_MESSAGES_FORBIDDEN) can restore it to the tray without losing the audio.
+                if let Some((rec, chip)) = out.voice_chip.clone() {
+                    self.held_voice = Some((out.key.clone(), out.client_id.clone(), rec, chip));
+                    self.note = None;
+                } else if out.note {
                     self.note = None;
                     ask_later(cx, Request::Record(RecordRequest::Forget), |_, _| {});
                 }
@@ -1549,6 +2241,54 @@ impl Composer {
             Some(words) => self.tell(&out.key, (words, Tone::Refused), cx),
             None if scan => self.hold_tiny_files(out, cx),
             None => self.went(&out, cx),
+        }
+        cx.notify();
+    }
+
+    /// A voice note send settled on the network. When refused (e.g. `VOICE_MESSAGES_FORBIDDEN`),
+    /// restore the recorded note to the tray with the refusal words so it is not lost.
+    fn voice_settled(&mut self, key: &Key, client_id: &str, outcome: Result<(), String>, cx: &mut Context<Self>) {
+        let matches = self
+            .held_voice
+            .as_ref()
+            .is_some_and(|(held_key, held_id, _, _)| held_key == key && held_id == client_id);
+        if !matches {
+            return;
+        }
+        let Some((held_key, held_id, rec, chip)) = self.held_voice.take() else {
+            return;
+        };
+        match outcome {
+            Ok(()) => {
+                ask_later(cx, Request::Record(RecordRequest::Forget), |_, _| {});
+            }
+            Err(reason) => {
+                self.note = Some(rec);
+                let here = self.target.as_ref().is_some_and(|now| now.key == held_key);
+                if here {
+                    if !self.tray.iter().any(|existing| existing.path == chip.path) {
+                        self.tray.push(chip);
+                    }
+                } else if let Some(draft) = self.drafts.get_mut(&held_key) {
+                    if !draft.files.iter().any(|existing| existing.path == chip.path) {
+                        draft.files.push(chip);
+                    }
+                } else {
+                    self.remember(
+                        held_key.clone(),
+                        Draft {
+                            files: vec![chip],
+                            ..Draft::default()
+                        },
+                    );
+                }
+                self.tell(&held_key, (reason, Tone::Refused), cx);
+                ask_later(
+                    cx,
+                    Request::Discard { conversation: held_key, client_id: held_id },
+                    |_, _| {},
+                );
+            }
         }
         cx.notify();
     }
@@ -1649,7 +2389,15 @@ impl Composer {
     /// The message is chatd's or the hold's now: the field empties, the chips that went leave
     /// the tray, and the draft is forgotten.
     fn went(&mut self, out: &Outgoing, cx: &mut Context<Self>) {
+        if let Some(rules) = self.send_rules.get_mut(&out.key) {
+            if rules.slowmode_seconds > 0 {
+                rules.slowmode_next_send = Some(now() + i64::from(rules.slowmode_seconds));
+            }
+        }
         let here = self.target.as_ref().is_some_and(|now| now.key == out.key);
+        if here {
+            self.ensure_slowmode_timer(cx);
+        }
         if !here {
             if let Some(draft) = self.drafts.get_mut(&out.key) {
                 draft.reply_went(out.reply_to.as_deref());
@@ -1772,8 +2520,16 @@ impl Composer {
         if paths.is_empty() {
             return;
         }
-        if !controls(&target.can, false).attach {
-            let why = format!("{} can't take files here.", target.key.network.label());
+        let allowed = match self.send_rules.get(&target.key) {
+            Some(rules) => controls(&target.can, false).apply_rules(rules).attach,
+            None => controls(&target.can, false).attach,
+        };
+        if !allowed {
+            let why = if self.send_rules.get(&target.key).is_some_and(|r| !r.allows_any_attachment()) {
+                "Admins don't allow media in this chat.".to_owned()
+            } else {
+                format!("{} can't take files here.", target.key.network.label())
+            };
             self.tell(&target.key, (why, Tone::Note), cx);
             if owned {
                 delete_later(paths);
@@ -1816,9 +2572,19 @@ impl Composer {
                 chip
             })
             .collect();
+        let editing_media = here && self.editing.as_ref().is_some_and(|e| e.has_media) && can.edit_media;
+        let incoming: Vec<Staged> = if editing_media {
+            incoming.into_iter().take(1).collect()
+        } else {
+            incoming
+        };
         let converting: Vec<(u64, PathBuf)> = incoming.iter().filter(|chip| chip.converting).map(|chip| (chip.id, chip.path.clone())).collect();
         let kept: Vec<u64> = incoming.iter().map(|chip| chip.id).collect();
         let turned_away: Vec<PathBuf> = incoming.iter().skip(attach::most(&can).saturating_sub(room)).filter(|chip| chip.owned).map(|chip| chip.path.clone()).collect();
+        if editing_media && !incoming.is_empty() {
+            let replaced: Vec<PathBuf> = self.tray.drain(..).filter(|chip| chip.owned).map(|chip| chip.path).collect();
+            delete_later(replaced);
+        }
         let destination = if here {
             &mut self.tray
         } else {
@@ -2054,6 +2820,443 @@ impl Composer {
             );
         }
         Some(bar)
+    }
+
+    fn can_create_thread(&self) -> bool {
+        !self.thread
+            && self.editing.is_none()
+            && self.target.as_ref().is_some_and(|target| {
+                target.key.network == Network::Discord
+                    && matches!(target.kind, ConversationKind::Channel | ConversationKind::Announcement)
+                    && (target.rights.create_public_threads || target.rights.create_private_threads)
+            })
+    }
+
+    fn toggle_thread_composer(&mut self, cx: &mut Context<Self>) {
+        if self.thread_composer.is_some() {
+            self.thread_composer = None;
+            cx.notify();
+            return;
+        }
+        let Some(target) = self.target.as_ref() else {
+            return;
+        };
+        if !self.can_create_thread() {
+            return;
+        }
+        let allow_private = target.kind == ConversationKind::Channel && target.rights.create_private_threads;
+        let private = allow_private && !target.rights.create_public_threads;
+        let name = cx.new(|cx| TextInput::new("Thread name", cx));
+        let first_message = cx.new(|cx| TextInput::new("First message (optional)", cx));
+        self.thread_composer = Some(ThreadComposer {
+            name,
+            first_message,
+            private,
+            allow_private,
+            auto_archive_minutes: 1440,
+        });
+        cx.notify();
+    }
+
+    fn submit_thread(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.target.clone() else { return };
+        let Some(form) = self.thread_composer.as_ref() else { return };
+        let name = form.name.read(cx).text().trim().to_owned();
+        if name.is_empty() {
+            return;
+        }
+        let first_message = form.first_message.read(cx).text().trim().to_owned();
+        let private = form.private && form.allow_private;
+        let auto_archive_minutes = Some(form.auto_archive_minutes);
+        self.thread_composer = None;
+        cx.notify();
+        if !live() {
+            return;
+        }
+        let request = Request::StartThread {
+            conversation: target.key,
+            message: None,
+            name: name.clone(),
+            private,
+            auto_archive_minutes,
+            first_message,
+        };
+        cx.spawn(async move |composer, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = composer.update(cx, |this, cx| match answer {
+                Ok(Response::Conversation { conversation: created }) => {
+                    let key = created.key;
+                    let title = created.title;
+                    this.shell_later(cx, move |shell, cx| shell.open_now(key, &title, cx));
+                }
+                Ok(Response::Error { detail, .. }) => {
+                    this.shell_later(cx, move |shell, cx| shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx));
+                }
+                Ok(_) => {
+                    this.shell_later(cx, |shell, cx| {
+                        shell.toast(Some(("icons/circle-alert.svg", theme::danger())), "Could not create thread.".to_owned(), cx)
+                    });
+                }
+                Err(err) => {
+                    let detail = crate::client::trouble_words("thread", &err);
+                    this.shell_later(cx, move |shell, cx| shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx));
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn thread_composer_panel(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let form = self.thread_composer.as_ref()?;
+        let ready = !form.name.read(cx).text().trim().is_empty();
+        let durations: [(u32, &'static str); 4] = [(60, "1h"), (1440, "24h"), (4320, "3d"), (10080, "1w")];
+        let mut archive_row = div().flex().items_center().gap(px(4.)).child(
+            div().type_small().text_color(theme::text_faint()).child("Auto-archive:"),
+        );
+        for (mins, label) in durations {
+            let active = form.auto_archive_minutes == mins;
+            archive_row = archive_row.child(
+                div()
+                    .id(("thread-archive", mins as usize))
+                    .px(px(6.))
+                    .py(px(2.))
+                    .rounded(px(theme::R_CHIP))
+                    .type_small()
+                    .cursor_pointer()
+                    .when(active, |el| el.bg(theme::selected()).text_color(theme::text()))
+                    .when(!active, |el| el.text_color(theme::text_soft()).hover(|s| s.bg(theme::hover())))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(form) = this.thread_composer.as_mut() {
+                            form.auto_archive_minutes = mins;
+                            cx.notify();
+                        }
+                    }))
+                    .child(label),
+            );
+        }
+        let private_toggle = form.allow_private.then(|| {
+            let priv_on = form.private;
+            div()
+                .id("thread-toggle-private")
+                .type_small()
+                .text_color(if priv_on { theme::accent_text() } else { theme::text_soft() })
+                .cursor_pointer()
+                .hover(|s| s.underline())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    let can_public = this.target.as_ref().is_some_and(|target| target.rights.create_public_threads);
+                    if let Some(form) = this.thread_composer.as_mut() {
+                        if can_public {
+                            form.private = !form.private;
+                            cx.notify();
+                        }
+                    }
+                }))
+                .child(if priv_on { "☑ Private thread" } else { "☐ Private thread" })
+        });
+        let field_box = |input: Entity<TextInput>| {
+            div()
+                .px(px(8.))
+                .py(px(4.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(theme::canvas())
+                .border_1()
+                .border_color(theme::hairline())
+                .type_ui()
+                .child(input)
+        };
+        Some(
+            div()
+                .mb(px(6.))
+                .p(px(10.))
+                .rounded(px(theme::R_FLOAT))
+                .bg(theme::raised())
+                .border_1()
+                .border_color(theme::hairline())
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(div().type_small().font_weight(theme::SEMIBOLD).text_color(theme::text()).child("New thread"))
+                .child(field_box(form.name.clone()))
+                .child(field_box(form.first_message.clone()))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.))
+                        .child(archive_row)
+                        .children(private_toggle),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .gap(px(6.))
+                        .child(
+                            button("thread-cancel", ButtonKind::Ghost, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                                this.thread_composer = None;
+                                cx.notify();
+                            })),
+                        )
+                        .child(
+                            button("thread-submit", if ready { ButtonKind::Primary } else { ButtonKind::Ghost }, "Create thread")
+                                .when(ready, |b| b.on_click(cx.listener(|this, _, _, cx| this.submit_thread(cx)))),
+                        ),
+                ),
+        )
+    }
+
+    fn toggle_thread_settings(&mut self, cx: &mut Context<Self>) {
+        if self.thread_settings.is_some() {
+            self.thread_settings = None;
+            cx.notify();
+            return;
+        }
+        let Some(target) = self.target.as_ref() else {
+            return;
+        };
+        if target.key.network != Network::Discord
+            || target.kind != ConversationKind::Thread
+            || !(target.rights.manage_threads || target.rights.rename)
+        {
+            return;
+        }
+        let current_title = target.title.clone();
+        let name = cx.new(|cx| {
+            let mut input = TextInput::new("Thread name", cx);
+            input.set_text(&current_title, cx);
+            input
+        });
+        self.thread_settings = Some(ThreadSettings { name, confirm_delete: false });
+        cx.notify();
+    }
+
+    fn send_thread_update(
+        &mut self,
+        name: Option<String>,
+        archived: Option<bool>,
+        locked: Option<bool>,
+        auto_archive_minutes: Option<u32>,
+        slowmode_seconds: Option<u32>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self.target.clone() else { return };
+        if !live() {
+            return;
+        }
+        let conversation = target.key.clone();
+        let request = Request::ThreadUpdate {
+            conversation: conversation.clone(),
+            name,
+            archived,
+            locked,
+            auto_archive_minutes,
+            slowmode_seconds,
+        };
+        cx.spawn(async move |composer, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = composer.update(cx, |this, cx| match answer {
+                Ok(Response::Ok) => {
+                    this.shell_later(cx, move |shell, cx| shell.refresh_row(conversation, cx));
+                }
+                Ok(Response::Error { detail, .. }) => {
+                    this.shell_later(cx, move |shell, cx| {
+                        shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx)
+                    });
+                }
+                Ok(_) => {
+                    this.shell_later(cx, |shell, cx| {
+                        shell.toast(Some(("icons/circle-alert.svg", theme::danger())), "Could not update thread.".to_owned(), cx)
+                    });
+                }
+                Err(err) => {
+                    let detail = crate::client::trouble_words("thread", &err);
+                    this.shell_later(cx, move |shell, cx| {
+                        shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx)
+                    });
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn confirm_delete_thread(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.target.clone() else { return };
+        self.thread_settings = None;
+        cx.notify();
+        if !live() {
+            return;
+        }
+        let request = Request::DeleteThread { conversation: target.key };
+        cx.spawn(async move |composer, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = composer.update(cx, |this, cx| match answer {
+                Ok(Response::Ok) => {}
+                Ok(Response::Error { detail, .. }) => {
+                    this.shell_later(cx, move |shell, cx| {
+                        shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx)
+                    });
+                }
+                Ok(_) => {
+                    this.shell_later(cx, |shell, cx| {
+                        shell.toast(Some(("icons/circle-alert.svg", theme::danger())), "Could not delete thread.".to_owned(), cx)
+                    });
+                }
+                Err(err) => {
+                    let detail = crate::client::trouble_words("thread", &err);
+                    this.shell_later(cx, move |shell, cx| {
+                        shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx)
+                    });
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn thread_settings_panel(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let form = self.thread_settings.as_ref()?;
+        let target = self.target.as_ref()?;
+        let can_manage = target.rights.manage_threads;
+        let archived = target.archived;
+        let locked = target.locked;
+        let name_ready = !form.name.read(cx).text().trim().is_empty();
+        let durations: [(u32, &'static str); 4] = [(60, "1h"), (1440, "24h"), (4320, "3d"), (10080, "1w")];
+        let mut archive_row = div().flex().items_center().gap(px(4.)).child(
+            div().type_small().text_color(theme::text_faint()).child("Auto-archive:"),
+        );
+        for (mins, label) in durations {
+            archive_row = archive_row.child(
+                div()
+                    .id(("thread-set-archive", mins as usize))
+                    .px(px(6.))
+                    .py(px(2.))
+                    .rounded(px(theme::R_CHIP))
+                    .type_small()
+                    .text_color(theme::text_soft())
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()).text_color(theme::text()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.send_thread_update(None, None, None, Some(mins), None, cx);
+                    }))
+                    .child(label),
+            );
+        }
+        let slowmodes: [(u32, &'static str); 5] = [(0, "Off"), (5, "5s"), (15, "15s"), (30, "30s"), (60, "1m")];
+        let mut slow_row = div().flex().items_center().gap(px(4.)).child(
+            div().type_small().text_color(theme::text_faint()).child("Slowmode:"),
+        );
+        for (secs, label) in slowmodes {
+            let active = target.slowmode_seconds == secs;
+            slow_row = slow_row.child(
+                div()
+                    .id(("thread-set-slow", secs as usize))
+                    .px(px(6.))
+                    .py(px(2.))
+                    .rounded(px(theme::R_CHIP))
+                    .type_small()
+                    .cursor_pointer()
+                    .when(active, |el| el.bg(theme::selected()).text_color(theme::text()))
+                    .when(!active, |el| el.text_color(theme::text_soft()).hover(|s| s.bg(theme::hover())))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.send_thread_update(None, None, None, None, Some(secs), cx);
+                    }))
+                    .child(label),
+            );
+        }
+        let rename_row = div()
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .px(px(8.))
+                    .py(px(4.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::canvas())
+                    .border_1()
+                    .border_color(theme::hairline())
+                    .type_ui()
+                    .child(form.name.clone()),
+            )
+            .child(
+                button("thread-rename-save", if name_ready { ButtonKind::Primary } else { ButtonKind::Ghost }, "Rename")
+                    .when(name_ready, |b| {
+                        b.on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(form) = this.thread_settings.as_ref() {
+                                let name = form.name.read(cx).text().trim().to_owned();
+                                if !name.is_empty() {
+                                    this.send_thread_update(Some(name), None, None, None, None, cx);
+                                }
+                            }
+                        }))
+                    }),
+            );
+        let delete_btn = can_manage.then(|| {
+            if form.confirm_delete {
+                button("thread-delete-confirm", ButtonKind::Danger, "Confirm delete")
+                    .on_click(cx.listener(|this, _, _, cx| this.confirm_delete_thread(cx)))
+            } else {
+                button("thread-delete", ButtonKind::Ghost, "Delete thread").on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(form) = this.thread_settings.as_mut() {
+                        form.confirm_delete = true;
+                        cx.notify();
+                    }
+                }))
+            }
+        });
+        let lock_btn = can_manage.then(|| {
+            button("thread-lock-toggle", ButtonKind::Secondary, if locked { "Unlock" } else { "Lock" })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.send_thread_update(None, None, Some(!locked), None, None, cx);
+                }))
+        });
+        Some(
+            div()
+                .mb(px(6.))
+                .p(px(10.))
+                .rounded(px(theme::R_FLOAT))
+                .bg(theme::raised())
+                .border_1()
+                .border_color(theme::hairline())
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(div().type_small().font_weight(theme::SEMIBOLD).text_color(theme::text()).child("Thread settings"))
+                        .child(button("thread-settings-close", ButtonKind::Ghost, "Done").on_click(cx.listener(|this, _, _, cx| {
+                            this.thread_settings = None;
+                            cx.notify();
+                        }))),
+                )
+                .child(rename_row)
+                .child(archive_row)
+                .when(can_manage, |panel| panel.child(slow_row))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(
+                            button(
+                                "thread-archive-toggle",
+                                ButtonKind::Secondary,
+                                if archived { "Reopen thread" } else { "Close thread" },
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.send_thread_update(None, Some(!archived), None, None, None, cx);
+                            })),
+                        )
+                        .children(lock_btn)
+                        .children(delete_btn),
+                ),
+        )
     }
 
     fn toggle_poll_composer(&mut self, cx: &mut Context<Self>) {
@@ -2520,7 +3723,25 @@ impl Composer {
             }
         };
         let (text, tokens) = mention::source(message);
-        self.editing = Some(Editing { id: message.id.clone(), original: text.clone(), stash, reply });
+        let has_media = !message.attachments.is_empty();
+        let removable: Vec<(String, String)> = message
+            .attachments
+            .iter()
+            .filter(|a| !a.sticker && a.file.id.starts_with("att:"))
+            .map(|a| {
+                let name = if a.name.is_empty() { a.file.id.clone() } else { a.name.clone() };
+                (a.file.id.clone(), name)
+            })
+            .collect();
+        self.editing = Some(Editing {
+            id: message.id.clone(),
+            original: text.clone(),
+            original_attachments: removable.clone(),
+            attachments: removable,
+            has_media,
+            stash,
+            reply,
+        });
         self.set_field(&Draft { text, subject: String::new(), tokens, files: Vec::new(), note: None, reply: None }, cx);
         self.close_picker(cx);
         self.caption = None;
@@ -2560,7 +3781,8 @@ impl Composer {
             return;
         };
         self.set_field(&editing.stash, cx);
-        self.tray = editing.stash.files;
+        let replaced = std::mem::replace(&mut self.tray, editing.stash.files);
+        delete_later(replaced.into_iter().filter(|chip| chip.owned).map(|chip| chip.path).collect());
         self.reply = editing.reply;
         self.refresh_placeholder(cx);
         self.caption = None;
@@ -2596,18 +3818,27 @@ impl Composer {
     }
 
     fn save_edit(&mut self, target: &Target, cx: &mut Context<Self>) {
-        let Some((id, original)) = self.editing.as_ref().map(|editing| (editing.id.clone(), editing.original.clone())) else {
+        let Some((id, original, attachments_changed, kept_ids, has_media)) = self.editing.as_ref().map(|editing| {
+            let changed = editing.attachments != editing.original_attachments;
+            let ids: Vec<String> = editing.attachments.iter().map(|(id, _)| id.clone()).collect();
+            // Media this pane cannot take off the message still keeps it from being empty.
+            let has_media = editing.has_media && editing.original_attachments.is_empty();
+            (editing.id.clone(), editing.original.clone(), changed, ids, has_media)
+        }) else {
             return;
         };
         self.follow_text(cx);
         let field = self.input.read(cx).text().to_owned();
-        if field.trim() == original.trim() {
+        let replacement = self.tray.iter().filter_map(Staged::outgoing).next();
+        if replacement.is_none() && field.trim() == original.trim() && !attachments_changed {
             self.end_edit(cx);
             return;
         }
-        if field.trim().is_empty() {
-            self.caption = Some(("A message can't be saved empty. Delete it from its menu instead.".to_owned(), Tone::Note));
-            cx.notify();
+        if replacement.is_none() && !has_media && field.trim().is_empty() && kept_ids.is_empty() {
+            // Nothing left in the message: leave edit mode and offer Delete confirmation.
+            let delete_id = id.clone();
+            self.end_edit(cx);
+            let _ = self.shell.update(cx, |shell, cx| shell.confirm_delete_message(&delete_id, cx));
             return;
         }
         if !live() {
@@ -2615,16 +3846,29 @@ impl Composer {
         }
         let key = target.key.clone();
         let (wire, spans) = length::wire_with_spans(&field, &self.tokens, &target.can, false);
-        if let Some(words) = length::edit_refusal(wire.chars().count(), target.can.text_limit) {
+        let limit = if has_media || replacement.is_some() { target.can.caption_limit } else { target.can.text_limit };
+        if let Some(words) = length::edit_refusal(wire.chars().count(), limit) {
             self.caption = Some((words, Tone::Refused));
             cx.notify();
             return;
         }
-        let request = Request::Edit {
-            conversation: key.clone(),
-            message_id: id.clone(),
-            text: wire,
-            spans,
+        let request = match replacement {
+            Some(file) => Request::EditMedia {
+                conversation: key.clone(),
+                message_id: id.clone(),
+                file,
+                text: wire,
+                spans,
+                invert_media: false,
+            },
+            None => Request::Edit {
+                conversation: key.clone(),
+                message_id: id.clone(),
+                text: wire,
+                spans,
+                suppress_embeds: false,
+                keep_attachments: attachments_changed.then_some(kept_ids),
+            },
         };
         self.sending = true;
         cx.notify();
@@ -2655,8 +3899,10 @@ impl Composer {
     fn close_list(&mut self, cx: &mut Context<Self>) {
         self.list = None;
         self.colon = None;
+        self.app_slash = None;
         self.slash = None;
         self.lookup = None;
+        self.slash_lookup = None;
         self.input.update(cx, |input, _| input.set_list_open(false));
     }
 
@@ -2665,8 +3911,250 @@ impl Composer {
         let open = !list.rows.is_empty();
         self.list = Some(list);
         self.colon = None;
+        self.app_slash = None;
         self.slash = None;
         self.input.update(cx, |input, _| input.set_list_open(open));
+    }
+
+    /// Runs a slash command via `Request::RunCommand`, clearing the composer on acceptance.
+    fn run_slash_command(
+        &mut self,
+        conversation: Key,
+        cmd: protocol::AppCommand,
+        arguments: Vec<protocol::CommandArg>,
+        cx: &mut Context<Self>,
+    ) {
+        let files: Vec<OutgoingFile> = self.tray.iter().filter_map(Staged::outgoing).collect();
+        let request = Request::RunCommand {
+            conversation: conversation.clone(),
+            command_id: cmd.id,
+            application_id: cmd.application_id,
+            version: cmd.version,
+            kind: cmd.kind,
+            name: cmd.name.clone(),
+            arguments,
+            target_id: None,
+            files,
+        };
+        self.sending = true;
+        self.close_list(cx);
+        self.app_slash_dismissed = false;
+        cx.notify();
+        let this = cx.weak_entity();
+        ask_later(cx, request, move |answer, cx| {
+            let _ = this.update(cx, |this, cx| {
+                this.sending = false;
+                match answer {
+                    Ok(Response::Ok) => {
+                        if this.target.as_ref().is_some_and(|t| t.key == conversation) {
+                            this.input.update(cx, |input, cx| input.clear(cx));
+                            this.tokens.clear();
+                            this.seen.clear();
+                            this.tray.clear();
+                            this.reply = None;
+                            this.caption = None;
+                            this.store_draft(conversation, String::new(), cx);
+                        }
+                    }
+                    Ok(Response::Error { detail, .. }) => {
+                        this.caption = Some((detail, Tone::Refused));
+                    }
+                    Err(_) => {
+                        this.caption = Some((NOT_ANSWERING.to_owned(), Tone::Refused));
+                    }
+                    _ => {}
+                }
+                cx.notify();
+            });
+        });
+    }
+
+    /// Lazily fetches the conversation's slash commands once per conversation.
+    fn ask_slash_commands(&mut self, key: &Key, cx: &mut Context<Self>) {
+        if self.slash_loaded.contains(key) || !live() {
+            return;
+        }
+        self.slash_loaded.insert(key.clone());
+        let key = key.clone();
+        let request = Request::Commands {
+            conversation: key.clone(),
+            query: String::new(),
+            kind: Some(protocol::CommandKind::ChatInput),
+        };
+        let this = cx.weak_entity();
+        ask_later(cx, request, move |answer, cx| {
+            let Ok(Response::Commands { commands }) = answer else {
+                // A refusal or a dropped answer must not stick, or the next `/` never asks again.
+                let _ = this.update(cx, |this, _| {
+                    this.slash_loaded.remove(&key);
+                });
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.app_commands.insert(key.clone(), commands);
+                if this.target.as_ref().is_some_and(|t| t.key == key) {
+                    this.look_up(cx);
+                }
+                cx.notify();
+            });
+        });
+    }
+
+    /// Fills the composer with `/name ` and opens command completion/options.
+    fn fill_command(&mut self, name: &str, cx: &mut Context<Self>) {
+        let name = name.trim().trim_start_matches('/');
+        if name.is_empty() {
+            return;
+        }
+        let filled = format!("/{name} ");
+        self.app_slash_dismissed = false;
+        self.input.update(cx, |input, cx| input.set_text(&filled, cx));
+        self.follow_text(cx);
+        self.look_up(cx);
+        cx.notify();
+    }
+
+    fn look_up_slash(&mut self, target: &Target, text: &str, caret: usize, cx: &mut Context<Self>) -> bool {
+        if self.editing.is_some() || !text.starts_with('/') {
+            self.app_slash_dismissed = false;
+            self.app_slash = None;
+            self.slash_lookup = None;
+            return false;
+        }
+        self.ask_slash_commands(&target.key, cx);
+        if self.app_slash_dismissed {
+            self.close_list(cx);
+            return true;
+        }
+        let commands = self.app_commands.get(&target.key).cloned().unwrap_or_default();
+        if let Some(query) = slash::command_trigger(text, caret) {
+            let matched = slash::filter(&commands, query);
+            let open = !matched.is_empty();
+            self.list = None;
+            self.colon = None;
+            self.lookup = None;
+            self.slash_lookup = None;
+            self.app_slash = open.then_some(slash::List { mode: slash::Mode::Commands(matched), selected: 0 });
+            self.input.update(cx, |input, _| input.set_list_open(open));
+            return true;
+        }
+        if let Some(active) = slash::active_option(text, caret, &commands) {
+            if !active.option.autocomplete {
+                let choices = slash::filter_choices(&active.option.choices, &active.typed);
+                let open = !choices.is_empty();
+                self.list = None;
+                self.colon = None;
+                self.lookup = None;
+                self.slash_lookup = None;
+                self.app_slash = open.then_some(slash::List {
+                    mode: slash::Mode::Choices {
+                        command: active.command,
+                        option: active.option.name,
+                        replace_start: active.replace_start,
+                        choices,
+                    },
+                    selected: 0,
+                });
+                self.input.update(cx, |input, _| input.set_list_open(open));
+                return true;
+            }
+            if live() {
+                let conversation = target.key.clone();
+                let command = active.command.clone();
+                let option_name = active.option.name.clone();
+                let replace_start = active.replace_start;
+                let mut options = active.filled.clone();
+                if let Some(existing) = options.iter_mut().find(|a| a.name == option_name) {
+                    existing.value = active.typed.clone();
+                } else {
+                    options.push(protocol::CommandArg {
+                        name: option_name.clone(),
+                        value: active.typed.clone(),
+                        kind: active.option.kind,
+                    });
+                }
+                let request = Request::CommandAutocomplete {
+                    conversation: conversation.clone(),
+                    command_id: command.id.clone(),
+                    application_id: command.application_id.clone(),
+                    version: command.version.clone(),
+                    name: command.name.clone(),
+                    options,
+                    focused: option_name.clone(),
+                };
+                self.slash_lookup = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(LOOKUP_QUIET).await;
+                    let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+                    let _ = this.update(cx, |this, cx| {
+                        if this.target.as_ref().is_none_or(|t| t.key != conversation) {
+                            return;
+                        }
+                        if let Ok(Response::CommandChoices { choices }) = answer {
+                            let open = !choices.is_empty();
+                            this.app_slash = open.then_some(slash::List {
+                                mode: slash::Mode::Choices {
+                                    command,
+                                    option: option_name,
+                                    replace_start,
+                                    choices,
+                                },
+                                selected: 0,
+                            });
+                            this.input.update(cx, |input, _| input.set_list_open(open));
+                            cx.notify();
+                        }
+                    });
+                }));
+                return true;
+            }
+        }
+        self.app_slash = None;
+        self.slash_lookup = None;
+        false
+    }
+
+    fn complete_app_slash(&mut self, row: usize, cx: &mut Context<Self>) {
+        let Some(list) = self.app_slash.take() else {
+            return;
+        };
+        self.close_list(cx);
+        self.follow_text(cx);
+        let (caret, text_len) = {
+            let input = self.input.read(cx);
+            (input.cursor(), input.text().len())
+        };
+        match list.mode {
+            slash::Mode::Commands(commands) => {
+                let Some(cmd) = commands.get(row) else {
+                    return;
+                };
+                let replacement = if cmd.options.is_empty() {
+                    format!("/{}", cmd.name)
+                } else {
+                    format!("/{} ", cmd.name)
+                };
+                let end = caret.min(text_len);
+                self.input.update(cx, |input, cx| input.replace(0..end, &replacement, cx));
+                self.follow_text(cx);
+                self.look_up(cx);
+            }
+            slash::Mode::Choices { replace_start, choices, .. } => {
+                let Some(choice) = choices.get(row) else {
+                    return;
+                };
+                let start = replace_start.min(caret).min(text_len);
+                let end = caret.min(text_len);
+                let val = if choice.value.contains(char::is_whitespace) {
+                    format!("\"{}\" ", choice.value)
+                } else {
+                    format!("{} ", choice.value)
+                };
+                self.input.update(cx, |input, cx| input.replace(start..end, &val, cx));
+                self.follow_text(cx);
+                self.look_up(cx);
+            }
+        }
+        cx.notify();
     }
 
     /// The people the shell already holds who could be meant: those typing here.
@@ -2685,6 +4173,9 @@ impl Composer {
             let input = self.input.read(cx);
             (input.text().to_owned(), input.cursor())
         };
+        if self.look_up_slash(&target, &text, caret, cx) {
+            return;
+        }
         if target.key.network == Network::Slack && self.editing.is_none() {
             if let Some(prefix) = slack_slash_trigger(&text, caret) {
                 if self.slash_dismissed {
@@ -2833,7 +4324,7 @@ impl Composer {
                     .collect();
                 let missing: Vec<String> = this.customs.iter().filter_map(|custom| custom.file.as_ref()).filter(|file| file.path.is_none()).map(|file| file.id.clone()).collect();
                 if !missing.is_empty() && live() {
-                    ask_later(cx, Request::Fetch { account, ids: missing, size: Some(40), retry: false }, |_, _| {});
+                    ask_later(cx, Request::Fetch { account, ids: missing, size: Some(40), retry: false, span: None }, |_, _| {});
                 }
                 this.look_up(cx);
                 cx.notify();
@@ -2922,7 +4413,17 @@ impl Composer {
     }
 
     fn step(&mut self, down: bool, cx: &mut Context<Self>) {
-        if let Some(slash) = &mut self.slash {
+        if self.slash_open(cx) {
+            let n = self.slash_rows(&self.slash_query(cx).unwrap_or_default()).len();
+            if n > 0 {
+                self.slash_at = if down { (self.slash_at + 1) % n } else { (self.slash_at + n - 1) % n };
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(commands) = &mut self.app_slash {
+            commands.step(down);
+        } else if let Some(slash) = &mut self.slash {
             slash.step(down);
         } else if let Some(colon) = &mut self.colon {
             colon.step(down);
@@ -2933,7 +4434,13 @@ impl Composer {
     }
 
     fn complete_selected(&mut self, cx: &mut Context<Self>) {
-        if let Some(selected) = self.slash.as_ref().map(|slash| slash.selected) {
+        if let Some(command) = self.highlighted_slash(cx) {
+            self.accept_slash(command, cx);
+            return;
+        }
+        if let Some(selected) = self.app_slash.as_ref().map(|commands| commands.selected) {
+            self.complete_app_slash(selected, cx);
+        } else if let Some(selected) = self.slash.as_ref().map(|slash| slash.selected) {
             self.complete_slash(selected, cx);
         } else if let Some(selected) = self.colon.as_ref().map(|colon| colon.selected) {
             self.complete_colon(selected, cx);
@@ -3027,11 +4534,68 @@ impl Composer {
         let _ = self.shell.update(cx, |shell, cx| shell.sign_in(network, cx));
     }
 
+    /// Subscribe on a Telegram channel. Join on a Telegram group. Other networks keep the old label.
+    fn join_label(network: Network, kind: ConversationKind) -> &'static str {
+        match (network, kind) {
+            (Network::Telegram, ConversationKind::Channel | ConversationKind::Announcement) => "Subscribe",
+            (Network::Telegram, _) => "Join",
+            _ => "Join channel",
+        }
+    }
+
+    /// A join finished. Success offers one Undo, which leaves. A refusal stays on the preview.
+    fn note_join(&mut self, conversation: Key, answer: std::io::Result<Response>, cx: &mut Context<Self>) {
+        if self.target.as_ref().is_none_or(|target| target.key != conversation) {
+            return;
+        }
+        match answer {
+            Ok(Response::Ok | Response::Conversation { .. }) => self.undo_join = Some(conversation),
+            Ok(Response::Error { detail, .. }) => self.caption = Some((detail, Tone::Refused)),
+            _ => self.caption = Some(("Telegram did not confirm the join.".to_owned(), Tone::Refused)),
+        }
+        cx.notify();
+    }
+
+    /// One click undoes a join that just succeeded. Moving to another conversation clears it.
+    fn undo_join_bar(&self, target: &Target, cx: &mut Context<Self>) -> Option<Div> {
+        let key = self.undo_join.clone().filter(|key| key == &target.key)?;
+        let word = match target.kind {
+            ConversationKind::Channel | ConversationKind::Announcement => "Subscribed",
+            _ => "Joined",
+        };
+        Some(
+            div()
+                .h(px(28.))
+                .mb(px(6.))
+                .px(px(12.))
+                .rounded(px(theme::R_FLOAT))
+                .border_1()
+                .border_color(theme::border())
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .type_ui()
+                .text_color(theme::text_soft())
+                .child(div().flex_1().child(word))
+                .child(button("undo-join", ButtonKind::Secondary, "Undo").on_click(cx.listener(move |this, _, _, cx| {
+                    if this.undo_join.as_ref() != Some(&key) {
+                        return;
+                    }
+                    this.undo_join = None;
+                    let conversation = key.clone();
+                    ask_later(cx, Request::Leave { conversation, silent: false }, |_, _| {});
+                    cx.notify();
+                }))),
+        )
+    }
+
     /// The 40 pt bar that stands where the card would be.
     fn bar(&self, locked: Locked, network: Network, cx: &mut Context<Self>) -> Div {
         if matches!(locked, Locked::NotJoined) {
             let key = self.target.as_ref().map(|t| t.key.clone());
+            let kind = self.target.as_ref().map(|t| t.kind).unwrap_or(ConversationKind::Channel);
             let title = self.target.as_ref().map(|t| t.title.clone()).unwrap_or_else(|| "this channel".to_owned());
+            let label = Self::join_label(network, kind);
             return div()
                 .h(px(card_height()))
                 .pl(px(12.))
@@ -3047,10 +4611,26 @@ impl Composer {
                 .child(glyph("icons/hash.svg", 16., theme::text_faint()))
                 .child(div().flex_1().min_w_0().truncate().child(format!("Previewing {title}")))
                 .child(
-                    button("join-channel", ButtonKind::Primary, "Join channel").on_click(cx.listener(move |_, _, _, cx| {
-                        if let Some(conversation) = key.clone() {
-                            ask_later(cx, Request::Join { conversation }, |_, _| {});
+                    button("join-channel", ButtonKind::Primary, label).on_click(cx.listener(move |this, _, _, cx| {
+                        if this.joining {
+                            return;
                         }
+                        let Some(conversation) = key.clone() else { return };
+                        this.join_epoch = this.join_epoch.wrapping_add(1);
+                        let epoch = this.join_epoch;
+                        this.joining = true;
+                        let joined = conversation.clone();
+                        let entity = cx.weak_entity();
+                        ask_later(cx, Request::Join { conversation }, move |answer, cx| {
+                            let _ = entity.update(cx, |this, cx| {
+                                // A newer click, or a click after this one was superseded, owns the guard.
+                                if this.join_epoch != epoch {
+                                    return;
+                                }
+                                this.joining = false;
+                                this.note_join(joined, answer, cx);
+                            });
+                        });
                     })),
                 );
         }
@@ -3118,7 +4698,16 @@ impl Composer {
                 format!("{name} signed you out. Your messages are still here."),
                 Some("Sign in again"),
             ),
-            Locked::ReadOnly(sentence) => ("icons/lock.svg", sentence, None),
+            Locked::ReadOnly(sentence) => {
+                let action = if sentence == "Accept the rules to talk here" {
+                    Some("Accept the rules")
+                } else if sentence.contains("verified phone") || sentence.contains("verified email") {
+                    Some("Open Discord")
+                } else {
+                    None
+                };
+                ("icons/lock.svg", sentence, action)
+            }
             Locked::MessageRequest | Locked::Blocked(_) | Locked::NotJoined => unreachable!(),
         };
         let expired = action == Some("Sign in again");
@@ -3138,8 +4727,18 @@ impl Composer {
             .child(glyph(icon, 16., if expired { theme::danger() } else { theme::text_faint() }))
             .child(div().flex_1().min_w_0().truncate().child(words))
             .children(action.map(|label| {
-                button("composer-sign-in", ButtonKind::Primary, label)
-                    .on_click(cx.listener(|this, _, _, cx| this.sign_in(cx)))
+                button("composer-sign-in", ButtonKind::Primary, label).on_click(cx.listener(move |this, _, window, cx| {
+                    if label == "Accept the rules" {
+                        let space = this.target.as_ref().and_then(|target| target.space_key());
+                        if let Some(space) = space {
+                            let _ = this.shell.update(cx, |shell, cx| shell.open_server_gate(space, cx));
+                        }
+                    } else if label == "Open Discord" {
+                        let _ = this.shell.update(cx, |shell, cx| shell.open_external_link("https://discord.com/app", window, cx));
+                    } else {
+                        this.sign_in(cx);
+                    }
+                }))
             }))
     }
 
@@ -3281,10 +4880,30 @@ impl Composer {
                 cx.notify();
             }))
             .child(glyph("icons/x.svg", 14., theme::text_soft()));
-        if self.editing.is_some() {
+        if let Some(editing) = &self.editing {
+            let can_replace = editing.has_media && self.target.as_ref().is_some_and(|t| t.can.edit_media && t.can.max_file_bytes > 0);
+            let replace_btn = can_replace.then(|| {
+                div()
+                    .id("edit-replace-file")
+                    .flex_none()
+                    .h(px(if phone { 32. } else { 22. }))
+                    .px(px(6.))
+                    .rounded(px(theme::R_CONTROL))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme::hover()))
+                    .font_weight(theme::MEDIUM)
+                    .text_color(theme::accent_text())
+                    .child("Replace file")
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|this, _, _, cx| this.attach_files(cx)))
+            });
             return Some(
                 bar.child(glyph("icons/pencil.svg", 14., theme::accent_text()))
                     .child(strong("Editing message".to_owned()))
+                    .children(replace_btn)
                     .child(div().flex_1())
                     // A phone's keyboard has no Esc, and its Return is the send button.
                     .when(!phone, |bar| bar.child(div().flex_none().text_color(theme::text_faint()).child("Return to save · Esc to cancel")))
@@ -3341,16 +4960,40 @@ impl Composer {
         if !on {
             return None;
         }
+        if let Some(reason) = self
+            .target
+            .as_ref()
+            .and_then(|target| rec::blocked_reason(&target.voice_notes_forbidden))
+        {
+            let size = if crate::gui::phone::active() { 18. } else { 16. };
+            return Some(
+                div()
+                    .id("mic")
+                    .relative()
+                    .flex_none()
+                    .size(px(card_control()))
+                    .rounded(px(theme::R_CONTROL))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .opacity(0.4)
+                    .tooltip(tip(reason.to_owned(), None))
+                    .child(glyph("icons/mic.svg", size, theme::text_soft())),
+            );
+        }
         let hot = self
             .recording
             .as_ref()
             .is_some_and(|recording| Some(&recording.conversation) == self.target.as_ref().map(|target| &target.key) && matches!(recording.state, RecordState::Active));
         let push = crate::gui::app::prefs::values().on(protocol::settings::PUSH_TO_TALK);
-        let (icon, words) = match (hot, push) {
-            (true, true) => ("icons/square.svg", "Release to stop recording"),
-            (true, false) => ("icons/square.svg", "Stop recording"),
-            (false, true) => ("icons/mic.svg", "Hold to record"),
-            (false, false) => ("icons/mic.svg", "Record a voice message"),
+        let video = self.video_note && self.target.as_ref().is_some_and(|target| target.can.video_notes);
+        let (icon, words) = match (hot, push, video) {
+            (true, true, _) => ("icons/square.svg", "Release to stop recording"),
+            (true, false, _) => ("icons/square.svg", "Stop recording"),
+            (false, true, true) => ("icons/video.svg", "Hold to record a video message"),
+            (false, false, true) => ("icons/video.svg", "Record a video message"),
+            (false, true, false) => ("icons/mic.svg", "Hold to record"),
+            (false, false, false) => ("icons/mic.svg", "Record a voice message"),
         };
         let button = self
             .card_button("mic", Some(icon), false, None)
@@ -3379,11 +5022,63 @@ impl Composer {
         })
     }
 
+    /// The mic records a round video when the account offers one and the switch is on.
+    fn wants_video(&self) -> bool {
+        self.video_note && self.target.as_ref().is_some_and(|target| target.can.video_notes && rec::available(&target.can))
+    }
+
+    fn record_input(&self, video: bool) -> Option<String> {
+        let key = if video { protocol::settings::CAMERA } else { protocol::settings::INPUT };
+        crate::gui::app::prefs::values().device(key)
+    }
+
+    /// Switches the mic between a voice note and a round video message.
+    fn video_switch(&self, on: bool, cx: &mut Context<Self>) -> Option<gpui::Stateful<Div>> {
+        if !on {
+            return None;
+        }
+        let chosen = self.video_note;
+        let hot = self.recording.as_ref().is_some_and(|recording| matches!(recording.state, RecordState::Active));
+        Some(
+            self.card_button("video-note", Some(if chosen { "icons/mic.svg" } else { "icons/video.svg" }), chosen, None)
+                .tooltip(tip(if chosen { "Switch to a voice message" } else { "Switch to a video message" }, None))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if hot {
+                        return;
+                    }
+                    this.video_note = !this.video_note;
+                    cx.notify();
+                })),
+        )
+    }
+
+    /// A circular live preview while a round video message records.
+    fn round_live(&self) -> Option<Div> {
+        let recording = self.recording.as_ref()?;
+        if !recording.video || !matches!(recording.state, RecordState::Active) {
+            return None;
+        }
+        let target = self.target.as_ref()?;
+        if recording.conversation != target.key {
+            return None;
+        }
+        let path = recording.frame.clone()?;
+        Some(
+            div().flex().justify_center().py(px(8.)).child(
+                div()
+                    .size(px(96.))
+                    .rounded(px(48.))
+                    .overflow_hidden()
+                    .child(gpui::img(PathBuf::from(path)).size_full().object_fit(gpui::ObjectFit::Cover)),
+            ),
+        )
+    }
+
     /// The conversation a recording may start for now, if there is one.
     fn record_target(&self) -> Option<Key> {
         self.target
             .as_ref()
-            .filter(|target| target.locked().is_none())
+            .filter(|target| target.locked().is_none() && target.voice_notes_forbidden.is_empty())
             .filter(|_| live())
             .map(|target| target.key.clone())
     }
@@ -3395,8 +5090,9 @@ impl Composer {
         let Some(target) = self.record_target() else {
             return;
         };
-        let input = crate::gui::app::prefs::values().device(protocol::settings::INPUT);
-        ask_later(cx, Request::Record(rec::on_press(&self.recording, &target, input)), |_, _| {});
+        let video = self.wants_video();
+        let input = self.record_input(video);
+        ask_later(cx, Request::Record(rec::on_press(&self.recording, &target, input, video)), |_, _| {});
     }
 
     /// Push-to-talk, the press: record now. A press inside the previous release's grace drops
@@ -3407,8 +5103,9 @@ impl Composer {
         let Some(target) = self.record_target() else {
             return;
         };
-        let input = crate::gui::app::prefs::values().device(protocol::settings::INPUT);
-        ask_later(cx, Request::Record(rec::on_hold_down(&target, input)), |_, _| {});
+        let video = self.wants_video();
+        let input = self.record_input(video);
+        ask_later(cx, Request::Record(rec::on_hold_down(&target, input, video)), |_, _| {});
         self.holding = Some(target);
     }
 
@@ -3518,16 +5215,83 @@ impl Composer {
             }))
     }
 
+    fn edit_attachments_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let editing = self.editing.as_ref()?;
+        if editing.attachments.is_empty() {
+            return None;
+        }
+        let chips = editing.attachments.iter().enumerate().map(|(ix, (id, name))| {
+            let remove_id = id.clone();
+            div()
+                .h(px(24.))
+                .pl(px(8.))
+                .pr(px(4.))
+                .rounded(px(theme::R_CHIP))
+                .bg(theme::field())
+                .border_1()
+                .border_color(theme::border())
+                .flex()
+                .items_center()
+                .gap(px(5.))
+                .type_small()
+                .text_color(theme::text())
+                .child(glyph("icons/paperclip.svg", 12., theme::text_soft()))
+                .child(div().max_w(px(180.)).truncate().child(name.clone()))
+                .child(
+                    div()
+                        .id(("edit-att-remove", ix))
+                        .size(px(18.))
+                        .rounded(px(theme::R_CONTROL))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::selected()))
+                        .tooltip(tip("Remove attachment", None))
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(editing) = this.editing.as_mut() {
+                                editing.attachments.retain(|(att_id, _)| att_id != &remove_id);
+                                cx.notify();
+                            }
+                        }))
+                        .child(glyph("icons/x.svg", 12., theme::text_soft())),
+                )
+        });
+        Some(
+            div()
+                .px(px(12.))
+                .py(px(6.))
+                .border_b_1()
+                .border_color(theme::hairline())
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(6.))
+                .children(chips),
+        )
+    }
+
     fn card(&mut self, focused: bool, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let controls = self.controls();
-        let ready = !self.sending && !self.scan_blocks_current() && (!self.input.read(cx).text().trim().is_empty() || !self.tray.is_empty());
+        let editing_media = self.editing.as_ref().is_some_and(|e| e.has_media);
+        let slowmode_wait = self.slowmode_wait();
+        let ready = !self.sending
+            && slowmode_wait == 0
+            && !self.scan_blocks_current()
+            && (self.editing.is_some() || !self.slowmode_blocks())
+            && (editing_media || !self.input.read(cx).text().trim().is_empty() || !self.tray.is_empty() || self.editing.is_some());
         let focus = self.input.focus_handle(cx);
         let open_tab = self.picking.as_ref().map(|picking| picking.picker.read(cx).tab());
         let send_icon = if self.editing.is_some() { "icons/check.svg" } else { "icons/send-horizontal.svg" };
-        let send_tip = match (self.editing.is_some(), controls.silent) {
-            (true, _) => "Save  ↩",
-            (false, true) => "Send  ↩ · Silently  ⌥↩",
-            (false, false) => "Send  ↩",
+        let send_tip = if slowmode_wait > 0 {
+            format!("Slow mode: wait {}", format_countdown(slowmode_wait))
+        } else {
+            match (self.editing.is_some(), controls.silent) {
+                (true, _) => "Save  ↩".to_owned(),
+                (false, true) => "Send  ↩ · Silently  ⌥↩".to_owned(),
+                (false, false) => "Send  ↩".to_owned(),
+            }
         };
         let attach = controls.attach.then(|| {
             self.card_button("attach", Some("icons/paperclip.svg"), false, None)
@@ -3538,6 +5302,11 @@ impl Composer {
             self.card_button("create-poll", Some("icons/list.svg"), self.poll_composer.is_some(), None)
                 .tooltip(tip("Create poll", None))
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_poll_composer(cx)))
+        });
+        let thread_btn = self.can_create_thread().then(|| {
+            self.card_button("create-thread", Some("icons/messages-square.svg"), self.thread_composer.is_some(), None)
+                .tooltip(tip("Create thread", None))
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_thread_composer(cx)))
         });
         let gif = controls.gif.then(|| {
             let catalog = controls.tabs.contains(&Tab::Gifs);
@@ -3555,6 +5324,7 @@ impl Composer {
                 .on_click(cx.listener(|this, _, window, cx| this.toggle_picker(Tab::Emoji, window, cx)))
         });
         let mic = self.mic_button(controls.voice, cx);
+        let video_mode = self.video_switch(controls.voice && self.target.as_ref().is_some_and(|target| target.can.video_notes), cx);
         let sim_btn = self
             .target
             .as_ref()
@@ -3605,10 +5375,22 @@ impl Composer {
         let phone = crate::gui::phone::active();
         // A phone's send is the desktop's filled square drawn at 36 inside a 44 pt target, so a
         // ready one reads as a button and not as a slab beside the field.
+        let send_body: gpui::AnyElement = if slowmode_wait > 0 {
+            div()
+                .px(px(4.))
+                .type_small()
+                .font_weight(theme::SEMIBOLD)
+                .text_color(theme::text_soft())
+                .child(format_countdown(slowmode_wait))
+                .into_any_element()
+        } else {
+            glyph(send_icon, if crate::gui::phone::active() { 18. } else { 16. }, if ready { theme::on_accent() } else { theme::text_disabled() }).into_any_element()
+        };
         let send = div()
             .id("send")
             .relative()
-            .size(px(card_control()))
+            .h(px(card_control()))
+            .min_w(px(card_control()))
             .flex_none()
             .rounded(px(theme::R_CONTROL))
             .flex()
@@ -3643,7 +5425,7 @@ impl Composer {
                 }),
             )
             .on_click(cx.listener(|this, _, _, cx| this.send(false, cx)))
-            .child(glyph(send_icon, if crate::gui::phone::active() { 18. } else { 16. }, if ready { theme::on_accent() } else { theme::text_disabled() }))
+            .child(send_body)
             .child(canvas(move |bounds, _, _| anchors.send.set(Some(bounds)), |_, _, _, _| {}).absolute().top_0().left_0().size_full());
         // The field: 44 pt at its shortest, growing to five lines at any text size, and never
         // wider than the room the buttons leave it.
@@ -3663,9 +5445,9 @@ impl Composer {
             .text_color(theme::text())
             .child(self.input.clone());
         let row = if phone {
-            // A real flex row: 44 | field | 44 | 44. Every button keeps its size; only the field
-            // gives way, so nothing can overlap at 100% or at 200%. GIFs and stickers are inside
-            // the emoji picker's own tabs, so the row has no fifth button.
+            // A real flex row. Every button keeps its size; only the field gives way, so nothing
+            // can overlap at 100% or at 200%. GIFs and stickers stay in the emoji picker. A
+            // video-note account adds one switch before the mic.
             div()
                 .min_h(px(52.))
                 // Without the attach button (an edit), the words keep the desktop's 12 from the edge.
@@ -3678,6 +5460,7 @@ impl Composer {
                 .children(attach)
                 .child(field)
                 .children(sim_btn)
+                .children(video_mode)
                 .children(mic)
                 .children(smile)
                 .child(send)
@@ -3691,9 +5474,11 @@ impl Composer {
                 .items_end()
                 .children(attach.map(|attach| attach.mr(px(4.))))
                 .children(poll_btn.map(|btn| btn.mr(px(4.))))
+                .children(thread_btn.map(|btn| btn.mr(px(4.))))
                 .child(field)
                 .children(sim_btn.map(|btn| btn.mr(px(4.))))
                 .children(gif.map(|gif| gif.mr(px(2.))))
+                .children(video_mode.map(|mode| mode.mr(px(2.))))
                 .children(mic.map(|mic| mic.mr(px(2.))))
                 .children(smile.map(|smile| smile.mr(px(4.))))
                 .child(send)
@@ -3715,8 +5500,10 @@ impl Composer {
             // A click anywhere on the card is a click into the field.
             .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| window.focus(&focus, cx))
             .children(self.mode_bar(cx))
+            .children(self.edit_attachments_bar(cx))
             .children(self.subject_bar(cx))
             .children(self.tray(window, cx))
+            .children(self.round_live())
             .children(self.format_bar(cx))
             .child(row)
     }
@@ -3728,9 +5515,15 @@ impl Composer {
             let name = target.key.network.label();
             (format!("{name} is offline. A message sent now waits up to 60 seconds for it to come back."), Tone::Offline)
         };
-        let unlocked = target.locked().is_none();
+        let unlocked = self.locked_for(target).is_none();
         let text = self.input.read(cx).text().to_owned();
         let note = || attach::sending_note(target.key.network, &target.can, &self.tray, &text).map(|words| (words, Tone::Note));
+        let paid_note = || {
+            unlocked
+                .then(|| self.send_rules.get(&target.key).and_then(|r| r.paid_stars).filter(|&s| s > 0))
+                .flatten()
+                .map(|stars| (format!("Messages here cost {stars} Telegram Stars."), Tone::Note))
+        };
         let recording = rec::foot(&self.recording, &target.key, playing::now_ms(), crate::gui::app::prefs::values().on(protocol::settings::PUSH_TO_TALK));
         let length_note = || {
             // An edit cannot become a file, so the offer is only for a new message. Emoticons
@@ -3775,7 +5568,31 @@ impl Composer {
                         )
                     })
             });
-        let said = self.caption.clone().or(recording).or_else(length_note).or_else(note).or_else(|| (unlocked && target.link == Link::Offline).then(offline));
+        let slowmode_active = || {
+            (unlocked && self.editing.is_none() && self.slowmode_blocks())
+                .then(|| slowmode_words(target.slowmode_seconds, target.slowmode_until, now()).map(|words| (words, Tone::Note)))
+                .flatten()
+        };
+        let slowmode_quiet = || {
+            (unlocked && self.editing.is_none())
+                .then(|| slowmode_words(target.slowmode_seconds, target.slowmode_until, now()).map(|words| (words, Tone::Note)))
+                .flatten()
+        };
+        let archived_thread = || {
+            (unlocked && target.kind == ConversationKind::Thread && target.archived)
+                .then(|| ("This thread is archived. Send a message to reopen it.".to_owned(), Tone::Note))
+        };
+        let said = self
+            .caption
+            .clone()
+            .or(recording)
+            .or_else(length_note)
+            .or_else(slowmode_active)
+            .or_else(note)
+            .or_else(paid_note)
+            .or_else(|| (unlocked && target.link == Link::Offline).then(offline))
+            .or_else(archived_thread)
+            .or_else(slowmode_quiet);
         let tiny_previews_off = target.key.network == Network::Tiny && !super::app::prefs::choices().send_link_previews;
         let hosts = if self.controls().link_chip && unlocked && !tiny_previews_off { niceties::link_hosts(&text) } else { Vec::new() };
         let chip = niceties::preview_words(&hosts, self.no_preview).map(|words| {
@@ -3851,6 +5668,41 @@ impl Composer {
 
     /// The completion lists, 6 pt above the card and over the messages.
     fn popover(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if self.slash_open(cx) {
+            let query = self.slash_query(cx).unwrap_or_default();
+            let rows = self.slash_rows(&query);
+            let selected = if rows.is_empty() { 0 } else { self.slash_at.min(rows.len() - 1) };
+            let this = cx.weak_entity();
+            let mut list = menu().w(px(340.)).max_w(px(340.));
+            for (ix, cmd) in rows.iter().enumerate() {
+                let command = cmd.command.clone();
+                let description = cmd.description.clone();
+                let label = format!("/{command}");
+                let pick = this.clone();
+                list = list.child(
+                    div()
+                        .id(("slash", ix))
+                        .h(px(40.))
+                        .px(px(8.))
+                        .rounded(px(theme::R_CONTROL))
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .cursor_pointer()
+                        .when(ix == selected, |row| row.bg(theme::selected()))
+                        .when(ix != selected, |row| row.hover(|style| style.bg(theme::hover())))
+                        .on_mouse_down(gpui::MouseButton::Left, move |_: &gpui::MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            window.prevent_default();
+                            let command = command.clone();
+                            let _ = pick.update(cx, |this, cx| this.accept_slash(command, cx));
+                        })
+                        .child(div().flex_none().max_w(px(140.)).truncate().type_ui().font_weight(theme::SEMIBOLD).child(label))
+                        .child(div().flex_1().min_w_0().truncate().type_small().text_color(theme::text_faint()).child(description)),
+                );
+            }
+            return Some(deferred(div().absolute().left_0().bottom(relative(1.)).pb(px(6.)).child(list)).priority(1).into_any_element());
+        }
         if let Some(slash) = self.slash.as_ref().filter(|slash| !slash.rows.is_empty()) {
             let selected = slash.selected;
             let mut panel = div()
@@ -3937,6 +5789,14 @@ impl Composer {
                 }
             };
             let drawn = colon::draw(colon, customs, tone, image, pick);
+            return Some(deferred(div().absolute().left_0().bottom(relative(1.)).pb(px(6.)).child(drawn)).priority(1).into_any_element());
+        }
+        if let Some(slash) = self.app_slash.as_ref().filter(|slash| !slash.is_empty()) {
+            let this = cx.weak_entity();
+            let pick = move |row: usize, _: &mut Window, cx: &mut App| {
+                let _ = this.update(cx, |this, cx| this.complete_app_slash(row, cx));
+            };
+            let drawn = slash::draw(slash, pick);
             return Some(deferred(div().absolute().left_0().bottom(relative(1.)).pb(px(6.)).child(drawn)).priority(1).into_any_element());
         }
         let list = self.list.as_ref().filter(|list| !list.rows.is_empty())?;
@@ -4046,6 +5906,21 @@ impl Composer {
                 }
                 if self.target.as_ref().is_some_and(|t| t.key.network == Network::Messages) {
                     items = items.child(menu_label("Sends while this computer is on and your phone is reachable."));
+                }
+                let can_when_online = self.target.as_ref().is_some_and(|t| {
+                    schedule::when_online_for(
+                        t.key.network,
+                        t.kind,
+                        t.special != protocol::Special::None || t.bot,
+                        t.hidden_last_seen,
+                    )
+                });
+                if can_when_online {
+                    items = items.child(
+                        menu_item("schedule-when-online", Some("icons/clock.svg"), "Send when online", None).on_click(
+                            cx.listener(|this, _, _, cx| this.choose_schedule(protocol::SCHEDULE_WHEN_ONLINE, cx)),
+                        ),
+                    );
                 }
                 for (index, moment) in presets.into_iter().enumerate() {
                     let at = moment.at;
@@ -4164,7 +6039,15 @@ impl Composer {
             }
         } else if staged("edit") {
             let original = "Sounds good. I'll keep the consumers paused until it finishes.";
-            self.editing = Some(Editing { id: "1".into(), original: original.into(), stash: Draft::default(), reply: None });
+            self.editing = Some(Editing {
+                id: "1".into(),
+                original: original.into(),
+                original_attachments: Vec::new(),
+                attachments: Vec::new(),
+                has_media: false,
+                stash: Draft::default(),
+                reply: None,
+            });
             self.set_field(&field(original, Vec::new()), cx);
         } else if staged("complete") {
             let person = |name: &str, handle: &str, presence| Person {
@@ -4178,10 +6061,12 @@ impl Composer {
                 status: String::new(),
                 link: String::new(),
                 emoji: String::new(),
+                emoji_file: None,
                 activity: None,
                 title: String::new(),
                 utc_offset: None,
                 mark: None,
+                nickname: String::new(),
             };
             let found = vec![
                 person("Dev Patel", "devp", protocol::Presence::Online),
@@ -4254,6 +6139,7 @@ impl Composer {
                     chips: Vec::new(),
                     made: Vec::new(),
                     note: false,
+                    voice_chip: None,
                 };
                 self.dispatch(out, with, cx);
             }
@@ -4490,7 +6376,8 @@ impl Render for Composer {
         let Some(target) = self.target.clone() else {
             return dock;
         };
-        let body = match target.locked() {
+        let undo = self.undo_join_bar(&target, cx);
+        let body = match self.locked_for(&target) {
             Some(locked) => self.bar(locked, target.key.network, cx),
             None => self.card(focus.is_focused(window), window, cx),
         };
@@ -4500,8 +6387,11 @@ impl Render for Composer {
             .children(self.ooo_banner(&target))
             .children(self.send_options_bar(cx))
             .children(self.poll_composer_panel(cx))
-            .child(div().relative().child(body).children(self.popover(cx)))
+            .children(self.thread_composer_panel(cx))
+            .children(self.thread_settings_panel(cx))
+            .child(div().relative().children(undo).child(body).children(self.popover(cx)))
             .children(self.caption_line(&target, cx))
+            .children(self.bot_strip(&target, window, cx))
             .children(self.picker_layer(window, cx))
             .children(self.send_menu_layer(window, cx))
             .children(self.drop_layer(cx))
@@ -4565,6 +6455,14 @@ impl Shell {
                 (person.relation == protocol::Relation::Blocked).then_some(person)
             })
             .flatten();
+        let hidden_last_seen = kind == ConversationKind::Direct
+            && open.peer.as_deref().is_some_and(|peer_id| {
+                let peer_key = Key::new(&open.key.account(), peer_id);
+                let hub = self.people_state.hub();
+                let live = hub.status_of(&peer_key);
+                let status = if live.is_empty() { hub.person(&peer_key).map(|person| person.status).unwrap_or_default() } else { live };
+                rough_last_seen(&status)
+            });
         Target {
             key: open.key.clone(),
             title: open.title.clone(),
@@ -4574,11 +6472,19 @@ impl Shell {
             peer: open.peer.clone(),
             read_only: open.read_only,
             read_only_reason: open.read_only_reason.clone(),
+            voice_notes_forbidden: open.voice_notes_forbidden.clone(),
             joined: open.joined,
             blocked_peer,
             special: open.special,
+            bot: open.bot,
+            hidden_last_seen,
             can,
             send_as: self.send_as_of(&open.key),
+            slowmode_seconds: open.slowmode_seconds,
+            slowmode_until: (open.slowmode_seconds > 0 && !open.rights.slowmode_exempt).then_some(open.slowmode_until).flatten(),
+            rights: open.rights,
+            archived: open.archived,
+            locked: open.locked,
         }
     }
 
@@ -4603,26 +6509,46 @@ impl Shell {
     }
 
     /// The same dock for the thread pane. A message typed here goes to the thread.
+    /// The pane's `Open` has no slowmode or lock, so those come from the held row when one exists.
     #[allow(dead_code)]
-    pub(super) fn thread_composer(&self, thread: &Key, title: &str, link: Link, cx: &mut Context<Self>) -> Div {
+    pub(super) fn thread_composer(&self, key: &Key, title: &str, rights: ConversationRights, link: Link, cx: &mut Context<Self>) -> Div {
+        let held = self.held_rows().find(|row| row.key == *key).cloned();
+        let title = held.as_ref().map(|row| row.title.clone()).unwrap_or_else(|| title.to_owned());
+        let rights = held.as_ref().map(|row| row.rights).unwrap_or(rights);
+        let slowmode_seconds = held.as_ref().map(|row| row.slowmode_seconds).unwrap_or(0);
+        let slowmode_until = held.as_ref().and_then(|row| {
+            (row.slowmode_seconds > 0 && !row.rights.slowmode_exempt).then_some(row.slowmode_until).flatten()
+        });
+        let mut can = self.can_of(key);
+        if let Some(bytes) = held.as_ref().map(|row| row.max_file_bytes).filter(|bytes| *bytes > 0) {
+            can.max_file_bytes = can.max_file_bytes.max(bytes);
+        }
         let target = Target {
-            key: thread.clone(),
-            title: title.to_owned(),
+            key: key.clone(),
+            title,
             kind: ConversationKind::Thread,
             link,
-            space: None,
+            space: held.as_ref().and_then(|row| row.space.clone()),
             peer: None,
-            read_only: false,
-            read_only_reason: String::new(),
-            joined: true,
+            read_only: held.as_ref().is_some_and(|row| row.read_only),
+            read_only_reason: held.as_ref().map(|row| row.read_only_reason.clone()).unwrap_or_default(),
+            voice_notes_forbidden: String::new(),
+            joined: held.as_ref().map(|row| row.joined).unwrap_or(true),
             blocked_peer: None,
-            special: protocol::Special::None,
-            can: self.can_of(thread),
-            send_as: self.send_as_of(thread),
+            special: held.as_ref().map(|row| row.special).unwrap_or(protocol::Special::None),
+            bot: false,
+            hidden_last_seen: false,
+            can,
+            send_as: self.send_as_of(key),
+            slowmode_seconds,
+            slowmode_until,
+            rights,
+            archived: held.as_ref().is_some_and(|row| row.archived),
+            locked: held.as_ref().is_some_and(|row| row.locked),
         };
+        let draft = held.as_ref().map(|row| row.draft.as_str()).unwrap_or("");
         let composer = self.composer_in(true, cx);
-        // A thread's row is not handed over, so its draft is the one this window remembers.
-        composer.update(cx, |composer, cx| composer.aim(target, "", cx));
+        composer.update(cx, |composer, cx| composer.aim(target, draft, cx));
         div().flex_none().child(composer)
     }
 
@@ -4731,6 +6657,14 @@ impl Shell {
                 peer: None,
                 blocked_peer: None,
                 special: protocol::Special::None,
+                bot: false,
+                hidden_last_seen: false,
+                voice_notes_forbidden: String::new(),
+                rights: open.rights,
+                slowmode_seconds: open.slowmode_seconds,
+                slowmode_until: open.slowmode_until,
+                archived: open.archived,
+                locked: open.locked,
                 can: self.can_of(&open.key),
                 send_as: self.send_as_of(&open.key),
             }
@@ -4746,6 +6680,11 @@ impl Shell {
     }
 
     // Hooks for the conversation and the window.
+
+    /// Opens or closes the inline thread settings panel on the main composer.
+    pub(super) fn composer_toggle_thread_settings(&mut self, cx: &mut Context<Self>) {
+        self.composer_in(false, cx).update(cx, |composer, cx| composer.toggle_thread_settings(cx));
+    }
 
     /// Puts one of my messages in the open conversation's composer to be edited.
     #[allow(dead_code)]
@@ -4789,6 +6728,15 @@ impl Shell {
         };
         window.focus(&composer.focus_handle(cx), cx);
         composer.update(cx, |composer, cx| composer.type_text(text, cx));
+    }
+
+    /// Pre-fills `/name ` in the open conversation's composer (e.g. when clicking a `</name:id>` mention).
+    pub(super) fn composer_fill_command(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(composer) = self.composer_state.main.get().filter(|composer| composer.read(cx).can_type()).cloned() else {
+            return;
+        };
+        window.focus(&composer.focus_handle(cx), cx);
+        composer.update(cx, |composer, cx| composer.fill_command(name, cx));
     }
 
     /// How far a pending message's files have gone: (bytes sent, bytes in all), from the last
@@ -5048,7 +6996,7 @@ impl Shell {
                 }
                 self.recording_ticking(cx);
             }
-            Change::People { account } => {
+            Change::People { account, .. } => {
                 for composer in [self.composer_state.main.get(), self.composer_state.thread.get()].into_iter().flatten() {
                     let (composer, account) = (composer.clone(), account.clone());
                     cx.defer(move |cx| composer.update(cx, |composer, cx| composer.forget_peer_away_account(&account, cx)));
@@ -5123,6 +7071,19 @@ impl Shell {
                 if changed {
                     cx.notify();
                 }
+                for id in &inflight {
+                    let voice_outcome = match found_state(id) {
+                        Some(SendState::Sent) => Some(Ok(())),
+                        Some(SendState::Failed { reason }) => Some(Err(reason)),
+                        _ => None,
+                    };
+                    if let Some(outcome) = voice_outcome {
+                        for composer in [shell.composer_state.main.get(), shell.composer_state.thread.get()].into_iter().flatten() {
+                            let (composer, key, id, outcome) = (composer.clone(), key.clone(), id.clone(), outcome.clone());
+                            cx.defer(move |cx| composer.update(cx, |composer, cx| composer.voice_settled(&key, &id, outcome, cx)));
+                        }
+                    }
+                }
                 if key.network != Network::Tiny {
                     return;
                 }
@@ -5135,10 +7096,27 @@ impl Shell {
         });
     }
 
+    /// Remaining slowmode cooldown for `conversation`, in seconds.
+    fn slowmode_remaining_for(&self, conversation: &Key, cx: &App) -> u32 {
+        let clock = now();
+        let check = |slot: &OnceCell<Entity<Composer>>| {
+            slot.get()
+                .and_then(|composer| {
+                    let target = composer.read(cx).target.as_ref().filter(|target| &target.key == conversation)?.clone();
+                    if target.rights.slowmode_exempt {
+                        return Some(0);
+                    }
+                    Some(slowmode_remaining(target.slowmode_until, clock))
+                })
+                .unwrap_or(0)
+        };
+        check(&self.composer_state.main).max(check(&self.composer_state.thread))
+    }
+
     /// Sends a failed message again. One chatd holds goes back to pending; one the hold gave
     /// up on goes now if its network is there, and otherwise waits another 60 s.
     pub(super) fn retry_send(&mut self, conversation: Key, client_id: String, cx: &mut Context<Self>) {
-        if !live() {
+        if !live() || self.slowmode_remaining_for(&conversation, cx) > 0 {
             return;
         }
         if self.composer_state.hold.has(&conversation, &client_id) {
@@ -5218,10 +7196,22 @@ impl Shell {
             (conversation.clone(), client_id.to_owned()),
             (conversation.clone(), client_id.to_owned()),
         );
+        let wait = self.slowmode_remaining_for(conversation, cx);
+        let retry_btn = if wait > 0 {
+            small("retry", "Retry")
+                .ml(px(2.))
+                .opacity(0.45)
+                .cursor_default()
+                .tooltip(tip(format!("Slowmode · {} remaining", format_slowmode(wait)), None))
+        } else {
+            small("retry", "Retry")
+                .ml(px(2.))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.retry_send(retry.0.clone(), retry.1.clone(), cx);
+                }))
+        };
         let actions = div().min_w_0().max_w_full().flex().flex_wrap().gap(px(6.))
-            .child(small("retry", "Retry").ml(px(2.)).on_click(cx.listener(move |this, _, _, cx| {
-                this.retry_send(retry.0.clone(), retry.1.clone(), cx);
-            })))
+            .child(retry_btn)
             .child(small("discard", "Delete").on_click(cx.listener(move |this, _, _, cx| {
                 this.discard_send(discard.0.clone(), discard.1.clone(), cx);
             })));
@@ -5387,12 +7377,34 @@ mod tests {
             peer: None,
             read_only,
             read_only_reason: String::new(),
+            voice_notes_forbidden: String::new(),
             blocked_peer: None,
             special: protocol::Special::None,
+            bot: false,
+            hidden_last_seen: false,
             joined: true,
             can: Capabilities::default(),
             send_as: Vec::new(),
+            slowmode_seconds: 0,
+            slowmode_until: None,
+            rights: protocol::ConversationRights::default(),
+            archived: false,
+            locked: false,
         }
+    }
+
+    #[test]
+    fn slowmode_formats_interval_countdown_and_blocks_return_until_clear() {
+        assert_eq!(slowmode_words(0, None, 1000), None);
+        assert_eq!(slowmode_words(30, None, 1000).as_deref(), Some("Slowmode · 30 s"));
+        assert_eq!(slowmode_words(120, None, 1000).as_deref(), Some("Slowmode · 2 m"));
+        assert_eq!(slowmode_words(30, Some(1012), 1000).as_deref(), Some("Slowmode · 12 s remaining"));
+        assert_eq!(slowmode_remaining(Some(1012), 1000), 12);
+        assert_eq!(slowmode_remaining(Some(1000), 1000), 0);
+        assert_eq!(slowmode_words(30, Some(1000), 1000).as_deref(), Some("Slowmode · 30 s"));
+        assert_eq!(format_slowmode(3600), "1 h");
+        assert_eq!(format_slowmode(3661), "1 h 1 m");
+        assert_eq!(format_slowmode(7200), "2 h");
     }
 
     #[test]
@@ -5405,7 +7417,14 @@ mod tests {
             panic!("a read-only channel takes no message");
         };
         assert_eq!(sentence, "You can read #announcements but not post in it.");
-        assert!(matches!(target(Link::Offline, ConversationKind::Forum, false).locked(), Some(Locked::ReadOnly(_))));
+        let Some(Locked::ReadOnly(forum)) = target(Link::Offline, ConversationKind::Forum, false).locked() else {
+            panic!("a forum takes no message in the composer");
+        };
+        assert_eq!(forum, "Start a post with New post.");
+        let Some(Locked::ReadOnly(quiet)) = target(Link::Connected, ConversationKind::Forum, true).locked() else {
+            panic!("a read-only forum says why");
+        };
+        assert_eq!(quiet, "You can read #announcements but not post in it.");
     }
 
     #[test]
@@ -5508,6 +7527,18 @@ mod tests {
         assert!(!pasted.exists());
         let _ = std::fs::remove_file(&notes);
         let _ = std::fs::remove_file(&huge);
+    }
+
+    #[test]
+    fn slowmode_countdown_and_timed_mute_format_cleanly() {
+        assert_eq!(format_countdown(5), "0:05");
+        assert_eq!(format_countdown(30), "0:30");
+        assert_eq!(format_countdown(95), "1:35");
+        assert_eq!(format_countdown(3665), "1:01:05");
+        let soon = format_ban_until(1_700_003_600, 1_700_000_000);
+        assert!(soon.starts_with("You can send messages again at "), "{soon}");
+        let later = format_ban_until(1_700_200_000, 1_700_000_000);
+        assert!(later.starts_with("You can send messages again on "), "{later}");
     }
 
     #[test]

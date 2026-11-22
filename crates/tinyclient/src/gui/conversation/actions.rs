@@ -9,16 +9,20 @@ use super::{Pane, PaneEvent};
 use crate::client::ask;
 use crate::gui::components::place::{max_height, placed, Layer, Place};
 use crate::gui::components::{
-    button, fade_in, menu, menu_item, menu_item_danger, menu_separator, menu_step, modal, modal_body, modal_buttons, popover, tip,
-    ButtonKind,
+    button, fade_in, menu, menu_item, menu_item_danger, menu_item_more, menu_label, menu_separator, menu_step, modal, modal_body,
+    modal_buttons, popover, tip, ButtonKind,
 };
 use crate::gui::theme::{self, Type};
 use crate::gui::time;
 use gpui::{
-    anchored, deferred, div, point, prelude::*, px, AnyElement, Bounds, ClipboardItem, Context, Div, ElementId, Entity,
-    KeyDownEvent, MouseButton, Pixels, Point, SharedString, Stateful, Subscription, Window,
+    anchored, canvas, deferred, div, point, prelude::*, px, AnyElement, Bounds, ClipboardItem, Context, Div, ElementId, Entity,
+    KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, SharedString, Stateful, Subscription, Window,
 };
-use protocol::{Capabilities, ConversationKind, ConversationRights, ErrorCode, Message, MessageKind, Network, ReactionRules, Request, Response, SendState};
+use protocol::{
+    AppCommand, Capabilities, CommandKind, ConversationKind, ConversationRights, ErrorCode, Message, MessageKind, Network,
+    ReactionRules, Request, Response, SendState,
+};
+use std::cell::Cell;
 use std::rc::Rc;
 
 /// Pending confirmation sheet for spending Telegram Stars on a paid reaction (#517).
@@ -106,9 +110,11 @@ pub struct Menu {
     pub at: Point<Pixels>,
     /// Which actionable row the keyboard has selected.
     pub cursor: usize,
-    /// The reaction whose reactors the menu lists, by its place on the message. `None` for
-    /// the message's own menu.
-    pub reactor: Option<usize>,
+    /// The reaction whose reactors the menu lists, by its place on the message and whether it is a super reaction.
+    /// `None` for the message's own menu.
+    pub reactor: Option<(usize, bool)>,
+    /// The Apps submenu is open beside this menu.
+    pub apps: bool,
 }
 
 /// The forward / copy-to picker, open for one message.
@@ -124,11 +130,24 @@ pub struct Forwarding {
     pub note: String,
 }
 
+/// The announcement Follow picker: choose a channel where this account has Manage Webhooks,
+/// then explicitly confirm before creating a webhook in the target server.
+pub struct Following {
+    pub source: protocol::Key,
+    pub source_title: String,
+    /// `(space_name, channel)` candidates where `rights.manage_webhooks` is true.
+    pub candidates: Vec<(String, protocol::Conversation)>,
+    pub selected: Option<protocol::Key>,
+    pub loading: bool,
+}
+
 /// The reaction picker, open for a message.
 pub struct Picking {
     pub message: String,
     pub at: Point<Pixels>,
     pub picker: Entity<Picker>,
+    /// When true, the chosen emoji is sent as a Discord Nitro super / burst reaction.
+    pub burst: bool,
     _listening: Subscription,
 }
 
@@ -146,6 +165,10 @@ pub struct Can {
     pub delete: bool,
     /// Pin or unpin this message (`Capabilities::pins` and `ConversationRights::pin`).
     pub pin: bool,
+    /// Publish (crosspost) an announcement-channel message to following servers.
+    pub publish: bool,
+    /// Suppress link previews / embeds on a message (own message or moderator on Discord).
+    pub suppress_embeds: bool,
     /// Forward this message natively (`Capabilities::forward`).
     pub forward: bool,
     /// May delete this message for everyone (own message or moderator with `rights.delete_others`).
@@ -160,6 +183,8 @@ pub struct Can {
     pub unsent: bool,
     /// May report this message to the server's moderators (Tiny `abuse_reports`, other people's messages).
     pub report: bool,
+    /// Moderator may remove reactions from this message (`rights.delete_others` and non-empty reactions).
+    pub clear_reactions: bool,
     /// May translate this message inline on demand (`Capabilities::translate`, non-E2EE, non-empty text).
     pub translate: bool,
 }
@@ -191,7 +216,21 @@ pub(super) fn starts_thread(message: &Message, caps: &Capabilities, kind: Conver
 }
 
 /// Whether `message` is still within `caps.edit_window` at unix second `now`.
-fn within_edit_window(message: &Message, caps: &Capabilities, now: i64) -> bool {
+/// Telegram's 48-hour edit window does not apply to Saved Messages or own channel posts.
+fn within_edit_window(
+    message: &Message,
+    network: Network,
+    kind: ConversationKind,
+    special: protocol::Special,
+    caps: &Capabilities,
+    now: i64,
+) -> bool {
+    if network == Network::Telegram
+        && (special == protocol::Special::Saved
+            || matches!(kind, ConversationKind::Channel | ConversationKind::Announcement))
+    {
+        return true;
+    }
     caps.edit_window == 0
         || now <= 0
         || message.sent <= 0
@@ -229,6 +268,7 @@ pub fn can_with_rights(
         pins: network != Network::Messages,
         forward: network != Network::Messages,
         reactions: true,
+        announcement_follow: network == Network::Discord,
         ..Capabilities::default()
     };
     can_with_network(message, network, &caps, rights, kind, in_thread, 0)
@@ -255,6 +295,7 @@ pub fn can_in(
         pins: network != Network::Messages,
         forward: network != Network::Messages,
         reactions: true,
+        announcement_follow: network == Network::Discord,
         ..Capabilities::default()
     };
     can_with_network_topic(message, network, &caps, ConversationRights::default(), kind, in_thread, topic, now)
@@ -284,6 +325,21 @@ pub fn can_with_network_topic(
     topic: &str,
     now: i64,
 ) -> Can {
+    can_with_network_context(message, network, caps, rights, kind, protocol::Special::None, in_thread, topic, now)
+}
+
+/// Full capability + network + rights + topic + special-role check used by the conversation pane.
+pub fn can_with_network_context(
+    message: &Message,
+    network: Network,
+    caps: &Capabilities,
+    rights: ConversationRights,
+    kind: ConversationKind,
+    special: protocol::Special,
+    in_thread: bool,
+    topic: &str,
+    now: i64,
+) -> Can {
     let sent = message.state == SendState::Sent;
     let said = matches!(message.kind, MessageKind::Normal | MessageKind::Unsupported { .. }) && !message.deleted;
     let act = sent && said;
@@ -294,7 +350,7 @@ pub fn can_with_network_topic(
         && !message.saved_history
         && match message.can_edit {
             Some(allowed) => allowed,
-            None => own && caps.edit && messages_rcs && within_edit_window(message, caps, now),
+            None => own && caps.edit && messages_rcs && within_edit_window(message, network, kind, special, caps, now),
         };
     let delete_everyone = !message.deleted
         && sent
@@ -310,6 +366,11 @@ pub fn can_with_network_topic(
         };
     let unsent = !sent && message.outgoing;
     let delete = delete_everyone || delete_me || (!message.deleted && unsent && own);
+    let publish = act
+        && kind == ConversationKind::Announcement
+        && caps.announcement_follow
+        && !message.published
+        && (own || rights.delete_others);
     Can {
         act,
         react: act && caps.reactions,
@@ -318,6 +379,8 @@ pub fn can_with_network_topic(
         edit,
         delete,
         pin: act && caps.pins && rights.pin,
+        publish,
+        suppress_embeds: act && network == Network::Discord && caps.suppress_embeds && (own || rights.delete_others),
         forward: act && caps.forward,
         delete_everyone,
         delete_me,
@@ -325,6 +388,7 @@ pub fn can_with_network_topic(
         remind: act && caps.save_messages,
         unsent,
         report: act && network == Network::Tiny && !message.outgoing && caps.abuse_reports,
+        clear_reactions: act && network == Network::Discord && caps.reactions && rights.delete_others && !message.reactions.is_empty(),
         translate: act && caps.translate && network != Network::Signal && !message.text.trim().is_empty(),
     }
 }
@@ -372,6 +436,8 @@ enum MenuAct {
     Edit,
     /// Pin or unpin a message when `can.pin` is true.
     Pin,
+    /// Publish (crosspost) an announcement-channel message to following servers.
+    Publish,
     /// Forward natively (`can.forward`) or "Copy to…" fallback (`can.act && !can.forward`).
     Forward,
     Link,
@@ -380,6 +446,8 @@ enum MenuAct {
     SaveAs,
     /// Save an animated GIF attachment to the account's saved GIFs (`Capabilities::save_gif`).
     SaveGif,
+    /// Favourite a Discord GIF by its page address.
+    FavouriteGif,
     /// This message becomes the first unread one.
     Unread,
     /// Enter multi-message selection mode with this message ticked.
@@ -390,10 +458,14 @@ enum MenuAct {
     Remind,
     /// Report another person's message on a Tiny server.
     Report,
+    /// Moderator: remove all reactions from a message.
+    ClearReactions,
     /// Translate this message inline, or hide its translation.
     Translate,
     /// A sent message: ask, unless the click held Shift.
     Delete,
+    /// The messages loaded in this chat, one request. Not the live Premium bar.
+    TranslateChat,
 }
 
 /// Maximum number of messages that can be selected at once (matches Telegram's 100-message cap).
@@ -516,6 +588,11 @@ pub fn deletable_selected<'a>(
         .collect()
 }
 
+/// A Telegram secret chat: `e` and digits. `Who` does not parse that prefix.
+fn secret_id(id: &str) -> bool {
+    id.strip_prefix('e').is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 /// What the menu offers, in the order it is drawn and the order Up and Down move.
 /// `quick` is how many quick reactions the menu shows. An unsent message ignores the rest.
 fn menu_acts(
@@ -528,6 +605,8 @@ fn menu_acts(
     can_open_link: bool,
     can_save: bool,
     can_save_gif: bool,
+    favourite_gif: bool,
+    translate_chat: bool,
 ) -> Vec<MenuAct> {
     if can.unsent {
         let mut acts = Vec::new();
@@ -557,6 +636,9 @@ fn menu_acts(
     if can.pin {
         acts.push(MenuAct::Pin);
     }
+    if can.publish {
+        acts.push(MenuAct::Publish);
+    }
     if can.act {
         acts.push(MenuAct::Forward);
     }
@@ -565,6 +647,9 @@ fn menu_acts(
     }
     if can.translate {
         acts.push(MenuAct::Translate);
+    }
+    if translate_chat {
+        acts.push(MenuAct::TranslateChat);
     }
     if has_link {
         acts.push(MenuAct::Link);
@@ -578,6 +663,9 @@ fn menu_acts(
     if can_save_gif {
         acts.push(MenuAct::SaveGif);
     }
+    if favourite_gif {
+        acts.push(MenuAct::FavouriteGif);
+    }
     if !can.unsent {
         acts.push(MenuAct::Unread);
         acts.push(MenuAct::Select);
@@ -590,6 +678,9 @@ fn menu_acts(
     }
     if can.report {
         acts.push(MenuAct::Report);
+    }
+    if can.clear_reactions {
+        acts.push(MenuAct::ClearReactions);
     }
     if can.delete {
         acts.push(MenuAct::Delete);
@@ -615,12 +706,13 @@ impl Pane {
                 if open.can_pin {
                     rights.pin = true;
                 }
-                let mut allowed = can_with_network_topic(
+                let mut allowed = can_with_network_context(
                     message,
                     open.key.network,
                     &open.can,
                     rights,
                     open.kind,
+                    open.special,
                     self.is_thread(),
                     &open.topic,
                     now,
@@ -657,9 +749,14 @@ impl Pane {
     /// Why this reaction cannot be added to this message, or `None` when it can (or nothing is
     /// known to say otherwise). Taking mine back is always allowed.
     pub(super) fn refusal(&self, message: &Message, emoji: &str) -> Option<String> {
+        self.refusal_kind(message, emoji, false)
+    }
+
+    /// Like [`Self::refusal`], also checking super / burst reaction permission when `burst` is true.
+    pub(super) fn refusal_kind(&self, message: &Message, emoji: &str, burst: bool) -> Option<String> {
         // A custom emoji is named by an id or `:name:`, which are plain text; a Unicode one never is.
         let custom = emoji.is_ascii() || message.reactions.iter().any(|have| have.emoji == emoji && have.file.is_some());
-        self.rules()?.check(&message.reactions, emoji, custom).err()
+        self.rules()?.check_kind(&message.reactions, emoji, custom, burst).err()
     }
 
     /// Asks what the open conversation takes as reactions; chatd keeps the answer five minutes.
@@ -710,10 +807,14 @@ impl Pane {
         if self.menu.is_some()
             || self.picker.is_some()
             || self.confirm.is_some()
+            || self.forward.is_some()
+            || self.follow.is_some()
             || self.action_confirm.is_some()
             || self.open_select.is_some()
+            || self.interaction_modal.is_some()
             || self.link_ask.is_some()
             || self.viewer.is_some()
+            || self.text_viewer.is_some()
         {
             return;
         }
@@ -741,10 +842,14 @@ impl Pane {
         let own = self.menu.is_some()
             || self.picker.is_some()
             || self.confirm.is_some()
+            || self.forward.is_some()
+            || self.follow.is_some()
             || self.action_confirm.is_some()
             || self.open_select.is_some()
+            || self.interaction_modal.is_some()
             || self.link_ask.is_some()
-            || self.viewer.is_some();
+            || self.viewer.is_some()
+            || self.text_viewer.is_some();
         own || self.shell.upgrade().is_some_and(|shell| {
             let shell = shell.read(cx);
             shell.layout_state.menu.is_some() || shell.layout_state.floating || shell.sidebar_state.switcher.is_some() || shell.pane_card_open(cx)
@@ -802,10 +907,17 @@ impl Pane {
     /// message's sheet or the reaction picker closes before the conversation does. False when
     /// none of them was up.
     pub(in crate::gui) fn phone_back(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.viewer.is_some() {
+        if self.text_viewer.is_some() {
+            self.close_text_viewer(cx);
+        } else if self.viewer.is_some() {
             self.close_viewer(cx);
         } else if self.confirm.is_some() {
             self.confirm = None;
+            cx.notify();
+        } else if self.follow.is_some() {
+            self.follow = None;
+        } else if self.interaction_modal.is_some() {
+            self.interaction_modal = None;
             cx.notify();
         } else if self.action_confirm.is_some() {
             self.action_confirm = None;
@@ -975,6 +1087,11 @@ impl Pane {
 
     /// Sends a reaction, optionally with `big` (`burst: true` on Telegram for the full animation).
     pub(super) fn react_with(&mut self, message_id: &str, emoji: &str, on: bool, big: bool, cx: &mut Context<Self>) {
+        let burst = big && on && self.open.as_ref().is_some_and(|open| open.can.burst_reactions);
+        self.react_kind(message_id, emoji, on, burst, cx);
+    }
+
+    pub(super) fn react_kind(&mut self, message_id: &str, emoji: &str, on: bool, burst: bool, cx: &mut Context<Self>) {
         let Some(conversation) = self.key().cloned() else {
             return;
         };
@@ -984,7 +1101,7 @@ impl Pane {
             return;
         }
         if on {
-            if let Some(why) = self.find(message_id).and_then(|message| self.refusal(&message, emoji)) {
+            if let Some(why) = self.find(message_id).and_then(|message| self.refusal_kind(&message, emoji, burst)) {
                 self.say(format!("Couldn't react: {why}"), cx);
                 return;
             }
@@ -993,7 +1110,6 @@ impl Pane {
                 emoji::used(emoji);
             }
         }
-        let burst = big && on && self.open.as_ref().is_some_and(|open| open.can.burst_reactions);
         let request = Request::React { conversation, message_id: message_id.to_owned(), emoji: emoji.to_owned(), on, burst };
         self.act_then(request, "Couldn't react", |this, cx| this.ask_reactions(cx), cx);
         cx.notify();
@@ -1093,11 +1209,17 @@ impl Pane {
 
     /// A reaction chosen where the message may already carry it: mine toggles off.
     fn react_toggle(&mut self, message_id: &str, emoji: &str, cx: &mut Context<Self>) {
+        self.react_toggle_kind(message_id, emoji, false, cx);
+    }
+
+    fn react_toggle_kind(&mut self, message_id: &str, emoji: &str, burst: bool, cx: &mut Context<Self>) {
         let same = |have: &protocol::Reaction| {
             have.emoji == emoji || have.file.as_ref().is_some_and(|file| file.id == emoji) || protocol::bare_emoji(&have.emoji) == protocol::bare_emoji(emoji)
         };
-        let mine = self.find(message_id).is_some_and(|message| message.reactions.iter().any(|have| have.mine && same(have)));
-        self.react(message_id, emoji, !mine, cx);
+        let mine = self.find(message_id).is_some_and(|message| {
+            message.reactions.iter().any(|have| (if burst { have.mine_burst } else { have.mine }) && same(have))
+        });
+        self.react_kind(message_id, emoji, !mine, burst, cx);
     }
 
     /// Replying and editing happen in the composer, which is the composer's owner's: this
@@ -1169,8 +1291,12 @@ impl Pane {
         self.close_picker(cx);
         self.revisions = None;
         self.hover = Some(message.id.clone());
-        self.menu = Some(Menu { message, at,
-            cursor: 0, reactor: None });
+        self.apps_anchor.set(None);
+        self.apps_menu.set(None);
+        self.menu = Some(Menu { message, at, cursor: 0, reactor: None, apps: false });
+        if let Some(key) = self.key().filter(|key| key.network == Network::Discord).cloned() {
+            let _ = self.shell.update(cx, |shell, cx| shell.ask_app_commands(key, CommandKind::Message, cx));
+        }
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -1178,14 +1304,14 @@ impl Pane {
     /// The people behind one reaction, where the pointer was. When the message payload did not
     /// carry names and the account supports `Capabilities::reactors`, fetches them on demand and
     /// caches them for the session.
-    pub(super) fn open_reactors(&mut self, message: Rc<Message>, reaction: usize, at: Point<Pixels>,
+    pub(super) fn open_reactors(&mut self, message: Rc<Message>, reaction: usize, burst: bool, at: Point<Pixels>,
         window: &mut Window, cx: &mut Context<Self>) {
         self.close_picker(cx);
         self.revisions = None;
         self.hover = Some(message.id.clone());
         let can_reactors = self.open.as_ref().is_some_and(|open| open.can.reactors);
         let needs_fetch = message.reactions.get(reaction).and_then(|r| {
-            if r.who.is_empty() && can_reactors {
+            if (burst || r.who.is_empty()) && can_reactors {
                 let emoji = r.file.as_ref().map_or_else(|| r.emoji.clone(), |file| file.id.clone());
                 Some((message.id.clone(), emoji))
             } else {
@@ -1193,7 +1319,7 @@ impl Pane {
             }
         });
         if let Some((msg_id, emoji)) = needs_fetch {
-            let cache_key = (msg_id.clone(), emoji.clone());
+            let cache_key = (msg_id.clone(), emoji.clone(), burst);
             if !self.fetched_reactors.contains_key(&cache_key) && self.reactors_loading.as_ref() != Some(&cache_key) {
                 if let Some(conversation) = self.key().cloned() {
                     self.reactors_loading = Some(cache_key.clone());
@@ -1201,7 +1327,7 @@ impl Pane {
                         conversation: conversation.clone(),
                         message_id: msg_id,
                         emoji,
-                        burst: false,
+                        burst,
                         after: None,
                         limit: 100,
                     };
@@ -1223,8 +1349,9 @@ impl Pane {
                 }
             }
         }
-        self.menu = Some(Menu { message, at,
-            cursor: 0, reactor: Some(reaction) });
+        self.apps_anchor.set(None);
+        self.apps_menu.set(None);
+        self.menu = Some(Menu { message, at, cursor: 0, reactor: Some((reaction, burst)), apps: false });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -1264,6 +1391,45 @@ impl Pane {
         .detach();
     }
 
+    /// Opens the delete confirmation dialog for `message_id` (used when an edit leaves a message empty).
+    pub(super) fn confirm_delete_by_id(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        let Some(message) = self.find(message_id) else {
+            return;
+        };
+        self.confirm = Some(message);
+        self.wants_focus = true;
+        cx.notify();
+    }
+
+    /// Suppresses embeds / link previews on `message_id` via `Request::Edit { suppress_embeds: true }`.
+    pub(super) fn suppress_message_embeds(&mut self, message_id: &str, cx: &mut Context<Self>) {
+        let Some(conversation) = self.key().cloned() else {
+            return;
+        };
+        let request = Request::Edit {
+            conversation,
+            message_id: message_id.to_owned(),
+            text: String::new(),
+            spans: Vec::new(),
+            suppress_embeds: true,
+            keep_attachments: None,
+        };
+        self.act(request, "Couldn't remove preview", cx);
+    }
+
+    /// Publishes (crossposts) an announcement-channel message to all following servers.
+    /// Surfaces Discord's refusal (such as the 10/hour channel rate limit) verbatim.
+    pub(super) fn publish_message(&mut self, message: &Message, cx: &mut Context<Self>) {
+        let Some(conversation) = self.key().cloned() else {
+            return;
+        };
+        let request = Request::Publish {
+            conversation,
+            message_id: message.id.clone(),
+        };
+        self.act(request, "Couldn't publish", cx);
+    }
+
     fn close_menu(&mut self, cx: &mut Context<Self>) {
         if self.menu.take().is_some() {
             cx.notify();
@@ -1295,6 +1461,8 @@ impl Pane {
             has_link && self.open.as_ref().is_some_and(|open| open.key.network != Network::Tiny),
             self.saveable_file(message).is_some(),
             self.saveable_gif(message).is_some(),
+            self.favourite_gif_page(message).is_some(),
+            self.can_translate_chat(cx),
         );
         let cursor = if acts.is_empty() {
             0
@@ -1356,6 +1524,7 @@ impl Pane {
             MenuAct::React => self.open_picker(&message.id, at, window, cx),
             MenuAct::Edit => self.edit(&message, window, cx),
             MenuAct::Pin => self.toggle_pin(&message, cx),
+            MenuAct::Publish => self.publish_message(&message, cx),
             MenuAct::Forward => {
                 let native = self.can(&message).forward;
                 self.open_forward(message, native, window, cx);
@@ -1383,6 +1552,11 @@ impl Pane {
                         unsave: false,
                     };
                     cx.background_executor().spawn(async move { let _ = ask(&request); }).detach();
+                }
+            }
+            MenuAct::FavouriteGif => {
+                if let Some(page) = self.favourite_gif_page(&message) {
+                    self.favourite_posted_gif(&page, cx);
                 }
             }
             MenuAct::Unread => self.mark_message_unread(&message, cx),
@@ -1422,9 +1596,133 @@ impl Pane {
                     });
                 }
             }
+            MenuAct::ClearReactions => self.clear_reactions(&message.id, None, None, cx),
             MenuAct::Translate => self.translate_message(&message, cx),
             MenuAct::Delete => self.delete(&message, at_once, window, cx),
+            MenuAct::TranslateChat => self.translate_chat(cx),
         }
+    }
+
+    /// Moderator removal of all reactions, all of one emoji, or one person's reaction.
+    fn clear_reactions(&mut self, message_id: &str, emoji: Option<String>, user_id: Option<String>, cx: &mut Context<Self>) {
+        let Some(conversation) = self.key().cloned() else {
+            return;
+        };
+        let mid = message_id.to_owned();
+        let evict_emoji = emoji.clone();
+        let request = Request::ClearReactions {
+            conversation,
+            message_id: mid.clone(),
+            emoji,
+            user_id,
+        };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| match answer {
+                Ok(Response::Ok) => {
+                    match evict_emoji {
+                        Some(emoji) => {
+                            // A moderator's removal takes the ordinary and the super reaction alike.
+                            this.fetched_reactors.retain(|(id, kept, _), _| !(id == &mid && kept == &emoji));
+                            if this.reactors_loading.as_ref().is_some_and(|(id, kept, _)| id == &mid && kept == &emoji) {
+                                this.reactors_loading = None;
+                            }
+                        }
+                        None => {
+                            this.fetched_reactors.retain(|(id, _, _), _| id != &mid);
+                            if this.reactors_loading.as_ref().is_some_and(|(id, _, _)| id == &mid) {
+                                this.reactors_loading = None;
+                            }
+                        }
+                    }
+                    cx.notify();
+                }
+                Ok(Response::Error { detail, .. }) => this.say(detail, cx),
+                Err(err) => this.say(crate::client::trouble_words("remove reactions", &err), cx),
+                _ => {}
+            });
+        })
+        .detach();
+    }
+    /// Telegram, and not a sealed or secret chat. Missing the open row counts as sealed: nothing is sent.
+    fn translation_blocked(&self, cx: &Context<Self>) -> bool {
+        let Some(open) = self.open.as_ref() else {
+            return true;
+        };
+        if open.key.network != Network::Telegram || secret_id(&open.key.id) {
+            return true;
+        }
+        let Some(shell) = self.shell.upgrade() else {
+            return true;
+        };
+        let shell = shell.read(cx);
+        match shell.snapshot.as_ref().and_then(|snap| snap.open.as_ref()) {
+            Some(row) if row.key == open.key => row.encryption.is_sealed(),
+            _ => true,
+        }
+    }
+
+    fn can_translate_chat(&self, cx: &Context<Self>) -> bool {
+        !self.translation_blocked(cx)
+            && self.items.iter().filter_map(Item::message).any(|message| !message.deleted && !message.text.trim().is_empty())
+    }
+
+    /// shortcut: one request of the messages on screen, not Telegram's Premium live bar (`togglePeerTranslations`).
+    fn translate_chat(&mut self, cx: &mut Context<Self>) {
+        let mut ids: Vec<String> = self
+            .items
+            .iter()
+            .filter_map(Item::message)
+            .filter(|message| !message.deleted && !message.text.trim().is_empty())
+            .map(|message| message.id.clone())
+            .collect();
+        if ids.len() > 100 {
+            ids.drain(0..ids.len() - 100);
+        }
+        self.translate_ids(ids, cx);
+    }
+
+    fn translate_ids(&mut self, message_ids: Vec<String>, cx: &mut Context<Self>) {
+        if self.translation_blocked(cx) {
+            self.say("A sealed or secret chat is not translated.".into(), cx);
+            return;
+        }
+        if message_ids.is_empty() {
+            self.say("Choose a message to translate.".into(), cx);
+            return;
+        }
+        let Some(conversation) = self.key().cloned() else {
+            return;
+        };
+        // The language Settings chose, the same one a single message is translated into.
+        let to = crate::gui::app::prefs::values().translate_target();
+        let target_lang = to.clone();
+        let watched = conversation.clone();
+        let request = Request::TranslateMessages { conversation, message_ids, to };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| {
+                // The chat changed while Telegram answered. Those ids belong to the chat that asked.
+                if this.key() != Some(&watched) {
+                    return;
+                }
+                match answer {
+                    Ok(Response::TranslatedMessages { items }) => {
+                        for item in items {
+                            if !item.text.is_empty() {
+                                let translation = protocol::Translation { text: item.text, source_lang: None, target_lang: target_lang.clone() };
+                                this.translations.insert(item.message_id, translation);
+                            }
+                        }
+                        cx.notify();
+                    }
+                    Ok(Response::Error { detail, .. }) => this.say(detail, cx),
+                    Err(err) => this.say(crate::client::trouble_words("translate", &err), cx),
+                    _ => {}
+                }
+            });
+        })
+        .detach();
     }
 
     /// Translates one message inline on demand, or clears its translation when already shown.
@@ -1484,6 +1782,31 @@ impl Pane {
             let path = attachment.file.path.clone().or_else(|| self.known.get(&attachment.file.id).cloned())?;
             Some((path, super::media::disk_name(attachment)))
         })
+    }
+
+    /// A Discord GIF's page address, when the message still has one.
+    fn favourite_gif_page(&self, message: &Message) -> Option<String> {
+        if !self.open.as_ref().is_some_and(|open| open.key.network == Network::Discord) {
+            return None;
+        }
+        message.attachments.iter().find_map(|attachment| {
+            let page = attachment.page.as_str();
+            (page.starts_with("https://") || page.starts_with("http://")).then(|| page.to_owned())
+        })
+    }
+
+    /// Adds a posted GIF to the account's favourites. The page address is what Discord stores.
+    pub(super) fn favourite_posted_gif(&self, page: &str, cx: &mut Context<Self>) {
+        let Some(account) = self.open.as_ref().map(|open| open.key.account()) else {
+            return;
+        };
+        let request = Request::Favourite {
+            account,
+            kind: protocol::CatalogKind::Gifs,
+            id: page.to_owned(),
+            on: true,
+        };
+        cx.background_executor().spawn(async move { let _ = ask(&request); }).detach();
     }
 
     /// A GIF attachment's network document id when the account supports saving GIFs.
@@ -1561,6 +1884,30 @@ impl Pane {
                         .child(words),
                 )
         };
+        let row_app = |ix: usize, words: String| {
+            div()
+                .id(("sheet-app", ix))
+                .h(px(row_height))
+                .mx(px(8.))
+                .px(px(12.))
+                .rounded(px(theme::R_CARD))
+                .flex()
+                .items_center()
+                .gap(px(14.))
+                .cursor_pointer()
+                .active(|style| style.bg(theme::pressed()))
+                .child(crate::gui::components::glyph("icons/bot.svg", 20., theme::text_soft()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(tokens::scaled(16.)))
+                        .line_height(px(tokens::scaled(22.)))
+                        .text_color(theme::text())
+                        .child(words),
+                )
+        };
         let rule = || div().flex_none().h(px(1.)).mx(px(20.)).my(px(4.)).bg(theme::hairline());
         let then = |act: fn(&mut Pane, &Rc<Message>, &mut Window, &mut Context<Pane>)| {
             let message = message.clone();
@@ -1635,6 +1982,9 @@ impl Pane {
                         .into_any_element(),
                 );
             }
+            if self.can_translate_chat(cx) {
+                rows.push(row("sheet-translate-chat", "icons/messages-square.svg", "Translate chat".into(), false).on_click(then(|this, _, _, cx| this.translate_chat(cx))).into_any_element());
+            }
             if let Some(link) = self.link_of(message, cx) {
                 let open = link.clone();
                 rows.push(
@@ -1680,11 +2030,28 @@ impl Pane {
                         .into_any_element(),
                 );
             }
+            if let Some(page) = self.favourite_gif_page(message) {
+                rows.push(
+                    row("sheet-favourite-gif", "icons/star.svg", "Favourite GIF".into(), false)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_menu(cx);
+                            this.favourite_posted_gif(&page, cx);
+                        }))
+                        .into_any_element(),
+                );
+            }
             if can.pin {
                 let label = if message.pinned { "Unpin" } else { "Pin" };
                 rows.push(
                     row("sheet-pin", "icons/pin.svg", label.into(), false)
                         .on_click(then(|this, message, _, cx| this.toggle_pin(message, cx)))
+                        .into_any_element(),
+                );
+            }
+            if can.publish {
+                rows.push(
+                    row("sheet-publish", "icons/megaphone.svg", "Publish".into(), false)
+                        .on_click(then(|this, message, _, cx| this.publish_message(message, cx)))
                         .into_any_element(),
                 );
             }
@@ -1715,6 +2082,34 @@ impl Pane {
                         .into_any_element(),
                 );
             }
+            let apps = self.message_app_commands(cx);
+            if !apps.is_empty() {
+                rows.push(rule().into_any_element());
+                rows.push(
+                    div()
+                        .px(px(20.))
+                        .py(px(6.))
+                        .text_size(px(tokens::scaled(13.)))
+                        .text_color(theme::text_faint())
+                        .child("Apps")
+                        .into_any_element(),
+                );
+                for (ix, command) in apps.into_iter().enumerate() {
+                    let words = if command.app_name.is_empty() {
+                        command.name.clone()
+                    } else {
+                        format!("{} · {}", command.app_name, command.name)
+                    };
+                    let target = message.id.clone();
+                    rows.push(
+                        row_app(ix, words)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.run_message_app(command.clone(), target.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
+            }
             if can.report {
                 rows.push(rule().into_any_element());
                 rows.push(
@@ -1729,6 +2124,14 @@ impl Pane {
                                 });
                             }
                         }))
+                        .into_any_element(),
+                );
+            }
+            if can.clear_reactions {
+                rows.push(rule().into_any_element());
+                rows.push(
+                    row("sheet-clear-reactions", "icons/trash-2.svg", "Remove all reactions".into(), true)
+                        .on_click(then(|this, message, _, cx| this.clear_reactions(&message.id, None, None, cx)))
                         .into_any_element(),
                 );
             }
@@ -1832,6 +2235,83 @@ impl Pane {
         Some(deferred(anchored().position(point(px(0.), px(0.))).child(fade_in("message-sheet", 160, scrim))).priority(1).into_any_element())
     }
 
+    /// Discord message commands for the open conversation, apps then names.
+    fn message_app_commands(&self, cx: &Context<Self>) -> Vec<AppCommand> {
+        let Some(key) = self.key().filter(|key| key.network == Network::Discord) else {
+            return Vec::new();
+        };
+        let mut commands = self
+            .shell
+            .upgrade()
+            .and_then(|shell| shell.read(cx).message_commands.get(key).cloned())
+            .unwrap_or_default();
+        commands.retain(|command| command.kind == CommandKind::Message && !command.application_id.is_empty());
+        commands.sort_by(|a, b| {
+            a.app_name
+                .to_ascii_lowercase()
+                .cmp(&b.app_name.to_ascii_lowercase())
+                .then(a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+        });
+        commands
+    }
+
+    /// Opens the Apps submenu. Its row is measured while painting, so the list is placed on the next frame.
+    fn show_apps(&mut self, cx: &mut Context<Self>) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        if menu.apps {
+            return;
+        }
+        menu.apps = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(16)).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
+    }
+
+    fn run_message_app(&mut self, command: AppCommand, target: String, cx: &mut Context<Self>) {
+        let Some(conversation) = self.key().cloned() else {
+            return;
+        };
+        self.close_menu(cx);
+        let _ = self.shell.update(cx, |shell, cx| shell.run_app_command(conversation, command, target, cx));
+    }
+
+    fn apps_submenu(&self, message_id: &str, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.menu.as_ref().is_some_and(|menu| menu.apps) {
+            return None;
+        }
+        let anchor = self.apps_anchor.get()?;
+        let commands = self.message_app_commands(cx);
+        if commands.is_empty() {
+            return None;
+        }
+        let mark = self.apps_menu.clone();
+        let mut list = menu().w(px(220.)).relative().child(
+            canvas(move |bounds, _, _| mark.set(Some(bounds)), |_, _, _, _| {}).absolute().top_0().left_0().size_full(),
+        );
+        let mut last = String::new();
+        for (ix, command) in commands.iter().enumerate() {
+            if !command.app_name.is_empty() && command.app_name != last {
+                if !last.is_empty() {
+                    list = list.child(menu_separator());
+                }
+                list = list.child(menu_label(command.app_name.clone()));
+                last = command.app_name.clone();
+            }
+            let (chosen, target) = (command.clone(), message_id.to_owned());
+            list = list.child(menu_item(("app-cmd", ix), None, command.name.clone(), None).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.run_message_app(chosen.clone(), target.clone(), cx);
+                },
+            )));
+        }
+        Some(placed("message-apps", Place::Beside(anchor), Layer::Menu, window, list))
+    }
+
     fn menu_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let shown = self.menu.as_ref()?;
         let message = shown.message.clone();
@@ -1901,6 +2381,13 @@ impl Pane {
                         .on_click(go(MenuAct::Pin)),
                 );
             }
+            if can.publish {
+                items = items.child(
+                    menu_item("publish", Some("icons/megaphone.svg"), "Publish", None)
+                        .when(lit(MenuAct::Publish), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::Publish)),
+                );
+            }
             if can.act {
                 let label = if can.forward { "Forward…" } else { "Copy to…" };
                 items = items.child(
@@ -1927,6 +2414,13 @@ impl Pane {
                         .on_click(go(MenuAct::Translate)),
                 );
             }
+            if self.can_translate_chat(cx) {
+                items = items.child(
+                    menu_item("translate-chat", Some("icons/messages-square.svg"), "Translate chat", None)
+                        .when(lit(MenuAct::TranslateChat), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::TranslateChat)),
+                );
+            }
             if self.link_of(&message, cx).is_some() {
                 items = items
                     .child(menu_item("link", Some("icons/link.svg"), "Copy link", None).when(lit(MenuAct::Link), |row| row.bg(theme::selected()))
@@ -1950,6 +2444,13 @@ impl Pane {
                     menu_item("save-gif", Some("icons/star.svg"), "Save GIF", None)
                         .when(lit(MenuAct::SaveGif), |row| row.bg(theme::selected()))
                         .on_click(go(MenuAct::SaveGif)),
+                );
+            }
+            if self.favourite_gif_page(&message).is_some() {
+                items = items.child(
+                    menu_item("favourite-gif", Some("icons/star.svg"), "Favourite GIF", None)
+                        .when(lit(MenuAct::FavouriteGif), |row| row.bg(theme::selected()))
+                        .on_click(go(MenuAct::FavouriteGif)),
                 );
             }
             if message.state == SendState::Sent {
@@ -1992,6 +2493,13 @@ impl Pane {
                         .on_click(go(MenuAct::Report)),
                 );
             }
+            if can.clear_reactions {
+                items = items.child(menu_separator()).child(
+                    menu_item_danger("clear-reactions", Some("icons/trash-2.svg"), "Remove all reactions")
+                        .when(lit(MenuAct::ClearReactions), |row| row.bg(theme::danger_soft()))
+                        .on_click(go(MenuAct::ClearReactions)),
+                );
+            }
             if can.delete {
                 items = items.child(menu_separator()).child(
                     menu_item_danger("delete", Some("icons/trash-2.svg"), "Delete…").when(lit(MenuAct::Delete), |row| row.bg(theme::danger_soft()))
@@ -2001,24 +2509,61 @@ impl Pane {
                 );
             }
         }
-        let items = items.on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_menu(cx)));
-        Some(placed(
+        let commands = if can.unsent { Vec::new() } else { self.message_app_commands(cx) };
+        if !commands.is_empty() {
+            let open = self.menu.as_ref().is_some_and(|menu| menu.apps);
+            let mut row = menu_item_more("apps", Some("icons/bot.svg"), "Apps", open)
+                .on_hover(cx.listener(|this, over: &bool, _, cx| {
+                    if *over {
+                        this.show_apps(cx);
+                    }
+                }))
+                .on_click(cx.listener(|this, _, _, cx| this.show_apps(cx)));
+            if open {
+                let anchor = self.apps_anchor.clone();
+                row = row.relative().child(
+                    canvas(move |bounds, _, _| anchor.set(Some(bounds)), |_, _, _, _| {})
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                );
+            }
+            items = items.child(menu_separator()).child(row);
+        }
+        let (row_at, menu_at) = (self.apps_anchor.clone(), self.apps_menu.clone());
+        let items = items.on_mouse_down_out(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+            let at = event.position;
+            let on_apps = row_at.get().is_some_and(|bounds| bounds.contains(&at)) || menu_at.get().is_some_and(|bounds| bounds.contains(&at));
+            if !on_apps {
+                this.close_menu(cx);
+            }
+        }));
+        let main = placed(
             "message-menu-scroll",
             Place::Pointer(at),
             Layer::Menu,
             window,
             fade_in("message-menu", 120, items),
-        ))
+        );
+        let submenu = self.apps_submenu(&message.id, window, cx);
+        Some(div().child(main).children(submenu).into_any_element())
     }
 
     /// Who one reaction came from, where the pointer was: the names the network sent with the
     /// message, in its own order, then how many are kept back. A row opens the person's card;
     /// a person the shell does not know yet reads Someone and opens nothing.
-    fn reactors_layer(&self, message: &Rc<Message>, reactor: usize, at: Point<Pixels>,
+    fn reactors_layer(&self, message: &Rc<Message>, reactor: (usize, bool), at: Point<Pixels>,
         window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let reaction = message.reactions.get(reactor)?;
+        let (index, burst) = reactor;
+        let reaction = message.reactions.get(index)?;
+        let can_mod = self
+            .open
+            .as_ref()
+            .is_some_and(|open| open.key.network == Network::Discord && (open.rights.delete_others || open.moderate));
+        let emoji_key = reaction.file.as_ref().map_or_else(|| reaction.emoji.clone(), |file| file.id.clone());
         let mut list = menu().w(px(248.));
-        if !reaction.who.is_empty() {
+        if !burst && !reaction.who.is_empty() {
             for (ix, id) in reaction.who.iter().enumerate() {
                 if ix == REACTORS_SHOWN {
                     list = list.child(menu_separator()).child(menu_item(
@@ -2047,8 +2592,7 @@ impl Pane {
                 );
             }
         } else {
-            let emoji_key = reaction.file.as_ref().map_or_else(|| reaction.emoji.clone(), |file| file.id.clone());
-            let cache_key = (message.id.clone(), emoji_key);
+            let cache_key = (message.id.clone(), emoji_key.clone(), burst);
             if let Some((reactors, more)) = self.fetched_reactors.get(&cache_key) {
                 if reactors.is_empty() {
                     list = list.child(menu_item("reactors-empty", None, "No reactions found", None));
@@ -2062,13 +2606,44 @@ impl Pane {
                         }
                         let label = if person.name.is_empty() { "Someone".to_owned() } else { person.name.clone() };
                         let key = person.key.clone();
-                        list = list.child(menu_item(("reactor", ix), None, label, None).on_click(cx.listener(
+                        let row = menu_item(("reactor", ix), None, label, None).on_click(cx.listener(
                             move |this: &mut Pane, _: &gpui::ClickEvent, window, cx| {
                                 this.close_menu(cx);
                                 let at = window.mouse_position();
                                 let _ = this.shell.update(cx, |shell, cx| shell.open_profile(key.clone(), at, cx));
                             },
-                        )));
+                        ));
+                        if can_mod {
+                            let mid = message.id.clone();
+                            let em = emoji_key.clone();
+                            let uid = person.key.id.clone();
+                            list = list.child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .child(div().flex_1().min_w_0().child(row))
+                                    .child(
+                                        div()
+                                            .id(("reactor-rm", ix))
+                                            .px(px(6.))
+                                            .py(px(4.))
+                                            .rounded(px(theme::R_CONTROL))
+                                            .cursor_pointer()
+                                            .type_small()
+                                            .text_color(theme::text_faint())
+                                            .hover(|style| style.text_color(theme::danger()).bg(theme::danger_soft()))
+                                            .tooltip(tip("Remove reaction", None))
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.close_menu(cx);
+                                                this.clear_reactions(&mid, Some(em.clone()), Some(uid.clone()), cx);
+                                            }))
+                                            .child("×"),
+                                    ),
+                            );
+                        } else {
+                            list = list.child(row);
+                        }
                     }
                     if reactors.len() <= REACTORS_SHOWN && *more {
                         list = list.child(menu_separator()).child(menu_item("reactors-more", None, "and more…", None));
@@ -2079,6 +2654,17 @@ impl Pane {
             } else {
                 list = list.child(menu_item("reactors-empty", None, "No reactions found", None));
             }
+        }
+        if can_mod {
+            let mid = message.id.clone();
+            let em = emoji_key;
+            list = list.child(menu_separator()).child(
+                menu_item_danger("clear-emoji-reactions", Some("icons/trash-2.svg"), "Remove all of this reaction")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_menu(cx);
+                        this.clear_reactions(&mid, Some(em.clone()), None, cx);
+                    })),
+            );
         }
         let list = list.on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_menu(cx)));
         Some(placed(
@@ -2125,9 +2711,9 @@ impl Pane {
         let (rules, account, space) = (self.rules().cloned(), self.key().map(protocol::Key::account), self.space(cx));
         let picker = cx.new(|cx| Picker::new(custom, rules, account, space, window, cx));
         let listening = cx.subscribe_in(&picker, window, |this, _, event: &PickerEvent, window, cx| {
-            let target = this.picker.as_ref().map(|picking| picking.message.clone());
-            match (event, target) {
-                (PickerEvent::Picked(emoji), Some(target)) => this.react_toggle(&target, emoji, cx),
+            let picked = this.picker.as_ref().map(|picking| (picking.message.clone(), picking.burst));
+            match (event, picked) {
+                (PickerEvent::Picked(emoji), Some((target, burst))) => this.react_toggle_kind(&target, emoji, burst, cx),
                 (PickerEvent::OpenUrl(url), _) => this.open_external_link(url, window, cx),
                 _ => {}
             }
@@ -2135,8 +2721,55 @@ impl Pane {
             window.focus(&this.focus, cx);
         });
         self.hover = Some(message_id.to_owned());
-        self.picker = Some(Picking { message: message_id.to_owned(), at, picker, _listening: listening });
+        self.picker = Some(Picking { message: message_id.to_owned(), at, picker, burst: false, _listening: listening });
         cx.notify();
+    }
+
+    fn super_react_toggle(&self, active: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.rules().is_some_and(|rules| rules.burst) {
+            return None;
+        }
+        let bar = div()
+            .px(px(10.))
+            .py(px(6.))
+            .border_b_1()
+            .border_color(theme::border())
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(div().type_small().text_color(theme::text_soft()).child("Super React"))
+            .child(
+                div()
+                    .id("picker-super-toggle")
+                    .h(px(24.))
+                    .px(px(10.))
+                    .rounded_full()
+                    .border_1()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .cursor_pointer()
+                    .type_micro()
+                    .font_weight(theme::SEMIBOLD)
+                    .when(active, |pill| {
+                        pill.bg(gpui::rgba(0x8b5cf62e))
+                            .border_color(gpui::rgb(0x8b5cf6))
+                            .text_color(gpui::rgb(0x8b5cf6))
+                    })
+                    .when(!active, |pill| {
+                        pill.bg(theme::raised())
+                            .border_color(theme::border())
+                            .text_color(theme::text_soft())
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(picking) = this.picker.as_mut() {
+                            picking.burst = !picking.burst;
+                            cx.notify();
+                        }
+                    }))
+                    .child(if active { "✦ Super ON" } else { "✦ Super" }),
+            );
+        Some(bar.into_any_element())
     }
 
     pub(super) fn close_picker(&mut self, cx: &mut Context<Self>) {
@@ -2183,7 +2816,8 @@ impl Pane {
             picker.set_width(wide, cx);
             picker.set_height((tall * 0.6).min(crate::gui::composer::picker::HEIGHT), cx);
         });
-        let panel = sheet_panel().child(picking.picker.clone());
+        let toggle = self.super_react_toggle(picking.burst, cx);
+        let panel = sheet_panel().children(toggle).child(picking.picker.clone());
         let scrim = sheet_scrim(window).on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.close_picker(cx))).child(panel);
         Some(deferred(anchored().position(point(px(0.), px(0.))).child(fade_in("picker-sheet", 160, scrim))).priority(1).into_any_element())
     }
@@ -2199,10 +2833,14 @@ impl Pane {
         picking.picker.update(cx, |picker, cx| {
             picker.set_height(room.min(emoji::HEIGHT), cx)
         });
+        let toggle = self.super_react_toggle(picking.burst, cx);
         let panel = popover()
             .p(px(0.))
             .w(px(emoji::WIDTH))
             .max_w(px(emoji::WIDTH))
+            .flex()
+            .flex_col()
+            .children(toggle)
             .child(picking.picker.clone())
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_picker(cx)));
         Some(placed(
@@ -2504,36 +3142,331 @@ impl Pane {
         Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
     }
 
+    /// Opens the Follow announcement channel picker, loading channels across the account's
+    /// servers where this account has `ConversationRights::manage_webhooks`.
+    pub(super) fn open_follow(
+        &mut self,
+        source: protocol::Key,
+        source_title: String,
+        spaces: Vec<protocol::Space>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.follow = Some(Following {
+            source: source.clone(),
+            source_title,
+            candidates: Vec::new(),
+            selected: None,
+            loading: true,
+        });
+        window.focus(&self.focus, cx);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let candidates: Vec<(String, protocol::Conversation)> = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut out = Vec::new();
+                    for space in spaces {
+                        let req = Request::Tree {
+                            space: space.key.clone(),
+                            offset: 0,
+                            limit: 500,
+                            peek: false,
+                        };
+                        if let Ok(Response::Tree { conversations, .. }) = ask(&req) {
+                            for conv in conversations {
+                                if conv.rights.manage_webhooks
+                                    && conv.key != source
+                                    && matches!(
+                                        conv.kind,
+                                        ConversationKind::Channel | ConversationKind::Announcement
+                                    )
+                                {
+                                    out.push((space.name.clone(), conv));
+                                }
+                            }
+                        }
+                    }
+                    out
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(follow) = this.follow.as_mut() {
+                    follow.candidates = candidates;
+                    follow.loading = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn submit_follow(&mut self, cx: &mut Context<Self>) {
+        let Some(follow) = self.follow.take() else {
+            return;
+        };
+        cx.notify();
+        let Some(into) = follow.selected else {
+            return;
+        };
+        let target_label = follow
+            .candidates
+            .iter()
+            .find(|(_, c)| c.key == into)
+            .map(|(space, c)| {
+                if space.is_empty() {
+                    format!("#{}", c.title)
+                } else {
+                    format!("#{} ({space})", c.title)
+                }
+            })
+            .unwrap_or_else(|| into.id.clone());
+        let request = Request::Follow {
+            conversation: follow.source,
+            into,
+        };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| match answer {
+                Ok(Response::Ok) => {
+                    let _ = this.shell.update(cx, |shell, cx| {
+                        shell.toast(
+                            Some(("icons/check.svg", theme::text_soft())),
+                            format!("Following in {target_label}"),
+                            cx,
+                        );
+                    });
+                }
+                Ok(Response::Error { detail, .. }) => this.say(format!("Couldn't follow: {detail}"), cx),
+                Err(err) => this.say(format!("Couldn't follow: {}", crate::client::trouble_words("follow", &err)), cx),
+                _ => {}
+            });
+        })
+        .detach();
+    }
+
+    fn follow_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let follow = self.follow.as_ref()?;
+        let selected_label = follow.selected.as_ref().and_then(|sel| {
+            follow.candidates.iter().find(|(_, c)| &c.key == sel).map(|(space, c)| {
+                if space.is_empty() {
+                    format!("#{}", c.title)
+                } else {
+                    format!("#{} in {space}", c.title)
+                }
+            })
+        });
+        let body = match &selected_label {
+            Some(target) => format!(
+                "Follow #{} into {target}? This creates a webhook in the target server.",
+                follow.source_title
+            ),
+            None => format!(
+                "Choose a channel where you have Manage Webhooks to receive posts from #{}.",
+                follow.source_title
+            ),
+        };
+        let list_el = if follow.loading {
+            div()
+                .py(px(12.))
+                .type_ui()
+                .text_color(theme::text_faint())
+                .child("Loading channels…")
+                .into_any_element()
+        } else if follow.candidates.is_empty() {
+            div()
+                .py(px(12.))
+                .type_ui()
+                .text_color(theme::text_faint())
+                .child("No channels where you have Manage Webhooks.")
+                .into_any_element()
+        } else {
+            let rows = follow.candidates.iter().take(60).map(|(space, conv)| {
+                let key = conv.key.clone();
+                let picked = follow.selected.as_ref() == Some(&key);
+                let title = if conv.title.is_empty() { conv.key.id.clone() } else { conv.title.clone() };
+                let label = if space.is_empty() { format!("#{title}") } else { format!("#{title} · {space}") };
+                div()
+                    .id(ElementId::Name(format!("follow-{}", conv.key.id).into()))
+                    .px(px(10.))
+                    .py(px(6.))
+                    .rounded(px(theme::R_CONTROL))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .cursor_pointer()
+                    .when(picked, |d| d.bg(theme::selected()))
+                    .hover(|s| s.bg(theme::hover()))
+                    .child(div().min_w_0().truncate().type_ui().text_color(theme::text()).child(label))
+                    .when(picked, |d| d.child(div().type_micro().text_color(theme::accent_text()).child("Selected")))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(f) = this.follow.as_mut() {
+                            f.selected = Some(key.clone());
+                            cx.notify();
+                        }
+                    }))
+            });
+            div()
+                .id("follow-candidates")
+                .mt(px(8.))
+                .max_h(px(260.))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .children(rows)
+                .into_any_element()
+        };
+        let can_confirm = follow.selected.is_some();
+        let panel = modal(format!("Follow #{}", follow.source_title))
+            .w(px(420.))
+            .child(modal_body(body))
+            .child(list_el)
+            .child(
+                modal_buttons()
+                    .child(button("follow-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                        this.follow = None;
+                        cx.notify();
+                    })))
+                    .child(
+                        button("follow-confirm", ButtonKind::Primary, "Follow")
+                            .when(!can_confirm, |b| b.opacity(0.45).cursor_default())
+                            .when(can_confirm, |b| b.on_click(cx.listener(|this, _, _, cx| this.submit_follow(cx)))),
+                    ),
+            )
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        let size = window.viewport_size();
+        let scrim = div()
+            .id("follow-scrim")
+            .w(size.width)
+            .h(size.height)
+            .bg(theme::scrim())
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.follow = None;
+                    cx.notify();
+                }),
+            )
+            .child(fade_in("follow-panel", 160, panel));
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
+    }
+
     fn select_menu_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let open = self.open_select.as_ref()?;
-        let mut list = menu().w(px(240.));
+        let multi = open.max_values > 1 || open.element_type.starts_with("multi_");
+        let mut list = menu().w(px(260.));
         for (ix, opt) in open.options.iter().enumerate() {
-            let active = open.selected.as_deref() == Some(opt.value.as_str());
+            let active = if multi {
+                open.multi_selected.iter().any(|v| v == &opt.value)
+            } else {
+                open.selected.as_deref() == Some(opt.value.as_str())
+            };
             let conversation = open.conversation.clone();
             let msg_id = open.message_id.clone();
             let block_id = open.block_id.clone();
             let action_id = open.action_id.clone();
             let element_type = open.element_type.clone();
             let val = opt.value.clone();
-            let values = if element_type.starts_with("multi_") { vec![val.clone()] } else { Vec::new() };
             let confirm = open.confirm.clone();
             let label = if active { format!("✓ {}", opt.label) } else { opt.label.clone() };
-            list = list.child(
-                menu_item(("ctrl-opt", ix), None, label, None)
-                    .when(active, |row| row.bg(theme::selected()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.trigger_control(
-                            conversation.clone(),
-                            msg_id.clone(),
-                            block_id.clone(),
-                            action_id.clone(),
-                            element_type.clone(),
-                            val.clone(),
-                            values.clone(),
-                            confirm.clone(),
-                            cx,
-                        );
-                    })),
+            let mut row = div()
+                .id(SharedString::from(format!("ctrl-opt-{ix}")))
+                .px(px(10.))
+                .py(px(6.))
+                .rounded(px(theme::R_CONTROL))
+                .cursor_pointer()
+                .when(active, |d| d.bg(theme::selected()))
+                .hover(|s| s.bg(theme::hover()))
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(div().type_small().text_color(theme::text()).child(label));
+            if !opt.description.is_empty() {
+                row = row.child(
+                    div()
+                        .type_micro()
+                        .text_color(theme::text_soft())
+                        .child(opt.description.clone()),
+                );
+            }
+            if multi {
+                let max = if open.max_values > 0 { open.max_values as usize } else { usize::MAX };
+                row = row.on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    if let Some(open) = this.open_select.as_mut() {
+                        if open.multi_selected.iter().any(|v| v == &val) {
+                            open.multi_selected.retain(|v| v != &val);
+                        } else if open.multi_selected.len() < max {
+                            open.multi_selected.push(val.clone());
+                        }
+                        cx.notify();
+                    }
+                }));
+            } else {
+                row = row.on_click(cx.listener(move |this, _, window, cx| {
+                    this.trigger_control(
+                        conversation.clone(),
+                        msg_id.clone(),
+                        block_id.clone(),
+                        action_id.clone(),
+                        element_type.clone(),
+                        val.clone(),
+                        vec![val.clone()],
+                        confirm.clone(),
+                        window,
+                        cx,
+                    );
+                }));
+            }
+            list = list.child(row);
+        }
+        if multi {
+            let min = open.min_values as usize;
+            let count = open.multi_selected.len();
+            let can_submit = count >= min && (min == 0 || count > 0);
+            let conversation = open.conversation.clone();
+            let msg_id = open.message_id.clone();
+            let block_id = open.block_id.clone();
+            let action_id = open.action_id.clone();
+            let element_type = open.element_type.clone();
+            let values = open.multi_selected.clone();
+            let confirm = open.confirm.clone();
+            list = list.child(menu_separator()).child(
+                div()
+                    .px(px(6.))
+                    .py(px(4.))
+                    .flex()
+                    .justify_end()
+                    .child(
+                        button(
+                            "ctrl-multi-apply",
+                            ButtonKind::Primary,
+                            if count == 0 { "Apply".to_owned() } else { format!("Apply ({count})") },
+                        )
+                        .when(!can_submit, |b| b.opacity(0.5))
+                        .when(can_submit, |b| {
+                            b.on_click(cx.listener(move |this, _, window, cx| {
+                                let first = values.first().cloned().unwrap_or_default();
+                                this.trigger_control(
+                                    conversation.clone(),
+                                    msg_id.clone(),
+                                    block_id.clone(),
+                                    action_id.clone(),
+                                    element_type.clone(),
+                                    first,
+                                    values.clone(),
+                                    confirm.clone(),
+                                    window,
+                                    cx,
+                                );
+                            }))
+                        }),
+                    ),
             );
         }
         let list = list.on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -2547,6 +3480,93 @@ impl Pane {
             window,
             fade_in("control-select", 120, list),
         ))
+    }
+
+    fn interaction_modal_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let active = self.interaction_modal.as_ref()?;
+        let title = if active.modal.title.is_empty() {
+            "Form".to_owned()
+        } else {
+            active.modal.title.clone()
+        };
+        let room = f32::from(window.viewport_size().width) - 32.;
+        let mut fields_col = div().flex().flex_col().gap(px(10.)).pt(px(4.));
+        for (field, input) in active.modal.fields.iter().zip(&active.inputs) {
+            let label = if field.required {
+                format!("{} *", field.label)
+            } else {
+                field.label.clone()
+            };
+            let box_el = div()
+                .rounded(px(theme::R_CONTROL))
+                .bg(theme::canvas())
+                .border_1()
+                .border_color(super::tokens::border_strong())
+                .px(px(8.))
+                .py(px(6.))
+                .when(field.multiline, |d| d.min_h(px(72.)))
+                .child(input.clone());
+            fields_col = fields_col.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(div().type_small().font_weight(theme::MEDIUM).text_color(theme::text_soft()).child(label))
+                    .child(box_el),
+            );
+        }
+        let error_line = active.error.as_ref().map(|err| {
+            div()
+                .pt(px(6.))
+                .type_small()
+                .text_color(theme::danger())
+                .child(err.clone())
+        });
+        let submitting = active.submitting;
+        let panel = modal(title)
+            .w(px(if crate::gui::phone::active() { room.min(440.) } else { 440. }))
+            .child(fields_col)
+            .children(error_line)
+            .child(
+                modal_buttons()
+                    .child(button("interaction-modal-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                        this.interaction_modal = None;
+                        cx.notify();
+                    })))
+                    .child(
+                        button(
+                            "interaction-modal-submit",
+                            ButtonKind::Primary,
+                            if submitting { "Submitting…" } else { "Submit" },
+                        )
+                        .when(submitting, |b| b.opacity(0.6))
+                        .when(!submitting, |b| {
+                            b.on_click(cx.listener(|this, _, _, cx| {
+                                this.submit_modal(cx);
+                            }))
+                        }),
+                    ),
+            )
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        let size = window.viewport_size();
+        let scrim = div()
+            .id("interaction-modal-scrim")
+            .w(size.width)
+            .h(size.height)
+            .bg(theme::scrim())
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.interaction_modal = None;
+                    cx.notify();
+                }),
+            )
+            .child(fade_in("interaction-modal-panel", 160, panel));
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
     }
 
     fn action_confirm_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -2574,7 +3594,11 @@ impl Pane {
                         this.action_confirm = None;
                         if let Some(url) = &to_run.open_url {
                             if this.key() == Some(&to_run.conversation) {
-                                this.open_external_link(url, window, cx);
+                                if super::links::telegram_app_link(url) {
+                                    cx.open_url(url);
+                                } else {
+                                    this.open_external_link(url, window, cx);
+                                }
                             }
                             cx.notify();
                         } else {
@@ -2586,6 +3610,7 @@ impl Pane {
                                 to_run.element_type.clone(),
                                 to_run.value.clone(),
                                 to_run.values.clone(),
+                                window,
                                 cx,
                             );
                         }
@@ -2701,6 +3726,96 @@ impl Pane {
         Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
     }
 
+    fn action_result_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let result = self.action_result.as_ref()?;
+        let title = if result.title.is_empty() { "Details".to_owned() } else { result.title.clone() };
+        let body = result.text.clone();
+        let fields = result.fields.clone();
+        let url = result.url.clone();
+        let url_label = if result.url_label.is_empty() { "Open".to_owned() } else { result.url_label.clone() };
+        let follow = (!result.follow_action.is_empty()).then(|| (result.follow_action.clone(), result.follow_value.clone()));
+        let origin = self.action_origin.clone();
+        let room = f32::from(window.viewport_size().width) - 32.;
+        let field_rows = (!fields.is_empty()).then(|| {
+            div().mt(px(8.)).flex().flex_col().gap(px(4.)).children(fields.into_iter().map(|(label, value)| {
+                div()
+                    .flex()
+                    .gap(px(8.))
+                    .child(div().w(px(96.)).flex_none().type_small().text_color(theme::text_faint()).child(label))
+                    .child(div().flex_1().min_w_0().type_small().text_color(theme::text()).child(value))
+            }))
+        });
+        let open = url.clone();
+        let panel = modal(title)
+            .w(px(if crate::gui::phone::active() { room.min(400.) } else { 400. }))
+            .when(!body.is_empty(), |m| m.child(modal_body(body)))
+            .children(field_rows)
+            .child(
+                modal_buttons()
+                    .child(button("action-result-close", ButtonKind::Secondary, "Close").on_click(cx.listener(|this, _, _, cx| {
+                        this.action_result = None;
+                        this.action_origin = None;
+                        cx.notify();
+                    })))
+                    .when(follow.is_some() && origin.is_some(), |row| {
+                        let Some((action_id, value)) = follow.clone() else {
+                            return row;
+                        };
+                        let Some((conversation, message_id)) = origin.clone() else {
+                            return row;
+                        };
+                        row.child(button("action-result-allow", ButtonKind::Primary, "Allow").on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.action_result = None;
+                                this.action_origin = None;
+                                this.execute_control(
+                                    conversation.clone(),
+                                    message_id.clone(),
+                                    String::new(),
+                                    action_id.clone(),
+                                    "telegram_login".to_owned(),
+                                    value.clone(),
+                                    Vec::new(),
+                                    window,
+                                    cx,
+                                );
+                            },
+                        )))
+                    })
+                    .when(open.is_some() && follow.is_none(), |row| {
+                        let target = open.clone().unwrap_or_default();
+                        row.child(button("action-result-open", ButtonKind::Primary, url_label.clone()).on_click(
+                            cx.listener(move |this, _, window, cx| {
+                                this.action_result = None;
+                                this.action_origin = None;
+                                this.open_external_link(&target, window, cx);
+                            }),
+                        ))
+                    }),
+            )
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        let size = window.viewport_size();
+        let scrim = div()
+            .id("action-result-scrim")
+            .w(size.width)
+            .h(size.height)
+            .bg(theme::scrim())
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.action_result = None;
+                    this.action_origin = None;
+                    cx.notify();
+                }),
+            )
+            .child(fade_in("action-result-panel", 160, panel));
+        Some(deferred(anchored().position(point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
+    }
+
     pub(super) fn action_layers(&self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         if crate::gui::phone::active() {
             return [
@@ -2711,8 +3826,11 @@ impl Pane {
                 self.confirm_layer(window, cx),
                 self.paid_react_layer(window, cx),
                 self.action_confirm_layer(window, cx),
+                self.interaction_modal_layer(window, cx),
+                self.action_result_layer(window, cx),
                 self.bulk_confirm_layer(window, cx),
                 self.forward_layer(window, cx),
+                self.follow_layer(window, cx),
                 self.link_layer(window, cx),
             ]
             .into_iter()
@@ -2727,8 +3845,11 @@ impl Pane {
             self.confirm_layer(window, cx),
             self.paid_react_layer(window, cx),
             self.action_confirm_layer(window, cx),
+            self.interaction_modal_layer(window, cx),
+            self.action_result_layer(window, cx),
             self.bulk_confirm_layer(window, cx),
             self.forward_layer(window, cx),
+            self.follow_layer(window, cx),
             self.link_layer(window, cx),
         ]
         .into_iter()
@@ -2795,14 +3916,28 @@ impl Pane {
         if targets.is_empty() {
             return;
         }
-        // Send deletes paced off-thread so we never burst the network.
+        // Batch deletes by scope so networks like Telegram delete all selected messages in one RPC.
+        let mut everyone: Vec<String> = Vec::new();
+        let mut me_only: Vec<String> = Vec::new();
+        for (message_id, scope) in targets {
+            match scope {
+                protocol::DeleteScope::Everyone => everyone.push(message_id),
+                protocol::DeleteScope::Me => me_only.push(message_id),
+            }
+        }
         cx.spawn(async move |_, cx| {
-            for (ix, (message_id, scope)) in targets.into_iter().enumerate() {
-                if ix > 0 {
-                    cx.background_executor().timer(std::time::Duration::from_millis(120)).await;
+            for (scope, ids) in [(protocol::DeleteScope::Everyone, everyone), (protocol::DeleteScope::Me, me_only)] {
+                if ids.is_empty() {
+                    continue;
                 }
-                let req = Request::Delete { conversation: conversation.clone(), message_id, scope };
-                let _ = cx.background_executor().spawn(async move { crate::client::ask(&req) }).await;
+                for chunk in ids.chunks(100) {
+                    let req = Request::DeleteMany {
+                        conversation: conversation.clone(),
+                        message_ids: chunk.to_vec(),
+                        scope,
+                    };
+                    let _ = cx.background_executor().spawn(async move { crate::client::ask(&req) }).await;
+                }
             }
         })
         .detach();
@@ -2932,6 +4067,11 @@ impl Pane {
             cx.notify();
             return true;
         }
+        if key == "escape" && self.interaction_modal.is_some() {
+            self.interaction_modal = None;
+            cx.notify();
+            return true;
+        }
         if key == "escape" && self.action_confirm.is_some() {
             self.action_confirm = None;
             cx.notify();
@@ -2939,6 +4079,11 @@ impl Pane {
         }
         if key == "escape" && self.forward.is_some() {
             self.forward = None;
+            cx.notify();
+            return true;
+        }
+        if key == "escape" && self.follow.is_some() {
+            self.follow = None;
             cx.notify();
             return true;
         }
@@ -2972,8 +4117,20 @@ impl Pane {
             let bare = !event.keystroke.modifiers.modified();
             match key {
                 "escape" => {
+                    if self.menu.as_ref().is_some_and(|menu| menu.apps) {
+                        if let Some(menu) = self.menu.as_mut() {
+                            menu.apps = false;
+                        }
+                        self.apps_anchor.set(None);
+                        self.apps_menu.set(None);
+                        cx.notify();
+                        return true;
+                    }
                     self.close_menu(cx);
                     self.close_picker(cx);
+                    return true;
+                }
+                "up" | "down" | "enter" if bare && self.menu.as_ref().is_some_and(|menu| menu.apps) => {
                     return true;
                 }
                 "up" | "down" if bare => {
@@ -3093,6 +4250,8 @@ mod tests {
             forward: true,
             polls: Some(protocol::PollCapabilities::default()),
             reactions: true,
+            suppress_embeds: true,
+            announcement_follow: true,
             ..Capabilities::default()
         }
     }
@@ -3162,7 +4321,7 @@ mod tests {
         let said = Message::plain("1", "Mara", "hello", 1, false);
         let on = can(&said, &discord_caps(), rights, channel, false, 10);
         assert_eq!(
-            menu_acts(on, false, 2, true, true, true, true, false, false),
+            menu_acts(on, false, 2, true, true, true, true, false, false, false, false),
             vec![
                 MenuAct::Quick(0),
                 MenuAct::Quick(1),
@@ -3178,7 +4337,7 @@ mod tests {
             ]
         );
         // Tiny has Copy link without Open in Tiny.
-        let tiny_acts = menu_acts(on, false, 0, true, false, true, false, false, false);
+        let tiny_acts = menu_acts(on, false, 0, true, false, true, false, false, false, false, false);
         assert!(tiny_acts.contains(&MenuAct::Link) && !tiny_acts.contains(&MenuAct::Open));
         let mut mine = Message::plain("2", "Robin", "on it", 2, true);
         mine.state = SendState::Failed {
@@ -3186,18 +4345,25 @@ mod tests {
         };
         let failed = can(&mine, &discord_caps(), rights, channel, false, 10);
         assert_eq!(
-            menu_acts(failed, true, 3, true, true, false, false, true, false),
+            menu_acts(failed, true, 3, true, true, false, false, true, false, false, false),
             vec![MenuAct::Retry, MenuAct::Copy, MenuAct::Drop]);
         assert_eq!(
-            menu_acts(on, false, 0, false, false, false, false, true, false),
+            menu_acts(on, false, 0, false, false, false, false, true, false, false, false),
             vec![MenuAct::Reply, MenuAct::Thread, MenuAct::Forward, MenuAct::SaveAs, MenuAct::Unread, MenuAct::Select],
         );
+        assert!(menu_acts(on, false, 0, false, false, false, false, false, false, true, false).contains(&MenuAct::FavouriteGif));
+        let translated = menu_acts(Can { translate: true, ..on }, false, 0, false, true, true, true, false, false, false, true);
+        let copy = translated.iter().position(|act| *act == MenuAct::Copy).unwrap();
+        let link = translated.iter().position(|act| *act == MenuAct::Link).unwrap();
+        assert!(copy + 1 < link);
+        assert_eq!(translated[copy + 1], MenuAct::Translate);
+        assert_eq!(translated[copy + 2], MenuAct::TranslateChat);
         // Translate appears only when the account supports it and the message has text.
         let mut t_caps = discord_caps();
         t_caps.translate = true;
         let translatable = can(&said, &t_caps, rights, channel, false, 10);
         assert!(translatable.translate);
-        assert!(menu_acts(translatable, false, 0, false, true, false, false, false, false).contains(&MenuAct::Translate));
+        assert!(menu_acts(translatable, false, 0, false, true, false, false, false, false, false, false).contains(&MenuAct::Translate));
         let empty = Message::plain("3", "Mara", "   ", 3, false);
         assert!(!can(&empty, &t_caps, rights, channel, false, 10).translate);
     }
@@ -3210,12 +4376,12 @@ mod tests {
         let rights = ConversationRights::default();
         let offered = can_with_network(&said, Network::Telegram, &caps, rights, ConversationKind::Direct, false, 10);
         assert!(offered.translate);
-        let acts = menu_acts(offered, false, 0, true, true, false, false, false, false);
+        let acts = menu_acts(offered, false, 0, true, true, false, false, false, false, false, false);
         let copy = acts.iter().position(|act| *act == MenuAct::Copy).unwrap();
         assert_eq!(acts.get(copy + 1), Some(&MenuAct::Translate));
         let signal = can_with_network(&said, Network::Signal, &caps, rights, ConversationKind::Direct, false, 10);
         assert!(!signal.translate);
-        assert!(!menu_acts(signal, false, 0, true, true, false, false, false, false).contains(&MenuAct::Translate));
+        assert!(!menu_acts(signal, false, 0, true, true, false, false, false, false, false, false).contains(&MenuAct::Translate));
         let blank = Message::plain("2", "Mara", "  ", 1, false);
         assert!(!can_with_network(&blank, Network::Telegram, &caps, rights, ConversationKind::Direct, false, 10).translate);
     }
@@ -3244,10 +4410,17 @@ mod tests {
         assert!(!can(&theirs, &discord_caps(), none, ConversationKind::Voice, false, 1_100).thread);
         assert!(!can(&theirs, &discord_caps(), none, ConversationKind::Forum, false, 1_100).thread);
 
-        // Moderator rights grant delete on others' messages and pin.
+        // Moderator rights grant delete on others' messages, pin, and clearing reactions on Discord only.
         let mod_rights = ConversationRights { pin: true, delete_others: true, manage_members: true, ..ConversationRights::default() };
-        let moderated = can(&theirs, &discord_caps(), mod_rights, channel, false, 1_100);
-        assert!(moderated.delete && moderated.pin && !moderated.edit);
+        let moderated = can_with_network(&theirs, Network::Discord, &discord_caps(), mod_rights, channel, false, 1_100);
+        assert!(moderated.delete && moderated.delete_everyone && moderated.pin && !moderated.edit && !moderated.clear_reactions);
+        let mut reacted = theirs.clone();
+        reacted.reactions.push(protocol::Reaction { emoji: "👍".into(), file: None, count: 2, mine: false, who: Vec::new(), burst: 0, mine_burst: false, burst_colors: Vec::new() });
+        assert!(can_with_network(&reacted, Network::Discord, &discord_caps(), mod_rights, channel, false, 1_100).clear_reactions);
+        assert!(!can_with_network(&reacted, Network::Discord, &discord_caps(), none, channel, false, 1_100).clear_reactions);
+        assert!(!can_with_network(&reacted, Network::Tiny, &tiny_caps(), mod_rights, channel, false, 1_100).clear_reactions);
+        assert!(!can_with_rights(&reacted, Network::Telegram, ConversationKind::Group, false, mod_rights).clear_reactions);
+        assert!(!can_with_rights(&reacted, Network::Signal, ConversationKind::Group, false, mod_rights).clear_reactions);
 
         // Slack fixture: no inline reply, threads in both channels and DMs.
         let slack = can(&theirs, &slack_caps(), none, channel, false, 1_100);
@@ -3290,10 +4463,27 @@ mod tests {
         let overridden = can(&mine_sms, &messages_caps(), none, ConversationKind::Direct, false, 1_100);
         assert!(overridden.edit && overridden.delete);
 
-        // Telegram edit_window (48h): edit offered inside window, hidden past window.
+        // Telegram edit_window (48h): edit offered inside window, hidden past window in DMs/groups,
+        // but Saved Messages and own channel posts stay editable indefinitely.
         let mine_tg = Message::plain("t1", "Me", "hi", 1_000, true);
-        assert!(can(&mine_tg, &telegram_caps(), none, ConversationKind::Direct, false, 1_000 + 3_600).edit);
-        assert!(!can(&mine_tg, &telegram_caps(), none, ConversationKind::Direct, false, 1_000 + 48 * 3_600 + 1).edit);
+        let past_48h = 1_000 + 48 * 3_600 + 1;
+        assert!(can_with_network(&mine_tg, Network::Telegram, &telegram_caps(), none, ConversationKind::Direct, false, 1_000 + 3_600).edit);
+        assert!(!can_with_network(&mine_tg, Network::Telegram, &telegram_caps(), none, ConversationKind::Direct, false, past_48h).edit);
+        assert!(can_with_network(&mine_tg, Network::Telegram, &telegram_caps(), none, ConversationKind::Channel, false, past_48h).edit);
+        assert!(
+            can_with_network_context(
+                &mine_tg,
+                Network::Telegram,
+                &telegram_caps(),
+                none,
+                ConversationKind::Direct,
+                protocol::Special::Saved,
+                false,
+                "",
+                past_48h,
+            )
+            .edit
+        );
 
         let mut mine = Message::plain("2", "Robin", "on it", 2, true);
         let own = can(&mine, &discord_caps(), none, channel, false, 100);
@@ -3436,5 +4626,45 @@ mod tests {
         assert!(!can_in(&old, Network::Messages, ConversationKind::Direct, false, "RCS message", 900, now).edit);
         assert!(!can_in(&mine, Network::Messages, ConversationKind::Direct, false, "Text message", 900, now).edit);
         assert!(!can_in(&mine, Network::Messages, ConversationKind::Direct, false, "", 900, now).edit);
+    }
+
+    #[test]
+    fn announcement_publish_follows_rights_and_published_flag() {
+        let caps = discord_caps();
+        let plain = ConversationRights::default();
+        let mod_rights = ConversationRights { delete_others: true, ..ConversationRights::default() };
+
+        let mut mine = Message::plain("m1", "Me", "release notes", 10, true);
+        let theirs = Message::plain("m2", "Mara", "patch notes", 11, false);
+
+        // Own unpublished message in an announcement channel can be published.
+        let mine_ann = can(&mine, &caps, plain, ConversationKind::Announcement, false, 20);
+        assert!(mine_ann.publish);
+        assert!(menu_acts(mine_ann, false, 0, false, true, false, false, false, false, false, false).contains(&MenuAct::Publish));
+
+        // Not offered in a regular text channel.
+        assert!(!can(&mine, &caps, plain, ConversationKind::Channel, false, 20).publish);
+
+        // Once published, no longer offered.
+        mine.published = true;
+        assert!(!can(&mine, &caps, plain, ConversationKind::Announcement, false, 20).publish);
+
+        // Others' unpublished messages require Manage Messages (`delete_others`).
+        assert!(!can(&theirs, &caps, plain, ConversationKind::Announcement, false, 20).publish);
+        assert!(can(&theirs, &caps, mod_rights, ConversationKind::Announcement, false, 20).publish);
+    }
+
+    #[test]
+    fn suppress_embeds_is_offered_on_own_messages_and_for_moderators_on_discord() {
+        let caps = discord_caps();
+        let plain = ConversationRights::default();
+        let mod_rights = ConversationRights { delete_others: true, ..ConversationRights::default() };
+        let mine = Message::plain("m1", "Me", "https://example.com", 10, true);
+        let theirs = Message::plain("m2", "Mara", "https://example.com", 11, false);
+
+        assert!(can_with_network(&mine, Network::Discord, &caps, plain, ConversationKind::Channel, false, 20).suppress_embeds);
+        assert!(!can_with_network(&theirs, Network::Discord, &caps, plain, ConversationKind::Channel, false, 20).suppress_embeds);
+        assert!(can_with_network(&theirs, Network::Discord, &caps, mod_rights, ConversationKind::Channel, false, 20).suppress_embeds);
+        assert!(!can_with_network(&mine, Network::Slack, &caps, plain, ConversationKind::Channel, false, 20).suppress_embeds);
     }
 }

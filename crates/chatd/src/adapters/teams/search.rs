@@ -70,7 +70,7 @@ pub(super) fn build_query_string(
     match filters.has {
         Some(SearchHas::Files | SearchHas::Images) => parts.push("hasAttachment:true".to_owned()),
         Some(SearchHas::Links) => parts.push("hasLinks:true".to_owned()),
-        None => {}
+        Some(_) | None => {}
     }
     if filters.mentions_me {
         parts.push("mentionsMe:true".to_owned());
@@ -421,7 +421,7 @@ impl Teams {
                     }
                 }
             }
-            SearchScope::Account => {}
+            SearchScope::Account | SearchScope::Home => {}
         }
 
         let display_query = sanitize_search_text(query);
@@ -482,7 +482,7 @@ impl Teams {
                         continue;
                     }
                 }
-                SearchScope::Account | SearchScope::Conversation(_) => {}
+                SearchScope::Account | SearchScope::Home | SearchScope::Conversation(_) => {}
             }
 
             // Ensure the target conversation (or reply chain) exists in the store so jumping
@@ -519,6 +519,7 @@ impl Teams {
             let outgoing = !me.is_empty() && parsed.sender_id == me;
 
             hits.push(MessageHit {
+                age_restricted: false,
                 conversation: self.ctx.key(&place),
                 message_id: parsed.message_id,
                 sent: parsed.sent,

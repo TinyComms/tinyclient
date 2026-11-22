@@ -392,7 +392,7 @@ impl Discord {
     }
 
     /// A session was refused: the reason is kept for the user, and counted.
-    fn identify_failed(&self, why: &str) {
+    pub(super) fn identify_failed(&self, why: &str) {
         self.forget_session();
         let mut refused = self.refused_sessions.lock().unwrap();
         refused.0 += 1;
@@ -609,9 +609,15 @@ impl Discord {
                         return Err(err.into());
                     }
                 };
-                // READY can be many megabytes: the text goes before anything is done with it.
-                drop(text);
+                // The servers are read out of the text one at a time, so it stays until they are
+                // in the store, and goes before anything else is done.
                 self.ready(ready)?;
+                drop(text);
+                // glibc keeps what was freed for itself: the megabytes of READY go back to the system.
+                #[cfg(all(target_os = "linux", target_env = "gnu"))]
+                unsafe {
+                    libc::malloc_trim(0);
+                }
                 self.refused_sessions.lock().unwrap().0 = 0;
                 beat.ready = true;
                 self.ctx.link(Link::Connected);

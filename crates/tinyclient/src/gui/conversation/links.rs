@@ -3,7 +3,8 @@
 //! The decision is `protocol::link::Destination` (host, registrable domain, punycode, lookalike
 //! check, tracking strip). This file is only the question and what the answer does. The browser
 //! is started with the system's own opener (`cx.open_url`): it is handed the address alone, so no
-//! page is the referrer and no `Referer` is sent. Only http and https ever get that far.
+//! page is the referrer and no `Referer` is sent. Web links are http or https. A `tg://` link
+//! is handed to the system as it is, and `http://t.me` or `http://telegram.me` is opened as https.
 
 use super::Pane;
 use crate::gui::app::prefs;
@@ -82,12 +83,42 @@ pub(super) fn message_link_for(
     message_link(key, open.space.as_deref(), message)
 }
 
+/// `http://t.me` and `http://telegram.me` are the same sites as their https links.
+fn https_telegram_web(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") {
+        return None;
+    }
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host.eq_ignore_ascii_case("t.me") || host.eq_ignore_ascii_case("telegram.me") {
+        Some(format!("https://{rest}"))
+    } else {
+        None
+    }
+}
+
 /// A `mailto:` link, which other networks put on an address. It opens the mail app as it is:
-/// no question, no tracking strip. Every other scheme that is not http or https stays refused.
+/// no question, no tracking strip.
 pub(in crate::gui) fn is_mailto(url: &str) -> bool {
     url.get(..7).is_some_and(|scheme| scheme.eq_ignore_ascii_case("mailto:"))
         && url.len() <= 2048
         && !url.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"')
+}
+
+/// A Telegram mini app handed to Telegram's own app: `tg://resolve?domain=<bot>&appname=<app>`.
+/// Anything else, including a login token, is not one.
+pub(super) fn telegram_app_link(url: &str) -> bool {
+    let Some(query) = url.strip_prefix("tg://resolve?") else {
+        return false;
+    };
+    // Exactly `domain=…&appname=…`, in that order: anything reordered or added is not handed over.
+    let mut pairs = query.split('&');
+    let (Some(domain), Some(app), None) =
+        (pairs.next().and_then(|pair| pair.strip_prefix("domain=")), pairs.next().and_then(|pair| pair.strip_prefix("appname=")), pairs.next())
+    else {
+        return false;
+    };
+    [domain, app].iter().all(|value| !value.is_empty() && value.len() <= 128 && value.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
 }
 
 /// Whether a link to `dest` opens without a question, given what the person chose.
@@ -123,6 +154,20 @@ pub(in crate::gui) fn open_external_link(url: &str, cx: &mut App) {
     };
     cx.open_url(&dest.target(prefs::choices().strip_tracking));
 }
+/// Web URL fallback when a `#channel` mention is clicked but chatd has no row for it.
+pub(super) fn channel_mention_fallback_url(
+    network: protocol::Network,
+    space: Option<&str>,
+    channel_id: &str,
+) -> Option<String> {
+    if network != protocol::Network::Discord || channel_id.is_empty() || !channel_id.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let place = space
+        .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or("@me");
+    Some(format!("https://discord.com/channels/{place}/{channel_id}"))
+}
 
 impl Pane {
     /// Opens a link externally (in the system browser), asking for confirmation per preferences.
@@ -132,6 +177,17 @@ impl Pane {
             cx.open_url(url);
             return;
         }
+        // `tg://` is not http. Destination refuses it, so the click used to do nothing.
+        let trimmed = url.trim();
+        if trimmed.len() <= protocol::link::LINK_LIMIT
+            && trimmed.to_ascii_lowercase().starts_with("tg:")
+            && !trimmed.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"')
+        {
+            cx.open_url(trimmed);
+            return;
+        }
+        let upgraded = https_telegram_web(trimmed);
+        let url = upgraded.as_deref().unwrap_or(trimmed);
         let Some(dest) = Destination::parse(url) else {
             return;
         };
@@ -158,16 +214,44 @@ impl Pane {
                 });
                 return;
             }
+            if protocol::link::telegram_invite_hash(url).is_some() {
+                let preferred = self
+                    .key()
+                    .filter(|k| k.network == protocol::Network::Telegram)
+                    .map(|k| k.account());
+                let owned = url.to_owned();
+                let opened = self
+                    .shell
+                    .update(cx, |shell, cx| shell.open_telegram_invite(preferred, owned, cx))
+                    .unwrap_or(false);
+                if opened {
+                    return;
+                }
+            }
         }
-        if !external && protocol::link::parse_network_link(url).is_some() {
+        // Only t.me and telegram.me open in the app. telegram.dog, tg://, a traversal, or a pack
+        // is still a Telegram address, so it must not fall through to the wider parser.
+        let in_app = protocol::link::telegram_app_link(url).is_some()
+            || (!protocol::link::telegram_family(url) && protocol::link::parse_network_link(url).is_some());
+        if !external && in_app {
             let owned = url.to_owned();
             let request = protocol::Request::Resolve { url: owned.clone() };
             let window_handle = window.window_handle();
             cx.spawn(async move |this, cx| {
                 let answer = cx.background_executor().spawn(async move { crate::client::ask(&request) }).await;
                 if let Ok(protocol::Response::Resolved { conversation: Some(key), message_id, title }) = answer {
+                    let parsed = protocol::link::parse_network_link(&owned);
+                    let boost = parsed.as_ref().is_some_and(|link| link.space.as_deref() == Some("boost"));
+                    let start = parsed.and_then(|link| (link.space.as_deref() == Some("start")).then(|| link.thread_id.unwrap_or_default()));
                     let _ = this.update(cx, |this, cx| {
-                        let _ = this.shell.update(cx, |shell, cx| shell.open_resolved_link(key, message_id, &title, cx));
+                        let _ = this.shell.update(cx, |shell, cx| {
+                            shell.open_resolved_link(key.clone(), message_id, &title, cx);
+                            if boost {
+                                shell.details_conversation(key, cx);
+                            } else if let Some(param) = start {
+                                shell.start_bot(key, param, cx);
+                            }
+                        });
                     });
                     return;
                 }
@@ -179,6 +263,51 @@ impl Pane {
             return;
         }
         self.open_external_link(url, window, cx);
+    }
+
+    /// A click on a `#channel` mention: resolves the channel via `Request::Conversation` and opens
+    /// it in-app. If chatd does not know the row (or Alt is held), falls back to the web link.
+    pub(super) fn open_channel_mention(
+        &mut self,
+        channel_id: &str,
+        external: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(open) = self.open.as_ref() else {
+            return;
+        };
+        let key = protocol::Key::new(&open.key.account(), channel_id);
+        let space = self
+            .shell
+            .upgrade()
+            .and_then(|shell| shell.read(cx).snapshot.as_ref()?.open.as_ref()?.space.clone());
+        let fallback = channel_mention_fallback_url(open.key.network, space.as_deref(), channel_id);
+        if external {
+            if let Some(url) = fallback {
+                self.open_external_link(&url, window, cx);
+            }
+            return;
+        }
+        let request = protocol::Request::Conversation { conversation: key };
+        let window_handle = window.window_handle();
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { crate::client::ask(&request) }).await;
+            if let Ok(protocol::Response::Conversation { conversation }) = answer {
+                let _ = this.update(cx, |this, cx| {
+                    let _ = this.shell.update(cx, |shell, cx| {
+                        shell.open_resolved_link(conversation.key, None, &conversation.title, cx);
+                    });
+                });
+                return;
+            }
+            if let Some(url) = fallback {
+                let _ = cx.update_window(window_handle, |_, window, cx| {
+                    let _ = this.update(cx, |this, cx| this.open_external_link(&url, window, cx));
+                });
+            }
+        })
+        .detach();
     }
 
     /// Opens what is asked about, and remembers its domain if that was ticked.
@@ -374,6 +503,22 @@ mod tests {
     }
 
     #[test]
+    fn a_mini_app_link_is_handed_to_telegram_and_a_token_is_not() {
+        assert!(telegram_app_link("tg://resolve?domain=trail_bot&appname=ridge"));
+        assert!(Destination::parse("tg://resolve?domain=trail_bot&appname=ridge").is_none());
+        for bad in [
+            "tg://resolve?domain=trail_bot",
+            "tg://resolve?domain=trail_bot&appname=ridge&hash=secret-token-9",
+            "tg://login?token=secret-token-9",
+            "tg://resolve?appname=ridge&domain=trail_bot",
+            "https://t.me/trail_bot/ridge",
+            "tg://resolve?domain=trail_bot&appname=../ridge",
+        ] {
+            assert!(!telegram_app_link(bad), "{bad}");
+        }
+    }
+
+    #[test]
     fn a_lookalike_or_a_user_name_is_asked_about_whatever_was_chosen() {
         for url in ["https://\u{0430}pple.com/", "https://paypal.com@evil.example/"] {
             let d = dest(url);
@@ -390,11 +535,11 @@ mod tests {
     fn message_link_round_trips_through_parse_network_link() {
         let mut key = protocol::Key { network: protocol::Network::Discord, account: "1".into(), id: "12345".into() };
         let said = protocol::Message::plain("67890", "Mara", "hello", 1, false);
-        let url = message_link(&key, Some("G7"), &said).unwrap();
-        assert_eq!(url, "https://discord.com/channels/G7/12345/67890");
+        let url = message_link(&key, Some("4000"), &said).unwrap();
+        assert_eq!(url, "https://discord.com/channels/4000/12345/67890");
         let parsed = protocol::link::parse_network_link(&url).unwrap();
         assert_eq!(parsed.network, protocol::Network::Discord);
-        assert_eq!(parsed.space.as_deref(), Some("G7"));
+        assert_eq!(parsed.space.as_deref(), Some("4000"));
         assert_eq!(parsed.channel, "12345");
         assert_eq!(parsed.message_id.as_deref(), Some("67890"));
 
@@ -422,11 +567,31 @@ mod tests {
             "engineering",
         );
         assert_eq!(
-            network_link_chip("https://discord.com/channels/G7/12345/67890", &[conv.clone()]).as_deref(),
+            network_link_chip("https://discord.com/channels/4000/12345/67890", &[conv.clone()]).as_deref(),
             Some("#engineering ↗")
         );
         assert_eq!(
-            network_link_chip("https://discord.com/channels/G7/99999/67890", &[conv]),
+            network_link_chip("https://discord.com/channels/4000/99999/67890", &[conv]),
+            None
+        );
+    }
+
+    #[test]
+    fn channel_mention_fallback_url_validates_discord_snowflakes() {
+        assert_eq!(
+            channel_mention_fallback_url(protocol::Network::Discord, Some("4000"), "4102").as_deref(),
+            Some("https://discord.com/channels/4000/4102")
+        );
+        assert_eq!(
+            channel_mention_fallback_url(protocol::Network::Discord, None, "4102").as_deref(),
+            Some("https://discord.com/channels/@me/4102")
+        );
+        assert_eq!(
+            channel_mention_fallback_url(protocol::Network::Discord, Some("4000"), "bad/id"),
+            None
+        );
+        assert_eq!(
+            channel_mention_fallback_url(protocol::Network::Slack, Some("T1"), "C1"),
             None
         );
     }

@@ -702,7 +702,7 @@ impl Shell {
         let me = self.me(key);
         let can = self.snapshot.as_ref().and_then(|snapshot| snapshot.account(&key.account())).map(|status| status.can).unwrap_or_default();
         let picture = self.conversation_picture(&row, cx);
-        pane.update(cx, |pane, cx| pane.show(&row, &me, can, picture, typing, cx));
+        pane.update(cx, |pane, cx| pane.show(&row, &me, can, picture, typing, false, cx));
         self.sync_one_composer(key, cx);
     }
 
@@ -747,7 +747,7 @@ impl Shell {
             let thread_key = key.clone();
             cx.new(move |cx| {
                 let mut pane = Pane::new(Metrics::DENSE, true, shell, cx);
-                pane.show_thread(thread_key, &title, &me, can, rights, root, cx);
+                pane.show_thread(thread_key, &title, &me, can, rights, root, false, false, cx);
                 pane
             })
         } else {
@@ -757,7 +757,7 @@ impl Shell {
             let picture = self.conversation_picture(&row, cx);
             cx.new(move |cx| {
                 let mut pane = Pane::new(Metrics::FULL, false, shell, cx);
-                pane.show(&row, &me, can, picture, owns, cx);
+                pane.show(&row, &me, can, picture, owns, false, cx);
                 pane
             })
         };
@@ -831,7 +831,14 @@ impl Shell {
         if window_key.network != Network::Discord || !super::actions::starts_thread(&root, &can, kind) {
             return;
         }
-        let request = Request::StartThread { conversation: window_key.clone(), message: root.id.clone() };
+        let request = Request::StartThread {
+            conversation: window_key.clone(),
+            message: Some(root.id.clone()),
+            name: String::new(),
+            private: false,
+            auto_archive_minutes: None,
+            first_message: String::new(),
+        };
         let window_key = window_key.clone();
         cx.spawn(async move |this, cx| {
             let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
@@ -878,7 +885,7 @@ impl Shell {
         let shell = cx.weak_entity();
         let pane = cx.new(|cx| {
             let mut pane = Pane::new(Metrics::DENSE, true, shell, cx);
-            pane.show_thread(key.clone(), &title, &me, can, rights, root, cx);
+            pane.show_thread(key.clone(), &title, &me, can, rights, root, false, false, cx);
             pane
         });
         let previous = self

@@ -28,6 +28,8 @@ pub const CODEC_LATER: &str = "OpenH264 is still downloading.";
 mod desktop;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub use desktop::*;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) use desktop::{RoundCam, RoundEncoder};
 /// What a share sends: the picker's list and the one chosen.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod screens;
@@ -594,6 +596,11 @@ fn write_jpeg(rgb: &[u8], width: u32, height: u32, generation: u64) -> io::Resul
         return Err(err);
     }
     Ok(path)
+}
+
+/// One RGB picture as a JPEG the window can read. The caller drops the file it replaces.
+pub(crate) fn paint_rgb(rgb: &[u8], width: u32, height: u32, generation: u64) -> Option<PathBuf> {
+    write_jpeg(rgb, width, height, generation).ok()
 }
 
 /// One picture on disk for the window.

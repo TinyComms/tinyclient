@@ -11,16 +11,17 @@ pub(in crate::gui) mod profile;
 use super::card::Float;
 use super::presence::Ring;
 use super::{existing_direct, in_call, only_draws, person_avatar, shown_presence, Hub, Scene};
-use crate::gui::components::{button, glyph, icon_button, sensitive_cover, tip, ButtonKind};
+use crate::gui::components::{button, glyph, icon_button, search_field, sensitive_cover, tip, ButtonKind};
+use crate::gui::input::{InputEvent, TextInput};
 use crate::gui::layout::{RightKind, RightPane};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
-use gpui::{div, prelude::*, px, AnyElement, App, ClipboardItem, Context, Div, Entity, MouseButton, SharedString, WeakEntity, Window};
+use gpui::{div, prelude::*, px, AnyElement, App, ClipboardItem, Context, Div, Entity, Focusable, MouseButton, SharedString, WeakEntity, Window};
 use profile::draw;
 use profile::facts::{self, Act, Call, Seen, Surface};
 use profile::shared::{self, Shared};
 use protocol::{
-    Contact, ContactKind, Conversation, ConversationInfo, Key, Link, Network, Notify, Person, Profile, RelateAction,
+    AccountKey, Contact, ContactKind, Conversation, ConversationInfo, Key, Link, Network, Notify, Person, Profile, RelateAction,
     Request, Response, Space, SpaceInfo,
 };
 use std::collections::HashSet;
@@ -60,6 +61,39 @@ pub(in crate::gui) enum ManageKind {
     Topic,
     Description,
     AddMembers,
+    Nickname,
+}
+
+/// Pending destructive moderation / management confirmation in Details.
+#[derive(Clone)]
+pub(in crate::gui) enum PendingMod {
+    Ban {
+        conversation: Key,
+        person_id: String,
+        person_name: String,
+    },
+    Promote {
+        conversation: Key,
+        person_id: String,
+        person_name: String,
+        rank: Entity<crate::gui::input::TextInput>,
+    },
+    TransferOwner {
+        conversation: Key,
+        person_id: String,
+        person_name: String,
+        password: Entity<crate::gui::input::TextInput>,
+    },
+}
+
+impl PendingMod {
+    pub fn conversation(&self) -> &Key {
+        match self {
+            PendingMod::Ban { conversation, .. }
+            | PendingMod::Promote { conversation, .. }
+            | PendingMod::TransferOwner { conversation, .. } => conversation,
+        }
+    }
 }
 
 pub struct InfoPane {
@@ -81,20 +115,41 @@ pub struct InfoPane {
     /// Show was clicked: the phone numbers read in full until the pane shows someone else.
     phones_shown: bool,
     about_open: bool,
+    /// Mutual friends list expanded in the "In common" section.
+    friends_open: bool,
     /// Bio, note, and other contacts the user chose to reveal in Streamer mode.
     revealed_sensitive: HashSet<String>,
     /// What the user set here, drawn before the row says so.
     notify_set: Option<(Key, Notify)>,
+    /// What the user set for a Space's notifications, drawn before SpaceInfo reloads.
+    space_notify_set: Option<(Key, Notify)>,
     /// Inline conversation management input (rename, topic, add people).
     manage: Option<(Key, ManageKind, Entity<crate::gui::input::TextInput>)>,
     /// History sharing mode when adding people to a Teams group chat.
     share_history: protocol::HistoryShare,
     /// Pending confirmation to remove a member: (conversation, person_id, person_name).
     pending_remove: Option<(Key, String, String)>,
+    /// Pending confirmation for ban, admin promotion, or ownership transfer.
+    pending_mod: Option<PendingMod>,
+    /// Read-only recent admin actions fetched on demand (`Request::AdminLog`).
+    admin_log: Option<(Key, Vec<protocol::AdminLogEntry>)>,
+    admin_log_loading: bool,
+    /// A Telegram channel's boost level, loaded when its Details open.
+    boosts: Option<(Key, Answer<protocol::ChannelBoosts>)>,
+    /// The Boost button is waiting for a yes.
+    boost_confirm: bool,
     /// The content width, from the pane's.
     width: f32,
     /// The shell's Spaces, for In common and Details' icons.
     spaces: Vec<Space>,
+    /// Editable private note on the person on show (`Capabilities::person_notes`).
+    note_input: Option<(Key, Entity<TextInput>)>,
+    note_baseline: String,
+    note_saving: bool,
+    note_saved: bool,
+    note_error: Option<String>,
+    /// True when the current conversation's age gate was already passed this session.
+    age_gate_passed: bool,
 }
 
 /// The Space a person is seen from, when the open conversation is in one: what the network
@@ -140,13 +195,26 @@ impl InfoPane {
             shared: Shared::default(),
             phones_shown: false,
             about_open: false,
+            friends_open: false,
             revealed_sensitive: HashSet::new(),
             notify_set: None,
+            space_notify_set: None,
             manage: None,
             share_history: protocol::HistoryShare::None,
             pending_remove: None,
+            pending_mod: None,
+            admin_log: None,
+            admin_log_loading: false,
+            boosts: None,
+            boost_confirm: false,
             width: 268.,
             spaces: Vec::new(),
+            note_input: None,
+            note_baseline: String::new(),
+            note_saving: false,
+            note_saved: false,
+            note_error: None,
+            age_gate_passed: false,
         }
     }
 
@@ -177,6 +245,7 @@ impl InfoPane {
     /// Those hooks run inside the shell's own update, so what the shell holds is read a moment
     /// later; the head is drawn at once.
     pub fn show(&mut self, person: Key, cx: &mut Context<Self>) {
+        self.release_note(Some(&person), cx);
         let subject = Subject::Person { key: person.clone(), space: None };
         if self.subject.as_ref().and_then(|subject| match subject {
             Subject::Person { key, .. } => Some(key),
@@ -216,6 +285,7 @@ impl InfoPane {
         direct: Option<Conversation>,
         cx: &mut Context<Self>,
     ) {
+        self.release_note(Some(&person), cx);
         let subject = Subject::Person { key: person.clone(), space: space.clone() };
         // Their presence is drawn, so it is watched for as long as the pane shows them.
         self.hub.watch("info", [person.clone()], cx);
@@ -225,11 +295,13 @@ impl InfoPane {
         if !same {
             self.phones_shown = false;
             self.about_open = false;
+            self.friends_open = false;
             self.revealed_sensitive.clear();
         }
         let entity = cx.entity();
         self.shared.show(self.row.as_ref().map(|row| row.key.clone()), &entity, cx, |pane: &mut InfoPane| &mut pane.shared);
         if let Some(profile) = given {
+            self.sync_note_input(&profile.person.key, &profile.note, cx);
             self.profile = Answer::Got(profile);
             cx.notify();
             return;
@@ -237,6 +309,9 @@ impl InfoPane {
         // The same person again keeps the answer; chatd holds it five minutes in any case.
         let held = self.profile.got().is_some_and(|profile| profile.person.key == person);
         if same && held {
+            if let Some(profile) = self.profile.got().cloned() {
+                self.sync_note_input(&profile.person.key, &profile.note, cx);
+            }
             cx.notify();
             return;
         }
@@ -255,6 +330,10 @@ impl InfoPane {
                 this.profile = match answer {
                     Ok(Response::Profile { profile }) => {
                         this.hub.learn(std::slice::from_ref(&profile.person));
+                        this.sync_note_input(&profile.person.key, &profile.note, cx);
+                        if !profile.mutual_people.is_empty() {
+                            this.hub.learn(&profile.mutual_people);
+                        }
                         Answer::Got(*profile)
                     }
                     _ => Answer::Failed,
@@ -262,6 +341,128 @@ impl InfoPane {
                 cx.notify();
             });
         });
+    }
+
+    fn can_note(&self, person: &Key) -> bool {
+        self.scene.accounts.iter().any(|own| own.key == person.account() && own.can.person_notes)
+    }
+
+    fn sync_note_input(&mut self, person: &Key, note: &str, cx: &mut Context<Self>) {
+        if !self.can_note(person) {
+            self.note_input = None;
+            return;
+        }
+        let same = self.note_input.as_ref().is_some_and(|(k, _)| k == person);
+        if same {
+            let current = self.note_input.as_ref().map(|(_, e)| e.read(cx).text().to_owned()).unwrap_or_default();
+            if current == self.note_baseline {
+                if let Some((_, input)) = &self.note_input {
+                    input.update(cx, |i, cx| i.set_text(note, cx));
+                }
+                self.note_baseline = note.to_owned();
+            }
+            return;
+        }
+        let input = cx.new(|cx| {
+            let mut field = TextInput::new("Add a note…", cx);
+            field.set_text(note, cx);
+            field
+        });
+        cx.subscribe(&input, |this, _, event: &InputEvent, cx| match event {
+            InputEvent::Changed => {
+                this.note_saved = false;
+                this.note_error = None;
+                cx.notify();
+            }
+            InputEvent::Submit => this.save_note(cx),
+        })
+        .detach();
+        self.note_input = Some((person.clone(), input));
+        self.note_baseline = note.to_owned();
+        self.note_saving = false;
+        self.note_saved = false;
+        self.note_error = None;
+    }
+
+    /// Saves a dirty note. `force` sends even when a save is already in flight, so switching
+    /// the subject does not drop the latest text.
+    fn write_note(&mut self, cx: &mut Context<Self>, force: bool) {
+        let Some((person, input)) = self.note_input.clone() else {
+            return;
+        };
+        let text = input.read(cx).text().to_owned();
+        if text == self.note_baseline || only_draws() || (!force && self.note_saving) {
+            return;
+        }
+        if text.chars().count() > 256 {
+            self.note_error = Some("Notes can be at most 256 characters.".to_owned());
+            cx.notify();
+            return;
+        }
+        self.note_saving = true;
+        self.note_saved = false;
+        self.note_error = None;
+        cx.notify();
+        let this = cx.weak_entity();
+        let saved_text = text.clone();
+        super::ask_later(cx, Request::SetNote { person: person.clone(), text }, move |answer, cx| {
+            let _ = this.update(cx, |this, cx| {
+                let still = this.note_input.as_ref().is_some_and(|(key, _)| key == &person);
+                let profile_hit = matches!(&this.profile, Answer::Got(profile) if profile.person.key == person);
+                if still {
+                    this.note_saving = false;
+                    match &answer {
+                        Ok(Response::Ok) => {
+                            this.note_baseline = saved_text.clone();
+                            this.note_saved = true;
+                            this.note_error = None;
+                        }
+                        Ok(Response::Error { detail, .. }) => this.note_error = Some(detail.clone()),
+                        Ok(_) => this.note_error = Some("Could not save note.".to_owned()),
+                        Err(err) => this.note_error = Some(err.to_string()),
+                    }
+                }
+                if profile_hit {
+                    if let (Ok(Response::Ok), Answer::Got(profile)) = (&answer, &mut this.profile) {
+                        profile.note = saved_text;
+                    }
+                }
+                if still || profile_hit {
+                    cx.notify();
+                }
+            });
+        });
+    }
+
+    fn save_note(&mut self, cx: &mut Context<Self>) {
+        self.write_note(cx, false);
+    }
+
+    /// Sends the latest note, then forgets the editor when `next` is not that person.
+    fn release_note(&mut self, next: Option<&Key>, cx: &mut Context<Self>) {
+        let current = self.note_input.as_ref().map(|(key, _)| key);
+        if current == next {
+            return;
+        }
+        if current.is_some() {
+            self.write_note(cx, true);
+            self.note_input = None;
+            self.note_baseline.clear();
+            self.note_saving = false;
+            self.note_saved = false;
+            self.note_error = None;
+        }
+    }
+
+    /// Re-fetches the open person's profile when `Change::People` signals a live update (e.g. `USER_NOTE_UPDATE`).
+    pub fn refresh_profile(&mut self, account: &AccountKey, cx: &mut Context<Self>) {
+        let Some(Subject::Person { key, space }) = self.subject.clone() else {
+            return;
+        };
+        if key.account() != *account || self.note_saving {
+            return;
+        }
+        self.ask_profile(key, space.map(|(k, _)| k), cx);
     }
 
     /// A new subject: counts the ask, and repaints at 150 ms (skeletons) and 1 s (Shared).
@@ -289,12 +490,18 @@ impl InfoPane {
 
     /// Puts a conversation's details in the pane. `row` is drawn at once; the answer adds the rest.
     pub(in crate::gui) fn show_conversation(&mut self, key: Key, row: Option<Conversation>, cx: &mut Context<Self>) {
+        self.release_note(None, cx);
         self.hub.watch("info", [], cx);
         let same = self.subject.as_ref() == Some(&Subject::Conversation(key.clone()));
         self.subject = Some(Subject::Conversation(key.clone()));
+        if !same {
+            self.boosts = None;
+            self.boost_confirm = false;
+        }
         self.row = row.or_else(|| self.row.clone().filter(|_| same));
+        let gated = self.row.as_ref().is_some_and(|r| r.age_restricted) && !self.age_gate_passed;
         let entity = cx.entity();
-        self.shared.show(Some(key.clone()), &entity, cx, |pane: &mut InfoPane| &mut pane.shared);
+        self.shared.show((!gated).then(|| key.clone()), &entity, cx, |pane: &mut InfoPane| &mut pane.shared);
         if same && matches!(self.info, Answer::Got(_)) {
             cx.notify();
             return;
@@ -311,10 +518,15 @@ impl InfoPane {
                 this.info = match answer {
                     Ok(Response::ConversationInfo { info }) => {
                         this.row = Some(info.conversation.clone());
+                        if info.conversation.age_restricted && !this.age_gate_passed {
+                            let entity = cx.entity();
+                            this.shared.show(None, &entity, cx, |pane: &mut InfoPane| &mut pane.shared);
+                        }
                         let small = matches!(facts::members_shown(&info.conversation, Some(&info)), facts::MembersShown::Inline);
                         if small {
                             this.ask_members(key.clone(), asked, cx);
                         }
+                        this.load_boosts(key.clone(), cx);
                         Answer::Got(*info)
                     }
                     _ => Answer::Failed,
@@ -322,6 +534,15 @@ impl InfoPane {
                 cx.notify();
             });
         });
+    }
+
+    pub(in crate::gui) fn unlock_age_gate(&mut self, key: &Key, cx: &mut Context<Self>) {
+        if self.subject.as_ref() == Some(&Subject::Conversation(key.clone())) {
+            self.age_gate_passed = true;
+            let entity = cx.entity();
+            self.shared.show(Some(key.clone()), &entity, cx, |pane: &mut InfoPane| &mut pane.shared);
+            cx.notify();
+        }
     }
 
     fn ask_members(&mut self, conversation: Key, asked: u64, cx: &mut Context<Self>) {
@@ -353,6 +574,7 @@ impl InfoPane {
 
     /// Puts a Space's own details in the pane.
     pub(in crate::gui) fn show_space(&mut self, space: Key, known: Option<Space>, cx: &mut Context<Self>) {
+        self.release_note(None, cx);
         self.hub.watch("info", [], cx);
         let same = self.subject.as_ref() == Some(&Subject::Space(space.clone()));
         self.subject = Some(Subject::Space(space.clone()));
@@ -382,6 +604,7 @@ impl InfoPane {
 
     /// The pane was closed: nobody in it is drawn any more.
     pub fn hide(&mut self, cx: &mut Context<Self>) {
+        self.release_note(None, cx);
         self.hub.watch("info", [], cx);
         self.subject = None;
     }
@@ -457,6 +680,47 @@ impl InfoPane {
         });
     }
 
+    /// Sends `Request::SetSpaceOptions` after optimistically applying `apply` to the shown `SpaceInfo`.
+    /// On failure, restores the prior `SpaceInfo` and displays an error toast.
+    pub(in crate::gui) fn set_space_options(
+        &mut self,
+        request: Request,
+        apply: impl FnOnce(&mut SpaceInfo),
+        cx: &mut Context<Self>,
+    ) {
+        let previous = self.space_info.clone();
+        if let Answer::Got(ref mut info) = self.space_info {
+            apply(info);
+        }
+        cx.notify();
+        if only_draws() {
+            return;
+        }
+        let pane = cx.weak_entity();
+        let shell = self.shell.clone();
+        super::ask_later(cx, request, move |answer, cx| {
+            if matches!(&answer, Ok(Response::Ok)) {
+                return;
+            }
+            let _ = pane.update(cx, |this, cx| {
+                this.space_info = previous;
+                cx.notify();
+            });
+            let detail = match answer {
+                Ok(Response::Error { detail, .. }) => detail,
+                Err(err) => crate::client::trouble_words("save", &err),
+                _ => crate::client::OTHER_ANSWER.to_owned(),
+            };
+            let _ = shell.update(cx, |shell, cx| {
+                shell.toast(
+                    Some(("icons/circle-alert.svg", theme::danger())),
+                    format!("Can't change server settings: {detail}"),
+                    cx,
+                );
+            });
+        });
+    }
+
     fn with_shell(&self, cx: &mut App, then: impl FnOnce(&mut Shell, &mut Context<Shell>)) {
         let _ = self.shell.update(cx, then);
     }
@@ -494,24 +758,63 @@ impl InfoPane {
         let line = draw::presence_line_for(person, profile, presence, &status, calling);
         let place = space.map(|(_, name)| name.as_str());
         let accent = profile.and_then(|profile| profile.accent);
+        let banner_path = profile
+            .and_then(|p| p.banner.as_ref())
+            .and_then(|file| self.hub.file(&person.key.account(), file, cx).path);
+        let badges: Vec<(String, Option<String>)> = profile
+            .map(|p| {
+                p.badges
+                    .iter()
+                    .map(|b| {
+                        let path = b.icon.as_ref().and_then(|file| self.hub.file(&person.key.account(), file, cx).path);
+                        (b.name.clone(), path)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mark = draw::mark_of(person).or_else(|| {
+            profile
+                .map(|p| p.server_tag.as_str())
+                .filter(|t| !t.is_empty())
+                .map(|t| draw::tag(t.to_owned(), false))
+        });
         let actions = facts::actions(person, &seen, Surface::Pane);
 
         // "…" alone never opens a row of its own at the left: it sits at the head's right.
         let lone = actions.more && !actions.message && !actions.request && actions.call.is_none();
         let more = actions.more.then(|| self.more_button(person, &seen));
         let (more_in_head, more_in_row) = if lone { (more, None) } else { (None, more) };
-        let head = self.head(person, accent, calling, more_in_head, cx);
+        let shown_person = profile.map(|p| &p.person).unwrap_or(person);
+        let head = self.head(shown_person, banner_path, accent, calling, more_in_head, cx);
         let mut top = div()
             .px(px(theme::PANE_PAD))
             .flex()
             .flex_col()
-            .child(draw::name_line(person.name.clone(), draw::mark_of(person)).mt(px(12.)))
+            .child(draw::name_line(person.name.clone(), mark).mt(px(12.)))
+            .children(profile.filter(|p| p.server_profile).and_then(|_| draw::soft_line("Server profile".to_owned())))
             .children(draw::soft_line(facts::handle_line(person, profile)))
+            .children(draw::badge_strip("info-badge", &badges))
             .children(draw::presence_row(&line, theme::sidebar(), 2));
         if !lone && (actions.more || actions.message || actions.request || actions.call.is_some()) {
             top = top.child(self.person_actions(person, &actions, &seen, more_in_row, cx).mt(px(16.)));
         }
         let is_self = self.scene.accounts.iter().any(|own| own.key == person.key.account() && own.me == person.key.id);
+        let can_edit_self = is_self
+            && self
+                .scene
+                .accounts
+                .iter()
+                .any(|own| own.key == person.key.account() && own.can.can_edit_profile());
+        if can_edit_self {
+            top = top.child(
+                button("info-edit-profile", ButtonKind::Secondary, "Edit profile")
+                    .w_full()
+                    .mt(px(12.))
+                    .on_click(|_, _, cx| {
+                        crate::gui::settings::open(crate::gui::settings::Section::Accounts, cx);
+                    }),
+            );
+        }
         if let Some((action, label)) = facts::friendship_action(person).filter(|_| !is_self) {
             let who = person.clone();
             let friendship = button("info-friendship", ButtonKind::Secondary, label).w_full();
@@ -555,6 +858,69 @@ impl InfoPane {
                 }
             }
         }
+        if network == Network::Discord && online && person.relation == protocol::Relation::Friend {
+            if let Some(row) = self.row.as_ref().filter(|r| r.kind == protocol::ConversationKind::Direct) {
+                let dm_key = row.key.clone();
+                top = top.child(
+                    div().mt(px(8.)).child(
+                        button("info-dm-add-people", ButtonKind::Secondary, "Add people…")
+                            .h(px(26.))
+                            .px(px(8.))
+                            .type_small()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.start_manage(
+                                    dm_key.clone(),
+                                    ManageKind::AddMembers,
+                                    "",
+                                    "Friend IDs (comma-separated)",
+                                    cx,
+                                );
+                            })),
+                    ),
+                );
+                if let Some((mkey, ManageKind::AddMembers, input)) = self.managing() {
+                    if mkey == &row.key {
+                        top = top.child(
+                            div()
+                                .mt(px(8.))
+                                .p(px(8.))
+                                .rounded(px(theme::R_CONTROL))
+                                .bg(theme::raised())
+                                .flex()
+                                .flex_col()
+                                .gap(px(6.))
+                                .child(
+                                    div()
+                                        .type_micro()
+                                        .text_color(theme::text_faint())
+                                        .child("Only Discord friends can be added (creates a group DM, up to 10 people)."),
+                                )
+                                .child(input.clone())
+                                .child(
+                                    div()
+                                        .flex()
+                                        .justify_end()
+                                        .gap(px(6.))
+                                        .child(
+                                            button("dm-manage-cancel", ButtonKind::Ghost, "Cancel")
+                                                .h(px(24.))
+                                                .px(px(8.))
+                                                .type_small()
+                                                .on_click(cx.listener(|this, _, _, cx| this.cancel_manage(cx))),
+                                        )
+                                        .child(
+                                            button("dm-manage-save", ButtonKind::Primary, "Create group")
+                                                .h(px(24.))
+                                                .px(px(10.))
+                                                .type_small()
+                                                .on_click(cx.listener(|this, _, _, cx| this.submit_manage(cx))),
+                                        ),
+                                ),
+                        );
+                    }
+                }
+            }
+        }
         if let Some(heads_up) = facts::heads_up(person, profile, online) {
             let words = facts::heads_up_words(&heads_up, &person.name, network, crate::view::now());
             // CONTRACT: `RelateAction` has no Unblock, so the Blocked banner offers none.
@@ -574,12 +940,27 @@ impl InfoPane {
             for (ix, fact) in facts::right_now(person, Some(profile), &line, crate::view::now(), ours).into_iter().enumerate() {
                 any = true;
                 let opens = fact.opens.clone();
+                let url = fact.url.clone().filter(|_| opens.is_none());
                 let title = fact.words.clone();
+                let art_path = fact
+                    .art
+                    .as_ref()
+                    .and_then(|file| self.hub.file(&person.key.account(), file, cx).path);
+                let row = match art_path {
+                    Some(path) => draw::fact_inline_art(("info-now", ix), path, fact.words, fact.soft),
+                    None => draw::fact_inline(("info-now", ix), fact.glyph, fact.words, fact.soft),
+                };
                 sections = sections.child(
-                    draw::fact_inline(("info-now", ix), fact.glyph, fact.words, fact.soft).when_some(opens, |row, key| {
+                    row.when_some(opens, |row, key| {
                         row.cursor_pointer().hover(|row| row.bg(theme::hover())).on_click(cx.listener(move |this, _, _, cx| {
                             let (key, title) = (key.clone(), title.clone());
                             this.with_shell(cx, move |shell, cx| shell.select(key, &title, cx));
+                        }))
+                    })
+                    .when_some(url, |row, url| {
+                        row.cursor_pointer().hover(|row| row.bg(theme::hover())).on_click(cx.listener(move |this, _, window, cx| {
+                            let url = url.clone();
+                            this.with_shell(cx, move |shell, cx| shell.open_external_link(&url, window, cx));
                         }))
                     }),
                 );
@@ -645,10 +1026,55 @@ impl InfoPane {
                 sections = sections.child(org);
             }
             let shown = facts::sections(person, profile, place, crate::view::now(), ours);
-            if shown.about {
+            let editable_note = self.note_input.as_ref().filter(|(k, _)| *k == person.key);
+            if shown.about && (editable_note.is_none() || !profile.bio.trim().is_empty()) {
                 sections = sections.child(draw::label("About", !any));
                 any = true;
-                sections = sections.child(self.about(profile, cx));
+                sections = sections.child(self.about(profile, editable_note.is_none(), cx));
+            }
+            if let Some((_, input)) = editable_note {
+                sections = sections.child(draw::label("Note", !any));
+                any = true;
+                let focused = input.focus_handle(cx).is_focused(window);
+                let dirty = input.read(cx).text() != self.note_baseline;
+                let status = if self.note_saving {
+                    Some("Saving…")
+                } else if self.note_saved && !dirty {
+                    Some("Saved")
+                } else {
+                    None
+                };
+                sections = sections.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(div().type_micro().text_color(theme::text_faint()).child("Only you see this"))
+                                .children(status.map(|s| div().type_micro().text_color(theme::text_faint()).child(s))),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(search_field(focused).flex_1().min_w_0().line_height(px(18.)).child(input.clone()))
+                                .when(dirty && !self.note_saving, |row| {
+                                    row.child(
+                                        button("info-note-save", ButtonKind::Secondary, "Save")
+                                            .h(px(24.))
+                                            .px(px(8.))
+                                            .type_small()
+                                            .on_click(cx.listener(|this, _, _, cx| this.save_note(cx))),
+                                    )
+                                }),
+                        )
+                        .children(self.note_error.as_ref().map(|err| div().type_micro().text_color(theme::danger()).child(err.clone()))),
+                );
             }
             if shown.contact {
                 let contacts = facts::contacts(person, profile);
@@ -658,10 +1084,26 @@ impl InfoPane {
                     sections = sections.child(self.contact_row(ix, contact, cx));
                 }
             }
-            if let Some(common) = facts::in_common(network, profile) {
+            let common = facts::in_common(network, profile);
+            let has_mutual_friends = profile.mutual_friends > 0 || !profile.mutual_people.is_empty();
+            if common.is_some() || has_mutual_friends {
                 sections = sections.child(draw::label("In common", !any));
                 any = true;
-                sections = sections.child(self.in_common(person, &common, cx));
+                sections = sections.child(self.in_common(person, profile, common.as_ref(), cx));
+            }
+            if !profile.connections.is_empty() {
+                sections = sections.child(draw::label("Connections", !any));
+                any = true;
+                for (ix, conn) in profile.connections.iter().enumerate() {
+                    let url = conn.url.clone();
+                    let row = draw::connection_row(("info-conn", ix), conn).when(!url.is_empty(), |row| {
+                        row.on_click(cx.listener(move |this, _, window, cx| {
+                            let url = url.clone();
+                            let _ = this.shell.update(cx, |shell, cx| shell.open_web_link(&url, window, cx));
+                        }))
+                    });
+                    sections = sections.child(row);
+                }
             }
             let safety_digits = profile
                 .fields
@@ -728,13 +1170,13 @@ impl InfoPane {
         body
     }
 
-    fn head(&self, person: &Person, accent: Option<u32>, calling: bool, more: Option<AnyElement>, cx: &mut Context<Self>) -> Div {
+    fn head(&self, person: &Person, banner_path: Option<String>, accent: Option<u32>, calling: bool, more: Option<AnyElement>, cx: &mut Context<Self>) -> Div {
         let ring = Ring::on(theme::sidebar());
         // The band's slot is kept with or without a colour, so nothing below moves.
         div()
             .relative()
             .h(px(16. + draw::AVATAR))
-            .children(accent.map(|color| div().absolute().top_0().left_0().right_0().h(px(draw::BAND)).bg(draw::band(color, theme::sidebar()))))
+            .children(draw::banner_band(banner_path, accent, theme::sidebar()))
             .child(
                 div()
                     .absolute()
@@ -834,7 +1276,7 @@ impl InfoPane {
         row.children(more)
     }
 
-    fn about(&self, profile: &Profile, cx: &mut Context<Self>) -> Div {
+    fn about(&self, profile: &Profile, show_note: bool, cx: &mut Context<Self>) -> Div {
         let bio = profile.bio.trim().to_owned();
         let note = profile.note.trim().to_owned();
         let streamer = crate::gui::streamer::is_active();
@@ -869,7 +1311,7 @@ impl InfoPane {
                     })
                 }
             })
-            .when(!note.is_empty(), |about| {
+            .when(show_note && !note.is_empty(), |about| {
                 about
                     .child(div().mt(px(8.)).type_micro().text_color(theme::text_faint()).child("Note · only you see this"))
                     .child(if hide_note {
@@ -960,10 +1402,107 @@ impl InfoPane {
             }))
     }
 
-    fn in_common(&self, person: &Person, common: &facts::InCommon, cx: &mut Context<Self>) -> Div {
+    fn in_common(&self, person: &Person, profile: &Profile, common: Option<&facts::InCommon>, cx: &mut Context<Self>) -> Div {
         let spaces = &self.spaces;
         let account = person.key.account();
         let mut rows = div().flex().flex_col();
+        let friend_count = profile.mutual_friends.max(profile.mutual_people.len() as u32);
+        if friend_count > 0 {
+            let expandable = !profile.mutual_people.is_empty();
+            let ring = Ring::on(theme::sidebar());
+            let faces: Vec<Div> = profile
+                .mutual_people
+                .iter()
+                .take(3)
+                .map(|friend| person_avatar(&self.hub, friend, 18., &ring, false, cx))
+                .collect();
+            let toggle = div()
+                .id("info-mutual-friends")
+                .h(px(theme::ROW_ONE))
+                .mx(px(-8.))
+                .px(px(8.))
+                .rounded(px(theme::R_CONTROL))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .type_ui()
+                .when(faces.is_empty(), |row| row.child(glyph("icons/users.svg", 16., theme::text_soft())))
+                .when(!faces.is_empty(), |row| row.child(div().flex().items_center().gap(px(2.)).children(faces)))
+                .child(div().flex_1().min_w_0().truncate().child(facts::mutual_friends_words(friend_count)))
+                .when(expandable, |row| {
+                    let icon = if self.friends_open { "icons/chevron-down.svg" } else { "icons/chevron-right.svg" };
+                    row.cursor_pointer()
+                        .hover(|r| r.bg(theme::hover()))
+                        .child(glyph(icon, 14., theme::text_faint()))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.friends_open = !this.friends_open;
+                            cx.notify();
+                        }))
+                });
+            rows = rows.child(toggle);
+            if self.friends_open && expandable {
+                for (ix, friend) in profile.mutual_people.iter().enumerate() {
+                    let key = friend.key.clone();
+                    let ring = Ring::row(theme::sidebar(), false, "mutual-friend");
+                    rows = rows.child(
+                        div()
+                            .id(("info-mutual-friend", ix))
+                            .group("mutual-friend")
+                            .h(px(theme::ROW_ONE))
+                            .mx(px(-8.))
+                            .pl(px(20.))
+                            .pr(px(8.))
+                            .rounded(px(theme::R_CONTROL))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .type_ui()
+                            .cursor_pointer()
+                            .hover(|r| r.bg(theme::hover()))
+                            .child(person_avatar(&self.hub, friend, 20., &ring, false, cx))
+                            .child(div().flex_1().min_w_0().truncate().child(friend.name.clone()))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let key = key.clone();
+                                this.with_shell(cx, move |shell, cx| shell.details_person(key, None, cx));
+                            })),
+                    );
+                }
+            }
+        }
+        if !profile.mutual_space_items.is_empty() {
+            for (ix, item) in profile.mutual_space_items.iter().take(facts::SPACES_SHOWN).enumerate() {
+                let known = spaces.iter().find(|space| space.key == item.key);
+                let icon = known.and_then(|space| space.icon.as_ref()).map(|icon| self.hub.file(&account, icon, cx));
+                let key = item.key.clone();
+                let mut row = draw::place_row(("info-space", ix), &item.key, &item.name, icon.as_ref());
+                if !item.nickname.is_empty() {
+                    row = row.child(
+                        div()
+                            .flex_none()
+                            .max_w(px(100.))
+                            .truncate()
+                            .type_small()
+                            .text_color(theme::text_faint())
+                            .child(item.nickname.clone()),
+                    );
+                }
+                rows = rows.child(row.cursor_pointer().hover(|row| row.bg(theme::hover())).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        let key = key.clone();
+                        this.with_shell(cx, move |shell, cx| shell.go(crate::gui::sidebar::Mode::Space(key), cx));
+                    },
+                )));
+            }
+            if let Some(common) = common.filter(|c| c.more > 0) {
+                rows = rows.child(
+                    div().h(px(theme::ROW_ONE)).flex().items_center().type_ui().text_color(theme::text_soft()).child(format!("{} more", common.more)),
+                );
+            }
+            return rows;
+        }
+        let Some(common) = common else {
+            return rows;
+        };
         if common.names.is_empty() {
             // CONTRACT: no request names the groups behind `mutual_total`, so the count stays a line.
             return rows.child(draw::fact("info-common", "icons/users.svg", common.words.clone(), ""));
@@ -1079,6 +1618,14 @@ impl InfoPane {
     }
 
     fn shared_part(&self, network: Network, _: &Window, cx: &mut Context<Self>) -> Div {
+        if self.row.as_ref().is_some_and(|row| row.age_restricted) && !self.age_gate_passed {
+            return div()
+                .px(px(theme::PANE_PAD))
+                .py(px(12.))
+                .type_small()
+                .text_color(theme::text_faint())
+                .child("Confirm the age warning to view shared media.");
+        }
         let entity = cx.entity();
         let (pick_to, search_to) = (entity.clone(), entity.clone());
         let link = self.row.as_ref().and_then(|row| facts::conversation_link(row, self.info.got()));
@@ -1157,6 +1704,57 @@ impl InfoPane {
         self.set_notify(conversation, notify, cx);
     }
 
+    pub(in crate::gui) fn space_notify_shown(&self, space: &Key, told: Notify) -> Notify {
+        match &self.space_notify_set {
+            Some((key, notify)) if key == space => *notify,
+            _ => told,
+        }
+    }
+
+    pub(in crate::gui) fn space_notify_to(&mut self, space: Key, notify: Notify, cx: &mut Context<Self>) {
+        let previous = self.space_notify_set.clone();
+        self.space_notify_set = Some((space.clone(), notify));
+        cx.notify();
+        if only_draws() {
+            return;
+        }
+        let pane = cx.weak_entity();
+        let shell = self.shell.clone();
+        let saved = space.clone();
+        super::ask_later(
+            cx,
+            Request::SetSpaceNotify { space, notify, until: None, category: None },
+            move |answer, cx| {
+                let accepted = matches!(&answer, Ok(Response::Ok));
+                let _ = pane.update(cx, |this, cx| {
+                    let still = this.space_notify_set.as_ref().is_some_and(|(key, set)| key == &saved && *set == notify);
+                    if still {
+                        this.space_notify_set = kept_notify(previous, &saved, notify, accepted);
+                        if accepted {
+                            if let Answer::Got(info) = &mut this.space_info {
+                                if info.space.key == saved {
+                                    info.notify = notify;
+                                }
+                            }
+                        }
+                        cx.notify();
+                    }
+                });
+                if accepted {
+                    return;
+                }
+                let detail = match answer {
+                    Ok(Response::Error { detail, .. }) => detail,
+                    Err(err) => crate::client::trouble_words("save", &err),
+                    _ => crate::client::OTHER_ANSWER.to_owned(),
+                };
+                let _ = shell.update(cx, |shell, cx| {
+                    shell.toast(Some(("icons/circle-alert.svg", theme::danger())), format!("Can't change notifications: {detail}"), cx);
+                });
+            },
+        );
+    }
+
     pub(in crate::gui) fn shared_of(&self, network: Network, window: &Window, cx: &mut Context<Self>) -> Div {
         self.shared_part(network, window, cx)
     }
@@ -1179,6 +1777,76 @@ impl InfoPane {
 
     pub(in crate::gui) fn managing(&self) -> Option<&(Key, ManageKind, Entity<crate::gui::input::TextInput>)> {
         self.manage.as_ref()
+    }
+
+    pub(in crate::gui) fn channel_boosts(&self, key: &Key) -> Option<&protocol::ChannelBoosts> {
+        match self.boosts.as_ref() {
+            Some((held, Answer::Got(status))) if held == key => Some(status),
+            _ => None,
+        }
+    }
+
+    pub(in crate::gui) fn boosts_waiting(&self, key: &Key) -> bool {
+        matches!(&self.boosts, Some((held, Answer::Waiting)) if held == key)
+    }
+
+    pub(in crate::gui) fn boost_confirming(&self, key: &Key) -> bool {
+        self.boost_confirm && self.boosts.as_ref().is_some_and(|(held, _)| held == key)
+    }
+
+    pub(in crate::gui) fn ask_boost_confirm(&mut self, cx: &mut Context<Self>) {
+        self.boost_confirm = true;
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn cancel_boost(&mut self, cx: &mut Context<Self>) {
+        self.boost_confirm = false;
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn confirm_boost(&mut self, cx: &mut Context<Self>) {
+        let Some(key) = self.boosts.as_ref().map(|(key, _)| key.clone()) else {
+            return;
+        };
+        self.boost_confirm = false;
+        let this = cx.weak_entity();
+        super::ask_later(cx, Request::ApplyBoost { conversation: key.clone() }, move |answer, cx| {
+            let _ = this.update(cx, |this, cx| {
+                if let Ok(Response::Boosts { status, conversation }) = answer {
+                    if this.boosts.as_ref().is_some_and(|(held, _)| held == &conversation) {
+                        this.boosts = Some((key, Answer::Got(status)));
+                    }
+                }
+                cx.notify();
+            });
+        });
+    }
+
+    fn load_boosts(&mut self, key: Key, cx: &mut Context<Self>) {
+        let channel = self.row.as_ref().is_some_and(|row| row.key == key && row.key.network == Network::Telegram && row.kind == protocol::ConversationKind::Channel);
+        if !channel {
+            return;
+        }
+        if self.boosts.as_ref().is_some_and(|(held, answer)| held == &key && !matches!(answer, Answer::Failed)) {
+            return;
+        }
+        self.boosts = Some((key.clone(), Answer::Waiting));
+        let this = cx.weak_entity();
+        super::ask_later(cx, Request::GetBoosts { conversation: key.clone() }, move |answer, cx| {
+            let _ = this.update(cx, |this, cx| {
+                let Some((held, slot)) = this.boosts.as_mut() else {
+                    return;
+                };
+                if held != &key {
+                    return;
+                }
+                *slot = match answer {
+                    Ok(Response::Boosts { status, .. }) => Answer::Got(status),
+                    _ => Answer::Failed,
+                };
+                cx.notify();
+            });
+        });
     }
 
     pub(in crate::gui) fn share_history(&self) -> protocol::HistoryShare {
@@ -1261,17 +1929,80 @@ impl InfoPane {
                     cx.notify();
                     return;
                 }
+                if let Some(row) = self.row.as_ref().filter(|r| {
+                    r.key == conversation
+                        && r.kind == protocol::ConversationKind::Direct
+                        && r.key.network == Network::Discord
+                }) {
+                    let account = row.key.account();
+                    let mut keys: Vec<Key> = Vec::new();
+                    if let Some(peer) = row.peer.as_deref().filter(|p| !p.is_empty()) {
+                        keys.push(Key::new(&account, peer));
+                    }
+                    for id in people {
+                        let k = Key::new(&account, id);
+                        if !keys.contains(&k) {
+                            keys.push(k);
+                        }
+                    }
+                    let shell = self.shell.clone();
+                    super::ask_later(cx, Request::StartGroup { account, people: keys, title: None }, move |answer, cx| {
+                        match answer {
+                            Ok(Response::Conversation { conversation }) => {
+                                let _ = shell.update(cx, |shell, cx| {
+                                    shell.select(conversation.key, &conversation.title, cx);
+                                });
+                            }
+                            Ok(Response::Error { detail, .. }) => {
+                                let _ = shell.update(cx, |shell, cx| {
+                                    shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                                });
+                            }
+                            _ => {}
+                        }
+                    });
+                    cx.notify();
+                    return;
+                }
                 let share_history = (conversation.network == Network::Teams
                     && self.row.as_ref().is_some_and(|r| r.kind == protocol::ConversationKind::Group))
                 .then_some(chosen_history);
                 Request::MembersAdd { conversation, people, share_history }
+            }
+            ManageKind::Nickname => {
+                let space = conversation.clone();
+                let req = Request::SetNickname {
+                    space: space.clone(),
+                    nickname: (!value.is_empty()).then_some(value),
+                };
+                let this = cx.weak_entity();
+                super::ask_later(cx, req, move |answer, cx| {
+                    if matches!(answer, Ok(Response::Ok)) {
+                        let _ = this.update(cx, |this, cx| {
+                            if this.subject == Some(Subject::Space(space.clone())) {
+                                this.space_info = Answer::Waiting;
+                                let known = this.space.clone();
+                                this.show_space(space, known, cx);
+                            }
+                        });
+                    }
+                });
+                cx.notify();
+                return;
             }
             _ => {
                 cx.notify();
                 return;
             }
         };
-        super::ask_later(cx, request, |_, _| {});
+        let shell = self.shell.clone();
+        super::ask_later(cx, request, move |answer, cx| {
+            if let Ok(Response::Error { detail, .. }) = answer {
+                let _ = shell.update(cx, |shell, cx| {
+                    shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                });
+            }
+        });
         cx.notify();
     }
 
@@ -1289,8 +2020,228 @@ impl InfoPane {
         let Some((conversation, person, _)) = self.pending_remove.take() else {
             return;
         };
-        super::ask_later(cx, Request::MembersRemove { conversation, person }, |_, _| {});
+        let shell = self.shell.clone();
+        super::ask_later(cx, Request::MembersRemove { conversation, person }, move |answer, cx| {
+            if let Ok(Response::Error { detail, .. }) = answer {
+                let _ = shell.update(cx, |shell, cx| {
+                    shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                });
+            }
+        });
         cx.notify();
+    }
+
+    pub(in crate::gui) fn pick_conversation_picture(&mut self, conversation: Key, cx: &mut Context<Self>) {
+        let asked = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose group picture".into()),
+        });
+        let shell = self.shell.clone();
+        cx.spawn(async move |_, cx| {
+            let Ok(Ok(Some(paths))) = asked.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let req = Request::ConversationPicture {
+                conversation,
+                path: path.to_string_lossy().into_owned(),
+            };
+            let answer = cx.background_executor().spawn(async move { crate::client::ask(&req) }).await;
+            if let Ok(Response::Error { detail, .. }) = answer {
+                let _ = shell.update(cx, |shell, cx| {
+                    shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    pub(in crate::gui) fn clear_conversation_picture(&mut self, conversation: Key, cx: &mut Context<Self>) {
+        let shell = self.shell.clone();
+        super::ask_later(cx, Request::ConversationPicture { conversation, path: String::new() }, move |answer, cx| {
+            if let Ok(Response::Error { detail, .. }) = answer {
+                let _ = shell.update(cx, |shell, cx| {
+                    shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                });
+            }
+        });
+    }
+
+    pub(in crate::gui) fn transfer_owner(&mut self, conversation: Key, person: String, cx: &mut Context<Self>) {
+        let shell = self.shell.clone();
+        super::ask_later(cx, Request::TransferOwner { conversation, person }, move |answer, cx| {
+            if let Ok(Response::Error { detail, .. }) = answer {
+                let _ = shell.update(cx, |shell, cx| {
+                    shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                });
+            }
+        });
+    }
+
+    pub(in crate::gui) fn pending_mod(&self) -> Option<&PendingMod> {
+        self.pending_mod.as_ref()
+    }
+
+    pub(in crate::gui) fn admin_log_for(&self, key: &Key) -> Option<&[protocol::AdminLogEntry]> {
+        self.admin_log.as_ref().filter(|(k, _)| k == key).map(|(_, entries)| entries.as_slice())
+    }
+
+    pub(in crate::gui) fn admin_log_loading(&self) -> bool {
+        self.admin_log_loading
+    }
+
+    pub(in crate::gui) fn ask_ban_member(&mut self, conversation: Key, person_id: String, person_name: String, cx: &mut Context<Self>) {
+        self.pending_mod = Some(PendingMod::Ban { conversation, person_id, person_name });
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn ask_promote_admin(&mut self, conversation: Key, person_id: String, person_name: String, cx: &mut Context<Self>) {
+        let rank = cx.new(|cx| crate::gui::input::TextInput::new("Custom title (optional)", cx));
+        self.pending_mod = Some(PendingMod::Promote { conversation, person_id, person_name, rank });
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn ask_transfer_owner(&mut self, conversation: Key, person_id: String, person_name: String, cx: &mut Context<Self>) {
+        let password = cx.new(|cx| crate::gui::input::TextInput::secret("Two-step verification password", cx));
+        self.pending_mod = Some(PendingMod::TransferOwner { conversation, person_id, person_name, password });
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn cancel_mod(&mut self, cx: &mut Context<Self>) {
+        self.pending_mod = None;
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn confirm_mod(&mut self, cx: &mut Context<Self>) {
+        if let Some(PendingMod::TransferOwner { password, .. }) = self.pending_mod.as_ref() {
+            if password.read(cx).text().is_empty() {
+                cx.notify();
+                return;
+            }
+        }
+        let Some(action) = self.pending_mod.take() else {
+            return;
+        };
+        let request = match action {
+            PendingMod::Ban { conversation, person_id, .. } => Request::ModerateMember {
+                conversation,
+                person: person_id,
+                action: protocol::MemberModeration::Ban { until: None },
+            },
+            PendingMod::Promote { conversation, person_id, rank, .. } => {
+                let rank = rank.read(cx).text().trim().to_owned();
+                Request::SetAdmin {
+                    conversation,
+                    person: person_id,
+                    rights: protocol::AdminRights {
+                        change_info: true,
+                        delete_messages: true,
+                        ban_users: true,
+                        invite_users: true,
+                        pin_messages: true,
+                        rank,
+                        ..protocol::AdminRights::default()
+                    },
+                }
+            }
+            PendingMod::TransferOwner { conversation, person_id, password, .. } => {
+                let password = password.read(cx).text().to_owned();
+                Request::TransferOwnership { conversation, person: person_id, password }
+            }
+        };
+        let shell = self.shell.clone();
+        super::ask_later(cx, request, move |answer, cx| {
+            if let Ok(Response::Error { detail, .. }) = answer {
+                let _ = shell.update(cx, |shell, cx| {
+                    shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                });
+            }
+        });
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn pick_picture(&mut self, conversation: Key, cx: &mut Context<Self>) {
+        if only_draws() {
+            return;
+        }
+        let asked = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose photo".into()),
+        });
+        let shell = self.shell.clone();
+        cx.spawn(async move |_, cx| {
+            let Ok(Ok(Some(paths))) = asked.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let path = path.to_string_lossy().into_owned();
+            let _ = cx.update(|cx| {
+                super::ask_later(cx, Request::ConversationPicture { conversation, path }, move |answer, cx| {
+                    if let Ok(Response::Error { detail, .. }) = answer {
+                        let _ = shell.update(cx, |shell, cx| {
+                            shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                        });
+                    }
+                });
+            });
+        })
+        .detach();
+    }
+
+    pub(in crate::gui) fn update_chat_settings(&mut self, conversation: Key, settings: protocol::ChatSettings, cx: &mut Context<Self>) {
+        if only_draws() {
+            return;
+        }
+        let shell = self.shell.clone();
+        super::ask_later(cx, Request::UpdateChatSettings { conversation, settings }, move |answer, cx| {
+            if let Ok(Response::Error { detail, .. }) = answer {
+                let _ = shell.update(cx, |shell, cx| {
+                    shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                });
+            }
+        });
+        cx.notify();
+    }
+
+    pub(in crate::gui) fn load_admin_log(&mut self, conversation: Key, cx: &mut Context<Self>) {
+        if self.admin_log.as_ref().is_some_and(|(k, _)| k == &conversation) {
+            self.admin_log = None;
+            cx.notify();
+            return;
+        }
+        self.admin_log_loading = true;
+        cx.notify();
+        if only_draws() {
+            self.admin_log_loading = false;
+            return;
+        }
+        let this = cx.weak_entity();
+        let shell = self.shell.clone();
+        super::ask_later(cx, Request::AdminLog { conversation: conversation.clone(), limit: 50 }, move |answer, cx| {
+            let _ = this.update(cx, |this, cx| {
+                this.admin_log_loading = false;
+                match answer {
+                    Ok(Response::AdminLog { conversation, entries }) => {
+                        this.admin_log = Some((conversation, entries));
+                    }
+                    Ok(Response::Error { detail, .. }) => {
+                        let _ = shell.update(cx, |shell, cx| {
+                            shell.toast(Some(("icons/circle-alert.svg", theme::danger())), detail, cx);
+                        });
+                    }
+                    _ => {}
+                }
+                cx.notify();
+            });
+        });
     }
 }
 
@@ -1351,9 +2302,18 @@ impl Shell {
         if let Some(peer) = row.as_ref().filter(|row| row.kind == protocol::ConversationKind::Direct).and_then(super::peer_of) {
             return self.details_person(peer, None, cx);
         }
+        let passed = self.age_gate_passed(&conversation);
         let info = self.info_entity(cx);
-        info.update(cx, |info, cx| info.show_conversation(conversation, row, cx));
+        info.update(cx, |info, cx| {
+            info.age_gate_passed = passed;
+            info.show_conversation(conversation, row, cx);
+        });
         self.open_details("Details", cx);
+    }
+
+    pub(in crate::gui) fn info_age_gate_passed(&mut self, key: &Key, cx: &mut Context<Self>) {
+        let info = self.info_entity(cx);
+        info.update(cx, |info, cx| info.unlock_age_gate(key, cx));
     }
 
     /// A Space's own details, opened from its name above its tree.
@@ -1371,6 +2331,9 @@ impl Shell {
 
     /// Opens a floating menu or confirm of the People views at `anchor`.
     pub(in crate::gui) fn open_float(&mut self, float: Float, anchor: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        if let Float::Menu(person) | Float::Person { person, .. } = &float {
+            self.ask_person_apps(person, cx);
+        }
         self.people_state.attach(cx);
         let floating = self.floating_entity(cx);
         floating.update(cx, |floating, cx| floating.open(float, anchor, cx));
@@ -1378,8 +2341,12 @@ impl Shell {
     }
 
     /// Leaves a group, after its one confirm. The row goes when the network agrees.
-    pub(in crate::gui) fn leave(&mut self, conversation: &Conversation, cx: &mut Context<Self>) {
-        self.conversation_act(Request::Leave { conversation: conversation.key.clone() }, format!("Can't leave {}", conversation.title), cx);
+    pub(in crate::gui) fn leave(&mut self, conversation: &Conversation, silent: bool, cx: &mut Context<Self>) {
+        self.conversation_act(
+            Request::Leave { conversation: conversation.key.clone(), silent },
+            format!("Can't leave {}", conversation.title),
+            cx,
+        );
     }
 
     /// Where the network's own app opens a row, and whether the user can leave it: what a row's
@@ -1390,7 +2357,7 @@ impl Shell {
 
     /// Asks once, then leaves: the same confirm Details' "…" asks, from a row's sheet.
     pub(in crate::gui) fn confirm_leave(&mut self, conversation: Conversation, cx: &mut Context<Self>) {
-        self.open_float(Float::Leave(conversation), gpui::Point::default(), cx);
+        self.open_float(Float::Leave { conversation, silent: false }, gpui::Point::default(), cx);
     }
 
     /// A row's notifications, from its menu: everything, or nothing. The row changes when the
@@ -1408,6 +2375,22 @@ impl Shell {
             return;
         }
         self.conversation_act(Request::SetMute { conversation, notify, until }, "Can't change notifications".to_owned(), cx);
+    }
+
+    /// Sets a Space's (or category's) notifications or timed mute from a menu.
+    pub(in crate::gui) fn set_space_notify(
+        &mut self,
+        space: Key,
+        notify: Notify,
+        until: Option<i64>,
+        category: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.conversation_act(
+            Request::SetSpaceNotify { space, notify, until, category },
+            "Can't change notifications".to_owned(),
+            cx,
+        );
     }
 
     /// Closes a DM as the network's own ×: it leaves the list until a new message.
@@ -1497,7 +2480,7 @@ impl InfoPane {
             Subject::Conversation(_) => {
                 let row = self.row.clone()?;
                 if confirm {
-                    return facts::can_leave(&row).then_some(Float::Leave(row));
+                    return facts::can_leave(&row).then_some(Float::Leave { conversation: row, silent: false });
                 }
                 let link = facts::conversation_link(&row, self.info.got());
                 Some(Float::Conversation { conversation: row, link, alt: false })

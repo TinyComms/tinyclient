@@ -40,6 +40,8 @@ pub struct Choices {
     pub emoticons: bool,
     /// P3: pictures and link previews load by themselves.
     pub images: bool,
+    /// P3T: text and code attachments fetch their head and show an inline preview.
+    pub text_previews: bool,
     /// G4: a newer release is downloaded and installed on quit. Off, the notice still appears.
     pub updates: bool,
     /// G1: tinyclient starts when the user signs in. The switch lives here; what it drives is
@@ -65,7 +67,7 @@ pub struct Choices {
 
 impl Default for Choices {
     fn default() -> Choices {
-        Choices { appearance: Appearance::System, high_contrast: false, compact: false, previews: true, command_return: false, newest: false, typing: true, emoticons: false, images: true, updates: true, open_at_login: false, tray: false, confirm_links: true, strip_tracking: false, spell: true, send_link_previews: true, auto_popout_call: false, section: Section::Accounts }
+        Choices { appearance: Appearance::System, high_contrast: false, compact: false, previews: true, command_return: false, newest: false, typing: true, emoticons: false, images: true, text_previews: true, updates: true, open_at_login: false, tray: false, confirm_links: true, strip_tracking: false, spell: true, send_link_previews: true, auto_popout_call: false, section: Section::Accounts }
     }
 }
 
@@ -80,6 +82,7 @@ static CHOICES: Mutex<Choices> = Mutex::new(Choices {
     typing: true,
     emoticons: false,
     images: true,
+    text_previews: true,
     updates: true,
     open_at_login: false,
     tray: false,
@@ -317,6 +320,7 @@ pub fn parse(text: &str) -> Prefs {
             "typing" => prefs.choices.typing = fields.next() != Some("off"),
             "emoticons" => prefs.choices.emoticons = fields.next() == Some("on"),
             "images" => prefs.choices.images = fields.next() != Some("click"),
+            "text_previews" => prefs.choices.text_previews = fields.next() != Some("off"),
             "updates" => prefs.choices.updates = fields.next() != Some("off"),
             "login" => prefs.choices.open_at_login = fields.next() == Some("on"),
             "tray" => prefs.choices.tray = fields.next() == Some("on"),
@@ -382,7 +386,7 @@ pub fn write(prefs: &Prefs) -> String {
     text.push_str(&format!("details\t{}\t{}\n", word(prefs.details_channels), word(prefs.details_directs)));
     text.push_str(&format!("text\t{}\n", prefs.text_step));
     let (choices, default) = (prefs.choices, Choices::default());
-    let lines: [(&str, bool, &str); 18] = [
+    let lines: [(&str, bool, &str); 19] = [
         ("appearance", choices.appearance != default.appearance, choices.appearance.word()),
         ("high_contrast", choices.high_contrast != default.high_contrast, "on"),
         ("density", choices.compact != default.compact, "compact"),
@@ -392,6 +396,7 @@ pub fn write(prefs: &Prefs) -> String {
         ("typing", choices.typing != default.typing, "off"),
         ("emoticons", choices.emoticons != default.emoticons, "on"),
         ("images", choices.images != default.images, "click"),
+        ("text_previews", choices.text_previews != default.text_previews, "off"),
         ("updates", choices.updates != default.updates, "off"),
         ("login", choices.open_at_login != default.open_at_login, "on"),
         ("tray", choices.tray != default.tray, "on"),
@@ -472,7 +477,7 @@ mod tests {
             details_channels: true,
             details_directs: false,
             text_step: 2,
-            choices: Choices { appearance: Appearance::Light, high_contrast: true, compact: true, previews: false, send_link_previews: false, auto_popout_call: true, command_return: true, newest: true, typing: false, emoticons: true, images: false, updates: false, open_at_login: true, tray: true, confirm_links: false, strip_tracking: true, spell: false, section: Section::Audio },
+            choices: Choices { appearance: Appearance::Light, high_contrast: true, compact: true, previews: false, send_link_previews: false, auto_popout_call: true, command_return: true, newest: true, typing: false, emoticons: true, images: false, text_previews: false, updates: false, open_at_login: true, tray: true, confirm_links: false, strip_tracking: true, spell: false, section: Section::Audio },
             kept: Vec::new(),
             autoplay: Autoplay::Hover,
             tiny_members: false,
@@ -520,9 +525,12 @@ mod tests {
     #[test]
     fn only_changed_choices_are_written_and_lines_from_a_newer_build_are_kept() {
         let text = write(&Prefs::default());
-        for name in ["density", "previews", "send", "open_at", "typing", "emoticons", "images", "settings_section", "confirm_links", "strip_tracking", "link_ok", "spell", "login", "tray"] {
+        for name in ["density", "previews", "send", "open_at", "typing", "emoticons", "images", "text_previews", "settings_section", "confirm_links", "strip_tracking", "link_ok", "spell", "login", "tray"] {
             assert!(!text.contains(name), "{name} is at its default and not written");
         }
+        assert!(write(&Prefs { choices: Choices { text_previews: false, ..Choices::default() }, ..Prefs::default() }).contains("text_previews\toff\n"));
+        assert!(!parse("text_previews\toff\n").choices.text_previews);
+        assert!(parse("text_previews\ton\n").choices.text_previews);
         let newer = "sidebar\t300\ntheme\tlight\nbounce\tonce\n";
         let read = parse(newer);
         assert_eq!(read.kept, ["theme\tlight", "bounce\tonce"]);

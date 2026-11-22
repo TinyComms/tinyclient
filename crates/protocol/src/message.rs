@@ -24,6 +24,8 @@ pub const DELIVERIES_LIMIT: usize = 256;
 pub const MESSAGE_CONTROLS_LIMIT: usize = 32;
 /// Most selectable options on a single menu, radio group, or checkbox group.
 pub const CONTROL_OPTIONS_LIMIT: usize = 100;
+/// Most invite or event cards attached to one message.
+pub const MESSAGE_INVITES_LIMIT: usize = 3;
 /// Most timed cues kept from a clip transcript (WebVTT).
 pub const TRANSCRIPT_LINES_LIMIT: usize = 2_000;
 
@@ -102,10 +104,12 @@ pub enum MentionKind {
     Role,
     /// Everyone, here, channel.
     Everyone,
+    /// A slash command `</name:id>`. `id` is the command's id; the text is `/name`.
+    Command,
 }
 
-/// How a range of a message's text is drawn. Block styles (`CodeBlock`, `Quote`, `ListItem`)
-/// cover whole lines.
+/// How a range of a message's text is drawn. Block styles (`CodeBlock`, `Quote`, `ListItem`,
+/// `Heading`, `Small`) cover whole lines.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "style", rename_all = "snake_case")]
 pub enum Style {
@@ -123,6 +127,12 @@ pub enum Style {
         ordered: bool,
         depth: u8,
     },
+    /// A section heading: level 1, 2, or 3 (`#`, `##`, `###`).
+    Heading {
+        level: u8,
+    },
+    /// Smaller, muted subtext (`-# ` in Discord).
+    Small,
     Spoiler,
     Link {
         url: String,
@@ -136,6 +146,28 @@ pub enum Style {
     Emoji {
         file: MediaFile,
     },
+    /// A clickable hashtag or cashtag (`#rust`, `$BTC`): clicking searches for it in the chat.
+    Hashtag,
+    /// A clickable bot command (`/start`, `/help@bot`): clicking sends it in the open chat.
+    Command,
+    /// A clickable `@username` without a known user id: clicking resolves and opens in-app.
+    Username {
+        username: String,
+    },
+    /// A clickable phone number or bank card number: clicking copies it to the clipboard.
+    Copyable,
+    /// A timestamp token (e.g. Discord `<t:unix:form>`). The underlying text carries neutral
+    /// fallback words for search snippets and notifications; the shell formats `unix` in the
+    /// user's locale and ticks relative (`'R'`) timestamps while on screen.
+    Time {
+        unix: i64,
+        #[serde(default = "default_time_form")]
+        form: char,
+    },
+}
+
+fn default_time_form() -> char {
+    'f'
 }
 
 /// A styled range of [`Message::text`]. `start` and `end` are byte offsets into the UTF-8 text
@@ -145,6 +177,33 @@ pub struct Span {
     pub start: u32,
     pub end: u32,
     pub style: Style,
+}
+
+/// Server-side transcription of a voice or round video message (Telegram).
+/// Stored inside [`Attachment::transcription`] so it survives restarts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Transcription {
+    /// Network transcription id (used for rating feedback).
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub id: i64,
+    /// Transcribed text so far (may stream in chunks while `pending` is true).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    /// True while the network is still generating the transcription.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub pending: bool,
+    /// Plain-words failure or quota message (e.g. Premium required when trial is used up).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed: Option<String>,
+    /// Free trial transcriptions remaining this period (non-Premium), when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_remains: Option<u32>,
+    /// Unix seconds when the free trial resets, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trial_resets_at: Option<i64>,
+    /// User's rating (`Some(true)` = good, `Some(false)` = bad).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rated: Option<bool>,
 }
 
 /// One timed cue in a clip's transcript or caption track (parsed from WebVTT).
@@ -375,6 +434,13 @@ pub struct Attachment {
     /// Telegram sticker pack as `id:access_hash` or a short name. Empty on every other attachment.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub sticker_set: String,
+    /// The page a GIF was picked from (a Tenor or Giphy address). Empty for every other file.
+    /// Favouriting a GIF someone else posted uses this, not the file's name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub page: String,
+    /// Server-side speech-to-text transcription for a voice or round video message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcription: Option<Transcription>,
     /// Optional clip transcript preview and lazy caption track (Slack clips).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript: Option<Transcript>,
@@ -396,6 +462,8 @@ impl Attachment {
             round: false,
             view_once: false,
             sticker_set: String::new(),
+            page: String::new(),
+            transcription: None,
             transcript: None,
         }
     }
@@ -416,18 +484,25 @@ pub struct Preview {
     /// Only when the network serves it from its own proxy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<MediaFile>,
+    /// Seconds, when the card is a video its site plays. Zero when it is not one.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub duration: u32,
+    /// The picture plays on its site. A click opens the browser; this client has no web view.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub opens_in_browser: bool,
 }
 
 /// How many reactors a reaction carries: what a network names in the payload it already
 /// sends, never a reason to ask again.
 pub const REACTION_REACTORS: usize = 50;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reaction {
     /// The emoji itself, or `:name:` for a custom one.
     pub emoji: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<MediaFile>,
+    #[serde(default)]
     pub count: u32,
     #[serde(default, skip_serializing_if = "is_false")]
     pub mine: bool,
@@ -437,6 +512,15 @@ pub struct Reaction {
     /// (Telegram in channels and large groups): the chip then stays a number and says so.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub who: Vec<String>,
+    /// Discord super / burst reaction count. Separate from `count` (normal reactions).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub burst: u32,
+    /// Whether this account gave a super / burst reaction with this emoji.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mine_burst: bool,
+    /// Accent colours Discord assigns to a super reaction (`#RRGGBB` hex strings, at most 4).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub burst_colors: Vec<String>,
 }
 
 /// One person who reacted to a message (`Request::Reactors`).
@@ -800,6 +884,10 @@ impl Poll {
     }
 }
 
+fn is_zero_u8(value: &u8) -> bool {
+    *value == 0
+}
+
 /// Visual tone for an interactive message button.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -807,6 +895,7 @@ pub enum ControlStyle {
     #[default]
     Default,
     Primary,
+    Success,
     Danger,
 }
 
@@ -834,6 +923,8 @@ pub struct ConfirmDialog {
 pub struct ControlOption {
     pub label: String,
     pub value: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
 }
 
 /// What kind of interactive widget a [`MessageControl`] draws and submits.
@@ -885,13 +976,58 @@ pub enum ControlKind {
     },
 }
 
-/// One interactive Block Kit control attached to a bot/app message (button, menu, picker, etc.).
+/// What a Telegram reply-keyboard button does. Text is the default and stays off the wire.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BotKeyKind {
+    #[default]
+    Text,
+    Url,
+    Phone,
+    Location,
+    Peer,
+}
+
+fn is_text_key(kind: &BotKeyKind) -> bool {
+    matches!(kind, BotKeyKind::Text)
+}
+
+/// One button on a Telegram reply keyboard. Inline callback buttons stay unmapped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BotKey {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "is_text_key")]
+    pub kind: BotKeyKind,
+}
+
+/// A bot's reply keyboard, drawn under the composer. `selective` hides it unless the
+/// message mentions the reader or answers one of theirs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyKeyboard {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rows: Vec<Vec<BotKey>>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub resize: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub single_use: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub selective: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub persistent: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+}
+
+/// One interactive Block Kit or bot keyboard control attached to a message (button, menu, picker, etc.).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageControl {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub block_id: String,
     pub action_id: String,
-    /// Network element type (e.g. `"button"`, `"static_select"`, `"datepicker"`, `"overflow"`).
+    /// Network element type (e.g. `"button"`, `"static_select"`, `"discord_button"`, `"discord_string_select"`).
     pub element_type: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub label: String,
@@ -900,6 +1036,206 @@ pub struct MessageControl {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirm: Option<ConfirmDialog>,
     pub kind: ControlKind,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disabled: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub emoji: String,
+    /// Visual row index (0-based) for grouping controls into action rows.
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub row: u8,
+    /// Minimum selections for multi-select controls (0 means unspecified / single).
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub min_values: u8,
+    /// Maximum selections for multi-select controls (0 or 1 means single-select).
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub max_values: u8,
+}
+
+/// Most application commands returned in a single list answer.
+pub const COMMANDS_LIMIT: usize = 200;
+/// Most options carried by one command.
+pub const COMMAND_OPTIONS_LIMIT: usize = 25;
+/// Most autocomplete choices returned for one option.
+pub const COMMAND_CHOICES_LIMIT: usize = 25;
+/// Most text fields carried by one interaction modal.
+pub const MODAL_FIELDS_LIMIT: usize = 5;
+
+/// Whether a command runs from `/` in the composer, a person's menu, or a message's menu.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandKind {
+    #[default]
+    ChatInput,
+    User,
+    Message,
+}
+
+/// The value type of one slash-command option.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandOptionKind {
+    #[default]
+    String,
+    Integer,
+    Boolean,
+    User,
+    Channel,
+    Role,
+    Mentionable,
+    Number,
+    Attachment,
+    SubCommand,
+    SubCommandGroup,
+}
+
+/// One static or autocomplete choice for a slash-command option.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandChoice {
+    pub name: String,
+    pub value: String,
+}
+
+/// One option or subcommand of a slash command.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandOption {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default)]
+    pub kind: CommandOptionKind,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub autocomplete: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<CommandChoice>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<CommandOption>,
+}
+
+/// One slash command or context-menu command offered in a conversation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppCommand {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub application_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub version: String,
+    #[serde(default)]
+    pub kind: CommandKind,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub app_name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<CommandOption>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub built_in: bool,
+}
+
+/// One filled argument supplied when running a slash command or requesting autocomplete.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandArg {
+    pub name: String,
+    pub value: String,
+    #[serde(default)]
+    pub kind: CommandOptionKind,
+}
+
+/// One text field inside an interaction modal form.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModalField {
+    pub custom_id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub value: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub placeholder: String,
+    #[serde(default = "crate::yes", skip_serializing_if = "crate::is_true")]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub multiline: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_length: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_length: Option<u16>,
+}
+
+/// Who ran the command a message answers, and that command's name without a leading slash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Via {
+    pub who: String,
+    pub command: String,
+}
+
+/// A form popped up by a bot/app in response to a button, select menu, or command.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InteractionModal {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub application_id: String,
+    pub custom_id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<ModalField>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub nonce: String,
+}
+
+/// Resolution state of a Space invite or scheduled-event card on a message.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InviteState {
+    #[default]
+    Unresolved,
+    Valid,
+    Joined,
+    Invalid,
+}
+
+/// Metadata for a scheduled event (e.g. Discord `guild_scheduled_event`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledEvent {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub guild_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Unix seconds when the event starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<i64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub place: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interested_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub interested: bool,
+}
+
+/// A Space invite or scheduled-event link detected inside a message, resolved lazily when on screen.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageInvite {
+    /// Invite code (e.g. `rustlang`), empty for a standalone event link.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub code: String,
+    /// Canonical HTTPS link to open in the official app / browser when handing off.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub space_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<MediaFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub members: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub online: Option<u32>,
+    #[serde(default)]
+    pub state: InviteState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<ScheduledEvent>,
 }
 
 /// Maximum inline button rows kept on a single message.
@@ -949,6 +1285,68 @@ pub struct ButtonAnswer {
     pub alert: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+}
+
+/// What an interactive message control answered when it has details to display or a link to open
+/// (Telegram giveaway status, bot game launch / high scores, callback answers).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionResult {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    /// Label/value rows shown in a details modal (e.g. giveaway status, high scores).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<(String, String)>,
+    /// Validated `https://` or `http://` link to open (or offer as a button when `alert` is true).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Label for the `url` action button inside a details modal (defaults to `"Open"` when empty).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url_label: String,
+    /// True when the answer should open a modal dialog rather than a brief toast or immediate open.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub alert: bool,
+    /// When set, the modal's primary button sends this action in the same conversation.
+    /// Empty means the button opens `url`, or the modal only closes.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub follow_action: String,
+    /// The value sent with [`ActionResult::follow_action`].
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub follow_value: String,
+}
+
+fn is_http_url(url: &str) -> bool {
+    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"));
+    rest.is_some_and(|rest| !rest.is_empty() && !url.chars().any(|c| c.is_control() || c.is_whitespace()))
+}
+
+impl ActionResult {
+    pub fn bound(&mut self) {
+        clip(&mut self.title, 256);
+        clip(&mut self.text, 4_000);
+        clip(&mut self.url_label, 120);
+        if let Some(url) = &mut self.url {
+            clip(url, 2_000);
+        }
+        if !self.url.as_deref().is_some_and(is_http_url) {
+            self.url = None;
+            self.url_label.clear();
+        }
+        self.fields.truncate(24);
+        for (label, value) in &mut self.fields {
+            clip(label, 256);
+            clip(value, 1_000);
+        }
+        clip(&mut self.follow_action, 64);
+        clip(&mut self.follow_value, 64);
+        let follow_ok = !self.follow_action.is_empty()
+            && self.follow_action.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-'));
+        if !follow_ok {
+            self.follow_action.clear();
+            self.follow_value.clear();
+        }
+    }
 }
 
 /// One message. Which conversation it is in comes from the answer that carries it.
@@ -1061,7 +1459,7 @@ pub struct Message {
     /// Why a read list is empty. "Read receipts are off" when this account does not share them.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub receipt_note: String,
-    /// Structured metadata for a call transcript row (`MessageKind::System`).
+    /// Structured metadata for a call transcription row (`MessageKind::System`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call: Option<CallNote>,
     /// Per-message edit override when the network decides per message. `None`: derived from
@@ -1094,6 +1492,9 @@ pub struct Message {
     /// Interactive app/bot controls (Slack Block Kit buttons, menus, pickers, checkboxes, radios).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub controls: Vec<MessageControl>,
+    /// Server invite or scheduled-event cards detected in the message text (resolved lazily on screen).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub invites: Vec<MessageInvite>,
     /// Ephemeral message only visible to the current user (e.g. Slack slash-command replies).
     /// Never stored in persistent channel history.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -1101,6 +1502,32 @@ pub struct Message {
     /// Inline keyboard button rows under a bot message (Telegram `replyInlineMarkup`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub buttons: Vec<Vec<InlineButton>>,
+    /// Target message id for a system line (pins, thread starter, poll result), so clicking opens it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jump: Option<String>,
+    /// Published (crossposted) from an announcement channel to following channels (Discord `CROSSPOSTED`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub published: bool,
+    /// Source server/channel label for a crossposted announcement message (Discord `IS_CROSSPOST`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub crosspost_source: String,
+    /// Who ran the command this message answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<Via>,
+    /// Sent without a notification (`@silent`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub silent: bool,
+    /// The app is still writing this reply.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub loading: bool,
+    /// Voice or round video message has not been listened to / played yet (Telegram `media_unread`).
+    /// On incoming messages, cleared once played here or on another device; on outgoing messages,
+    /// stays set until the recipient plays it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub media_unread: bool,
+    /// Telegram reply keyboard for this message. Inline keyboards are not carried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyboard: Option<ReplyKeyboard>,
 }
 
 /// How a direct or group call ended, or that it is live.
@@ -1210,8 +1637,17 @@ impl Message {
             sent_via: None,
             permalink: String::new(),
             controls: Vec::new(),
+            invites: Vec::new(),
             ephemeral: false,
             buttons: Vec::new(),
+            jump: None,
+            published: false,
+            crosspost_source: String::new(),
+            via: None,
+            silent: false,
+            loading: false,
+            media_unread: false,
+            keyboard: None,
         }
     }
 
@@ -1242,6 +1678,10 @@ impl Message {
             reaction.who.truncate(REACTION_REACTORS);
             for id in &mut reaction.who {
                 clip(id, 200);
+            }
+            reaction.burst_colors.truncate(4);
+            for color in &mut reaction.burst_colors {
+                clip(color, 16);
             }
         }
         if let Some(forwarded) = &mut self.forwarded {
@@ -1293,13 +1733,37 @@ impl Message {
         if let Some(via) = &mut self.sent_via {
             clip(via, 64);
         }
+        if let Some(jump) = &mut self.jump {
+            clip(jump, 128);
+        }
+        clip(&mut self.crosspost_source, 200);
+        if let Some(via) = &mut self.via {
+            clip(&mut via.who, 200);
+            clip(&mut via.command, 100);
+        }
         self.controls.truncate(MESSAGE_CONTROLS_LIMIT);
+        if let Some(keyboard) = &mut self.keyboard {
+            keyboard.rows.truncate(8);
+            for row in &mut keyboard.rows {
+                row.truncate(8);
+                for key in row.iter_mut() {
+                    clip(&mut key.text, 64);
+                    if let Some(url) = &mut key.url {
+                        clip(url, 2_000);
+                    }
+                }
+            }
+            if let Some(hint) = &mut keyboard.placeholder {
+                clip(hint, 64);
+            }
+        }
         for control in &mut self.controls {
             clip(&mut control.block_id, 255);
             clip(&mut control.action_id, 255);
             clip(&mut control.element_type, 64);
             clip(&mut control.label, 256);
             clip(&mut control.value, 2_000);
+            clip(&mut control.emoji, 64);
             if let Some(confirm) = &mut control.confirm {
                 clip(&mut confirm.title, 200);
                 clip(&mut confirm.text, 1_000);
@@ -1314,6 +1778,7 @@ impl Message {
                     for opt in options {
                         clip(&mut opt.label, 200);
                         clip(&mut opt.value, 2_000);
+                        clip(&mut opt.description, 200);
                     }
                     if let Some(sel) = selected {
                         clip(sel, 2_000);
@@ -1330,6 +1795,7 @@ impl Message {
                     for opt in options {
                         clip(&mut opt.label, 200);
                         clip(&mut opt.value, 2_000);
+                        clip(&mut opt.description, 200);
                     }
                     selected.truncate(CONTROL_OPTIONS_LIMIT);
                     for val in selected {
@@ -1341,11 +1807,24 @@ impl Message {
                     for opt in options {
                         clip(&mut opt.label, 200);
                         clip(&mut opt.value, 2_000);
+                        clip(&mut opt.description, 200);
                     }
                     if let Some(sel) = selected {
                         clip(sel, 2_000);
                     }
                 }
+            }
+        }
+        self.invites.truncate(MESSAGE_INVITES_LIMIT);
+        for invite in &mut self.invites {
+            clip(&mut invite.code, 128);
+            clip(&mut invite.url, 512);
+            clip(&mut invite.space_name, 200);
+            if let Some(ev) = &mut invite.event {
+                clip(&mut ev.id, 64);
+                clip(&mut ev.guild_id, 64);
+                clip(&mut ev.name, 200);
+                clip(&mut ev.place, 200);
             }
         }
         self.buttons.truncate(MESSAGE_BUTTON_ROWS_LIMIT);
@@ -1381,12 +1860,18 @@ impl Message {
         self.card = None;
         self.cards.clear();
         self.controls.clear();
+        self.invites.clear();
         self.buttons.clear();
+        self.jump = None;
+        self.keyboard = None;
         self.poll = None;
         self.deliveries.clear();
         self.receipt_note.clear();
         self.pinned = false;
+        self.published = false;
+        self.crosspost_source.clear();
         self.mentions_me = false;
+        self.media_unread = false;
         self.deleted = true;
     }
 
@@ -1408,6 +1893,7 @@ impl Message {
         attached
             .chain(self.previews.iter().filter_map(|preview| preview.image.as_ref()))
             .chain(cards)
+            .chain(self.invites.iter().filter_map(|invite| invite.icon.as_ref()))
             .chain(self.reactions.iter().filter_map(|reaction| reaction.file.as_ref()))
             .chain(emoji)
             .chain(self.reply_to.as_ref().and_then(|reply| reply.thumb.as_ref()))
@@ -1435,6 +1921,7 @@ impl Message {
         attached
             .chain(self.previews.iter_mut().filter_map(|preview| preview.image.as_mut()))
             .chain(cards)
+            .chain(self.invites.iter_mut().filter_map(|invite| invite.icon.as_mut()))
             .chain(self.reactions.iter_mut().filter_map(|reaction| reaction.file.as_mut()))
             .chain(emoji)
             .chain(self.reply_to.as_mut().and_then(|reply| reply.thumb.as_mut()))
@@ -1450,17 +1937,32 @@ mod tests {
     /// holds the list to its cap.
     #[test]
     fn reaction_reactors_read_and_stay_bounded() {
-        let plain = Reaction { emoji: "👍".into(), file: None, count: 1, mine: false, who: Vec::new() };
+        let plain = Reaction { emoji: "👍".into(), file: None, count: 1, mine: false, who: Vec::new(), ..Reaction::default() };
         let on = serde_json::to_string(&plain).unwrap();
         assert!(!on.contains("who"), "an empty list stays off the wire");
+        assert!(!on.contains("burst"), "zero burst fields stay off the wire");
         assert_eq!(serde_json::from_str::<Reaction>(&on).unwrap(), plain);
 
         let older = r#"{"emoji":"👍","count":2,"mine":false}"#;
-        assert_eq!(serde_json::from_str::<Reaction>(older).unwrap().who, Vec::<String>::new());
+        let parsed: Reaction = serde_json::from_str(older).unwrap();
+        assert_eq!(parsed.who, Vec::<String>::new());
+        assert_eq!((parsed.burst, parsed.mine_burst), (0, false));
+
+        let super_rx = Reaction {
+            emoji: "🔥".into(),
+            count: 2,
+            mine: false,
+            burst: 3,
+            mine_burst: true,
+            burst_colors: vec!["#ff6b6b".into(), "#feca57".into()],
+            ..Reaction::default()
+        };
+        let wire = serde_json::to_string(&super_rx).unwrap();
+        assert_eq!(serde_json::from_str::<Reaction>(&wire).unwrap(), super_rx);
 
         let mut message = Message::plain("m1", "Ada", "hi", 1_700_000_000, false);
         let many: Vec<String> = (0..REACTION_REACTORS - 1).map(|one| format!("u{one}")).collect();
-        let mut named = Reaction { emoji: "👍".into(), file: None, count: 60, mine: false, who: many };
+        let mut named = Reaction { emoji: "👍".into(), file: None, count: 60, mine: false, who: many, ..Reaction::default() };
         named.who.insert(1, "u".repeat(500));
         message.reactions.push(named);
         message.bound();
@@ -1550,6 +2052,11 @@ mod tests {
                     deny: "Cancel".into(),
                 }),
                 kind: ControlKind::Button { url: String::new(), style: ControlStyle::Primary },
+                disabled: false,
+                emoji: String::new(),
+                row: 0,
+                min_values: 0,
+                max_values: 0,
             });
         }
         msg.bound();
@@ -1560,8 +2067,61 @@ mod tests {
         let back: Message = serde_json::from_str(&wire).unwrap();
         assert_eq!(back.controls, msg.controls);
 
+        // Older control payload without disabled/emoji/row/min_values/max_values/description still reads.
+        let legacy: MessageControl = serde_json::from_str(
+            r#"{"action_id":"a1","element_type":"button","label":"Go","kind":{"kind":"button","style":"success"}}"#,
+        )
+        .unwrap();
+        assert!(!legacy.disabled && legacy.emoji.is_empty() && legacy.row == 0);
+        assert_eq!(legacy.kind, ControlKind::Button { url: String::new(), style: ControlStyle::Success });
+
         msg.tombstone();
         assert!(msg.controls.is_empty());
+    }
+
+    #[test]
+    fn app_commands_and_interaction_modals_round_trip() {
+        let cmd = AppCommand {
+            id: "100".into(),
+            application_id: "200".into(),
+            version: "300".into(),
+            kind: CommandKind::ChatInput,
+            name: "deploy".into(),
+            description: "Deploy a service".into(),
+            app_name: "DeployBot".into(),
+            options: vec![CommandOption {
+                name: "env".into(),
+                description: "Target environment".into(),
+                kind: CommandOptionKind::String,
+                required: true,
+                autocomplete: true,
+                choices: vec![CommandChoice { name: "Staging".into(), value: "staging".into() }],
+                options: Vec::new(),
+            }],
+            built_in: false,
+        };
+        let wire = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(serde_json::from_str::<AppCommand>(&wire).unwrap(), cmd);
+
+        let modal = InteractionModal {
+            id: "m1".into(),
+            application_id: "200".into(),
+            custom_id: "feedback_form".into(),
+            title: "Send feedback".into(),
+            fields: vec![ModalField {
+                custom_id: "reason".into(),
+                label: "Reason".into(),
+                value: String::new(),
+                placeholder: "Tell us why".into(),
+                required: true,
+                multiline: true,
+                min_length: Some(5),
+                max_length: Some(400),
+            }],
+            nonce: "n1".into(),
+        };
+        let mwire = serde_json::to_string(&modal).unwrap();
+        assert_eq!(serde_json::from_str::<InteractionModal>(&mwire).unwrap(), modal);
     }
 
     #[test]
@@ -1663,6 +2223,51 @@ mod tests {
     }
 
     #[test]
+    fn style_time_round_trips_and_defaults_form() {
+        let span = Span { start: 0, end: 10, style: Style::Time { unix: 1_618_953_630, form: 'R' } };
+        let wire = serde_json::to_string(&span).unwrap();
+        assert_eq!(serde_json::from_str::<Span>(&wire).unwrap(), span);
+        let omitted = r#"{"start":0,"end":10,"style":{"style":"time","unix":1618953630}}"#;
+        assert_eq!(
+            serde_json::from_str::<Span>(omitted).unwrap().style,
+            Style::Time { unix: 1_618_953_630, form: 'f' }
+        );
+    }
+
+    #[test]
+    fn message_invites_round_trip_bound_and_tombstone() {
+        let mut msg = Message::plain("m4", "Ana", "https://discord.gg/moss", 1_700_000_000, false);
+        assert!(!serde_json::to_string(&msg).unwrap().contains("invites"));
+        for i in 0..(MESSAGE_INVITES_LIMIT + 2) {
+            msg.invites.push(MessageInvite {
+                code: format!("code{i}"),
+                url: format!("https://discord.gg/code{i}"),
+                space_name: "X".repeat(300),
+                space_id: Some("4000".into()),
+                state: InviteState::Valid,
+                event: Some(ScheduledEvent {
+                    id: "888".into(),
+                    guild_id: "4000".into(),
+                    name: "E".repeat(300),
+                    start: Some(1_791_931_020),
+                    place: "North Ridge".into(),
+                    interested_count: Some(12),
+                    interested: true,
+                }),
+                ..MessageInvite::default()
+            });
+        }
+        msg.bound();
+        assert_eq!(msg.invites.len(), MESSAGE_INVITES_LIMIT);
+        assert_eq!(msg.invites[0].space_name.len(), 200);
+        assert_eq!(msg.invites[0].event.as_ref().unwrap().name.len(), 200);
+        let wire = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<Message>(&wire).unwrap().invites, msg.invites);
+        msg.tombstone();
+        assert!(msg.invites.is_empty());
+    }
+
+    #[test]
     fn inline_buttons_round_trip_and_stay_bounded() {
         let mut msg = Message::plain("m4", "Bot", "Pick one", 1_700_000_000, false);
         assert!(!serde_json::to_string(&msg).unwrap().contains("buttons"));
@@ -1682,5 +2287,56 @@ mod tests {
         assert_eq!(back.buttons, msg.buttons);
         msg.tombstone();
         assert!(msg.buttons.is_empty());
+    }
+
+    #[test]
+    fn system_jump_round_trips_bounds_and_clears_on_tombstone() {
+        let mut msg = Message::plain("m4", "Ada", "Ada pinned a message.", 1_700_000_000, false);
+        msg.kind = MessageKind::System;
+        assert!(!serde_json::to_string(&msg).unwrap().contains("\"jump\""));
+        msg.jump = Some("x".repeat(200));
+        msg.bound();
+        assert_eq!(msg.jump.as_deref().map(str::len), Some(128));
+        let wire = serde_json::to_string(&msg).unwrap();
+        let back: Message = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.jump, msg.jump);
+        msg.tombstone();
+        assert_eq!(msg.jump, None);
+    }
+
+    #[test]
+    fn heading_and_small_styles_round_trip() {
+        for style in [Style::Heading { level: 1 }, Style::Heading { level: 2 }, Style::Heading { level: 3 }, Style::Small] {
+            let span = Span { start: 0, end: 4, style };
+            let wire = serde_json::to_string(&span).unwrap();
+            assert_eq!(serde_json::from_str::<Span>(&wire).unwrap(), span);
+        }
+    }
+
+    #[test]
+    fn clickable_telegram_span_styles_round_trip() {
+        let styles = vec![
+            Style::Hashtag,
+            Style::Command,
+            Style::Username { username: "forest_wren".into() },
+            Style::Copyable,
+        ];
+        for style in styles {
+            let span = Span { start: 0, end: 5, style };
+            let wire = serde_json::to_string(&span).unwrap();
+            assert_eq!(serde_json::from_str::<Span>(&wire).unwrap(), span);
+        }
+    }
+
+    #[test]
+    fn media_unread_stays_off_wire_when_false_and_round_trips() {
+        let mut msg = Message::plain("m4", "Odalys", "", 1_700_000_000, false);
+        assert!(!serde_json::to_string(&msg).unwrap().contains("media_unread"));
+        msg.media_unread = true;
+        let wire = serde_json::to_string(&msg).unwrap();
+        assert!(wire.contains(r#""media_unread":true"#), "{wire}");
+        assert!(serde_json::from_str::<Message>(&wire).unwrap().media_unread);
+        msg.tombstone();
+        assert!(!msg.media_unread);
     }
 }

@@ -179,6 +179,8 @@ pub fn parse_html(url: &str, html: &str) -> Option<Preview> {
         title,
         description,
         image: None,
+        duration: 0,
+        opens_in_browser: false,
     })
 }
 

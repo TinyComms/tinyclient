@@ -230,23 +230,22 @@ impl Demo {
     }
 
     /// Our reaction as the network would report it. A custom emoji is named by its file's id.
-    fn reaction(&self, emoji: &str) -> Reaction {
+    /// A super reaction is counted on its own, not as a normal one.
+    fn reaction(&self, emoji: &str, burst: bool) -> Reaction {
         let custom = self.hub.store().media(&self.ctx.account, &[emoji.to_owned()]).ok().and_then(|mut known| known.pop());
-        match custom {
-            Some((file, _)) => Reaction {
-                emoji: format!(":{}:", emoji.trim_start_matches("emoji-")),
-                file: Some(file),
-                count: 1,
-                mine: true,
-                who: Vec::new(),
-            },
-            None => Reaction {
-                emoji: emoji.to_owned(),
-                file: None,
-                count: 1,
-                mine: true,
-                who: Vec::new(),
-            },
+        let (emoji, file) = match custom {
+            Some((file, _)) => (format!(":{}:", emoji.trim_start_matches("emoji-")), Some(file)),
+            None => (emoji.to_owned(), None),
+        };
+        Reaction {
+            emoji,
+            file,
+            count: if burst { 0 } else { 1 },
+            mine: !burst,
+            who: Vec::new(),
+            burst: u32::from(burst),
+            mine_burst: burst,
+            burst_colors: Vec::new(),
         }
     }
 
@@ -381,6 +380,7 @@ impl Demo {
             link: if self.ctx.account.network == Network::Telegram && !row.kind.is_direct() { format!("https://t.me/{}", row.title.to_lowercase().replace(' ', "_")) } else { String::new() },
             disappearing: row.disappearing,
             bookmarks: Vec::new(),
+            pending_requests: 0,
             ..ConversationAbout::default()
         })
     }
@@ -396,6 +396,7 @@ impl Demo {
             nickname: if self.ctx.account.network == Network::Discord { "Robin 🍄".to_owned() } else { String::new() },
             roles: if self.ctx.account.network == Network::Discord { vec!["Member".to_owned(), "Trail lead".to_owned()] } else { Vec::new() },
             notify: Notify::Mentions,
+            can_change_nickname: self.ctx.account.network == Network::Discord,
             ..SpaceAbout::default()
         })
     }
@@ -639,10 +640,13 @@ impl Demo {
             }
             Network::Discord => {
                 let direct = row.as_ref().is_none_or(|row| row.space.is_none());
+                let join_only = row.is_some_and(|row| row.read_only);
                 ReactionRules {
                     custom: if direct { EmojiScope::None } else { EmojiScope::Space },
-                    join_only: row.is_some_and(|row| row.read_only),
+                    join_only,
                     distinct: 20,
+                    // The demo Discord account has super reactions. A read-only channel still cannot start one.
+                    burst: !join_only,
                     ..ReactionRules::default()
                 }
             }
@@ -657,13 +661,14 @@ impl Demo {
     fn serve(demo: &Arc<Demo>, command: Command) {
         match command {
             Command::Send { conversation_id, client_id, text, reply_to } => demo.send(&conversation_id, &client_id, text, reply_to),
-            Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
-                let reacted = demo.ctx.reacted(&conversation_id, &message_id, &demo.reaction(&emoji), on);
+            Command::React { conversation_id, message_id, emoji, on, burst, reply } => {
+                let reacted = demo.ctx.reacted(&conversation_id, &message_id, &demo.reaction(&emoji, burst), on);
                 let _ = reply.send(reacted.map_err(|err| Refusal::Refused(err.to_string())));
             }
-            Command::Edit { conversation_id, message_id, text, spans: _, reply } => {
+            Command::Edit { conversation_id, message_id, text, spans: _, suppress_embeds: _, keep_attachments: _, reply } => {
                 let _ = reply.send(demo.edit(&conversation_id, &message_id, text));
             }
+            Command::EditMedia { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Delete { conversation_id, message_id, scope: _, reply } => {
                 let deleted = demo.ctx.deleted(&conversation_id, &message_id);
                 let _ = reply.send(deleted.map_err(|err| Refusal::Refused(err.to_string())));
@@ -731,7 +736,8 @@ impl Demo {
                 demo.ctx.presence(&demo.me.id, presence, status.as_deref().unwrap_or(&old), true);
                 let _ = reply.send(Ok(()));
             }
-            Command::SetProfile { name: _, about, pronouns: _, reply } => {
+            Command::SetActivity { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetProfile { about, reply, .. } => {
                 if let Some(about) = about {
                     let (presence, _) = demo.hub.shown(&demo.key(&demo.me.id));
                     demo.ctx.presence(&demo.me.id, presence, &about, true);
@@ -761,7 +767,7 @@ impl Demo {
                 let set = demo.ctx.starred(&conversation_id, starred);
                 let _ = reply.send(set.map_err(|err| Refusal::Refused(err.to_string())));
             }
-            Command::Leave { conversation_id, reply } => {
+            Command::Leave { conversation_id, silent: _, reply } => {
                 let left = demo.ctx.conversation_gone(&conversation_id);
                 let _ = reply.send(left.map_err(|err| Refusal::Refused(err.to_string())));
             }
@@ -831,13 +837,20 @@ impl Demo {
                 let (conv, space) = match &scope {
                     crate::adapters::SearchScope::Conversation(id) => (Some(id.as_str()), None),
                     crate::adapters::SearchScope::Space(id) => (None, Some(id.as_str())),
-                    crate::adapters::SearchScope::Account => (None, None),
+                    crate::adapters::SearchScope::Account | crate::adapters::SearchScope::Home => (None, None),
                 };
                 let found = demo
                     .hub
                     .store()
                     .search_account_filtered(&demo.ctx.account, conv, space, &query, &filters, 100)
-                    .map(|hits| crate::adapters::SearchPage { hits, cursor: None })
+                    .map(crate::adapters::SearchPage::from)
+                    .map(|mut hits| {
+                        if matches!(scope, crate::adapters::SearchScope::Home) {
+                            hits.hits.retain(|hit| hit.space_title.is_empty());
+                        }
+                        hits
+                    })
+                    .map(Into::into)
                     .map_err(|err| Refusal::Refused(err.to_string()));
                 let _ = reply.send(found);
             }
@@ -876,7 +889,7 @@ impl Demo {
                 })();
                 let _ = reply.send(outcome);
             }
-            Command::CreateChannel { space_id, name, kind, private, group, reply } => {
+            Command::CreateChannel { space_id, name, kind, private, group, reply, .. } => {
                 let outcome = (|| -> Result<String, Refusal> {
                     let id = format!("chan-{}", demo.made.fetch_add(1, Ordering::Relaxed) + 1);
                     let row = ConversationRow {
@@ -892,6 +905,7 @@ impl Demo {
             }
             Command::StartThread { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchPeople(query) => demo.ctx.searched(&query),
+            Command::ResolveUsername { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Download { url, reply, .. } => drop(reply.send(Ok(Download { url, headers: Vec::new(), sealed: None }))),
             Command::Handoff { conversation_id, reply } => {
                 let account = &demo.ctx.account.account;
@@ -921,7 +935,7 @@ impl Demo {
             // The demo's topics are what its store holds: nothing to fetch, and the landing
             // reads it from there.
             Command::OpenForum { reply, .. } => {
-                let _ = reply.send(Ok(()));
+                let _ = reply.send(Ok(None));
             }
             Command::AnswerMessageRequest { reply, .. } => {
                 let _ = reply.send(Err(Refusal::Unsupported));
@@ -929,6 +943,9 @@ impl Demo {
             Command::Source { reply, .. } | Command::CreateGroup { reply, .. } => {
                 let _ = reply.send(Err(Refusal::Unsupported));
             }
+            Command::OpenLink { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::TranslateMessages { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SendRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StarMessage { reply, .. } => {
                 let _ = reply.send(Err(Refusal::Unsupported));
             }
@@ -950,8 +967,23 @@ impl Demo {
                 }
                 let _ = reply.send(outcome);
             }
-            Command::MembersAdd { reply, .. } | Command::MembersRemove { reply, .. } | Command::ConversationPicture { reply, .. } => {
+            Command::MembersAdd { reply, .. }
+            | Command::MembersRemove { reply, .. }
+            | Command::ConversationPicture { reply, .. }
+            | Command::ModerateMember { reply, .. }
+            | Command::SetAdmin { reply, .. }
+            | Command::TransferOwnership { reply, .. }
+            | Command::UpdateChatSettings { reply, .. }
+            | Command::SetDefaultSendAs { reply, .. } => {
                 let _ = reply.send(Ok(()));
+            }
+            Command::AdminLog { reply, .. } => {
+                let entries: Vec<protocol::AdminLogEntry> = Vec::new();
+                let _ = reply.send(Ok(entries));
+            }
+            Command::SendAsOptions { reply, .. } => {
+                let peers: Vec<protocol::SendAs> = Vec::new();
+                let _ = reply.send(Ok((peers, None)));
             }
             Command::ConversationUpdate { conversation_id, title, topic, description, reply } => {
                 let outcome = match demo.ctx.known(&conversation_id) {
@@ -1009,6 +1041,10 @@ impl Demo {
             // Nothing is behind these: what is stored is all there is.
             Command::ActivityFeed { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityMarkRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Mentions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DismissMention { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MoveSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetFolder { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReadBy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BookmarkAdd { reply, .. }
             | Command::BookmarkEdit { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1020,6 +1056,9 @@ impl Demo {
             Command::SendPaidReaction { reply, .. }
             | Command::TogglePaidReactionPrivacy { reply, .. }
             | Command::SetDefaultReaction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Favourite { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Transcribe { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::RateTranscript { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Translate { conversation_id, message_id, to, reply } => {
                 let original = demo
                     .ctx
@@ -1043,9 +1082,203 @@ impl Demo {
             Command::PreviewChannel { reply, .. }
             | Command::Join { reply, .. }
             | Command::DeleteFile { reply, .. }
-            | Command::MessageAction { reply, .. }
             | Command::InviteMember { reply, .. }
             | Command::AddCustomEmoji { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MessageAction { conversation_id, message_id, action_id, value, values, reply, .. } => {
+                let outcome = (|| -> Result<(), Refusal> {
+                    let stored = demo.ctx.stored_message(&conversation_id, &message_id).ok().flatten();
+                    let mut message = stored.ok_or_else(|| Refusal::Refused("That message is gone.".to_owned()))?;
+                    let picked = if !values.is_empty() {
+                        values.join(", ")
+                    } else if !value.is_empty() {
+                        value.clone()
+                    } else {
+                        action_id.clone()
+                    };
+                    for ctrl in &mut message.controls {
+                        if ctrl.action_id == action_id {
+                            match &mut ctrl.kind {
+                                protocol::ControlKind::Select { selected, .. }
+                                | protocol::ControlKind::RadioButtons { selected, .. } => {
+                                    *selected = Some(picked.clone());
+                                }
+                                protocol::ControlKind::Checkboxes { selected, .. } => {
+                                    *selected = values.clone();
+                                }
+                                protocol::ControlKind::Button { .. } => {
+                                    if !ctrl.label.ends_with(" ✓") {
+                                        ctrl.label.push_str(" ✓");
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    if action_id == "demo_open_modal" {
+                        demo.ctx.interaction_modal(
+                            &conversation_id,
+                            protocol::InteractionModal {
+                                id: format!("modal-{message_id}"),
+                                application_id: "demo-bot".into(),
+                                custom_id: "demo_feedback".into(),
+                                title: "Submit note".into(),
+                                fields: vec![protocol::ModalField {
+                                    custom_id: "note".into(),
+                                    label: "Your note".into(),
+                                    value: String::new(),
+                                    placeholder: "Type something…".into(),
+                                    required: true,
+                                    multiline: false,
+                                    min_length: Some(1),
+                                    max_length: Some(200),
+                                }],
+                                nonce: String::new(),
+                            },
+                        );
+                    }
+                    demo.ctx.message(&conversation_id, &message).map_err(|err| Refusal::Refused(err.to_string()))
+                })();
+                let _ = reply.send(outcome.map(|()| None));
+            }
+            Command::Commands { query, kind, reply, .. } => {
+                let mut cmds = vec![
+                    protocol::AppCommand {
+                        id: "demo-shrug".into(),
+                        application_id: "builtin".into(),
+                        version: "1".into(),
+                        kind: protocol::CommandKind::ChatInput,
+                        name: "shrug".into(),
+                        description: "Append ¯\\_(ツ)_/¯ to your message".into(),
+                        app_name: "Built-in".into(),
+                        options: vec![protocol::CommandOption {
+                            name: "message".into(),
+                            description: "Text before the shrug".into(),
+                            kind: protocol::CommandOptionKind::String,
+                            required: false,
+                            ..Default::default()
+                        }],
+                        built_in: true,
+                    },
+                    protocol::AppCommand {
+                        id: "demo-deploy".into(),
+                        application_id: "demo-bot".into(),
+                        version: "1".into(),
+                        kind: protocol::CommandKind::ChatInput,
+                        name: "deploy".into(),
+                        description: "Post a demo deployment approval with buttons".into(),
+                        app_name: "DeployBot".into(),
+                        options: vec![protocol::CommandOption {
+                            name: "env".into(),
+                            description: "Target environment".into(),
+                            kind: protocol::CommandOptionKind::String,
+                            required: true,
+                            autocomplete: true,
+                            choices: vec![
+                                protocol::CommandChoice { name: "Staging".into(), value: "staging".into() },
+                                protocol::CommandChoice { name: "Production".into(), value: "production".into() },
+                            ],
+                            ..Default::default()
+                        }],
+                        built_in: false,
+                    },
+                ];
+                if let Some(k) = kind {
+                    cmds.retain(|c| c.kind == k);
+                }
+                let q = query.trim().to_ascii_lowercase();
+                if !q.is_empty() {
+                    cmds.retain(|c| c.name.to_ascii_lowercase().contains(&q) || c.description.to_ascii_lowercase().contains(&q));
+                }
+                let _ = reply.send(Ok(cmds));
+            }
+            Command::CommandAutocomplete { focused, options, reply, .. } => {
+                let typed = options
+                    .iter()
+                    .find(|a| a.name == focused)
+                    .map(|a| a.value.to_ascii_lowercase())
+                    .unwrap_or_default();
+                let all = [
+                    ("Staging", "staging"),
+                    ("Canary", "canary"),
+                    ("Production", "production"),
+                ];
+                let choices = all
+                    .into_iter()
+                    .filter(|(name, val)| typed.is_empty() || name.to_ascii_lowercase().contains(&typed) || val.contains(&typed))
+                    .map(|(name, val)| protocol::CommandChoice { name: name.into(), value: val.into() })
+                    .collect();
+                let _ = reply.send(Ok(choices));
+            }
+            Command::RunCommand { conversation_id, name, arguments, reply, .. } => {
+                let now = crate::hub::now();
+                let outcome = match name.as_str() {
+                    "shrug" => {
+                        let text = arguments.first().map(|a| a.value.trim()).unwrap_or("");
+                        let body = if text.is_empty() {
+                            "¯\\_(ツ)_/¯".to_owned()
+                        } else {
+                            format!("{text} ¯\\_(ツ)_/¯")
+                        };
+                        let msg = demo.accepted(&conversation_id, body, None, Vec::new());
+                        demo.ctx.message(&conversation_id, &msg).map_err(|err| Refusal::Refused(err.to_string()))
+                    }
+                    "deploy" => {
+                        let env = arguments
+                            .iter()
+                            .find(|a| a.name == "env")
+                            .or_else(|| arguments.first())
+                            .map(|a| a.value.as_str())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("staging");
+                        let id = format!("demo-cmd-{}", demo.made.fetch_add(1, Ordering::Relaxed) + 1);
+                        let mut msg = Message::plain(id, "DeployBot", format!("Deploy to `{env}`?"), now, false);
+                        msg.sender.bot = true;
+                        msg.controls = vec![
+                            protocol::MessageControl {
+                                block_id: "demo-deploy".into(),
+                                action_id: "approve".into(),
+                                element_type: "button".into(),
+                                label: "Approve".into(),
+                                value: "approved".into(),
+                                confirm: None,
+                                kind: protocol::ControlKind::Button { url: String::new(), style: protocol::ControlStyle::Success },
+                                disabled: false,
+                                emoji: String::new(),
+                                row: 0,
+                                min_values: 0,
+                                max_values: 0,
+                            },
+                            protocol::MessageControl {
+                                block_id: "demo-deploy".into(),
+                                action_id: "reject".into(),
+                                element_type: "button".into(),
+                                label: "Cancel".into(),
+                                value: "cancelled".into(),
+                                confirm: None,
+                                kind: protocol::ControlKind::Button { url: String::new(), style: protocol::ControlStyle::Danger },
+                                disabled: false,
+                                emoji: String::new(),
+                                row: 0,
+                                min_values: 0,
+                                max_values: 0,
+                            },
+                        ];
+                        demo.ctx.message(&conversation_id, &msg).map_err(|err| Refusal::Refused(err.to_string()))
+                    }
+                    _ => Err(Refusal::Refused(format!("Unknown command /{name}."))),
+                };
+                let _ = reply.send(outcome);
+            }
+            Command::ModalSubmit { conversation_id, values, reply, .. } => {
+                let summary = values
+                    .iter()
+                    .map(|(k, v)| format!("{k}: {v}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let msg = demo.accepted(&conversation_id, format!("Submitted form ({summary})"), None, Vec::new());
+                let res = demo.ctx.message(&conversation_id, &msg).map_err(|err| Refusal::Refused(err.to_string()));
+                let _ = reply.send(res);
+            }
             Command::UserGroups { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::UserGroupCreate { reply, .. }
             | Command::UserGroupUpdate { reply, .. }
@@ -1079,15 +1312,85 @@ impl Demo {
                 drop(reply.send(Err(Refusal::Unsupported)));
             }
             Command::Reactors { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ClearReactions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::AddFriend { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetNote { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetFriendNickname { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateInviteLink { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::TransferOwner { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Events { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::EventInterest { reply, .. }
+            | Command::EditSpace { reply, .. }
+            | Command::DeleteSpace { reply, .. }
+            | Command::TransferSpace { reply, .. }
+            | Command::DeleteEvent { reply, .. }
+            | Command::RevokeSpaceInvite { reply, .. }
+            | Command::SetInvitesPaused { reply, .. }
+            | Command::MoveRoles { reply, .. }
+            | Command::DeleteRole { reply, .. }
+            | Command::SetMemberRoles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SpaceInvites { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Roles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateRole { reply, .. } | Command::EditRole { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateEvent { reply, .. } | Command::EditEvent { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::EventPreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::EventLinkInterest { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Discover { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::JoinDiscovered { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SpaceGate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AcceptRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SubmitOnboarding { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ChatInvites { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateInvite { reply, .. } | Command::RevokeInvite { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::JoinRequests { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::HandleJoinRequest { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::LeaveSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetSpaceNotify { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SpaceIntegrations { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateWebhook { reply, .. } | Command::EditWebhook { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::DeleteWebhook { reply, .. } | Command::RemoveIntegration { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::SpaceExpressions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateEmoji { reply, .. } | Command::EditEmoji { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::CreateSticker { reply, .. } | Command::EditSticker { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::DeleteEmoji { reply, .. } | Command::DeleteSticker { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::GetDefaultDisappearing { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetDefaultDisappearing { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::FolderSave { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::FolderDelete { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::FoldersReorder { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SuggestedFolders { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::LoadTopics { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::TopicCreate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::TopicUpdate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::TopicDelete { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::TopicIcons { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CancelScheduled { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SendScheduledNow { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::JumpToDate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SearchCalendar { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DeleteMany { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DeleteParticipantHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ReportSpamMessages { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::FollowThread { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ForumInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ForumPost { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::PressButton { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::GetNotifyDefaults { reply }
             | Command::SetNotifyDefault { reply, .. }
@@ -1098,6 +1401,35 @@ impl Demo {
             Command::EndSession { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::UnreadItems { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MarkUnreadItemsRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ChannelThreads { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ThreadUpdate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DeleteThread { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Publish { reply, .. } | Command::Follow { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::FollowChannel { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetSpaceView { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetSpaceOptions { reply, .. } | Command::SetSpacePrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetNetworkPrivacy { reply } | Command::SetNetworkPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateCategory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::EditChannel { reply, .. }
+            | Command::MoveChannels { reply, .. }
+            | Command::DeleteChannel { reply, .. }
+            | Command::SetOverwrite { reply, .. }
+            | Command::DeleteOverwrite { reply, .. }
+            | Command::SyncChannelPermissions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ChannelPermissions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AuditLog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AutomodRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SaveAutomodRule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DeleteAutomodRule { reply, .. } | Command::SaveSpaceSafety { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::GetAutoDownload { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetAutoDownload { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetBoosts { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ApplyBoost { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetBotMenu { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::StartBot { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SharePhone { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Meetings { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MeetingRsvp { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Backfill(_)
@@ -1111,6 +1443,7 @@ impl Demo {
             | Command::MarkRead { .. }
             | Command::MarkUnread { .. }
             | Command::Viewed { .. }
+            | Command::MarkPlayed { .. }
             | Command::AckBulk { .. }
             | Command::Collapse { .. }
             | Command::Typing { .. }
@@ -1118,6 +1451,7 @@ impl Demo {
             | Command::Draft { .. }
             | Command::Watch(_)
             | Command::Wanted(_)
+            | Command::Played { .. }
             | Command::Stop => {}
         }
     }

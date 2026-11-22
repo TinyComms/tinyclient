@@ -1111,6 +1111,12 @@ fn start_download(path: PathBuf) {
 /// Cisco's OpenH264 2.6.0 for this machine. A download in progress is [`CODEC_LATER`], not a
 /// failure, and this never blocks on the network. A failed download says its words, and the
 /// next share or camera that is turned on starts a new download.
+/// The OpenH264 decoder a round video message plays through. The same library a call loads.
+pub(crate) fn open_h264() -> Result<Decoder, String> {
+    let api = load_api()?;
+    Decoder::with_api_config(api, DecoderConfig::new()).map_err(|err| err.to_string())
+}
+
 fn load_api() -> Result<OpenH264API, String> {
     let path = library_path()?;
     if let Some(api) = open_cached(&path) {
@@ -1500,4 +1506,74 @@ mod tests {
         assert!(key);
         assert!(bytes_low * 45 / 35 < bytes_high, "the rate moved: {bytes_high} then {bytes_low}");
     }
+}
+
+/// The camera a round video message records from. Dropped when the take ends, which stops
+/// the stream.
+pub(crate) struct RoundCam {
+    camera: nokhwa::Camera,
+    name: String,
+}
+
+impl RoundCam {
+    pub(crate) fn open(choice: Option<&str>) -> Result<Self, String> {
+        let (index, name) = chosen_camera(choice)?;
+        let mut camera = open_camera(index)?;
+        camera.open_stream().map_err(|err| err.to_string())?;
+        Ok(Self { camera, name })
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn grab(&mut self) -> Result<Rgba, String> {
+        let frame = self.camera.frame().map_err(|err| err.to_string())?;
+        rgba_of(&frame)
+    }
+}
+
+impl Drop for RoundCam {
+    fn drop(&mut self) {
+        let _ = self.camera.stop_stream();
+    }
+}
+
+/// H.264 for a round video message: baseline, level 3.1, camera use, a few hundred kb/s.
+/// The same opener a call uses. Annex B out.
+pub(crate) struct RoundEncoder {
+    backend: Backend,
+}
+
+impl RoundEncoder {
+    pub(crate) fn open() -> Result<Self, String> {
+        Ok(Self { backend: Backend::open_h264(400_000, protocol::ROUND_FPS as f32, false)? })
+    }
+
+    pub(crate) fn encode(&mut self, planes: &Planes, at: Duration, key: bool) -> Result<Encoded, String> {
+        let ask = Ask { key, bps: 400_000, at, fps: protocol::ROUND_FPS as f32 };
+        self.backend.encode(planes, &ask)
+    }
+}
+
+fn chosen_camera(choice: Option<&str>) -> Result<(nokhwa::utils::CameraIndex, String), String> {
+    use nokhwa::utils::{ApiBackend, CameraIndex};
+    let listed = nokhwa::query(ApiBackend::Auto).map_err(|err| err.to_string())?;
+    if listed.is_empty() {
+        return Err("No camera was found.".to_owned());
+    }
+    let (name, id) = match choice.and_then(|choice| choice.split_once('\t')) {
+        Some((name, id)) => (name, Some(id)),
+        None => (choice.unwrap_or_default(), None),
+    };
+    let found = listed
+        .iter()
+        .find(|info| id.is_some_and(|id| camera_id(info) == id))
+        .or_else(|| listed.iter().find(|info| !name.is_empty() && info.human_name() == name))
+        .unwrap_or(&listed[0]);
+    let index = match found.index() {
+        CameraIndex::Index(n) => CameraIndex::Index(*n),
+        CameraIndex::String(s) => CameraIndex::String(s.clone()),
+    };
+    Ok((index, found.human_name()))
 }

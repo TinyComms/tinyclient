@@ -2,6 +2,7 @@
 //! text. No drawing here; `text.rs` turns a block into an element.
 
 use protocol::{MediaFile, MentionKind, Span, Style};
+use std::borrow::Cow;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -14,6 +15,8 @@ const PAD: &str = "\u{2005}";
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
     Text(Inline),
+    Heading { level: u8, text: Inline },
+    Small(Inline),
     Quote(Inline),
     Item { ordered: bool, depth: u8, number: u32, text: Inline },
     Code { language: String, text: String },
@@ -26,6 +29,16 @@ pub struct Inline {
     pub runs: Vec<Run>,
 }
 
+/// Interactive action attached to an inline text run (Telegram hashtags, bot commands,
+/// `@username` mentions, and copyable phone/card numbers).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunAction {
+    Hashtag,
+    Command,
+    Username(String),
+    Copyable,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Run {
     /// Bytes of [`Inline::text`].
@@ -36,11 +49,14 @@ pub struct Run {
     pub strike: bool,
     pub code: bool,
     pub link: Option<String>,
+    pub action: Option<RunAction>,
     pub mention: Option<(MentionKind, String)>,
     /// Which spoiler this is part of: the span's start, which names it within the message.
     pub spoiler: Option<u32>,
     /// A custom emoji. With its image on disk the text is [`EMOJI_SLOT`]; without, `:name:`.
     pub emoji: Option<MediaFile>,
+    /// A live timestamp chip (`Style::Time`): `(unix, form)`.
+    pub time: Option<(i64, char)>,
     /// "(edited)", after the last word.
     pub mark: bool,
     /// What the run stands for when it is copied: the `:name:` of an emoji drawn as its image.
@@ -54,7 +70,7 @@ impl Run {
 
     /// Drawn on a background that the padding belongs to.
     fn boxed(&self) -> bool {
-        self.code || self.mention.is_some()
+        self.code || self.mention.is_some() || self.time.is_some()
     }
 }
 
@@ -87,11 +103,25 @@ fn floor(text: &str, at: u32) -> usize {
 }
 
 fn is_block(style: &Style) -> bool {
-    matches!(style, Style::CodeBlock { .. } | Style::Quote | Style::ListItem { .. })
+    matches!(
+        style,
+        Style::CodeBlock { .. } | Style::Quote | Style::ListItem { .. } | Style::Heading { .. } | Style::Small
+    )
+}
+
+fn block_rank(style: &Style) -> u8 {
+    match style {
+        Style::CodeBlock { .. } => 0,
+        Style::Quote => 1,
+        Style::ListItem { .. } => 2,
+        Style::Heading { .. } => 3,
+        Style::Small => 4,
+        _ => 5,
+    }
 }
 
 /// The styled runs of `text[range]`.
-fn inline(text: &str, spans: &[Span], range: Range<usize>) -> Inline {
+fn inline(text: &str, spans: &[Span], range: Range<usize>, now: i64) -> Inline {
     let within = |span: &&Span| {
         !is_block(&span.style) && floor(text, span.start) < range.end && floor(text, span.end) > range.start
     };
@@ -108,7 +138,7 @@ fn inline(text: &str, spans: &[Span], range: Range<usize>) -> Inline {
     for cut in cuts.windows(2) {
         let (start, end) = (cut[0], cut[1]);
         let mut run = Run::default();
-        let mut shown = &text[start..end];
+        let mut shown: Cow<'_, str> = Cow::Borrowed(&text[start..end]);
         for span in spans.iter().filter(|span| floor(text, span.start) <= start && floor(text, span.end) >= end) {
             match &span.style {
                 Style::Bold => run.bold = true,
@@ -118,20 +148,37 @@ fn inline(text: &str, spans: &[Span], range: Range<usize>) -> Inline {
                 Style::Code => run.code = true,
                 Style::Spoiler => run.spoiler = Some(span.start),
                 Style::Link { url } => run.link = Some(url.clone()),
+                Style::Hashtag => run.action = Some(RunAction::Hashtag),
+                Style::Command => run.action = Some(RunAction::Command),
+                Style::Username { username } => run.action = Some(RunAction::Username(username.clone())),
+                Style::Copyable => run.action = Some(RunAction::Copyable),
                 Style::Mention { kind, id } => run.mention = Some((*kind, id.clone())),
                 Style::Emoji { file } => {
                     if file.path.is_some() {
                         run.alt = Some(text[start..end].to_owned());
-                        shown = EMOJI_SLOT;
+                        shown = Cow::Borrowed(EMOJI_SLOT);
                     }
                     run.emoji = Some(file.clone());
                 }
-                Style::CodeBlock { .. } | Style::Quote | Style::ListItem { .. } => {}
+                Style::Time { unix, form } => {
+                    run.time = Some((*unix, *form));
+                    if start == floor(text, span.start).max(range.start) {
+                        shown = Cow::Owned(crate::gui::time::discord_timestamp(*unix, *form, now));
+                    } else {
+                        shown = Cow::Borrowed("");
+                    }
+                }
+                Style::CodeBlock { .. } | Style::Quote | Style::ListItem { .. } | Style::Heading { .. } | Style::Small => {}
             }
         }
+        if run.time.is_some() && shown.is_empty() {
+            continue;
+        }
         match pieces.last_mut() {
-            Some((before, last)) if last.same_style(&run) && run.emoji.is_none() => before.push_str(shown),
-            _ => pieces.push((shown.to_owned(), run)),
+            Some((before, last)) if last.same_style(&run) && run.emoji.is_none() && run.time.is_none() => {
+                before.push_str(&shown);
+            }
+            _ => pieces.push((shown.into_owned(), run)),
         }
     }
 
@@ -149,7 +196,7 @@ fn inline(text: &str, spans: &[Span], range: Range<usize>) -> Inline {
 
 impl Run {
     fn same_box(&self, other: &Run) -> bool {
-        self.code == other.code && self.mention == other.mention
+        self.code == other.code && self.mention == other.mention && self.time == other.time
     }
 }
 
@@ -162,8 +209,12 @@ fn trimmed(text: &str, range: Range<usize>) -> Range<usize> {
 }
 
 pub fn blocks(text: &str, spans: &[Span]) -> Vec<Block> {
+    blocks_at(text, spans, crate::view::now())
+}
+
+pub fn blocks_at(text: &str, spans: &[Span], now: i64) -> Vec<Block> {
     let mut whole: Vec<&Span> = spans.iter().filter(|span| is_block(&span.style)).collect();
-    whole.sort_by_key(|span| span.start);
+    whole.sort_by_key(|span| (span.start, block_rank(&span.style)));
 
     let mut out = Vec::new();
     let mut at = 0;
@@ -172,7 +223,7 @@ pub fn blocks(text: &str, spans: &[Span]) -> Vec<Block> {
     let paragraph = |out: &mut Vec<Block>, range: Range<usize>| {
         let range = trimmed(text, range);
         if !range.is_empty() {
-            out.push(Block::Text(inline(text, spans, range)));
+            out.push(Block::Text(inline(text, spans, range, now)));
         }
     };
     for span in whole {
@@ -195,7 +246,7 @@ pub fn blocks(text: &str, spans: &[Span]) -> Vec<Block> {
             Style::Quote => {
                 numbers = [0; 3];
                 // Consecutive quoted lines are one quote under one bar.
-                let more = inline(text, spans, body);
+                let more = inline(text, spans, body, now);
                 match out.last_mut() {
                     Some(Block::Quote(quote)) => {
                         quote.text.push('\n');
@@ -217,8 +268,19 @@ pub fn blocks(text: &str, spans: &[Span]) -> Vec<Block> {
                     ordered: *ordered,
                     depth,
                     number: numbers[depth as usize],
-                    text: inline(text, spans, body),
+                    text: inline(text, spans, body, now),
                 });
+            }
+            Style::Heading { level } => {
+                numbers = [0; 3];
+                out.push(Block::Heading {
+                    level: (*level).clamp(1, 3),
+                    text: inline(text, spans, body, now),
+                });
+            }
+            Style::Small => {
+                numbers = [0; 3];
+                out.push(Block::Small(inline(text, spans, body, now)));
             }
             _ => {}
         }
@@ -295,7 +357,8 @@ pub fn plain(blocks: &[Block], a: Place, b: Place) -> String {
             (start == 0, inline.plain(start..end.max(start)))
         };
         lines.push(match block {
-            Block::Text(inline) => part(inline).1,
+            Block::Text(inline) | Block::Small(inline) => part(inline).1,
+            Block::Heading { text, .. } => part(text).1,
             Block::Quote(inline) => match part(inline) {
                 (true, text) => text.lines().map(|line| format!("> {line}")).collect::<Vec<_>>().join("\n"),
                 (false, text) => text,
@@ -492,7 +555,11 @@ mod tests {
             last.mark_edited();
         }
         let end = |block: usize| match &found[block] {
-            Block::Text(inline) | Block::Quote(inline) | Block::Item { text: inline, .. } => inline.text.len(),
+            Block::Text(inline)
+            | Block::Heading { text: inline, .. }
+            | Block::Small(inline)
+            | Block::Quote(inline)
+            | Block::Item { text: inline, .. } => inline.text.len(),
             Block::Code { text, .. } => text.len(),
         };
         // Everything: mention by name, the emoji by its name, the link by its address, the code
@@ -534,6 +601,8 @@ mod tests {
             .iter()
             .map(|block| match block {
                 Block::Text(inline) => format!("text {:?}", inline.text),
+                Block::Heading { level, text } => format!("h{level} {:?}", text.text),
+                Block::Small(inline) => format!("small {:?}", inline.text),
                 Block::Quote(inline) => format!("quote {:?}", inline.text),
                 Block::Item { depth, number, text, .. } => format!("item {depth}.{number} {:?}", text.text),
                 Block::Code { language, text } => format!("code {language} {text:?}"),
@@ -580,23 +649,30 @@ mod tests {
             for _ in 0..400 {
                 let spans: Vec<Span> = (0..next(6))
                     .map(|_| {
-                        let style = match next(9) {
-                            0 => Style::Bold,
-                            1 => Style::Code,
-                            2 => Style::Spoiler,
-                            3 => Style::Link { url: "https://example.org".into() },
-                            4 => Style::Mention { kind: MentionKind::User, id: "U1".into() },
-                            5 => Style::Emoji { file: file.clone() },
-                            6 => Style::Quote,
-                            7 => Style::ListItem { ordered: next(2) == 0, depth: next(5) as u8 },
-                            _ => Style::CodeBlock { language: String::new() },
-                        };
-                        Span { start: next(limit), end: next(limit), style }
-                    })
-                    .collect();
+                    let style = match next(11) {
+                        0 => Style::Bold,
+                        1 => Style::Code,
+                        2 => Style::Spoiler,
+                        3 => Style::Link { url: "https://example.org".into() },
+                        4 => Style::Mention { kind: MentionKind::User, id: "U1".into() },
+                        5 => Style::Emoji { file: file.clone() },
+                        6 => Style::Quote,
+                        7 => Style::ListItem { ordered: next(2) == 0, depth: next(5) as u8 },
+                        8 => Style::Heading { level: (next(3) as u8) + 1 },
+                        9 => Style::Small,
+                        _ => Style::CodeBlock { language: String::new() },
+                    };
+                    Span { start: next(limit), end: next(limit), style }
+                })
+                .collect();
                 let found = blocks(&text, &spans);
                 for block in &found {
-                    if let Block::Text(inline) | Block::Quote(inline) | Block::Item { text: inline, .. } = block {
+                    if let Block::Text(inline)
+                    | Block::Heading { text: inline, .. }
+                    | Block::Small(inline)
+                    | Block::Quote(inline)
+                    | Block::Item { text: inline, .. } = block
+                    {
                         assert_eq!(inline.runs.iter().map(|run| run.len).sum::<usize>(), inline.text.len());
                         for _ in 0..4 {
                             let (a, b) = (next(inline.text.len() as u32 + 3) as usize, next(inline.text.len() as u32 + 3) as usize);
@@ -638,5 +714,88 @@ mod tests {
             Some(vec![Jumbo::Custom { file, name: ":parrot:".into() }, Jumbo::Unicode("🎉".into())])
         );
         assert_eq!(jumbo("🎉", &[span("🎉", "🎉", Style::Bold)]), None);
+        assert_eq!(jumbo("🎉", &[span("🎉", "🎉", Style::Heading { level: 1 })]), None);
+        assert_eq!(jumbo("🎉", &[span("🎉", "🎉", Style::Small)]), None);
+    }
+
+    #[test]
+    fn headings_and_subtext_keep_inline_styles_and_copy_cleanly() {
+        let text = "Title ok\nSub note\nFootnote link";
+        let spans = [
+            span(text, "Title ok", Style::Heading { level: 1 }),
+            span(text, "ok", Style::Italic),
+            span(text, "Sub note", Style::Heading { level: 3 }),
+            span(text, "Footnote link", Style::Small),
+            span(text, "link", Style::Link { url: "https://example.org".into() }),
+        ];
+        let found = blocks(text, &spans);
+        assert_eq!(found.len(), 3);
+        match &found[0] {
+            Block::Heading { level, text } => {
+                assert_eq!(*level, 1);
+                assert_eq!(runs(text), [("Title ", String::new()), ("ok", "i".into())]);
+            }
+            other => panic!("expected heading 1, got {other:?}"),
+        }
+        match &found[1] {
+            Block::Heading { level, text } => {
+                assert_eq!(*level, 3);
+                assert_eq!(text.text, "Sub note");
+            }
+            other => panic!("expected heading 3, got {other:?}"),
+        }
+        match &found[2] {
+            Block::Small(inline) => {
+                assert_eq!(inline.text, "Footnote link");
+                assert_eq!(inline.runs.last().and_then(|r| r.link.as_deref()), Some("https://example.org"));
+            }
+            other => panic!("expected small block, got {other:?}"),
+        }
+        assert_eq!(plain(&found, (0, 0), (2, usize::MAX)), "Title ok\nSub note\nFootnote https://example.org");
+    }
+
+    #[test]
+    fn relative_time_span_renders_differently_at_two_clock_values() {
+        let text = "Starts 20 April 2021 18:40 sharp";
+        let target_unix = 1_700_007_200;
+        let spans = [span(text, "20 April 2021 18:40", Style::Time { unix: target_unix, form: 'R' })];
+        let earlier = match blocks_at(text, &spans, target_unix - 7_200).as_slice() {
+            [Block::Text(inline)] => inline.clone(),
+            other => panic!("expected one block: {other:?}"),
+        };
+        let later = match blocks_at(text, &spans, target_unix + 180).as_slice() {
+            [Block::Text(inline)] => inline.clone(),
+            other => panic!("expected one block: {other:?}"),
+        };
+        assert_eq!(earlier.plain(0..earlier.text.len()), "Starts in 2 hours sharp");
+        assert_eq!(later.plain(0..later.text.len()), "Starts 3 minutes ago sharp");
+        assert_ne!(earlier.text, later.text);
+        assert!(earlier.runs.iter().any(|r| r.time == Some((target_unix, 'R'))));
+    }
+
+    #[test]
+    fn clickable_telegram_spans_build_action_runs_and_copy_as_plain_text() {
+        let text = "check #rust /start @wren +15550100777";
+        let spans = [
+            span(text, "#rust", Style::Hashtag),
+            span(text, "/start", Style::Command),
+            span(text, "@wren", Style::Username { username: "wren".into() }),
+            span(text, "+15550100777", Style::Copyable),
+        ];
+        let inline = only(text, &spans);
+        let actions: Vec<(&str, &RunAction)> = inline
+            .ranges()
+            .filter_map(|(range, run)| run.action.as_ref().map(|act| (&inline.text[range], act)))
+            .collect();
+        assert_eq!(
+            actions,
+            vec![
+                ("#rust", &RunAction::Hashtag),
+                ("/start", &RunAction::Command),
+                ("@wren", &RunAction::Username("wren".into())),
+                ("+15550100777", &RunAction::Copyable),
+            ]
+        );
+        assert_eq!(inline.plain(0..inline.text.len()), text);
     }
 }

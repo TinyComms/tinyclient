@@ -15,6 +15,7 @@ pub mod browser;
 mod call;
 pub mod crash;
 pub mod device_approval;
+pub mod discord_perms;
 mod e2ee;
 pub mod highlight;
 pub mod hotkey;
@@ -40,10 +41,14 @@ pub mod web_sign_in;
 
 pub use call::*;
 pub use crash::redact;
+pub use discord_perms::*;
 pub use e2ee::*;
 pub use info::*;
 pub use ipc::{ChatListener, ChatStream};
 pub use message::*;
+
+/// Maximum bytes fetched automatically for an inline text/code attachment preview (100 KB).
+pub const TEXT_PREVIEW_MAX_BYTES: u32 = 100 * 1024;
 pub use play::*;
 pub use react::*;
 pub use record::*;
@@ -72,6 +77,25 @@ pub(crate) fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// A present JSON value for `Option<Option<T>>`. An absent field stays the `Default` (`None`:
+/// leave it). `null` is `Some(None)` (clear). A value is `Some(Some(value))`. Serde's own
+/// `Option` turns a present `null` into the outer `None`, which cannot be told from absent.
+fn present_or_null<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Some(Option::<T>::deserialize(deserializer)?))
+}
+
+fn default_mentions_true() -> bool {
+    true
+}
+
+fn default_mentions_limit() -> u32 {
+    25
+}
+
 pub(crate) fn is_true(value: &bool) -> bool {
     *value
 }
@@ -90,6 +114,10 @@ pub(crate) fn is_zero64(value: &u64) -> bool {
 
 pub(crate) fn is_zero_i64(value: &i64) -> bool {
     *value == 0
+}
+
+pub(crate) fn is_activity(sort: &TopicSort) -> bool {
+    matches!(sort, TopicSort::Activity)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -220,6 +248,12 @@ pub struct AccountStatus {
     pub presence: Presence,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub status: String,
+    /// Our own status emoji as the network shows it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status_emoji: String,
+    /// Unix seconds when our own status automatically clears (`None` = never).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_until: Option<i64>,
     /// What this account may send: file limits, pickers and options. All off until the adapter
     /// reports them.
     #[serde(default, skip_serializing_if = "Capabilities::is_none")]
@@ -236,6 +270,64 @@ pub enum Media {
     /// mediad is not running. Calls and screen share are impossible in this state.
     Stopped,
     Running,
+}
+
+/// Server management permissions the signed-in user holds in a Space.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceRights {
+    /// Manage Server (`MANAGE_GUILD` on Discord): overview settings and invites.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_space: bool,
+    /// Manage Roles (`MANAGE_ROLES` on Discord): roles and permission overwrites.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_roles: bool,
+    /// Manage Events (`MANAGE_EVENTS` on Discord).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_events: bool,
+    /// Server owner (transfer ownership / delete server).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub owner: bool,
+    /// May create, edit, reorder, or delete channels and categories (Discord `MANAGE_CHANNELS`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_channels: bool,
+    /// May read the server's audit log (Discord `VIEW_AUDIT_LOG`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub view_audit_log: bool,
+    /// May edit server safety setup and AutoMod rules (Discord `MANAGE_GUILD`, and not timed out).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manage_server: bool,
+}
+
+impl SpaceRights {
+    pub fn is_empty(&self) -> bool {
+        *self == SpaceRights::default()
+    }
+
+    pub fn any_settings(&self) -> bool {
+        self.manage_space || self.manage_roles || self.manage_events || self.owner
+    }
+
+    pub fn to_bits(self) -> u32 {
+        u32::from(self.manage_space)
+            | (u32::from(self.manage_roles) << 1)
+            | (u32::from(self.manage_events) << 2)
+            | (u32::from(self.owner) << 3)
+            | (u32::from(self.manage_channels) << 4)
+            | (u32::from(self.view_audit_log) << 5)
+            | (u32::from(self.manage_server) << 6)
+    }
+
+    pub fn from_bits(bits: u32) -> Self {
+        Self {
+            manage_space: bits & 1 != 0,
+            manage_roles: bits & 2 != 0,
+            manage_events: bits & 4 != 0,
+            owner: bits & 8 != 0,
+            manage_channels: bits & 16 != 0,
+            view_audit_log: bits & 32 != 0,
+            manage_server: bits & 64 != 0,
+        }
+    }
 }
 
 /// A server, workspace or team. Every account also has its direct conversations, which belong to
@@ -263,6 +355,24 @@ pub struct Space {
     /// The user has permission to create channels in this Space (`Request::CreateChannel`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub can_create_channels: bool,
+    /// The user has permission to create invite links in at least one channel of this Space (`Request::CreateInvite`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_create_invites: bool,
+    /// Opt-in channel filter is active ("Show all channels" is off, Discord `OPT_IN_CHANNELS_ON`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub opt_in_channels: bool,
+    /// Server-level management permissions for this account inside this Space.
+    #[serde(default, skip_serializing_if = "SpaceRights::is_empty")]
+    pub rights: SpaceRights,
+    /// The user has permission to manage webhooks in this Space (`MANAGE_WEBHOOKS`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_manage_webhooks: bool,
+    /// The user has permission to manage server integrations in this Space (`MANAGE_GUILD`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_manage_guild: bool,
+    /// The user has permission to manage or create emoji/stickers in this Space (`MANAGE_GUILD_EXPRESSIONS` / `CREATE_GUILD_EXPRESSIONS`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub can_manage_expressions: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -625,6 +735,41 @@ pub struct Conversation {
     /// Whether this account has joined the conversation (`false` when previewing an unjoined public channel).
     #[serde(default = "yes", skip_serializing_if = "is_true")]
     pub joined: bool,
+    /// Slowmode interval in seconds. `0` when off. Exemption is [`ConversationRights::slowmode_exempt`], not a zeroed interval.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub slowmode_seconds: u32,
+    /// Unix seconds until this account may send again in a slowmode conversation. Never stored:
+    /// kept live by chatd and rides on the row when read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slowmode_until: Option<i64>,
+    /// Thread is locked by a moderator (Discord `thread_metadata.locked`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub locked: bool,
+    /// Marked age-restricted / NSFW by the network (Discord `channel.nsfw`, inherited by threads).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub age_restricted: bool,
+    /// Tag ids applied to a forum post.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Messages in a forum post that the network still counts.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub message_count: u32,
+    /// Messages ever sent in a forum post, including ones since deleted.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub total_message_sent: u32,
+    /// The first message's picture, for a post card and a media gallery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<MediaFile>,
+    /// The emoji of the post's strongest reaction.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reaction: String,
+    /// Who started the forum post.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub owner: String,
+    /// Why voice and round video messages are not allowed in this conversation (e.g. the recipient's
+    /// Telegram setting or group banned rights). Empty when allowed.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub voice_notes_forbidden: String,
 }
 
 /// What became of my newest message, as its mark says it (`design/06-live-signals.md` §4).
@@ -696,12 +841,28 @@ impl Conversation {
             moderate: false,
             can_pin: false,
             joined: true,
+            slowmode_seconds: 0,
+            slowmode_until: None,
+            locked: false,
+            age_restricted: false,
+            tags: Vec::new(),
+            message_count: 0,
+            total_message_sent: 0,
+            thumbnail: None,
+            reaction: String::new(),
+            owner: String::new(),
+            voice_notes_forbidden: String::new(),
         }
     }
 
     /// Whether this account may post messages in this conversation.
     pub fn can_post(&self) -> bool {
         !self.read_only
+    }
+
+    /// Whether voice and round video messages may be sent in this conversation.
+    pub fn allows_voice_notes(&self) -> bool {
+        self.voice_notes_forbidden.is_empty()
     }
 
     /// The mark on my newest message. `None` when the newest is not mine.
@@ -817,10 +978,17 @@ pub struct Person {
     /// Their status's emoji, apart from its words (`status`). Live, like presence.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub emoji: String,
+    /// Custom status emoji image (e.g. a Discord guild emoji with an id), fetched via media.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emoji_file: Option<MediaFile>,
     /// What they are doing now: playing, listening, in voice, in a meeting. Live. Boxed: few
     /// people in a list are doing anything.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<Box<Activity>>,
+    /// A server nickname, shown on that server's member list. People keeps `name`, the global
+    /// display name. Empty when this row has no server nickname.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub nickname: String,
     /// Their job title (Slack, Teams). Stored.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub title: String,
@@ -854,10 +1022,12 @@ impl Person {
             status: String::new(),
             link: String::new(),
             emoji: String::new(),
+            emoji_file: None,
             activity: None,
             title: String::new(),
             utc_offset: None,
             mark: None,
+            nickname: String::new(),
             role_color: None,
             role_icon: None,
             role_emoji: None,
@@ -875,6 +1045,12 @@ pub struct Profile {
     /// The titles of the Spaces we share, at most [`MUTUAL_SPACES`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mutual_spaces: Vec<String>,
+    /// Shared Spaces with their keys and the person's server nickname there, at most [`MUTUAL_SPACES`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mutual_space_items: Vec<MutualSpace>,
+    /// Mutual friends known to the network (capped at 25).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mutual_people: Vec<Person>,
     /// Their time zone as the network names it (`Europe/Lisbon`), and its offset from UTC in
     /// seconds now, so the shell can show their local time without a zone database.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -919,6 +1095,9 @@ pub struct Profile {
     /// Their roles in that Space, names only (colours are left out), at most [`PROFILE_ROLES`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<String>,
+    /// Role ids in that Space, so a card can give or take them. Not capped at [`PROFILE_ROLES`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub role_ids: Vec<String>,
     /// Email and phone, each copied on click; phone numbers masked until clicked. At most
     /// [`PROFILE_CONTACTS`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -946,6 +1125,18 @@ pub struct Profile {
     pub note: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<Warning>,
+    /// Badges shown on their profile (Nitro, HypeSquad, Booster, etc.), at most [`PROFILE_BADGES`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub badges: Vec<ProfileBadge>,
+    /// External accounts linked on their profile, at most [`PROFILE_CONNECTIONS`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connections: Vec<ProfileConnection>,
+    /// Short guild/clan tag beside their name (e.g. Discord's primary guild tag).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub server_tag: String,
+    /// True when the profile shows per-Space overrides (e.g. Discord server avatar, banner, bio, pronouns).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub server_profile: bool,
 }
 
 impl Profile {
@@ -955,6 +1146,8 @@ impl Profile {
             person,
             bio: String::new(),
             mutual_spaces: Vec::new(),
+            mutual_space_items: Vec::new(),
+            mutual_people: Vec::new(),
             time_zone: String::new(),
             utc_offset: None,
             fields: Vec::new(),
@@ -970,6 +1163,7 @@ impl Profile {
             manager: None,
             reports: Vec::new(),
             roles: Vec::new(),
+            role_ids: Vec::new(),
             contacts: Vec::new(),
             mutual_total: 0,
             joined: None,
@@ -980,6 +1174,10 @@ impl Profile {
             away_until: None,
             note: String::new(),
             warning: None,
+            badges: Vec::new(),
+            connections: Vec::new(),
+            server_tag: String::new(),
+            server_profile: false,
         }
     }
 }
@@ -993,6 +1191,12 @@ pub enum SharedKind {
     /// Every other attachment: documents, archives, audio.
     Files,
     Links,
+    /// Audio/music files (Telegram `inputMessagesFilterMusic`).
+    Music,
+    /// Voice and round video notes (Telegram `inputMessagesFilterRoundVoice`).
+    Voice,
+    /// GIF animations (Telegram `inputMessagesFilterGif`).
+    Gifs,
 }
 
 /// One thing shared in a conversation, and the message it was shared in.
@@ -1123,6 +1327,10 @@ pub enum Compose {
     UploadingFile,
     ChoosingSticker,
     PlayingGame,
+    /// Speaking in a group call or video chat (`speakingInGroupCallAction`).
+    Speaking,
+    /// Stopped typing, recording, or uploading (`sendMessageCancelAction`).
+    Cancel,
 }
 
 impl Compose {
@@ -1272,6 +1480,9 @@ pub struct MessageHit {
     /// Mine, so the row can say "You".
     #[serde(default, skip_serializing_if = "is_false")]
     pub outgoing: bool,
+    /// The conversation is age-restricted. A search hit keeps this even when the row is not on screen.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub age_restricted: bool,
 }
 
 /// A reminder the user set on one message ("Remind me…"). Local to this device: no network
@@ -1327,6 +1538,17 @@ impl DeleteScope {
 
 fn default_starred_limit() -> u32 {
     50
+}
+
+/// One message as a network translated it. The stored message is left as it was.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranslatedMessage {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spans: Vec<Span>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1429,10 +1651,29 @@ pub enum Request {
     ScheduledMessages {
         conversation: Key,
     },
-    /// Cancels a pending scheduled message (Slack `chat.deleteScheduledMessage`).
+    /// Cancels a pending scheduled message (Slack `chat.deleteScheduledMessage` / Telegram `messages.deleteScheduledMessages`).
     CancelScheduled {
         conversation: Key,
         scheduled_id: String,
+    },
+    /// Sends a pending scheduled message immediately (Telegram `messages.sendScheduledMessages`).
+    SendScheduledNow {
+        conversation: Key,
+        scheduled_id: String,
+    },
+    /// Jumps to the message closest to `date` (Unix seconds) in a conversation (Telegram `messages.getHistory` with `offset_date`).
+    /// Answers with [`Response::Resolved`].
+    JumpToDate {
+        conversation: Key,
+        date: i64,
+    },
+    /// Lists calendar days containing messages (or matching `kind`) in a conversation (Telegram `messages.getSearchResultsCalendar`).
+    SearchCalendar {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<SharedKind>,
+        #[serde(default)]
+        offset_date: i64,
     },
     /// Edits and/or reschedules a pending scheduled message (Slack delete + `chat.scheduleMessage`).
     RescheduleMessage {
@@ -1465,8 +1706,10 @@ pub enum Request {
         limit: u32,
     },
     /// Ask the network itself for messages, as the pane's Enter does: a server's own search
-    /// when a Space is the scope, the channel's when one conversation is, one account/network, or
-    /// everywhere across every connected account that supports global search.
+    /// when a Space is the scope, the channel's when one conversation is, one account's direct
+    /// messages when `home` is set, one account/network, or everywhere across every connected
+    /// account that supports global search. `home` is one Discord account's direct messages,
+    /// not a search of every server.
     SearchNetwork {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conversation: Option<Key>,
@@ -1481,6 +1724,9 @@ pub enum Request {
         filters: SearchFilters,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor: Option<String>,
+        /// All direct messages on `account`. Discord only; ignored for an everywhere search.
+        #[serde(default, skip_serializing_if = "is_false")]
+        home: bool,
     },
     /// Keeps what the user typed and did not send. Empty text forgets it. Local: no network
     /// hears of it and no change is announced.
@@ -1519,22 +1765,122 @@ pub enum Request {
         limit: u32,
     },
     /// Follow (`on: true`) or unfollow (`on: false`) a thread for reply notifications
-    /// (Slack `subscriptions.thread.add` / `subscriptions.thread.remove`).
+    /// (Slack `subscriptions.thread.add` / `subscriptions.thread.remove`, Discord thread-members/@me).
     FollowThread {
         conversation: Key,
         on: bool,
+    },
+    /// Active or archived threads of one channel (Discord). Opening any returned thread works
+    /// without joining it first.
+    ChannelThreads {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "is_false")]
+        archived: bool,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        query: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+    },
+    /// Rename, archive/reopen, lock/unlock, or update auto-archive/slowmode on a thread (Discord).
+    /// Only fields that are `Some` are sent to the network.
+    ThreadUpdate {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        archived: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        locked: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auto_archive_minutes: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        slowmode_seconds: Option<u32>,
+    },
+    /// Delete a thread channel (Discord `DELETE /channels/{thread}`).
+    DeleteThread {
+        conversation: Key,
+    },
+    /// Follow (`on: true`) or unfollow (`on: false`) a channel or category in a Space's
+    /// channel list (Discord Browse Channels opt-in flag bit 12).
+    FollowChannel {
+        conversation: Key,
+        on: bool,
+    },
+    /// Toggle a Space's channel-list view filters (Discord "Show all channels" and
+    /// "Hide muted channels"). Unset fields are left unchanged.
+    SetSpaceView {
+        space: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        show_all: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hide_muted: Option<bool>,
     },
     /// The topics of a forum (a Telegram forum group, a Discord forum), the network's pins
     /// first, then newest first. From the cache; opening a topic is opening a conversation.
     /// With `landing`, not a page but the one topic opening the forum lands on: the newest
     /// unread, else General. Asking for the landing is also what makes chatd read the
     /// topics from the network first, so the answer names the landing on Telegram's word now.
+    /// Discord pages archived posts with `offset` (25 a page), and `sort`, `tag`, and `query`
+    /// stay inside that forum.
     Topics {
         forum: Key,
         offset: u32,
         limit: u32,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         landing: bool,
+        #[serde(default, skip_serializing_if = "is_activity")]
+        sort: TopicSort,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
+    },
+    /// Reads a forum or media channel's posting rules: guidelines, available tags, whether a
+    /// tag or attachment is required, and default post slowmode.
+    ForumInfo {
+        forum: Key,
+    },
+    /// Creates a new post in a forum or media channel.
+    ForumPost {
+        forum: Key,
+        title: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
+        #[serde(default, skip_serializing_if = "Outgoing::is_plain")]
+        with: Outgoing,
+    },
+    /// Creates a new topic in a forum (Telegram `messages.createForumTopic`). Answers with
+    /// [`Response::Conversation`] for the newly created topic row.
+    TopicCreate {
+        forum: Key,
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon_color: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon_emoji_id: Option<String>,
+    },
+    /// Edits a forum topic: rename, icon, close/reopen, hide/unhide General, or pin/unpin.
+    TopicUpdate {
+        topic: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon_emoji_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        closed: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hidden: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pinned: Option<bool>,
+    },
+    /// Deletes a forum topic and its history (Telegram `messages.deleteTopicHistory`).
+    TopicDelete {
+        topic: Key,
+    },
+    /// Lists the default forum topic icons offered by the network (`inputStickerSetEmojiDefaultTopicIcons`).
+    TopicIcons {
+        account: AccountKey,
     },
     /// Voice channels and calls with a friend in them now, across Spaces: the Discord home's
     /// "In voice". From what chatd holds live; at most 50.
@@ -1591,6 +1937,45 @@ pub enum Request {
         conversation: Key,
         path: String,
     },
+    /// Moderates one member of a group or channel: kick, ban, unban, or restrict send rights.
+    ModerateMember {
+        conversation: Key,
+        person: String,
+        action: MemberModeration,
+    },
+    /// Promotes or demotes an admin with specific rights and an optional custom title.
+    SetAdmin {
+        conversation: Key,
+        person: String,
+        rights: AdminRights,
+    },
+    /// Transfers group/channel ownership to another user (requires 2FA password proof).
+    TransferOwnership {
+        conversation: Key,
+        person: String,
+        password: String,
+    },
+    /// Updates group/channel settings: default member permissions, slow mode, join approval,
+    /// forum topics, pre-history visibility, post signatures, or protected content.
+    UpdateChatSettings {
+        conversation: Key,
+        settings: ChatSettings,
+    },
+    /// Reads the recent-actions admin log for a supergroup or channel.
+    AdminLog {
+        conversation: Key,
+        #[serde(default)]
+        limit: u32,
+    },
+    /// Lists the peers this account may post as in a group or channel (`channels.getSendAs`).
+    SendAsOptions {
+        conversation: Key,
+    },
+    /// Sets the default peer to post as in a group or channel (`messages.saveDefaultSendAs`).
+    SetDefaultSendAs {
+        conversation: Key,
+        peer: String,
+    },
     /// The direct conversation with a person, created if there is none. Nothing reaches the other
     /// person until a message is sent.
     StartDirect {
@@ -1619,6 +2004,103 @@ pub enum Request {
         private: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         group: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        username: Option<String>,
+    },
+    /// Create a category inside a Space where the user has Manage Channels. Answers `Response::Group`.
+    CreateCategory {
+        space: Key,
+        name: String,
+    },
+    /// Edit a channel's or category's properties (name, topic, slow mode, age restriction,
+    /// voice user limit, or parent category). Unset fields are left unchanged.
+    EditChannel {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        topic: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rate_limit_per_user: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        nsfw: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_id: Option<Option<String>>,
+    },
+    /// Bulk-reorder channels and categories (and optionally move channels between categories)
+    /// in a Space in one request (`PATCH /guilds/{id}/channels`).
+    MoveChannels {
+        space: Key,
+        order: Vec<ChannelPosition>,
+    },
+    /// Permanently delete a channel or category in a Space (`DELETE /channels/{id}`).
+    DeleteChannel {
+        conversation: Key,
+    },
+    /// Read a channel's or category's permission overwrites and role list (`#397`).
+    /// Answers `Response::ChannelPermissions`.
+    ChannelPermissions {
+        conversation: Key,
+    },
+    /// Create or update one role/member permission overwrite on a channel or category
+    /// (`PUT /channels/{id}/permissions/{target}`).
+    SetOverwrite {
+        conversation: Key,
+        target_id: String,
+        target_kind: OverwriteTargetKind,
+        allow: u64,
+        deny: u64,
+    },
+    /// Delete one role/member permission overwrite from a channel or category
+    /// (`DELETE /channels/{id}/permissions/{target}`).
+    DeleteOverwrite {
+        conversation: Key,
+        target_id: String,
+    },
+    /// Copy the parent category's permission overwrites onto a channel (`PATCH /channels/{id}`).
+    SyncChannelPermissions {
+        conversation: Key,
+    },
+    /// Read a server's audit log (`GET /guilds/{id}/audit-logs`, `#394`).
+    /// Answers `Response::AuditLog`.
+    AuditLog {
+        space: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        person: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
+        #[serde(default)]
+        limit: u32,
+    },
+    /// A server's AutoMod rules and safety setup (`#395`). Answers `Response::AutomodRules`.
+    AutomodRules {
+        space: Key,
+    },
+    /// Create or replace one AutoMod rule. An empty `rule.id` creates it.
+    /// Answers `Response::AutomodRule`.
+    SaveAutomodRule {
+        space: Key,
+        #[serde(default)]
+        rule: AutomodRule,
+    },
+    /// Delete one AutoMod rule. Answers `Response::Ok`.
+    DeleteAutomodRule {
+        space: Key,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        id: String,
+    },
+    /// Save verification, the explicit-content filter, and raid pauses (`#395`).
+    /// Answers `Response::Ok`.
+    SaveSpaceSafety {
+        space: Key,
+        #[serde(default)]
+        safety: SpaceSafety,
     },
     /// Starts a new group conversation with two or more members (by person id or phone number)
     /// and an optional group name. Answers `Response::Conversation`.
@@ -1628,12 +2110,22 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
     },
-    /// The thread a channel message starts. Discord only: its thread is a new channel, so this
-    /// creates it and answers with that conversation. Slack and Teams name a thread from the
-    /// message, and opening or sending there is enough.
+    /// Start a Discord thread — attached to `message` when `Some`, or standalone from the channel
+    /// when `None` (public, announcement, or private). Answers with the created thread conversation.
     StartThread {
         conversation: Key,
-        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        name: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        private: bool,
+        /// Auto-archive duration in minutes: 60 (1 h), 1440 (24 h), 4320 (3 d), or 10080 (1 w).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auto_archive_minutes: Option<u32>,
+        /// Optional first message posted into a newly created standalone thread.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        first_message: String,
     },
     /// One person's card, asked of the network when the card opens and kept five minutes.
     /// `space` is where it was opened from, for the nickname, roles and join date there.
@@ -1665,6 +2157,26 @@ pub enum Request {
     SpaceInfo {
         space: Key,
     },
+    /// Updates a Space's notification level, switches, or resets a per-channel override
+    /// (Discord `PATCH /users/@me/guilds/{id}/settings`). Omitted fields are left unchanged.
+    SetSpaceOptions {
+        space: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notify: Option<Notify>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        suppress_everyone: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        suppress_roles: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        highlights: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        events: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mobile_push: Option<bool>,
+        /// Channel id whose per-channel override should be reset to the Space's default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reset_channel: Option<String>,
+    },
     /// The network's notification setting for a conversation. The row changes when the network
     /// says so. `until` is when a mute ends, as Unix seconds. Absent means muted until it is
     /// turned off, or not muted when `notify` asks for everything.
@@ -1674,15 +2186,62 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         until: Option<i64>,
     },
+    /// The network's notification setting for a whole Space (or one category inside it, when
+    /// `category` is set). `until` is when a mute ends, as Unix seconds; absent means until
+    /// turned off or not muted.
+    SetSpaceNotify {
+        space: Key,
+        notify: Notify,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        category: Option<String>,
+    },
     /// Sets or clears a conversation's disappearing-messages timer (`seconds == 0` turns it off).
     /// Separate from local cache retention (`keep_days`).
     SetDisappearing {
         conversation: Key,
         seconds: u32,
     },
+    /// Reads the account's default disappearing-messages timer for new chats (Telegram `messages.getDefaultHistoryTTL`).
+    GetDefaultDisappearing {
+        account: AccountKey,
+    },
+    /// Sets the account's default disappearing-messages timer for new chats (`seconds == 0` turns it off).
+    SetDefaultDisappearing {
+        account: AccountKey,
+        seconds: u32,
+    },
+    /// Creates or edits a chat folder on the network (Telegram `messages.updateDialogFilter`).
+    FolderSave {
+        account: AccountKey,
+        folder: FolderSpec,
+    },
+    /// Deletes a chat folder on the network (Telegram `messages.updateDialogFilter` with no filter).
+    FolderDelete {
+        account: AccountKey,
+        folder_id: String,
+    },
+    /// Reorders an account's chat folders (Telegram `messages.updateDialogFiltersOrder`).
+    FoldersReorder {
+        account: AccountKey,
+        order: Vec<String>,
+    },
+    /// Lists network-suggested chat folders (Telegram `messages.getSuggestedDialogFilters`).
+    SuggestedFolders {
+        account: AccountKey,
+    },
     /// Leaves a group conversation on the network. The shell asks once to confirm first.
+    /// When `silent` is true on Discord group DMs, leaves without posting a leave system message.
     Leave {
         conversation: Key,
+        #[serde(default, skip_serializing_if = "is_false")]
+        silent: bool,
+    },
+    /// Transfers ownership of a group conversation (e.g., Discord group DM) to another member.
+    TransferOwner {
+        conversation: Key,
+        person: String,
     },
     /// Closes a direct conversation, as the network's own ×: it leaves the list until a new
     /// message brings it back. Nothing is deleted.
@@ -1775,6 +2334,39 @@ pub enum Request {
     SpaceTags {
         space: Key,
     },
+    /// Read an account's Privacy & Safety settings (Discord `PreloadedUserSettings.privacy`).
+    GetNetworkPrivacy {
+        account: AccountKey,
+    },
+    /// Write an account's Privacy & Safety settings (Discord `PATCH /users/@me/settings-proto/1`
+    /// with all unknown fields preserved).
+    SetNetworkPrivacy {
+        account: AccountKey,
+        privacy: NetworkPrivacy,
+    },
+    /// Update a Space's per-server privacy switches (Discord: allow DMs and message requests).
+    SetSpacePrivacy {
+        space: Key,
+        privacy: SpacePrivacy,
+    },
+    /// Telegram's auto-download presets and this device's chat-kind gates.
+    GetAutoDownload { account: AccountKey },
+    /// Writes the presets (`account.saveAutoDownloadSettings`) and the local chat-kind gates.
+    SetAutoDownload { account: AccountKey, settings: AutoDownload },
+    /// A channel's boost level (`premium.getBoostsStatus`).
+    GetBoosts { conversation: Key },
+    /// Gives this Premium account's free boost to the channel (`premium.applyBoost`).
+    ApplyBoost { conversation: Key },
+    /// A bot's description, commands, and menu button (`users.getFullUser`).
+    GetBotMenu { conversation: Key },
+    /// `messages.startBot`. An empty `start_param` is the Start button.
+    StartBot {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        start_param: String,
+    },
+    /// Shares this account's phone number with a bot, after the shell has confirmed.
+    SharePhone { conversation: Key },
     /// Answer, withdraw or end a friendship, or block. The list changes when the network says so
     /// (a `People` change).
     Relate {
@@ -1830,9 +2422,17 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         clear_at: Option<i64>,
     },
-    /// Our own profile on one account. `None` leaves that part. An empty about or emoji clears
-    /// it. A username, or `photo`, is refused: those are still changed on the phone. Signal is
-    /// the account that accepts a name, about, and about emoji.
+    /// What this session says it is playing. Empty clears it. The name is the local user's;
+    /// another member cannot set it.
+    SetActivity {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        name: String,
+    },
+    /// Our own profile on one account. `None` leaves that part. An empty about, emoji,
+    /// username, or birthday clears it where supported. Signal accepts name, about, and about
+    /// emoji (refusing username/photo); Telegram accepts name, about, username, emoji status,
+    /// and birthday (and uses `SetAvatar` for profile photos).
     SetProfile {
         account: AccountKey,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1845,8 +2445,19 @@ pub enum Request {
         emoji: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         username: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        birthday: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         photo: bool,
+        /// Optional 0xRRGGBB profile accent colour (Discord).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accent: Option<u32>,
+        /// Optional local image path for a profile banner; empty clears it (Nitro-only on Discord).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        banner: Option<String>,
+        /// Optional Space for per-server profile overrides (Nitro-only on Discord).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<Key>,
     },
     /// Sets our own profile picture on a network from a local file path (empty clears it).
     /// Maps Tiny's `TinyAvatar` onto the shared request.
@@ -1859,6 +2470,11 @@ pub enum Request {
         space: Key,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         nickname: Option<String>,
+    },
+    /// Sets or clears the user's private note on a person (Discord `/users/@me/notes/{id}`).
+    SetNote {
+        person: Key,
+        text: String,
     },
     /// Sets (or clears, when `None` or empty) a private nickname for a friend (Discord).
     SetFriendNickname {
@@ -1874,11 +2490,296 @@ pub enum Request {
     InvitePreview {
         account: AccountKey,
         code: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_id: Option<String>,
     },
-    /// Join a Space from an invite link or code (e.g. Discord `POST /invites/{code}`).
+    /// Join a Space or chat from an invite link or code (Discord `POST /invites/{code}`, Telegram `messages.importChatInvite`).
     InviteJoin {
         account: AccountKey,
         code: String,
+    },
+    /// Create an invite link for a channel (`conversation`), a Space (`space`, picking the first
+    /// channel that allows invites), or a friend-invite link (`account` alone).
+    /// Answers `Response::Link { url }`.
+    CreateInviteLink {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation: Option<Key>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<Key>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<AccountKey>,
+        /// Expiry in seconds (`0` = never; Discord default `604_800` = 7 days).
+        #[serde(default)]
+        max_age: u32,
+        /// Maximum uses (`0` = unlimited).
+        #[serde(default)]
+        max_uses: u32,
+        /// Grant temporary membership.
+        #[serde(default, skip_serializing_if = "is_false")]
+        temporary: bool,
+    },
+    /// Create a new Space on this account (e.g. Discord `POST /guilds`).
+    CreateSpace {
+        account: AccountKey,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        icon: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        template: Option<String>,
+    },
+    /// Lists scheduled and active events for a Space (e.g. Discord `GET /guilds/{id}/scheduled-events`).
+    Events {
+        space: Key,
+    },
+    /// Marks (`on: true`) or unmarks (`on: false`) the signed-in user as interested in an event.
+    EventInterest {
+        space: Key,
+        event: Key,
+        on: bool,
+    },
+    /// Edit a Space's overview settings (e.g. Discord `PATCH /guilds/{id}`).
+    EditSpace {
+        space: Key,
+        edit: SpaceEdit,
+    },
+    /// Permanently delete a Space you own (e.g. Discord `POST /guilds/{id}/delete`).
+    DeleteSpace {
+        space: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mfa_code: Option<String>,
+    },
+    /// Transfer ownership of a Space you own to another member (e.g. Discord `PATCH /guilds/{id}`).
+    TransferSpace {
+        space: Key,
+        new_owner: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mfa_code: Option<String>,
+    },
+    /// Create a scheduled event in a Space (e.g. Discord `POST /guilds/{id}/scheduled-events`).
+    CreateEvent {
+        space: Key,
+        event: SpaceEventEdit,
+    },
+    /// Edit an existing scheduled event in a Space (e.g. Discord `PATCH /guilds/{id}/scheduled-events/{event_id}`).
+    EditEvent {
+        space: Key,
+        event_id: String,
+        event: SpaceEventEdit,
+    },
+    /// Cancel / delete a scheduled event in a Space (e.g. Discord `DELETE /guilds/{id}/scheduled-events/{event_id}`).
+    DeleteEvent {
+        space: Key,
+        event_id: String,
+    },
+    /// List active invite links for a Space (e.g. Discord `GET /guilds/{id}/invites`).
+    SpaceInvites {
+        space: Key,
+    },
+    /// Revoke one invite link (e.g. Discord `DELETE /invites/{code}`).
+    RevokeSpaceInvite {
+        space: Key,
+        code: String,
+    },
+    /// Pause or resume invites on a Space (e.g. Discord `INVITES_DISABLED` feature).
+    SetInvitesPaused {
+        space: Key,
+        paused: bool,
+    },
+    /// List a Space's roles (Discord roles already known from the gateway).
+    Roles {
+        space: Key,
+    },
+    /// Create a role (Discord `POST /guilds/{id}/roles`).
+    CreateRole {
+        space: Key,
+        #[serde(default)]
+        edit: RoleEdit,
+    },
+    /// Edit a role (Discord `PATCH /guilds/{id}/roles/{role}`).
+    EditRole {
+        space: Key,
+        role_id: String,
+        #[serde(default)]
+        edit: RoleEdit,
+    },
+    /// Reorder roles (Discord `PATCH /guilds/{id}/roles`).
+    MoveRoles {
+        space: Key,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        roles: Vec<RoleMove>,
+    },
+    /// Delete a role (Discord `DELETE /guilds/{id}/roles/{role}`).
+    DeleteRole {
+        space: Key,
+        role_id: String,
+    },
+    /// Give or take a member's roles (Discord `PUT` / `DELETE /guilds/{id}/members/{user}/roles/{role}`).
+    SetMemberRoles {
+        space: Key,
+        person: Key,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        roles: Vec<String>,
+    },
+    /// Preview a scheduled event link (`GET /guilds/{id}/scheduled-events/{event}`).
+    EventPreview {
+        space: Key,
+        event_id: String,
+    },
+    /// Toggle "Interested" on a scheduled event (`PUT` / `DELETE /guilds/{id}/scheduled-events/{event}/users/@me`).
+    EventLinkInterest {
+        space: Key,
+        event_id: String,
+        interested: bool,
+    },
+    /// Browse or search Discord's public servers. `query` empty is the listing.
+    Discover {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        query: String,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        category: u32,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        offset: u32,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        limit: u32,
+    },
+    /// Join a server from Discovery by its id. Not a URL and not an invite link.
+    JoinDiscovered {
+        account: AccountKey,
+        guild_id: String,
+    },
+    /// A server's rules and onboarding, for the member who is looking at it.
+    SpaceGate {
+        space: Key,
+    },
+    /// Accept that server's rules. `answers` follow the form fields, in order.
+    AcceptRules {
+        space: Key,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        answers: Vec<String>,
+    },
+    /// Finish that server's onboarding. `options` are snowflake ids from its questions.
+    SubmitOnboarding {
+        space: Key,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        options: Vec<String>,
+    },
+    /// Read a Space's webhooks, followed channels, and installed bots/integrations.
+    SpaceIntegrations {
+        space: Key,
+    },
+    /// Create an incoming webhook in a channel.
+    CreateWebhook {
+        conversation: Key,
+        name: String,
+    },
+    /// Rename or move an existing webhook in a Space.
+    EditWebhook {
+        space: Key,
+        webhook_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        channel_id: Option<String>,
+    },
+    /// Delete a webhook (or unfollow a followed announcement channel) in a Space.
+    DeleteWebhook {
+        space: Key,
+        webhook_id: String,
+    },
+    /// Remove an installed bot or integration from a Space.
+    RemoveIntegration {
+        space: Key,
+        integration_id: String,
+    },
+    /// Read a Space's custom emoji, stickers, slot counts, and available roles.
+    SpaceExpressions {
+        space: Key,
+    },
+    /// Upload a new custom emoji to a Space from a local image file.
+    CreateEmoji {
+        space: Key,
+        name: String,
+        path: String,
+    },
+    /// Rename or change role restrictions on an existing custom emoji in a Space.
+    EditEmoji {
+        space: Key,
+        emoji_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        roles: Option<Vec<String>>,
+    },
+    /// Delete a custom emoji from a Space.
+    DeleteEmoji {
+        space: Key,
+        emoji_id: String,
+    },
+    /// Upload a new custom sticker (PNG, APNG, or Lottie JSON) to a Space.
+    CreateSticker {
+        space: Key,
+        name: String,
+        tags: String,
+        #[serde(default)]
+        description: String,
+        path: String,
+    },
+    /// Rename or edit tags/description on an existing custom sticker in a Space.
+    EditSticker {
+        space: Key,
+        sticker_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tags: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+    },
+    /// Delete a custom sticker from a Space.
+    DeleteSticker {
+        space: Key,
+        sticker_id: String,
+    },
+    /// Lists exported invite links for a group or channel (Telegram `messages.getExportedChatInvites`).
+    ChatInvites {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "is_false")]
+        revoked: bool,
+    },
+    /// Creates a new invite link for a group or channel (Telegram `messages.exportChatInvite`).
+    CreateInvite {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expire_date: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage_limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        request_needed: bool,
+    },
+    /// Revokes an exported invite link (Telegram `messages.editExportedChatInvite { revoked: true }`).
+    RevokeInvite {
+        conversation: Key,
+        link: String,
+    },
+    /// Lists pending join requests (or importers) for a group or channel (Telegram `messages.getChatInviteImporters`).
+    JoinRequests {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link: Option<String>,
+        #[serde(default)]
+        limit: u32,
+    },
+    /// Approves or declines one pending join request (`user_id: Some(..)`) or all pending requests (`user_id: None`).
+    HandleJoinRequest {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_id: Option<String>,
+        approved: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link: Option<String>,
     },
     Watch(Watching),
 
@@ -1988,6 +2889,12 @@ pub enum Request {
         conversation: Key,
         message_id: String,
     },
+    /// The user started playing a voice or round video message: tells the network its contents
+    /// were listened to (`messages.readMessageContents` / `channels.readMessageContents`), once.
+    MarkPlayed {
+        conversation: Key,
+        message_id: String,
+    },
     /// Adds (`on`) or takes back our reaction. `emoji` is the emoji itself, or a custom one's
     /// `:name:` as `Reaction::emoji` spells it. Shown at once; what the network then says is
     /// what stays.
@@ -2030,6 +2937,11 @@ pub enum Request {
         account: AccountKey,
         emoji: String,
     },
+    /// What this account may send in one conversation: per-chat media restrictions, slow mode,
+    /// timed mute expiry, and paid-message star price. Asked when the conversation opens.
+    SendRules {
+        conversation: Key,
+    },
     /// Who reacted to a message with `emoji`, paged. Fetched only on demand (clicking or
     /// opening the reactors list), never prefetched.
     Reactors {
@@ -2043,15 +2955,46 @@ pub enum Request {
         #[serde(default)]
         limit: u32,
     },
-    /// Replaces the text of one of our own messages. Nothing changes on screen until the
-    /// network accepts it; a refusal is the answer. `spans` are the styled ranges of `text`;
-    /// empty keeps the edit as plain text. An older client omits them.
+    /// Moderator reaction removal (Discord `MANAGE_MESSAGES`): clears all reactions when
+    /// `emoji` is `None`, all reactions for `emoji` when `user_id` is `None`, or one user's
+    /// reaction when both `emoji` and `user_id` are set.
+    ClearReactions {
+        conversation: Key,
+        message_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emoji: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_id: Option<String>,
+    },
+    /// Replaces the text of one of our own messages, suppresses its link previews, or removes
+    /// attachments. Nothing changes on screen until the network accepts it; a refusal is the
+    /// answer. `spans` are the styled ranges of `text`; empty keeps the edit as plain text.
     Edit {
         conversation: Key,
         message_id: String,
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         spans: Vec<Span>,
+        /// Suppress embeds / link previews on the message (Discord `SUPPRESS_EMBEDS` flag bit 2).
+        #[serde(default, skip_serializing_if = "is_false")]
+        suppress_embeds: bool,
+        /// Attachment ids to keep on the message (`None` leaves attachments untouched; `Some(ids)`
+        /// keeps only those attachments and drops the rest).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        keep_attachments: Option<Vec<String>>,
+    },
+    /// Replaces the photo or file on one of our own sent messages, with an optional updated
+    /// caption and formatting spans (Telegram `messages.editMessage` with `media`).
+    EditMedia {
+        conversation: Key,
+        message_id: String,
+        file: OutgoingFile,
+        #[serde(default)]
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        spans: Vec<Span>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        invert_media: bool,
     },
     /// Deletes a message. `scope` defaults to `Everyone` (so older shells keep working);
     /// `Me` removes it on this user's side only (Telegram, Signal, Google Messages).
@@ -2060,6 +3003,24 @@ pub enum Request {
         message_id: String,
         #[serde(default, skip_serializing_if = "DeleteScope::is_everyone")]
         scope: DeleteScope,
+    },
+    /// Deletes several messages in one conversation in a single network batch where supported.
+    DeleteMany {
+        conversation: Key,
+        message_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "DeleteScope::is_everyone")]
+        scope: DeleteScope,
+    },
+    /// Deletes all messages sent by `person` in a supergroup/channel (Telegram `channels.deleteParticipantHistory`).
+    DeleteParticipantHistory {
+        conversation: Key,
+        person: Key,
+    },
+    /// Reports specific messages from `person` in a supergroup/channel as spam (Telegram `channels.reportSpam`).
+    ReportSpamMessages {
+        conversation: Key,
+        person: Key,
+        message_ids: Vec<String>,
     },
     /// Forwards one or more messages to up to [`FORWARD_LIMIT`] conversations on the same account.
     /// Cross-account targets are refused; callers use a separate re-send for "Copy to…".
@@ -2123,6 +3084,15 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "is_false")]
         unfave: bool,
     },
+    /// Marks or unmarks an emoji or sticker as a favourite on the account (Discord
+    /// `settings-proto/2`). `on` adds it. Frecency scores are not written.
+    Favourite {
+        account: AccountKey,
+        kind: CatalogKind,
+        id: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        on: bool,
+    },
 
     /// Translates one message on demand into `to` (a BCP-47 / ISO 639-1 tag such as `"en"`,
     /// or `"system"` to use the local system locale).
@@ -2152,6 +3122,21 @@ pub enum Request {
         /// with its `failed` reason and nothing is fetched.
         #[serde(default, skip_serializing_if = "is_false")]
         retry: bool,
+        /// A byte window of one file, inclusive start and exclusive end. Absent asks for the
+        /// whole file and stores it. A window is a `Range` read for the player and is not stored.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        span: Option<(u64, u64)>,
+    },
+
+    /// Fetches at most `max_bytes` (clamped to [`TEXT_PREVIEW_MAX_BYTES`]) from the head of
+    /// registered file attachments via a ranged HTTP request through chatd's media cache, for
+    /// inline text/code previews. Returned [`MediaFile`] ids carry a `"head:"` prefix so full
+    /// downloads stay separate; counts against the cache budget.
+    FetchPreview {
+        account: AccountKey,
+        ids: Vec<String>,
+        #[serde(default)]
+        max_bytes: u32,
     },
 
     /// Opens the network's sign-in and keeps the session. Answers when the user is done.
@@ -2686,6 +3671,19 @@ pub enum Request {
         room_id: String,
     },
 
+    /// Publish (crosspost) a message in an announcement channel to following channels (Discord).
+    /// Answers `Ok`.
+    Publish {
+        conversation: Key,
+        message_id: String,
+    },
+    /// Follow an announcement channel into `into` (a channel where the account holds
+    /// `ConversationRights::manage_webhooks`). Answers `Ok`.
+    Follow {
+        conversation: Key,
+        into: Key,
+    },
+
     /// The push-to-talk key went down or up, from the shell's global hotkey. `priority` is the
     /// priority key: on a Tiny server it also asks to be heard over everyone else, which the
     /// server honours only with priority_speaker. Refused with no call.
@@ -2733,6 +3731,50 @@ pub enum Request {
         account: AccountKey,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<String>,
+    },
+    /// Fetch recent mentions from the network (e.g. Discord `GET /users/@me/mentions`),
+    /// asked only when the user opens Mentions or requests another page.
+    Mentions {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
+        #[serde(default = "default_mentions_true")]
+        everyone: bool,
+        #[serde(default = "default_mentions_true")]
+        roles: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<Key>,
+        #[serde(default = "default_mentions_limit")]
+        limit: u32,
+    },
+    /// Dismiss a recent mention on the network (e.g. Discord `DELETE /users/@me/mentions/{id}`).
+    DismissMention {
+        account: AccountKey,
+        message_id: String,
+    },
+    /// Reorder a Space, move it into or out of a folder, or drop it onto another Space to make a folder.
+    MoveSpace {
+        space: Key,
+        /// Insert before this Space. Absent: the end of the target list.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
+        /// Move into this folder. Absent: the Space sits on its own.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        folder: Option<String>,
+        /// Drop onto this Space to make a folder of the two. Not combined with `folder`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        into_space: Option<String>,
+    },
+    /// Rename or recolour a Space folder (e.g. Discord server folder).
+    SetFolder {
+        folder: Key,
+        /// New name. Absent leaves it. Empty clears it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// New colour (`0xRRGGBB`). Absent leaves it. `Some(None)` clears it. A present JSON
+        /// `null` is the clear; serde's `Option` would read that as "leave it".
+        #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present_or_null")]
+        color: Option<Option<u32>>,
     },
     /// Add a link bookmark to a channel (Slack `bookmarks.add`).
     BookmarkAdd {
@@ -2794,8 +3836,9 @@ pub enum Request {
         account: AccountKey,
         file_id: String,
     },
-    /// Execute an interactive control on a message (Slack Block Kit `blocks.actions`).
-    /// Answers `Response::Ok` when accepted; message updates arrive asynchronously.
+    /// Execute an interactive control on a message (Slack Block Kit `blocks.actions`,
+    /// Discord message component interactions).
+    /// Answers `Response::Ok` when accepted; message updates or modals arrive asynchronously.
     MessageAction {
         conversation: Key,
         message_id: String,
@@ -3001,6 +4044,81 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         message_ids: Vec<String>,
     },
+    /// Lists slash or context-menu commands available in `conversation`, optionally filtered by
+    /// `query` and `kind`. Answers `Response::Commands`.
+    Commands {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        query: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<CommandKind>,
+    },
+    /// Asks the network for live autocomplete choices on `focused` option of a slash command.
+    /// Answers `Response::CommandChoices`.
+    CommandAutocomplete {
+        conversation: Key,
+        command_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        application_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        version: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        options: Vec<CommandArg>,
+        focused: String,
+    },
+    /// Runs a slash command or context-menu command (`kind`, `target_id`).
+    /// Answers `Response::Ok` when accepted; replies or modals arrive asynchronously.
+    RunCommand {
+        conversation: Key,
+        command_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        application_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        version: String,
+        #[serde(default)]
+        kind: CommandKind,
+        name: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        arguments: Vec<CommandArg>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<OutgoingFile>,
+    },
+    /// Submits a bot's interaction modal form (`Change::InteractionModal`).
+    /// Answers `Response::Ok` when accepted.
+    ModalSubmit {
+        conversation: Key,
+        modal_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        application_id: String,
+        custom_id: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        values: Vec<(String, String)>,
+    },
+    /// Translate these messages into `to` (a language tag such as `en`). On demand: nothing is
+    /// stored over the original, and a sealed or secret chat is refused before the network is asked.
+    TranslateMessages {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        message_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        to: String,
+    },
+    /// Transcribe a voice or round video message on the network (`messages.transcribeAudio`).
+    /// Never called automatically. Answers `Response::Transcription`.
+    Transcribe {
+        conversation: Key,
+        message_id: String,
+    },
+    /// Rate a transcription good (`true`) or bad (`false`) (`messages.rateTranscribedAudio`).
+    RateTranscript {
+        conversation: Key,
+        message_id: String,
+        transcription_id: i64,
+        good: bool,
+    },
 }
 
 /// One thing that changed. The shell asks again for exactly that; the ephemeral kinds carry their
@@ -3019,7 +4137,12 @@ pub enum Change {
     /// A Space's groups or conversations: ask `Tree`.
     Tree { space: Key },
     /// The owned lists or a search result: ask `People`.
-    People { account: AccountKey },
+    /// `person` set means only that profile changed (a private note). Unset means the list.
+    People {
+        account: AccountKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        person: Option<Key>,
+    },
     /// Rows of a conversation's member list were added, removed or moved: ask `Members` again
     /// for the rows on screen.
     Members { conversation: Key },
@@ -3074,6 +4197,22 @@ pub enum Change {
     /// A Tiny server's people, roles, invites or rooms changed: ask `TinyCommunity`. Who is in
     /// a room's call is `Occupants`, and who is online `Presence`.
     Tiny { account: AccountKey },
+    /// A Space's scheduled events changed: ask `Events`.
+    Events { space: Key },
+    /// Ephemeral. A bot/app opened a modal form in response to a control or command.
+    InteractionModal {
+        conversation: Key,
+        modal: InteractionModal,
+    },
+    /// Ephemeral. An asynchronous interaction (button, select, slash command, modal) failed.
+    InteractionFailed {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        message_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        action_id: String,
+        reason: String,
+    },
 }
 
 impl Change {
@@ -3094,6 +4233,7 @@ impl Change {
             | (Change::Members { conversation: a }, Change::Members { conversation: b })
             | (Change::Occupants { conversation: a, .. }, Change::Occupants { conversation: b, .. })
             | (Change::Tree { space: a }, Change::Tree { space: b })
+            | (Change::Events { space: a }, Change::Events { space: b })
             | (Change::Presence { person: a, .. }, Change::Presence { person: b, .. }) => a == b,
             (Change::Upload { conversation: a, client_id: x, .. }, Change::Upload { conversation: b, client_id: y, .. }) => {
                 a == b && x == y
@@ -3101,11 +4241,18 @@ impl Change {
             (Change::Spaces { account: a }, Change::Spaces { account: b })
             | (Change::Folders { account: a }, Change::Folders { account: b })
             | (Change::Searched { account: a, .. }, Change::Searched { account: b, .. })
-            | (Change::People { account: a }, Change::People { account: b })
             | (Change::Tiny { account: a }, Change::Tiny { account: b }) => a == b,
+            (Change::People { account: a, person: pa }, Change::People { account: b, person: pb }) => a == b && pa == pb,
             (Change::Media { account: a, file: x }, Change::Media { account: b, file: y }) => {
                 a == b && x.id == y.id
             }
+            (Change::InteractionModal { conversation: a, modal: x }, Change::InteractionModal { conversation: b, modal: y }) => {
+                a == b && x.id == y.id
+            }
+            (
+                Change::InteractionFailed { conversation: a, message_id: ma, action_id: aa, .. },
+                Change::InteractionFailed { conversation: b, message_id: mb, action_id: ab, .. },
+            ) => a == b && ma == mb && aa == ab,
             _ => false,
         }
     }
@@ -3127,10 +4274,26 @@ impl Change {
                 | Change::Recording { .. }
                 | Change::Meter { .. }
                 | Change::Open { .. }
+                | Change::InteractionModal { .. }
+                | Change::InteractionFailed { .. }
         )
     }
 }
 
+/// One thread listed by `Request::ChannelThreads`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelThread {
+    pub conversation: Conversation,
+    /// Number of replies in the thread, when the network reports it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub replies: u32,
+    /// Unix seconds of the most recent message or archive event.
+    #[serde(default)]
+    pub last_activity: i64,
+    /// Whether the thread is locked by a moderator.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub locked: bool,
+}
 /// An on-demand translation of one message (`Request::Translate` / `Response::Translated`).
 /// Never written into stored message history; kept in UI state only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3244,8 +4407,20 @@ pub enum Response {
         #[serde(default)]
         counts: InboxCounts,
     },
+    /// Active or archived threads of one channel (`Request::ChannelThreads`).
+    ChannelThreads {
+        conversation: Key,
+        threads: Vec<ChannelThread>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        more: bool,
+    },
     Conversation {
         conversation: Conversation,
+    },
+    Group {
+        group: Group,
     },
     Spaces {
         spaces: Vec<Space>,
@@ -3299,6 +4474,11 @@ pub enum Response {
     Source {
         text: String,
     },
+    /// Answers `Translate`. One item per message the network translated, in the order asked.
+    TranslatedMessages {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        items: Vec<TranslatedMessage>,
+    },
     /// Answers `Resolve`: the matching cached conversation and optional message id on a signed-in account.
     Resolved {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3330,6 +4510,12 @@ pub enum Response {
         cursor: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         not_searched: Vec<Network>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total: Option<u32>,
+    },
+    /// Calendar days with matching messages (`Request::SearchCalendar`).
+    SearchCalendar {
+        days: Vec<SearchCalendarDay>,
     },
     /// Answers `Reminders`: what is still waiting in the conversation, due first.
     Reminders {
@@ -3379,6 +4565,22 @@ pub enum Response {
         space: Key,
         tags: Vec<TeamTag>,
     },
+    NetworkPrivacy {
+        privacy: NetworkPrivacy,
+    },
+    AutoDownload {
+        settings: AutoDownload,
+    },
+    /// A channel's boost level, and the free slots this account can still give.
+    Boosts {
+        conversation: Key,
+        status: ChannelBoosts,
+    },
+    /// A bot's command menu for the composer's `/` list.
+    BotMenu {
+        conversation: Key,
+        menu: BotMenu,
+    },
     Folders {
         folders: Vec<Folder>,
     },
@@ -3410,6 +4612,67 @@ pub enum Response {
         space: Option<Key>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conversation: Option<Key>,
+        /// True when joining submitted a pending join request (`INVITE_REQUEST_SENT`) awaiting admin approval.
+        #[serde(default, skip_serializing_if = "is_false")]
+        pending: bool,
+    },
+    ChatInvites {
+        conversation: Key,
+        invites: Vec<ChatInviteLink>,
+    },
+    ChatInvite {
+        invite: ChatInviteLink,
+    },
+    JoinRequests {
+        conversation: Key,
+        requests: Vec<JoinRequest>,
+    },
+    /// Answers `CreateSpace`: the created Space and landing conversation, when reported.
+    SpaceCreated {
+        space: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation: Option<Key>,
+    },
+    /// Answers `Events`: scheduled and active events for `space`.
+    Events {
+        space: Key,
+        events: Vec<SpaceEvent>,
+    },
+    /// Answers `CreateEvent` / `EditEvent`: the created or updated event.
+    Event {
+        event: SpaceEvent,
+    },
+    /// Answers `SpaceInvites`: active invite links (with optional vanity URL first) and pause state.
+    SpaceInvites {
+        space: Key,
+        invites: Vec<SpaceInvite>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        paused: bool,
+    },
+    /// Answers `Roles`: the Space's roles, highest first.
+    Roles {
+        space: Key,
+        roles: Vec<SpaceRole>,
+    },
+    /// Answers `CreateRole` / `EditRole`.
+    Role {
+        role: SpaceRole,
+    },
+    /// Answers `EventPreview`: metadata for a scheduled event.
+    EventPreview {
+        event: ScheduledEvent,
+    },
+    /// Answers `Discover`: public servers, and how many the listing says there are.
+    Discovered {
+        guilds: Vec<DiscoveredGuild>,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        total: u32,
+    },
+    /// Answers `SpaceGate` and `AcceptRules`.
+    SpaceGate {
+        space: Key,
+        #[serde(default)]
+        gate: SpaceGate,
     },
     Pinned {
         conversation: Key,
@@ -3424,6 +4687,23 @@ pub enum Response {
         balance: i64,
         #[serde(default)]
         nanos: i32,
+    },
+    /// Answers `SendRules`: per-conversation send permissions, slow mode, timed mute, paid stars.
+    SendRules {
+        conversation: Key,
+        rules: SendRules,
+    },
+    /// Answers `AdminLog`: recent admin actions in a group or channel, newest first.
+    AdminLog {
+        conversation: Key,
+        entries: Vec<AdminLogEntry>,
+    },
+    /// Answers `SendAsOptions`: selectable posting identities for a conversation.
+    SendAsOptions {
+        conversation: Key,
+        peers: Vec<SendAs>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default: Option<String>,
     },
     /// Answers `Reactors`: one page of people who reacted with `emoji`.
     Reactors {
@@ -3451,6 +4731,10 @@ pub enum Response {
         network: Network,
         step: SignInStep,
     },
+    /// Answers `MessageAction` when the network returned structured details, an alert, or a link.
+    ActionResult {
+        result: ActionResult,
+    },
     Error {
         code: ErrorCode,
         detail: String,
@@ -3462,6 +4746,9 @@ pub enum Response {
     Storage {
         messages: u64,
         files: u64,
+        /// Per-chat cache, largest first. Chats with nothing on disk are left out.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        chats: Vec<ChatCache>,
     },
     /// What a shorter retention would delete: messages, and about how many bytes of them.
     Prunable {
@@ -3574,6 +4861,16 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cursor: Option<String>,
     },
+    /// One page of recent mentions (`Request::Mentions`).
+    Mentions {
+        items: Vec<MentionHit>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        more: bool,
+        /// Ask before this id next. The last id of the raw page, so a page that was filtered
+        /// down to nothing still moves on. Absent when `more` is false.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+    },
     /// A created or edited channel bookmark (`BookmarkAdd` / `BookmarkEdit`).
     Bookmark {
         bookmark: Bookmark,
@@ -3599,6 +4896,22 @@ pub enum Response {
     /// One updated/rescheduled message (`Request::RescheduleMessage`).
     ScheduledMessage {
         message: ScheduledMessage,
+    },
+    /// Posting rules, guidelines, and available tags of a forum or media channel (`Request::ForumInfo`).
+    ForumInfo {
+        info: ForumInfo,
+    },
+    /// Account's default disappearing-messages timer in seconds (`0` = off).
+    DefaultDisappearing {
+        seconds: u32,
+    },
+    /// A created or updated chat folder (`Request::FolderSave`).
+    Folder {
+        folder: Folder,
+    },
+    /// Suggested chat folders (`Request::SuggestedFolders`).
+    SuggestedFolders {
+        folders: Vec<SuggestedFolder>,
     },
     /// Active workspace user groups (`Request::UserGroups`).
     UserGroups {
@@ -3653,6 +4966,62 @@ pub enum Response {
     /// Unread mention or reaction message IDs in a conversation (`Request::UnreadItems`).
     UnreadItems {
         message_ids: Vec<String>,
+    },
+    /// Permission overwrites and role list for a channel or category (`Request::ChannelPermissions`).
+    ChannelPermissions {
+        info: Box<ChannelPermissionsInfo>,
+    },
+    /// One page of a server's audit log (`Request::AuditLog`).
+    AuditLog {
+        entries: Vec<AuditEntry>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        more: bool,
+    },
+    /// A server's AutoMod rules and safety setup (`Request::AutomodRules`).
+    AutomodRules {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        rules: Vec<AutomodRule>,
+        #[serde(default)]
+        safety: SpaceSafety,
+    },
+    /// One created or edited AutoMod rule (`Request::SaveAutomodRule`).
+    AutomodRule {
+        #[serde(default)]
+        rule: AutomodRule,
+    },
+    /// Slash or context-menu commands available in a conversation (`Request::Commands`).
+    Commands {
+        commands: Vec<AppCommand>,
+    },
+    /// Autocomplete choices for one slash-command option (`Request::CommandAutocomplete`).
+    CommandChoices {
+        choices: Vec<CommandChoice>,
+    },
+    /// A Space's webhooks, followed channels, and bots/integrations (`Request::SpaceIntegrations`).
+    SpaceIntegrations {
+        space: Key,
+        integrations: Box<SpaceIntegrations>,
+    },
+    /// A created or edited webhook (`Request::CreateWebhook` / `Request::EditWebhook`).
+    SpaceWebhook {
+        webhook: Box<SpaceWebhook>,
+    },
+    /// A Space's custom emoji, stickers, and slot limits (`Request::SpaceExpressions`).
+    SpaceExpressions {
+        space: Key,
+        expressions: Box<SpaceExpressions>,
+    },
+    /// A created or edited custom emoji (`Request::CreateEmoji` / `Request::EditEmoji`).
+    SpaceEmoji {
+        emoji: Box<SpaceEmoji>,
+    },
+    /// A created or edited custom sticker (`Request::CreateSticker` / `Request::EditSticker`).
+    SpaceSticker {
+        sticker: Box<SpaceSticker>,
+    },
+    /// Answers `Request::Transcribe`: the transcription state returned by the network.
+    Transcription {
+        transcription: Transcription,
     },
 }
 
@@ -3875,9 +5244,20 @@ mod tests {
             r#"{"op":"edit","conversation":{"network":"slack","account":"T1","id":"C1"},"message_id":"1","text":"hi"}"#,
         )
         .unwrap();
-        let Request::Edit { spans, text, .. } = &old else { panic!("not an edit") };
-        assert!(spans.is_empty() && text == "hi");
-        assert!(!serde_json::to_string(&old).unwrap().contains("spans"));
+        let Request::Edit { spans, text, suppress_embeds, keep_attachments, .. } = &old else { panic!("not an edit") };
+        assert!(spans.is_empty() && text == "hi" && !suppress_embeds && keep_attachments.is_none());
+        let serialized = serde_json::to_string(&old).unwrap();
+        assert!(!serialized.contains("spans") && !serialized.contains("suppress_embeds") && !serialized.contains("keep_attachments"));
+        let edit_flags = Request::Edit {
+            conversation: Key { network: Network::Discord, account: "1".into(), id: "4101".into() },
+            message_id: "99".into(),
+            text: String::new(),
+            spans: Vec::new(),
+            suppress_embeds: true,
+            keep_attachments: Some(vec!["att:1".into()]),
+        };
+        let encoded = serde_json::to_string(&edit_flags).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&encoded).unwrap(), edit_flags);
         let styled = Outgoing { spans: vec![Span { start: 0, end: 2, style: Style::Bold }], ..Outgoing::default() };
         assert!(!styled.is_plain());
         assert!(serde_json::to_string(&styled).unwrap().contains("bold"));
@@ -3910,11 +5290,43 @@ mod tests {
             title: String::new(),
             space_title: String::new(),
             outgoing: false,
+            age_restricted: false,
         };
         assert_eq!(
-            serde_json::to_string(&Response::MessageHits { hits: vec![hit], cursor: None, not_searched: Vec::new() }).unwrap(),
+            serde_json::to_string(&Response::MessageHits { hits: vec![hit], cursor: None, not_searched: Vec::new(), total: None }).unwrap(),
             r#"{"op":"message_hits","hits":[{"conversation":{"network":"discord","account":"1","id":"C2"},"message_id":"9","sent":20,"sender":"mara","snippet":"hello world"}]}"#
         );
+        // Structured search filters, sort, offset and total round-trip and omit defaults.
+        let filtered = Request::SearchNetwork {
+            conversation: None,
+            space: Some(Key { network: Network::Discord, account: "1".into(), id: "G1".into() }),
+            account: None,
+            network: None,
+            query: "release".into(),
+            filters: SearchFilters {
+                from: Some(Key { network: Network::Discord, account: "1".into(), id: "U1".into() }),
+                mentions: Some(Key { network: Network::Discord, account: "1".into(), id: "U2".into() }),
+                in_channel: Some(Key { network: Network::Discord, account: "1".into(), id: "C2".into() }),
+                has: Some(SearchHas::Videos),
+                before: Some(1_767_225_600),
+                after: Some(1_735_689_600),
+                mentions_me: false,
+                pinned: Some(true),
+                author_type: Some("bot".into()),
+                sort: SearchSort::Oldest,
+                offset: 25,
+            },
+            cursor: Some("25".into()),
+            home: false,
+        };
+        let encoded = serde_json::to_string(&filtered).unwrap();
+        let decoded: Request = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, filtered);
+        let hits_total = Response::MessageHits { hits: Vec::new(), cursor: Some("25".into()), not_searched: Vec::new(), total: Some(142) };
+        let encoded_hits = serde_json::to_string(&hits_total).unwrap();
+        assert!(encoded_hits.contains(r#""total":142"#), "{encoded_hits}");
+        let decoded_hits: Response = serde_json::from_str(&encoded_hits).unwrap();
+        assert_eq!(decoded_hits, hits_total);
         // The network's own ask: the scope is a conversation, Space, account, network, or everywhere.
         let ask: Request = serde_json::from_str(r#"{"op":"search_network","query":"lichen"}"#).unwrap();
         let Request::SearchNetwork { conversation, space, query, filters, cursor, .. } = &ask else {
@@ -3929,11 +5341,14 @@ mod tests {
             query: "lichen".into(),
             filters: SearchFilters::default(),
             cursor: None,
+            home: false,
         };
         assert_eq!(
             serde_json::to_string(&asked).unwrap(),
             r#"{"op":"search_network","conversation":{"network":"discord","account":"1","id":"C2"},"query":"lichen"}"#
         );
+        let home: Request = serde_json::from_str(r#"{"op":"search_network","query":"lichen","home":true}"#).unwrap();
+        assert!(matches!(home, Request::SearchNetwork { home: true, .. }));
     }
 
     #[test]
@@ -3967,9 +5382,41 @@ mod tests {
     }
 
     #[test]
+    fn clearing_a_folder_colour_round_trips_through_a_frame() {
+        use std::io::Cursor;
+        let folder = Key::new(&AccountKey { network: Network::Discord, account: "1".into() }, "77");
+        let clear = Request::SetFolder { folder: folder.clone(), name: None, color: Some(None) };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &clear).unwrap();
+        let back: Request = read_frame(Cursor::new(&buf)).unwrap();
+        assert!(matches!(back, Request::SetFolder { color: Some(None), name: None, .. }));
+
+        let paint = Request::SetFolder { folder: folder.clone(), name: Some("Games".into()), color: Some(Some(0x34_A8_53)) };
+        buf.clear();
+        write_frame(&mut buf, &paint).unwrap();
+        let back: Request = read_frame(Cursor::new(&buf)).unwrap();
+        assert!(matches!(back, Request::SetFolder { color: Some(Some(0x34_A8_53)), .. }));
+
+        let rename = Request::SetFolder { folder, name: Some("Games".into()), color: None };
+        buf.clear();
+        write_frame(&mut buf, &rename).unwrap();
+        let body = std::str::from_utf8(&buf[4..]).unwrap();
+        assert!(!body.contains("\"color\""));
+        let back: Request = read_frame(Cursor::new(buf)).unwrap();
+        assert!(matches!(back, Request::SetFolder { color: None, .. }));
+    }
+
+    #[test]
     fn frames_written_before_these_fields_existed_still_read() {
         let request: Request = serde_json::from_str(r#"{"op":"fetch","account":{"network":"slack","account":"T1"},"ids":["a"]}"#).unwrap();
-        assert!(matches!(request, Request::Fetch { size: None, retry: false, .. }));
+        assert!(matches!(request, Request::Fetch { size: None, retry: false, span: None, .. }));
+        let preview = Request::FetchPreview {
+            account: AccountKey { network: Network::Discord, account: "1".into() },
+            ids: vec!["att:42".into()],
+            max_bytes: TEXT_PREVIEW_MAX_BYTES,
+        };
+        let encoded = serde_json::to_string(&preview).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&encoded).unwrap(), preview);
         let request: Request = serde_json::from_str(r#"{"op":"sign_in","network":"slack"}"#).unwrap();
         assert!(matches!(request, Request::SignIn { at: None, resume: None, .. }));
         let thread: ThreadSummary = serde_json::from_str(r#"{"id":"t","replies":2,"last":5}"#).unwrap();
@@ -4064,6 +5511,17 @@ mod tests {
         assert!(me_json.contains(r#""scope":"me""#), "{me_json}");
         assert_eq!(serde_json::from_str::<Request>(&me_json).unwrap(), mine);
 
+        let batch = Request::DeleteMany {
+            conversation: key.clone(),
+            message_ids: vec!["9".into(), "10".into()],
+            scope: DeleteScope::Me,
+        };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&batch).unwrap()).unwrap(), batch);
+        let dph = Request::DeleteParticipantHistory { conversation: key.clone(), person: key.clone() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&dph).unwrap()).unwrap(), dph);
+        let rsm = Request::ReportSpamMessages { conversation: key.clone(), person: key.clone(), message_ids: vec!["9".into()] };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&rsm).unwrap()).unwrap(), rsm);
+
         // Older shell request without `scope` decodes as `Everyone`.
         let legacy: Request = serde_json::from_str(&format!(
             r#"{{"op":"delete","conversation":{},"message_id":"9"}}"#,
@@ -4094,6 +5552,41 @@ mod tests {
         assert_eq!(format_disappearing(604_800), "1w");
         assert!(disappearing_presets(Network::Signal).contains(&30));
         assert!(disappearing_presets(Network::Telegram).contains(&86_400));
+
+        let acct = AccountKey { network: Network::Telegram, account: "7001".into() };
+        let get_def = Request::GetDefaultDisappearing { account: acct.clone() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&get_def).unwrap()).unwrap(), get_def);
+        let set_def = Request::SetDefaultDisappearing { account: acct, seconds: 604_800 };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&set_def).unwrap()).unwrap(), set_def);
+        let resp = Response::DefaultDisappearing { seconds: 604_800 };
+        assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&resp).unwrap()).unwrap(), resp);
+    }
+
+    #[test]
+    fn folder_crud_requests_and_responses_round_trip() {
+        let acct = AccountKey { network: Network::Telegram, account: "7001".into() };
+        let spec = FolderSpec {
+            id: None,
+            name: "Hiking".into(),
+            emoticon: Some("⛰".into()),
+            include: vec!["u7002".into(), "g8001".into()],
+            exclude: vec!["u7003".into()],
+            pinned: vec!["u7002".into()],
+            contacts: true,
+            ..FolderSpec::default()
+        };
+        let save = Request::FolderSave { account: acct.clone(), folder: spec.clone() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&save).unwrap()).unwrap(), save);
+        let del = Request::FolderDelete { account: acct.clone(), folder_id: "4".into() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&del).unwrap()).unwrap(), del);
+        let reorder = Request::FoldersReorder { account: acct.clone(), order: vec!["4".into(), "2".into()] };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&reorder).unwrap()).unwrap(), reorder);
+        let sug = Request::SuggestedFolders { account: acct.clone() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&sug).unwrap()).unwrap(), sug);
+        let resp_sug = Response::SuggestedFolders {
+            folders: vec![SuggestedFolder { spec, description: "Trail chats".into() }],
+        };
+        assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&resp_sug).unwrap()).unwrap(), resp_sug);
     }
 
     #[test]
@@ -4115,8 +5608,34 @@ mod tests {
         assert!(!ujson.contains("description"), "{ujson}");
         assert_eq!(serde_json::from_str::<Request>(&ujson).unwrap(), update);
 
-        let pic = Request::ConversationPicture { conversation: key, path: "/tmp/icon.png".into() };
+        let pic = Request::ConversationPicture { conversation: key.clone(), path: "/tmp/icon.png".into() };
         assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&pic).unwrap()).unwrap(), pic);
+
+        let ban = Request::ModerateMember {
+            conversation: key.clone(),
+            person: "U2".into(),
+            action: MemberModeration::Ban { until: None },
+        };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&ban).unwrap()).unwrap(), ban);
+        let promote = Request::SetAdmin {
+            conversation: key.clone(),
+            person: "U2".into(),
+            rights: AdminRights { ban_users: true, rank: "Mod".into(), ..AdminRights::default() },
+        };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&promote).unwrap()).unwrap(), promote);
+        let give = Request::TransferOwnership { conversation: key.clone(), person: "U2".into(), password: "secret".into() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&give).unwrap()).unwrap(), give);
+        let settings = Request::UpdateChatSettings {
+            conversation: key.clone(),
+            settings: ChatSettings { slowmode_seconds: Some(30), no_forwards: Some(true), ..ChatSettings::default() },
+        };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&settings).unwrap()).unwrap(), settings);
+        let log = Request::AdminLog { conversation: key.clone(), limit: 20 };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&log).unwrap()).unwrap(), log);
+        let send_as = Request::SendAsOptions { conversation: key.clone() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&send_as).unwrap()).unwrap(), send_as);
+        let set_as = Request::SetDefaultSendAs { conversation: key, peer: "c9".into() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&set_as).unwrap()).unwrap(), set_as);
 
         let all = ConversationRights {
             pin: true,
@@ -4127,8 +5646,70 @@ mod tests {
             rename: true,
             edit_topic: true,
             edit_picture: true,
+            create_public_threads: true,
+            create_private_threads: true,
+            send_in_threads: true,
+            manage_threads: true,
+            slowmode_exempt: true,
+            create_invite: true,
+            manage_webhooks: true,
+            delete_channel: true,
+            manage_permissions: true,
+            manage_topics: true,
+            ban_members: true,
+            promote_admins: true,
+            manage_settings: true,
+            view_admin_log: true,
+            transfer_owner: true,
+            anonymous: true,
         };
         assert_eq!(ConversationRights::from_bits(all.to_bits()), all);
+        let webhooks = ConversationRights { manage_webhooks: true, ..ConversationRights::default() };
+        assert_eq!(webhooks.to_bits(), 1 << 14);
+        assert_eq!(ConversationRights::from_bits(1 << 14), webhooks);
+        assert!(!ConversationRights::from_bits(1 << 8).manage_webhooks);
+
+        let pub_req = Request::Publish {
+            conversation: Key { network: Network::Discord, account: "1".into(), id: "4101".into() },
+            message_id: "99".into(),
+        };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&pub_req).unwrap()).unwrap(), pub_req);
+        let follow_req = Request::Follow {
+            conversation: Key { network: Network::Discord, account: "1".into(), id: "4101".into() },
+            into: Key { network: Network::Discord, account: "1".into(), id: "5101".into() },
+        };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&follow_req).unwrap()).unwrap(), follow_req);
+        let space_all = SpaceRights {
+            manage_channels: true,
+            manage_roles: true,
+            view_audit_log: true,
+            manage_server: true,
+            ..SpaceRights::default()
+        };
+        assert_eq!(SpaceRights::from_bits(space_all.to_bits()), space_all);
+    }
+
+    #[test]
+    fn a_translate_frame_missing_its_new_fields_still_reads() {
+        let key = Key::new(&AccountKey { network: Network::Telegram, account: "a".into() }, "u1");
+        let bare: Request = serde_json::from_str(&format!(
+            r#"{{"op":"translate_messages","conversation":{}}}"#,
+            serde_json::to_string(&key).unwrap()
+        ))
+        .unwrap();
+        assert_eq!(bare, Request::TranslateMessages { conversation: key.clone(), message_ids: vec![], to: String::new() });
+
+        let full = Request::TranslateMessages { conversation: key, message_ids: vec!["9".into()], to: "en".into() };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&full).unwrap()).unwrap(), full);
+
+        let empty: Response = serde_json::from_str(r#"{"op":"translated_messages"}"#).unwrap();
+        assert_eq!(empty, Response::TranslatedMessages { items: vec![] });
+        let item: TranslatedMessage = serde_json::from_str("{}").unwrap();
+        assert_eq!(item, TranslatedMessage { message_id: String::new(), text: String::new(), spans: vec![] });
+        let said = TranslatedMessage { message_id: "9".into(), text: "hi".into(), spans: vec![] };
+        let wire = serde_json::to_string(&Response::TranslatedMessages { items: vec![said.clone()] }).unwrap();
+        assert!(!wire.contains("spans"), "{wire}");
+        assert_eq!(serde_json::from_str::<Response>(&wire).unwrap(), Response::TranslatedMessages { items: vec![said] });
     }
 }
 
@@ -4174,6 +5755,7 @@ mod sock_path_tests {
         let reqs = [
             Request::ScheduledMessages { conversation: conv.clone() },
             Request::CancelScheduled { conversation: conv.clone(), scheduled_id: "Q1".into() },
+            Request::SendScheduledNow { conversation: conv.clone(), scheduled_id: "Q1".into() },
             Request::RescheduleMessage {
                 conversation: conv.clone(),
                 scheduled_id: "Q1".into(),
@@ -4246,5 +5828,171 @@ mod sock_path_tests {
         assert_eq!(language_name("es"), "Spanish");
         assert_eq!(language_name("zh-Hans"), "Chinese");
         assert_eq!(language_name("auto"), "detected language");
+    }
+
+    #[test]
+    fn compose_activities_round_trip_and_default_to_typing() {
+        let conv = Key::new(&AccountKey { network: Network::Telegram, account: "1".into() }, "u7002");
+        for activity in [
+            Compose::Typing,
+            Compose::RecordingVoice,
+            Compose::RecordingVideo,
+            Compose::UploadingPhoto,
+            Compose::UploadingVideo,
+            Compose::UploadingAudio,
+            Compose::UploadingFile,
+            Compose::ChoosingSticker,
+            Compose::PlayingGame,
+            Compose::Speaking,
+            Compose::Cancel,
+        ] {
+            let req = Request::Typing { conversation: conv.clone(), activity };
+            let encoded = serde_json::to_string(&req).unwrap();
+            assert_eq!(serde_json::from_str::<Request>(&encoded).unwrap(), req);
+        }
+        // Older Typist JSON without `activity` defaults to `Compose::Typing`.
+        let legacy: Typist = serde_json::from_str(r#"{"id":"u1","name":"Ada","until":100}"#).unwrap();
+        assert_eq!(legacy.activity, Compose::Typing);
+    }
+
+    #[test]
+    fn forum_post_request_and_info_round_trip() {
+        let forum = Key::new(&AccountKey { network: Network::Discord, account: "1000".into() }, "4106");
+        let req = Request::ForumPost {
+            forum: forum.clone(),
+            title: "Cargo won't build".into(),
+            text: "I tried clean.".into(),
+            tags: vec!["9001".into()],
+            with: Outgoing::default(),
+        };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&req).unwrap()).unwrap(), req);
+        let info = ForumInfo {
+            forum,
+            guidelines: "Say what you tried.".into(),
+            tags: vec![ForumTag { id: "9001".into(), name: "question".into(), emoji: "❓".into(), moderated: false }],
+            require_tag: true,
+            media: false,
+            default_slowmode: 30,
+        };
+        let response = Response::ForumInfo { info };
+        assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&response).unwrap()).unwrap(), response);
+    }
+
+    #[test]
+    fn forum_topics_request_keeps_old_json_and_post_fields() {
+        let forum = Key::new(&AccountKey { network: Network::Discord, account: "1000".into() }, "4106");
+        let req = Request::Topics {
+            forum: forum.clone(),
+            offset: 25,
+            limit: 25,
+            landing: false,
+            sort: TopicSort::Created,
+            tag: Some("9001".into()),
+            query: Some("lichen".into()),
+        };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&req).unwrap()).unwrap(), req);
+        let mut bare = serde_json::to_value(&Request::Topics {
+            forum: forum.clone(),
+            offset: 0,
+            limit: 10,
+            landing: false,
+            sort: TopicSort::Activity,
+            tag: None,
+            query: None,
+        })
+        .unwrap();
+        for key in ["sort", "tag", "query", "landing"] {
+            bare.as_object_mut().unwrap().remove(key);
+        }
+        assert_eq!(
+            serde_json::from_value::<Request>(bare).unwrap(),
+            Request::Topics {
+                forum: forum.clone(),
+                offset: 0,
+                limit: 10,
+                landing: false,
+                sort: TopicSort::Activity,
+                tag: None,
+                query: None,
+            }
+        );
+        let mut row = Conversation::new(forum, ConversationKind::Thread, "Lichen");
+        row.tags = vec!["9001".into()];
+        row.message_count = 4;
+        row.total_message_sent = 6;
+        row.reaction = "👍".into();
+        row.owner = "2001".into();
+        row.thumbnail = Some(MediaFile::new("att:1:thumb", MediaKind::Image));
+        assert_eq!(serde_json::from_value::<Conversation>(serde_json::to_value(&row).unwrap()).unwrap(), row);
+        let mut old = serde_json::to_value(&Conversation::new(row.key.clone(), ConversationKind::Thread, "Lichen")).unwrap();
+        for key in ["tags", "message_count", "total_message_sent", "thumbnail", "reaction", "owner"] {
+            old.as_object_mut().unwrap().remove(key);
+        }
+        let decoded = serde_json::from_value::<Conversation>(old).unwrap();
+        assert!(decoded.tags.is_empty());
+        assert_eq!((decoded.message_count, decoded.total_message_sent), (0, 0));
+        assert!(decoded.thumbnail.is_none());
+        assert!(decoded.reaction.is_empty() && decoded.owner.is_empty());
+    }
+
+    #[test]
+    fn command_and_modal_frames_round_trip() {
+        let conv = Key::new(&AccountKey { network: Network::Discord, account: "1000".into() }, "4101");
+        let reqs = [
+            Request::Commands { conversation: conv.clone(), query: "dep".into(), kind: Some(CommandKind::ChatInput) },
+            Request::CommandAutocomplete {
+                conversation: conv.clone(),
+                command_id: "c1".into(),
+                application_id: "a1".into(),
+                version: "v1".into(),
+                name: "deploy".into(),
+                options: vec![CommandArg { name: "env".into(), value: "st".into(), kind: CommandOptionKind::String }],
+                focused: "env".into(),
+            },
+            Request::RunCommand {
+                conversation: conv.clone(),
+                command_id: "c1".into(),
+                application_id: "a1".into(),
+                version: "v1".into(),
+                kind: CommandKind::ChatInput,
+                name: "deploy".into(),
+                arguments: vec![CommandArg { name: "env".into(), value: "staging".into(), kind: CommandOptionKind::String }],
+                target_id: None,
+                files: Vec::new(),
+            },
+            Request::ModalSubmit {
+                conversation: conv.clone(),
+                modal_id: "m1".into(),
+                application_id: "a1".into(),
+                custom_id: "feedback".into(),
+                values: vec![("note".into(), "looks good".into())],
+            },
+        ];
+        for req in reqs {
+            let wire = serde_json::to_string(&req).unwrap();
+            assert_eq!(serde_json::from_str::<Request>(&wire).unwrap(), req);
+        }
+        let modal_change = Change::InteractionModal {
+            conversation: conv.clone(),
+            modal: InteractionModal {
+                id: "m1".into(),
+                application_id: "a1".into(),
+                custom_id: "feedback".into(),
+                title: "Feedback".into(),
+                fields: Vec::new(),
+                nonce: "n1".into(),
+            },
+        };
+        assert!(modal_change.is_ephemeral());
+        assert_eq!(serde_json::from_str::<Change>(&serde_json::to_string(&modal_change).unwrap()).unwrap(), modal_change);
+
+        let fail_change = Change::InteractionFailed {
+            conversation: conv,
+            message_id: "msg1".into(),
+            action_id: "btn1".into(),
+            reason: "Interaction failed.".into(),
+        };
+        assert!(fail_change.is_ephemeral());
+        assert_eq!(serde_json::from_str::<Change>(&serde_json::to_string(&fail_change).unwrap()).unwrap(), fail_change);
     }
 }

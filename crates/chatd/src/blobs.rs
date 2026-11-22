@@ -90,6 +90,13 @@ const OWN_EVERY: Duration = Duration::from_secs(2);
 const OWN_FOR: Duration = Duration::from_secs(120);
 /// What marks a picker's preview among an account's files.
 const PICK: &str = "pick:";
+/// What marks a ranged head preview of a text/code attachment among an account's files.
+pub const HEAD_PREFIX: &str = "head:";
+
+/// The cache id for an attachment's ranged head preview, distinct from the full download id.
+pub fn head_id(id: &str) -> String {
+    format!("{HEAD_PREFIX}{id}")
+}
 /// While a row's picture waits for its row to come back, the screen is looked at this often:
 /// `Watch` goes to the server, which does not tell the cache.
 const PARKED_LOOK: Duration = Duration::from_secs(1);
@@ -177,8 +184,12 @@ struct Job {
     adapter: Option<Sender<Command>>,
     /// Asked for as the picture of a row on screen: it waits while that row is scrolled away.
     row: bool,
+    /// When set, fetches at most this many bytes via an HTTP `Range` request (for text previews).
+    max_bytes: Option<u64>,
     /// When it was asked for.
     at: Instant,
+    /// A byte window for the player. None is the whole file. A window is not stored.
+    span: Option<(u64, u64)>,
 }
 
 /// What is on screen, as files: worked out once per `Watching`.
@@ -355,7 +366,38 @@ impl Blobs {
         ids: &[String],
         adapter: Option<Sender<Command>>,
     ) -> rusqlite::Result<Vec<MediaFile>> {
-        self.cache.request(account, ids, adapter)
+        self.cache.request(account, ids, None, adapter, None)
+    }
+
+    /// Requests ranged head previews (at most `max_bytes`, clamped to [`protocol::TEXT_PREVIEW_MAX_BYTES`])
+    /// for registered file attachments. If an original file is already on disk, returns its path
+    /// immediately under the `"head:"` id without another network request.
+    pub fn request_preview(
+        &self,
+        account: &AccountKey,
+        ids: &[String],
+        max_bytes: u32,
+        adapter: Option<Sender<Command>>,
+    ) -> rusqlite::Result<Vec<MediaFile>> {
+        let limit = if max_bytes == 0 {
+            protocol::TEXT_PREVIEW_MAX_BYTES
+        } else {
+            max_bytes.min(protocol::TEXT_PREVIEW_MAX_BYTES)
+        } as u64;
+        self.cache.request_preview(account, ids, limit, adapter)
+    }
+
+    /// A byte window of these files, for the player. Answered like [`Self::request`], and not
+    /// stored: the bytes are read and dropped. A file already on disk is still asked, because
+    /// the window is not that file.
+    pub fn request_span(
+        &self,
+        account: &AccountKey,
+        ids: &[String],
+        adapter: Option<Sender<Command>>,
+        span: (u64, u64),
+    ) -> rusqlite::Result<Vec<MediaFile>> {
+        self.cache.request(account, ids, None, adapter, Some(span))
     }
 
     /// The user asked for these again (`Fetch` with `retry`): whatever rest they were taking
@@ -453,8 +495,50 @@ impl Cache {
         });
     }
 
+    /// [`Blobs::request_preview`].
+    fn request_preview(
+        &self,
+        account: &AccountKey,
+        ids: &[String],
+        limit: u64,
+        adapter: Option<Sender<Command>>,
+    ) -> rusqlite::Result<Vec<MediaFile>> {
+        let originals = self.hub.store().media(account, ids)?;
+        let mut ready = Vec::new();
+        let mut to_register: Vec<(MediaFile, String)> = Vec::new();
+        let mut head_ids = Vec::new();
+        for (orig, url) in originals {
+            let preview_id = head_id(&orig.id);
+            if orig.path.as_ref().is_some_and(|p| Path::new(p).exists()) {
+                ready.push(MediaFile { id: preview_id, ..orig });
+                continue;
+            }
+            if url.is_empty() || kept_by_adapter(&url) {
+                continue;
+            }
+            let mut preview_file = MediaFile::new(preview_id.clone(), protocol::MediaKind::File);
+            preview_file.bytes = orig.bytes.min(limit);
+            to_register.push((preview_file, url));
+            head_ids.push(preview_id);
+        }
+        if !to_register.is_empty() {
+            self.hub.store().register_media(account, &to_register)?;
+        }
+        if !head_ids.is_empty() {
+            ready.extend(self.request(account, &head_ids, Some(limit), adapter, None)?);
+        }
+        Ok(ready)
+    }
+
     /// [`Blobs::request`].
-    fn request(&self, account: &AccountKey, ids: &[String], adapter: Option<Sender<Command>>) -> rusqlite::Result<Vec<MediaFile>> {
+    fn request(
+        &self,
+        account: &AccountKey,
+        ids: &[String],
+        max_bytes: Option<u64>,
+        adapter: Option<Sender<Command>>,
+        span: Option<(u64, u64)>,
+    ) -> rusqlite::Result<Vec<MediaFile>> {
         let mut files: Vec<(MediaFile, String)> = {
             let mut store = self.hub.store();
             store.media_used(account, ids, now())?;
@@ -495,8 +579,9 @@ impl Cache {
                     picking = true;
                 }
                 // A failure stands until `Fetch` says `retry` (the server clears it before
-                // this) or the adapter registers a fresh address.
-                if file.path.is_some() || file.failed.is_some() || queue.fetching.contains(&key) {
+                // this) or the adapter registers a fresh address. A byte window is not the file,
+                // so a path or a failure already recorded does not answer it.
+                if queue.fetching.contains(&key) || (span.is_none() && (file.path.is_some() || file.failed.is_some())) {
                     continue;
                 }
                 // Adapter-managed encrypted or session-fetched media (Telegram, Signal):
@@ -506,20 +591,25 @@ impl Cache {
                     continue;
                 }
                 // A failure of the line rests a while, and is answered with why until then.
-                if let Some(rest) = queue.resting.get(&key).filter(|rest| rest.until > at) {
-                    file.failed = Some(rest.why.clone());
-                    continue;
+                // A window is one read and is not that rest.
+                if span.is_none() {
+                    if let Some(rest) = queue.resting.get(&key).filter(|rest| rest.until > at) {
+                        file.failed = Some(rest.why.clone());
+                        continue;
+                    }
                 }
                 // Asked for again while waiting: it goes back to the front.
                 queue.waiting.retain(|job| job.file != key);
                 queue.parked.retain(|job| job.file != key);
                 queue.waiting.push(Job {
                     at,
-                    row: screen.rows.contains(&key),
+                    row: span.is_none() && screen.rows.contains(&key),
+                    max_bytes,
                     file: key,
                     epoch,
                     picker_generation,
                     adapter: adapter.clone(),
+                    span,
                 });
                 if queue.waiting.len() > WAITING {
                     dropped.push(queue.waiting.remove(0).file);
@@ -708,7 +798,7 @@ impl Cache {
                 if url.is_none_or(|url| self.hosts.trust_for(Some(account), account.network, &url) != Some(fetch::Trust::Open)) {
                     continue;
                 }
-                if let Err(err) = self.request(account, &[avatar.id], None) {
+                if let Err(err) = self.request(account, &[avatar.id], None, None, None) {
                     tracing::warn!("chatd: {}: own picture: {err}", account.network.label());
                 }
             }
@@ -856,6 +946,13 @@ impl Cache {
                 }
                 continue;
             }
+            // A window is not the file. It is not announced, not recorded, and a miss is not
+            // a failure of the poster.
+            if job.span.is_some() {
+                self.take_span(&agent, &job, &mut buffer);
+                crate::hub::lock(&self.queue).fetching.retain(|file| file != &job.file);
+                continue;
+            }
             let outcome = self.fetch(&agent, &job, &mut buffer);
             let (account, id) = &job.file;
             crate::hub::lock(&self.queue).fetching.retain(|file| file != &job.file);
@@ -947,6 +1044,7 @@ impl Cache {
             if let Err(err) = protocol::private::dir(&dir) {
                 return failed(&file, format!("The cache directory could not be made: {err}."));
             }
+            let cache_cap = self.cap.load(Ordering::Relaxed);
             let want = fetch::Want {
                 account: Some(account),
                 network: account.network,
@@ -954,8 +1052,14 @@ impl Cache {
                 url: &url,
                 adapter: job.adapter.as_ref(),
                 part: &part,
-                cap: fetch::cap(&file, self.cap.load(Ordering::Relaxed)),
+                cap: match job.max_bytes {
+                    Some(limit) => limit.min(cache_cap),
+                    None => fetch::cap(&file, cache_cap),
+                },
+                max_bytes: job.max_bytes,
+                renew_id: id.strip_prefix(HEAD_PREFIX),
                 also: &|| self.waiting_with(job),
+                span: None,
             };
             let (bytes, from) = match fetch::download(&self.hosts, agent, &want, buffer) {
                 Ok(fetched) => fetched,
@@ -1012,6 +1116,41 @@ impl Cache {
             };
         }
         None
+    }
+
+    /// Reads a byte window and drops it. The part name is not the file's, and neither a success
+    /// nor a miss is recorded against the file.
+    fn take_span(&self, agent: &ureq::Agent, job: &Job, buffer: &mut [u8]) {
+        let Some((start, end)) = job.span else {
+            return;
+        };
+        let (account, id) = &job.file;
+        let Some((file, url)) = self.hub.store().media(account, std::slice::from_ref(id)).ok().and_then(|mut known| known.pop()) else {
+            return;
+        };
+        if self.signed_out_since(job) {
+            return;
+        }
+        let dir = dir_for(&self.dir, account, id);
+        if protocol::private::dir(&dir).is_err() {
+            return;
+        }
+        let part = dir.join(format!(".{}.span.part", name_of(id)));
+        let want = fetch::Want {
+            account: None,
+            network: account.network,
+            file: &file,
+            url: &url,
+            adapter: job.adapter.as_ref(),
+            part: &part,
+            cap: fetch::cap(&file, self.cap.load(Ordering::Relaxed)),
+            also: &|| self.waiting_with(job),
+            max_bytes: None,
+            renew_id: None,
+            span: Some((start, end)),
+        };
+        let _ = fetch::download(&self.hosts, agent, &want, buffer);
+        let _ = std::fs::remove_file(&part);
     }
 
     /// Remembers where a file landed and removes the smaller size it replaces.

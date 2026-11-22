@@ -687,7 +687,10 @@ impl Builder<'_> {
         }
         let in_pre = self.verbatim > 0;
         element.style = match element.tag.as_str() {
-            "b" | "strong" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => Some(Style::Bold),
+            "b" | "strong" => Some(Style::Bold),
+            "h1" => Some(Style::Heading { level: 1 }),
+            "h2" => Some(Style::Heading { level: 2 }),
+            "h3" | "h4" | "h5" | "h6" => Some(Style::Heading { level: 3 }),
             "i" | "em" => Some(Style::Italic),
             "u" => Some(Style::Underline),
             "s" | "strike" | "del" => Some(Style::Strike),
@@ -1534,6 +1537,11 @@ pub(super) fn compose_with_mentions(text: &str, spans: &[Span]) -> (String, Vec<
             MentionKind::User => "person",
             MentionKind::Role => "tag",
             MentionKind::Channel | MentionKind::Everyone => "channel",
+            MentionKind::Command => {
+                escape_text(&mut out, &text[start..end], false);
+                cursor = end;
+                continue;
+            }
         };
         out.push_str("<span itemscope=\"\" itemtype=\"http://schema.skype.com/Mention\" itemid=\"");
         out.push_str(&item_id);

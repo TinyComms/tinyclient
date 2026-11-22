@@ -110,6 +110,20 @@ fn summary(scene: &Scene) -> String {
 /// Quick-pick status emojis offered in the rich status editor.
 const STATUS_EMOJIS: [&str; 6] = ["📅", "🌴", "🤒", "🏠", "🚌", "💬"];
 
+/// How long until a custom status clears, for the menu under the clear-after chips.
+fn clears_line(until: i64) -> String {
+    let left = until.saturating_sub(crate::view::now());
+    if left >= 86_400 {
+        format!("Clears in {}d", left / 86_400)
+    } else if left >= 3_600 {
+        format!("Clears in {}h", left / 3_600)
+    } else if left >= 60 {
+        format!("Clears in {}m", left / 60)
+    } else {
+        "Clears soon".to_owned()
+    }
+}
+
 /// Preset expiration choices for "Clear after" in the rich status editor.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ClearAfter {
@@ -117,15 +131,17 @@ pub enum ClearAfter {
     Never,
     Minutes30,
     Hour1,
+    Hours4,
     Today,
     ThisWeek,
 }
 
 impl ClearAfter {
-    const ALL: [ClearAfter; 5] = [
+    const ALL: [ClearAfter; 6] = [
         ClearAfter::Never,
         ClearAfter::Minutes30,
         ClearAfter::Hour1,
+        ClearAfter::Hours4,
         ClearAfter::Today,
         ClearAfter::ThisWeek,
     ];
@@ -135,6 +151,7 @@ impl ClearAfter {
             ClearAfter::Never => "Don't clear",
             ClearAfter::Minutes30 => "30m",
             ClearAfter::Hour1 => "1h",
+            ClearAfter::Hours4 => "4h",
             ClearAfter::Today => "Today",
             ClearAfter::ThisWeek => "This week",
         }
@@ -145,6 +162,7 @@ impl ClearAfter {
             ClearAfter::Never => None,
             ClearAfter::Minutes30 => Some(now + 30 * 60),
             ClearAfter::Hour1 => Some(now + 3600),
+            ClearAfter::Hours4 => Some(now + 4 * 3600),
             ClearAfter::Today => Some(now + 24 * 3600 - (now.rem_euclid(24 * 3600))),
             ClearAfter::ThisWeek => Some(now + 7 * 24 * 3600),
         }
@@ -200,6 +218,8 @@ pub struct StatusMenu {
     /// The account whose states and status text are showing.
     open: Option<AccountKey>,
     field: Entity<TextInput>,
+    /// What this Discord session says it is playing. Empty clears it. Not loaded from anyone else.
+    playing: Entity<TextInput>,
     /// Selected status emoji (empty means none / default) and clear-after preset for rich status.
     emoji: String,
     clear_after: ClearAfter,
@@ -267,6 +287,18 @@ impl StatusMenu {
             }
         })
         .detach();
+        let playing = cx.new(|cx| TextInput::new("What you're playing", cx));
+        cx.subscribe(&playing, |this, _, event: &InputEvent, cx| match event {
+            InputEvent::Changed => cx.notify(),
+            InputEvent::Submit => this.share_playing(cx),
+        })
+        .detach();
+        cx.subscribe(&playing, |this, _, key: &InputKey, cx| {
+            if *key == InputKey::Escape {
+                let _ = this.shell.update(cx, |shell, cx| shell.close_menu(cx));
+            }
+        })
+        .detach();
         let name = cx.new(|cx| TextInput::new("Your name", cx));
         cx.subscribe(&name, |this, _, event: &InputEvent, cx| match event {
             InputEvent::Changed => cx.notify(),
@@ -287,6 +319,7 @@ impl StatusMenu {
             scene: Scene::default(),
             open: None,
             field,
+            playing,
             emoji: String::new(),
             clear_after: ClearAfter::Never,
             refused: None,
@@ -391,9 +424,13 @@ impl StatusMenu {
         if self.open.as_ref() == Some(account) {
             self.open = None;
         } else {
-            let said = self.own(account).map(|own| own.status.clone()).unwrap_or_default();
+            let (said, emoji) = self
+                .own(account)
+                .map(|own| (own.status.clone(), own.status_emoji.clone()))
+                .unwrap_or_default();
             self.field.update(cx, |field, cx| field.set_text(&said, cx));
-            self.emoji.clear();
+            self.playing.update(cx, |field, cx| field.set_text("", cx));
+            self.emoji = emoji;
             self.clear_after = ClearAfter::Never;
             self.open = Some(account.clone());
         }
@@ -452,6 +489,8 @@ impl StatusMenu {
                 Some(String::new())
             } else if !self.emoji.is_empty() {
                 Some(self.emoji.clone())
+            } else if !own.status_emoji.is_empty() {
+                Some(String::new())
             } else {
                 None
             };
@@ -712,6 +751,38 @@ impl StatusMenu {
         box_div = box_div.child(form);
         box_div
     }
+    /// Shares or clears what this Discord session is playing. The words are the local user's.
+    fn share_playing(&mut self, cx: &mut Context<Self>) {
+        let Some(own) = self.open.as_ref().and_then(|open| self.own(open)).cloned() else {
+            return;
+        };
+        if own.key.network != Network::Discord {
+            return;
+        }
+        let name: String = self.playing.read(cx).text().trim().chars().take(128).collect();
+        self.playing.update(cx, |field, cx| field.set_text(&name, cx));
+        self.send_activity(own.key, name, cx);
+    }
+
+    fn send_activity(&mut self, account: AccountKey, name: String, cx: &mut Context<Self>) {
+        self.refused = None;
+        cx.notify();
+        if only_draws() {
+            return;
+        }
+        let this = cx.weak_entity();
+        super::ask_later(cx, Request::SetActivity { account, name }, move |answer, cx| {
+            let refused = match answer {
+                Ok(Response::Error { detail, .. }) => Some(detail),
+                Ok(_) => None,
+                Err(err) => Some(crate::client::trouble_words("people", &err)),
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.refused = refused;
+                cx.notify();
+            });
+        });
+    }
 
     fn account_row(&self, ix: usize, own: &Own, cx: &mut Context<Self>) -> Stateful<Div> {
         let network = own.key.network;
@@ -883,7 +954,10 @@ impl StatusMenu {
             return choices;
         }
         let focused = self.field.focus_handle(cx).is_focused(window);
-        let typed = !self.field.read(cx).text().is_empty();
+        let typed = !self.field.read(cx).text().is_empty()
+            || !self.emoji.is_empty()
+            || !own.status.is_empty()
+            || !own.status_emoji.is_empty();
         let clear = typed.then(|| {
             div()
                 .id("own-status-clear")
@@ -903,7 +977,9 @@ impl StatusMenu {
                 }))
                 .child(glyph("icons/x.svg", 14., theme::text_soft()))
         });
-        let unsent = self.field.read(cx).text().trim() != own.status.trim() || !self.emoji.is_empty();
+        let unsent = self.field.read(cx).text().trim() != own.status.trim()
+            || self.emoji != own.status_emoji
+            || self.clear_after != ClearAfter::Never;
         let leading = if !self.emoji.is_empty() {
             div().type_small().child(self.emoji.clone()).into_any_element()
         } else {
@@ -965,6 +1041,11 @@ impl StatusMenu {
                         }))
                 }));
             status_box = status_box.child(emoji_row).child(clear_row);
+            if let Some(until) = own.status_until.filter(|&until| until > crate::view::now()) {
+                status_box = status_box.child(
+                    div().type_micro().text_color(theme::text_faint()).child(clears_line(until)),
+                );
+            }
         }
         let mut out = choices.child(status_box.when(unsent, |status| {
             status.child(div().type_small().text_color(theme::text_faint()).child(crate::gui::shortcuts::label("Return sets it.")))
@@ -972,7 +1053,24 @@ impl StatusMenu {
         if own.can.out_of_office {
             out = out.child(self.ooo_panel(ix, own, window, cx));
         }
-        out
+        if network != Network::Discord {
+            return out;
+        }
+        let playing_focused = self.playing.focus_handle(cx).is_focused(window);
+        let sharing = !self.playing.read(cx).text().trim().is_empty();
+        out.child(
+            div()
+                .mt(px(4.))
+                .px(px(8.))
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(div().type_micro().text_color(theme::text_faint()).child("Playing"))
+                .child(field(playing_focused).line_height(px(18.)).child(div().flex_1().min_w_0().child(self.playing.clone())))
+                .when(sharing, |row| {
+                    row.child(div().type_small().text_color(theme::text_faint()).child(crate::gui::shortcuts::label("Return shares it.")))
+                }),
+        )
     }
 }
 
@@ -1182,6 +1280,8 @@ mod tests {
             me: "me".into(),
             presence,
             status: String::new(),
+            status_emoji: String::new(),
+            status_until: None,
             avatar: None,
             can: protocol::Capabilities::default(),
         }

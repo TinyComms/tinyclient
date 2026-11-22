@@ -116,7 +116,7 @@
         "features": ["COMMUNITY"]
       },
       "roles": [
-        {"id": "4000", "name": "@everyone", "permissions": "36769344", "position": 0, "color": 0},
+        {"id": "4000", "name": "@everyone", "permissions": "309274414656", "position": 0, "color": 0},
         {"id": "4010", "name": "mods", "permissions": "0", "position": 2, "color": 15105570},
         {"id": "4011", "name": "core", "permissions": "0", "position": 3, "color": 0}
       ],
@@ -138,7 +138,7 @@
           {"id": "4000", "type": 0, "allow": "0", "deny": "1024"},
           {"id": "4010", "type": 0, "allow": "1024", "deny": "0"}
         ]},
-        {"id": "4106", "type": 15, "name": "help", "position": 4, "parent_id": "4100", "last_message_id": "1300080000000000000", "permission_overwrites": []},
+        {"id": "4106", "type": 15, "name": "help", "position": 4, "parent_id": "4100", "last_message_id": "1300080000000000000", "topic": "Say what you tried.", "flags": 16, "available_tags": [{"id": "9001", "name": "question", "emoji_name": "❓"}, {"id": "9002", "name": "solved", "moderated": true, "emoji_id": "7001", "emoji_name": "ferris"}], "default_thread_rate_limit_per_user": 30, "permission_overwrites": []},
         {"id": "4201", "type": 2, "name": "Lounge", "position": 0, "parent_id": "4200", "bitrate": 64000, "user_limit": 12, "permission_overwrites": []},
         {"id": "4202", "type": 13, "name": "Town hall", "position": 1, "parent_id": "4200", "bitrate": 64000, "user_limit": 0, "permission_overwrites": []},
         {"id": "4105", "type": 0, "name": "rules", "position": 0, "parent_id": null, "last_message_id": "1300000000000000400", "permission_overwrites": []},

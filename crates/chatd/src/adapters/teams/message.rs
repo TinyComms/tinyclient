@@ -541,6 +541,8 @@ pub(super) fn parse_link_previews(
             title,
             description,
             image,
+            duration: 0,
+            opens_in_browser: false,
         });
     }
     previews
@@ -1431,6 +1433,7 @@ pub(super) fn invoke_card_action(
                 count: people.len() as u32,
                 mine: people.contains(&me),
                 who: people.iter().take(protocol::REACTION_REACTORS).map(|mri| (*mri).to_owned()).collect(),
+                ..Reaction::default()
             });
         }
         found
@@ -1934,6 +1937,8 @@ pub(super) fn invoke_card_action(
             title: title.to_owned(),
             description: description.to_owned(),
             image,
+            duration: 0,
+            opens_in_browser: false,
         };
         Some((entry, preview))
     }
@@ -2818,6 +2823,11 @@ mod tests {
             value: r#"{"action":"approve"}"#.to_owned(),
             confirm: None,
             kind: protocol::ControlKind::Button { url: String::new(), style: protocol::ControlStyle::Primary },
+            disabled: false,
+            emoji: String::new(),
+            row: 0,
+            min_values: 0,
+            max_values: 0,
         });
         assert!(matching_control(&message, "app", "approve", r#"{"action":"approve"}"#).is_some());
         assert!(matching_control(&message, "app", "approve", r#"{"action":"reject"}"#).is_none());

@@ -1847,7 +1847,7 @@ impl World {
     /// Asks for files as the shell does for what is on screen, until `id` is on disk.
     fn fetched(&self, account: &Key, id: &str, size: Option<u32>) -> protocol::MediaFile {
         self.until("the file to be on disk", || {
-            let asked = Request::Fetch { retry: false, size, account: account.account(), ids: vec![id.to_owned()] };
+            let asked = Request::Fetch { retry: false, size, account: account.account(), ids: vec![id.to_owned()], span: None };
             match self.ask(asked) {
                 Response::Media { mut files } => files.pop().filter(|file| file.path.is_some()),
                 other => panic!("{other:?}"),
@@ -2167,7 +2167,7 @@ fn a_channel_reads_as_it_does_in_slack_and_stays_current() {
     // Its files are registered with their sizes before any byte is fetched. Only the upload is
     // asked for here: its address is the fake's, and the avatar's and emoji's are Slack's own.
     let wanted = vec![image.file.id.clone(), thumb.id.clone(), "F0NOPE".to_owned()];
-    let Response::Media { files } = world.ask(Request::Fetch { retry: false, size: None, account: general.account(), ids: wanted }) else {
+    let Response::Media { files } = world.ask(Request::Fetch { retry: false, size: None, account: general.account(), ids: wanted, span: None }) else {
         panic!("no media");
     };
     let known: Vec<(&str, MediaKind, u32, u32)> = files.iter().map(|file| (file.id.as_str(), file.kind, file.width, file.height)).collect();
@@ -2897,6 +2897,8 @@ fn reacting_editing_and_deleting_ask_slack_and_show_what_slack_says() {
         message_id: mine.to_owned(),
         text: "good morning <team> & all".to_owned(),
         spans: Vec::new(),
+        suppress_embeds: false,
+        keep_attachments: None,
     };
     assert_eq!(world.ask(edit), Response::Ok);
     let edited = world.message(&general, mine).unwrap();
@@ -2905,7 +2907,7 @@ fn reacting_editing_and_deleting_ask_slack_and_show_what_slack_says() {
     assert_eq!((said(&updated, "channel"), said(&updated, "ts")), ("C0GEN".to_owned(), mine.to_owned()));
     assert_eq!(updated.params["text"], "good morning &lt;team&gt; &amp; all");
     // Only my own: chatd refuses the rest before Slack hears of it.
-    let theirs = Request::Edit { conversation: general.clone(), message_id: ROOT.to_owned(), text: "mine now".to_owned(), spans: Vec::new() };
+    let theirs = Request::Edit { conversation: general.clone(), message_id: ROOT.to_owned(), text: "mine now".to_owned(), spans: Vec::new(), suppress_embeds: false, keep_attachments: None };
     assert!(matches!(world.ask(theirs), Response::Error { code: ErrorCode::Refused, .. }), "someone else's message is not mine to edit");
     assert_eq!(world.fake.calls(ALPHA, "chat.update").len(), 1);
 
@@ -3383,7 +3385,7 @@ fn a_search_asks_slacks_own_search_once_and_maps_hits_to_their_conversations() {
 
     // One conversation: Slack's own search, narrowed to it, and the hit mapped like the
     // cache's. A channel the sidebar does not know is not a hit we can open.
-    let asked = world.ask(Request::SearchNetwork { conversation: Some(alpha("C0GEN")), space: None, query: "deploy".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
+    let asked = world.ask(Request::SearchNetwork { conversation: Some(alpha("C0GEN")), space: None, query: "deploy".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None, home: false  });
     let Response::MessageHits { hits, .. } = asked else { panic!("{asked:?}") };
     assert_eq!(hits.len(), 1, "{hits:?}");
     let hit = &hits[0];
@@ -3400,7 +3402,7 @@ fn a_search_asks_slacks_own_search_once_and_maps_hits_to_their_conversations() {
 
     // The workspace's own search: no channel filter, and every hit in a conversation the
     // sidebar knows, newest first.
-    let asked = world.ask(Request::SearchNetwork { conversation: None, space: Some(alpha("T01ALPHA")), query: "deploy".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
+    let asked = world.ask(Request::SearchNetwork { conversation: None, space: Some(alpha("T01ALPHA")), query: "deploy".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None, home: false  });
     let Response::MessageHits { hits, .. } = asked else { panic!("{asked:?}") };
     let mapped: Vec<(&str, &str)> = hits.iter().map(|hit| (hit.conversation.id.as_str(), hit.title.as_str())).collect();
     assert_eq!(mapped, [("C0GEN", "#general"), ("C0DEP", "#deploys")]);
@@ -3415,7 +3417,7 @@ fn a_search_slack_will_not_do_is_refused_in_words_rather_than_faked() {
     });
     world.ready();
     // The web session cannot reach Slack's search: the user is told, and no hit is invented.
-    let refused = world.ask(Request::SearchNetwork { conversation: Some(alpha("C0GEN")), space: None, query: "deploy".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
+    let refused = world.ask(Request::SearchNetwork { conversation: Some(alpha("C0GEN")), space: None, query: "deploy".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None, home: false  });
     assert!(matches!(&refused, Response::Error { detail, .. } if detail == "Slack's own search isn't reachable with this session."), "{refused:?}");
 }
 
@@ -3564,7 +3566,7 @@ fn a_custom_emoji_is_a_picture_without_opening_the_picker() {
     });
     assert_eq!(ana.emoji, ":waveblob:");
     let id = emoji_id("waveblob", wave);
-    let Response::Media { files } = world.ask(Request::Fetch { retry: false, size: None, account: general.account(), ids: vec![id.clone()] }) else {
+    let Response::Media { files } = world.ask(Request::Fetch { retry: false, size: None, account: general.account(), ids: vec![id.clone()], span: None }) else {
         panic!("no media");
     };
     assert!(files.iter().any(|file| file.id == id && file.kind == MediaKind::Emoji), "the status emoji is registered as a file");
@@ -3736,7 +3738,7 @@ fn closing_a_direct_or_leaving_a_group_dm_calls_conversations_close_and_drops_th
 
     let closed = world.ask(Request::CloseDirect { conversation: dm.clone() });
     assert!(matches!(closed, Response::Ok), "CloseDirect should succeed, got {closed:?}");
-    let left = world.ask(Request::Leave { conversation: group.clone() });
+    let left = world.ask(Request::Leave { conversation: group.clone(), silent: false });
     assert!(matches!(left, Response::Ok), "Leave on group DM should succeed, got {left:?}");
 
     let calls = world.fake.calls(ALPHA, "conversations.close");
@@ -4218,7 +4220,7 @@ fn slack_leave_rename_archive_and_browse_archived_channels() {
     assert!(world.account("T01ALPHA").can.archive, "Slack should advertise archive capability");
 
     // Leaving #general refuses with a clear human-readable message.
-    let err = world.ask(Request::Leave { conversation: general.clone() });
+    let err = world.ask(Request::Leave { conversation: general.clone(), silent: false });
     match err {
         Response::Error { code: ErrorCode::Refused, detail } => {
             assert!(detail.to_lowercase().contains("general"), "expected clear cant_leave_general message, got: {detail}");
@@ -4296,7 +4298,7 @@ fn slack_leave_rename_archive_and_browse_archived_channels() {
     assert!(!row.archived && !row.read_only, "unarchived channel must clear archived and read-only");
 
     // Leave a regular channel calls conversations.leave and drops it from the tree.
-    let left = world.ask(Request::Leave { conversation: side.clone() });
+    let left = world.ask(Request::Leave { conversation: side.clone(), silent: false });
     assert_eq!(left, Response::Ok);
     let leave_calls = world.fake.calls(ALPHA, "conversations.leave");
     assert!(leave_calls.iter().any(|c| c.params["channel"] == "C0SIDE"));
@@ -5235,6 +5237,8 @@ fn slack_create_channel_and_start_group_dm() {
         kind: ConversationKind::Channel,
         private: false,
         group: None,
+        description: None,
+        username: None,
     }) else {
         panic!("expected Conversation for public CreateChannel");
     };
@@ -5250,6 +5254,8 @@ fn slack_create_channel_and_start_group_dm() {
         kind: ConversationKind::Channel,
         private: true,
         group: None,
+        description: None,
+        username: None,
     }) else {
         panic!("expected Conversation for private CreateChannel");
     };
@@ -5268,6 +5274,8 @@ fn slack_create_channel_and_start_group_dm() {
         kind: ConversationKind::Channel,
         private: false,
         group: None,
+        description: None,
+        username: None,
     }) {
         Response::Error { code: ErrorCode::Refused, detail } => {
             assert!(detail.to_lowercase().contains("lowercase"), "got: {detail}");
@@ -5301,6 +5309,8 @@ fn slack_create_channel_and_start_group_dm() {
         kind: ConversationKind::Channel,
         private: false,
         group: None,
+        description: None,
+        username: None,
     }) {
         Response::Error { code: ErrorCode::Refused, .. } => {}
         other => panic!("expected Refused for restricted_action, got {other:?}"),
@@ -6029,6 +6039,7 @@ fn slack_search_filters_and_no_duplicate_in_modifier() {
         after: Some(1_735_689_600),
         mentions_me: false,
         sort: protocol::SearchSort::Newest,
+        ..Default::default()
     };
     let Response::MessageHits { .. } = world.ask(Request::SearchNetwork {
         conversation: Some(general.clone()),
@@ -6038,6 +6049,7 @@ fn slack_search_filters_and_no_duplicate_in_modifier() {
         query: "deploy".into(),
         filters: filters.clone(),
         cursor: None,
+        home: false,
     }) else {
         panic!("expected Response::MessageHits");
     };
@@ -6059,6 +6071,7 @@ fn slack_search_filters_and_no_duplicate_in_modifier() {
         query: "in:#deployments during:2026-11 release".into(),
         filters: protocol::SearchFilters::default(),
         cursor: None,
+        home: false,
     }) else {
         panic!("expected Response::MessageHits");
     };
@@ -6535,6 +6548,7 @@ fn slack_search_paging_unjoined_channels_sort_files_and_everywhere() {
         query: "release".into(),
         filters: protocol::SearchFilters { sort: protocol::SearchSort::Relevance, ..Default::default() },
         cursor: None,
+        home: false,
     }) else {
         panic!("expected MessageHits page 1");
     };
@@ -6564,6 +6578,7 @@ fn slack_search_paging_unjoined_channels_sort_files_and_everywhere() {
         query: "release".into(),
         filters: protocol::SearchFilters::default(),
         cursor: c1,
+        home: false,
     }) else {
         panic!("expected MessageHits page 2");
     };
@@ -6600,6 +6615,7 @@ fn slack_search_paging_unjoined_channels_sort_files_and_everywhere() {
         query: "release".into(),
         filters: protocol::SearchFilters::default(),
         cursor: None,
+        home: false,
     }) else {
         panic!("expected Everywhere MessageHits");
     };
@@ -6620,7 +6636,7 @@ fn slack_search_paging_unjoined_channels_sort_files_and_everywhere() {
     let mut cursor = None;
     let mut saw_page2 = false;
     for _ in 0..12 {
-        let Response::MessageHits { hits, cursor: next, not_searched } = world.ask(Request::SearchNetwork {
+        let Response::MessageHits { hits, cursor: next, not_searched, .. } = world.ask(Request::SearchNetwork {
             conversation: None,
             space: None,
             account: None,
@@ -6628,6 +6644,7 @@ fn slack_search_paging_unjoined_channels_sort_files_and_everywhere() {
             query: "release".into(),
             filters: protocol::SearchFilters::default(),
             cursor,
+            home: false,
         }) else {
             panic!("expected Everywhere MessageHits");
         };
@@ -6686,6 +6703,7 @@ fn slack_search_omits_a_named_private_channel() {
         query: "zzzz-not-in-the-text".into(),
         filters: protocol::SearchFilters::default(),
         cursor: None,
+        home: false,
     }) else {
         panic!("expected MessageHits");
     };
@@ -6722,6 +6740,7 @@ fn slack_search_falls_back_to_search_modules_when_search_messages_is_refused() {
         query: "deploy".into(),
         filters: protocol::SearchFilters::default(),
         cursor: None,
+        home: false,
     }) else {
         panic!("expected MessageHits from search.modules fallback");
     };

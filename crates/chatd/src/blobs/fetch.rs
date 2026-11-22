@@ -193,9 +193,22 @@ pub struct Want<'a> {
     /// Where the bytes go while they arrive. The caller renames it once it is whole.
     pub part: &'a Path,
     pub cap: u64,
+    /// When set, sends `Range: bytes=0-(max_bytes-1)`, accepts HTTP 206 or 200, and stops
+    /// cleanly after `max_bytes` bytes (for inline text/code attachment previews).
+    pub max_bytes: Option<u64>,
+    /// Underlying media id to pass to `Command::Download` when renewing an expiring URL for a
+    /// `head:` preview entry.
+    pub renew_id: Option<&'a str>,
     /// Other files of the account waiting to be fetched, as `(id, address)`, read only when
     /// an address has to be renewed.
     pub also: &'a dyn Fn() -> Vec<(String, String)>,
+    /// A byte window, inclusive start and exclusive end. Absent reads the whole file.
+    pub span: Option<(u64, u64)>,
+}
+
+/// `Range` for a window `[start, end)`. None when the window is empty.
+pub fn range_header(start: u64, end: u64) -> Option<String> {
+    (end > start).then(|| format!("bytes={start}-{}", end - 1))
 }
 
 /// True for an address that says of itself that it has run out, so asking it is a wasted
@@ -213,14 +226,15 @@ fn run_out(network: Network, url: &str) -> bool {
 /// one request to the network and record them (`Context::media_refreshed`); their answers are
 /// not waited for.
 fn renew(want: &Want) -> Result<Download, String> {
+    let target_id = want.renew_id.unwrap_or(&want.file.id);
     if let Some(adapter) = want.adapter {
         let others = (want.also)();
-        for (id, url) in others.into_iter().filter(|(id, url)| *id != want.file.id && run_out(want.network, url)) {
+        for (id, url) in others.into_iter().filter(|(id, url)| *id != target_id && *id != want.file.id && run_out(want.network, url)) {
             let (reply, _) = channel();
             let _ = adapter.send(Command::Download { id, url, reply });
         }
     }
-    ask(want.adapter, &want.file.id, want.url)
+    ask(want.adapter, target_id, want.url)
 }
 
 fn expects_image(kind: MediaKind) -> bool {
@@ -257,14 +271,22 @@ fn get(hosts: &Hosts, agent: &ureq::Agent, want: &Want, from: &Download, buffer:
             return Err(elsewhere());
         };
         let mut request = agent.get(&url);
+        let ranged = want.max_bytes.filter(|&limit| limit > 0 && from.sealed.is_none());
+        if let Some(limit) = ranged {
+            request = request.header("Range", &format!("bytes=0-{}", limit.saturating_sub(1)));
+        }
         if trust == Trust::Session {
             for (name, value) in &from.headers {
                 request = request.header(name.as_str(), value.as_str());
             }
         }
+        if let Some(range) = want.span.and_then(|(start, end)| range_header(start, end)) {
+            request = request.header("Range", range.as_str());
+        }
         let response = request.call().map_err(|err| Failed::Other(format!("The download failed: {err}.")))?;
         match response.status().as_u16() {
             200 => break response,
+            206 if ranged.is_some() || want.span.is_some() => break response,
             gone @ (403 | 404) => return Err(Failed::Gone(gone)),
             moved @ (301 | 302 | 303 | 307 | 308) if hops < REDIRECTS => {
                 let location = response.headers().get("location").and_then(|value| value.to_str().ok());
@@ -274,6 +296,7 @@ fn get(hosts: &Hosts, agent: &ureq::Agent, want: &Want, from: &Download, buffer:
             other => return Err(Failed::Other(format!("The server answered {other}."))),
         }
     };
+    let ranged = want.max_bytes.filter(|&limit| limit > 0 && from.sealed.is_none());
     let body = response.body();
     let mime = body.mime_type().unwrap_or("").to_ascii_lowercase();
     // A sign-in page where a file should be is the usual way a session shows it has ended. A
@@ -282,23 +305,41 @@ fn get(hosts: &Hosts, agent: &ureq::Agent, want: &Want, from: &Download, buffer:
         return Err(Failed::Other(format!("The server sent {mime:?}, not the file.")));
     }
     let too_large = || Failed::Other(format!("The file is larger than {} MB.", want.cap.div_ceil(MB)));
-    if body.content_length().is_some_and(|length| length > want.cap) {
+    // A window stops after its own bytes. A server that ignores Range answers 200 and names the
+    // whole file; that length is not the file we keep, so it is not held to the file's cap.
+    let window = want.span.and_then(|(start, end)| (end > start).then_some(end - start));
+    if ranged.is_none() && window.is_none() && body.content_length().is_some_and(|length| length > want.cap) {
         return Err(too_large());
     }
+    // A head preview or a window stops after its own bytes; a whole file is held to its cap.
+    let stop = ranged.or(window);
     let broken = |err: std::io::Error| Failed::Other(format!("The download failed: {err}."));
     let mut out = protocol::private::create(want.part).map_err(broken)?;
     let mut reader = response.body_mut().as_reader();
     let mut total = 0u64;
     loop {
-        let read = reader.read(buffer).map_err(broken)?;
+        let chunk = match stop {
+            Some(limit) => {
+                let room = limit.saturating_sub(total);
+                if room == 0 {
+                    return Ok(total);
+                }
+                buffer.len().min(room as usize)
+            }
+            None => buffer.len(),
+        };
+        let read = reader.read(&mut buffer[..chunk]).map_err(broken)?;
         if read == 0 {
             return Ok(total);
         }
         total += read as u64;
-        if total > want.cap {
+        if stop.is_none() && total > want.cap {
             return Err(too_large());
         }
         out.write_all(&buffer[..read]).map_err(broken)?;
+        if stop.is_some_and(|limit| total >= limit) {
+            return Ok(total);
+        }
     }
 }
 
@@ -442,7 +483,7 @@ fn fetch(hosts: &Hosts, agent: &ureq::Agent, want: &Want, buffer: &mut [u8]) -> 
         None => Err(format!("{} does not serve files from that address.", want.network.label())),
         // Only the adapter holds the session, so it says how.
         Some(Trust::Session) => {
-            let from = ask(want.adapter, &want.file.id, want.url)?;
+            let from = ask(want.adapter, want.renew_id.unwrap_or(&want.file.id), want.url)?;
             let bytes = get(hosts, agent, want, &from, buffer).map_err(explain)?;
             match &from.sealed {
                 Some(sealed) => Ok((open_sealed(want, sealed)?, from.url)),
@@ -561,7 +602,10 @@ mod tests {
             adapter,
             part: &part,
             cap: MB,
+            max_bytes: None,
+            renew_id: None,
             also: &Vec::new,
+            span: None,
         };
         let done = download(hosts, &agent(), &want, &mut vec![0u8; BUFFER]).map(|_| std::fs::read(&part).unwrap());
         assert_eq!(done.is_err(), !part.exists(), "a failure leaves no part file");
@@ -646,7 +690,10 @@ mod tests {
             adapter: Some(&commands),
             part: &part,
             cap: MB,
+            max_bytes: None,
+            renew_id: None,
             also: &|| waiting.clone(),
+            span: None,
         };
         download(&hosts, &agent(), &want, &mut vec![0u8; BUFFER]).unwrap();
         let _ = std::fs::remove_file(&part);
@@ -800,5 +847,150 @@ mod tests {
         assert!((20 * MB..24 * MB).contains(&cap(&file(MediaKind::File, 20 * MB), cache)));
         assert_eq!(cap(&file(MediaKind::Video, 0), cache), 100 * MB);
         assert_eq!(cap(&file(MediaKind::File, 800 * MB), cache), cache);
+    }
+
+    #[test]
+    fn ranged_head_preview_sends_range_header_accepts_206_and_caps_200() {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (seen, ranges) = channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut reader = BufReader::new(&stream);
+                let mut req_line = String::new();
+                if reader.read_line(&mut req_line).is_err() {
+                    continue;
+                }
+                let path = req_line.split_whitespace().nth(1).unwrap_or("").to_owned();
+                let mut range_hdr = None;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some((k, v)) = line.split_once(':') {
+                        if k.eq_ignore_ascii_case("range") {
+                            range_hdr = Some(v.trim().to_owned());
+                        }
+                    }
+                }
+                let _ = seen.send((path.clone(), range_hdr));
+                let mut out = stream;
+                if path == "/partial.log" {
+                    let body = b"line1\nline2\n";
+                    let _ = write!(
+                        out,
+                        "HTTP/1.1 206 Partial Content\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = out.write_all(body);
+                } else {
+                    // Server ignores Range and sends 200 with a larger body: client caps at max_bytes.
+                    let body = vec![b'a'; 512];
+                    let _ = write!(
+                        out,
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = out.write_all(&body);
+                }
+            }
+        });
+        let hosts = Hosts { local: vec![("127.0.0.1".to_owned(), Trust::Open)] };
+        let file = MediaFile::new("head:att:1", MediaKind::File);
+
+        let part1 = std::env::temp_dir().join(format!("tinyclient-range-206-{}.part", std::process::id()));
+        let want1 = Want {
+            account: None,
+            network: Network::Discord,
+            file: &file,
+            url: &format!("http://127.0.0.1:{port}/partial.log"),
+            adapter: None,
+            part: &part1,
+            cap: 64,
+            max_bytes: Some(64),
+            span: None,
+            renew_id: Some("att:1"),
+            also: &Vec::new,
+        };
+        let (bytes, _) = download(&hosts, &agent(), &want1, &mut vec![0u8; BUFFER]).unwrap();
+        assert_eq!(bytes, 12);
+        assert_eq!(std::fs::read(&part1).unwrap(), b"line1\nline2\n");
+        let _ = std::fs::remove_file(&part1);
+        assert_eq!(ranges.try_recv().unwrap(), ("/partial.log".to_owned(), Some("bytes=0-63".to_owned())));
+
+        let part2 = std::env::temp_dir().join(format!("tinyclient-range-200-{}.part", std::process::id()));
+        let want2 = Want {
+            account: None,
+            network: Network::Discord,
+            file: &file,
+            url: &format!("http://127.0.0.1:{port}/full.log"),
+            adapter: None,
+            part: &part2,
+            cap: 64,
+            max_bytes: Some(64),
+            span: None,
+            renew_id: Some("att:1"),
+            also: &Vec::new,
+        };
+        let (bytes2, _) = download(&hosts, &agent(), &want2, &mut vec![0u8; BUFFER]).unwrap();
+        assert_eq!(bytes2, 64);
+        assert_eq!(std::fs::read(&part2).unwrap().len(), 64);
+        let _ = std::fs::remove_file(&part2);
+        assert_eq!(ranges.try_recv().unwrap(), ("/full.log".to_owned(), Some("bytes=0-63".to_owned())));
+    }
+
+    #[test]
+    fn a_window_asks_for_a_range_and_stops_even_when_the_server_sends_the_file() {
+        assert_eq!(range_header(0, 65_536).as_deref(), Some("bytes=0-65535"));
+        assert_eq!(range_header(10, 138).as_deref(), Some("bytes=10-137"));
+        assert_eq!(range_header(5, 5), None);
+        assert_eq!(range_header(8, 4), None);
+
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (seen, asked) = channel();
+        std::thread::spawn(move || {
+            let stream = listener.incoming().next().unwrap().unwrap();
+            let mut reader = BufReader::new(stream);
+            let (mut range, mut line) = (String::new(), String::new());
+            while reader.read_line(&mut line).unwrap_or(0) > 2 {
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("range:") {
+                    range = value.trim().to_owned();
+                }
+                line.clear();
+            }
+            let _ = seen.send(range);
+            let body = vec![b'a'; 4_000];
+            let head = format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n", body.len());
+            let mut out = reader.into_inner();
+            let _ = out.write_all(head.as_bytes());
+            let _ = out.write_all(&body);
+        });
+        let hosts = Hosts { local: vec![("127.0.0.1".to_owned(), Trust::Open)] };
+        let part = std::env::temp_dir().join(format!("tinyclient-fetch-{}-span.part", std::process::id()));
+        let file = MediaFile::new("clip", MediaKind::Video);
+        let url = format!("http://127.0.0.1:{port}/clip.mp4");
+        let want = Want {
+            account: None,
+            network: Network::Discord,
+            file: &file,
+            url: &url,
+            adapter: None,
+            part: &part,
+            cap: 32,
+            also: &Vec::new,
+            max_bytes: None,
+            renew_id: None,
+            span: Some((10, 138)),
+        };
+        let bytes = download(&hosts, &agent(), &want, &mut vec![0u8; 64]).unwrap().0;
+        let kept = std::fs::read(&part).unwrap();
+        let _ = std::fs::remove_file(&part);
+        assert_eq!(asked.recv().unwrap(), "bytes=10-137");
+        assert_eq!(bytes, 128, "a window is not the whole answer");
+        assert_eq!(kept.len(), 128);
     }
 }

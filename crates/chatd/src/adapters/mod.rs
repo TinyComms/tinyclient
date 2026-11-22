@@ -63,14 +63,14 @@ pub mod tiny_bots;
 use crate::hub::{lock, now, Hub};
 use crate::session;
 use crate::store::{
-    ConversationRow, Filing, FolderRow, PersonDetails, PersonRow, PreviewLine, SpaceRow, Stored,
+    ConversationRow, Filing, FolderRow, PersonDetails, PersonRow, PostCard, PreviewLine, SpaceRow, Stored,
     KEEP_MESSAGES,
 };
 use protocol::{
     AccountKey, Activity, CallFailure, CallState, Capabilities, CatalogItem, CatalogKind, Change,
     Contact, Group, Key, Link, MediaFile, MemberSection, Message, MessageHit, Network, Notify,
     Occupant, Occupants, Outgoing, Participant, Person, Presence, Reaction, RelateAction, Relation,
-    SendState, SharedItem, SharedKind, Compose, Typist, VoiceJoin, Warning, Watching,
+    SendState, SharedItem, SharedKind, Compose, TranslatedMessage, Typist, VoiceJoin, Warning, Watching,
 };
 use std::collections::{HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -123,12 +123,15 @@ impl std::fmt::Debug for SealedFile {
     }
 }
 
-/// What the search's ask names: a Space's own search, one conversation's, or the whole account.
+/// What the search's ask names: a Space's own search, one conversation's, the whole account,
+/// or one account's direct messages (`Home`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchScope {
     Space(String),
     Conversation(String),
     Account,
+    /// Every direct message on this account. Not a search of every server.
+    Home,
 }
 
 /// One page of recent calls across all chats on an account (`Command::CallHistory`).
@@ -153,6 +156,10 @@ pub struct About {
     pub bio: String,
     /// Titles of the Spaces we share.
     pub mutual_spaces: Vec<String>,
+    /// Structured mutual spaces (key, name, nickname) for clickable navigation.
+    pub mutual_space_items: Vec<protocol::MutualSpace>,
+    /// Mutual friends (capped).
+    pub mutual_people: Vec<Person>,
     /// As the network names it: `Europe/Lisbon`.
     pub time_zone: String,
     /// Seconds east of UTC now.
@@ -178,6 +185,8 @@ pub struct About {
     pub reports: Vec<protocol::ProfilePerson>,
     /// Role names in that Space, colours left out.
     pub roles: Vec<String>,
+    /// Role ids in that Space. The card uses these to give or take roles; names stay in `roles`.
+    pub role_ids: Vec<String>,
     /// Email and phone; chatd masks phone numbers.
     pub contacts: Vec<Contact>,
     /// Mutual Spaces in all, when more than `mutual_spaces` lists.
@@ -192,6 +201,13 @@ pub struct About {
     pub away_until: Option<i64>,
     pub note: String,
     pub warning: Option<Warning>,
+    pub badges: Vec<protocol::ProfileBadge>,
+    pub connections: Vec<protocol::ProfileConnection>,
+    pub server_tag: String,
+    /// Space-scoped avatar override (e.g. Discord server avatar), kept out of global People storage.
+    pub avatar: Option<protocol::MediaFile>,
+    /// True when this profile carries per-Space overrides (server avatar, banner, bio, pronouns).
+    pub server_profile: bool,
 }
 
 /// What a conversation's info pane says beyond its row, as the network tells it.
@@ -208,13 +224,14 @@ pub struct ConversationAbout {
     pub link: String,
     pub disappearing: Option<u32>,
     pub bookmarks: Vec<protocol::Bookmark>,
+    pub pending_requests: u32,
     pub tabs: Vec<protocol::ConversationTab>,
     /// The meeting this chat is for, when the network gave a start time.
     pub meeting: Option<protocol::MeetingEvent>,
 }
 
 /// What a Space's info says, as the network tells it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SpaceAbout {
     pub description: String,
     pub members: Option<u32>,
@@ -226,6 +243,59 @@ pub struct SpaceAbout {
     pub link: String,
     pub domain: String,
     pub url: String,
+    pub banner: Option<MediaFile>,
+    pub boost_level: u8,
+    pub boosts: u32,
+    pub mark: Option<protocol::Mark>,
+    pub system_channel_id: Option<String>,
+    pub afk_channel_id: Option<String>,
+    pub afk_timeout: u32,
+    pub default_notify: Option<Notify>,
+    pub vanity_url: Option<String>,
+    pub invites_disabled: bool,
+    pub can_change_nickname: bool,
+    pub suppress_everyone: bool,
+    pub suppress_roles: bool,
+    pub highlights: bool,
+    pub events: bool,
+    pub mobile_push: bool,
+    pub channel_overrides: Vec<protocol::SpaceChannelOverride>,
+    pub privacy: Option<protocol::SpacePrivacy>,
+}
+
+impl Default for SpaceAbout {
+    fn default() -> SpaceAbout {
+        SpaceAbout {
+            description: String::new(),
+            members: None,
+            online: None,
+            nickname: String::new(),
+            roles: Vec::new(),
+            notify: Notify::default(),
+            domain: String::new(),
+            link: String::new(),
+            url: String::new(),
+            tags: Vec::new(),
+            banner: None,
+            boost_level: 0,
+            boosts: 0,
+            mark: None,
+            system_channel_id: None,
+            afk_channel_id: None,
+            afk_timeout: 0,
+            default_notify: None,
+            vanity_url: None,
+            invites_disabled: false,
+            can_change_nickname: false,
+            suppress_everyone: false,
+            suppress_roles: false,
+            highlights: true,
+            events: true,
+            mobile_push: true,
+            channel_overrides: Vec::new(),
+            privacy: None,
+        }
+    }
 }
 
 /// A page of what was shared, from the network's own search.
@@ -244,13 +314,6 @@ pub struct AccountFilesPage {
     pub items: Vec<SharedItem>,
     pub cursor: Option<String>,
     pub more: bool,
-}
-
-/// One page of network message search hits (`Command::Search`).
-#[derive(Debug, Clone, Default)]
-pub struct SearchPage {
-    pub hits: Vec<MessageHit>,
-    pub cursor: Option<String>,
 }
 
 /// A page of a picker's catalog, and where the next one starts.
@@ -281,6 +344,33 @@ pub struct ReactorsPage {
     pub more: bool,
 }
 
+/// A page of a server's audit log (`Command::AuditLog`).
+#[derive(Debug, Clone, Default)]
+pub struct AuditPage {
+    pub entries: Vec<protocol::AuditEntry>,
+    pub more: bool,
+}
+
+/// A server's AutoMod rules and safety setup (`Command::AutomodRules`).
+#[derive(Debug, Clone, Default)]
+pub struct AutomodPage {
+    pub rules: Vec<protocol::AutomodRule>,
+    pub safety: protocol::SpaceSafety,
+}
+/// One page of network message search results (`Command::Search`).
+#[derive(Debug, Clone, Default)]
+pub struct SearchPage {
+    pub hits: Vec<MessageHit>,
+    pub cursor: Option<String>,
+    pub total: Option<u32>,
+}
+
+impl From<Vec<MessageHit>> for SearchPage {
+    fn from(hits: Vec<MessageHit>) -> Self {
+        Self { hits, cursor: None, total: None }
+    }
+}
+
 /// A picture on the call the user is in. Discord is the network that acts on it.
 pub enum Picture {
     /// Our camera, on or off.
@@ -289,6 +379,20 @@ pub enum Picture {
     Share(bool),
     /// Whose share to watch. `None` stops watching.
     Watch(Option<String>),
+}
+
+/// One page of a forum's posts, in the network's order. `None` from [`Command::OpenForum`] means
+/// the cache still answers an unfiltered first page.
+pub struct ForumPosts {
+    pub ids: Vec<String>,
+    pub total: u32,
+}
+/// A Telegram link opened inside the app. `None` when the chat is not one this account can show.
+#[derive(Debug, Clone)]
+pub struct OpenedLink {
+    pub conversation_id: String,
+    pub message_id: Option<String>,
+    pub title: String,
 }
 
 /// What chatd asks of an adapter. Ids are the network's own; the account is the adapter's.
@@ -378,6 +482,8 @@ pub enum Command {
         emoji: String,
         reply: Reply<()>,
     },
+    /// Per-conversation send permissions, slow mode, timed mute, and paid-message star price.
+    SendRules { conversation_id: String, reply: Reply<protocol::SendRules> },
     /// Who reacted to a message with `emoji`, paged.
     Reactors {
         conversation_id: String,
@@ -388,14 +494,37 @@ pub enum Command {
         limit: u32,
         reply: Reply<ReactorsPage>,
     },
-    /// Replace the text of one of our messages. Report the edited message through
-    /// [`Context::message`] before answering: nothing was changed locally. `spans` are the
-    /// styled ranges of `text`; an adapter that cannot send them leaves them unused.
+    /// Moderator reaction removal: all reactions (`emoji: None`), one emoji (`user_id: None`),
+    /// or one person's reaction (`emoji: Some`, `user_id: Some`).
+    ClearReactions {
+        conversation_id: String,
+        message_id: String,
+        emoji: Option<String>,
+        user_id: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Replace the text of one of our messages, suppress embeds, or keep a subset of attachments.
+    /// Report the edited message through [`Context::message`] before answering: nothing was
+    /// changed locally. `spans` are the styled ranges of `text`; an adapter that cannot send them
+    /// leaves them unused.
     Edit {
         conversation_id: String,
         message_id: String,
         text: String,
         spans: Vec<protocol::Span>,
+        suppress_embeds: bool,
+        keep_attachments: Option<Vec<String>>,
+        reply: Reply<()>,
+    },
+    /// Replace the media (photo/file) on one of our messages, optionally updating its caption.
+    /// Report the edited message through [`Context::message`] before answering.
+    EditMedia {
+        conversation_id: String,
+        message_id: String,
+        file: protocol::OutgoingFile,
+        text: String,
+        spans: Vec<protocol::Span>,
+        invert_media: bool,
         reply: Reply<()>,
     },
     /// Fetch the raw source text of a message for lossless editing.
@@ -409,6 +538,26 @@ pub enum Command {
         conversation_id: String,
         message_id: String,
         scope: protocol::DeleteScope,
+        reply: Reply<()>,
+    },
+    /// Delete several messages in one conversation in one batch (`messages.deleteMessages` / `channels.deleteMessages`).
+    DeleteMany {
+        conversation_id: String,
+        message_ids: Vec<String>,
+        scope: protocol::DeleteScope,
+        reply: Reply<()>,
+    },
+    /// Delete all messages from one participant in a supergroup/channel (`channels.deleteParticipantHistory`).
+    DeleteParticipantHistory {
+        conversation_id: String,
+        person_id: String,
+        reply: Reply<()>,
+    },
+    /// Report specific messages from one participant in a supergroup/channel as spam (`channels.reportSpam`).
+    ReportSpamMessages {
+        conversation_id: String,
+        person_id: String,
+        message_ids: Vec<String>,
         reply: Reply<()>,
     },
     /// Vote on a poll, retract a vote (`Some(vec![])`), or end a poll (`None`). Report the
@@ -425,6 +574,9 @@ pub enum Command {
     /// The user followed a link out of this message (the shell is opening it). Telegram's terms
     /// want a sponsored message's follow told; nothing waits on it.
     FollowLink { conversation_id: String, message_id: String },
+    /// The user started playing a voice or round video message; tell the network its contents
+    /// were listened to (Telegram `readMessageContents`).
+    MarkPlayed { conversation_id: String, message_id: String },
     /// A conversation's cloud draft here changed to `text` (empty clears it). The shell has
     /// already waited out the pauses between the keys, so this is one settled draft and there
     /// is nothing to answer.
@@ -434,6 +586,9 @@ pub enum Command {
     Watch(Arc<Watching>),
     /// Search the network's directory. Results go to [`Context::people`]; at most 25.
     SearchPeople(String),
+    /// Resolve a public `@username` on click (cached on the adapter; never joins a chat).
+    /// Answers `Some((conversation_id, title))` when found.
+    ResolveUsername { username: String, reply: Reply<Option<(String, String)>> },
     Members {
         conversation_id: String,
         offset: u32,
@@ -467,6 +622,50 @@ pub enum Command {
         path: String,
         reply: Reply<()>,
     },
+    /// Kick, ban, unban, or restrict a member of a group or channel.
+    ModerateMember {
+        conversation_id: String,
+        person: String,
+        action: protocol::MemberModeration,
+        reply: Reply<()>,
+    },
+    /// Promote or demote an admin with specific rights and optional custom title.
+    SetAdmin {
+        conversation_id: String,
+        person: String,
+        rights: protocol::AdminRights,
+        reply: Reply<()>,
+    },
+    /// Transfer group/channel ownership using the account's 2FA password.
+    TransferOwnership {
+        conversation_id: String,
+        person: String,
+        password: String,
+        reply: Reply<()>,
+    },
+    /// Update group/channel default send permissions, slow mode, and feature toggles.
+    UpdateChatSettings {
+        conversation_id: String,
+        settings: protocol::ChatSettings,
+        reply: Reply<()>,
+    },
+    /// Read recent admin log events for a supergroup or channel.
+    AdminLog {
+        conversation_id: String,
+        limit: u32,
+        reply: Reply<Vec<protocol::AdminLogEntry>>,
+    },
+    /// List selectable send-as peers for a conversation and the current default peer id.
+    SendAsOptions {
+        conversation_id: String,
+        reply: Reply<(Vec<protocol::SendAs>, Option<String>)>,
+    },
+    /// Save the default send-as peer for a conversation.
+    SetDefaultSendAs {
+        conversation_id: String,
+        peer: String,
+        reply: Reply<()>,
+    },
     /// The id of the direct conversation with a person, created if there is none.
     StartDirect { person_id: String, reply: Reply<String> },
     /// Tiny call setup can create encrypted text history without enrolling a text device.
@@ -484,7 +683,94 @@ pub enum Command {
         kind: protocol::ConversationKind,
         private: bool,
         group: Option<String>,
+        description: Option<String>,
+        username: Option<String>,
         reply: Reply<String>,
+    },
+    /// Create a category in a Space; record it and answer with its group header.
+    CreateCategory {
+        space_id: String,
+        name: String,
+        reply: Reply<Group>,
+    },
+    /// Edit a channel's or category's properties (name, topic, slow mode, NSFW, user limit, parent).
+    EditChannel {
+        conversation_id: String,
+        name: Option<String>,
+        topic: Option<String>,
+        rate_limit_per_user: Option<u32>,
+        nsfw: Option<bool>,
+        user_limit: Option<u32>,
+        parent_id: Option<Option<String>>,
+        reply: Reply<()>,
+    },
+    /// Bulk-reorder channels/categories in a Space in one request.
+    MoveChannels {
+        space_id: String,
+        order: Vec<protocol::ChannelPosition>,
+        reply: Reply<()>,
+    },
+    /// Permanently delete a channel or category.
+    DeleteChannel {
+        conversation_id: String,
+        reply: Reply<()>,
+    },
+    /// Read a channel's or category's permission overwrites and roles.
+    ChannelPermissions {
+        conversation_id: String,
+        reply: Reply<protocol::ChannelPermissionsInfo>,
+    },
+    /// Set a role or member permission overwrite on a channel or category.
+    SetOverwrite {
+        conversation_id: String,
+        target_id: String,
+        target_kind: protocol::OverwriteTargetKind,
+        allow: u64,
+        deny: u64,
+        reply: Reply<()>,
+    },
+    /// Delete a role or member permission overwrite from a channel or category.
+    DeleteOverwrite {
+        conversation_id: String,
+        target_id: String,
+        reply: Reply<()>,
+    },
+    /// Sync a channel's permission overwrites with its parent category.
+    SyncChannelPermissions {
+        conversation_id: String,
+        reply: Reply<()>,
+    },
+    /// Read one page of a Space's audit log.
+    AuditLog {
+        space_id: String,
+        person: Option<String>,
+        action: Option<u32>,
+        before: Option<String>,
+        limit: u32,
+        reply: Reply<AuditPage>,
+    },
+    /// Read a server's AutoMod rules and safety setup.
+    AutomodRules {
+        space_id: String,
+        reply: Reply<AutomodPage>,
+    },
+    /// Create or replace one AutoMod rule.
+    SaveAutomodRule {
+        space_id: String,
+        rule: protocol::AutomodRule,
+        reply: Reply<protocol::AutomodRule>,
+    },
+    /// Delete one AutoMod rule.
+    DeleteAutomodRule {
+        space_id: String,
+        rule_id: String,
+        reply: Reply<()>,
+    },
+    /// Save verification, the explicit-content filter, and raid pauses.
+    SaveSpaceSafety {
+        space_id: String,
+        safety: protocol::SpaceSafety,
+        reply: Reply<()>,
     },
     /// Create a group conversation with two or more members (person ids or phone numbers) and an optional name.
     CreateGroup {
@@ -492,12 +778,29 @@ pub enum Command {
         name: Option<String>,
         reply: Reply<String>,
     },
-    /// The id of the thread a channel message starts. Discord only: create the thread channel,
-    /// record it, and answer with its id. `name` is already one line, at most 100 characters.
+    /// Creates a Discord thread, attached to `message_id` when `Some` or standalone when `None`,
+    /// records it, and answers with its id. `name` is already one line, at most 100 characters.
     StartThread {
         conversation_id: String,
-        message_id: String,
+        message_id: Option<String>,
         name: String,
+        private: bool,
+        auto_archive_minutes: Option<u32>,
+        first_message: String,
+        reply: Reply<String>,
+    },
+    /// Guidelines, tags, and posting rules of a forum or media channel, from what is already kept.
+    ForumInfo {
+        conversation_id: String,
+        reply: Reply<protocol::ForumInfo>,
+    },
+    /// The id of a new post in a forum or media channel. One create, then the thread is recorded.
+    ForumPost {
+        conversation_id: String,
+        title: String,
+        text: String,
+        tags: Vec<String>,
+        with: Box<Outgoing>,
         reply: Reply<String>,
     },
     /// One person's card. One request to the network, and only because the user opened it.
@@ -517,6 +820,35 @@ pub enum Command {
     /// Mark one activity feed item (`Some(id)`) or all items (`None`) read.
     ActivityMarkRead {
         item_id: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Fetch recent mentions from the network (e.g. Discord `GET /users/@me/mentions`).
+    Mentions {
+        before: Option<String>,
+        everyone: bool,
+        roles: bool,
+        space_id: Option<String>,
+        limit: u32,
+        reply: Reply<(Vec<protocol::MentionHit>, bool, Option<String>)>,
+    },
+    /// Dismiss a recent mention on the network (`DELETE /users/@me/mentions/{id}`).
+    DismissMention {
+        message_id: String,
+        reply: Reply<()>,
+    },
+    /// Reorder a Space, move it into/out of a folder, or create a folder with another Space.
+    MoveSpace {
+        space_id: String,
+        before: Option<String>,
+        folder: Option<String>,
+        into_space: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Rename or recolour a Space folder.
+    SetFolder {
+        folder_id: String,
+        name: Option<String>,
+        color: Option<Option<u32>>,
         reply: Reply<()>,
     },
     /// Members who have read a given message (`Request::ReadBy`).
@@ -581,15 +913,78 @@ pub enum Command {
     },
     /// A Space's info, opened from its name.
     SpaceInfo { space_id: String, reply: Reply<SpaceAbout> },
+    /// Updates a Space's notification level, switches, or resets one channel override.
+    SetSpaceOptions {
+        space_id: String,
+        notify: Option<Notify>,
+        suppress_everyone: Option<bool>,
+        suppress_roles: Option<bool>,
+        highlights: Option<bool>,
+        events: Option<bool>,
+        mobile_push: Option<bool>,
+        reset_channel: Option<String>,
+        reply: Reply<()>,
+    },
     /// Preview a Space invite link or code.
     InvitePreview {
         code: String,
+        event_id: Option<String>,
         reply: Reply<protocol::InvitePreview>,
     },
     /// Join a Space from an invite link or code; returns `(space_id, channel_id)`.
     InviteJoin {
         code: String,
-        reply: Reply<(Option<String>, Option<String>)>,
+        /// `(space_id, conversation_id, pending_approval)`.
+        reply: Reply<(Option<String>, Option<String>, bool)>,
+    },
+    /// Lists exported invite links for a group or channel.
+    ChatInvites {
+        conversation_id: String,
+        revoked: bool,
+        reply: Reply<Vec<protocol::ChatInviteLink>>,
+    },
+    /// Creates a new invite link for a group or channel.
+    CreateInvite {
+        conversation_id: String,
+        title: Option<String>,
+        expire_date: Option<i64>,
+        usage_limit: Option<u32>,
+        request_needed: bool,
+        reply: Reply<protocol::ChatInviteLink>,
+    },
+    /// Revokes an exported invite link.
+    RevokeInvite {
+        conversation_id: String,
+        link: String,
+        reply: Reply<protocol::ChatInviteLink>,
+    },
+    /// Lists pending join requests for a group or channel.
+    JoinRequests {
+        conversation_id: String,
+        link: Option<String>,
+        limit: u32,
+        reply: Reply<Vec<protocol::JoinRequest>>,
+    },
+    /// Approves or declines one (`user_id: Some`) or all (`user_id: None`) pending join requests.
+    HandleJoinRequest {
+        conversation_id: String,
+        user_id: Option<String>,
+        approved: bool,
+        link: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Preview a scheduled event by guild/space id and event id.
+    EventPreview {
+        space_id: String,
+        event_id: String,
+        reply: Reply<protocol::ScheduledEvent>,
+    },
+    /// Mark or unmark ourselves as interested in a scheduled event.
+    EventLinkInterest {
+        space_id: String,
+        event_id: String,
+        interested: bool,
+        reply: Reply<()>,
     },
     /// Moderate a member in a Space (kick, ban, timeout, untimeout, nickname).
     Moderate {
@@ -606,6 +1001,156 @@ pub enum Command {
         reason: String,
         reply: Reply<()>,
     },
+    /// Create an invite link for a channel (`conversation_id`), Space (`space_id`), or friend invite (both `None`).
+    CreateInviteLink {
+        conversation_id: Option<String>,
+        space_id: Option<String>,
+        max_age: u32,
+        max_uses: u32,
+        temporary: bool,
+        reply: Reply<String>,
+    },
+    /// Create a new Space; returns `(space_id, landing_channel_id)`.
+    CreateSpace {
+        name: String,
+        icon: Option<String>,
+        template: Option<String>,
+        reply: Reply<(String, Option<String>)>,
+    },
+    /// Lists scheduled and active events for a Space.
+    Events {
+        space_id: String,
+        reply: Reply<Vec<protocol::SpaceEvent>>,
+    },
+    /// Marks or unmarks the signed-in user as interested in a scheduled event.
+    EventInterest {
+        space_id: String,
+        event_id: String,
+        on: bool,
+        reply: Reply<()>,
+    },
+    /// Edit a Space's overview settings (`PATCH /guilds/{id}`).
+    EditSpace {
+        space_id: String,
+        edit: protocol::SpaceEdit,
+        reply: Reply<()>,
+    },
+    /// Delete an owned Space (`POST /guilds/{id}/delete`).
+    DeleteSpace {
+        space_id: String,
+        mfa_code: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Transfer ownership of an owned Space (`PATCH /guilds/{id}`).
+    TransferSpace {
+        space_id: String,
+        new_owner_id: String,
+        mfa_code: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Create a scheduled event in a Space.
+    CreateEvent {
+        space_id: String,
+        event: protocol::SpaceEventEdit,
+        reply: Reply<protocol::SpaceEvent>,
+    },
+    /// Edit a scheduled event in a Space.
+    EditEvent {
+        space_id: String,
+        event_id: String,
+        event: protocol::SpaceEventEdit,
+        reply: Reply<protocol::SpaceEvent>,
+    },
+    /// Delete / cancel a scheduled event in a Space.
+    DeleteEvent {
+        space_id: String,
+        event_id: String,
+        reply: Reply<()>,
+    },
+    /// List active invite links for a Space; returns `(invites, paused)`.
+    SpaceInvites {
+        space_id: String,
+        reply: Reply<(Vec<protocol::SpaceInvite>, bool)>,
+    },
+    /// Revoke one invite link in a Space.
+    RevokeSpaceInvite {
+        space_id: String,
+        code: String,
+        reply: Reply<()>,
+    },
+    /// Pause or resume invites for a Space (`INVITES_DISABLED`).
+    SetInvitesPaused {
+        space_id: String,
+        paused: bool,
+        reply: Reply<()>,
+    },
+    /// A Space's roles, from what the adapter already knows.
+    Roles {
+        space_id: String,
+        reply: Reply<Vec<protocol::SpaceRole>>,
+    },
+    /// Create a role.
+    CreateRole {
+        space_id: String,
+        edit: protocol::RoleEdit,
+        reply: Reply<protocol::SpaceRole>,
+    },
+    /// Edit a role.
+    EditRole {
+        space_id: String,
+        role_id: String,
+        edit: protocol::RoleEdit,
+        reply: Reply<protocol::SpaceRole>,
+    },
+    /// Reorder roles.
+    MoveRoles {
+        space_id: String,
+        roles: Vec<protocol::RoleMove>,
+        reply: Reply<()>,
+    },
+    /// Delete a role.
+    DeleteRole {
+        space_id: String,
+        role_id: String,
+        reply: Reply<()>,
+    },
+    /// Give or take a member's roles.
+    SetMemberRoles {
+        space_id: String,
+        person_id: String,
+        roles: Vec<String>,
+        reply: Reply<()>,
+    },
+    /// Discord's public-server listing or search.
+    Discover {
+        query: String,
+        category: u32,
+        offset: u32,
+        limit: u32,
+        reply: Reply<(Vec<protocol::DiscoveredGuild>, u32)>,
+    },
+    /// Join one server from that listing by its id. Returns `(space_id, channel_id)`.
+    JoinDiscovered {
+        guild_id: String,
+        reply: Reply<(Option<String>, Option<String>)>,
+    },
+    /// A server's rules form and onboarding questions.
+    SpaceGate {
+        space_id: String,
+        reply: Reply<protocol::SpaceGate>,
+    },
+    /// Accept that server's rules. Answers follow the form fields, in order.
+    AcceptRules {
+        space_id: String,
+        answers: Vec<String>,
+        reply: Reply<protocol::SpaceGate>,
+    },
+    /// Finish that server's onboarding with option ids from its questions.
+    SubmitOnboarding {
+        space_id: String,
+        options: Vec<String>,
+        reply: Reply<()>,
+    },
     /// Set the network's notification setting. `until` is when a mute ends, as Unix seconds.
     /// Absent means muted until it is turned off, or not muted. An adapter with no timed mute
     /// ignores it. Report the new mute through [`Context::muted`] before answering.
@@ -615,12 +1160,84 @@ pub enum Command {
         until: Option<i64>,
         reply: Reply<()>,
     },
+    /// Set the network's notification setting for a whole Space, or one category inside it.
+    SetSpaceNotify {
+        space_id: String,
+        notify: Notify,
+        until: Option<i64>,
+        category: Option<String>,
+        reply: Reply<()>,
+    },
     /// Set or clear a conversation's disappearing-messages timer (`seconds == 0` turns it off).
     /// Report the new timer through [`Context::disappearing`] before answering.
     SetDisappearing {
         conversation_id: String,
         seconds: u32,
         reply: Reply<()>,
+    },
+    /// Read the account's default disappearing-messages timer for new chats (seconds, 0 = off).
+    GetDefaultDisappearing {
+        reply: Reply<u32>,
+    },
+    /// Set the account's default disappearing-messages timer for new chats (seconds, 0 = off).
+    SetDefaultDisappearing {
+        seconds: u32,
+        reply: Reply<()>,
+    },
+    /// Create or edit a chat folder on the network (Telegram `messages.updateDialogFilter`).
+    FolderSave {
+        folder: protocol::FolderSpec,
+        reply: Reply<protocol::Folder>,
+    },
+    /// Delete a chat folder on the network.
+    FolderDelete {
+        folder_id: String,
+        reply: Reply<()>,
+    },
+    /// Reorder chat folders on the network.
+    FoldersReorder {
+        order: Vec<String>,
+        reply: Reply<()>,
+    },
+    /// Fetch additional or searched topics for a forum (Telegram `messages.getForumTopics`).
+    /// Answers with the network's total topic count for the query/forum.
+    LoadTopics {
+        conversation_id: String,
+        query: Option<String>,
+        offset: u32,
+        limit: u32,
+        reply: Reply<u32>,
+    },
+    /// Create a topic in a forum; answers with the new topic's conversation id.
+    TopicCreate {
+        conversation_id: String,
+        title: String,
+        icon_color: Option<i32>,
+        icon_emoji_id: Option<String>,
+        reply: Reply<String>,
+    },
+    /// Edit a forum topic (rename, icon, close/reopen, hide, pin/unpin).
+    TopicUpdate {
+        conversation_id: String,
+        title: Option<String>,
+        icon_emoji_id: Option<String>,
+        closed: Option<bool>,
+        hidden: Option<bool>,
+        pinned: Option<bool>,
+        reply: Reply<()>,
+    },
+    /// Delete a forum topic and its history.
+    TopicDelete {
+        conversation_id: String,
+        reply: Reply<()>,
+    },
+    /// Fetch default forum topic icons.
+    TopicIcons {
+        reply: Reply<CatalogPage>,
+    },
+    /// Fetch network-suggested chat folders.
+    SuggestedFolders {
+        reply: Reply<Vec<protocol::SuggestedFolder>>,
     },
     /// Star or unstar a conversation on the network. Report the flag through [`Context::starred`]
     /// before answering, and only after the network has it. Answer `Err` to leave the local flag
@@ -661,8 +1278,14 @@ pub enum Command {
         conversation_id: String,
         reply: Reply<Vec<protocol::ScheduledMessage>>,
     },
-    /// Cancels a pending scheduled message (Slack `chat.deleteScheduledMessage`).
+    /// Cancels a pending scheduled message (Slack `chat.deleteScheduledMessage` / Telegram `messages.deleteScheduledMessages`).
     CancelScheduled {
+        conversation_id: String,
+        scheduled_id: String,
+        reply: Reply<()>,
+    },
+    /// Sends a pending scheduled message immediately (Telegram `messages.sendScheduledMessages`).
+    SendScheduledNow {
         conversation_id: String,
         scheduled_id: String,
         reply: Reply<()>,
@@ -675,18 +1298,106 @@ pub enum Command {
         post_at: i64,
         reply: Reply<protocol::ScheduledMessage>,
     },
-    /// Follow (`on: true`) or unfollow (`on: false`) a thread (Slack `subscriptions.thread.add` / `remove`).
+    /// Follow (`on: true`) or unfollow (`on: false`) a thread (Slack `subscriptions.thread.add` / `remove`, Discord thread-members/@me).
     FollowThread {
         conversation_id: String,
         on: bool,
         reply: Reply<()>,
     },
+    /// Lists active or archived threads of one channel (Discord).
+    ChannelThreads {
+        conversation_id: String,
+        archived: bool,
+        query: String,
+        cursor: Option<String>,
+        reply: Reply<ChannelThreadsPage>,
+    },
+    /// Rename, archive/reopen, lock/unlock, or update auto-archive/slowmode on a thread (Discord).
+    ThreadUpdate {
+        conversation_id: String,
+        name: Option<String>,
+        archived: Option<bool>,
+        locked: Option<bool>,
+        auto_archive_minutes: Option<u32>,
+        slowmode_seconds: Option<u32>,
+        reply: Reply<()>,
+    },
+    /// Delete a thread channel (Discord `DELETE /channels/{thread}`).
+    DeleteThread {
+        conversation_id: String,
+        reply: Reply<()>,
+    },
+    /// Follow (`on: true`) or unfollow (`on: false`) a channel or category (Discord opt-in bit 12).
+    FollowChannel {
+        conversation_id: String,
+        on: bool,
+        reply: Reply<()>,
+    },
+    /// Toggle Space channel-list view settings (Discord Show All Channels / Hide Muted Channels).
+    SetSpaceView {
+        space_id: String,
+        show_all: Option<bool>,
+        hide_muted: Option<bool>,
+        reply: Reply<()>,
+    },
     /// Accept or decline/ignore a message request (Discord).
     AnswerMessageRequest { conversation_id: String, accept: bool, reply: Reply<()> },
     /// Leave a group conversation. Report it gone through [`Context::conversation_gone`].
-    Leave { conversation_id: String, reply: Reply<()> },
+    Leave { conversation_id: String, silent: bool, reply: Reply<()> },
+    /// Transfer group conversation ownership to another member (`person` id).
+    TransferOwner { conversation_id: String, person: String, reply: Reply<()> },
     /// Leave a Space (e.g. Discord server `DELETE /users/@me/guilds/{id}`).
     LeaveSpace { space_id: String, reply: Reply<()> },
+    /// Read a Space's webhooks, followed channels, and installed bots/integrations.
+    SpaceIntegrations { space_id: String, reply: Reply<protocol::SpaceIntegrations> },
+    /// Create an incoming webhook in a channel.
+    CreateWebhook { conversation_id: String, name: String, reply: Reply<protocol::SpaceWebhook> },
+    /// Rename or move an existing webhook in a Space.
+    EditWebhook {
+        space_id: String,
+        webhook_id: String,
+        name: Option<String>,
+        channel_id: Option<String>,
+        reply: Reply<protocol::SpaceWebhook>,
+    },
+    /// Delete a webhook or unfollow a followed channel in a Space.
+    DeleteWebhook { space_id: String, webhook_id: String, reply: Reply<()> },
+    /// Remove an installed bot or integration from a Space.
+    RemoveIntegration { space_id: String, integration_id: String, reply: Reply<()> },
+    /// Read a Space's custom emoji, stickers, slot limits, and roles.
+    SpaceExpressions { space_id: String, reply: Reply<protocol::SpaceExpressions> },
+    /// Upload a new custom emoji to a Space.
+    CreateEmoji { space_id: String, name: String, path: String, reply: Reply<protocol::SpaceEmoji> },
+    /// Rename or edit role restrictions on an existing custom emoji.
+    EditEmoji {
+        space_id: String,
+        emoji_id: String,
+        name: Option<String>,
+        roles: Option<Vec<String>>,
+        reply: Reply<protocol::SpaceEmoji>,
+    },
+    /// Delete a custom emoji from a Space.
+    DeleteEmoji { space_id: String, emoji_id: String, reply: Reply<()> },
+    /// Upload a new custom sticker to a Space.
+    CreateSticker {
+        space_id: String,
+        name: String,
+        tags: String,
+        description: String,
+        path: String,
+        reply: Reply<protocol::SpaceSticker>,
+    },
+    /// Rename or edit tags/description on an existing custom sticker.
+    EditSticker {
+        space_id: String,
+        sticker_id: String,
+        name: Option<String>,
+        tags: Option<String>,
+        description: Option<String>,
+        reply: Reply<protocol::SpaceSticker>,
+    },
+    /// Delete a custom sticker from a Space.
+    DeleteSticker { space_id: String, sticker_id: String, reply: Reply<()> },
     /// Close a direct conversation as the network's own × does. Report it through
     /// [`Context::filing`] (hidden) or [`Context::conversation_gone`].
     CloseDirect { conversation_id: String, reply: Reply<()> },
@@ -702,7 +1413,7 @@ pub enum Command {
         me_only: bool,
         reply: Reply<()>,
     },
-    /// Executes an interactive Block Kit control on a message (Slack `blocks.actions`).
+    /// Executes an interactive control on a message (Slack `blocks.actions`, Telegram giveaways / games / callbacks).
     MessageAction {
         conversation_id: String,
         message_id: String,
@@ -711,7 +1422,7 @@ pub enum Command {
         element_type: String,
         value: String,
         values: Vec<String>,
-        reply: Reply<()>,
+        reply: Reply<Option<protocol::ActionResult>>,
     },
     /// Presses an inline callback button under a bot message (Telegram `messages.getBotCallbackAnswer`).
     PressButton {
@@ -796,6 +1507,28 @@ pub enum Command {
         unfave: bool,
         reply: Reply<()>,
     },
+    /// Favourite or unfavourite an emoji or sticker on the account (Discord settings-proto/2).
+    /// Frecency scores are not written.
+    Favourite {
+        kind: CatalogKind,
+        id: String,
+        on: bool,
+        reply: Reply<()>,
+    },
+    /// Transcribe a voice or round video message on the network (`messages.transcribeAudio`).
+    Transcribe {
+        conversation_id: String,
+        message_id: String,
+        reply: Reply<protocol::Transcription>,
+    },
+    /// Rate a completed transcription (`messages.rateTranscribedAudio`).
+    RateTranscript {
+        conversation_id: String,
+        message_id: String,
+        transcription_id: i64,
+        good: bool,
+        reply: Reply<()>,
+    },
     /// Translate one message on demand into `to` (normalized ISO 639-1 language tag).
     /// Never called for end-to-end encrypted conversations.
     Translate {
@@ -851,6 +1584,55 @@ pub enum Command {
         space_id: String,
         reply: Reply<Vec<protocol::TeamTag>>,
     },
+    /// Read an account's Privacy & Safety settings (Discord).
+    GetNetworkPrivacy {
+        reply: Reply<protocol::NetworkPrivacy>,
+    },
+    /// Write an account's Privacy & Safety settings (Discord).
+    SetNetworkPrivacy {
+        privacy: protocol::NetworkPrivacy,
+        reply: Reply<protocol::NetworkPrivacy>,
+    },
+    /// Update a Space's per-server privacy switches (Discord).
+    SetSpacePrivacy {
+        space_id: String,
+        privacy: protocol::SpacePrivacy,
+        reply: Reply<()>,
+    },
+    /// Telegram auto-download presets and the local chat-kind gates.
+    GetAutoDownload {
+        reply: Reply<protocol::AutoDownload>,
+    },
+    SetAutoDownload {
+        settings: protocol::AutoDownload,
+        reply: Reply<protocol::AutoDownload>,
+    },
+    /// A channel's boost level.
+    GetBoosts {
+        conversation_id: String,
+        reply: Reply<protocol::ChannelBoosts>,
+    },
+    /// Gives a free Premium boost to that channel.
+    ApplyBoost {
+        conversation_id: String,
+        reply: Reply<protocol::ChannelBoosts>,
+    },
+    /// A bot's commands and menu button.
+    GetBotMenu {
+        conversation_id: String,
+        reply: Reply<protocol::BotMenu>,
+    },
+    /// Starts a bot, with the deep-link payload when there is one.
+    StartBot {
+        conversation_id: String,
+        start_param: String,
+        reply: Reply<()>,
+    },
+    /// Shares this account's phone number with a bot.
+    SharePhone {
+        conversation_id: String,
+        reply: Reply<()>,
+    },
     /// A picker's catalog: custom emoji (of one Space when `space_id` is set), stickers, or GIFs
     /// for `query`. Register every preview through [`Context::media`]. Only on a key press:
     /// never ahead.
@@ -871,14 +1653,33 @@ pub enum Command {
     /// The user opened a Space's Threads list: fetch the network's list of followed threads
     /// once, and record them with `Filing::followed`.
     OpenThreads(String),
-    /// The user opened a forum: fetch its topics once and answer, so the landing topic the
-    /// shell then reads from the store is named on what the network says now.
-    OpenForum { conversation_id: String, reply: Reply<()> },
+    /// The user opened a forum, or asked for another page of its posts. Discord answers with
+    /// the page (`Some`); a cache-only network answers `None`. `offset` is the existing cursor.
+    OpenForum {
+        conversation_id: String,
+        sort: protocol::TopicSort,
+        tag: Option<String>,
+        query: Option<String>,
+        offset: u32,
+        reply: Reply<Option<ForumPosts>>,
+    },
     /// The user answered, withdrew or ended a friendship, or blocked someone. Report the new
     /// relationship through [`Context::relation`] before answering.
     Relate {
         person_id: String,
         action: RelateAction,
+        reply: Reply<()>,
+    },
+    /// Publish (crosspost) a message in an announcement channel (Discord).
+    Publish {
+        conversation_id: String,
+        message_id: String,
+        reply: Reply<()>,
+    },
+    /// Follow an announcement channel into `into_channel_id` (Discord).
+    Follow {
+        conversation_id: String,
+        into_channel_id: String,
         reply: Reply<()>,
     },
     /// Send a friend request by username (e.g. Discord `POST /users/@me/relationships`).
@@ -908,11 +1709,22 @@ pub enum Command {
         clear_at: Option<i64>,
         reply: Reply<()>,
     },
+    /// This session's "Playing" name. Empty clears it. Not another member's text.
+    SetActivity {
+        name: String,
+        reply: Reply<()>,
+    },
     /// Edit our own profile fields on the network. `None` leaves a field unchanged.
     SetProfile {
         name: Option<String>,
         about: Option<String>,
         pronouns: Option<String>,
+        accent: Option<u32>,
+        banner: Option<String>,
+        space_id: Option<String>,
+        username: Option<String>,
+        emoji: Option<String>,
+        birthday: Option<String>,
         reply: Reply<()>,
     },
     /// Set (or clear, when `path` is empty) our own profile picture from a local file path.
@@ -924,6 +1736,12 @@ pub enum Command {
     SetNickname {
         space_id: String,
         nickname: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Set or clear the user's private note on a person (Discord `PUT /users/@me/notes/{id}`).
+    SetNote {
+        person_id: String,
+        text: String,
         reply: Reply<()>,
     },
     /// Set (or clear, when `None` or empty) a private nickname for a friend.
@@ -944,6 +1762,19 @@ pub enum Command {
         cursor: Option<String>,
         at: Instant,
         reply: Reply<SearchPage>,
+    },
+    /// Jump to the message closest to `date` (Unix seconds) in a conversation; answers with the message id.
+    JumpToDate {
+        conversation_id: String,
+        date: i64,
+        reply: Reply<Option<String>>,
+    },
+    /// Calendar days with matching messages in a conversation (Telegram `messages.getSearchResultsCalendar`).
+    SearchCalendar {
+        conversation_id: String,
+        kind: Option<SharedKind>,
+        offset_date: i64,
+        reply: Reply<Vec<protocol::SearchCalendarDay>>,
     },
     /// Search files on the network (e.g. Slack `search.files`).
     SearchFiles {
@@ -995,6 +1826,49 @@ pub enum Command {
     /// The user signed out: end the session on the network, best effort, then answer. chatd
     /// waits five seconds for the answer and forgets the account either way.
     SignOut(Reply<()>),
+    /// List slash or context-menu commands usable in `conversation_id`.
+    Commands {
+        conversation_id: String,
+        query: String,
+        kind: Option<protocol::CommandKind>,
+        reply: Reply<Vec<protocol::AppCommand>>,
+    },
+    /// Ask the network for live autocomplete choices on `focused` option.
+    CommandAutocomplete {
+        conversation_id: String,
+        command_id: String,
+        application_id: String,
+        version: String,
+        name: String,
+        options: Vec<protocol::CommandArg>,
+        focused: String,
+        reply: Reply<Vec<protocol::CommandChoice>>,
+    },
+    /// Execute a slash command or context-menu command (`kind`, `target_id`).
+    RunCommand {
+        conversation_id: String,
+        command_id: String,
+        application_id: String,
+        version: String,
+        kind: protocol::CommandKind,
+        name: String,
+        arguments: Vec<protocol::CommandArg>,
+        target_id: Option<String>,
+        files: Vec<protocol::OutgoingFile>,
+        reply: Reply<()>,
+    },
+    /// Submit an interaction modal form.
+    ModalSubmit {
+        conversation_id: String,
+        modal_id: String,
+        application_id: String,
+        custom_id: String,
+        values: Vec<(String, String)>,
+        reply: Reply<()>,
+    },
+    /// A round video message started playing. Telegram tells the network it was listened to
+    /// (`readMessageContents`). Nothing answers, and every other network ignores it.
+    Played { conversation_id: String, message_id: String },
     /// Invite a member by email to a workspace (`users.admin.invite`).
     InviteMember {
         email: String,
@@ -1085,6 +1959,24 @@ pub enum Command {
     },
     /// The adapter is being dropped. `serve_commands` returns on it; an adapter never sees it.
     Stop,
+    /// Open a `t.me` or `telegram.me` link as a chat this account already has, or a preview of a
+    /// public username. Never joins. Other adapters refuse it.
+    OpenLink { url: String, reply: Reply<Option<OpenedLink>> },
+    /// Translate these messages. The adapter returns the words; it does not replace what is stored.
+    TranslateMessages {
+        conversation_id: String,
+        message_ids: Vec<String>,
+        to: String,
+        reply: Reply<Vec<TranslatedMessage>>,
+    },
+}
+
+/// One page of a channel's active or archived threads (`Command::ChannelThreads`).
+#[derive(Debug, Clone, Default)]
+pub struct ChannelThreadsPage {
+    pub threads: Vec<protocol::ChannelThread>,
+    pub cursor: Option<String>,
+    pub more: bool,
 }
 
 impl Command {
@@ -1092,16 +1984,39 @@ impl Command {
     pub fn unsupported(self, ctx: &Context) {
         match self {
             Command::Members { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ResolveUsername { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MembersAdd { reply, .. }
             | Command::MembersRemove { reply, .. }
             | Command::ConversationUpdate { reply, .. }
-            | Command::ConversationPicture { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            | Command::ConversationPicture { reply, .. }
+            | Command::ModerateMember { reply, .. }
+            | Command::SetAdmin { reply, .. }
+            | Command::TransferOwnership { reply, .. }
+            | Command::UpdateChatSettings { reply, .. }
+            | Command::SetDefaultSendAs { reply, .. }
+            | Command::EditChannel { reply, .. }
+            | Command::MoveChannels { reply, .. }
+            | Command::DeleteChannel { reply, .. }
+            | Command::SetOverwrite { reply, .. }
+            | Command::DeleteOverwrite { reply, .. }
+            | Command::SyncChannelPermissions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ChannelPermissions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AuditLog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AutomodRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SaveAutomodRule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DeleteAutomodRule { reply, .. } | Command::SaveSpaceSafety { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::CreateCategory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AdminLog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SendAsOptions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StartDirect { reply, .. }
             | Command::StartDirectCall { reply, .. }
             | Command::StartGroup { reply, .. }
             | Command::CreateChannel { reply, .. }
             | Command::CreateGroup { reply, .. }
             | Command::StartThread { reply, .. }
+            | Command::ForumPost { reply, .. }
             | Command::Handoff { reply, .. }
             | Command::CallAddPeople { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
@@ -1112,14 +2027,69 @@ impl Command {
             Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ConversationInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SpaceInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ForumInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetSpaceOptions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SpaceIntegrations { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateWebhook { reply, .. } | Command::EditWebhook { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::SpaceExpressions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateEmoji { reply, .. } | Command::EditEmoji { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::CreateSticker { reply, .. } | Command::EditSticker { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateInviteLink { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Events { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::EventInterest { reply, .. }
+            | Command::EditSpace { reply, .. }
+            | Command::DeleteSpace { reply, .. }
+            | Command::TransferSpace { reply, .. }
+            | Command::DeleteEvent { reply, .. }
+            | Command::RevokeSpaceInvite { reply, .. }
+            | Command::SetInvitesPaused { reply, .. }
+            | Command::MoveRoles { reply, .. }
+            | Command::DeleteRole { reply, .. }
+            | Command::SetMemberRoles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SpaceInvites { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Roles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateRole { reply, .. } | Command::EditRole { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateEvent { reply, .. } | Command::EditEvent { reply, .. } => {
+                drop(reply.send(Err(Refusal::Unsupported)))
+            }
+            Command::EventPreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::EventLinkInterest { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Discover { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::JoinDiscovered { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SpaceGate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AcceptRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SubmitOnboarding { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ChatInvites { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CreateInvite { reply, .. }
+            | Command::RevokeInvite { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::JoinRequests { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::HandleJoinRequest { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetMute { reply, .. }
             | Command::Moderate { reply, .. }
             | Command::Unban { reply, .. }
+            | Command::SetSpaceNotify { reply, .. }
             | Command::SetDisappearing { reply, .. }
+            | Command::SetDefaultDisappearing { reply, .. }
+            | Command::FolderDelete { reply, .. }
+            | Command::FoldersReorder { reply, .. }
+            | Command::TopicUpdate { reply, .. }
+            | Command::TopicDelete { reply, .. }
             | Command::Leave { reply, .. }
+            | Command::TransferOwner { reply, .. }
             | Command::LeaveSpace { reply, .. }
+            | Command::DeleteWebhook { reply, .. }
+            | Command::RemoveIntegration { reply, .. }
+            | Command::DeleteEmoji { reply, .. }
+            | Command::DeleteSticker { reply, .. }
             | Command::CloseDirect { reply, .. }
             | Command::ClearHistory { reply, .. }
             | Command::Star { reply, .. }
@@ -1127,9 +2097,23 @@ impl Command {
             | Command::StarMessage { reply, .. }
             | Command::Remind { reply, .. }
             | Command::CancelScheduled { reply, .. }
-            | Command::FollowThread { reply, .. } => {
+            | Command::SendScheduledNow { reply, .. }
+            | Command::FollowThread { reply, .. }
+            | Command::ThreadUpdate { reply, .. }
+            | Command::DeleteThread { reply, .. }
+            | Command::Publish { reply, .. }
+            | Command::Follow { reply, .. }
+            | Command::FollowChannel { reply, .. }
+            | Command::SetSpaceView { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
+            Command::ChannelThreads { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetDefaultDisappearing { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::FolderSave { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::LoadTopics { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::TopicCreate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::TopicIcons { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SuggestedFolders { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StarredMessages { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1146,9 +2130,16 @@ impl Command {
             Command::EndSession { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::UnreadItems { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MarkUnreadItemsRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Commands { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CommandAutocomplete { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::RunCommand { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ModalSubmit { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Forward { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SaveGif { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StickerSet { reply, .. } | Command::FaveSticker { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Favourite { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Transcribe { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::RateTranscript { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1157,9 +2148,23 @@ impl Command {
             Command::GetOutOfOffice { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetOutOfOffice { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SpaceTags { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetNetworkPrivacy { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetNetworkPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetSpacePrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetAutoDownload { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetAutoDownload { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetBoosts { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ApplyBoost { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetBotMenu { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::StartBot { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SharePhone { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Catalog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityFeed { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityMarkRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Mentions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DismissMention { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::MoveSpace { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetFolder { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReadBy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::BookmarkAdd { reply, .. }
             | Command::BookmarkEdit { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1174,26 +2179,36 @@ impl Command {
             Command::SendPaidReaction { reply, .. }
             | Command::TogglePaidReactionPrivacy { reply, .. }
             | Command::SetDefaultReaction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SendRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reactors { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ClearReactions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendWith { conversation_id, client_id, .. } => {
                 let why = format!("Sending files and options is not built for {} yet.", ctx.account.network.label());
                 ctx.sent(&conversation_id, &client_id, Err(why));
             }
             Command::React { reply, .. }
             | Command::Edit { reply, .. }
+            | Command::EditMedia { reply, .. }
             | Command::Delete { reply, .. }
+            | Command::DeleteMany { reply, .. }
+            | Command::DeleteParticipantHistory { reply, .. }
+            | Command::ReportSpamMessages { reply, .. }
             | Command::Vote { reply, .. }
             | Command::Relate { reply, .. }
             | Command::AddFriend { reply, .. }
             | Command::Report { reply, .. }
             | Command::SetPresence { reply, .. }
+            | Command::SetActivity { reply, .. }
             | Command::SetProfile { reply, .. }
             | Command::SetAvatar { reply, .. }
             | Command::SetNickname { reply, .. }
+            | Command::SetNote { reply, .. }
             | Command::SetFriendNickname { reply, .. }
-            | Command::AnswerMessageRequest { reply, .. }
-            | Command::OpenForum { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            | Command::AnswerMessageRequest { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::OpenForum { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Source { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::OpenLink { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::TranslateMessages { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReportReasons { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Translate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Meetings { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1216,6 +2231,8 @@ impl Command {
             Command::AllUnreads { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Download { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Search { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::JumpToDate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SearchCalendar { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchFiles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Send { conversation_id, client_id, .. } => {
                 ctx.sent(&conversation_id, &client_id, Err("Sending is not built for this network.".to_owned()));
@@ -1295,6 +2312,18 @@ impl Context {
         Key::new(&self.account, id)
     }
 
+    /// A stored on/off setting for this account. Absent is off.
+    pub fn account_switch(&self, key: &str) -> bool {
+        let scope = protocol::settings::account_scope(&self.account);
+        self.hub.store().settings().ok().is_some_and(|rows| rows.iter().any(|row| row.scope == scope && row.key == key && row.value == "on"))
+    }
+
+    /// Stores an on/off setting for this account.
+    pub fn set_account_switch(&self, key: &str, on: bool) {
+        let scope = protocol::settings::account_scope(&self.account);
+        let _ = self.hub.store().set_setting(&scope, key, Some(if on { "on" } else { "off" }));
+    }
+
     /// Whether a conversation may appear where the user asked for what is listed: hidden
     /// conversations and message requests stay out of it, as they stay out of the cache's own
     /// search. A conversation the store does not know is not listed.
@@ -1357,12 +2386,58 @@ impl Context {
         Ok(())
     }
 
+    /// Sets whether the user can create invite links in `space_id`.
+    pub fn set_space_can_create_invites(&self, space_id: &str, can: bool) -> Stores {
+        let space = self.key(space_id);
+        if self.hub.store().set_space_can_create_invites(&space, can)? {
+            self.hub.changed(Change::Spaces { account: self.account.clone() });
+        }
+        Ok(())
+    }
+    /// Sets whether the Space's opt-in channel filter ("Show all channels" off) is active.
+    pub fn set_space_opt_in(&self, space_id: &str, opt_in: bool) -> Stores {
+        let space = self.key(space_id);
+        if self.hub.store().set_space_opt_in(&space, opt_in)? {
+            self.hub.changed(Change::Spaces { account: self.account.clone() });
+        }
+        Ok(())
+    }
+
+    /// Sets server-level management rights for this account in `space_id`.
+    pub fn set_space_rights(&self, space_id: &str, rights: protocol::SpaceRights) -> Stores {
+        let space = self.key(space_id);
+        if self.hub.store().set_space_rights(&space, rights)? {
+            self.hub.changed(Change::Spaces { account: self.account.clone() });
+        }
+        Ok(())
+    }
+    /// Sets whether the user can manage webhooks, guild integrations, or expressions in `space_id`.
+    pub fn set_space_manage(&self, space_id: &str, webhooks: bool, guild: bool, expressions: bool) -> Stores {
+        let space = self.key(space_id);
+        if self.hub.store().set_space_manage(&space, webhooks, guild, expressions)? {
+            self.hub.changed(Change::Spaces { account: self.account.clone() });
+        }
+        Ok(())
+    }
+
     /// One Space's whole tree: only what the user may see, in the network's order. Rows go
     /// straight to the store; keep none of them.
     pub fn tree(&self, space_id: &str, groups: &[Group], conversations: &[ConversationRow]) -> Stores {
         let space = self.key(space_id);
         self.hub.store().replace_tree(&space, groups, conversations)?;
         self.hub.changed(Change::Tree { space });
+        Ok(())
+    }
+
+    /// Writes this server's composer lock onto threads and forum posts already stored.
+    /// A tree replacement does not touch a row that names its parent.
+    pub fn restamp_threads(&self, space_id: &str, read_only: bool, reason: &str) -> Stores {
+        let space = self.key(space_id);
+        let changed = self.hub.store().restamp_threads(&space, read_only, reason)?;
+        for (id, stored_space) in &changed {
+            let place = (!stored_space.is_empty()).then_some(stored_space.as_str());
+            self.row_changed(id, place);
+        }
         Ok(())
     }
 
@@ -1417,6 +2492,11 @@ impl Context {
     /// is not announced: the row is told alone.
     pub fn occupants(&self, conversation_id: &str, people: Vec<Occupant>, total: u32) {
         self.hub.set_occupants(self.key(conversation_id), Occupants { people, total });
+    }
+
+    /// Records when this account may send again in a slowmode conversation (Unix seconds).
+    pub fn slowmode_until(&self, conversation_id: &str, until: i64) {
+        self.hub.set_slowmode_until(self.key(conversation_id), until);
     }
 
     /// One conversation: a direct message, or a channel created, renamed or moved.
@@ -1585,6 +2665,15 @@ impl Context {
         Ok(())
     }
 
+    /// Management permissions held by the signed-in user in a Space.
+    pub fn space_rights(&self, space_id: &str, rights: protocol::SpaceRights) -> Stores {
+        let space = self.key(space_id);
+        if self.hub.store().set_space_rights(&space, rights)? {
+            self.hub.changed(Change::Spaces { account: self.account.clone() });
+        }
+        Ok(())
+    }
+
     /// The newest message as a line, where the network's list gives only that (Teams'
     /// `lastMessage`). Where a whole message is at hand, record it with [`Context::history`].
     pub fn preview(&self, conversation_id: &str, line: &PreviewLine) -> Stores {
@@ -1594,6 +2683,15 @@ impl Context {
             if line.expires_at.is_some() {
                 self.hub.expiring();
             }
+        }
+        Ok(())
+    }
+
+    /// Tags, counts, picture, reaction, and owner of one forum post.
+    pub fn post_card(&self, conversation_id: &str, card: &PostCard) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().set_post(&conversation, card)? {
+            self.hub.changed(Change::Conversation { conversation });
         }
         Ok(())
     }
@@ -1753,6 +2851,35 @@ impl Context {
         Ok(())
     }
 
+    /// Drops every ephemeral message of this account and tells the shell which chats changed.
+    pub fn drop_ephemeral(&self) -> rusqlite::Result<Vec<String>> {
+        let conversations = self.hub.store().drop_ephemeral(&self.account)?;
+        for id in &conversations {
+            self.hub.changed(Change::Messages { conversation: self.key(id) });
+        }
+        Ok(conversations)
+    }
+    /// Clears `media_unread` on a stored message after it is listened to / played.
+    /// Returns true when the flag changed from true to false.
+    pub fn mark_media_played(&self, conversation_id: &str, message_id: &str) -> rusqlite::Result<bool> {
+        let conversation = self.key(conversation_id);
+        let changed = self.hub.store().clear_media_unread(&conversation, message_id)?;
+        if changed {
+            self.hub.changed(Change::Messages { conversation });
+        }
+        Ok(changed)
+    }
+
+    /// Consumes one unread mention in a conversation when a message's contents are marked read.
+    pub fn consume_mention(&self, conversation_id: &str) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().consume_mention(&conversation)? {
+            self.hub.changed(Change::Conversation { conversation });
+            self.hub.changed(Change::Status);
+        }
+        Ok(())
+    }
+
     /// A message is gone. One with a thread hanging off it stays as a tombstone, and replies to
     /// it say their original was deleted.
     pub fn deleted(&self, conversation_id: &str, message_id: &str) -> Stores {
@@ -1790,7 +2917,7 @@ impl Context {
         let conversation = self.key(conversation_id);
         if self.hub.store().react(&conversation, message_id, reaction, added)? {
             self.hub.changed(Change::Messages { conversation: conversation.clone() });
-            if added && !reaction.mine {
+            if added && !reaction.mine && !reaction.mine_burst {
                 if let Ok(Some(target)) = self.hub.store().message(&conversation, message_id) {
                     if target.outgoing {
                         let snippet = crate::store::preview_text(&target);
@@ -1851,6 +2978,11 @@ impl Context {
         self.hub.store().conversation(&self.key(conversation_id))
     }
 
+    /// Known threads whose parent conversation is `parent_id`.
+    pub fn child_threads(&self, parent_id: &str) -> rusqlite::Result<Vec<protocol::Conversation>> {
+        self.hub.store().child_threads(&self.key(parent_id))
+    }
+
     pub(crate) fn unread_telegram_channels(&self, after: &str, limit: u32) -> rusqlite::Result<Vec<String>> {
         self.hub.store().unread_telegram_channels(&self.account, after, limit)
     }
@@ -1860,6 +2992,24 @@ impl Context {
     pub fn note_newest(&self, conversation_id: &str, message_id: &str) -> Stores {
         self.hub.store().note_newest(&self.key(conversation_id), message_id)?;
         Ok(())
+    }
+
+    /// Drops cached messages sent by `sender_id` in `conversation_id` (and its child forum topics).
+    pub fn clear_sender_messages(&self, conversation_id: &str, sender_id: &str) -> Stores {
+        let conversation = self.key(conversation_id);
+        let affected = self.hub.store().clear_sender_messages(&conversation, sender_id)?;
+        for conv_id in affected {
+            let key = self.key(&conv_id);
+            self.hub.changed(Change::Messages { conversation: key.clone() });
+            self.hub.changed(Change::Conversation { conversation: key });
+        }
+        Ok(())
+    }
+
+    /// Cached pinned topics of a forum conversation.
+    pub fn pinned_topics(&self, forum_id: &str) -> rusqlite::Result<Vec<protocol::Conversation>> {
+        let (rows, _) = self.hub.store().topics(&self.key(forum_id), 0, 200)?;
+        Ok(rows.into_iter().filter(|c| c.pin.is_some()).collect())
     }
 
     /// Drops the cached messages of a conversation while keeping its row.
@@ -1916,20 +3066,20 @@ impl Context {
     /// People seen: friends, direct partners, authors, search results. Never a whole directory.
     pub fn people(&self, people: &[PersonRow]) -> Stores {
         self.hub.store().upsert_people(&self.account, people)?;
-        self.hub.changed(Change::People { account: self.account.clone() });
+        self.hub.changed(Change::People { account: self.account.clone(), person: None });
         Ok(())
     }
 
     /// The whole list the user owns, by person id, as sent at connect. Record the people first.
     pub fn relations(&self, relations: &[(String, Relation)]) -> Stores {
         self.hub.store().replace_relations(&self.account, relations)?;
-        self.hub.changed(Change::People { account: self.account.clone() });
+        self.hub.changed(Change::People { account: self.account.clone(), person: None });
         Ok(())
     }
 
     pub fn relation(&self, person_id: &str, relation: Relation) -> Stores {
         if self.hub.store().set_relation(&self.key(person_id), relation)? {
-            self.hub.changed(Change::People { account: self.account.clone() });
+            self.hub.changed(Change::People { account: self.account.clone(), person: None });
         }
         Ok(())
     }
@@ -1938,7 +3088,7 @@ impl Context {
     /// first.
     pub fn details(&self, people: &[(String, PersonDetails)]) -> Stores {
         self.hub.store().set_details(&self.account, people)?;
-        self.hub.changed(Change::People { account: self.account.clone() });
+        self.hub.changed(Change::People { account: self.account.clone(), person: None });
         Ok(())
     }
 
@@ -1946,6 +3096,11 @@ impl Context {
     /// presence: never stored, and only for owned lists and people the shell watches.
     pub fn activity(&self, person_id: &str, emoji: &str, activity: Option<Activity>, owned: bool) {
         self.hub.set_activity(self.key(person_id), emoji, activity, owned);
+    }
+
+    /// When our own custom status automatically clears (`None` = never).
+    pub fn status_until(&self, person_id: &str, until: Option<i64>, owned: bool) {
+        self.hub.set_status_until(self.key(person_id), until, owned);
     }
 
     /// What this account may send: file limits, pickers, options. Say it once the session
@@ -1989,6 +3144,41 @@ impl Context {
         self.hub.infos.forget(&self.key(conversation_id));
     }
 
+    /// Cached profiles for `person_id` are no longer current (e.g. a note from another device).
+    /// Only that person's open card refetches.
+    pub fn profile_stale(&self, person_id: &str) {
+        let person = self.key(person_id);
+        self.hub.profiles.forget_where(|(key, _)| *key == person);
+        self.hub.changed(Change::People { account: self.account.clone(), person: Some(person) });
+    }
+
+    /// Writes `note` into every cached profile for `person_id` without dropping the cache.
+    pub fn patch_profile_note(&self, person_id: &str, note: &str) {
+        let person = self.key(person_id);
+        let note = note.to_owned();
+        self.hub.profiles.update_where(|(key, _)| *key == person, |profile| profile.note = note.clone());
+    }
+    /// A Space's cached info is no longer current (e.g. `GUILD_UPDATE` or overview edit).
+    pub fn space_info_stale(&self, space_id: &str) {
+        self.hub.space_infos.forget(&self.key(space_id));
+    }
+
+    /// A Space's scheduled events changed: tells open shells to refresh them.
+    pub fn events_changed(&self, space_id: &str) {
+        self.hub.changed(Change::Events { space: self.key(space_id) });
+    }
+
+    /// A scheduled event the user is interested in just went live.
+    pub fn scheduled_event_started(&self, space_id: &str, space_name: &str, event_id: &str, name: &str, place: &str) {
+        self.hub.notify(crate::notify::Event::ScheduledEvent {
+            space: self.key(space_id),
+            space_name: space_name.to_owned(),
+            event_id: event_id.to_owned(),
+            name: name.to_owned(),
+            place: place.to_owned(),
+        });
+    }
+
     /// What is held about a person's presence now, for a member row built here.
     pub fn presence_of(&self, person_id: &str) -> Presence {
         self.hub.presence(&self.key(person_id))
@@ -2025,6 +3215,24 @@ impl Context {
             activity: Compose::Typing,
         };
         self.hub.set_typing(self.key(conversation_id), typist, false);
+    }
+
+    /// A bot/app opened a modal form in response to a control or command.
+    pub fn interaction_modal(&self, conversation_id: &str, modal: protocol::InteractionModal) {
+        self.hub.changed(Change::InteractionModal {
+            conversation: self.key(conversation_id),
+            modal,
+        });
+    }
+
+    /// An asynchronous interaction failed (button, select, slash command, or modal).
+    pub fn interaction_failed(&self, conversation_id: &str, message_id: &str, action_id: &str, reason: &str) {
+        self.hub.changed(Change::InteractionFailed {
+            conversation: self.key(conversation_id),
+            message_id: message_id.to_owned(),
+            action_id: action_id.to_owned(),
+            reason: reason.to_owned(),
+        });
     }
 
     /// What the shell has on screen, across every account. Also arrives as `Command::Watch`.
@@ -2120,7 +3328,7 @@ impl Context {
             self.row_changed(id, None);
         }
         if person {
-            self.hub.changed(Change::People { account: self.account.clone() });
+            self.hub.changed(Change::People { account: self.account.clone(), person: None });
         }
         Ok(())
     }
@@ -2684,7 +3892,7 @@ pub fn prove_reactors() -> Result<(), String> {
     let conversation = Key::new(&account, "c1");
     let said = Message::plain("m1", "Ada", "hello", 1_700_000_000, false);
     store.ingest(&conversation, &said, false).map_err(|err| err.to_string())?;
-    let by = |id: &str| protocol::Reaction { emoji: "👍".into(), file: None, count: 1, mine: false, who: vec![id.to_owned()] };
+    let by = |id: &str| protocol::Reaction { emoji: "👍".into(), file: None, count: 1, mine: false, who: vec![id.to_owned()], ..protocol::Reaction::default() };
     store.react(&conversation, "m1", &by("u-ana"), true).map_err(|err| err.to_string())?;
     store.react(&conversation, "m1", &by("u-bea"), true).map_err(|err| err.to_string())?;
     let who = |store: &crate::store::Store| -> Result<Vec<String>, String> {

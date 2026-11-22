@@ -312,9 +312,16 @@ fn parse_options(el: &Value) -> Vec<ControlOption> {
             .trim();
         let value = opt["value"].as_str().unwrap_or(label).trim();
         if !label.is_empty() || !value.is_empty() {
+            let description = opt["description"]["text"]
+                .as_str()
+                .or_else(|| opt["description"].as_str())
+                .unwrap_or("")
+                .trim()
+                .to_owned();
             out.push(ControlOption {
                 label: if label.is_empty() { value.to_owned() } else { label.to_owned() },
                 value: value.to_owned(),
+                description,
             });
         }
     };
@@ -370,6 +377,11 @@ fn parse_element(block_id: &str, el: &Value, label_override: Option<&str>, fallb
                 value,
                 confirm,
                 kind: ControlKind::Button { url, style },
+                disabled: false,
+                emoji: String::new(),
+                row: 0,
+                min_values: 0,
+                max_values: 0,
             })
         }
         "static_select"
@@ -415,6 +427,11 @@ fn parse_element(block_id: &str, el: &Value, label_override: Option<&str>, fallb
                 value: selected.clone().unwrap_or_default(),
                 confirm,
                 kind: ControlKind::Select { placeholder, options, selected, external },
+                disabled: false,
+                emoji: String::new(),
+                row: 0,
+                min_values: 0,
+                max_values: if kind.starts_with("multi_") { 25 } else { 0 },
             })
         }
         "overflow" => {
@@ -435,6 +452,11 @@ fn parse_element(block_id: &str, el: &Value, label_override: Option<&str>, fallb
                     selected: None,
                     external: false,
                 },
+                disabled: false,
+                emoji: String::new(),
+                row: 0,
+                min_values: 0,
+                max_values: 0,
             })
         }
         "datepicker" => {
@@ -453,6 +475,11 @@ fn parse_element(block_id: &str, el: &Value, label_override: Option<&str>, fallb
                 value: initial.clone().unwrap_or_default(),
                 confirm,
                 kind: ControlKind::DatePicker { placeholder, initial },
+                disabled: false,
+                emoji: String::new(),
+                row: 0,
+                min_values: 0,
+                max_values: 0,
             })
         }
         "timepicker" => {
@@ -471,6 +498,11 @@ fn parse_element(block_id: &str, el: &Value, label_override: Option<&str>, fallb
                 value: initial.clone().unwrap_or_default(),
                 confirm,
                 kind: ControlKind::TimePicker { placeholder, initial },
+                disabled: false,
+                emoji: String::new(),
+                row: 0,
+                min_values: 0,
+                max_values: 0,
             })
         }
         "checkboxes" => {
@@ -492,6 +524,11 @@ fn parse_element(block_id: &str, el: &Value, label_override: Option<&str>, fallb
                 value: String::new(),
                 confirm,
                 kind: ControlKind::Checkboxes { options, selected },
+                disabled: false,
+                emoji: String::new(),
+                row: 0,
+                min_values: 0,
+                max_values: 0,
             })
         }
         "radio_buttons" => {
@@ -508,6 +545,11 @@ fn parse_element(block_id: &str, el: &Value, label_override: Option<&str>, fallb
                 value: selected.clone().unwrap_or_default(),
                 confirm,
                 kind: ControlKind::RadioButtons { options, selected },
+                disabled: false,
+                emoji: String::new(),
+                row: 0,
+                min_values: 0,
+                max_values: 0,
             })
         }
         _ => None,
@@ -717,6 +759,8 @@ fn join_link(app: &str, v1: &Value) -> Option<Preview> {
         title: "Join".to_owned(),
         description: String::new(),
         image: None,
+        duration: 0,
+        opens_in_browser: false,
     })
 }
 
@@ -1439,6 +1483,8 @@ impl Slack {
             round: false,
             view_once: false,
             sticker_set: String::new(),
+            page: String::new(),
+            transcription: None,
             transcript,
         })
     }
@@ -1471,6 +1517,8 @@ impl Slack {
             title: first(&[&card["title"]]).unwrap_or("").to_owned(),
             description: description.chars().take(DESCRIPTION).collect(),
             image,
+            duration: 0,
+            opens_in_browser: false,
         }
     }
 
@@ -1785,6 +1833,8 @@ impl Slack {
                             title: first(&[&block["title"]["text"], &block["alt_text"]]).unwrap_or("Video").to_owned(),
                             description: first(&[&block["description"]["text"]]).unwrap_or("").chars().take(DESCRIPTION).collect(),
                             image,
+                            duration: 0,
+                            opens_in_browser: false,
                         });
                     }
                 }
@@ -2038,6 +2088,7 @@ impl Slack {
                 count: reaction["count"].as_u64().or(users.map(|users| users.len() as u64)).unwrap_or(1) as u32,
                 mine: users.is_some_and(|users| users.iter().any(|user| user == mine)),
                 who,
+                ..Reaction::default()
             })
         });
         let reactions: Vec<Reaction> = reactions.collect();

@@ -331,6 +331,26 @@ fn deliver_message(account: &Account, raw: &tl::enums::Message, edit: bool, cove
     let Some((conversation, mut mapped)) = placed(account, raw) else {
         return;
     };
+    if let tl::enums::Message::Service(svc) = raw {
+        match &svc.action {
+            tl::enums::MessageAction::SetMessagesTtl(ttl) => {
+                let _ = account.ctx.disappearing(&conversation, (ttl.period > 0).then_some(ttl.period as u32));
+            }
+            tl::enums::MessageAction::TopicCreate(created) => {
+                let forum = Who::of(&svc.peer_id);
+                sync::note_topic_create(account, forum, svc.id, &created.title, created.icon_color, created.icon_emoji_id, i64::from(svc.date));
+            }
+            tl::enums::MessageAction::TopicEdit(edited) => {
+                let forum = Who::of(&svc.peer_id);
+                let topic_id = svc.reply_to.as_ref().and_then(|r| match r {
+                    tl::enums::MessageReplyHeader::Header(h) => h.reply_to_top_id.or(h.reply_to_msg_id),
+                    _ => None,
+                }).unwrap_or(1);
+                sync::note_topic_edit(account, forum, topic_id, edited.title.as_deref(), edited.icon_emoji_id, edited.closed, edited.hidden);
+            }
+            _ => {}
+        }
+    }
     let watching = account.ctx.watching();
     let open = watching.conversation.as_ref().is_some_and(|open| open.account() == account.ctx.account && open.id == conversation);
     let member = sync::member(account, mapped.peer);
@@ -417,6 +437,7 @@ pub(super) fn noted(action: &tl::enums::SendMessageAction) -> Option<protocol::C
         SendMessageUploadDocumentAction(_) | SendMessageHistoryImportAction(_) => Some(protocol::Compose::UploadingFile),
         SendMessageChooseStickerAction => Some(protocol::Compose::ChoosingSticker),
         SendMessageGamePlayAction => Some(protocol::Compose::PlayingGame),
+        SpeakingInGroupCallAction => Some(protocol::Compose::Speaking),
         _ => Some(protocol::Compose::Typing),
     }
 }
@@ -434,6 +455,8 @@ pub(super) fn action_word(action: &tl::enums::SendMessageAction) -> &'static str
         Some(protocol::Compose::UploadingFile) => "upload-file",
         Some(protocol::Compose::ChoosingSticker) => "sticker",
         Some(protocol::Compose::PlayingGame) => "game",
+        Some(protocol::Compose::Speaking) => "speaking",
+        Some(protocol::Compose::Cancel) => "cancel",
     }
 }
 
@@ -472,6 +495,34 @@ fn reactions(account: &Account, conversation: &str, message: i32, update: &tl::e
     // later covers a reaction that arrives to a conversation nobody is in.
     if account.ctx.watching().conversation.as_ref().is_some_and(|open| open.account() == account.ctx.account && open.id == conversation) {
         sync::reaction_emoji(account, conversation, std::slice::from_ref(&stored));
+    }
+}
+
+/// Clears `media_unread` on a stored message (for both ours and theirs) and keeps the
+/// conversation's unread mention count in sync when `readMessageContents` also consumed a mention.
+pub(super) fn mark_contents_read(account: &Account, conversation: &str, id: i32) {
+    let id_str = id.to_string();
+    let stored = account.ctx.stored_message(conversation, &id_str).ok().flatten();
+    let _ = account.ctx.mark_media_played(conversation, &id_str);
+    let key = (conversation.to_owned(), id);
+    let first_time = {
+        let mut live = account.live();
+        if live.contents_read.contains(&key) {
+            false
+        } else {
+            if live.contents_read.len() >= 512 {
+                live.contents_read.pop_front();
+            }
+            live.contents_read.push_back(key);
+            true
+        }
+    };
+    if first_time {
+        if let Some(msg) = stored {
+            if !msg.outgoing && msg.mentions_me {
+                let _ = account.ctx.consume_mention(conversation);
+            }
+        }
     }
 }
 
@@ -569,6 +620,12 @@ pub(super) fn apply(account: &Account, update: &Update) {
             read(account, &conversation, seen.max_id, seen.still_unread_count);
         }
         Update::ReadChannelInbox(seen) => read(account, &Who::Channel(seen.channel_id).text(), seen.max_id, seen.still_unread_count),
+        Update::PinnedForumTopic(p) => sync::note_topic_pin(account, Who::of(&p.peer), p.topic_id, p.pinned),
+        Update::PinnedForumTopics(p) => {
+            if let Some(order) = &p.order {
+                sync::note_topic_pins(account, Who::of(&p.peer), order);
+            }
+        }
         Update::ChatParticipantDelete(changed) if changed.user_id == account.me => left(account, Who::Group(changed.chat_id)),
         Update::ChannelParticipant(changed) if changed.user_id == account.me => {
             use tl::enums::ChannelParticipant;
@@ -593,6 +650,32 @@ pub(super) fn apply(account: &Account, update: &Update) {
                 let _ = account.ctx.seen(&who.text(), &seen.max_id.to_string());
             }
         }
+        // Voice / round video messages listened to (or unread mentions/reactions consumed):
+        // clears the unplayed dot for both outgoing and incoming messages.
+        Update::ReadMessagesContents(read) => {
+            for &id in &read.messages {
+                let conversation = account
+                    .placed(None, id)
+                    .or_else(|| account.ctx.conversation_of_message(&id.to_string()).ok().flatten());
+                if let Some(conversation) = conversation {
+                    mark_contents_read(account, &conversation, id);
+                }
+            }
+        }
+        Update::ChannelReadMessagesContents(read) => {
+            let who = Who::Channel(read.channel_id);
+            let forum = account.dir().get(who).is_some_and(|known| known.forum);
+            for &id in &read.messages {
+                let conversation = if read.top_msg_id.is_some() {
+                    place(account, who, read.top_msg_id)
+                } else if forum {
+                    account.placed(Some(who), id).unwrap_or_else(|| place(account, who, None))
+                } else {
+                    who.text()
+                };
+                mark_contents_read(account, &conversation, id);
+            }
+        }
         // A scheduled message went, or was dropped: its placeholder goes.
         Update::DeleteScheduledMessages(gone) => {
             let conversation = Who::of(&gone.peer).text();
@@ -604,6 +687,14 @@ pub(super) fn apply(account: &Account, update: &Update) {
             let conversation = place(account, Who::of(&reacted.peer), reacted.top_msg_id);
             let message = written_id(account, reacted.msg_id).unwrap_or(reacted.msg_id);
             reactions(account, &conversation, message, &reacted.reactions);
+        }
+        Update::TranscribedAudio(tr) => {
+            let who = Who::of(&tr.peer);
+            let conversation = account
+                .placed(Some(who), tr.msg_id)
+                .or_else(|| (!matches!(who, Who::Channel(_))).then(|| account.placed(None, tr.msg_id)).flatten())
+                .unwrap_or_else(|| who.text());
+            super::info::apply_transcript_update(account, &conversation, tr.msg_id, tr.transcription_id, &tr.text, tr.pending);
         }
         // A full poll replaces the card. Counts alone name each option by its bytes, which the
         // stored card does not keep, so a results-only update is left as it is.
@@ -631,6 +722,11 @@ pub(super) fn apply(account: &Account, update: &Update) {
                 let relation = super::block_choice(!changed.blocked, contact).1;
                 let _ = account.ctx.relation(&who.text(), relation);
             }
+        }
+        Update::PendingJoinRequests(pending) => {
+            let who = Who::of(&pending.peer);
+            let count = pending.requests_pending.max(0) as u32;
+            account.live().pending_requests.insert(who, count);
         }
         Update::DraftMessage(drafted) => {
             let who = Who::of(&drafted.peer);

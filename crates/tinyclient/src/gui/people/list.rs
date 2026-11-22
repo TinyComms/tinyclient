@@ -1106,12 +1106,26 @@ impl PeopleList {
         .detach();
     }
 
+    /// The connected account matching the current scope that supports creating friend invite links.
+    fn friend_invite_account(&self) -> Option<AccountKey> {
+        let scope = self.scope?;
+        self.scene
+            .accounts
+            .iter()
+            .find(|own| own.key.network == scope && own.link == Link::Connected && own.can.create_friend_invite)
+            .map(|own| own.key.clone())
+    }
+
     /// The add-friend username bar at the top of People › Pending for accounts that support it.
     fn add_friend_bar(&self, window: &Window, cx: &mut Context<Self>) -> Option<Div> {
         if self.chip != Chip::Pending || !self.needle.is_empty() {
             return None;
         }
-        self.add_friend_account()?;
+        let add_account = self.add_friend_account();
+        let invite_account = self.friend_invite_account();
+        if add_account.is_none() && invite_account.is_none() {
+            return None;
+        }
         let focused = self.add_friend_input.focus_handle(cx).is_focused(window);
         let busy = self.adding_friend;
         let feedback = self.add_friend_feedback.as_ref().map(|(text, err)| {
@@ -1121,6 +1135,25 @@ impl PeopleList {
                 .text_color(if *err { theme::danger() } else { theme::text_soft() })
                 .child(text.clone())
         });
+        let shell = self.shell.clone();
+        let invite_row = invite_account.map(|account| {
+            div()
+                .pt(px(6.))
+                .flex()
+                .items_center()
+                .child(
+                    button("friend-invite-link", ButtonKind::Secondary, "Create invite link…").on_click(
+                        cx.listener(move |_, _, _, cx| {
+                            let _ = shell.update(cx, |shell, cx| {
+                                shell.open_create_invite(
+                                    crate::gui::sidebar::CreateInviteTarget::Friend(account.clone()),
+                                    cx,
+                                );
+                            });
+                        }),
+                    ),
+                )
+        });
         Some(
             div()
                 .flex_none()
@@ -1128,30 +1161,33 @@ impl PeopleList {
                 .pb(px(8.))
                 .flex()
                 .flex_col()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .child(
-                            search_field(focused)
-                                .flex_1()
-                                .min_w_0()
-                                .line_height(px(18.))
-                                .child(self.add_friend_input.clone()),
-                        )
-                        .child(
-                            button(
-                                "add-friend-send",
-                                ButtonKind::Primary,
-                                if busy { "Sending…" } else { "Send" },
+                .when(add_account.is_some(), |col| {
+                    col.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                search_field(focused)
+                                    .flex_1()
+                                    .min_w_0()
+                                    .line_height(px(18.))
+                                    .child(self.add_friend_input.clone()),
                             )
-                            .when(!busy, |btn| {
-                                btn.on_click(cx.listener(|this, _, _, cx| this.submit_add_friend(cx)))
-                            }),
-                        ),
-                )
-                .children(feedback),
+                            .child(
+                                button(
+                                    "add-friend-send",
+                                    ButtonKind::Primary,
+                                    if busy { "Sending…" } else { "Send" },
+                                )
+                                .when(!busy, |btn| {
+                                    btn.on_click(cx.listener(|this, _, _, cx| this.submit_add_friend(cx)))
+                                }),
+                            ),
+                    )
+                })
+                .children(feedback)
+                .children(invite_row),
         )
     }
 
@@ -1356,7 +1392,7 @@ mod tests {
     #[test]
     fn a_meeting_or_a_presentation_is_online_not_in_a_call() {
         let doing = |name: &str, kind: ActivityKind| Person {
-            activity: Some(Box::new(Activity { kind, name: String::new(), place: String::new(), conversation: None })),
+            activity: Some(Box::new(Activity::new(kind, ""))),
             ..(*person(name, Relation::Contact, Presence::Busy)).clone()
         };
         let in_call = vec![doing("Ana", ActivityKind::InMeeting), doing("Farah", ActivityKind::Presenting), doing("Odalys", ActivityKind::InCall)];
@@ -1370,11 +1406,14 @@ mod tests {
     fn line_two_says_where_they_talk_then_their_status_then_what_they_do_never_online() {
         let mut haruto = (*person("Haruto", Relation::Friend, Presence::Online)).clone();
         assert_eq!(around_line(&haruto, "", false, false), "");
-        haruto.activity = Some(Box::new(Activity { kind: ActivityKind::Playing, name: "Outer Ridge".into(), place: String::new(), conversation: None }));
+        haruto.activity = Some(Box::new(Activity::new(ActivityKind::Playing, "Outer Ridge")));
         assert_eq!(around_line(&haruto, "", false, false), "Playing Outer Ridge");
         haruto.emoji = "🌴".into();
         assert_eq!(around_line(&haruto, "Back Monday", false, false), "🌴 Back Monday");
-        haruto.activity = Some(Box::new(Activity { kind: ActivityKind::InVoice, name: "Campfire".into(), place: "Moss & Lichen".into(), conversation: None }));
+        haruto.activity = Some(Box::new(Activity {
+            place: "Moss & Lichen".into(),
+            ..Activity::new(ActivityKind::InVoice, "Campfire")
+        }));
         assert_eq!(around_line(&haruto, "Back Monday", false, false), "Campfire · Moss & Lichen");
         let titled = Person { title: "Designer".into(), ..(*person("Dev", Relation::Contact, Presence::Online)).clone() };
         assert_eq!((around_line(&titled, "", false, true), around_line(&titled, "", false, false)), ("Designer".to_owned(), String::new()));

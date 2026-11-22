@@ -8,7 +8,7 @@ use super::emoji;
 use super::icons::{icon, Icon};
 use super::images::Picture;
 use super::media::{self, Fit, Shape as MediaShape};
-use super::rich::{self, Block, Inline, Jumbo};
+use super::rich::{self, Block, Inline, Jumbo, RunAction};
 use super::rows::Item;
 use super::text::{Look, Rich, TextEvent};
 use super::tokens::{self, Metrics, MEASURE};
@@ -27,7 +27,7 @@ use gpui::{
 };
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use protocol::{Attachment, Card, Forwarded, Key, MediaFile, MentionKind, Message, MessageKind, Network, Preview, Receipt, Request, Response, SendState};
+use protocol::{Attachment, Card, Forwarded, InviteState, Key, MediaFile, MentionKind, Message, MessageInvite, MessageKind, Network, Preview, Receipt, Request, Response, ScheduledEvent, SendState, Via};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -266,16 +266,63 @@ fn replies_line(count: u32, metrics: Metrics) -> Div {
         .child(div().flex_1().h(px(1.)).bg(theme::hairline()))
 }
 
-fn system_line(message: &Message) -> Div {
+fn system_line_div(pane: &Pane, message: &Message, cx: &mut Context<Pane>) -> Div {
+    let _ = pane;
+    let text_el = if let Some(target) = message.jump.clone().filter(|id| !id.is_empty()) {
+        div()
+            .id(SharedString::from(format!("sys-jump-{}", message.id)))
+            .max_w(px(MEASURE))
+            .text_center()
+            .whitespace_normal()
+            .cursor_pointer()
+            .hover(|style| style.text_color(theme::text()).underline())
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| this.jump_to(&target, cx)))
+            .child(message.text.clone())
+            .into_any_element()
+    } else {
+        div().max_w(px(MEASURE)).text_center().whitespace_normal().child(message.text.clone()).into_any_element()
+    };
+    let quote_el = message.reply_to.as_ref().map(|reply| {
+        let target = message.jump.as_ref().filter(|id| !id.is_empty()).cloned();
+        let snippet = if reply.deleted {
+            "Original message was deleted".to_owned()
+        } else if reply.sender.is_empty() {
+            reply.snippet.clone()
+        } else {
+            format!("{}: {}", reply.sender, reply.snippet)
+        };
+        let row = div()
+            .id(SharedString::from(format!("sys-quote-{}", message.id)))
+            .mt(px(3.))
+            .max_w(px(MEASURE))
+            .pl(px(8.))
+            .border_l_2()
+            .border_color(theme::hairline())
+            .type_small()
+            .text_color(theme::text_soft())
+            .truncate()
+            .child(snippet);
+        if let Some(target) = target {
+            row.cursor_pointer()
+                .hover(|style| style.text_color(theme::text()))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| this.jump_to(&target, cx)))
+        } else {
+            row
+        }
+    });
     div()
         .min_h(px(28.))
         .px(px(20.))
         .py(px(5.))
         .flex()
-        .justify_center()
+        .flex_col()
+        .items_center()
         .type_small()
         .text_color(theme::text_faint())
-        .child(div().max_w(px(MEASURE)).child(message.text.clone()))
+        .child(text_el)
+        .children(quote_el)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -481,7 +528,7 @@ impl Pane {
             Item::New => new_line(metrics).into_any_element(),
             Item::Message { message, head } => self.message_row(message, *head, false, window, cx),
             Item::System(message) if message.call.is_some() => self.call_line(message, cx).into_any_element(),
-            Item::System(message) => system_line(message).into_any_element(),
+            Item::System(message) => self.system_row(message, cx).into_any_element(),
         };
         let seen = self.seen.clone();
         let mark = canvas(move |bounds, _, _| seen.borrow_mut().push((ix, bounds)), |_, (), _, _| {});
@@ -491,6 +538,35 @@ impl Pane {
             .child(body)
             .child(mark.absolute().top_0().left_0().size_full())
             .into_any_element()
+    }
+
+    /// A grey service line, plus any https link the adapter attached (a gift-code redeem).
+    fn system_row(&self, message: &Message, cx: &mut Context<Self>) -> Div {
+        let mut line = self.automod_row(message, cx);
+        for (idx, control) in message.controls.iter().enumerate() {
+            let protocol::ControlKind::Button { url, .. } = &control.kind else {
+                continue;
+            };
+            if url.is_empty() {
+                continue;
+            }
+            let target = url.clone();
+            let label = if control.label.is_empty() { "Open".to_owned() } else { control.label.clone() };
+            line = line.child(
+                div()
+                    .id(SharedString::from(format!("sys-{}-{idx}", message.id)))
+                    .ml(px(8.))
+                    .cursor_pointer()
+                    .text_color(theme::accent())
+                    .child(label)
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.open_external_link(&target, window, cx);
+                    })),
+            );
+        }
+        line
     }
 
     /// The widest a picture may be: 400, or what the pane leaves beside the gutter.
@@ -504,6 +580,28 @@ impl Pane {
         } else {
             self.metrics.media.min(room).max(120.).floor()
         }
+    }
+
+    /// AutoMod alerts are system rows. Their buttons are not drawn here, so the alert opens in Discord.
+    fn automod_row(&self, message: &Message, cx: &mut Context<Self>) -> Div {
+        let link = message
+            .text
+            .starts_with("AutoMod ")
+            .then(|| message.permalink.clone())
+            .filter(|link| link.starts_with("https://") || link.starts_with("http://"));
+        let mut row = system_line_div(self, message, cx);
+        if let Some(link) = link {
+            let id = SharedString::from(format!("automod-{}", message.id));
+            row = row.child(
+                div()
+                    .id(id)
+                    .cursor_pointer()
+                    .hover(|style| style.underline())
+                    .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&link)))
+                    .child("Open in Discord"),
+            );
+        }
+        row
     }
 
     fn call_line(&self, message: &Message, cx: &mut Context<Self>) -> Div {
@@ -986,7 +1084,7 @@ impl Pane {
                     };
                     quoted = quoted.children(attached);
                     sent.children(said)
-                        .child(div().mt(px(4.)).child(forwarded_line(from)))
+                        .child(div().mt(px(4.)).child(self.forwarded_line(&message.id, from, cx)))
                         .child(
                             div()
                                 .flex()
@@ -995,7 +1093,7 @@ impl Pane {
                         )
                 }
                 // What was forwarded is the message itself, set behind a bar under where it came from.
-                Some(from) => sent.child(forwarded_line(from)).child(
+                Some(from) => sent.child(self.forwarded_line(&message.id, from, cx)).child(
                     div()
                         .flex()
                         .child(div().w(px(2.)).flex_none().rounded(px(1.)).bg(tokens::border_strong()))
@@ -1152,6 +1250,7 @@ impl Pane {
                 .children(message.all_cards().enumerate().map(|(ix, card)| self.app_card(message, ix, card, cx)))
                 .children(message.poll.as_deref().map(|poll| self.poll_card(message, poll, cx)))
                 .children(message.contacts.iter().enumerate().map(|(idx, contact)| self.contact_card(message, contact, idx, cx)))
+                .children(message.invites.iter().enumerate().map(|(ix, invite)| self.invite_card(message, ix, invite, window, cx)))
                 .children(self.message_controls(message, cx))
                 .children(self.message_buttons(message, cx))
                 .children(self.cards(message, window, cx));
@@ -1169,14 +1268,17 @@ impl Pane {
             .min_w_0()
             .flex()
             .flex_col()
+            .children(message.via.as_ref().map(command_used))
             .children(head.then(|| self.header(message, in_header, cx)))
             .child(sent)
             .children((!sensitive_hidden).then(|| self.otp_chip(message, cx)).flatten())
+            .children(self.publish_chip(message, cx))
             .children(self.views_line(message))
             .children(self.reactions(message, window, cx))
             .children(self.thread_line(message, window, cx))
             .children(self.sending(message, cx))
-            .children(self.unsent(message, cx));
+            .children(self.unsent(message, cx))
+            .children(self.ephemeral_note(message, cx));
 
         let menu = message.clone();
         let inner = div()
@@ -1193,6 +1295,7 @@ impl Pane {
             // The row that owns an open menu, picker or dialog keeps `selected` (polish/01 §2).
             .when(owns && !editing, |row| row.bg(theme::selected()))
             .when(!mentioned && !editing && !owns, |row| row.hover(|style| style.bg(tokens::row_hover())))
+            .when(message.ephemeral && !editing, |row| row.bg(theme::warning_soft()))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
@@ -1432,6 +1535,14 @@ impl Pane {
             )
             .children(message.sender.bot.then(|| tag("APP")))
             .children(message.saved_history.then(|| tag("SAVED")))
+            .children(message.published.then(|| tag("PUBLISHED")))
+            .children((!message.crosspost_source.is_empty()).then(|| {
+                div()
+                    .flex_none()
+                    .type_micro()
+                    .text_color(theme::text_faint())
+                    .child(format!("from {}", message.crosspost_source))
+            }))
             .children(message.pinned.then(|| {
                 div()
                     .flex_none()
@@ -1479,7 +1590,8 @@ impl Pane {
             return message.edited.then(|| self.edited_mark(message, cx)).into_iter().collect();
         }
         if let Some(emoji) = rich::jumbo(&message.text, &message.spans) {
-            return vec![self.jumbo(&emoji, window, cx)];
+            let mut out = vec![self.jumbo(&emoji, window, cx)];
+            return out;
         }
         let mut blocks = rich::blocks(&message.text, &message.spans);
         let mut edited_alone = message.edited;
@@ -1494,6 +1606,13 @@ impl Pane {
                 // block its layout belongs to the line box, and `Rich` reads its own layout.
                 Block::Text(inline) => {
                     let marked = inline.runs.iter().any(|run| run.mark);
+                    let hovered_time = self
+                        .hovered
+                        .as_ref()
+                        .filter(|(id, at, _)| *id == message.id && *at == ix)
+                        .and_then(|(_, _, run)| inline.runs.get(*run))
+                        .and_then(|run| run.time)
+                        .map(|(unix, _)| time::tooltip(unix));
                     let block = div()
                         .max_w(px(MEASURE))
                         .flex()
@@ -1501,39 +1620,97 @@ impl Pane {
                         .type_body()
                         .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
                         .child(self.rich(message, ix, inline, theme::text().into_color(), window, cx));
-                    if marked {
+                    if let Some(words) = hovered_time {
+                        block.id(name_id(&format!("time-{ix}"), &message.id)).tooltip(tip(words, None)).into_any_element()
+                    } else if marked {
                         block.id(name_id("edited", &message.id)).tooltip(tip(edited_tip(message.edited_at), None)).into_any_element()
                     } else {
                         block.into_any_element()
                     }
                 }
-                Block::Quote(inline) => div()
+                Block::Heading { level, text } => {
+                    let (size, line, top, bottom) = match *level {
+                        1 => (20., 26., 6., 2.),
+                        2 => (18., 24., 4., 1.),
+                        _ => (16., 22., 2., 0.),
+                    };
+                    div()
+                        .max_w(px(MEASURE))
+                        .mt(px(top))
+                        .mb(px(bottom))
+                        .flex()
+                        .flex_col()
+                        .text_size(theme::sized(size))
+                        .line_height(theme::sized(line))
+                        .font_weight(theme::SEMIBOLD)
+                        .when(phone, |div| {
+                            div.text_size(px(tokens_phone::scaled(size + 2.)))
+                                .line_height(px(tokens_phone::scaled(line + 2.)))
+                        })
+                        .child(self.rich(message, ix, text, theme::text().into_color(), window, cx))
+                        .into_any_element()
+                }
+                Block::Small(inline) => div()
                     .max_w(px(MEASURE))
-                    .mt(px(3.))
+                    .mt(px(1.))
                     .flex()
-                    .child(div().w(px(3.)).flex_none().rounded(px(2.)).bg(tokens::border_strong()))
-                    .child(
-                        div()
-                            .pl(px(12.))
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .type_body()
-                            .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
-                            .child(self.rich(message, ix, inline, theme::text_soft().into_color(), window, cx)),
-                    )
+                    .flex_col()
+                    .type_small()
+                    .when(phone, |div| div.text_size(px(tokens_phone::scaled(13.))).line_height(px(tokens_phone::scaled(18.))))
+                    .text_color(theme::text_faint())
+                    .child(self.rich(message, ix, inline, theme::text_faint().into_color(), window, cx))
                     .into_any_element(),
+                Block::Quote(inline) => {
+                    let hovered_time = self
+                        .hovered
+                        .as_ref()
+                        .filter(|(id, at, _)| *id == message.id && *at == ix)
+                        .and_then(|(_, _, run)| inline.runs.get(*run))
+                        .and_then(|run| run.time)
+                        .map(|(unix, _)| time::tooltip(unix));
+                    let block = div()
+                        .max_w(px(MEASURE))
+                        .mt(px(3.))
+                        .flex()
+                        .child(div().w(px(3.)).flex_none().rounded(px(2.)).bg(tokens::border_strong()))
+                        .child(
+                            div()
+                                .pl(px(12.))
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .type_body()
+                                .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
+                                .child(self.rich(message, ix, inline, theme::text_soft().into_color(), window, cx)),
+                        );
+                    if let Some(words) = hovered_time {
+                        block.id(name_id(&format!("time-{ix}"), &message.id)).tooltip(tip(words, None)).into_any_element()
+                    } else {
+                        block.into_any_element()
+                    }
+                }
                 Block::Item { ordered, depth, number, text } => {
                     let marker = if *ordered { format!("{number}.") } else { "•".to_owned() };
-                    div()
+                    let hovered_time = self
+                        .hovered
+                        .as_ref()
+                        .filter(|(id, at, _)| *id == message.id && *at == ix)
+                        .and_then(|(_, _, run)| text.runs.get(*run))
+                        .and_then(|run| run.time)
+                        .map(|(unix, _)| time::tooltip(unix));
+                    let block = div()
                         .max_w(px(MEASURE))
                         .pl(px(22. * f32::from(*depth)))
                         .flex()
                         .type_body()
                         .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
                         .child(div().w(px(22.)).flex_none().text_color(theme::text_faint()).child(marker))
-                        .child(div().min_w_0().flex_1().flex().flex_col().child(self.rich(message, ix, text, theme::text().into_color(), window, cx)))
-                        .into_any_element()
+                        .child(div().min_w_0().flex_1().flex().flex_col().child(self.rich(message, ix, text, theme::text().into_color(), window, cx)));
+                    if let Some(words) = hovered_time {
+                        block.id(name_id(&format!("time-{ix}"), &message.id)).tooltip(tip(words, None)).into_any_element()
+                    } else {
+                        block.into_any_element()
+                    }
                 }
                 Block::Code { language, text } => self.code_block(message, ix, language, text, cx),
             };
@@ -1615,6 +1792,75 @@ impl Pane {
                 .detach();
             }));
         Some(div().flex().child(chip).into_any_element())
+    }
+
+    /// One-click "Publish" chip under my own unpublished messages in an announcement channel.
+    fn publish_chip(&mut self, message: &Rc<Message>, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !message.outgoing || !self.can(message).publish {
+            return None;
+        }
+        let msg = message.clone();
+        let chip = div()
+            .id(name_id("publish", &message.id))
+            .mt(px(4.))
+            .h(px(26.))
+            .px(px(10.))
+            .rounded(px(theme::R_CONTROL))
+            .bg(theme::field())
+            .border_1()
+            .border_color(theme::border())
+            .hover(|style| style.bg(theme::selected()).border_color(theme::border_strong()))
+            .active(|style| style.bg(theme::pressed()))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .type_small()
+            .text_color(theme::text())
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(crate::gui::components::glyph("icons/megaphone.svg", 12., theme::text_soft()))
+            .child("Publish")
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.publish_message(&msg, cx);
+            }));
+        Some(div().flex().child(chip).into_any_element())
+    }
+
+    /// Where a forwarded message was first said, with an in-app "→ origin" link when present.
+    fn forwarded_line(&self, message_id: &str, from: &Forwarded, cx: &mut Context<Self>) -> Div {
+        let place = match (from.from_title.is_empty(), from.from_space.is_empty()) {
+            (true, true) => "Forwarded".to_owned(),
+            (false, true) => format!("Forwarded from {}", from.from_title),
+            (true, false) => format!("Forwarded from {}", from.from_space),
+            (false, false) => format!("Forwarded from {} in {}", from.from_title, from.from_space),
+        };
+        let origin = (!from.link.is_empty()).then(|| {
+            let url = from.link.clone();
+            div()
+                .id(name_id("fwd-origin", message_id))
+                .flex_none()
+                .cursor_pointer()
+                .text_color(tokens::link())
+                .hover(|s| s.underline())
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_link(&url, event.modifiers().alt, window, cx);
+                }))
+                .child("→ origin")
+        });
+        div()
+            .h(px(18.))
+            .mb(px(2.))
+            .flex()
+            .items_center()
+            .gap(px(5.))
+            .type_small()
+            .text_color(theme::text_faint())
+            .child(icon(Icon::Forward, 13., theme::text_faint()))
+            .child(div().min_w_0().truncate().child(place))
+            .children(origin)
     }
 
     /// "(edited)", with the time it was edited. A network that keeps earlier wordings opens them on a click.
@@ -1914,7 +2160,7 @@ impl Pane {
                     cx.notify();
                 }
             }
-            TextEvent::Click(run, alt) => {
+            TextEvent::Click(run_ix, alt) => {
                 let Some(message) = self.find(id) else {
                     return;
                 };
@@ -1923,10 +2169,23 @@ impl Pane {
                     last.mark_edited();
                 }
                 let inline = match blocks.get(block) {
-                    Some(Block::Text(inline) | Block::Quote(inline) | Block::Item { text: inline, .. }) => inline,
+                    Some(
+                        Block::Text(inline)
+                        | Block::Heading { text: inline, .. }
+                        | Block::Small(inline)
+                        | Block::Quote(inline)
+                        | Block::Item { text: inline, .. },
+                    ) => inline,
                     _ => return,
                 };
-                let Some(run) = inline.runs.get(run) else {
+                let run_text = inline
+                    .ranges()
+                    .nth(run_ix)
+                    .and_then(|(range, _)| inline.text.get(range))
+                    .unwrap_or("")
+                    .trim()
+                    .to_owned();
+                let Some(run) = inline.runs.get(run_ix) else {
                     return;
                 };
                 if run.mark {
@@ -1948,6 +2207,44 @@ impl Pane {
                         }
                     }
                     self.open_link(url, alt, window, cx);
+                } else if let Some(action) = &run.action {
+                    match action {
+                        RunAction::Hashtag if !run_text.is_empty() => {
+                            let _ = self.shell.update(cx, |shell, cx| {
+                                shell.open_search_with(super::side::Scope::Conversation, &run_text, window, cx);
+                            });
+                        }
+                        RunAction::Command if !run_text.is_empty() => {
+                            if let Some(conversation) = self.key().cloned() {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map_or(0, |d| d.as_millis());
+                                let request = Request::Send {
+                                    conversation,
+                                    client_id: format!("cmd-{now}"),
+                                    text: run_text,
+                                    reply_to: None,
+                                    with: protocol::Outgoing::default(),
+                                };
+                                cx.spawn(async move |this, cx| {
+                                    let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+                                    if let Ok(Response::Error { detail, .. }) = answer {
+                                        let _ = this.update(cx, |this, cx| this.say(detail, cx));
+                                    }
+                                })
+                                .detach();
+                            }
+                        }
+                        RunAction::Username(username) if !username.is_empty() => {
+                            let url = format!("https://t.me/{username}");
+                            self.open_link(&url, alt, window, cx);
+                        }
+                        RunAction::Copyable if !run_text.is_empty() => {
+                            cx.write_to_clipboard(ClipboardItem::new_string(run_text.clone()));
+                            let _ = self.shell.update(cx, |shell, cx| shell.toast(None, format!("Copied {run_text}"), cx));
+                        }
+                        _ => {}
+                    }
                 } else if let Some((MentionKind::User, person)) = &run.mention {
                     let (Some(person), at) = (self.person(person), window.mouse_position()) else {
                         return;
@@ -1966,9 +2263,20 @@ impl Pane {
                             }
                         }
                     }
+                } else if let Some((MentionKind::Channel, channel_id)) = &run.mention {
+                    let channel_id = channel_id.clone();
+                    self.open_channel_mention(&channel_id, alt, window, cx);
+                } else if matches!(run.mention, Some((MentionKind::Command, _))) {
+                    let shown = inline
+                        .ranges()
+                        .find(|(_, one)| std::ptr::eq(*one, run))
+                        .map(|(range, _)| &inline.text[range])
+                        .unwrap_or("");
+                    let name = shown.trim().trim_start_matches('/').to_owned();
+                    if !name.is_empty() {
+                        let _ = self.shell.update(cx, |shell, cx| shell.composer_fill_command(&name, window, cx));
+                    }
                 }
-                // LATER: a click on a channel mention opens the channel; it needs the channel's
-                // row, which the sidebar holds.
             }
         }
     }
@@ -2173,7 +2481,23 @@ impl Pane {
                 let (wide, tall) = natural(attachment);
                 let single = media::single(wide, tall, width);
                 let tile = self.tile(message, *only, single.width, single.height, single.fit, None, window, cx);
-                if let Some(panel) = self.transcript_box(message, *only, None, cx) {
+                if attachment.round {
+                    let btn = self.transcribe_button(message, *only, cx);
+                    let block = self.transcript_block(message, *only, cx);
+                    if btn.is_some() || block.is_some() {
+                        out.push(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(4.))
+                                .child(div().flex().items_end().gap(px(6.)).child(tile).children(btn))
+                                .children(block)
+                                .into_any_element(),
+                        );
+                    } else {
+                        out.push(tile);
+                    }
+                } else if let Some(panel) = self.transcript_box(message, *only, None, cx) {
                     out.push(div().flex().flex_col().child(tile).child(panel).into_any_element());
                 } else {
                     out.push(tile);
@@ -2378,9 +2702,14 @@ impl Pane {
         // are `video`'s (`Pane::moving`, where an inline player plugs in). A GIF that is a GIF
         // plays here in its tile, and opens in the viewer like a picture.
         let id = message.id.clone();
+        let page = attachment.page.clone();
+        let fav_file = attachment.file.id.clone();
+        let discord_gif = shape == MediaShape::Gif
+            && (page.starts_with("https://") || page.starts_with("http://"))
+            && self.open.as_ref().is_some_and(|open| open.key.network == protocol::Network::Discord);
         let tile = match shape {
-            MediaShape::Video => self.moving(attachment, tile, cx),
-            MediaShape::Gif if media::is_video(attachment) => self.moving(attachment, tile, cx),
+            MediaShape::Video => self.moving(message, attachment, tile, cx),
+            MediaShape::Gif if media::is_video(attachment) => self.moving(message, attachment, tile, cx),
             _ => {
                 // A GIF says so where it does not play by itself. One held still (the setting
                 // is Never, the network sent a still, or there was no room) shows that a click
@@ -2393,7 +2722,36 @@ impl Pane {
                 tile.on_click(cx.listener(move |this, _, window, cx| this.open_viewer(&id, index, window, cx)))
             }
         };
-        let tile = tile.child(edge_line()).children(more.map(|more| {
+        // The border covers the picture. The star is painted after it, so a click lands on the
+        // star and does not open the GIF. A "+N" cover, when there is one, stays on top.
+        let tile = tile.child(edge_line());
+        let tile = if discord_gif {
+            let star_id: SharedString = format!("gif-fav-{fav_file}").into();
+            tile.child(
+                div()
+                    .id(star_id)
+                    .absolute()
+                    .top(px(4.))
+                    .right(px(4.))
+                    .size(px(24.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(gpui::rgba(0x00000099))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .tooltip(tip("Favourite GIF", None))
+                    .child(glyph("icons/star.svg", 14., gpui::white()))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.favourite_posted_gif(&page, cx);
+                    })),
+            )
+        } else {
+            tile
+        };
+        let tile = tile.children(more.map(|more| {
             div()
                 .absolute()
                 .inset_0()
@@ -2428,6 +2786,13 @@ impl Pane {
 
     fn file_row(&mut self, message: &Rc<Message>, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let attachment = &message.attachments[index];
+        if crate::gui::app::prefs::choices().text_previews && !attachment.spoiler && !self.is_gated() {
+            if let Some(lang) = super::text_preview::preview_language(attachment) {
+                if let Some(card) = self.text_preview_card(message, index, lang, cx) {
+                    return card;
+                }
+            }
+        }
         let file = attachment.file.clone();
         let on_disk = file.path.clone();
         let fetching = self.then.contains_key(&file.id);
@@ -2532,6 +2897,237 @@ impl Pane {
             None => row.child(tool("download", Icon::Download, 28.).tooltip(tip("Download", None))),
         };
         row.into_any_element()
+    }
+
+    /// Inline preview card for a text or code file attachment (#385). Fetches up to 100 KB via a
+    /// ranged request only when this row is drawn on screen, decodes UTF-8 lossily off the UI
+    /// thread, rejects binary-looking bytes, and renders with the same syntax-coloured code frame.
+    fn text_preview_card(
+        &mut self,
+        message: &Rc<Message>,
+        index: usize,
+        language: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let attachment = message.attachments[index].clone();
+        let file_id = attachment.file.id.clone();
+        let preview = match self.text_previews.get(&file_id) {
+            Some(Some(preview)) => Rc::clone(preview),
+            Some(None) => return None,
+            None => {
+                let head_key = super::text_preview::head_id(&file_id);
+                let disk_path = attachment
+                    .file
+                    .path
+                    .clone()
+                    .or_else(|| self.known.get(&file_id).cloned())
+                    .or_else(|| self.known.get(&head_key).cloned());
+                if let Some(path) = disk_path {
+                    if self.text_preview_loading.insert(file_id.clone()) {
+                        let declared = attachment.file.bytes;
+                        let id_for_task = file_id.clone();
+                        let path_buf = std::path::PathBuf::from(path);
+                        cx.spawn(async move |this, cx| {
+                            let decoded = cx
+                                .background_executor()
+                                .spawn(async move {
+                                    super::text_preview::read_file_preview(&path_buf, declared, language)
+                                })
+                                .await;
+                            let _ = this.update(cx, |this, cx| {
+                                this.text_preview_loading.remove(&id_for_task);
+                                this.text_previews.insert(id_for_task, decoded.map(Rc::new));
+                                cx.notify();
+                            });
+                        })
+                        .detach();
+                    }
+                } else if attachment.file.failed.is_none() && !self.asked_text_previews.contains(&file_id) {
+                    self.want_text_previews.push(file_id);
+                }
+                return None;
+            }
+        };
+
+        let block_id = 10_000usize.saturating_add(index);
+        let key = (message.id.clone(), block_id);
+        let lines = preview.inline_lines;
+        let folded = lines > CODE_LINES && !self.expanded.contains(&key);
+        let lit = if lines > super::highlight::PLAIN_LINES {
+            None
+        } else {
+            self.code_colors(message, block_id, preview.language, &preview.inline_text, cx)
+        };
+        let shown = match &lit {
+            Some(lit) if folded => first_lines(&lit.text, CODE_LINES).to_owned(),
+            Some(lit) => lit.text.clone(),
+            None if folded => preview.inline_text.lines().take(CODE_LINES).collect::<Vec<_>>().join("\n"),
+            None => preview.inline_text.clone(),
+        };
+        let highlights = code_highlights(&shown, lit.as_ref().map(|lit| lit.runs.as_slice()).unwrap_or(&[]));
+        let copied = self.copied.as_ref() == Some(&key);
+        let phone = self.metrics == Metrics::PHONE;
+        let btn_size = if phone { 36. } else { 24. };
+        let copy_text = preview.head_text.clone();
+        let copy_key = key.clone();
+        let expand_att = attachment.clone();
+        let expand_text = preview.head_text.clone();
+        let expand_truncated = preview.truncated;
+        let expand_lang = preview.language;
+        let download_att = attachment.clone();
+        let mut meta = media::type_label(&attachment);
+        if attachment.file.bytes > 0 {
+            meta = format!("{meta} · {}", media::size_label(attachment.file.bytes));
+        }
+        let mut body = div().id(("text-preview-body", block_id)).overflow_x_scroll().px(px(12.)).pt(px(2.)).pb(px(9.));
+        body.style().restrict_scroll_to_axis = Some(true);
+
+        let footer = if folded {
+            let expand_key = key.clone();
+            Some(
+                div()
+                    .id(("text-preview-more", block_id))
+                    .h(px(28.))
+                    .px(px(12.))
+                    .flex()
+                    .items_center()
+                    .border_t_1()
+                    .border_color(theme::hairline())
+                    .type_small()
+                    .text_color(theme::accent_text())
+                    .cursor_pointer()
+                    .child(format!("Show {} more lines", lines - CODE_LINES))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.expanded.insert(expand_key.clone());
+                        cx.notify();
+                    })),
+            )
+        } else if preview.truncated {
+            let open_att = attachment.clone();
+            let open_text = preview.head_text.clone();
+            let open_lang = preview.language;
+            Some(
+                div()
+                    .id(("text-preview-full", block_id))
+                    .h(px(28.))
+                    .px(px(12.))
+                    .flex()
+                    .items_center()
+                    .border_t_1()
+                    .border_color(theme::hairline())
+                    .type_small()
+                    .text_color(theme::accent_text())
+                    .cursor_pointer()
+                    .child("Expand full file")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_text_viewer(open_att.clone(), open_lang, open_text.clone(), true, window, cx);
+                    })),
+            )
+        } else {
+            None
+        };
+
+        Some(
+            div()
+                .mt(px(5.))
+                .mb(px(3.))
+                .max_w(px(MEASURE))
+                .rounded(px(theme::R_CARD))
+                .bg(tokens::code_bg())
+                .border_1()
+                .border_color(theme::hairline())
+                .overflow_hidden()
+                .child(
+                    div()
+                        .h(px(if phone { 38. } else { 32. }))
+                        .pl(px(10.))
+                        .pr(px(4.))
+                        .border_b_1()
+                        .border_color(theme::hairline())
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(icon(media::file_icon(&attachment), 14., theme::text_soft()))
+                                .child(div().min_w_0().truncate().type_small().font_weight(theme::MEDIUM).text_color(theme::text()).child(attachment.name.clone()))
+                                .child(div().flex_none().type_micro().text_color(theme::text_faint()).child(meta)),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap(px(2.))
+                                .child(
+                                    tool(("tp-copy", block_id), if copied { Icon::Check } else { Icon::Copy }, btn_size)
+                                        .when(!phone, |b| b.tooltip(tip("Copy text", None)))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                                            this.copied = Some(copy_key.clone());
+                                            cx.notify();
+                                            let copy_key = copy_key.clone();
+                                            cx.spawn(async move |this, cx| {
+                                                cx.background_executor().timer(Duration::from_millis(1500)).await;
+                                                let _ = this.update(cx, |this, cx| {
+                                                    if this.copied.as_ref() == Some(&copy_key) {
+                                                        this.copied = None;
+                                                        cx.notify();
+                                                    }
+                                                });
+                                            })
+                                            .detach();
+                                        })),
+                                )
+                                .child(
+                                    tool(("tp-expand", block_id), Icon::Fit, btn_size)
+                                        .when(!phone, |b| b.tooltip(tip("Expand", None)))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.open_text_viewer(
+                                                expand_att.clone(),
+                                                expand_lang,
+                                                expand_text.clone(),
+                                                expand_truncated,
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                                .child(
+                                    tool(("tp-download", block_id), Icon::Download, btn_size)
+                                        .when(!phone, |b| b.tooltip(tip("Download", None)))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.fetch_then(&download_att, Then::Open, cx);
+                                        })),
+                                ),
+                        ),
+                )
+                .child(crate::gui::components::scroll::scroll_content(
+                    ("tp-scroll-frame", block_id),
+                    body.pb(px(14.)).child(
+                        div()
+                            .type_code()
+                            .when(phone, |code| code.text_size(px(tokens_phone::scaled(14.))).line_height(px(tokens_phone::scaled(20.))))
+                            .whitespace_nowrap()
+                            .child(if highlights.is_empty() {
+                                shown.into_any_element()
+                            } else {
+                                StyledText::new(SharedString::from(shown)).with_highlights(highlights).into_any_element()
+                            }),
+                    ),
+                ))
+                .children(footer)
+                .into_any_element(),
+        )
     }
 
     /// What a bot or app posts instead of text: one framed card, its bar in one of our colors.
@@ -2829,30 +3425,107 @@ impl Pane {
         Some(grid.into_any_element())
     }
 
-    /// Interactive Block Kit controls attached to a message (buttons, menus, pickers, radios, checkboxes).
+    /// Users, roles, and channels the shell already holds, so an entity select with no stored
+    /// options can still post a picked id.
+    fn entity_choices(&self, element_type: &str, cx: &mut Context<Self>) -> Vec<protocol::ControlOption> {
+        let Some(shell) = self.shell.upgrade() else {
+            return Vec::new();
+        };
+        let shell = shell.read(cx);
+        let Some(open) = self.open.as_ref() else {
+            return Vec::new();
+        };
+        let account = open.key.account();
+        let mut rows = Vec::new();
+        if matches!(element_type, "discord_user_select" | "discord_mentionable_select") {
+            for person in shell.people_state.hub().friends(&account) {
+                if person.name.is_empty() || person.key.id.is_empty() {
+                    continue;
+                }
+                rows.push(protocol::ControlOption {
+                    label: person.name,
+                    value: person.key.id,
+                    description: String::new(),
+                });
+            }
+        }
+        if element_type == "discord_channel_select" {
+            let space = shell
+                .snapshot
+                .as_ref()
+                .and_then(|snap| snap.open.as_ref())
+                .filter(|row| row.key == open.key)
+                .and_then(|row| row.space.clone());
+            if let Some(space) = space {
+                if let Some(tree) = shell.trees.get(&Key::new(&account, space.as_str())) {
+                    for conv in &tree.conversations {
+                        if matches!(
+                            conv.kind,
+                            protocol::ConversationKind::Thread
+                                | protocol::ConversationKind::Direct
+                                | protocol::ConversationKind::Group
+                        ) {
+                            continue;
+                        }
+                        let name = conv.title.trim_start_matches('#').trim();
+                        if name.is_empty() || conv.key.id.is_empty() {
+                            continue;
+                        }
+                        rows.push(protocol::ControlOption {
+                            label: name.to_owned(),
+                            value: conv.key.id.clone(),
+                            description: String::new(),
+                        });
+                    }
+                }
+            }
+        }
+        rows.truncate(100);
+        rows
+    }
+
+    /// Interactive controls attached to a message (buttons, menus, pickers, radios, checkboxes).
     fn message_controls(&self, message: &Rc<Message>, cx: &mut Context<Self>) -> Option<AnyElement> {
         if message.controls.is_empty() {
             return None;
         }
         let conversation = self.key()?.clone();
-        let mut row = div().pt(px(6.)).flex().flex_wrap().items_center().gap(px(6.));
+        let mut container = div().pt(px(6.)).flex().flex_col().gap(px(6.));
+        let mut current_row_id: Option<u8> = None;
+        let mut row = div().flex().flex_wrap().items_center().gap(px(6.));
         for (idx, control) in message.controls.iter().enumerate() {
+            if let Some(prev) = current_row_id {
+                if prev != control.row {
+                    container = container.child(row);
+                    row = div().flex().flex_wrap().items_center().gap(px(6.));
+                }
+            }
+            current_row_id = Some(control.row);
             let pending = self
                 .pending_actions
                 .get(&(message.id.clone(), control.action_id.clone()))
                 .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(10));
+            let disabled = control.disabled;
             let el_id = SharedString::from(format!("ctrl-{}-{idx}", message.id));
             match &control.kind {
                 protocol::ControlKind::Button { url, style } => {
-                    let label = if pending {
-                        format!("{}…", control.label)
-                    } else if !url.is_empty() {
-                        format!("{} ↗", control.label)
-                    } else {
+                    let base = if control.emoji.is_empty() {
                         control.label.clone()
+                    } else if control.label.is_empty() {
+                        control.emoji.clone()
+                    } else {
+                        format!("{} {}", control.emoji, control.label)
+                    };
+                    let label = if pending {
+                        format!("{base}…")
+                    } else if !url.is_empty() {
+                        format!("{base} ↗")
+                    } else {
+                        base
                     };
                     let (bg, fg, border, hover_bg) = match style {
                         protocol::ControlStyle::Primary => (theme::accent(), theme::on_accent(), theme::accent(), theme::accent()),
+                        protocol::ControlStyle::Success => (theme::online(), theme::on_accent(), theme::online(), theme::online()),
                         protocol::ControlStyle::Danger => (theme::danger(), theme::on_accent(), theme::danger(), theme::danger()),
                         protocol::ControlStyle::Default => (tokens::card(), theme::text(), tokens::border_strong(), theme::hover()),
                     };
@@ -2869,12 +3542,14 @@ impl Pane {
                         .type_small()
                         .font_weight(theme::MEDIUM)
                         .text_color(fg)
-                        .cursor_pointer()
-                        .when(pending, |d| d.opacity(0.6))
-                        .hover(move |s| s.bg(hover_bg))
+                        .when(!disabled, |d| d.cursor_pointer().hover(move |s| s.bg(hover_bg)))
+                        .when(disabled, |d| d.cursor_default().opacity(0.45))
+                        .when(pending && !disabled, |d| d.opacity(0.6))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(label);
-                    if !url.is_empty() {
+                    if disabled {
+                        // Disabled button: drawn dimmed and inert.
+                    } else if !url.is_empty() {
                         let conv = conversation.clone();
                         let msg_id = message.id.clone();
                         let target = url.clone();
@@ -2891,7 +3566,7 @@ impl Pane {
                         let element_type = control.element_type.clone();
                         let value = control.value.clone();
                         let confirm = control.confirm.clone();
-                        btn = btn.on_click(cx.listener(move |this, _, _, cx| {
+                        btn = btn.on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
                             this.trigger_control(
                                 conv.clone(),
@@ -2902,6 +3577,7 @@ impl Pane {
                                 value.clone(),
                                 Vec::new(),
                                 confirm.clone(),
+                                window,
                                 cx,
                             );
                         }));
@@ -2909,9 +3585,23 @@ impl Pane {
                     row = row.child(btn);
                 }
                 protocol::ControlKind::Select { placeholder, options, selected, external } => {
+                    let entity = matches!(
+                        control.element_type.as_str(),
+                        "discord_user_select"
+                            | "discord_role_select"
+                            | "discord_mentionable_select"
+                            | "discord_channel_select"
+                    );
+                    let menu_options = if !options.is_empty() {
+                        options.clone()
+                    } else if entity {
+                        self.entity_choices(&control.element_type, cx)
+                    } else {
+                        Vec::new()
+                    };
                     let current_label = selected
                         .as_deref()
-                        .and_then(|val| options.iter().find(|o| o.value == val).map(|o| o.label.as_str()))
+                        .and_then(|val| menu_options.iter().find(|o| o.value == val).map(|o| o.label.as_str()))
                         .unwrap_or_else(|| if placeholder.is_empty() { "Select…" } else { placeholder.as_str() });
                     let shown = if pending {
                         format!("{current_label}…")
@@ -2930,20 +3620,26 @@ impl Pane {
                         .items_center()
                         .type_small()
                         .text_color(theme::text())
-                        .cursor_pointer()
-                        .when(pending, |d| d.opacity(0.6))
-                        .hover(|s| s.bg(theme::hover()))
+                        .when(!disabled, |d| d.cursor_pointer().hover(|s| s.bg(theme::hover())))
+                        .when(disabled, |d| d.cursor_default().opacity(0.45))
+                        .when(pending && !disabled, |d| d.opacity(0.6))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(shown);
-                    if !options.is_empty() && !pending {
+                    if disabled {
+                        // Disabled select: inert.
+                    } else if !menu_options.is_empty() && !pending {
+                        let initial_multi = selected.iter().cloned().collect();
                         let open = super::OpenSelect {
                             conversation: conversation.clone(),
                             message_id: message.id.clone(),
                             block_id: control.block_id.clone(),
                             action_id: control.action_id.clone(),
                             element_type: control.element_type.clone(),
-                            options: options.clone(),
+                            options: menu_options,
                             selected: selected.clone(),
+                            multi_selected: initial_multi,
+                            min_values: control.min_values,
+                            max_values: control.max_values,
                             confirm: control.confirm.clone(),
                             at: gpui::Point::default(),
                         };
@@ -2954,7 +3650,7 @@ impl Pane {
                             this.open_select = Some(next);
                             cx.notify();
                         }));
-                    } else if *external && !message.permalink.is_empty() {
+                    } else if !entity && *external && !message.permalink.is_empty() {
                         let link = message.permalink.clone();
                         chip = chip.on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
@@ -2972,12 +3668,20 @@ impl Pane {
                     let now = crate::view::now();
                     let mut opts = Vec::new();
                     if let Some(init) = initial.as_ref().filter(|s| !s.is_empty()) {
-                        opts.push(protocol::ControlOption { label: format!("Keep ({init})"), value: init.clone() });
+                        opts.push(protocol::ControlOption {
+                            label: format!("Keep ({init})"),
+                            value: init.clone(),
+                            description: String::new(),
+                        });
                     }
                     for (name, days) in [("Today", 0i64), ("Tomorrow", 1), ("In 3 days", 3), ("In 7 days", 7)] {
                         let ymd = format_ymd(now + days * 86_400);
                         if !opts.iter().any(|o| o.value == ymd) {
-                            opts.push(protocol::ControlOption { label: format!("{name} ({ymd})"), value: ymd });
+                            opts.push(protocol::ControlOption {
+                                label: format!("{name} ({ymd})"),
+                                value: ymd,
+                                description: String::new(),
+                            });
                         }
                     }
                     let open = super::OpenSelect {
@@ -2988,6 +3692,9 @@ impl Pane {
                         element_type: control.element_type.clone(),
                         options: opts,
                         selected: initial.clone(),
+                        multi_selected: Vec::new(),
+                        min_values: 0,
+                        max_values: 0,
                         confirm: control.confirm.clone(),
                         at: gpui::Point::default(),
                     };
@@ -3025,11 +3732,19 @@ impl Pane {
                     let shown = if pending { format!("🕒 {label}…") } else { format!("🕒 {label} ▾") };
                     let mut opts = Vec::new();
                     if let Some(init) = initial.as_ref().filter(|s| !s.is_empty()) {
-                        opts.push(protocol::ControlOption { label: init.clone(), value: init.clone() });
+                        opts.push(protocol::ControlOption {
+                            label: init.clone(),
+                            value: init.clone(),
+                            description: String::new(),
+                        });
                     }
                     for slot in ["09:00", "12:00", "14:00", "17:00"] {
                         if !opts.iter().any(|o| o.value == slot) {
-                            opts.push(protocol::ControlOption { label: slot.to_owned(), value: slot.to_owned() });
+                            opts.push(protocol::ControlOption {
+                                label: slot.to_owned(),
+                                value: slot.to_owned(),
+                                description: String::new(),
+                            });
                         }
                     }
                     let open = super::OpenSelect {
@@ -3040,6 +3755,9 @@ impl Pane {
                         element_type: control.element_type.clone(),
                         options: opts,
                         selected: initial.clone(),
+                        multi_selected: Vec::new(),
+                        min_values: 0,
+                        max_values: 0,
                         confirm: control.confirm.clone(),
                         at: gpui::Point::default(),
                     };
@@ -3099,7 +3817,7 @@ impl Pane {
                                 .text_color(theme::text())
                                 .cursor_pointer()
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                                .on_click(cx.listener(move |this, _, window, cx| {
                                     cx.stop_propagation();
                                     this.trigger_control(
                                         conv.clone(),
@@ -3110,6 +3828,7 @@ impl Pane {
                                         String::new(),
                                         next.clone(),
                                         confirm.clone(),
+                                        window,
                                         cx,
                                     );
                                 }))
@@ -3142,7 +3861,7 @@ impl Pane {
                                 .text_color(theme::text())
                                 .cursor_pointer()
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                                .on_click(cx.listener(move |this, _, window, cx| {
                                     cx.stop_propagation();
                                     this.trigger_control(
                                         conv.clone(),
@@ -3153,6 +3872,7 @@ impl Pane {
                                         val.clone(),
                                         Vec::new(),
                                         confirm.clone(),
+                                        window,
                                         cx,
                                     );
                                 }))
@@ -3162,7 +3882,7 @@ impl Pane {
                 }
             }
         }
-        Some(row.into_any_element())
+        Some(container.child(row).into_any_element())
     }
 
     /// Shared contact card: name, organization, masked phone numbers (click to reveal), emails, and copy actions.
@@ -3452,23 +4172,33 @@ impl Pane {
 
     fn cards(&mut self, message: &Rc<Message>, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let previews: Vec<Preview> = message.previews.iter().take(CARDS).cloned().collect();
+        let can_suppress = self.can(message).suppress_embeds;
         previews
             .iter()
             .enumerate()
             .map(|(ix, preview)| {
-                let card = self.card(ix, preview, window, cx);
+                let card = self.card(&message.id, ix, preview, can_suppress, window, cx);
                 div().pt(px(if ix == 0 { 5. } else { 4. })).flex().child(card).into_any_element()
             })
             .collect()
     }
 
-    fn card(&mut self, index: usize, preview: &Preview, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn card(
+        &mut self,
+        message_id: &str,
+        index: usize,
+        preview: &Preview,
+        can_suppress: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let preview = self.wikipedia_preview(preview, cx);
         let scale = window.scale_factor();
         let image = preview.image.as_ref();
         // Only the first card may be large, and only for a picture wide enough to deserve it.
-        let large = index == 0
-            && image.is_some_and(|image| image.width >= 400 && image.width as f32 >= image.height as f32 * 1.3);
+        // A site player is large even when its poster is small or missing.
+        let large = preview.opens_in_browser
+            || index == 0 && image.is_some_and(|image| image.width >= 400 && image.width as f32 >= image.height as f32 * 1.3);
         // A phone's card follows the phone's run: 12 / 16 / 14 over the desktop's 11 / 15 / 13.
         let phone = self.metrics == Metrics::PHONE;
         let sized = move |line: Div, size: f32, height: f32| match phone {
@@ -3495,27 +4225,67 @@ impl Pane {
             }))
             .children((!preview.description.is_empty()).then(|| {
                 clamp(sized(div().type_ui(), 14., 20.), 20.).text_color(theme::text_soft()).child(preview.description.clone())
+            }))
+            .children(preview.opens_in_browser.then(|| {
+                sized(div().truncate().type_micro(), 12., 16.).text_color(theme::text_faint()).child("Opens in browser")
             }));
         let url = preview.url.clone();
+        let dismiss = can_suppress.then(|| {
+            let msg_id = message_id.to_owned();
+            div()
+                .id(SharedString::from(format!("suppress-preview-{message_id}-{index}")))
+                .absolute()
+                .top(px(6.))
+                .right(px(6.))
+                .size(px(20.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(tokens::card())
+                .hover(|s| s.bg(theme::selected()))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .tooltip(tip("Remove link preview", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.suppress_message_embeds(&msg_id, cx);
+                }))
+                .child(glyph("icons/x.svg", 12., theme::text_soft()))
+        });
         // A phone's card is exactly the column's width: wrapped words then measure against it,
         // not against the desktop's 440, and never run past its edge.
         let card = div()
             .id(("card", index))
+            .relative()
             .w(px(if phone { self.media_width() } else { 440. }))
             .max_w_full()
             .px(px(12.))
+            .when(can_suppress, |c| c.pr(px(30.)))
             .py(px(10.))
             .rounded(px(theme::R_FLOAT))
             .bg(tokens::card())
             .border_1()
             .border_color(theme::hairline())
             .cursor_pointer()
-            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| this.open_link(&url, event.modifiers().alt, window, cx)));
-        let Some(image) = image.cloned() else {
-            return card.child(words).into_any_element();
-        };
+            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| this.open_link(&url, event.modifiers().alt, window, cx)))
+            .children(dismiss);
         let holder = |id: &'static str, wide: f32, tall: f32, radius: f32| {
             div().id(id).relative().w(px(wide)).h(px(tall)).flex_none().rounded(px(radius)).bg(theme::hover()).overflow_hidden()
+        };
+        let dress = |picture: Stateful<Div>| match preview.opens_in_browser {
+            true => {
+                let length = (preview.duration > 0).then(|| badge(media::duration_label(preview.duration)).right(px(6.)));
+                picture.child(play_disc()).children(length)
+            }
+            false => picture,
+        };
+        let Some(image) = image.cloned() else {
+            if !preview.opens_in_browser {
+                return card.child(words).into_any_element();
+            }
+            let wide = if phone { self.media_width() - 26. } else { self.media_width().min(416.) };
+            return card.flex().flex_col().gap(px(8.)).child(words).child(dress(holder("preview", wide, 180., 8.))).into_any_element();
         };
         let shown = |image, radius: f32| anim::picture(image, ObjectFit::Cover, radius, Play::Inline);
         if large {
@@ -3526,14 +4296,14 @@ impl Pane {
             let edge = media::decode_edge((image.width, image.height), wide, tall, Fit::Cover, scale);
             if self.held_back(&image) {
                 let picture = self.load_box(holder("preview", wide, tall, 8.), &image, "Preview", image.bytes, true, cx);
-                return card.flex().flex_col().gap(px(8.)).child(words).child(picture).into_any_element();
+                return card.flex().flex_col().gap(px(8.)).child(words).child(dress(picture)).into_any_element();
             }
             let picture = match self.still(&image, edge, edge, None, cx) {
                 Picture::Ready(decoded) => holder("preview", wide, tall, 8.).child(shown(decoded, 8.)),
                 Picture::Loading => holder("preview", wide, tall, 8.).child(in_box(Icon::Image, None)),
                 Picture::Failed => self.failed_box(holder("preview", wide, tall, 8.), &image, false, cx),
             };
-            return card.flex().flex_col().gap(px(8.)).child(words).child(picture).into_any_element();
+            return card.flex().flex_col().gap(px(8.)).child(words).child(dress(picture)).into_any_element();
         }
         let edge = media::decode_edge((image.width, image.height), 72., 72., Fit::Cover, scale);
         if self.held_back(&image) {
@@ -3546,6 +4316,278 @@ impl Pane {
             Picture::Failed => self.failed_box(holder("preview", 72., 72., 6.), &image, false, cx),
         };
         card.flex().gap(px(12.)).child(words).child(picture).into_any_element()
+    }
+
+    /// Renders a Discord server invite card and/or scheduled event card under a message.
+    fn invite_card(
+        &mut self,
+        message: &Message,
+        ix: usize,
+        invite: &MessageInvite,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut space_name = invite.space_name.clone();
+        let mut space_id = invite.space_id.clone();
+        let mut icon_file = invite.icon.clone();
+        let mut members = invite.members;
+        let mut online = invite.online;
+        let mut state = invite.state;
+        let mut event: Option<ScheduledEvent> = invite.event.clone();
+        let mut error_note: Option<String> = None;
+
+        if !invite.code.is_empty() {
+            let ev_id = invite.event.as_ref().map(|e| e.id.as_str()).filter(|id| !id.is_empty());
+            let cache_key = match ev_id {
+                Some(ev) => format!("{}:{ev}", invite.code),
+                None => invite.code.clone(),
+            };
+            if let Some(cached) = self.invite_previews.get(&cache_key).cloned() {
+                match cached {
+                    Ok(preview) => {
+                        space_name = preview.name;
+                        space_id = preview.space_id;
+                        icon_file = preview.icon;
+                        members = preview.members;
+                        online = preview.online;
+                        state = if preview.joined { InviteState::Joined } else { InviteState::Valid };
+                        if preview.event.is_some() {
+                            event = preview.event;
+                        }
+                    }
+                    Err(err) => {
+                        state = InviteState::Invalid;
+                        error_note = Some(err);
+                    }
+                }
+            }
+        } else if let Some(ev) = invite.event.as_ref().filter(|e| !e.guild_id.is_empty() && !e.id.is_empty()) {
+            if let Some(cached) = self.event_previews.get(&(ev.guild_id.clone(), ev.id.clone())).cloned() {
+                match cached {
+                    Ok(resolved) => {
+                        state = InviteState::Valid;
+                        event = Some(resolved);
+                    }
+                    Err(err) => {
+                        state = InviteState::Invalid;
+                        error_note = Some(err);
+                    }
+                }
+            }
+        }
+
+        let mut card = div()
+            .id(name_id(&format!("invite-{ix}"), &message.id))
+            .mt(px(6.))
+            .max_w(px(432.))
+            .p(px(12.))
+            .rounded(px(theme::R_CARD))
+            .bg(tokens::card())
+            .border_1()
+            .border_color(theme::border())
+            .flex()
+            .flex_col()
+            .gap(px(10.));
+
+        if !invite.code.is_empty() {
+            let heading = match state {
+                InviteState::Invalid => "INVITE INVALID",
+                InviteState::Joined => "YOU'RE ALREADY IN THIS SERVER",
+                _ => "YOU'VE BEEN INVITED TO JOIN A SERVER",
+            };
+            let title = if !space_name.is_empty() {
+                space_name.clone()
+            } else if state == InviteState::Invalid {
+                "Invite invalid or expired".to_owned()
+            } else {
+                format!("discord.gg/{}", invite.code)
+            };
+            let counts = match (online, members) {
+                (Some(on), Some(all)) => Some(format!("{on} online · {all} members")),
+                (None, Some(all)) => Some(format!("{all} members")),
+                (Some(on), None) => Some(format!("{on} online")),
+                (None, None) => error_note.clone().or_else(|| (state == InviteState::Unresolved).then(|| "Loading invite…".to_owned())),
+            };
+            let place_id = space_id.as_deref().unwrap_or(invite.code.as_str());
+            let place_key = self.open.as_ref().map(|open| Key::new(&open.key.account(), place_id));
+            let tile = match &place_key {
+                Some(key) => Avatar::new(key, &title, 40.),
+                None => Avatar::named(&title, 40.),
+            }
+            .shape(Shape::Place);
+            let avatar = self.face(tile, icon_file.as_ref(), 40., Shape::Place, window, cx);
+            let code = invite.code.clone();
+            let url = invite.url.clone();
+            let valid_url = url.starts_with("https://") || url.starts_with("http://");
+            let handoff = self.invite_handoff.contains(&code);
+            let joining = self.invite_joining.contains(&code);
+
+            let action: Option<AnyElement> = match state {
+                InviteState::Joined => {
+                    let target_space = space_id.clone();
+                    Some(
+                        div()
+                            .id(name_id(&format!("invite-open-{ix}"), &message.id))
+                            .flex_none()
+                            .h(px(30.))
+                            .px(px(12.))
+                            .rounded(px(theme::R_CONTROL))
+                            .bg(theme::raised())
+                            .border_1()
+                            .border_color(theme::border())
+                            .hover(|s| s.bg(theme::selected()))
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .type_small()
+                            .font_weight(theme::MEDIUM)
+                            .text_color(theme::text())
+                            .when_some(target_space, |btn, gid| {
+                                btn.on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_invite_space(gid.clone(), cx);
+                                }))
+                            })
+                            .child("Joined")
+                            .into_any_element(),
+                    )
+                }
+                InviteState::Valid => {
+                    let label = if handoff {
+                        "Open in Discord"
+                    } else if joining {
+                        "Joining…"
+                    } else {
+                        "Join"
+                    };
+                    Some(
+                        div()
+                            .id(name_id(&format!("invite-join-{ix}"), &message.id))
+                            .flex_none()
+                            .h(px(30.))
+                            .px(px(14.))
+                            .rounded(px(theme::R_CONTROL))
+                            .bg(theme::accent())
+                            .text_color(theme::on_accent())
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .type_small()
+                            .font_weight(theme::SEMIBOLD)
+                            .when(handoff && valid_url, |btn| {
+                                let url = url.clone();
+                                btn.on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_external_link(&url, window, cx);
+                                }))
+                            })
+                            .when(!handoff && !joining, |btn| {
+                                let code = code.clone();
+                                btn.on_click(cx.listener(move |this, _, _, cx| {
+                                    this.join_invite(code.clone(), cx);
+                                }))
+                            })
+                            .child(label)
+                            .into_any_element(),
+                    )
+                }
+                InviteState::Invalid | InviteState::Unresolved => None,
+            };
+
+            card = card
+                .child(div().type_micro().font_weight(theme::SEMIBOLD).text_color(theme::text_faint()).child(heading))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .child(avatar)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .type_ui()
+                                        .font_weight(theme::SEMIBOLD)
+                                        .text_color(if state == InviteState::Invalid { theme::text_faint() } else { theme::text() })
+                                        .child(title),
+                                )
+                                .children(counts.map(|c| div().truncate().type_micro().text_color(theme::text_soft()).child(c))),
+                        )
+                        .children(action),
+                );
+        }
+
+        if let Some(ev) = event {
+            let ev_title = if !ev.name.is_empty() {
+                ev.name.clone()
+            } else if state == InviteState::Invalid {
+                "Event unavailable".to_owned()
+            } else {
+                "Scheduled Event".to_owned()
+            };
+            let when_text = ev.start.map(time::tooltip);
+            let mut meta_parts: Vec<String> = Vec::new();
+            if !ev.place.is_empty() {
+                meta_parts.push(ev.place.clone());
+            }
+            if let Some(count) = ev.interested_count {
+                meta_parts.push(format!("{count} interested"));
+            }
+            let meta_line = (!meta_parts.is_empty()).then(|| meta_parts.join(" · "));
+            let can_interest = state != InviteState::Invalid && !ev.guild_id.is_empty() && !ev.id.is_empty();
+            let toggling = self.event_toggling.contains(&(ev.guild_id.clone(), ev.id.clone()));
+            let ev_guild = ev.guild_id.clone();
+            let ev_id = ev.id.clone();
+            let next_interested = !ev.interested;
+
+            let mut ev_box = div()
+                .when(!invite.code.is_empty(), |d| d.pt(px(8.)).border_t_1().border_color(theme::border()))
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .children(when_text.map(|w| div().type_micro().font_weight(theme::SEMIBOLD).text_color(theme::accent_text()).child(w)))
+                        .child(div().truncate().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(ev_title))
+                        .children(meta_line.map(|m| div().truncate().type_micro().text_color(theme::text_soft()).child(m))),
+                );
+            if can_interest {
+                ev_box = ev_box.child(
+                    div()
+                        .id(name_id(&format!("event-interest-{ix}"), &message.id))
+                        .flex_none()
+                        .h(px(28.))
+                        .px(px(10.))
+                        .rounded(px(theme::R_CONTROL))
+                        .border_1()
+                        .when(ev.interested, |b| b.bg(theme::accent_soft()).border_color(theme::accent()).text_color(theme::accent_text()))
+                        .when(!ev.interested, |b| b.bg(theme::raised()).border_color(theme::border()).text_color(theme::text()))
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .type_small()
+                        .font_weight(theme::MEDIUM)
+                        .when(!toggling, |b| {
+                            b.on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_event_interest(ev_guild.clone(), ev_id.clone(), next_interested, cx);
+                            }))
+                        })
+                        .child(if ev.interested { "✓ Interested" } else { "Interested" }),
+                );
+            }
+            card = card.child(ev_box);
+        }
+
+        card.into_any_element()
     }
 
     // Around the message.
@@ -3578,8 +4620,51 @@ impl Pane {
                 chip.bg(theme::raised()).border_color(gpui::transparent_black()).hover(|style| style.border_color(tokens::border_strong()))
             }
         };
+        let burst_chip = |id: ElementId, mine: bool, colors: &[String]| {
+            let parsed = colors
+                .first()
+                .and_then(|s| s.strip_prefix('#').or(Some(s.as_str())))
+                .filter(|s| s.len() == 6)
+                .and_then(|hex| u32::from_str_radix(hex, 16).ok());
+            let base = parsed.unwrap_or(0x8b5cf6);
+            let accent = gpui::rgb(base);
+            let fill = gpui::rgba((base << 8) | if mine { if theme::is_light() { 0x33 } else { 0x42 } } else if theme::is_light() { 0x1a } else { 0x24 });
+            let edge_color = if mine { accent } else { gpui::rgba((base << 8) | 0x80) };
+            (
+                div()
+                    .id(id)
+                    .flex_none()
+                    .h(px(if phone { 32. } else { 26. }))
+                    .min_w(px(if phone { 48. } else { 0. }))
+                    .px(px(if phone { 10. } else { 8. }))
+                    .justify_center()
+                    .rounded_full()
+                    .border_1()
+                    .bg(fill)
+                    .border_color(edge_color)
+                    .hover(move |style| style.border_color(accent))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .when(acts, |chip| chip.cursor_pointer()),
+                accent,
+            )
+        };
         let mut row = div().mt(px(6.)).mb(px(3.)).flex().flex_wrap().gap(px(if phone { 8. } else { 6. }));
-        for (ix, reaction) in message.reactions.iter().take(CHIPS).enumerate() {
+        // Flatten each reaction into its burst chip (if any) and normal chip (if any), so a
+        // message with both normal and super reactions for the same emoji shows both distinctly.
+        let mut entries: Vec<(usize, bool)> = Vec::new();
+        for (ix, reaction) in message.reactions.iter().enumerate() {
+            if reaction.burst > 0 {
+                entries.push((ix, true));
+            }
+            if reaction.count > 0 {
+                entries.push((ix, false));
+            }
+        }
+        let total_chips = entries.len();
+        for (chip_ix, (ix, is_burst)) in entries.into_iter().take(CHIPS).enumerate() {
+            let reaction = &message.reactions[ix];
             let picture = match &reaction.file {
                 Some(file) => match self.still(file, edge, edge, None, cx) {
                     Picture::Ready(image) => Some(div().size(px(18.)).flex_none().child(anim::picture(image, ObjectFit::Contain, 0., Play::Inline)).into_any_element()),
@@ -3592,15 +4677,11 @@ impl Pane {
                 let (size, line) = if phone { (17., 22.) } else { (15., 20.) };
                 div().text_size(px(size)).line_height(px(line)).child(emoji::display(&reaction.emoji)).into_any_element()
             });
-            let count = div()
-                .type_small()
-                .when(phone, |count| count.text_size(px(tokens_phone::scaled(14.))).line_height(px(tokens_phone::scaled(18.))))
-                .font_weight(theme::MEDIUM)
-                .text_color(if reaction.mine { theme::accent_text() } else { theme::text_soft() })
-                .child(reaction.count.to_string());
+            let mine = if is_burst { reaction.mine_burst } else { reaction.mine };
+            let shown_count = if is_burst { reaction.burst } else { reaction.count };
             // A custom one goes by its file, which names it where its `:name:` may not.
             let toggled = reaction.file.as_ref().map_or_else(|| reaction.emoji.clone(), |file| file.id.clone());
-            let (id, on) = (message.id.clone(), !reaction.mine);
+            let (id, on) = (message.id.clone(), !mine);
             let is_telegram = self.open.as_ref().is_some_and(|open| open.key.network == protocol::Network::Telegram);
             let is_paid_star = is_telegram && reaction.file.is_none() && protocol::bare_emoji(&reaction.emoji) == "⭐";
             let paid_allowed = is_paid_star && acts && self.rules().is_some_and(|rules| rules.paid);
@@ -3610,11 +4691,11 @@ impl Pane {
             let refused = if is_paid_star {
                 None
             } else {
-                (!reaction.mine).then(|| self.refusal(message, &toggled)).flatten()
+                (!mine).then(|| self.refusal_kind(message, &toggled, is_burst)).flatten()
             };
             // Who reacted, where the network said or after an on-demand fetch; a chip that is
             // only a count keeps its own words.
-            let named = !reaction.who.is_empty();
+            let named = !is_burst && !reaction.who.is_empty();
             let names = if named {
                 let said = |id: &str| match self.person(id) {
                     Some(person) => self.who(&person, cx).0,
@@ -3623,7 +4704,7 @@ impl Pane {
                 reactor_words(&reaction.who, said)
             } else {
                 self.fetched_reactors
-                    .get(&(message.id.clone(), toggled.clone()))
+                    .get(&(message.id.clone(), toggled.clone(), is_burst))
                     .and_then(|(reactors, _)| {
                         let ids: Vec<String> = reactors.iter().map(|r| r.name.clone()).collect();
                         reactor_words(&ids, |name| name.to_owned())
@@ -3639,8 +4720,11 @@ impl Pane {
             } else {
                 match (&refused, &names) {
                     (Some(why), _) => why.clone(),
+                    (None, Some(names)) if is_burst => format!("Super reaction · {names}"),
                     (None, Some(names)) => names.clone(),
-                    (None, None) if reaction.mine => "Take back your reaction".to_owned(),
+                    (None, None) if is_burst && mine => "Take back your super reaction".to_owned(),
+                    (None, None) if is_burst => "Super react with this too".to_owned(),
+                    (None, None) if mine => "Take back your reaction".to_owned(),
                     (None, None) if can_big => "React with this too (Shift+click for big)".to_owned(),
                     (None, None) => "React with this too".to_owned(),
                 }
@@ -3658,13 +4742,34 @@ impl Pane {
                     cx.stop_propagation();
                     let at = event.position;
                     let open = open.clone();
-                    this.open_reactors(open, ix, at, window, cx);
+                    this.open_reactors(open, ix, is_burst, at, window, cx);
                 })
             });
-            row = row.child(
-                chip(("chip", ix).into(), reaction.mine)
+            let built = if is_burst {
+                let (base_chip, accent) = burst_chip(("chip", chip_ix).into(), mine, &reaction.burst_colors);
+                let count = div()
+                    .type_small()
+                    .when(phone, |count| count.text_size(px(tokens_phone::scaled(14.))).line_height(px(tokens_phone::scaled(18.))))
+                    .font_weight(theme::SEMIBOLD)
+                    .text_color(if mine { accent } else { theme::text() })
+                    .child(shown_count.to_string());
+                base_chip
+                    .child(div().type_micro().text_color(accent).child("✦"))
                     .child(emoji)
                     .child(count)
+            } else {
+                let count = div()
+                    .type_small()
+                    .when(phone, |count| count.text_size(px(tokens_phone::scaled(14.))).line_height(px(tokens_phone::scaled(18.))))
+                    .font_weight(theme::MEDIUM)
+                    .text_color(if mine { theme::accent_text() } else { theme::text_soft() })
+                    .child(shown_count.to_string());
+                chip(("chip", chip_ix).into(), mine)
+                    .child(emoji)
+                    .child(count)
+            };
+            row = row.child(
+                built
                     .when((acts || is_paid_star) && !phone, |chip| chip.tooltip(tip(words, None)))
                     .when(paid_allowed, |chip| {
                         let id = id.clone();
@@ -3672,14 +4777,18 @@ impl Pane {
                     })
                     .when(joins, |chip| {
                         chip.on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
-                            this.react_with(&id, &toggled, on, can_big && event.modifiers().shift, cx);
+                            if is_burst {
+                                this.react_kind(&id, &toggled, on, true, cx);
+                            } else {
+                                this.react_with(&id, &toggled, on, can_big && event.modifiers().shift, cx);
+                            }
                         }))
                     })
                     .when_some(list, |chip, list| chip.on_mouse_down(MouseButton::Right, list))
                     .when(!clickable, |chip| chip.cursor_default()),
             );
         }
-        let hidden = message.reactions.len().saturating_sub(CHIPS);
+        let hidden = total_chips.saturating_sub(CHIPS);
         if hidden > 0 {
             row = row.child(chip("chips-more".into(), false).type_small().text_color(theme::text_soft()).child(format!("+{hidden}")));
         }
@@ -4011,6 +5120,42 @@ impl Pane {
             .child(actions);
         Some(line.into_any_element())
     }
+
+    /// The tinted foot of an only-you reply. Dismiss removes it here, and on Discord when that is allowed.
+    fn ephemeral_note(&self, message: &Rc<Message>, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !message.ephemeral || message.deleted {
+            return None;
+        }
+        let conversation = self.key()?.clone();
+        let message_id = message.id.clone();
+        let dismiss = div()
+            .id(name_id("dismiss", &message.id))
+            .flex_none()
+            .cursor_pointer()
+            .text_color(tokens::link())
+            .hover(|style| style.underline())
+            .child("Dismiss")
+            .on_click(cx.listener(move |_, _, _, cx| {
+                let request = Request::Delete {
+                    conversation: conversation.clone(),
+                    message_id: message_id.clone(),
+                    scope: protocol::DeleteScope::Everyone,
+                };
+                cx.background_executor().spawn(async move { crate::client::ask(&request) }).detach();
+            }));
+        Some(
+            div()
+                .mt(px(4.))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .type_small()
+                .text_color(theme::text_faint())
+                .child("Only you can see this ·")
+                .child(dismiss)
+                .into_any_element(),
+        )
+    }
 }
 
 /// Bytes as the upload line says them: "3.1 MB", "820 KB".
@@ -4056,17 +5201,34 @@ fn receipt_mark(id: &str, receipt: Receipt) -> AnyElement {
 
 /// The bell-off after a message's time when it went without notification.
 fn silent_mark(message: &Message) -> Option<AnyElement> {
-    let client_id = message.client_id.as_deref()?;
-    crate::gui::composer::sent_silently(client_id).then(|| {
+    let from_send = message.client_id.as_deref().is_some_and(crate::gui::composer::sent_silently);
+    if !message.silent && !from_send {
+        return None;
+    }
+    let id = message.client_id.as_deref().unwrap_or(message.id.as_str());
+    Some(
         div()
-            .id(name_id("silent", client_id))
+            .id(name_id("silent", id))
             .flex_none()
             .flex()
             .items_center()
             .tooltip(tip("Sent without notification", None))
             .child(glyph("icons/bell-off.svg", 12., theme::text_faint()))
-            .into_any_element()
-    })
+            .into_any_element(),
+    )
+}
+
+/// "<person> used /command" above a bot's answer.
+fn command_used(via: &Via) -> Div {
+    let command = via.command.trim_start_matches('/');
+    div()
+        .h(px(18.))
+        .mb(px(2.))
+        .flex()
+        .items_center()
+        .type_small()
+        .text_color(theme::text_faint())
+        .child(format!("{} used /{command}", via.who))
 }
 
 fn megabytes(bytes: u64) -> String {
@@ -4074,26 +5236,6 @@ fn megabytes(bytes: u64) -> String {
         0..1_000_000 => format!("{} KB", bytes.div_ceil(1000)),
         _ => format!("{:.1} MB", bytes as f64 / 1_000_000.),
     }
-}
-
-/// Where a forwarded message was first said.
-fn forwarded_line(from: &Forwarded) -> Div {
-    let place = match (from.from_title.is_empty(), from.from_space.is_empty()) {
-        (true, true) => "Forwarded".to_owned(),
-        (false, true) => format!("Forwarded from {}", from.from_title),
-        (true, false) => format!("Forwarded from {}", from.from_space),
-        (false, false) => format!("Forwarded from {} in {}", from.from_title, from.from_space),
-    };
-    div()
-        .h(px(18.))
-        .mb(px(2.))
-        .flex()
-        .items_center()
-        .gap(px(5.))
-        .type_small()
-        .text_color(theme::text_faint())
-        .child(icon(Icon::Forward, 13., theme::text_faint()))
-        .child(div().min_w_0().truncate().child(place))
 }
 
 /// The size the network gave for an attachment's picture: the file's, or its still's.

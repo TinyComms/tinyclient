@@ -3,14 +3,20 @@
 //! the server-side search for what was shared. Each is one request at most, and only because
 //! the user opened or clicked something.
 
-use super::super::{About, ConversationAbout, Refusal, Reply, SearchScope, SharedPage, SpaceAbout};
+use super::super::{About, ConversationAbout, Failure, ForumPosts, Refusal, Reply, SearchPage, SearchScope, SharedPage, SpaceAbout};
 use super::model::{self, number, GuildSettings, Posted};
 use super::rest::Refused;
 use super::{escaped, refusal, Discord};
 use crate::hub::now;
-use protocol::{ConversationKind, MediaKind, Message, MessageHit, Notify, SharedItem, SharedKind, Style};
+use base64::Engine;
+use crate::store::{PostCard, PreviewLine};
+use protocol::{
+    ConversationKind, MediaKind, Message, MessageHit, Notify, SearchFilters, SearchHas, SearchSort,
+    SharedItem, SharedKind, Style, TopicSort,
+};
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -20,27 +26,390 @@ const PROFILE_EVERY: Duration = Duration::from_secs(3);
 static PROFILE_TURN: Mutex<()> = Mutex::new(());
 /// Discord's search answers 25 messages a page at most.
 const SEARCH_PAGE: u32 = 25;
+/// Discord's forum thread search answers 25 posts a page at most.
+const FORUM_PAGE: u32 = 25;
+/// Most characters Discord's forum search accepts in `name`.
+const FORUM_NAME_MAX: usize = 100;
 /// Most characters Discord's message search accepts in `content`.
 const SEARCH_MAX_CHARS: usize = 1024;
+/// Most characters Discord accepts in a private note on a user.
+const NOTE_MAX_CHARS: usize = 256;
+
+#[derive(Deserialize)]
+struct NotePayload {
+    #[serde(default)]
+    note: Option<String>,
+}
+
 /// Recent message searches kept in memory per account, so the same scope and words are not
 /// asked twice in a session.
 const REMEMBERED_SEARCHES: usize = 32;
 
+/// Discord thread-member flags: 2 all messages, 4 mentions, 8 nothing.
+pub(super) fn thread_notify_word(flags: u32) -> Option<&'static str> {
+    if flags & 8 != 0 {
+        Some("nothing")
+    } else if flags & 4 != 0 {
+        Some("mentions")
+    } else if flags & 2 != 0 {
+        Some("all")
+    } else {
+        None
+    }
+}
+
 #[derive(Default)]
 pub(super) struct MessageSearch {
-    in_flight: bool,
     last: Option<Instant>,
-    remembered: std::collections::VecDeque<(SearchScope, String, Vec<MessageHit>)>,
+    remembered: std::collections::VecDeque<(SearchScope, String, SearchPage)>,
+}
+
+fn search_has_param(has: SearchHas) -> &'static str {
+    match has {
+        SearchHas::Files => "file",
+        SearchHas::Links => "link",
+        SearchHas::Images => "image",
+        SearchHas::Videos => "video",
+        SearchHas::Embeds => "embed",
+        SearchHas::Sounds => "sound",
+        SearchHas::Stickers => "sticker",
+        SearchHas::Polls => "poll",
+    }
+}
+
+/// Builds Discord's search URL and resolved offset from structured filters, sort, and cursor.
+fn build_search_path(
+    base: &str,
+    scope_channel: Option<&str>,
+    query: &str,
+    filters: &SearchFilters,
+    cursor: Option<&str>,
+    me: &str,
+) -> (String, u32) {
+    let mut params: Vec<String> = Vec::new();
+    if let Some(ch) = scope_channel {
+        params.push(format!("channel_id={}", escaped(ch)));
+    } else if let Some(in_ch) = filters.in_channel.as_ref().filter(|k| !k.id.is_empty()) {
+        params.push(format!("channel_id={}", escaped(&in_ch.id)));
+    }
+    if !query.is_empty() {
+        params.push(format!("content={}", escaped(query)));
+    }
+    if let Some(from) = filters.from.as_ref().filter(|k| !k.id.is_empty()) {
+        params.push(format!("author_id={}", escaped(&from.id)));
+    }
+    if let Some(mentions) = filters.mentions.as_ref().filter(|k| !k.id.is_empty()) {
+        params.push(format!("mentions={}", escaped(&mentions.id)));
+    } else if filters.mentions_me && !me.is_empty() {
+        params.push(format!("mentions={}", escaped(me)));
+    }
+    if let Some(has) = filters.has {
+        params.push(format!("has={}", search_has_param(has)));
+    }
+    if let Some(after) = filters.after.filter(|ts| *ts > 0) {
+        params.push(format!("min_id={}", model::snowflake_from_unix(after)));
+    }
+    if let Some(before) = filters.before.filter(|ts| *ts > 0) {
+        params.push(format!("max_id={}", model::snowflake_from_unix(before)));
+    }
+    if let Some(pinned) = filters.pinned {
+        params.push(format!("pinned={}", if pinned { "true" } else { "false" }));
+    }
+    if let Some(kind) = filters.author_type.as_deref() {
+        let lower = kind.trim().to_ascii_lowercase();
+        if matches!(lower.as_str(), "user" | "bot" | "webhook") {
+            params.push(format!("author_type={lower}"));
+        }
+    }
+    match filters.sort {
+        SearchSort::Newest => {
+            params.push("sort_by=timestamp".into());
+            params.push("sort_order=desc".into());
+        }
+        SearchSort::Oldest => {
+            params.push("sort_by=timestamp".into());
+            params.push("sort_order=asc".into());
+        }
+        SearchSort::Relevance => {
+            params.push("sort_by=relevance".into());
+            params.push("sort_order=desc".into());
+        }
+    }
+    let offset: u32 = cursor
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(filters.offset);
+    if offset > 0 {
+        params.push(format!("offset={offset}"));
+    }
+    let path = if params.is_empty() {
+        base.to_owned()
+    } else {
+        format!("{base}?{}", params.join("&"))
+    };
+    (path, offset)
+}
+
+/// The file's magic matches the extension. A renamed text file is not an image.
+fn image_magic(ext: &str, bytes: &[u8]) -> bool {
+    let png = bytes.starts_with(b"\x89PNG\r\n\x1a\n");
+    let jpeg = bytes.starts_with(&[0xFF, 0xD8, 0xFF]);
+    let gif = bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a");
+    let webp = bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP";
+    match ext {
+        "png" => png,
+        "jpg" | "jpeg" => jpeg,
+        "gif" => gif,
+        "webp" => webp,
+        _ => false,
+    }
 }
 
 fn refused(why: impl std::fmt::Display) -> Refusal {
     Refusal::Refused(why.to_string())
 }
 
+/// Extracts `YYYY-MM-DD` from an ISO 8601 timestamp like `2022-05-10T12:00:00+00:00`.
+fn iso_date(raw: &str) -> Option<String> {
+    let prefix = raw.get(0..10)?;
+    model::iso_seconds(raw)?;
+    Some(prefix.to_owned())
+}
+/// Translates refusals for owner-only sensitive guild operations (delete / transfer), including
+/// Discord's 2FA requirement (`code == 60003` or `60008`).
+fn sensitive_guild_refusal(err: Refused, action: &str) -> Refusal {
+    match err {
+        Refused::Status { code: 60003, .. } => Refusal::Refused(format!(
+            "Discord requires your 2FA code to {action}. Enter your 6-digit authenticator code and try again, or do it in Discord."
+        )),
+        Refused::Status { code: 60008, .. } => {
+            Refusal::Refused("That 2FA code was rejected. Check your authenticator and try again.".to_owned())
+        }
+        Refused::Challenge => Refusal::Refused(format!(
+            "Discord asked for an extra verification step tinyclient cannot complete. Complete this in Discord to {action}."
+        )),
+        other => refusal(other),
+    }
+}
+
+/// Builds the JSON payload for `POST`/`PATCH /guilds/{id}/scheduled-events`.
+fn build_event_body(edit: &protocol::SpaceEventEdit) -> Result<serde_json::Value, Refusal> {
+    let name = edit.name.trim();
+    if name.is_empty() || name.chars().count() > 100 {
+        return Err(refused("Event name must be between 1 and 100 characters."));
+    }
+    if edit.start <= 0 {
+        return Err(refused("Choose a valid start time for the event."));
+    }
+    let entity_type: u8 = match edit.place_kind {
+        protocol::EventPlaceKind::Stage => 1,
+        protocol::EventPlaceKind::Voice => 2,
+        protocol::EventPlaceKind::External => 3,
+    };
+    let mut body = serde_json::Map::new();
+    body.insert("name".into(), json!(name));
+    body.insert("privacy_level".into(), json!(2));
+    body.insert("entity_type".into(), json!(entity_type));
+    body.insert("scheduled_start_time".into(), json!(model::format_iso_utc(edit.start)));
+    if !edit.description.trim().is_empty() {
+        let desc = edit.description.trim();
+        if desc.chars().count() > 1000 {
+            return Err(refused("Event description can be at most 1000 characters."));
+        }
+        body.insert("description".into(), json!(desc));
+    }
+    match edit.place_kind {
+        protocol::EventPlaceKind::Voice | protocol::EventPlaceKind::Stage => {
+            let ch = edit
+                .channel_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| refused("Choose a voice or stage channel for this event."))?;
+            body.insert("channel_id".into(), json!(ch));
+            if let Some(end) = edit.end.filter(|e| *e > edit.start) {
+                body.insert("scheduled_end_time".into(), json!(model::format_iso_utc(end)));
+            }
+        }
+        protocol::EventPlaceKind::External => {
+            let loc = edit
+                .location
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| refused("Enter a location for an external event."))?;
+            let end = edit
+                .end
+                .filter(|e| *e > edit.start)
+                .ok_or_else(|| refused("External events require an end time after the start time."))?;
+            body.insert("channel_id".into(), serde_json::Value::Null);
+            body.insert("entity_metadata".into(), json!({"location": loc}));
+            body.insert("scheduled_end_time".into(), json!(model::format_iso_utc(end)));
+        }
+    }
+    if let Some(img) = &edit.image {
+        let trimmed = img.trim();
+        if trimmed.is_empty() {
+            body.insert("image".into(), serde_json::Value::Null);
+        } else {
+            let uri = super::read_image_data_uri(trimmed, super::DISCORD_IMAGE_MAX)?;
+            body.insert("image".into(), json!(uri));
+        }
+    }
+    Ok(serde_json::Value::Object(body))
+}
+
+/// Returns a new guild feature list with `"INVITES_DISABLED"` present iff `paused` is true.
+fn toggle_invites_disabled_feature(features: &[String], paused: bool) -> Vec<String> {
+    let mut out: Vec<String> = features
+        .iter()
+        .filter(|f| f.as_str() != "INVITES_DISABLED")
+        .cloned()
+        .collect();
+    if paused {
+        out.push("INVITES_DISABLED".to_owned());
+    }
+    out
+}
+
+#[cfg(test)]
+mod invite_tests {
+    use super::*;
+
+    #[test]
+    fn toggle_invites_disabled_adds_and_removes_idempotently() {
+        let base = vec!["COMMUNITY".to_owned(), "VANITY_URL".to_owned()];
+        let paused = toggle_invites_disabled_feature(&base, true);
+        assert!(paused.iter().any(|f| f == "INVITES_DISABLED"));
+        assert_eq!(paused.iter().filter(|f| f.as_str() == "INVITES_DISABLED").count(), 1);
+        // Pausing twice never duplicates the feature flag.
+        let paused_again = toggle_invites_disabled_feature(&paused, true);
+        assert_eq!(paused_again, paused);
+        // Resuming removes it while preserving other features.
+        let resumed = toggle_invites_disabled_feature(&paused, false);
+        assert_eq!(resumed, base);
+    }
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::model::{ADMINISTRATOR, MANAGE_ROLES};
+    use super::{may_grant, role_rights};
+
+    #[test]
+    fn role_rights_follow_hierarchy_and_skip_managed_and_everyone() {
+        let (editable, assignable) = role_rights(true, 5, 4777, 4701, 100, false);
+        assert!(editable && assignable, "the owner edits and assigns a role above everyone else");
+        let (editable, assignable) = role_rights(false, 5, 4777, 4701, 1, false);
+        assert!(editable && assignable, "a role below our highest is editable and assignable");
+        let (editable, assignable) = role_rights(false, 5, 4777, 4702, 5, false);
+        assert!(!editable && !assignable, "our own highest role is not below us");
+        let (editable, assignable) = role_rights(false, 5, 4777, 4703, 10, false);
+        assert!(!editable && !assignable, "a role above us is out of reach");
+        let (editable, assignable) = role_rights(true, i32::MAX, 4777, 4704, 2, true);
+        assert!(!editable && !assignable, "a managed role stays put even for the owner");
+        let (editable, assignable) = role_rights(false, 5, 4777, 4777, 0, false);
+        assert!(editable && !assignable, "everyone can be edited when it sits below us, never assigned");
+    }
+
+    #[test]
+    fn may_grant_only_adds_bits_the_actor_holds() {
+        assert!(!may_grant(MANAGE_ROLES, 0, ADMINISTRATOR), "Manage Roles alone cannot add Administrator");
+        assert!(may_grant(MANAGE_ROLES | ADMINISTRATOR, 0, ADMINISTRATOR));
+        assert!(may_grant(u64::MAX, 0, ADMINISTRATOR));
+        assert!(may_grant(MANAGE_ROLES, ADMINISTRATOR, 0), "taking away a bit we lack is allowed");
+        assert!(may_grant(MANAGE_ROLES, ADMINISTRATOR, ADMINISTRATOR | MANAGE_ROLES));
+    }
+}
+fn failure_words(failed: Failure) -> Refusal {
+    let why = match failed {
+        Failure::SignedOut(why) | Failure::Dropped(why) => why,
+    };
+    refused(why)
+}
+
+fn forum_search_failed(failed: Refused, plain: bool) -> Result<Option<ForumPosts>, Refusal> {
+    let denied = matches!(failed, Refused::Status { status: 403, .. } | Refused::Status { code: 50001, .. });
+    if denied || !plain {
+        return Err(refusal(failed));
+    }
+    Ok(None)
+}
+
+/// `GET /channels/{id}/threads/search`. `name` is the documented text query. `archived` is left
+/// off so both active and archived posts come back. Nothing pages past this one request.
+fn forum_search_path(channel: &str, sort: TopicSort, tag: &str, query: &str, offset: u32) -> String {
+    let sort_by = match sort {
+        TopicSort::Activity => "last_message_time",
+        TopicSort::Created => "creation_time",
+    };
+    let mut params = vec![format!("sort_by={sort_by}"), "sort_order=desc".to_owned(), format!("limit={FORUM_PAGE}")];
+    if !tag.is_empty() {
+        params.push(format!("tag={}", escaped(tag)));
+    }
+    let name: String = query.chars().take(FORUM_NAME_MAX).collect();
+    if !name.is_empty() {
+        params.push(format!("name={}", escaped(&name)));
+    }
+    if offset > 0 {
+        params.push(format!("offset={offset}"));
+    }
+    format!("/channels/{}/threads/search?{}", escaped(channel), params.join("&"))
+}
+
+fn post_thumb(message: &Message) -> String {
+    let pictured = |kind: MediaKind| matches!(kind, MediaKind::Image | MediaKind::Gif | MediaKind::Video);
+    message
+        .attachments
+        .iter()
+        .find(|attachment| !attachment.spoiler && (pictured(attachment.file.kind) || attachment.thumb.is_some()))
+        .map(|attachment| attachment.thumb.as_ref().map(|thumb| thumb.id.clone()).unwrap_or_else(|| attachment.file.id.clone()))
+        .unwrap_or_default()
+}
+
+fn top_reaction(message: &Message) -> String {
+    message
+        .reactions
+        .iter()
+        .max_by_key(|reaction| reaction.count.saturating_add(reaction.burst))
+        .filter(|reaction| reaction.count.saturating_add(reaction.burst) > 0)
+        .map(|reaction| reaction.emoji.clone())
+        .unwrap_or_default()
+}
+
+#[derive(Deserialize)]
+struct ThreadSearch {
+    #[serde(default)]
+    threads: Vec<model::Channel>,
+    #[serde(default)]
+    has_more: bool,
+    #[serde(default)]
+    total_results: Option<u32>,
+    #[serde(default)]
+    first_messages: Vec<Posted>,
+}
+
 #[derive(Deserialize)]
 struct GuildCounts {
     #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    banner: Option<String>,
+    #[serde(default)]
+    premium_tier: Option<u8>,
+    #[serde(default)]
+    premium_subscription_count: Option<u32>,
+    #[serde(default)]
+    features: Vec<String>,
+    #[serde(default)]
+    vanity_url_code: Option<String>,
+    #[serde(default)]
+    system_channel_id: Option<String>,
+    #[serde(default)]
+    afk_channel_id: Option<String>,
+    #[serde(default)]
+    afk_timeout: Option<u32>,
+    #[serde(default)]
+    default_message_notifications: Option<u8>,
     #[serde(default)]
     approximate_member_count: Option<u32>,
     #[serde(default)]
@@ -81,8 +450,20 @@ pub(super) fn shared_items(message: &Message, kind: SharedKind) -> Vec<SharedIte
     };
     let pictured = |kind: MediaKind| matches!(kind, MediaKind::Image | MediaKind::Video | MediaKind::Gif);
     match kind {
-        SharedKind::Media | SharedKind::Files => {
-            let wanted = message.attachments.iter().filter(|attachment| !attachment.sticker && pictured(attachment.file.kind) == (kind == SharedKind::Media));
+        SharedKind::Media | SharedKind::Files | SharedKind::Music | SharedKind::Voice | SharedKind::Gifs => {
+            let wanted = message.attachments.iter().filter(|attachment| {
+                !attachment.sticker && match kind {
+                    SharedKind::Media => pictured(attachment.file.kind),
+                    SharedKind::Gifs => attachment.file.kind == MediaKind::Gif,
+                    SharedKind::Voice => attachment.round || !attachment.waveform.is_empty(),
+                    SharedKind::Music => {
+                        attachment.file.kind == MediaKind::Audio
+                            && attachment.waveform.is_empty()
+                            && !attachment.round
+                    }
+                    _ => !pictured(attachment.file.kind),
+                }
+            });
             wanted.map(|attachment| item(Some(attachment.clone()), "", "")).collect()
         }
         SharedKind::Links => {
@@ -97,6 +478,171 @@ pub(super) fn shared_items(message: &Message, kind: SharedKind) -> Vec<SharedIte
             items
         }
     }
+}
+
+/// A Discord snowflake: digits only, at most 20, and not zero. The returned text is the number,
+/// so a path never keeps whatever punctuation arrived with it.
+fn snowflake(raw: &str) -> Option<u64> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.len() > 20 || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let n = raw.parse::<u64>().ok()?;
+    (n != 0).then_some(n)
+}
+
+fn discord_id(raw: &str, why: &str) -> Result<(u64, String), Refusal> {
+    let n = snowflake(raw).ok_or_else(|| refused(why))?;
+    Ok((n, n.to_string()))
+}
+
+fn role_name(name: &str) -> Result<String, Refusal> {
+    let name = name.trim();
+    let count = name.chars().count();
+    if count == 0 {
+        return Err(refused("Enter a role name."));
+    }
+    if count > 100 {
+        return Err(refused("Role name must be between 1 and 100 characters."));
+    }
+    Ok(name.to_owned())
+}
+
+/// `(editable, assignable)`. Managed roles are neither. The owner bypasses the position check;
+/// Administrator does not. `@everyone` is never assignable.
+fn role_rights(owner: bool, highest: i32, guild_id: u64, role_id: u64, position: i32, managed: bool) -> (bool, bool) {
+    if managed {
+        return (false, false);
+    }
+    let editable = owner || position < highest;
+    let assignable = editable && role_id != guild_id;
+    (editable, assignable)
+}
+
+/// Newly set bits must be ones the actor already holds. `u64::MAX` is the owner or Administrator.
+/// Clearing a bit the actor lacks is allowed.
+fn may_grant(actor: u64, before: u64, after: u64) -> bool {
+    if actor == u64::MAX {
+        return true;
+    }
+    let added = after & !before;
+    added & !actor == 0
+}
+
+fn confirm_admin(before: u64, after: u64, confirmed: bool) -> Result<(), Refusal> {
+    let bit = model::ADMINISTRATOR;
+    if after & bit != 0 && before & bit == 0 && !confirmed {
+        return Err(refused("Confirm before granting the Administrator permission."));
+    }
+    Ok(())
+}
+
+fn highest_of(owner: bool, info: &super::GuildInfo) -> i32 {
+    if owner {
+        return i32::MAX;
+    }
+    info.my_roles.iter().filter_map(|id| info.roles.get(id).map(|role| role.position)).max().unwrap_or(0)
+}
+
+fn space_role(guild_num: u64, role_id: u64, role: &super::RoleInfo, owner: bool, highest: i32) -> protocol::SpaceRole {
+    let (editable, assignable) = role_rights(owner, highest, guild_num, role_id, role.position, role.managed);
+    let icon = match (&role.icon, &role.unicode_emoji) {
+        (Some(hash), _) => model::role_icon_url(&role_id.to_string(), hash).unwrap_or_default(),
+        (None, Some(emoji)) => emoji.clone(),
+        (None, None) => String::new(),
+    };
+    protocol::SpaceRole {
+        id: role_id.to_string(),
+        name: role.name.clone(),
+        color: role.color,
+        hoist: role.hoist,
+        position: role.position,
+        mentionable: role.mentionable,
+        managed: role.managed,
+        icon,
+        permissions: role.permissions,
+        editable,
+        assignable,
+    }
+}
+
+/// Picture and emoji are mutually exclusive on the wire. A clear of one leaves the other alone.
+fn role_body(edit: &protocol::RoleEdit, include_name: bool) -> Result<serde_json::Map<String, serde_json::Value>, Refusal> {
+    let picture_path = edit.icon.as_deref().map(str::trim);
+    if picture_path.is_some_and(|path| path.contains("://")) {
+        return Err(refused("Choose a picture on this computer."));
+    }
+    let emoji_value: Option<Option<&str>> = match edit.unicode_emoji.as_deref().map(str::trim) {
+        None => None,
+        Some("") => Some(None),
+        Some(text) => {
+            if model::role_emoji(Some(text)).is_none() {
+                return Err(refused("That emoji cannot be used on a role."));
+            }
+            Some(Some(text))
+        }
+    };
+    let picture_is_file = picture_path.is_some_and(|path| !path.is_empty());
+    if picture_is_file && matches!(emoji_value, Some(Some(_))) {
+        return Err(refused("A role can have a picture or an emoji, not both."));
+    }
+    let picture_value: Option<Option<String>> = match picture_path {
+        None => None,
+        Some("") => Some(None),
+        Some(path) => Some(Some(super::read_image_data_uri(path, super::DISCORD_IMAGE_MAX)?)),
+    };
+    let mut body = serde_json::Map::new();
+    if include_name {
+        if let Some(name) = edit.name.as_deref().map(str::trim).filter(|name| !name.is_empty()) {
+            body.insert("name".into(), json!(name));
+        }
+    }
+    if let Some(color) = edit.color {
+        if color > 0x00FF_FFFF {
+            return Err(refused("Role color must be between #000000 and #FFFFFF."));
+        }
+        body.insert("color".into(), json!(color));
+    }
+    if let Some(hoist) = edit.hoist {
+        body.insert("hoist".into(), json!(hoist));
+    }
+    if let Some(mentionable) = edit.mentionable {
+        body.insert("mentionable".into(), json!(mentionable));
+    }
+    if let Some(permissions) = edit.permissions {
+        body.insert("permissions".into(), json!(permissions.to_string()));
+    }
+    match (&picture_value, &emoji_value) {
+        (Some(Some(uri)), _) => {
+            body.insert("icon".into(), json!(uri));
+            body.insert("unicode_emoji".into(), serde_json::Value::Null);
+        }
+        (_, Some(Some(text))) => {
+            body.insert("unicode_emoji".into(), json!(text));
+            body.insert("icon".into(), serde_json::Value::Null);
+        }
+        (Some(None), Some(None)) => {
+            body.insert("icon".into(), serde_json::Value::Null);
+            body.insert("unicode_emoji".into(), serde_json::Value::Null);
+        }
+        (Some(None), None) => {
+            body.insert("icon".into(), serde_json::Value::Null);
+        }
+        (None, Some(None)) => {
+            body.insert("unicode_emoji".into(), serde_json::Value::Null);
+        }
+        _ => {}
+    }
+    Ok(body)
+}
+
+#[derive(Clone, Copy)]
+struct RoleGate {
+    owner: bool,
+    highest: i32,
+    manage: bool,
+    actor: u64,
+    guild_num: u64,
 }
 
 impl Discord {
@@ -141,7 +687,7 @@ impl Discord {
         // `profile_queued` has waited the turn; this marks it taken.
         crate::hub::lock(&self.state).profiled = Some(Instant::now());
         let mut path = format!(
-            "/users/{person}/profile?type=popout&with_mutual_guilds=true&with_mutual_friends=false&with_mutual_friends_count=false"
+            "/users/{person}/profile?type=modal&with_mutual_guilds=true&with_mutual_friends=true&with_mutual_friends_count=true"
         );
         if let Some(space) = space {
             path.push_str(&format!("&guild_id={space}"));
@@ -157,15 +703,226 @@ impl Discord {
                 let _ = self.ctx.media_variants(&id, &sizes);
             }
         }
-        let state = crate::hub::lock(&self.state);
-        let shared = profile.mutual_guilds.iter().filter_map(|guild| state.guilds.get(&guild.id));
+        let mut media: Vec<(protocol::MediaFile, String)> = Vec::new();
         let text = profile.user_profile.as_ref();
+        let member_text = profile.guild_member_profile.as_ref();
+        let member_banner_hash = space.and_then(|_| {
+            member_text
+                .and_then(|p| p.banner.as_deref())
+                .filter(|h| !h.is_empty())
+                .or_else(|| profile.guild_member.as_ref().and_then(|m| m.banner.as_deref()).filter(|h| !h.is_empty()))
+        });
+        let banner = space
+            .zip(member_banner_hash)
+            .and_then(|(guild, hash)| model::member_banner(guild, person, hash))
+            .or_else(|| {
+                text.and_then(|p| p.banner.as_deref())
+                    .filter(|h| !h.is_empty())
+                    .or_else(|| profile.user.as_ref().and_then(|u| u.banner.as_deref()).filter(|h| !h.is_empty()))
+                    .and_then(|hash| model::user_banner(person, hash))
+            });
+        let banner_file = banner.map(|(file, url)| {
+            media.push((file.clone(), url));
+            file
+        });
+        // The server's own colours count only when the profile was asked in that server.
+        let member_colors = space.and_then(|_| member_text);
+        let accent = member_colors
+            .and_then(|p| p.accent_color)
+            .or_else(|| text.and_then(|p| p.accent_color))
+            .or_else(|| profile.user.as_ref().and_then(|u| u.accent_color))
+            .or_else(|| member_colors.and_then(|p| p.theme_colors.as_ref()).and_then(|c| c.first().copied()))
+            .or_else(|| text.and_then(|p| p.theme_colors.as_ref()).and_then(|c| c.first().copied()));
+
+        let mut seen_badges = std::collections::HashSet::new();
+        let mut badges = Vec::new();
+        for badge in profile.badges.iter().chain(profile.guild_badges.iter()) {
+            if !badge.id.is_empty() && !seen_badges.insert(badge.id.clone()) {
+                continue;
+            }
+            let name = if !badge.description.is_empty() {
+                badge.description.clone()
+            } else {
+                badge.id.clone()
+            };
+            if name.is_empty() {
+                continue;
+            }
+            let icon = badge.icon.as_deref().filter(|h| !h.is_empty()).and_then(|hash| {
+                let (file, url) = model::badge_icon(hash)?;
+                media.push((file.clone(), url));
+                Some(file)
+            });
+            badges.push(protocol::ProfileBadge { name, icon });
+        }
+        if !media.is_empty() {
+            let _ = self.ctx.media(&media);
+        }
+
+        let connections: Vec<protocol::ProfileConnection> = profile
+            .connected_accounts
+            .iter()
+            .filter(|c| !c.kind.is_empty() && !c.name.is_empty())
+            .map(|c| protocol::ProfileConnection {
+                service: model::connection_label(&c.kind),
+                name: c.name.clone(),
+                url: model::connection_url(&c.kind, &c.id, &c.name),
+                verified: c.verified,
+            })
+            .collect();
+        let server_tag = profile
+            .user
+            .as_ref()
+            .and_then(|u| u.primary_guild.as_ref())
+            .filter(|pg| pg.identity_enabled != Some(false))
+            .and_then(|pg| pg.tag.clone())
+            .unwrap_or_default();
+        let mut fields = Vec::new();
+        if let Some(date) = profile.premium_since.as_deref().and_then(iso_date) {
+            fields.push(("Nitro since".to_owned(), date));
+        }
+        if let Some(date) = profile.premium_guild_since.as_deref().and_then(iso_date) {
+            fields.push(("Boosting since".to_owned(), date));
+        }
+
+        // Read before the `if`: a guard taken in an `else if let` is held through the last branch,
+        // which locks the state again.
+        let cached_note = crate::hub::lock(&self.state).notes.get(person).cloned();
+        let note = if let Some(inline) = profile.note.clone() {
+            crate::hub::lock(&self.state).notes.insert(person.to_owned(), inline.clone());
+            inline
+        } else if let Some(cached) = cached_note {
+            cached
+        } else {
+            match self.call("GET", &format!("/users/@me/notes/{person}"), None) {
+                Ok(raw) => {
+                    let text = serde_json::from_str::<NotePayload>(&raw)
+                        .ok()
+                        .and_then(|p| p.note)
+                        .unwrap_or_default();
+                    crate::hub::lock(&self.state).notes.insert(person.to_owned(), text.clone());
+                    text
+                }
+                Err(Refused::Status { status: 404, .. }) => {
+                    crate::hub::lock(&self.state).notes.insert(person.to_owned(), String::new());
+                    String::new()
+                }
+                Err(other) => {
+                    self.log("note", other);
+                    String::new()
+                }
+            }
+        };
+
+        let member_profile = space.and_then(|_| profile.guild_member_profile.as_ref());
+        let mut server_profile = false;
+        let mut server_avatar = None;
+        let member_avatar = space
+            .zip(profile.guild_member.as_ref().and_then(|m| m.avatar.as_deref()).filter(|h| !h.is_empty()))
+            .and_then(|(guild_id, hash)| model::member_avatar(guild_id, person, hash));
+        if let Some((file, url)) = member_avatar {
+            let sizes = model::avatar_variants(&file.id);
+            let id = file.id.clone();
+            let registered = self.ctx.media(&[(file.clone(), url)]);
+            if let (Ok(()), Some(sizes)) = (registered, sizes) {
+                let _ = self.ctx.media_variants(&id, &sizes);
+            }
+            server_avatar = Some(file);
+            server_profile = true;
+        }
+        if member_banner_hash.is_some() && banner_file.is_some() {
+            server_profile = true;
+        }
+        let mut friend_files = Vec::new();
+        for friend in profile.mutual_friends.iter().take(25) {
+            friend_files.push(friend.avatar());
+        }
+        if !friend_files.is_empty() {
+            let _ = self.ctx.media(&friend_files);
+        }
+        let state = crate::hub::lock(&self.state);
+        // Count known servers before the list is capped. An id we have never seen stays out.
+        let known_spaces: Vec<protocol::MutualSpace> = profile
+            .mutual_guilds
+            .iter()
+            .filter_map(|mg| {
+                let guild = state.guilds.get(&mg.id)?;
+                Some(protocol::MutualSpace {
+                    key: self.ctx.key(&mg.id),
+                    name: guild.name.clone(),
+                    nickname: mg.nick.clone().unwrap_or_default(),
+                })
+            })
+            .collect();
+        let mutual_total = known_spaces.len() as u32;
+        let mutual_space_items: Vec<protocol::MutualSpace> = known_spaces.into_iter().take(protocol::MUTUAL_SPACES).collect();
+        let mutual_spaces: Vec<String> = mutual_space_items.iter().map(|s| s.name.clone()).collect();
+        // An unknown id is not a friend. Inventing Friend here lets the card's learn
+        // replace a blocked or ignored person. Anyone who is not already Friend is left out.
+        let mutual_people: Vec<protocol::Person> = profile
+            .mutual_friends
+            .iter()
+            .take(25)
+            .filter_map(|friend| {
+                let relation = state.relations.get(&friend.id).copied().unwrap_or(protocol::Relation::None);
+                if relation != protocol::Relation::Friend {
+                    return None;
+                }
+                let (avatar, _) = friend.avatar();
+                let name = state.users.get(&friend.id).cloned().unwrap_or_else(|| friend.name().to_owned());
+                Some(protocol::Person {
+                    key: self.ctx.key(&friend.id),
+                    name,
+                    handle: friend.username.clone(),
+                    avatar: Some(avatar),
+                    bot: friend.bot,
+                    relation,
+                    link: model::user_link(&friend.id),
+                    ..protocol::Person::new(self.ctx.key(&friend.id), "")
+                })
+            })
+            .collect();
+        let mutual_friends = profile
+            .mutual_friends_count
+            .unwrap_or(profile.mutual_friends.len() as u32)
+            .max(mutual_people.len() as u32);
+        let bio = match member_profile.map(|p| p.bio.as_str()).filter(|b| !b.is_empty()) {
+            Some(server_bio) => {
+                server_profile = true;
+                let mut bio = server_bio.to_owned();
+                protocol::clip(&mut bio, 1_000);
+                bio
+            }
+            None => profile.bio(),
+        };
+        let pronouns = match member_profile.map(|p| p.pronouns.as_str()).filter(|p| !p.is_empty()) {
+            Some(server_pronouns) => {
+                server_profile = true;
+                server_pronouns.to_owned()
+            }
+            None => text.map(|text| text.pronouns.clone()).unwrap_or_default(),
+        };
+        // The server's own accent colour is part of a server profile; the colour shown is worked out above.
+        if member_profile.and_then(|p| p.accent_color).is_some() {
+            server_profile = true;
+        }
         let mut about = About {
-            bio: profile.bio(),
-            mutual_spaces: shared.map(|guild| guild.name.clone()).take(protocol::MUTUAL_SPACES).collect(),
-            mutual_total: profile.mutual_guilds.len() as u32,
-            pronouns: text.map(|text| text.pronouns.clone()).unwrap_or_default(),
-            accent: text.and_then(|text| text.accent_color),
+            bio,
+            mutual_spaces,
+            mutual_space_items,
+            mutual_people,
+            mutual_friends,
+            mutual_total,
+            pronouns,
+            accent,
+            banner: banner_file,
+            avatar: server_avatar,
+            server_profile,
+            badges,
+            connections,
+            server_tag,
+            fields,
+            note,
             // An id carries the moment it was made: the day they joined Discord.
             since: Some(model::seconds(person)).filter(|since| *since > 1_420_070_400),
             ..About::default()
@@ -176,8 +933,9 @@ impl Discord {
             about.nickname = member.nick.clone().unwrap_or_default();
             // Role names in the server's own order of ids, the everyone role left out; colours
             // are never sent on.
-            let named = member.roles.iter().filter(|role| role.as_str() != space);
-            let names = named.filter_map(|role| guild.and_then(|guild| guild.roles.get(&number(role))).map(|role| role.name.clone()));
+            let held: Vec<&String> = member.roles.iter().filter(|role| role.as_str() != space).collect();
+            about.role_ids = held.iter().take(100).map(|role| (*role).clone()).collect();
+            let names = held.iter().filter_map(|role| guild.and_then(|guild| guild.roles.get(&number(role))).map(|role| role.name.clone()));
             about.roles = names.take(protocol::PROFILE_ROLES).collect();
             about.joined = member.joined_at.as_deref().and_then(model::iso_seconds);
         }
@@ -193,12 +951,21 @@ impl Discord {
         let kept = guild.as_ref().and_then(|guild| self.ctx.note(&format!("kept:{guild}")));
         let kept: Vec<model::Kept> = kept.and_then(|kept| serde_json::from_str(&kept).ok()).unwrap_or_default();
         let topic = kept.into_iter().find(|kept| kept.id == channel).and_then(|kept| kept.topic);
+        let noted = (known.kind == ConversationKind::Thread).then(|| self.ctx.note(&format!("thread-notify:{channel}"))).flatten();
         let state = crate::hub::lock(&self.state);
         let parent = known.parent.as_deref().or(known.group.as_deref());
-        let notify = match guild.as_ref().map(|guild| state.guilds.get(guild)) {
-            Some(Some(info)) => info.quiet.notify(channel, parent, now()),
-            Some(None) => Notify::All,
-            None => state.quiet_directs.notify(channel, None, now()),
+        let thread_notify = (known.kind == ConversationKind::Thread)
+            .then(|| state.thread_members.get(channel).and_then(|tm| tm.notify()))
+            .flatten();
+        let notify = match noted.as_deref() {
+            Some("all") => Notify::All,
+            Some("mentions") => Notify::Mentions,
+            Some("nothing") => Notify::Nothing,
+            _ => thread_notify.unwrap_or_else(|| match guild.as_ref().map(|guild| state.guilds.get(guild)) {
+                Some(Some(info)) => info.quiet.notify(channel, parent, now()),
+                Some(None) => Notify::All,
+                None => state.quiet_directs.notify(channel, None, now()),
+            }),
         };
         let members = match known.kind {
             ConversationKind::Direct => Some(2),
@@ -214,6 +981,121 @@ impl Discord {
         })
     }
 
+    /// A forum's posting rules, from the channel note READY kept. Nothing is asked of Discord.
+    pub(super) fn forum_info(&self, channel: &str) -> Result<protocol::ForumInfo, Refusal> {
+        let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
+        if known.kind != ConversationKind::Forum {
+            return Err(refused("This is not a forum."));
+        }
+        let guild = self.guild_of(&known).ok_or_else(|| refused("This forum is not here."))?;
+        let note = self.ctx.note(&format!("kept:{guild}"));
+        let kept: Vec<model::Kept> = note.and_then(|kept| serde_json::from_str(&kept).ok()).unwrap_or_default();
+        let kept = kept.into_iter().find(|kept| kept.id == channel).ok_or_else(|| refused("This forum is not here."))?;
+        let tags = kept.available_tags.iter().map(|tag| {
+            let emoji = tag
+                .emoji_name
+                .clone()
+                .filter(|name| !name.is_empty())
+                .or_else(|| tag.emoji_id.clone().filter(|id| !id.is_empty()))
+                .unwrap_or_default();
+            protocol::ForumTag { id: tag.id.clone(), name: tag.name.clone(), emoji, moderated: tag.moderated }
+        });
+        Ok(protocol::ForumInfo {
+            forum: known.key,
+            guidelines: kept.topic.unwrap_or_default(),
+            tags: tags.collect(),
+            require_tag: kept.flags & model::REQUIRE_TAG != 0,
+            media: kept.kind == model::MEDIA_FORUM,
+            default_slowmode: kept.default_thread_rate_limit_per_user,
+        })
+    }
+
+    /// One page of a forum's posts. Archived posts are in this search; nothing walks every page.
+    /// `Ok(None)` is an unfiltered first page Discord did not answer, so the cache can.
+    pub(super) fn forum_posts(
+        &self,
+        channel: &str,
+        sort: TopicSort,
+        tag: Option<String>,
+        query: Option<String>,
+        offset: u32,
+    ) -> Result<Option<ForumPosts>, Refusal> {
+        let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("You cannot read this channel."))?;
+        if known.kind != ConversationKind::Forum {
+            return Err(refused("This is not a forum."));
+        }
+        let tag = tag.unwrap_or_default();
+        let query = query.unwrap_or_default();
+        let plain = offset == 0 && sort == TopicSort::Activity && tag.trim().is_empty() && query.trim().is_empty();
+        let path = forum_search_path(channel, sort, tag.trim(), query.trim(), offset);
+        let body = match self.call("GET", &path, None) {
+            Ok(body) => body,
+            Err(failed) => return forum_search_failed(failed, plain),
+        };
+        let parsed: ThreadSearch = match serde_json::from_str(&body) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                if plain {
+                    return Ok(None);
+                }
+                return Err(refused(err));
+            }
+        };
+        let guild = self.guild_of(&known);
+        let wanted = tag.trim();
+        let ThreadSearch { threads, has_more, total_results, first_messages } = parsed;
+        let mut ids = Vec::new();
+        for thread in threads.into_iter().take(FORUM_PAGE as usize) {
+            if thread.parent_id.as_deref() != Some(channel) {
+                continue;
+            }
+            if !wanted.is_empty() && !thread.applied_tags.iter().any(|have| have == wanted) {
+                continue;
+            }
+            self.thread_changed(thread.clone(), false).map_err(failure_words)?;
+            if self.ctx.known(&thread.id).map_err(refused)?.is_none() {
+                continue;
+            }
+            let (thumbnail, reaction) = match first_messages.iter().find(|posted| posted.channel_id == thread.id) {
+                Some(posted) => self.record_starter(&thread, posted, guild.as_deref()),
+                None => (String::new(), String::new()),
+            };
+            let _ = self.ctx.post_card(&thread.id, &PostCard {
+                tags: thread.applied_tags.clone(),
+                message_count: thread.message_count.unwrap_or(0),
+                total_message_sent: thread.total_message_sent.unwrap_or(0),
+                thumbnail,
+                reaction,
+                owner: thread.owner_id.clone().unwrap_or_default(),
+            });
+            ids.push(thread.id);
+        }
+        let kept = ids.len() as u32;
+        let total = total_results.unwrap_or_else(|| {
+            if has_more { offset.saturating_add(kept).saturating_add(1) } else { offset.saturating_add(kept) }
+        });
+        Ok(Some(ForumPosts { ids, total }))
+    }
+
+    /// The starter message, its picture, and its strongest reaction. A failure here keeps the post.
+    fn record_starter(&self, thread: &model::Channel, posted: &Posted, guild: Option<&str>) -> (String, String) {
+        let (message, files) = self.convert(posted, guild, ConversationKind::Thread);
+        let _ = files.register(&self.ctx);
+        let _ = self.ctx.history(&thread.id, std::slice::from_ref(&message));
+        if !message.text.is_empty() {
+            let sent = thread.last_message_id.as_deref().map(model::seconds).filter(|sent| *sent > 0).unwrap_or(message.sent);
+            let _ = self.ctx.preview(&thread.id, &PreviewLine {
+                id: message.id.clone(),
+                text: message.text.clone(),
+                sender: message.sender.name.clone(),
+                mine: message.outgoing,
+                sent,
+                expires_at: message.expires_at,
+            });
+        }
+        (post_thumb(&message), top_reaction(&message))
+    }
+
     /// A server's info: its description and counts in one request, our nickname, roles and the
     /// notification setting from what READY said.
     ///
@@ -225,31 +1107,527 @@ impl Discord {
         }
         let answer = self.call("GET", &format!("/guilds/{guild}?with_counts=true"), None).map_err(refusal)?;
         let counts: GuildCounts = serde_json::from_str(&answer).map_err(refused)?;
-        let state = crate::hub::lock(&self.state);
-        let info = state.guilds.get(guild).ok_or_else(|| refused("This server is gone."))?;
-        let roles = info.my_roles.iter().filter(|role| **role != number(guild)).filter_map(|role| info.roles.get(role));
-        let notify = match () {
-            _ if info.quiet.server_muted(now()) => Notify::Nothing,
-            _ if info.quiet.level == 1 => Notify::Mentions,
-            _ if info.quiet.level == 2 => Notify::Nothing,
-            _ => Notify::All,
+        let (
+            description,
+            banner_hash,
+            boost_level,
+            boosts,
+            mark,
+            nickname,
+            roles,
+            notify,
+            system_channel_id,
+            afk_channel_id,
+            afk_timeout,
+            default_notify,
+            vanity_url,
+            invites_disabled,
+            can_change_nickname,
+            suppress_everyone,
+            suppress_roles,
+            highlights,
+            events,
+            mobile_push,
+            raw_overrides,
+            space_privacy,
+        ) = {
+            let state = crate::hub::lock(&self.state);
+            let info = state.guilds.get(guild).ok_or_else(|| refused("This server is gone."))?;
+            let roles = info
+                .my_roles
+                .iter()
+                .filter(|role| **role != number(guild))
+                .filter_map(|role| info.roles.get(role))
+                .map(|role| role.name.clone())
+                .take(protocol::PROFILE_ROLES)
+                .collect();
+            let notify = match () {
+                _ if info.quiet.server_muted(now()) => Notify::Nothing,
+                _ if info.quiet.level == 1 => Notify::Mentions,
+                _ if info.quiet.level == 2 => Notify::Nothing,
+                _ => Notify::All,
+            };
+            let description = counts
+                .description
+                .filter(|text| !text.is_empty())
+                .unwrap_or_else(|| info.description.clone());
+            let banner_hash = counts.banner.or_else(|| info.banner.clone());
+            let boost_level = counts.premium_tier.unwrap_or(info.premium_tier);
+            let boosts = counts.premium_subscription_count.unwrap_or(info.premium_subscription_count);
+            let features = if counts.features.is_empty() { &info.features } else { &counts.features };
+            let mark = model::guild_mark(features);
+            let invites_disabled = features.iter().any(|f| f == "INVITES_DISABLED");
+            let system_channel_id = counts
+                .system_channel_id
+                .filter(|s| !s.is_empty())
+                .or_else(|| info.system_channel_id.clone());
+            let afk_channel_id = counts
+                .afk_channel_id
+                .filter(|s| !s.is_empty())
+                .or_else(|| info.afk_channel_id.clone());
+            let afk_timeout = counts.afk_timeout.unwrap_or(info.afk_timeout);
+            let default_notify = Some(match counts.default_message_notifications.unwrap_or(info.default_message_notifications) {
+                1 => Notify::Mentions,
+                _ => Notify::All,
+            });
+            let vanity_url = counts
+                .vanity_url_code
+                .filter(|s| !s.is_empty())
+                .or_else(|| info.vanity_url_code.clone());
+            let now_ts = now();
+            let suppress_everyone = info.quiet.suppress_everyone;
+            let suppress_roles = info.quiet.suppress_roles;
+            let highlights = info.quiet.notify_highlights != 1;
+            let events = !info.quiet.mute_scheduled_events;
+            let mobile_push = info.quiet.mobile_push;
+            // Collect every channel (excluding categories) that overrides the server's own level or mute.
+            let mut override_ids: Vec<String> = info
+                .quiet
+                .channels
+                .iter()
+                .filter(|(_, until)| **until > now_ts)
+                .map(|(id, _)| id.clone())
+                .chain(info.quiet.levels.keys().cloned())
+                .filter(|id| !info.categories.contains_key(id))
+                .collect();
+            override_ids.sort();
+            override_ids.dedup();
+            let raw_overrides: Vec<(String, Notify)> = override_ids
+                .into_iter()
+                .map(|id| {
+                    let level = if info.quiet.channels.get(&id).is_some_and(|until| *until > now_ts) {
+                        Notify::Nothing
+                    } else {
+                        match info.quiet.levels.get(&id).copied().unwrap_or(info.quiet.level) {
+                            1 => Notify::Mentions,
+                            2 => Notify::Nothing,
+                            _ => Notify::All,
+                        }
+                    };
+                    (id, level)
+                })
+                .collect();
+            let decoded_privacy = super::proto::decode_privacy(&state.privacy_settings);
+            let space_privacy = protocol::SpacePrivacy {
+                allow_dms: !decoded_privacy.restricted_spaces.iter().any(|id| id == guild),
+                allow_requests: !decoded_privacy.request_restricted_spaces.iter().any(|id| id == guild),
+            };
+            let can_change_nickname =
+                info.owner || (info.base_permissions(guild) & (model::ADMINISTRATOR | model::CHANGE_NICKNAME)) != 0;
+            (
+                description,
+                banner_hash,
+                boost_level,
+                boosts,
+                mark,
+                info.nick.clone(),
+                roles,
+                notify,
+                system_channel_id,
+                afk_channel_id,
+                afk_timeout,
+                default_notify,
+                vanity_url,
+                invites_disabled,
+                can_change_nickname,
+                suppress_everyone,
+                suppress_roles,
+                highlights,
+                events,
+                mobile_push,
+                raw_overrides,
+                space_privacy,
+            )
         };
+        let banner = match banner_hash.as_deref() {
+            Some(hash) => {
+                let (file, url) = model::guild_banner(guild, hash);
+                let _ = self.ctx.media(&[(file.clone(), url)]);
+                Some(file)
+            }
+            None => None,
+        };
+        let mut channel_overrides = Vec::with_capacity(raw_overrides.len());
+        for (channel_id, ch_notify) in raw_overrides {
+            let name = self
+                .ctx
+                .known(&channel_id)
+                .ok()
+                .flatten()
+                .map(|row| row.title)
+                .unwrap_or_else(|| channel_id.clone());
+            channel_overrides.push(protocol::SpaceChannelOverride {
+                channel_id,
+                name,
+                notify: ch_notify,
+            });
+        }
         Ok(SpaceAbout {
-            description: counts.description.unwrap_or_default(),
+            description,
             members: counts.approximate_member_count,
             online: counts.approximate_presence_count,
-            nickname: info.nick.clone(),
-            roles: roles.map(|role| role.name.clone()).take(protocol::PROFILE_ROLES).collect(),
+            nickname,
+            roles,
             notify,
+            suppress_everyone,
+            suppress_roles,
+            highlights,
+            events,
+            mobile_push,
+            channel_overrides,
+            privacy: Some(space_privacy),
+            can_change_nickname,
+            banner,
+            boost_level,
+            boosts,
+            mark,
+            system_channel_id,
+            afk_channel_id,
+            afk_timeout,
+            default_notify,
+            vanity_url,
+            invites_disabled,
             ..SpaceAbout::default()
         })
     }
 
+    /// Remembers a thread's own notification level so Details does not show the parent channel's.
+    pub(super) fn note_thread_notify(&self, channel: &str, word: &str) {
+        self.ctx.set_note(&format!("thread-notify:{channel}"), word);
+        self.ctx.info_stale(channel);
+    }
+    /// Edits our own Discord display name (`PATCH /users/@me`), global profile (`PATCH /users/@me/profile`),
+    /// or Nitro per-server profile (`PATCH /guilds/{id}/profile/@me`).
+    pub(super) fn set_profile(
+        &self,
+        name: Option<String>,
+        about: Option<String>,
+        pronouns: Option<String>,
+        accent: Option<u32>,
+        banner: Option<String>,
+        space_id: Option<String>,
+    ) -> Result<(), Refusal> {
+        let premium = crate::hub::lock(&self.state).premium;
+        if let Some(guild) = space_id {
+            if premium == 0 {
+                return Err(refused("Per-server profiles require Discord Nitro."));
+            }
+            if !crate::hub::lock(&self.state).guilds.contains_key(&guild) {
+                return Err(refused("This server is gone."));
+            }
+            let mut body = serde_json::Map::new();
+            if let Some(mut bio) = about {
+                let trimmed = bio.trim().to_owned();
+                bio = trimmed;
+                protocol::clip(&mut bio, 190);
+                body.insert("bio".into(), json!(bio));
+            }
+            if let Some(mut p) = pronouns {
+                let trimmed = p.trim().to_owned();
+                p = trimmed;
+                protocol::clip(&mut p, 40);
+                body.insert("pronouns".into(), json!(p));
+            }
+            if let Some(color) = accent {
+                body.insert("accent_color".into(), json!(color & 0xFF_FFFF));
+            }
+            if let Some(path) = banner {
+                let trimmed = path.trim();
+                if trimmed.is_empty() {
+                    body.insert("banner".into(), serde_json::Value::Null);
+                } else {
+                    let uri = image_data_uri(trimmed, true)?;
+                    body.insert("banner".into(), json!(uri));
+                }
+            }
+            if !body.is_empty() {
+                self.call("PATCH", &format!("/guilds/{guild}/profile/@me"), Some(serde_json::Value::Object(body)))
+                    .map_err(profile_refusal)?;
+            }
+            return Ok(());
+        }
+
+        if let Some(name) = name {
+            let mut trimmed = name.trim().to_owned();
+            protocol::clip(&mut trimmed, 32);
+            let value = if trimmed.is_empty() { serde_json::Value::Null } else { json!(trimmed) };
+            self.call("PATCH", "/users/@me", Some(json!({"global_name": value})))
+                .map_err(profile_refusal)?;
+        }
+
+        let mut profile_body = serde_json::Map::new();
+        if let Some(about) = about {
+            let mut trimmed = about.trim().to_owned();
+            protocol::clip(&mut trimmed, 190);
+            profile_body.insert("bio".into(), json!(trimmed));
+        }
+        if let Some(pronouns) = pronouns {
+            let mut trimmed = pronouns.trim().to_owned();
+            protocol::clip(&mut trimmed, 40);
+            profile_body.insert("pronouns".into(), json!(trimmed));
+        }
+        if let Some(color) = accent {
+            profile_body.insert("accent_color".into(), json!(color & 0xFF_FFFF));
+        }
+        if let Some(path) = banner {
+            let trimmed = path.trim();
+            if trimmed.is_empty() {
+                profile_body.insert("banner".into(), serde_json::Value::Null);
+            } else {
+                if premium == 0 {
+                    return Err(refused("Profile banners require Discord Nitro."));
+                }
+                let uri = image_data_uri(trimmed, true)?;
+                profile_body.insert("banner".into(), json!(uri));
+            }
+        }
+        if !profile_body.is_empty() {
+            self.call("PATCH", "/users/@me/profile", Some(serde_json::Value::Object(profile_body)))
+                .map_err(profile_refusal)?;
+        }
+        Ok(())
+    }
+
+    /// Sets or clears our own Discord avatar via `PATCH /users/@me`.
+    pub(super) fn set_avatar(&self, path: &str) -> Result<(), Refusal> {
+        let premium = crate::hub::lock(&self.state).premium;
+        let trimmed = path.trim();
+        let value = if trimmed.is_empty() {
+            serde_json::Value::Null
+        } else {
+            let uri = image_data_uri(trimmed, premium > 0)?;
+            json!(uri)
+        };
+        self.call("PATCH", "/users/@me", Some(json!({"avatar": value})))
+            .map_err(profile_refusal)?;
+        Ok(())
+    }
+
+    /// Sets or clears our nickname in a Discord server via `PATCH /guilds/{id}/members/@me`.
+    pub(super) fn set_nickname(&self, guild: &str, nickname: Option<String>) -> Result<(), Refusal> {
+        {
+            let state = crate::hub::lock(&self.state);
+            let info = state.guilds.get(guild).ok_or_else(|| refused("This server is gone."))?;
+            let allowed = info.owner
+                || (info.base_permissions(guild) & (model::ADMINISTRATOR | model::CHANGE_NICKNAME)) != 0;
+            if !allowed {
+                return Err(refused("You don't have permission to change your nickname in this server."));
+            }
+        }
+        let cleaned = nickname.and_then(|n| {
+            let mut trimmed = n.trim().to_owned();
+            protocol::clip(&mut trimmed, 32);
+            (!trimmed.is_empty()).then_some(trimmed)
+        });
+        let value = match &cleaned {
+            Some(nick) => json!(nick),
+            None => serde_json::Value::Null,
+        };
+        self.call("PATCH", &format!("/guilds/{guild}/members/@me"), Some(json!({"nick": value})))
+            .map_err(profile_refusal)?;
+        if let Some(info) = crate::hub::lock(&self.state).guilds.get_mut(guild) {
+            info.nick = cleaned.unwrap_or_default();
+        }
+        Ok(())
+    }
+    /// Reads our Privacy & Safety settings from the cached privacy block (field 8) and the
+    /// explicit-content and DM-spam fields of the cached text-and-images block (field 6).
+    pub(super) fn get_network_privacy(&self) -> Result<protocol::NetworkPrivacy, Refusal> {
+        let state = crate::hub::lock(&self.state);
+        let mut privacy = super::proto::decode_privacy(&state.privacy_settings);
+        super::proto::apply_content_filters(&state.text_and_images, &mut privacy);
+        Ok(privacy)
+    }
+
+    /// Writes updated Privacy & Safety settings to `PATCH /users/@me/settings-proto/1`.
+    /// Privacy is field 8. Explicit content and the DM spam filter are merged into the cached
+    /// text-and-images block and sent as field 6. Every other protobuf field is copied.
+    pub(super) fn set_network_privacy(&self, privacy: protocol::NetworkPrivacy) -> Result<protocol::NetworkPrivacy, Refusal> {
+        let (kept, kept_text) = {
+            let state = crate::hub::lock(&self.state);
+            (state.privacy_settings.clone(), state.text_and_images.clone())
+        };
+        let updated = super::proto::with_privacy(&kept, &privacy);
+        let updated_text = (!kept_text.is_empty()).then(|| super::proto::with_content_filters(&kept_text, &privacy));
+        let body = json!({"settings": super::proto::privacy_update_settings(&updated, updated_text.as_deref())});
+        self.call("PATCH", "/users/@me/settings-proto/1", Some(body)).map_err(refusal)?;
+        {
+            let mut state = crate::hub::lock(&self.state);
+            state.privacy_settings = updated.clone();
+            if let Some(text) = &updated_text {
+                state.text_and_images = text.clone();
+            }
+        }
+        let mut decoded = super::proto::decode_privacy(&updated);
+        super::proto::apply_content_filters(updated_text.as_deref().unwrap_or(&[]), &mut decoded);
+        Ok(decoded)
+    }
+
+    /// Updates a single server's "Allow direct messages" / "Allow message requests" switches
+    /// by adding or removing `guild` in `restricted_guild_ids` / `message_request_restricted_guild_ids`
+    /// and writing `PATCH /users/@me/settings-proto/1`.
+    pub(super) fn set_space_privacy(&self, guild: &str, privacy: protocol::SpacePrivacy) -> Result<(), Refusal> {
+        let kept = {
+            let state = crate::hub::lock(&self.state);
+            if !state.guilds.contains_key(guild) {
+                return Err(refused("This server is gone."));
+            }
+            state.privacy_settings.clone()
+        };
+        let mut net = super::proto::decode_privacy(&kept);
+        net.restricted_spaces.retain(|id| id != guild);
+        if !privacy.allow_dms {
+            net.restricted_spaces.push(guild.to_owned());
+        }
+        net.request_restricted_spaces.retain(|id| id != guild);
+        if !privacy.allow_requests {
+            net.request_restricted_spaces.push(guild.to_owned());
+        }
+        let updated = super::proto::with_privacy(&kept, &net);
+        let body = json!({"settings": super::proto::privacy_update_settings(&updated, None)});
+        self.call("PATCH", "/users/@me/settings-proto/1", Some(body)).map_err(refusal)?;
+        crate::hub::lock(&self.state).privacy_settings = updated;
+        Ok(())
+    }
+
+    /// Updates a server's notification level, switches (`suppress_everyone`, `suppress_roles`,
+    /// `notify_highlights`, `mute_scheduled_events`, `mobile_push`), or resets a per-channel
+    /// notification override via `PATCH /users/@me/guilds/{guild}/settings`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn set_space_options(
+        &self,
+        guild: &str,
+        notify: Option<Notify>,
+        suppress_everyone: Option<bool>,
+        suppress_roles: Option<bool>,
+        highlights: Option<bool>,
+        events: Option<bool>,
+        mobile_push: Option<bool>,
+        reset_channel: Option<&str>,
+    ) -> Result<(), Refusal> {
+        if !crate::hub::lock(&self.state).guilds.contains_key(guild) {
+            return Err(refused("This server is gone."));
+        }
+        let mut map = serde_json::Map::new();
+        if let Some(level) = notify {
+            let num = match level {
+                Notify::All => 0,
+                Notify::Mentions => 1,
+                Notify::Nothing => 2,
+            };
+            map.insert("muted".to_owned(), json!(false));
+            map.insert("message_notifications".to_owned(), json!(num));
+        }
+        if let Some(v) = suppress_everyone {
+            map.insert("suppress_everyone".to_owned(), json!(v));
+        }
+        if let Some(v) = suppress_roles {
+            map.insert("suppress_roles".to_owned(), json!(v));
+        }
+        if let Some(v) = highlights {
+            // Discord: 1 = disabled (suppressed), 2 = enabled.
+            map.insert("notify_highlights".to_owned(), json!(if v { 2 } else { 1 }));
+        }
+        if let Some(v) = events {
+            map.insert("mute_scheduled_events".to_owned(), json!(!v));
+        }
+        if let Some(v) = mobile_push {
+            map.insert("mobile_push".to_owned(), json!(v));
+        }
+        if let Some(channel) = reset_channel.filter(|id| !id.is_empty()) {
+            map.insert(
+                "channel_overrides".to_owned(),
+                json!({
+                    channel: {
+                        "muted": false,
+                        "message_notifications": 3,
+                        "mute_config": {"end_time": null, "selected_time_window": -1},
+                    }
+                }),
+            );
+        }
+        if map.is_empty() {
+            return Ok(());
+        }
+        let path = format!("/users/@me/guilds/{guild}/settings");
+        let answer = self.call("PATCH", &path, Some(serde_json::Value::Object(map))).map_err(refusal)?;
+        match serde_json::from_str::<GuildSettings>(&answer) {
+            Ok(settings) if settings.guild_id.as_deref() == Some(guild) => {
+                self.settings_changed(settings).map_err(|failed| match failed {
+                    super::Failure::SignedOut(why) | super::Failure::Dropped(why) => refused(why),
+                })
+            }
+            _ => {
+                // Apply optimistically to in-memory state if the response didn't echo full settings.
+                let mut state = crate::hub::lock(&self.state);
+                if let Some(info) = state.guilds.get_mut(guild) {
+                    if let Some(level) = notify {
+                        info.quiet.muted_until = None;
+                        info.quiet.level = match level {
+                            Notify::All => 0,
+                            Notify::Mentions => 1,
+                            Notify::Nothing => 2,
+                        };
+                    }
+                    if let Some(v) = suppress_everyone {
+                        info.quiet.suppress_everyone = v;
+                    }
+                    if let Some(v) = suppress_roles {
+                        info.quiet.suppress_roles = v;
+                    }
+                    if let Some(v) = highlights {
+                        info.quiet.notify_highlights = if v { 2 } else { 1 };
+                    }
+                    if let Some(v) = events {
+                        info.quiet.mute_scheduled_events = !v;
+                    }
+                    if let Some(v) = mobile_push {
+                        info.quiet.mobile_push = v;
+                    }
+                    if let Some(channel) = reset_channel {
+                        info.quiet.channels.remove(channel);
+                        info.quiet.levels.remove(channel);
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Sets a conversation's notifications as Discord's own menu does: one settings change for
-    /// its server (`@me` for direct and group conversations). Discord answers with the server's
-    /// settings whole, which are applied as if they came from the gateway.
+    /// its server (`@me` for direct and group conversations), or thread-member settings for a
+    /// thread (`PATCH /channels/{id}/thread-members/@me/settings`).
     pub(super) fn set_mute(&self, channel: &str, notify: Notify, until: Option<i64>) -> Result<(), Refusal> {
         let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
+        if known.kind == ConversationKind::Thread {
+            let word = match notify {
+                Notify::All => "all",
+                Notify::Mentions => "mentions",
+                Notify::Nothing => "nothing",
+            };
+            let base = crate::hub::lock(&self.state)
+                .thread_members
+                .get(channel)
+                .map_or(0, |tm| tm.flags & !model::THREAD_NOTIFY_MASK);
+            let (muted, bits) = match notify {
+                Notify::All => (false, model::THREAD_NOTIFY_ALL),
+                Notify::Mentions => (false, model::THREAD_NOTIFY_MENTIONS),
+                Notify::Nothing => (true, model::THREAD_NOTIFY_NONE),
+            };
+            let flags = base | bits;
+            let body = json!({
+                "flags": flags,
+                "muted": muted,
+                "mute_config": {"end_time": null, "selected_time_window": -1},
+            });
+            self.call("PATCH", &format!("/channels/{channel}/thread-members/@me/settings"), Some(body))
+                .map_err(refusal)?;
+            crate::hub::lock(&self.state)
+                .thread_members
+                .insert(channel.to_owned(), model::ThreadMember { flags, muted });
+            self.note_thread_notify(channel, word);
+            return self.ctx.muted(channel, muted).map_err(refused);
+        }
         let guild = self.guild_of(&known);
         let body = mute_override_body(channel, notify, until, now());
         let path = format!("/users/@me/guilds/{}/settings", guild.as_deref().unwrap_or("@me"));
@@ -263,14 +1641,272 @@ impl Discord {
         }
     }
 
+    /// Sets a server's or category's notifications (`PATCH /users/@me/guilds/{id}/settings`).
+    /// When `category` is `Some(id)`, writes `channel_overrides[id]`; otherwise writes the
+    /// top-level server `muted`, `mute_config`, and `message_notifications`.
+    pub(super) fn set_space_notify(
+        &self,
+        guild: &str,
+        notify: Notify,
+        until: Option<i64>,
+        category: Option<&str>,
+    ) -> Result<(), Refusal> {
+        if !crate::hub::lock(&self.state).guilds.contains_key(guild) {
+            return Err(refused("This server is gone."));
+        }
+        let clock = now();
+        let body = space_notify_body(notify, until, category, clock);
+        let path = format!("/users/@me/guilds/{guild}/settings");
+        let answer = self.call("PATCH", &path, Some(body)).map_err(refusal)?;
+        match serde_json::from_str::<GuildSettings>(&answer) {
+            Ok(settings) if settings.guild_id.as_deref() == Some(guild) => {
+                self.settings_changed(settings).map_err(|failed| match failed {
+                    super::Failure::SignedOut(why) | super::Failure::Dropped(why) => refused(why),
+                })
+            }
+            _ => {
+                let end = until.filter(|&t| t > clock).unwrap_or(i64::MAX);
+                {
+                    let mut state = crate::hub::lock(&self.state);
+                    if let Some(info) = state.guilds.get_mut(guild) {
+                        if let Some(cat) = category.filter(|c| !c.is_empty()) {
+                            match notify {
+                                Notify::Nothing => {
+                                    info.quiet.channels.insert(cat.to_owned(), end);
+                                }
+                                Notify::All => {
+                                    info.quiet.channels.remove(cat);
+                                    info.quiet.levels.insert(cat.to_owned(), 0);
+                                }
+                                Notify::Mentions => {
+                                    info.quiet.channels.remove(cat);
+                                    info.quiet.levels.insert(cat.to_owned(), 1);
+                                }
+                            }
+                        } else {
+                            match notify {
+                                Notify::Nothing => {
+                                    info.quiet.muted_until = Some(end);
+                                    if until.is_none() {
+                                        info.quiet.level = 2;
+                                    }
+                                }
+                                Notify::All => {
+                                    info.quiet.muted_until = None;
+                                    info.quiet.level = 0;
+                                }
+                                Notify::Mentions => {
+                                    info.quiet.muted_until = None;
+                                    info.quiet.level = 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                self.apply_quiet(Some(guild)).map_err(refused)?;
+                self.replant(guild).map_err(refused)?;
+                self.reschedule_unmute();
+                Ok(())
+            }
+        }
+    }
+
+    /// Opts a channel or category in (`on: true`) or out (`on: false`) of the server's channel
+    /// list (`channel_overrides[id].flags`, bit 12 `OPT_IN_ENABLED`) via
+    /// `PATCH /users/@me/guilds/{id}/settings`.
+    pub(super) fn follow_channel(&self, channel: &str, on: bool) -> Result<(), Refusal> {
+        let guild = if let Some(known) = self.ctx.known(channel).map_err(refused)? {
+            self.guild_of(&known)
+        } else {
+            let state = crate::hub::lock(&self.state);
+            state
+                .guilds
+                .iter()
+                .find(|(_, info)| info.categories.contains_key(channel))
+                .map(|(id, _)| id.clone())
+        };
+        let Some(guild) = guild else {
+            return Err(refused("Only a server channel or category can be followed."));
+        };
+        let existing_flags = {
+            let state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get(&guild) else {
+                return Err(refused("This server is gone."));
+            };
+            info.quiet.channel_flags.get(channel).copied().unwrap_or(0)
+        };
+        let body = follow_channel_body(channel, existing_flags, on);
+        let path = format!("/users/@me/guilds/{guild}/settings");
+        let answer = self.call("PATCH", &path, Some(body)).map_err(refusal)?;
+        match serde_json::from_str::<GuildSettings>(&answer) {
+            Ok(settings) if settings.guild_id.as_deref() == Some(guild.as_str()) => {
+                self.settings_changed(settings).map_err(|failed| match failed {
+                    super::Failure::SignedOut(why) | super::Failure::Dropped(why) => refused(why),
+                })
+            }
+            _ => {
+                let next_flags = if on {
+                    existing_flags | model::OPT_IN_ENABLED
+                } else {
+                    existing_flags & !model::OPT_IN_ENABLED
+                };
+                {
+                    let mut state = crate::hub::lock(&self.state);
+                    if let Some(info) = state.guilds.get_mut(&guild) {
+                        if on {
+                            info.quiet.opted_in.insert(channel.to_owned());
+                        } else {
+                            info.quiet.opted_in.remove(channel);
+                        }
+                        info.quiet.channel_flags.insert(channel.to_owned(), next_flags);
+                    }
+                }
+                self.replant(&guild).map_err(refused)
+            }
+        }
+    }
+
+    /// Toggles "Show All Channels" (guild `flags`, bit 14 `OPT_IN_CHANNELS_ON`) and/or
+    /// `hide_muted_channels` on `PATCH /users/@me/guilds/{id}/settings`.
+    pub(super) fn set_space_view(
+        &self,
+        guild: &str,
+        show_all: Option<bool>,
+        hide_muted: Option<bool>,
+    ) -> Result<(), Refusal> {
+        let existing_flags = {
+            let state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get(guild) else {
+                return Err(refused("This server is gone."));
+            };
+            info.quiet.raw_flags
+        };
+        if show_all.is_none() && hide_muted.is_none() {
+            return Ok(());
+        }
+        let body = space_view_body(existing_flags, show_all, hide_muted);
+        let path = format!("/users/@me/guilds/{guild}/settings");
+        let answer = self.call("PATCH", &path, Some(body)).map_err(refusal)?;
+        match serde_json::from_str::<GuildSettings>(&answer) {
+            Ok(settings) if settings.guild_id.as_deref() == Some(guild) => {
+                self.settings_changed(settings).map_err(|failed| match failed {
+                    super::Failure::SignedOut(why) | super::Failure::Dropped(why) => refused(why),
+                })
+            }
+            _ => {
+                {
+                    let mut state = crate::hub::lock(&self.state);
+                    if let Some(info) = state.guilds.get_mut(guild) {
+                        if let Some(show_all) = show_all {
+                            info.quiet.opt_in = !show_all;
+                            info.quiet.raw_flags = if show_all {
+                                existing_flags & !model::OPT_IN_CHANNELS_ON
+                            } else {
+                                existing_flags | model::OPT_IN_CHANNELS_ON
+                            };
+                        }
+                        if let Some(hide_muted) = hide_muted {
+                            info.quiet.hide_muted = hide_muted;
+                        }
+                    }
+                }
+                self.replant(guild).map_err(refused)
+            }
+        }
+    }
+
+    /// Lists every viewable channel in a Discord server for "Browse Channels", fetching the
+    /// server's onboarding default channels (`GET /guilds/{id}/onboarding`) once per session so
+    /// the hidden set matches Discord's.
+    pub(super) fn browse_channels(
+        &self,
+        guild: &str,
+        query: &str,
+        limit: u32,
+    ) -> Result<super::super::BrowsedPage, Refusal> {
+        let need_onboarding = {
+            let mut state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get_mut(guild) else {
+                return Err(refused("This server is gone."));
+            };
+            let need = !info.onboarding_fetched;
+            info.onboarding_fetched = true;
+            need
+        };
+        if need_onboarding {
+            if let Ok(answer) = self.call("GET", &format!("/guilds/{guild}/onboarding"), None) {
+                if let Ok(onboarding) = serde_json::from_str::<model::Onboarding>(&answer) {
+                    let changed = {
+                        let mut state = crate::hub::lock(&self.state);
+                        if let Some(info) = state.guilds.get_mut(guild) {
+                            let next: std::collections::HashSet<String> =
+                                onboarding.default_channel_ids.into_iter().collect();
+                            let diff = info.onboarding_defaults != next;
+                            info.onboarding_defaults = next;
+                            diff
+                        } else {
+                            false
+                        }
+                    };
+                    if changed {
+                        let _ = self.replant(guild);
+                    }
+                }
+            }
+        }
+        let kept: Vec<model::Kept> = self
+            .ctx
+            .note(&format!("kept:{guild}"))
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        let needle = query.trim().to_lowercase();
+        let me = self.me();
+        let state = crate::hub::lock(&self.state);
+        let Some(info) = state.guilds.get(guild) else {
+            return Err(refused("This server is gone."));
+        };
+        let cap = if limit == 0 { 200 } else { limit as usize };
+        let mut channels = Vec::new();
+        for item in kept {
+            let ch = item.channel();
+            if ch.kind == model::CATEGORY || !info.can_view(guild, &me, &ch) {
+                continue;
+            }
+            let name = ch.name.clone().unwrap_or_else(|| "channel".to_owned());
+            let topic = ch.topic.clone().unwrap_or_default();
+            if !needle.is_empty()
+                && !name.to_lowercase().contains(&needle)
+                && !topic.to_lowercase().contains(&needle)
+            {
+                continue;
+            }
+            let opted_out = info
+                .quiet
+                .opted_out(&ch.id, ch.parent_id.as_deref(), &info.onboarding_defaults);
+            channels.push(protocol::BrowsedChannel {
+                key: self.ctx.key(&ch.id),
+                name,
+                topic,
+                members: 0,
+                joined: !opted_out,
+                private: info.private(guild, &ch),
+                archived: false,
+            });
+            if channels.len() >= cap {
+                break;
+            }
+        }
+        Ok(super::super::BrowsedPage { channels, cursor: None })
+    }
+
     /// Leaves a group DM (`close` false) or closes a DM as Discord's × does (`close` true). Both
     /// are one `DELETE` of the channel; a server's channel is neither. The row goes, as it does
     /// in Discord; a closed DM comes back with its next message.
-    pub(super) fn leave(&self, channel: &str, close: bool) -> Result<(), Refusal> {
+    pub(super) fn leave(&self, channel: &str, close: bool, silent: bool) -> Result<(), Refusal> {
         let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
         let path = match (known.kind, close) {
             (ConversationKind::Direct, true) => format!("/channels/{channel}"),
-            (ConversationKind::Group, false) => format!("/channels/{channel}?silent=false"),
+            (ConversationKind::Group, false) => format!("/channels/{channel}?silent={silent}"),
             (_, true) => return Err(refused("Only a direct message can be closed.")),
             (_, false) => return Err(refused("Leave servers and their channels in Discord.")),
         };
@@ -286,9 +1922,182 @@ impl Discord {
         {
             let mut state = crate::hub::lock(&self.state);
             state.privates.remove(channel);
+            state.groups.remove(channel);
             state.directs.retain(|_, id| id != channel);
         }
         self.ctx.conversation_gone(channel).map_err(refused)
+    }
+
+    /// Renames a group DM (`PATCH /channels/{channel}` with `{"name": ...}`).
+    pub(super) fn update_group(&self, channel: &str, title: Option<&str>) -> Result<(), Refusal> {
+        let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
+        if known.kind != ConversationKind::Group {
+            return Err(Refusal::Unsupported);
+        }
+        let Some(raw) = title else {
+            return Err(Refusal::Unsupported);
+        };
+        let name: String = raw.trim().chars().take(100).collect();
+        if name.is_empty() {
+            return Err(refused("A group name cannot be empty."));
+        }
+        let answer = self
+            .call("PATCH", &format!("/channels/{channel}"), Some(json!({ "name": name })))
+            .map_err(refusal)?;
+        if let Ok(updated) = serde_json::from_str::<model::Channel>(&answer) {
+            self.direct(&updated, &HashMap::new()).map_err(refused)?;
+        } else {
+            if let Some(group) = crate::hub::lock(&self.state).groups.get_mut(channel) {
+                group.named = true;
+            }
+            self.ctx.conversation(&super::renamed(&known, &name)).map_err(refused)?;
+        }
+        self.ctx.info_stale(channel);
+        Ok(())
+    }
+
+    /// Sets or clears a group DM's icon (`PATCH /channels/{channel}` with a `data:image/...;base64,...`
+    /// URI, or `{"icon": null}` when `path` is empty).
+    pub(super) fn set_group_icon(&self, channel: &str, path: &str) -> Result<(), Refusal> {
+        let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
+        if known.kind != ConversationKind::Group {
+            return Err(Refusal::Unsupported);
+        }
+        let icon_val = if path.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            let file_path = std::path::Path::new(path);
+            let ext = file_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let mime = match ext.as_str() {
+                "png" => "image/png",
+                "jpg" | "jpeg" => "image/jpeg",
+                "gif" => "image/gif",
+                "webp" => "image/webp",
+                _ => return Err(refused("Choose a PNG, JPEG, GIF or WebP image.")),
+            };
+            let len = std::fs::metadata(file_path)
+                .map_err(|err| refused(format!("Could not read picture: {err}")))?
+                .len();
+            if len == 0 || len > 10 * 1024 * 1024 {
+                return Err(refused("Choose an image under 10 MB."));
+            }
+            let bytes = std::fs::read(file_path).map_err(|err| refused(format!("Could not read picture: {err}")))?;
+            if !image_magic(&ext, &bytes) {
+                return Err(refused("Choose a PNG, JPEG, GIF or WebP image."));
+            }
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            serde_json::Value::String(format!("data:{mime};base64,{encoded}"))
+        };
+        let answer = self
+            .call("PATCH", &format!("/channels/{channel}"), Some(json!({ "icon": icon_val })))
+            .map_err(refusal)?;
+        if let Ok(updated) = serde_json::from_str::<model::Channel>(&answer) {
+            self.direct(&updated, &HashMap::new()).map_err(refused)?;
+        }
+        self.ctx.info_stale(channel);
+        Ok(())
+    }
+
+    /// Removes a person from a group DM (`DELETE /channels/{channel}/recipients/{person}`).
+    /// Owner-only on Discord; non-owners are refused locally before calling Discord.
+    pub(super) fn remove_from_group(&self, channel: &str, person: &str) -> Result<(), Refusal> {
+        let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
+        if known.kind != ConversationKind::Group {
+            return Err(Refusal::Unsupported);
+        }
+        {
+            let state = crate::hub::lock(&self.state);
+            let Some(group) = state.groups.get(channel) else {
+                return Err(refused("This group is gone."));
+            };
+            if group.owner != state.me {
+                return Err(refused("Only the group owner can remove people."));
+            }
+            if person == state.me {
+                return Err(refused("Use Leave group to leave this conversation."));
+            }
+        }
+        self.call("DELETE", &format!("/channels/{channel}/recipients/{person}"), None)
+            .map_err(refusal)?;
+        let title = {
+            let mut state = crate::hub::lock(&self.state);
+            if let Some(group) = state.groups.get_mut(channel) {
+                group.recipients.retain(|id| id != person);
+                let named = group.named;
+                let recs = group.recipients.clone();
+                (!named).then(|| {
+                    recs.iter()
+                        .filter_map(|id| state.users.get(id).map(String::as_str))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+            } else {
+                None
+            }
+        };
+        if let Some(title) = title.filter(|t| !t.is_empty()) {
+            if let Ok(Some(current)) = self.ctx.known(channel) {
+                let _ = self.ctx.conversation(&super::renamed(&current, &title));
+            }
+        }
+        self.ctx.info_stale(channel);
+        self.ctx.members_changed(channel);
+        Ok(())
+    }
+
+    /// Transfers group DM ownership to another member (`PATCH /channels/{channel}` with `{"owner": person}`).
+    /// Owner-only on Discord; non-owners and non-members are refused locally.
+    pub(super) fn transfer_group_owner(&self, channel: &str, person: &str) -> Result<(), Refusal> {
+        let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
+        if known.kind != ConversationKind::Group {
+            return Err(Refusal::Unsupported);
+        }
+        {
+            let state = crate::hub::lock(&self.state);
+            let Some(group) = state.groups.get(channel) else {
+                return Err(refused("This group is gone."));
+            };
+            if group.owner != state.me {
+                return Err(refused("Only the group owner can transfer ownership."));
+            }
+            if person == state.me || !group.recipients.iter().any(|id| id == person) {
+                return Err(refused("Choose another member of this group to make owner."));
+            }
+        }
+        let answer = self
+            .call("PATCH", &format!("/channels/{channel}"), Some(json!({ "owner": person })))
+            .map_err(refusal)?;
+        if let Some(group) = crate::hub::lock(&self.state).groups.get_mut(channel) {
+            group.owner = person.to_owned();
+        }
+        if let Ok(updated) = serde_json::from_str::<model::Channel>(&answer) {
+            self.direct(&updated, &HashMap::new()).map_err(refused)?;
+        } else {
+            let mut row = super::renamed(&known, &known.title);
+            row.rights.remove_members = false;
+            self.ctx.conversation(&row).map_err(refused)?;
+        }
+        self.ctx.info_stale(channel);
+        self.ctx.members_changed(channel);
+        Ok(())
+    }
+
+    /// Writes or clears the user's private note on `person` (`PUT /users/@me/notes/{person}`).
+    /// Refuses notes longer than 256 characters locally before hitting Discord.
+    pub(super) fn set_note(&self, person: &str, text: &str) -> Result<(), Refusal> {
+        if text.chars().count() > NOTE_MAX_CHARS {
+            return Err(refused(format!("Discord notes can be at most {NOTE_MAX_CHARS} characters.")));
+        }
+        self.call("PUT", &format!("/users/@me/notes/{person}"), Some(json!({ "note": text })))
+            .map_err(refusal)?;
+        crate::hub::lock(&self.state).notes.insert(person.to_owned(), text.to_owned());
+        // The open card already has this text. Patch the cache; do not refetch the profile.
+        self.ctx.patch_profile_note(person, text);
+        Ok(())
     }
 
     /// Leaves a Discord server (`DELETE /users/@me/guilds/{guild}` with `{"lurking": false}`).
@@ -317,6 +2126,917 @@ impl Discord {
             state.guilds.remove(guild);
         }
         self.spaces().map_err(refused)
+    }
+
+    /// Lists scheduled and active events for a Discord server (`GET /guilds/{guild}/scheduled-events?with_user_count=true`).
+    pub(super) fn events(&self, guild: &str) -> Result<Vec<protocol::SpaceEvent>, Refusal> {
+        if !crate::hub::lock(&self.state).guilds.contains_key(guild) {
+            return Err(refused("This server is gone."));
+        }
+        let answer = self
+            .call("GET", &format!("/guilds/{guild}/scheduled-events?with_user_count=true"), None)
+            .map_err(refusal)?;
+        let fetched: Vec<model::ScheduledEvent> = serde_json::from_str(&answer).map_err(refused)?;
+        let mut covers = Vec::new();
+        let stored_list: Vec<super::StoredEvent> = {
+            let mut state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get_mut(guild) else {
+                return Err(refused("This server is gone."));
+            };
+            let prev_interest: std::collections::HashMap<String, bool> = info
+                .events
+                .iter()
+                .map(|(id, stored)| (id.clone(), stored.interested))
+                .collect();
+            info.events.clear();
+            for mut ev in fetched {
+                if !matches!(ev.status, 1 | 2) {
+                    continue;
+                }
+                if ev.guild_id.is_empty() {
+                    ev.guild_id = guild.to_owned();
+                }
+                if let Some(hash) = ev.image.as_deref().filter(|h| !h.is_empty()) {
+                    covers.push(model::event_cover(&ev.id, hash));
+                }
+                let interested = prev_interest.get(&ev.id).copied().unwrap_or(false);
+                info.events.insert(ev.id.clone(), super::StoredEvent { event: ev, interested });
+            }
+            info.events.values().cloned().collect()
+        };
+        if !covers.is_empty() {
+            let _ = self.ctx.media(&covers);
+        }
+        let space_key = self.ctx.key(guild);
+        let mut out: Vec<protocol::SpaceEvent> = stored_list
+            .into_iter()
+            .map(|stored| {
+                let ev = stored.event;
+                let place_kind = match ev.entity_type {
+                    1 => protocol::EventPlaceKind::Stage,
+                    3 => protocol::EventPlaceKind::External,
+                    _ => protocol::EventPlaceKind::Voice,
+                };
+                let conversation = ev.channel_id.as_deref().filter(|s| !s.is_empty()).map(|id| self.ctx.key(id));
+                let place = match place_kind {
+                    protocol::EventPlaceKind::External => ev
+                        .entity_metadata
+                        .as_ref()
+                        .and_then(|m| m.location.clone())
+                        .unwrap_or_default(),
+                    protocol::EventPlaceKind::Voice | protocol::EventPlaceKind::Stage => ev
+                        .channel_id
+                        .as_deref()
+                        .and_then(|ch| self.ctx.known(ch).ok().flatten())
+                        .map(|row| row.title)
+                        .unwrap_or_default(),
+                };
+                let status = match ev.status {
+                    2 => protocol::EventStatus::Active,
+                    3 => protocol::EventStatus::Completed,
+                    4 => protocol::EventStatus::Canceled,
+                    _ => protocol::EventStatus::Scheduled,
+                };
+                let cover = ev
+                    .image
+                    .as_deref()
+                    .filter(|h| !h.is_empty())
+                    .map(|h| model::event_cover(&ev.id, h).0);
+                protocol::SpaceEvent {
+                    key: self.ctx.key(&ev.id),
+                    space: space_key.clone(),
+                    name: ev.name,
+                    description: ev.description.unwrap_or_default(),
+                    start: ev.scheduled_start_time.as_deref().and_then(model::iso_seconds).unwrap_or(0),
+                    end: ev.scheduled_end_time.as_deref().and_then(model::iso_seconds),
+                    place_kind,
+                    place,
+                    conversation,
+                    status,
+                    interested: stored.interested,
+                    count: ev.user_count.unwrap_or(0),
+                    cover,
+                }
+            })
+            .collect();
+        out.sort_by_key(|ev| (ev.status != protocol::EventStatus::Active, ev.start, ev.key.id.clone()));
+        Ok(out)
+    }
+
+    /// Marks (`on: true`) or unmarks (`on: false`) ourselves as interested in a server's scheduled event.
+    pub(super) fn event_interest(&self, guild: &str, event_id: &str, on: bool) -> Result<(), Refusal> {
+        if !crate::hub::lock(&self.state).guilds.contains_key(guild) {
+            return Err(refused("This server is gone."));
+        }
+        let method = if on { "PUT" } else { "DELETE" };
+        let path = format!("/guilds/{guild}/scheduled-events/{event_id}/users/@me");
+        self.call(method, &path, None).map_err(refusal)?;
+        {
+            let mut state = crate::hub::lock(&self.state);
+            if let Some(stored) = state
+                .guilds
+                .get_mut(guild)
+                .and_then(|info| info.events.get_mut(event_id))
+            {
+                let was = stored.interested;
+                stored.interested = on;
+                if was != on {
+                    let count = stored.event.user_count.unwrap_or(0);
+                    stored.event.user_count = Some(if on { count.saturating_add(1) } else { count.saturating_sub(1) });
+                }
+            }
+        }
+        self.ctx.events_changed(guild);
+        Ok(())
+    }
+
+    fn space_event_of(&self, guild: &str, ev: model::ScheduledEvent, interested: bool) -> protocol::SpaceEvent {
+        let place_kind = match ev.entity_type {
+            1 => protocol::EventPlaceKind::Stage,
+            3 => protocol::EventPlaceKind::External,
+            _ => protocol::EventPlaceKind::Voice,
+        };
+        let conversation = ev.channel_id.as_deref().filter(|s| !s.is_empty()).map(|id| self.ctx.key(id));
+        let place = match place_kind {
+            protocol::EventPlaceKind::External => ev
+                .entity_metadata
+                .as_ref()
+                .and_then(|m| m.location.clone())
+                .unwrap_or_default(),
+            protocol::EventPlaceKind::Voice | protocol::EventPlaceKind::Stage => ev
+                .channel_id
+                .as_deref()
+                .and_then(|ch| self.ctx.known(ch).ok().flatten())
+                .map(|row| row.title)
+                .unwrap_or_default(),
+        };
+        let status = match ev.status {
+            2 => protocol::EventStatus::Active,
+            3 => protocol::EventStatus::Completed,
+            4 => protocol::EventStatus::Canceled,
+            _ => protocol::EventStatus::Scheduled,
+        };
+        let cover = ev
+            .image
+            .as_deref()
+            .filter(|h| !h.is_empty())
+            .map(|h| model::event_cover(&ev.id, h).0);
+        protocol::SpaceEvent {
+            key: self.ctx.key(&ev.id),
+            space: self.ctx.key(guild),
+            name: ev.name,
+            description: ev.description.unwrap_or_default(),
+            start: ev.scheduled_start_time.as_deref().and_then(model::iso_seconds).unwrap_or(0),
+            end: ev.scheduled_end_time.as_deref().and_then(model::iso_seconds),
+            place_kind,
+            place,
+            conversation,
+            status,
+            interested,
+            count: ev.user_count.unwrap_or(0),
+            cover,
+        }
+    }
+
+    /// Edits a Discord server's overview settings (`PATCH /guilds/{guild}`).
+    /// Checks `MANAGE_GUILD` locally before hitting Discord.
+    pub(super) fn edit_space(&self, guild: &str, edit: &protocol::SpaceEdit) -> Result<(), Refusal> {
+        {
+            let state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get(guild) else {
+                return Err(refused("This server is gone."));
+            };
+            if !info.space_rights(guild, now()).manage_space {
+                return Err(refused("You need the Manage Server permission to edit server settings."));
+            }
+        }
+        let mut body = serde_json::Map::new();
+        if let Some(name) = &edit.name {
+            let trimmed = name.trim();
+            if !(2..=100).contains(&trimmed.chars().count()) {
+                return Err(refused("Server name must be between 2 and 100 characters."));
+            }
+            body.insert("name".into(), json!(trimmed));
+        }
+        if let Some(desc) = &edit.description {
+            let trimmed = desc.trim();
+            if trimmed.chars().count() > 120 {
+                return Err(refused("Server description can be at most 120 characters."));
+            }
+            body.insert(
+                "description".into(),
+                if trimmed.is_empty() { serde_json::Value::Null } else { json!(trimmed) },
+            );
+        }
+        if let Some(icon) = &edit.icon {
+            let trimmed = icon.trim();
+            if trimmed.is_empty() {
+                body.insert("icon".into(), serde_json::Value::Null);
+            } else {
+                let uri = super::read_image_data_uri(trimmed, super::DISCORD_IMAGE_MAX)?;
+                body.insert("icon".into(), json!(uri));
+            }
+        }
+        if let Some(banner) = &edit.banner {
+            let trimmed = banner.trim();
+            if trimmed.is_empty() {
+                body.insert("banner".into(), serde_json::Value::Null);
+            } else {
+                let uri = super::read_image_data_uri(trimmed, super::DISCORD_IMAGE_MAX)?;
+                body.insert("banner".into(), json!(uri));
+            }
+        }
+        if let Some(sys) = &edit.system_channel_id {
+            let trimmed = sys.trim();
+            body.insert(
+                "system_channel_id".into(),
+                if trimmed.is_empty() { serde_json::Value::Null } else { json!(trimmed) },
+            );
+        }
+        if let Some(afk) = &edit.afk_channel_id {
+            let trimmed = afk.trim();
+            body.insert(
+                "afk_channel_id".into(),
+                if trimmed.is_empty() { serde_json::Value::Null } else { json!(trimmed) },
+            );
+        }
+        if let Some(timeout) = edit.afk_timeout {
+            if !matches!(timeout, 60 | 300 | 900 | 1800 | 3600) {
+                return Err(refused("AFK timeout must be 1, 5, 15, 30, or 60 minutes."));
+            }
+            body.insert("afk_timeout".into(), json!(timeout));
+        }
+        if let Some(notify) = edit.default_notify {
+            let level = match notify {
+                Notify::All => 0u8,
+                Notify::Mentions | Notify::Nothing => 1u8,
+            };
+            body.insert("default_message_notifications".into(), json!(level));
+        }
+        if body.is_empty() {
+            return Ok(());
+        }
+        let raw = self
+            .call("PATCH", &format!("/guilds/{guild}"), Some(serde_json::Value::Object(body)))
+            .map_err(refusal)?;
+        if let Ok(updated) = serde_json::from_str::<model::Guild>(&raw) {
+            let mut state = crate::hub::lock(&self.state);
+            if let Some(info) = state.guilds.get_mut(guild) {
+                if updated.name.is_some() {
+                    info.name = updated.name().to_owned();
+                }
+                if edit.icon.is_some() {
+                    info.icon = updated.icon().map(str::to_owned);
+                }
+                if edit.banner.is_some() {
+                    info.banner = updated.banner().map(str::to_owned);
+                }
+                if edit.description.is_some() {
+                    info.description = updated.description().unwrap_or_default().to_owned();
+                }
+                if edit.system_channel_id.is_some() {
+                    info.system_channel_id = updated.system_channel_id().map(str::to_owned);
+                }
+                if edit.afk_channel_id.is_some() {
+                    info.afk_channel_id = updated.afk_channel_id().map(str::to_owned);
+                }
+                if let Some(t) = updated.afk_timeout() {
+                    info.afk_timeout = t;
+                }
+                if let Some(n) = updated.default_message_notifications() {
+                    info.default_message_notifications = n;
+                }
+            }
+        }
+        self.ctx.space_info_stale(guild);
+        self.spaces().map_err(refused)
+    }
+
+    /// Deletes a Discord server we own (`POST /guilds/{guild}/delete`).
+    pub(super) fn delete_space(&self, guild: &str, mfa_code: Option<&str>) -> Result<(), Refusal> {
+        {
+            let state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get(guild) else {
+                return Err(refused("This server is gone."));
+            };
+            if !info.owner {
+                return Err(refused("Only the server owner can delete this server."));
+            }
+        }
+        let code = mfa_code.map(str::trim).filter(|c| !c.is_empty());
+        let body = match code {
+            Some(c) => json!({"code": c}),
+            None => json!({}),
+        };
+        let path = format!("/guilds/{guild}/delete");
+        self.rest
+            .call_once_with("POST", &path, Some(body), &[])
+            .map_err(|err| sensitive_guild_refusal(err, "delete this server"))?;
+        {
+            let mut state = crate::hub::lock(&self.state);
+            state.voice.states.retain(|_, voice| voice.guild.as_deref() != Some(guild));
+            if state.members.on_screen.as_deref() == Some(guild) {
+                state.members = Default::default();
+            }
+            state.guilds.remove(guild);
+        }
+        self.spaces().map_err(refused)
+    }
+
+    /// Transfers ownership of a Discord server we own (`PATCH /guilds/{guild}` with `owner_id`).
+    pub(super) fn transfer_space(
+        &self,
+        guild: &str,
+        new_owner_id: &str,
+        mfa_code: Option<&str>,
+    ) -> Result<(), Refusal> {
+        let new_owner_id = new_owner_id.trim();
+        if new_owner_id.is_empty() {
+            return Err(refused("Choose a member to transfer ownership to."));
+        }
+        {
+            let state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get(guild) else {
+                return Err(refused("This server is gone."));
+            };
+            if !info.owner {
+                return Err(refused("Only the server owner can transfer ownership."));
+            }
+            if new_owner_id == state.me {
+                return Err(refused("You already own this server."));
+            }
+        }
+        let mut body = json!({"owner_id": new_owner_id});
+        if let Some(code) = mfa_code.map(str::trim).filter(|c| !c.is_empty()) {
+            body["code"] = json!(code);
+        }
+        let path = format!("/guilds/{guild}");
+        self.rest
+            .call_once_with("PATCH", &path, Some(body), &[])
+            .map_err(|err| sensitive_guild_refusal(err, "transfer ownership"))?;
+        {
+            let mut state = crate::hub::lock(&self.state);
+            if let Some(info) = state.guilds.get_mut(guild) {
+                info.owner = false;
+            }
+        }
+        self.ctx.space_info_stale(guild);
+        self.spaces().map_err(refused)
+    }
+
+    /// Creates a scheduled event (`POST /guilds/{guild}/scheduled-events`).
+    pub(super) fn create_event(
+        &self,
+        guild: &str,
+        edit: &protocol::SpaceEventEdit,
+    ) -> Result<protocol::SpaceEvent, Refusal> {
+        {
+            let state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get(guild) else {
+                return Err(refused("This server is gone."));
+            };
+            if !info.space_rights(guild, now()).manage_events {
+                return Err(refused("You need the Manage Events permission to create events."));
+            }
+        }
+        let body = build_event_body(edit)?;
+        let raw = self
+            .call("POST", &format!("/guilds/{guild}/scheduled-events"), Some(body))
+            .map_err(refusal)?;
+        let mut ev: model::ScheduledEvent = serde_json::from_str(&raw).map_err(refused)?;
+        if ev.guild_id.is_empty() {
+            ev.guild_id = guild.to_owned();
+        }
+        if let Some(hash) = ev.image.as_deref().filter(|h| !h.is_empty()) {
+            let _ = self.ctx.media(&[model::event_cover(&ev.id, hash)]);
+        }
+        {
+            let mut state = crate::hub::lock(&self.state);
+            if let Some(info) = state.guilds.get_mut(guild) {
+                info.events.insert(ev.id.clone(), super::StoredEvent { event: ev.clone(), interested: true });
+            }
+        }
+        self.ctx.events_changed(guild);
+        Ok(self.space_event_of(guild, ev, true))
+    }
+
+    /// Edits a scheduled event (`PATCH /guilds/{guild}/scheduled-events/{event_id}`).
+    pub(super) fn edit_event(
+        &self,
+        guild: &str,
+        event_id: &str,
+        edit: &protocol::SpaceEventEdit,
+    ) -> Result<protocol::SpaceEvent, Refusal> {
+        {
+            let state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get(guild) else {
+                return Err(refused("This server is gone."));
+            };
+            if !info.space_rights(guild, now()).manage_events {
+                return Err(refused("You need the Manage Events permission to edit events."));
+            }
+        }
+        let body = build_event_body(edit)?;
+        let raw = self
+            .call("PATCH", &format!("/guilds/{guild}/scheduled-events/{event_id}"), Some(body))
+            .map_err(refusal)?;
+        let mut ev: model::ScheduledEvent = serde_json::from_str(&raw).map_err(refused)?;
+        if ev.guild_id.is_empty() {
+            ev.guild_id = guild.to_owned();
+        }
+        if let Some(hash) = ev.image.as_deref().filter(|h| !h.is_empty()) {
+            let _ = self.ctx.media(&[model::event_cover(&ev.id, hash)]);
+        }
+        let interested = {
+            let mut state = crate::hub::lock(&self.state);
+            if let Some(info) = state.guilds.get_mut(guild) {
+                let was = info.events.get(&ev.id).is_some_and(|s| s.interested);
+                info.events.insert(ev.id.clone(), super::StoredEvent { event: ev.clone(), interested: was });
+                was
+            } else {
+                false
+            }
+        };
+        self.ctx.events_changed(guild);
+        Ok(self.space_event_of(guild, ev, interested))
+    }
+
+    /// Deletes or cancels a scheduled event (`DELETE /guilds/{guild}/scheduled-events/{event_id}`).
+    pub(super) fn delete_event(&self, guild: &str, event_id: &str) -> Result<(), Refusal> {
+        {
+            let state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get(guild) else {
+                return Err(refused("This server is gone."));
+            };
+            if !info.space_rights(guild, now()).manage_events {
+                return Err(refused("You need the Manage Events permission to delete events."));
+            }
+        }
+        self.call("DELETE", &format!("/guilds/{guild}/scheduled-events/{event_id}"), None)
+            .map_err(refusal)?;
+        {
+            let mut state = crate::hub::lock(&self.state);
+            if let Some(info) = state.guilds.get_mut(guild) {
+                info.events.remove(event_id);
+            }
+        }
+        self.ctx.events_changed(guild);
+        Ok(())
+    }
+
+    /// Lists a Discord server's active invites (`GET /guilds/{guild}/invites`), prepending the
+    /// server's read-only vanity URL when present, along with the `INVITES_DISABLED` pause flag.
+    pub(super) fn space_invites(&self, guild: &str) -> Result<(Vec<protocol::SpaceInvite>, bool), Refusal> {
+        let (vanity_known, has_vanity_feature, paused) = {
+            let state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get(guild) else {
+                return Err(refused("This server is gone."));
+            };
+            if !info.space_rights(guild, now()).manage_space {
+                return Err(refused("You need the Manage Server permission to view server invites."));
+            }
+            (
+                info.vanity_url_code.clone(),
+                info.features.iter().any(|f| f == "VANITY_URL"),
+                info.features.iter().any(|f| f == "INVITES_DISABLED"),
+            )
+        };
+
+        #[derive(Deserialize)]
+        struct InviteChannel {
+            #[serde(default)]
+            id: String,
+            #[serde(default)]
+            name: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct GuildInviteRow {
+            code: String,
+            #[serde(default)]
+            inviter: Option<model::User>,
+            #[serde(default)]
+            channel: Option<InviteChannel>,
+            #[serde(default)]
+            uses: u32,
+            #[serde(default)]
+            max_uses: u32,
+            #[serde(default)]
+            expires_at: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct VanityResponse {
+            #[serde(default)]
+            code: Option<String>,
+            #[serde(default)]
+            uses: u32,
+        }
+
+        let answer = self.call("GET", &format!("/guilds/{guild}/invites"), None).map_err(refusal)?;
+        let rows: Vec<GuildInviteRow> = serde_json::from_str(&answer).map_err(refused)?;
+
+        let mut invites = Vec::with_capacity(rows.len() + 1);
+        let vanity_pair: Option<(String, u32)> = if let Some(code) = vanity_known.filter(|c| !c.is_empty()) {
+            Some((code, 0))
+        } else if has_vanity_feature {
+            self.call("GET", &format!("/guilds/{guild}/vanity-url"), None)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<VanityResponse>(&raw).ok())
+                .and_then(|v| v.code.filter(|c| !c.is_empty()).map(|c| (c, v.uses)))
+        } else {
+            None
+        };
+        if let Some((code, uses)) = vanity_pair {
+            invites.push(protocol::SpaceInvite {
+                url: format!("https://discord.gg/{code}"),
+                code,
+                inviter: String::new(),
+                channel_id: None,
+                channel_name: String::new(),
+                uses,
+                max_uses: 0,
+                expires_at: None,
+                vanity: true,
+            });
+        }
+
+        for row in rows {
+            let (channel_id, channel_name) = match row.channel {
+                Some(ch) => (
+                    (!ch.id.is_empty()).then_some(ch.id),
+                    ch.name.unwrap_or_default(),
+                ),
+                None => (None, String::new()),
+            };
+            invites.push(protocol::SpaceInvite {
+                url: format!("https://discord.gg/{}", row.code),
+                code: row.code,
+                inviter: row.inviter.map(|u| u.name().to_owned()).unwrap_or_default(),
+                channel_id,
+                channel_name,
+                uses: row.uses,
+                max_uses: row.max_uses,
+                expires_at: row.expires_at.as_deref().and_then(model::iso_seconds),
+                vanity: false,
+            });
+        }
+        Ok((invites, paused))
+    }
+
+    /// Revokes one invite link (`DELETE /invites/{code}`). Refuses locally without `MANAGE_GUILD`
+    /// or if the code matches the server's vanity URL.
+    pub(super) fn revoke_invite(&self, guild: &str, code: &str) -> Result<(), Refusal> {
+        let code = code.trim();
+        if code.is_empty() {
+            return Err(refused("Missing invite code."));
+        }
+        {
+            let state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get(guild) else {
+                return Err(refused("This server is gone."));
+            };
+            if !info.space_rights(guild, now()).manage_space {
+                return Err(refused("You need the Manage Server permission to revoke invites."));
+            }
+            if info.vanity_url_code.as_deref() == Some(code) {
+                return Err(refused("The server's vanity URL cannot be revoked here."));
+            }
+        }
+        self.call("DELETE", &format!("/invites/{}", escaped(code)), None)
+            .map_err(refusal)?;
+        Ok(())
+    }
+
+    /// Pauses or resumes server invites by toggling Discord's `INVITES_DISABLED` guild feature.
+    pub(super) fn set_invites_paused(&self, guild: &str, paused: bool) -> Result<(), Refusal> {
+        let updated_features = {
+            let state = crate::hub::lock(&self.state);
+            let Some(info) = state.guilds.get(guild) else {
+                return Err(refused("This server is gone."));
+            };
+            if !info.space_rights(guild, now()).manage_space {
+                return Err(refused("You need the Manage Server permission to pause or resume invites."));
+            }
+            toggle_invites_disabled_feature(&info.features, paused)
+        };
+        let raw = self
+            .call("PATCH", &format!("/guilds/{guild}"), Some(json!({"features": updated_features})))
+            .map_err(refusal)?;
+        {
+            let mut state = crate::hub::lock(&self.state);
+            if let Some(info) = state.guilds.get_mut(guild) {
+                if let Ok(updated) = serde_json::from_str::<model::Guild>(&raw) {
+                    if !updated.features().is_empty() || !paused {
+                        info.features = updated.features().to_vec();
+                    } else {
+                        info.features = updated_features;
+                    }
+                } else {
+                    info.features = updated_features;
+                }
+            }
+        }
+        self.ctx.space_info_stale(guild);
+        Ok(())
+    }
+
+    fn role_gate(&self, guild: &str) -> Result<RoleGate, Refusal> {
+        let state = crate::hub::lock(&self.state);
+        let Some(info) = state.guilds.get(guild) else {
+            return Err(refused("This server is gone."));
+        };
+        let owner = info.owner;
+        Ok(RoleGate {
+            owner,
+            highest: highest_of(owner, info),
+            manage: info.space_rights(guild, now()).manage_roles,
+            actor: info.base_permissions(guild),
+            guild_num: number(guild),
+        })
+    }
+
+    fn role_view(&self, guild: &str, role_id: u64) -> Result<protocol::SpaceRole, Refusal> {
+        let state = crate::hub::lock(&self.state);
+        let info = state.guilds.get(guild).ok_or_else(|| refused("This server is gone."))?;
+        let role = info.roles.get(&role_id).ok_or_else(|| refused("Discord did not return the role."))?;
+        let owner = info.owner;
+        let highest = highest_of(owner, info);
+        Ok(space_role(number(guild), role_id, role, owner, highest))
+    }
+
+    fn apply_role(&self, guild: &str, raw: &str) -> Result<protocol::SpaceRole, Refusal> {
+        let role: model::Role = serde_json::from_str(raw).map_err(|_| refused("Discord did not return the role."))?;
+        let (id, _) = discord_id(&role.id, "Discord did not return the role.")?;
+        let _ = self.role_changed(guild, Some(role), None);
+        self.role_view(guild, id)
+    }
+
+    /// Roles already known from READY and later gateway events. Nothing is asked of Discord.
+    pub(super) fn roles(&self, guild: &str) -> Result<Vec<protocol::SpaceRole>, Refusal> {
+        let (_, guild) = discord_id(guild, "That server is not a Discord id.")?;
+        let state = crate::hub::lock(&self.state);
+        let Some(info) = state.guilds.get(&guild) else {
+            return Err(refused("This server is gone."));
+        };
+        if !info.space_rights(&guild, now()).manage_roles {
+            return Err(refused("You need the Manage Roles permission to view roles."));
+        }
+        let owner = info.owner;
+        let highest = highest_of(owner, info);
+        let guild_num = number(&guild);
+        let mut roles: Vec<protocol::SpaceRole> = info.roles.iter().map(|(id, role)| space_role(guild_num, *id, role, owner, highest)).collect();
+        drop(state);
+        roles.sort_by(|a, b| b.position.cmp(&a.position).then_with(|| a.id.cmp(&b.id)));
+        Ok(roles)
+    }
+
+    /// `POST /guilds/{id}/roles`. One click, so a 429 is not retried.
+    pub(super) fn create_role(&self, guild: &str, edit: &protocol::RoleEdit) -> Result<protocol::SpaceRole, Refusal> {
+        let (_, guild) = discord_id(guild, "That server is not a Discord id.")?;
+        let gate = self.role_gate(&guild)?;
+        if !gate.manage {
+            return Err(refused("You need the Manage Roles permission to create a role."));
+        }
+        role_name(edit.name.as_deref().unwrap_or(""))?;
+        let after = edit.permissions.unwrap_or(0);
+        if !may_grant(gate.actor, 0, after) {
+            return Err(refused("You can only grant permissions you have."));
+        }
+        confirm_admin(0, after, edit.confirm_admin)?;
+        let body = role_body(edit, true)?;
+        let raw = self
+            .rest
+            .call_once_with("POST", &format!("/guilds/{guild}/roles"), Some(serde_json::Value::Object(body)), &[])
+            .map_err(refusal)?;
+        self.apply_role(&guild, &raw)
+    }
+
+    /// `PATCH /guilds/{id}/roles/{role}`. Hierarchy, managed, and Administrator are refused first.
+    pub(super) fn edit_role(&self, guild: &str, role_id: &str, edit: &protocol::RoleEdit) -> Result<protocol::SpaceRole, Refusal> {
+        let (_, guild) = discord_id(guild, "That server is not a Discord id.")?;
+        let (role_num, role_id) = discord_id(role_id, "That role is not a Discord id.")?;
+        let gate = self.role_gate(&guild)?;
+        if !gate.manage {
+            return Err(refused("You need the Manage Roles permission to edit roles."));
+        }
+        let held = {
+            let state = crate::hub::lock(&self.state);
+            let info = state.guilds.get(&guild).ok_or_else(|| refused("This server is gone."))?;
+            let role = info.roles.get(&role_num).ok_or_else(|| refused("That role is not on this server."))?;
+            (role.name.clone(), role.permissions, role.managed, role.position)
+        };
+        let (name, before, managed, position) = held;
+        if managed {
+            return Err(refused("Managed roles cannot be edited."));
+        }
+        let (editable, _) = role_rights(gate.owner, gate.highest, gate.guild_num, role_num, position, false);
+        if !editable {
+            return Err(refused("That role is at or above your highest role, so you cannot edit it."));
+        }
+        let everyone = role_num == gate.guild_num;
+        if let Some(asked) = edit.name.as_deref() {
+            let asked = role_name(asked)?;
+            if everyone && asked != name {
+                return Err(refused("The everyone role cannot be renamed."));
+            }
+        }
+        let after = edit.permissions.unwrap_or(before);
+        if !may_grant(gate.actor, before, after) {
+            return Err(refused("You can only grant permissions you have."));
+        }
+        confirm_admin(before, after, edit.confirm_admin)?;
+        let body = role_body(edit, !everyone)?;
+        if body.is_empty() {
+            return self.role_view(&guild, role_num);
+        }
+        let raw = self
+            .rest
+            .call_once_with("PATCH", &format!("/guilds/{guild}/roles/{role_id}"), Some(serde_json::Value::Object(body)), &[])
+            .map_err(refusal)?;
+        self.apply_role(&guild, &raw)
+    }
+
+    /// `PATCH /guilds/{id}/roles` with the new order. An empty list changes nothing.
+    pub(super) fn move_roles(&self, guild: &str, roles: &[protocol::RoleMove]) -> Result<(), Refusal> {
+        let (_, guild) = discord_id(guild, "That server is not a Discord id.")?;
+        let gate = self.role_gate(&guild)?;
+        if !gate.manage {
+            return Err(refused("You need the Manage Roles permission to edit roles."));
+        }
+        if roles.is_empty() {
+            return Ok(());
+        }
+        let mut planned = Vec::with_capacity(roles.len());
+        for role in roles {
+            let (id, id_text) = discord_id(&role.id, "That role is not a Discord id.")?;
+            planned.push((id, id_text, role.position));
+        }
+        let payload = {
+            let state = crate::hub::lock(&self.state);
+            let info = state.guilds.get(&guild).ok_or_else(|| refused("This server is gone."))?;
+            let mut payload = Vec::with_capacity(planned.len());
+            for (id, id_text, position) in &planned {
+                if *id == gate.guild_num {
+                    return Err(refused("The everyone role cannot be moved."));
+                }
+                let Some(role) = info.roles.get(id) else {
+                    return Err(refused("That role is not on this server."));
+                };
+                if role.managed {
+                    return Err(refused("Managed roles cannot be moved."));
+                }
+                let (editable, _) = role_rights(gate.owner, gate.highest, gate.guild_num, *id, role.position, false);
+                if !editable {
+                    return Err(refused("That role is at or above your highest role, so you cannot move it."));
+                }
+                if *position <= 0 {
+                    return Err(refused("A role cannot move to the everyone position."));
+                }
+                if !gate.owner && *position >= gate.highest {
+                    return Err(refused("That position is at or above your highest role."));
+                }
+                payload.push(json!({"id": id_text, "position": position}));
+            }
+            payload
+        };
+        let raw = self
+            .rest
+            .call_once_with("PATCH", &format!("/guilds/{guild}/roles"), Some(json!(payload)), &[])
+            .map_err(refusal)?;
+        if let Ok(updated) = serde_json::from_str::<Vec<model::Role>>(&raw) {
+            for role in updated {
+                let _ = self.role_changed(&guild, Some(role), None);
+            }
+            return Ok(());
+        }
+        let mut state = crate::hub::lock(&self.state);
+        if let Some(info) = state.guilds.get_mut(&guild) {
+            for (id, _, position) in &planned {
+                if let Some(role) = info.roles.get_mut(id) {
+                    role.position = *position;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `DELETE /guilds/{id}/roles/{role}`.
+    pub(super) fn delete_role(&self, guild: &str, role_id: &str) -> Result<(), Refusal> {
+        let (_, guild) = discord_id(guild, "That server is not a Discord id.")?;
+        let (role_num, role_id) = discord_id(role_id, "That role is not a Discord id.")?;
+        let gate = self.role_gate(&guild)?;
+        if !gate.manage {
+            return Err(refused("You need the Manage Roles permission to edit roles."));
+        }
+        if role_num == gate.guild_num {
+            return Err(refused("The everyone role cannot be deleted."));
+        }
+        let (managed, position) = {
+            let state = crate::hub::lock(&self.state);
+            let info = state.guilds.get(&guild).ok_or_else(|| refused("This server is gone."))?;
+            let role = info.roles.get(&role_num).ok_or_else(|| refused("That role is not on this server."))?;
+            (role.managed, role.position)
+        };
+        if managed {
+            return Err(refused("Managed roles cannot be deleted."));
+        }
+        let (editable, _) = role_rights(gate.owner, gate.highest, gate.guild_num, role_num, position, false);
+        if !editable {
+            return Err(refused("That role is at or above your highest role, so you cannot delete it."));
+        }
+        self.rest.call_once_with("DELETE", &format!("/guilds/{guild}/roles/{role_id}"), None, &[]).map_err(refusal)?;
+        let _ = self.role_changed(&guild, None, Some(&role_id));
+        Ok(())
+    }
+
+    /// `PUT` and `DELETE /guilds/{id}/members/{user}/roles/{role}` for the difference from the
+    /// member Discord returns. Refusals happen before any of those writes.
+    pub(super) fn set_member_roles(&self, guild: &str, person: &str, desired: &[String]) -> Result<(), Refusal> {
+        let (_, guild) = discord_id(guild, "That server is not a Discord id.")?;
+        let (_, person) = discord_id(person, "That member is not a Discord id.")?;
+        let gate = self.role_gate(&guild)?;
+        if !gate.manage {
+            return Err(refused("You need the Manage Roles permission to change a member's roles."));
+        }
+        let mut wanted = Vec::new();
+        for raw in desired {
+            let (id, _) = discord_id(raw, "That role is not a Discord id.")?;
+            if id == gate.guild_num {
+                return Err(refused("The everyone role is assigned to every member."));
+            }
+            if !wanted.contains(&id) {
+                wanted.push(id);
+            }
+        }
+        let flags: Vec<(u64, bool)> = {
+            let state = crate::hub::lock(&self.state);
+            let info = state.guilds.get(&guild).ok_or_else(|| refused("This server is gone."))?;
+            info.roles
+                .iter()
+                .map(|(id, role)| {
+                    let (_, assignable) = role_rights(gate.owner, gate.highest, gate.guild_num, *id, role.position, role.managed);
+                    (*id, assignable)
+                })
+                .collect()
+        };
+        for id in &wanted {
+            if !flags.iter().any(|(known, _)| known == id) {
+                return Err(refused("That role is not on this server."));
+            }
+        }
+        let raw = self
+            .rest
+            .call_once_with("GET", &format!("/guilds/{guild}/members/{person}"), None, &[])
+            .map_err(refusal)?;
+        let member: model::Member = serde_json::from_str(&raw).map_err(refused)?;
+        let mut current = Vec::new();
+        for id in &member.roles {
+            match snowflake(id) {
+                Some(n) if n == gate.guild_num => {}
+                Some(n) => {
+                    if !current.contains(&n) {
+                        current.push(n);
+                    }
+                }
+                None => return Err(refused("That role is above yours or managed, so it stays.")),
+            }
+        }
+        let assignable = |id: &u64| flags.iter().find(|(known, _)| known == id).map(|(_, ok)| *ok).unwrap_or(false);
+        for id in &current {
+            if !wanted.contains(id) && !assignable(id) {
+                return Err(refused("That role is above yours or managed, so it stays."));
+            }
+        }
+        for id in &wanted {
+            if !current.contains(id) && !assignable(id) {
+                return Err(refused("That role cannot be assigned."));
+            }
+        }
+        let mut final_ids: Vec<String> = current.iter().map(u64::to_string).collect();
+        for id in &current {
+            if wanted.contains(id) {
+                continue;
+            }
+            let id_s = id.to_string();
+            self.rest
+                .call_once_with("DELETE", &format!("/guilds/{guild}/members/{person}/roles/{id_s}"), None, &[])
+                .map_err(refusal)?;
+            final_ids.retain(|kept| kept != &id_s);
+        }
+        for id in &wanted {
+            if current.contains(id) {
+                continue;
+            }
+            let id_s = id.to_string();
+            self.rest
+                .call_once_with("PUT", &format!("/guilds/{guild}/members/{person}/roles/{id_s}"), None, &[])
+                .map_err(refusal)?;
+            final_ids.push(id_s);
+        }
+        if person == self.me() {
+            let member = model::Member { user_id: Some(self.me()), roles: final_ids, ..model::Member::default() };
+            let _ = self.member_changed(&guild, &member);
+        }
+        Ok(())
     }
 
     /// The pinned messages, newest pin first, from the route the web client uses now; the older
@@ -351,7 +3071,8 @@ impl Discord {
         let guild = self.guild_of(&known);
         let has = match kind {
             SharedKind::Media => "has=image&has=video",
-            SharedKind::Files => "has=file",
+            SharedKind::Files | SharedKind::Music | SharedKind::Voice => "has=file",
+            SharedKind::Gifs => "has=image",
             SharedKind::Links => "has=link",
         };
         let wanted = limit.clamp(1, SEARCH_PAGE);
@@ -382,81 +3103,132 @@ impl Discord {
         })
     }
 
-    /// Runs a message search off the command thread, one at a time per account.
+    /// Runs a message search off the command thread, queued one at a time per account.
     pub(super) fn search_queued(
         discord: &Arc<Discord>,
         query: String,
         scope: SearchScope,
+        filters: SearchFilters,
+        cursor: Option<String>,
         at: Instant,
-        reply: Reply<super::super::SearchPage>,
+        reply: Reply<SearchPage>,
     ) {
         let searching = discord.clone();
         let run = move || {
-            let page = searching
-                .search_messages(&query, &scope, at)
-                .map(|hits| super::super::SearchPage { hits, cursor: None });
-            let _ = reply.send(page);
+            let _ = reply.send(searching.search_messages(&query, &scope, &filters, cursor.as_deref(), at).map(Into::into));
         };
         if let Err(err) = std::thread::Builder::new().name("discord-search".into()).spawn(run) {
             tracing::warn!("chatd: Discord: no thread for a search: {err}");
         }
     }
 
-    /// What the network itself finds for the pane's words, from Discord's own search: the
-    /// server's when a Space is the scope, the channel's when one conversation is. The hits
-    /// are mapped like the cache's, so the pane can merge the two lists and tell them apart.
-    pub(super) fn search_messages(&self, query: &str, scope: &SearchScope, at: Instant) -> Result<Vec<MessageHit>, Refusal> {
+    /// What the network itself finds for the pane's words and filters, from Discord's own search:
+    /// the server's when a Space is the scope, the channel's when one conversation is, or all DMs
+    /// (`/users/@me/messages/search`) for account scope. Paced requests queue and wait out the
+    /// remaining gap rather than refusing immediately.
+    pub(super) fn search_messages(
+        &self,
+        query: &str,
+        scope: &SearchScope,
+        filters: &SearchFilters,
+        cursor: Option<&str>,
+        at: Instant,
+    ) -> Result<SearchPage, Refusal> {
         if at.elapsed() >= super::SEARCH_PATIENCE {
             return Err(refused("That took too long. Try again."));
         }
         let capped: String = query.chars().take(SEARCH_MAX_CHARS).collect();
         let query = capped.trim();
-        let key = query.to_lowercase();
-        let path = match scope {
+        let (base, scope_channel, me) = match scope {
             SearchScope::Space(space) => {
-                // A Space's id is a guild's: one the account is in, as space_info checks.
-                if !crate::hub::lock(&self.state).guilds.contains_key(space) {
+                let state = crate::hub::lock(&self.state);
+                if !state.guilds.contains_key(space) {
                     return Err(refused("This server is gone."));
                 }
-                format!("/guilds/{space}/messages/search?content={}", escaped(query))
+                (format!("/guilds/{space}/messages/search"), None, state.me.clone())
             }
-            SearchScope::Account => return Err(Refusal::Unsupported),
+            // Home (the pane's "all direct messages") and the account scope are the same route.
+            SearchScope::Account | SearchScope::Home => {
+                let me = crate::hub::lock(&self.state).me.clone();
+                ("/users/@me/messages/search".to_owned(), None, me)
+            }
             SearchScope::Conversation(channel) => {
                 let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
+                let me = crate::hub::lock(&self.state).me.clone();
                 match self.guild_of(&known) {
-                    Some(guild) => {
-                        format!("/guilds/{guild}/messages/search?channel_id={channel}&content={}", escaped(query))
-                    }
-                    None => format!("/channels/{channel}/messages/search?content={}", escaped(query)),
+                    Some(guild) => (format!("/guilds/{guild}/messages/search"), Some(channel.as_str()), me),
+                    None => (format!("/channels/{channel}/messages/search"), None, me),
                 }
             }
         };
-        // One search in flight per account, and at least SEARCH_GAP after the previous finished:
-        // no client turns Enter into a burst against Discord's tight search limits.
+        let (path, offset) = build_search_path(&base, scope_channel, query, filters, cursor, &me);
+        let cache_key = path.to_lowercase();
         {
-            let mut search = crate::hub::lock(&self.message_search);
-            if let Some((_, _, hits)) = search.remembered.iter().find(|(s, q, _)| s == scope && *q == key) {
-                return Ok(hits.clone());
+            let search = crate::hub::lock(&self.message_search);
+            if let Some((_, _, page)) = search.remembered.iter().find(|(s, k, _)| s == scope && *k == cache_key) {
+                return Ok(page.clone());
             }
-            if search.in_flight || search.last.is_some_and(|last| last.elapsed() < super::members::SEARCH_GAP) {
-                return Err(refused("Discord search is paced. Try again in a moment."));
-            }
-            search.in_flight = true;
         }
-        let outcome = self.run_message_search(&path, query, scope);
+        // One search in flight per account, waiting out SEARCH_GAP between requests rather than
+        // refusing with an error.
+        let _turn = crate::hub::lock(&self.search_turn);
+        if at.elapsed() >= super::SEARCH_PATIENCE {
+            return Err(refused("That took too long. Try again."));
+        }
+        let wait = {
+            let search = crate::hub::lock(&self.message_search);
+            if let Some((_, _, page)) = search.remembered.iter().find(|(s, k, _)| s == scope && *k == cache_key) {
+                return Ok(page.clone());
+            }
+            search
+                .last
+                .map_or(Duration::ZERO, |last| super::members::SEARCH_GAP.saturating_sub(last.elapsed()))
+        };
+        if !wait.is_zero() {
+            if at.elapsed() + wait >= super::SEARCH_PATIENCE {
+                return Err(refused("That took too long. Try again."));
+            }
+            if self.ctx.pause(wait) {
+                return Err(refused("Stopped."));
+            }
+        }
+        let outcome = self.run_message_search(&path, query, scope, offset);
         let mut search = crate::hub::lock(&self.message_search);
-        search.in_flight = false;
         search.last = Some(Instant::now());
-        if let Ok(hits) = &outcome {
+        if let Ok(page) = &outcome {
             if search.remembered.len() >= REMEMBERED_SEARCHES {
                 search.remembered.pop_front();
             }
-            search.remembered.push_back((scope.clone(), key, hits.clone()));
+            search.remembered.push_back((scope.clone(), cache_key, page.clone()));
         }
         outcome
     }
 
-    fn run_message_search(&self, path: &str, query: &str, scope: &SearchScope) -> Result<Vec<MessageHit>, Refusal> {
+    /// A hit we may quote: the conversation is listed, we know it, and a server channel is one
+    /// this account can see. Home is direct messages only. Unknown channels are dropped before
+    /// their text is read.
+    fn quotable(&self, scope: &SearchScope, channel_id: &str) -> Option<protocol::Conversation> {
+        if !self.ctx.listable(channel_id) {
+            return None;
+        }
+        let known = self.ctx.known(channel_id).ok().flatten()?;
+        let guild = self.guild_of(&known);
+        if matches!(scope, SearchScope::Home) && guild.is_some() {
+            return None;
+        }
+        if let Some(guild) = guild.as_deref() {
+            let id = number(channel_id);
+            let seen = crate::hub::lock(&self.state).guilds.get(guild).is_some_and(|info| {
+                id != 0 && info.channels.iter().any(|(channel, _)| *channel == id)
+            });
+            if !seen {
+                return None;
+            }
+        }
+        Some(known)
+    }
+
+    fn run_message_search(&self, path: &str, query: &str, scope: &SearchScope, offset: u32) -> Result<SearchPage, Refusal> {
         let answer = self.call("GET", path, None).map_err(refusal)?;
         let found: Found = serde_json::from_str(&answer).map_err(refused)?;
         // A 202 with no hits: the index is still being built.
@@ -468,19 +3240,20 @@ impl Discord {
             SearchScope::Conversation(channel) => {
                 self.ctx.known(channel).ok().flatten().and_then(|known| self.guild_of(&known))
             }
-            SearchScope::Account => None,
+            SearchScope::Account | SearchScope::Home => None,
         };
+        let raw_count = hits.len();
         let mut found_hits = Vec::new();
         for posted in hits.iter().filter_map(|hit| hit.first()) {
-            // Hidden conversations and message requests stay out of it, as they stay out of
-            // the cache's own search.
-            if !self.ctx.listable(&posted.channel_id) {
+            // Hidden rows, message requests, and anything we cannot confirm the user can read
+            // stay out. The message text is not used until that check passes.
+            let Some(known) = self.quotable(scope, &posted.channel_id) else {
                 continue;
-            }
-            let known = self.ctx.known(&posted.channel_id).ok().flatten();
-            let kind = known.as_ref().map_or(ConversationKind::Channel, |row| row.kind);
-            let title = known.as_ref().map_or_else(String::new, |row| row.title.clone());
-            let space_title = known.as_ref().map_or_else(String::new, |row| row.space_title.clone());
+            };
+            let age_restricted = known.age_restricted;
+            let kind = known.kind;
+            let title = known.title.clone();
+            let space_title = known.space_title.clone();
             let (message, _) = self.convert(posted, space_id.as_deref(), kind);
             let text = if !message.text.is_empty() {
                 message.text
@@ -498,11 +3271,99 @@ impl Discord {
                 title,
                 space_title,
                 outgoing: message.outgoing,
+                age_restricted,
             });
         }
-        Ok(found_hits)
+        let next_offset = offset.saturating_add(SEARCH_PAGE);
+        let cursor = found
+            .total_results
+            .and_then(|total| (next_offset < total && raw_count > 0).then(|| next_offset.to_string()));
+        Ok(SearchPage {
+            hits: found_hits,
+            cursor,
+            total: found.total_results,
+        })
     }
 
+    /// Recent mentions from before tinyclient was open (`GET /users/@me/mentions`).
+    /// Mapped through `convert()` without writing into channel message history; respects hidden
+    /// channels, message requests, and age-gated (NSFW) channels.
+    pub(super) fn mentions(
+        &self,
+        before: Option<&str>,
+        everyone: bool,
+        roles: bool,
+        space: Option<&str>,
+        limit: u32,
+    ) -> Result<(Vec<protocol::MentionHit>, bool, Option<String>), Refusal> {
+        let cap = limit.clamp(1, 25);
+        let mut path = format!("/users/@me/mentions?limit={cap}&roles={roles}&everyone={everyone}");
+        if let Some(before) = before.filter(|b| !b.is_empty()) {
+            path.push_str(&format!("&before={}", escaped(before)));
+        }
+        if let Some(guild) = space.filter(|g| !g.is_empty()) {
+            path.push_str(&format!("&guild_id={}", escaped(guild)));
+        }
+        let answer = self.call("GET", &path, None).map_err(refusal)?;
+        let raw: Vec<Posted> = serde_json::from_str(&answer).map_err(refused)?;
+        let more = raw.len() >= cap as usize;
+        // The next page starts before the last raw id, even when every hit on this page was
+        // filtered out. One call returns one page.
+        let cursor = more.then(|| raw.last().map(|posted| posted.id.clone())).flatten();
+        let nsfw = crate::hub::lock(&self.state).nsfw_channels.clone();
+        let mut hits = Vec::new();
+        for posted in &raw {
+            if !self.ctx.listable(&posted.channel_id) || nsfw.contains(&posted.channel_id) {
+                continue;
+            }
+            let known = self.ctx.known(&posted.channel_id).ok().flatten();
+            if known.as_ref().is_some_and(|row| row.special == protocol::Special::Request) {
+                continue;
+            }
+            let kind = known.as_ref().map_or(ConversationKind::Channel, |row| row.kind);
+            let title = known.as_ref().map_or_else(String::new, |row| row.title.clone());
+            let space_title = known.as_ref().map_or_else(String::new, |row| row.space_title.clone());
+            let guild = posted
+                .guild_id
+                .as_deref()
+                .or_else(|| known.as_ref().and_then(|row| row.space.as_deref()));
+            let (message, files) = self.convert(posted, guild, kind);
+            if !files.files.is_empty() {
+                let _ = self.ctx.media(&files.files);
+            }
+            let text = if !message.text.is_empty() {
+                message.text
+            } else if let Some(first) = message.attachments.first() {
+                if first.name.is_empty() { "Attachment".to_owned() } else { first.name.clone() }
+            } else {
+                posted.content.clone().unwrap_or_default()
+            };
+            hits.push(protocol::MentionHit {
+                conversation: self.ctx.key(&posted.channel_id),
+                message_id: posted.id.clone(),
+                sent: model::seconds(&posted.id),
+                sender: message.sender.name,
+                sender_avatar: message.sender.avatar,
+                text,
+                title,
+                space_title,
+                mentions_everyone: posted.mention_everyone,
+                mentions_role: !posted.mention_roles.is_empty(),
+            });
+        }
+        Ok((hits, more, cursor))
+    }
+
+    /// Dismisses a recent mention (`DELETE /users/@me/mentions/{message_id}`).
+    pub(super) fn dismiss_mention(&self, message_id: &str) -> Result<(), Refusal> {
+        let id = message_id.trim();
+        if id.is_empty() {
+            return Err(refused("Missing mention message id."));
+        }
+        self.call("DELETE", &format!("/users/@me/mentions/{}", escaped(id)), None)
+            .map_err(refusal)?;
+        Ok(())
+    }
     /// Kicks, bans, times out, untimes out, or renames a guild member, gated by
     /// computed guild permissions and role hierarchy.
     pub(super) fn moderate(
@@ -549,6 +3410,134 @@ impl Discord {
                 .map_err(refusal)?;
         }
         Ok(())
+    }
+}
+
+/// Largest avatar or banner image file accepted before base64-encoding into a Discord data URI.
+const MAX_PROFILE_IMAGE_BYTES: usize = 10 << 20;
+
+fn profile_refusal(failed: Refused) -> Refusal {
+    match failed {
+        Refused::Status { code: 50035, ref message, .. } if !message.is_empty() => {
+            Refusal::Refused(format!("Discord rejected the profile change: {message}"))
+        }
+        other => refusal(other),
+    }
+}
+
+/// Reads a local image file, validates its magic bytes and size, and encodes it as a
+/// `data:image/{png,jpeg,webp,gif};base64,...` URI for Discord's profile endpoints.
+fn image_data_uri(path: &str, allow_gif: bool) -> Result<String, Refusal> {
+    let len = std::fs::metadata(path).map_err(|err| refused(format!("Could not read image: {err}")))?.len();
+    if len == 0 {
+        return Err(refused("The chosen image file is empty."));
+    }
+    if len > MAX_PROFILE_IMAGE_BYTES as u64 {
+        return Err(refused("Profile images must be 10 MB or smaller."));
+    }
+    let bytes = std::fs::read(path).map_err(|err| refused(format!("Could not read image: {err}")))?;
+    if bytes.is_empty() {
+        return Err(refused("The chosen image file is empty."));
+    }
+    if bytes.len() > MAX_PROFILE_IMAGE_BYTES {
+        return Err(refused("Profile images must be 10 MB or smaller."));
+    }
+    let mime = if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        "image/png"
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "image/jpeg"
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "image/webp"
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        if !allow_gif {
+            return Err(refused("Animated avatars and banners require Discord Nitro."));
+        }
+        "image/gif"
+    } else {
+        return Err(refused("Choose a PNG, JPEG, WebP, or GIF image."));
+    };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:{mime};base64,{encoded}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::{AccountKey, Key, Network};
+
+    fn key(id: &str) -> Key {
+        Key::new(&AccountKey { network: Network::Discord, account: "1000".into() }, id)
+    }
+
+    #[test]
+    fn discord_search_path_maps_all_filters_dates_sort_and_offset() {
+        let filters = SearchFilters {
+            from: Some(key("2001")),
+            mentions: Some(key("2002")),
+            in_channel: Some(key("4101")),
+            has: Some(SearchHas::Videos),
+            before: Some(1_767_225_600),
+            after: Some(1_735_689_600),
+            mentions_me: false,
+            pinned: Some(true),
+            author_type: Some("bot".into()),
+            sort: SearchSort::Oldest,
+            offset: 25,
+        };
+        let (path, offset) = build_search_path(
+            "/guilds/4000/messages/search",
+            None,
+            "deploy",
+            &filters,
+            None,
+            "1000",
+        );
+        assert_eq!(offset, 25);
+        assert!(path.starts_with("/guilds/4000/messages/search?"), "{path}");
+        assert!(path.contains("channel_id=4101"), "{path}");
+        assert!(path.contains("content=deploy"), "{path}");
+        assert!(path.contains("author_id=2001"), "{path}");
+        assert!(path.contains("mentions=2002"), "{path}");
+        assert!(path.contains("has=video"), "{path}");
+        assert!(path.contains(&format!("min_id={}", model::snowflake_from_unix(1_735_689_600))), "{path}");
+        assert!(path.contains(&format!("max_id={}", model::snowflake_from_unix(1_767_225_600))), "{path}");
+        assert!(path.contains("pinned=true"), "{path}");
+        assert!(path.contains("author_type=bot"), "{path}");
+        assert!(path.contains("sort_by=timestamp&sort_order=asc"), "{path}");
+        assert!(path.contains("offset=25"), "{path}");
+
+        // Cursor overrides filters.offset, mentions_me maps to own user id, and Relevant maps to relevance.
+        let rel = SearchFilters {
+            mentions_me: true,
+            sort: SearchSort::Relevance,
+            has: Some(SearchHas::Polls),
+            author_type: Some("invalid".into()),
+            ..SearchFilters::default()
+        };
+        let (path2, offset2) = build_search_path(
+            "/users/@me/messages/search",
+            None,
+            "",
+            &rel,
+            Some("50"),
+            "1000",
+        );
+        assert_eq!(offset2, 50);
+        assert!(path2.starts_with("/users/@me/messages/search?"), "{path2}");
+        assert!(!path2.contains("content="), "{path2}");
+        assert!(path2.contains("mentions=1000"), "{path2}");
+        assert!(path2.contains("has=poll"), "{path2}");
+        assert!(!path2.contains("author_type="), "unknown author_type must be ignored: {path2}");
+        assert!(path2.contains("sort_by=relevance&sort_order=desc"), "{path2}");
+        assert!(path2.contains("offset=50"), "{path2}");
+    }
+
+    #[test]
+    fn snowflake_from_unix_round_trips_seconds() {
+        let ts = 1_735_689_600;
+        let sf = model::snowflake_from_unix(ts);
+        assert_eq!(model::seconds(&sf.to_string()), ts);
+        assert_eq!(model::snowflake_from_unix(0), 0);
     }
 }
 
@@ -618,6 +3607,48 @@ pub(super) fn encode_audit_reason(reason: &str) -> String {
     out
 }
 
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    #[test]
+    fn image_data_uri_validates_format_and_nitro_gif_gate() {
+        let dir = std::env::temp_dir().join(format!("tinyclient-discord-img-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let png = dir.join("a.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\nrest").unwrap();
+        let uri = image_data_uri(png.to_str().unwrap(), false).unwrap();
+        assert!(uri.starts_with("data:image/png;base64,"), "{uri}");
+
+        let jpg = dir.join("a.jpg");
+        std::fs::write(&jpg, b"\xFF\xD8\xFF\xE0jpg").unwrap();
+        assert!(image_data_uri(jpg.to_str().unwrap(), false).unwrap().starts_with("data:image/jpeg;base64,"));
+
+        let webp = dir.join("a.webp");
+        std::fs::write(&webp, b"RIFF1234WEBPdata").unwrap();
+        assert!(image_data_uri(webp.to_str().unwrap(), false).unwrap().starts_with("data:image/webp;base64,"));
+
+        let gif = dir.join("a.gif");
+        std::fs::write(&gif, b"GIF89adata").unwrap();
+        assert!(image_data_uri(gif.to_str().unwrap(), false).is_err(), "GIF requires Nitro");
+        assert!(image_data_uri(gif.to_str().unwrap(), true).unwrap().starts_with("data:image/gif;base64,"));
+
+        let txt = dir.join("a.txt");
+        std::fs::write(&txt, b"not an image").unwrap();
+        assert!(image_data_uri(txt.to_str().unwrap(), true).is_err());
+
+        let huge = dir.join("huge.png");
+        let file = std::fs::File::create(&huge).unwrap();
+        file.set_len((10 << 20) + 1).unwrap();
+        drop(file);
+        let err = image_data_uri(huge.to_str().unwrap(), true).unwrap_err();
+        let words = format!("{err:?}");
+        assert!(words.contains("10 MB"), "{words}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
 #[cfg(test)]
 mod moderation_tests {
     use super::*;
@@ -737,4 +3768,145 @@ mod moderation_tests {
         assert!(!parsed.mutes("4101", None, one_hour), "unmuted at end_time");
         assert!(!parsed.mutes("4101", None, one_hour + 60), "unmuted after end_time");
     }
+}
+
+/// Builds the `PATCH /users/@me/guilds/{id}/settings` body for muting or changing the
+/// notification level of a server (when `category` is `None`) or a category (`Some(id)`).
+pub(super) fn space_notify_body(
+    notify: Notify,
+    until: Option<i64>,
+    category: Option<&str>,
+    now: i64,
+) -> serde_json::Value {
+    let timed = notify == Notify::Nothing && until.is_some_and(|t| t > now);
+    let mute_config = match until.filter(|&t| notify == Notify::Nothing && t > now) {
+        Some(end) => json!({
+            "end_time": model::seconds_iso(end),
+            "selected_time_window": (end - now).max(1),
+        }),
+        None => json!({"end_time": null, "selected_time_window": -1}),
+    };
+    if let Some(cat) = category.filter(|c| !c.is_empty()) {
+        let mut setting = match notify {
+            Notify::All => json!({"muted": false, "message_notifications": 0}),
+            Notify::Mentions => json!({"muted": false, "message_notifications": 1}),
+            Notify::Nothing => json!({"muted": true}),
+        };
+        setting["mute_config"] = mute_config;
+        json!({"channel_overrides": {cat: setting}})
+    } else {
+        match notify {
+            Notify::All => json!({
+                "muted": false,
+                "message_notifications": 0,
+                "mute_config": mute_config,
+            }),
+            Notify::Mentions => json!({
+                "muted": false,
+                "message_notifications": 1,
+                "mute_config": mute_config,
+            }),
+            Notify::Nothing if timed => json!({
+                "muted": true,
+                "mute_config": mute_config,
+            }),
+            Notify::Nothing => json!({
+                "muted": true,
+                "message_notifications": 2,
+                "mute_config": mute_config,
+            }),
+        }
+    }
+}
+
+/// Builds the `PATCH /users/@me/guilds/{id}/settings` body to opt a channel or category in
+/// (`on: true`) or out (`on: false`), toggling only bit 12 (`OPT_IN_ENABLED`) while preserving
+/// all other override flag bits.
+pub(super) fn follow_channel_body(channel: &str, existing_flags: u32, on: bool) -> serde_json::Value {
+    let flags = if on {
+        existing_flags | model::OPT_IN_ENABLED
+    } else {
+        existing_flags & !model::OPT_IN_ENABLED
+    };
+    json!({"channel_overrides": {channel: {"flags": flags}}})
+}
+
+/// Builds the `PATCH /users/@me/guilds/{id}/settings` body to toggle "Show All Channels"
+/// (guild `flags` bit 14 `OPT_IN_CHANNELS_ON`) and/or `hide_muted_channels`, preserving all
+/// other guild flag bits.
+pub(super) fn space_view_body(
+    existing_flags: u32,
+    show_all: Option<bool>,
+    hide_muted: Option<bool>,
+) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    if let Some(show_all) = show_all {
+        let flags = if show_all {
+            existing_flags & !model::OPT_IN_CHANNELS_ON
+        } else {
+            existing_flags | model::OPT_IN_CHANNELS_ON
+        };
+        map.insert("flags".to_owned(), json!(flags));
+    }
+    if let Some(hide_muted) = hide_muted {
+        map.insert("hide_muted_channels".to_owned(), json!(hide_muted));
+    }
+    serde_json::Value::Object(map)
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    #[test]
+    fn follow_and_space_view_bodies_toggle_only_their_flag_bits() {
+        let base = 0b101u32;
+        let follow = follow_channel_body("4102", base, true);
+        assert_eq!(follow["channel_overrides"]["4102"]["flags"], base | model::OPT_IN_ENABLED);
+        let unfollow = follow_channel_body("4102", base | model::OPT_IN_ENABLED, false);
+        assert_eq!(unfollow["channel_overrides"]["4102"]["flags"], base);
+
+        let opt_in_on = space_view_body(base, Some(false), None);
+        assert_eq!(opt_in_on["flags"], base | model::OPT_IN_CHANNELS_ON);
+        assert!(opt_in_on.get("hide_muted_channels").is_none());
+
+        let show_all = space_view_body(base | model::OPT_IN_CHANNELS_ON, Some(true), Some(true));
+        assert_eq!(show_all["flags"], base);
+        assert_eq!(show_all["hide_muted_channels"], true);
+    }
+
+    #[test]
+    fn space_notify_body_shapes_server_levels_timed_mute_and_category_overrides() {
+        let clock = 1_760_000_000;
+        let all = space_notify_body(Notify::All, None, None, clock);
+        assert_eq!(all["muted"], false);
+        assert_eq!(all["message_notifications"], 0);
+        assert_eq!(all["mute_config"]["end_time"], serde_json::Value::Null);
+        assert_eq!(all["mute_config"]["selected_time_window"], -1);
+
+        let mentions = space_notify_body(Notify::Mentions, None, None, clock);
+        assert_eq!(mentions["muted"], false);
+        assert_eq!(mentions["message_notifications"], 1);
+
+        let nothing = space_notify_body(Notify::Nothing, None, None, clock);
+        assert_eq!(nothing["muted"], true);
+        assert_eq!(nothing["message_notifications"], 2);
+        assert_eq!(nothing["mute_config"]["end_time"], serde_json::Value::Null);
+
+        let timed = space_notify_body(Notify::Nothing, Some(clock + 3600), None, clock);
+        assert_eq!(timed["muted"], true);
+        assert!(timed.get("message_notifications").is_none());
+        assert_eq!(timed["mute_config"]["selected_time_window"], 3600);
+        assert_eq!(timed["mute_config"]["end_time"], model::seconds_iso(clock + 3600));
+
+        let cat = space_notify_body(Notify::Nothing, Some(clock + 900), Some("4050"), clock);
+        assert_eq!(cat["channel_overrides"]["4050"]["muted"], true);
+        assert_eq!(cat["channel_overrides"]["4050"]["mute_config"]["selected_time_window"], 900);
+        assert_eq!(cat["channel_overrides"]["4050"]["mute_config"]["end_time"], model::seconds_iso(clock + 900));
+
+        let cat_unmute = space_notify_body(Notify::All, None, Some("4050"), clock);
+        assert_eq!(cat_unmute["channel_overrides"]["4050"]["muted"], false);
+        assert_eq!(cat_unmute["channel_overrides"]["4050"]["message_notifications"], 0);
+    }
+
 }

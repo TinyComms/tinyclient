@@ -1,0 +1,12 @@
+{
+  "id": "telegram-wave8g",
+  "title": "Wave 8G Telegram auto-delete timer, chat folders CRUD & reorder, forum topics CRUD & paging, scheduled messages & send-when-online, chat search filters & jump-to-date, and delete modes/batch/admin moderation",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "Desktop Wave 8G Telegram enhancements verified by unit and integration test suites.",
+    "ios": "Desktop Wave 8G Telegram enhancements verified by unit and integration test suites."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

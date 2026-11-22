@@ -1484,9 +1484,12 @@ impl Teams {
             .or_else(|| team["membershipSummary"]["totalMemberCount"].as_u64())
             .map(|n| n as u32);
         Ok(protocol::InvitePreview {
+            event: None,
+            joined: false,
             code,
             name,
             description,
+            request_needed: false,
             icon: None,
             members,
             online: None,

@@ -620,6 +620,11 @@ fn try_parse_approval(
                 value: data,
                 confirm: None,
                 kind: ControlKind::Button { url: String::new(), style },
+                disabled: false,
+                emoji: String::new(),
+                row: 0,
+                min_values: 0,
+                max_values: 0,
             });
         }
     }

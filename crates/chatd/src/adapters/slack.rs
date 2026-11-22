@@ -1609,6 +1609,7 @@ impl Slack {
             mine: self.me.get().is_some_and(|me| event["user"] == me.as_str()),
             // The event names the one who acted; the store folds them into the list.
             who: event["user"].as_str().map(|user| vec![user.to_owned()]).unwrap_or_default(),
+            ..Reaction::default()
         };
         let added = event["type"] == "reaction_added";
         // The event does not say which thread a reply is in. The message is found in the
@@ -1972,7 +1973,8 @@ impl Slack {
                     &element_type,
                     &value,
                     &values,
-                ),
+                )
+                .map(|()| None),
             ),
             Command::Forward { from_conversation_id, message_ids, to_conversation_ids, note, reply } => {
                 answer(reply, self.forward(&from_conversation_id, &message_ids, &to_conversation_ids, &note))
@@ -1981,7 +1983,7 @@ impl Slack {
                 if at.elapsed() >= SEARCH_PATIENCE {
                     drop(reply);
                 } else {
-                    answer(reply, self.search_messages(&query, &scope, &filters, cursor.as_deref()));
+                    answer(reply, self.search_messages(&query, &scope, &filters, cursor.as_deref()).map(super::SearchPage::from));
                 }
             }
             Command::SearchFiles { query, scope, sort, cursor, reply } => {
@@ -2039,7 +2041,7 @@ impl Slack {
             Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
                 answer(reply, self.react(&conversation_id, &message_id, &emoji, on));
             }
-            Command::Edit { conversation_id, message_id, text, spans, reply } => {
+            Command::Edit { conversation_id, message_id, text, spans, suppress_embeds: _, keep_attachments: _, reply } => {
                 answer(reply, self.edit(&conversation_id, &message_id, &text, &spans));
             }
             Command::Delete { conversation_id, message_id, scope, reply } => {
@@ -2074,7 +2076,7 @@ impl Slack {
             Command::CloseDirect { conversation_id, reply } => {
                 answer(reply, self.close_direct(&conversation_id));
             }
-            Command::Leave { conversation_id, reply } => {
+            Command::Leave { conversation_id, silent: _, reply } => {
                 answer(reply, self.leave(&conversation_id));
             }
             Command::ConversationUpdate { conversation_id, title, topic, description, reply } => {

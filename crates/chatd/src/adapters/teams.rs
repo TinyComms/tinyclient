@@ -1134,10 +1134,10 @@ impl Teams {
                 let _ = reply.send(self.vote(&conversation_id, &message_id, votes.as_deref()).map_err(refuse));
             }
             Command::MessageAction { conversation_id, message_id, block_id, action_id, element_type: _, value, values: _, reply } => {
-                let _ = reply.send(self.invoke_card_action(&conversation_id, &message_id, &block_id, &action_id, &value).map_err(refuse));
+                let _ = reply.send(self.invoke_card_action(&conversation_id, &message_id, &block_id, &action_id, &value).map(|()| None).map_err(refuse));
             }
             Command::ReactionRules { reply, .. } => drop(reply.send(Ok(message::reaction_rules()))),
-            Command::Edit { conversation_id, message_id, text, spans, reply } => {
+            Command::Edit { conversation_id, message_id, text, spans, suppress_embeds: _, keep_attachments: _, reply } => {
                 let _ = reply.send(self.edit(&conversation_id, &message_id, &text, &spans).map_err(refuse));
             }
             Command::Delete { conversation_id, message_id, scope, reply } => {
@@ -1197,7 +1197,7 @@ impl Teams {
             Command::SetMute { conversation_id, notify, until: _, reply } => {
                 let _ = reply.send(self.set_mute(&conversation_id, notify).map_err(refuse));
             }
-            Command::Leave { conversation_id, reply } => {
+            Command::Leave { conversation_id, silent: _, reply } => {
                 let _ = reply.send(self.leave(&conversation_id).map_err(refuse));
             }
             Command::LeaveSpace { space_id, reply } => {
@@ -1212,14 +1212,14 @@ impl Teams {
             Command::Join { conversation_id, reply } => {
                 let _ = reply.send(self.join_channel_or_team(&conversation_id).map_err(refuse));
             }
-            Command::CreateChannel { space_id, name, kind: _, private, group: _, reply } => {
+            Command::CreateChannel { space_id, name, kind: _, private, group: _, reply, .. } => {
                 let _ = reply.send(self.create_channel(&space_id, &name, private).map_err(refuse));
             }
-            Command::InvitePreview { code, reply } => {
+            Command::InvitePreview { code, reply, .. } => {
                 let _ = reply.send(self.invite_preview(&code).map_err(refuse));
             }
             Command::InviteJoin { code, reply } => {
-                let _ = reply.send(self.invite_join(&code).map_err(refuse));
+                let _ = reply.send(self.invite_join(&code).map(|(space, conversation)| (space, conversation, false)).map_err(refuse));
             }
             Command::File { conversation_id, pinned, archived, folder_add: _, folder_remove: _, reply } => {
                 let _ = reply.send(self.file_conversation(&conversation_id, pinned, archived).map_err(refuse));
@@ -1244,7 +1244,7 @@ impl Teams {
             }
             Command::Search { query, scope, filters, cursor, at, reply } => {
                 let found = self.search_messages(&query, &scope, &filters, cursor.as_deref(), at);
-                let _ = reply.send(found.map(|hits| super::SearchPage { hits, cursor: None }).map_err(refuse));
+                let _ = reply.send(found.map(|hits| super::SearchPage { hits, cursor: None, total: None }).map_err(refuse));
             }
             Command::Relate { person_id, action, reply } => {
                 let _ = reply.send(self.relate(&person_id, action).map_err(refuse));

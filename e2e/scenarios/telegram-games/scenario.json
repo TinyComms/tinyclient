@@ -1,0 +1,12 @@
+{
+  "id": "telegram-games",
+  "title": "A bot game shows its picture, title and a play link",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. The same card is what a game maps to.",
+    "ios": "The phone proof build does not run desktop chatd. The same card is what a game maps to."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

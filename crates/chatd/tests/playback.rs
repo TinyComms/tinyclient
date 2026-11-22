@@ -102,6 +102,9 @@ fn start(path: &Path, at: Option<u32>, rate: u16) -> PlayRequest {
         at,
         rate,
         output: None,
+        round: false,
+        muted: false,
+        looped: false,
     }
 }
 
@@ -277,5 +280,117 @@ fn only_a_file_in_the_media_cache_is_played_and_a_bad_one_fails_in_words() {
     world.ask(start(&broken, None, 100)).unwrap();
     let failed = world.until("a failure", |shown| shown.as_ref().is_some_and(|shown| matches!(shown.state, PlayState::Failed { .. })));
     assert_eq!(failed.unwrap().state, PlayState::Failed { detail: "This file can't be played.".into() });
+    until_no_mediad();
+}
+
+#[test]
+fn three_voice_messages_in_a_row_auto_play_at_chosen_speed_and_stop_before_text_or_view_once() {
+    let _turn = alone();
+    let world = world();
+    let conv = Key { network: Network::Telegram, account: "1".into(), id: "7002".into() };
+    let v1 = world.voice.with_file_name("v1.opus");
+    let v2 = world.voice.with_file_name("v2.opus");
+    let v3 = world.voice.with_file_name("v3.opus");
+    let v4 = world.voice.with_file_name("v4.opus");
+    for dst in [&v1, &v2, &v3, &v4] {
+        std::fs::copy(&world.voice, dst).unwrap();
+    }
+    let voice_msg = |id: &str, file_id: &str, path: &Path, sent: i64, view_once: bool| {
+        let mut msg = protocol::Message::plain(id, "Odalys", "", sent, false);
+        let mut mf = protocol::MediaFile::new(file_id, protocol::MediaKind::Audio);
+        mf.path = Some(path.display().to_string());
+        let mut att = protocol::Attachment::new("Voice message", mf);
+        att.mime = "audio/ogg".into();
+        att.duration = 1;
+        att.waveform = vec![120, 200, 80];
+        att.view_once = view_once;
+        msg.attachments.push(att);
+        msg.media_unread = !view_once;
+        msg
+    };
+    {
+        let mut store = world.hub.store();
+        let row = chatd::store::ConversationRow::new("7002", protocol::ConversationKind::Direct, "Odalys");
+        store.upsert_conversation(&account(), &row).unwrap();
+        for (id, file, path, sent, vo) in [
+            ("101", "f1", v1.as_path(), 1_000, false),
+            ("102", "f2", v2.as_path(), 1_001, false),
+            ("103", "f3", v3.as_path(), 1_002, false),
+            ("104", "f4", v4.as_path(), 1_003, true),
+        ] {
+            let mut m = voice_msg(id, file, path, sent, vo);
+            let mf = protocol::MediaFile::new(file, protocol::MediaKind::Audio);
+            store.register_media(&account(), &[(mf, String::new())]).unwrap();
+            store.media_landed(&account(), file, &path.display().to_string(), 0, 1_000).unwrap();
+            m.attachments[0].file.path = Some(path.display().to_string());
+            store.ingest(&conv, &m, false).unwrap();
+        }
+        store.ingest(&conv, &protocol::Message::plain("105", "Odalys", "text break", 1_004, false), false).unwrap();
+    }
+
+    let started = Arc::new(Mutex::new(Vec::<String>::new()));
+    let started_ref = started.clone();
+    world.hub.player.on_started(move |_, id| {
+        started_ref.lock().unwrap().push(id.to_owned());
+    });
+
+    // Start message 101 at 2x speed: it must automatically play 101 -> 102 -> 103 at 2x,
+    // and stop before view-once message 104!
+    world
+        .ask(PlayRequest::Start {
+            account: account(),
+            file: "f1".into(),
+            path: v1.display().to_string(),
+            conversation: conv.clone(),
+            message: "101".into(),
+            title: "Odalys".into(),
+            at: None,
+            rate: 200,
+            output: None,
+            round: false,
+            muted: false,
+            looped: false,
+        })
+        .unwrap();
+
+    let first = world.until("playing 101", |s| s.as_ref().is_some_and(|p| p.message == "101" && p.state == PlayState::Playing));
+    assert!(first.as_ref().unwrap().has_next);
+    assert!(!first.as_ref().unwrap().has_previous);
+    assert_eq!(first.unwrap().rate, 200);
+
+    let second = world.until("auto-playing 102", |s| s.as_ref().is_some_and(|p| p.message == "102" && p.state == PlayState::Playing));
+    assert!(second.as_ref().unwrap().has_next);
+    assert!(second.as_ref().unwrap().has_previous);
+    assert_eq!(second.unwrap().rate, 200);
+
+    let third = world.until("auto-playing 103", |s| s.as_ref().is_some_and(|p| p.message == "103" && p.state == PlayState::Playing));
+    assert!(!third.as_ref().unwrap().has_next, "view-once 104 must never be auto-played");
+    assert!(third.as_ref().unwrap().has_previous);
+    assert_eq!(third.unwrap().rate, 200);
+
+    let ended = world.until_state(PlayState::Ended);
+    assert_eq!(ended.message, "103");
+    assert_eq!(*started.lock().unwrap(), vec!["101".to_owned(), "102".to_owned(), "103".to_owned()]);
+    until_no_mediad();
+
+    // Previous steps back from 103 -> 102, Next steps forward from 102 -> 103.
+    world.ask(PlayRequest::Previous).unwrap();
+    let back = world.until("previous to 102", |s| s.as_ref().is_some_and(|p| p.message == "102" && p.state == PlayState::Playing));
+    assert_eq!(back.unwrap().rate, 200);
+    world.ask(PlayRequest::Next).unwrap();
+    let fwd = world.until("next to 103", |s| s.as_ref().is_some_and(|p| p.message == "103" && p.state == PlayState::Playing));
+    assert_eq!(fwd.unwrap().rate, 200);
+    world.ask(PlayRequest::Stop).unwrap();
+    until_no_mediad();
+}
+
+#[test]
+fn half_speed_plays_at_50_percent() {
+    let _turn = alone();
+    let world = world();
+    world.play(None, 50);
+    let playing = world.until_state(PlayState::Playing);
+    assert_eq!(playing.rate, 50);
+    world.ask(PlayRequest::Stop).unwrap();
     until_no_mediad();
 }

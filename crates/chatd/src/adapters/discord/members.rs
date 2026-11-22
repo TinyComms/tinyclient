@@ -413,6 +413,53 @@ impl Discord {
         Some(Members { pending: false, sections: vec![MemberSection { name: "Members".into(), count }], members })
     }
 
+    /// Fetches the member list of a Discord thread (`GET /channels/{thread}/thread-members?with_member=true`).
+    fn thread_members(&self, thread: &str, offset: u32, limit: u32) -> Result<Members, Refusal> {
+        #[derive(Deserialize)]
+        struct ThreadMember {
+            #[serde(default)]
+            user_id: Option<String>,
+            #[serde(default)]
+            member: Option<Member>,
+        }
+        let body = self
+            .call("GET", &format!("/channels/{thread}/thread-members?with_member=true"), None)
+            .map_err(super::refusal)?;
+        let entries: Vec<ThreadMember> = serde_json::from_str(&body)
+            .map_err(|err| Refusal::Refused(format!("Discord's answer was unreadable: {err}")))?;
+        let mut files = Vec::new();
+        let mut all = Vec::with_capacity(entries.len());
+        let known_users = self.state.lock().unwrap().users.clone();
+        let relations = self.state.lock().unwrap().relations.clone();
+        let guild = self.ctx.known(thread).ok().flatten().and_then(|row| self.guild_of(&row)).unwrap_or_default();
+        for entry in entries {
+            if let Some(member) = entry.member.as_ref() {
+                if let Some((mut person, ..)) = self.person(&guild, member, &HashMap::new(), &mut files) {
+                    person.relation = relations.get(&person.key.id).copied().unwrap_or_default();
+                    all.push(person);
+                    continue;
+                }
+            }
+            if let Some(uid) = entry.user_id.filter(|id| !id.is_empty()) {
+                let name = known_users.get(&uid).cloned().unwrap_or_else(|| uid.clone());
+                let mut person = Person::new(self.ctx.key(&uid), name);
+                person.link = super::model::user_link(&uid);
+                person.relation = relations.get(&uid).copied().unwrap_or_default();
+                all.push(person);
+            }
+        }
+        if let Err(err) = self.ctx.media(&files) {
+            self.log("thread members", err);
+        }
+        let count = all.len() as u32;
+        let members = all.into_iter().skip(offset as usize).take(limit.clamp(1, WINDOW) as usize).collect();
+        Ok(Members {
+            pending: false,
+            sections: vec![MemberSection { name: "Members".into(), count }],
+            members,
+        })
+    }
+
     /// Reads the current cache immediately. Only Watch controls the live viewport;
     /// a cache miss is pending data, never a request that blocks later scrolling.
     pub(super) fn members(&self, channel: String, offset: u32, limit: u32, reply: Reply<Members>) {
@@ -420,12 +467,12 @@ impl Discord {
             return answer(reply, Ok(list));
         }
         let conversation = self.ctx.known(&channel).ok().flatten();
+        if conversation.as_ref().is_some_and(|conversation| conversation.kind == ConversationKind::Thread) {
+            return answer(reply, self.thread_members(&channel, offset, limit));
+        }
         let guild = conversation.as_ref().and_then(|conversation| self.guild_of(conversation));
         let in_tree = conversation.as_ref().is_some_and(|conversation| conversation.space.is_some());
         let (Some(guild), true) = (guild, in_tree) else { return answer(reply, Err(Refusal::Unsupported)); };
-        if conversation.is_some_and(|conversation| conversation.kind == ConversationKind::Thread) {
-            return answer(reply, Err(Refusal::Unsupported));
-        }
         let (groups, members, pending) = {
             let mut state = self.state.lock().unwrap();
             if !state.guilds.contains_key(&guild) {
@@ -456,30 +503,79 @@ impl Discord {
         answer(reply, Ok(Members { pending, sections: self.sections(&guild, &roster), members }));
     }
 
-    fn person(&self, member: &Member, files: &mut Vec<(MediaFile, String)>) -> Option<(Person, Presence, String)> {
+    fn person(
+        &self,
+        guild: &str,
+        member: &Member,
+        voice: &HashMap<String, protocol::Activity>,
+        files: &mut Vec<(MediaFile, String)>,
+    ) -> Option<(Person, Presence, String, String, Option<protocol::Activity>)> {
         let user = member.user.as_ref()?;
-        let (avatar, url) = user.avatar();
+        let (avatar, url) = member.avatar(Some(guild)).unwrap_or_else(|| user.avatar());
         files.push((avatar.clone(), url));
         let presence = member.presence.as_ref();
         let (shown, status) = presence.map_or((Presence::Unknown, ""), |presence| (presence.presence(), presence.status()));
+        let emoji = presence.map_or("", |presence| presence.emoji()).to_owned();
+        let emoji_file = presence.and_then(|presence| presence.emoji_file()).map(|(file, url)| {
+            files.push((file.clone(), url));
+            file
+        });
+        let presence_doing = presence.and_then(|presence| presence.doing_with_art()).map(|(doing, art)| {
+            if let Some(art) = art {
+                files.push(art);
+            }
+            doing
+        });
+        // In voice wins over playing/listening, matching Friends.
+        let activity = voice.get(&user.id).cloned().or(presence_doing);
+        // `name` is the global display name. The server nickname stays on `nickname` so the
+        // member list can show it without People taking it as who they are everywhere.
         let person = Person {
             link: super::model::user_link(&user.id),
             key: self.ctx.key(&user.id),
-            name: member.name().to_owned(),
+            name: user.name().to_owned(),
             handle: user.username.clone(),
             avatar: Some(avatar),
             bot: user.bot,
             relation: Relation::None,
             presence: shown,
             status: status.to_owned(),
+            emoji: emoji.clone(),
+            emoji_file,
+            activity: activity.clone().map(Box::new),
+            nickname: member.nick.clone().filter(|nick| !nick.is_empty()).unwrap_or_default(),
             ..Person::new(self.ctx.key(&user.id), "")
         };
-        Some((person, shown, status.to_owned()))
+        Some((person, shown, status.to_owned(), emoji, activity))
     }
 
     /// Discord's updates to the list we subscribed to: a window synced, a row inserted, changed
     /// or removed.
     pub(super) fn member_list(&self, update: ListUpdate) {
+        let voice_raw: Vec<(String, String, Option<String>)> = {
+            let state = self.state.lock().unwrap();
+            let place = state.guilds.get(&update.guild_id).map(|g| g.name.clone());
+            state
+                .voice
+                .states
+                .iter()
+                .filter(|(_, heard)| heard.guild.as_deref() == Some(update.guild_id.as_str()))
+                .map(|(uid, heard)| (uid.clone(), heard.channel().to_owned(), place.clone()))
+                .collect()
+        };
+        let voice: HashMap<String, protocol::Activity> = voice_raw
+            .into_iter()
+            .map(|(uid, channel, place)| {
+                let name = self.ctx.known(&channel).ok().flatten().map(|row| row.title).unwrap_or_default();
+                let mut act = protocol::Activity {
+                    place: place.unwrap_or_default(),
+                    conversation: Some(self.ctx.key(&channel)),
+                    ..protocol::Activity::new(protocol::ActivityKind::InVoice, name)
+                };
+                act.bound();
+                (uid, act)
+            })
+            .collect();
         let mut files = Vec::new();
         let mut seen = Vec::new();
         let mut member_roles: Vec<(String, Vec<u64>)> = Vec::new();
@@ -487,10 +583,10 @@ impl Discord {
         let changed;
         let mut entry = |item: &ListItem| match item.member.as_ref().and_then(|member| {
             let roles: Vec<u64> = member.roles.iter().map(|r| super::model::number(r)).collect();
-            self.person(member, &mut files).map(|res| (res, roles))
+            self.person(&update.guild_id, member, &voice, &mut files).map(|res| (res, roles))
         }) {
-            Some(((person, presence, status), roles)) => {
-                seen.push((person.key.id.clone(), presence, status));
+            Some(((person, presence, status, emoji, activity), roles)) => {
+                seen.push((person.key.id.clone(), presence, status, emoji, activity));
                 member_roles.push((person.key.id.clone(), roles));
                 Entry::Member(Box::new(person))
             }
@@ -585,8 +681,9 @@ impl Discord {
             self.log("member list", err);
         }
         // chatd keeps these only for the people the shell is watching.
-        for (id, presence, status) in seen {
+        for (id, presence, status, emoji, activity) in seen {
             self.ctx.presence(&id, presence, &status, false);
+            self.ctx.activity(&id, &emoji, activity, false);
         }
         // Wake cache readers when their subscribed data arrives, as well as on edits.
         if changed || update.ops.iter().any(|op| op.op == "SYNC") {

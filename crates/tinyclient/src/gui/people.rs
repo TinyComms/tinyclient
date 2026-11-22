@@ -32,7 +32,7 @@ mod card;
 mod hub;
 mod info;
 pub(in crate::gui) use info::profile::facts::{
-    mask, mask_email,
+    mask, mask_email, rough_last_seen,
     can_archive, can_clear_history, can_close_direct, can_edit_folders, can_pin_on_network, network_pin_label,
     slack_workspace_url, SLACK_WORKSPACE_LINKS,
 };
@@ -47,7 +47,7 @@ pub use hub::{ask_later, Hub};
 
 use super::anim::Play;
 use super::components::Avatar;
-use super::composer::typing_preview;
+use super::composer::typing_preview_for;
 use super::layout::{RightKind, RightPane};
 use super::sidebar::Mode;
 use super::state::Shell;
@@ -80,6 +80,15 @@ pub struct State {
     status: OnceCell<Entity<StatusMenu>>,
 }
 
+impl State {
+    /// The person menu reads commands the shell just stored.
+    pub(in crate::gui) fn wake_floating(&self, cx: &mut gpui::App) {
+        if let Some(float) = self.floating.get() {
+            float.update(cx, |_, cx| cx.notify());
+        }
+    }
+}
+
 /// One signed-in account, and how others see us on it.
 #[derive(Clone, PartialEq)]
 pub(in crate::gui) struct Own {
@@ -92,6 +101,8 @@ pub(in crate::gui) struct Own {
     pub me: String,
     pub presence: Presence,
     pub status: String,
+    pub status_emoji: String,
+    pub status_until: Option<i64>,
     pub avatar: Option<MediaFile>,
     pub can: protocol::Capabilities,
 }
@@ -263,13 +274,18 @@ pub fn presence_slot(shell: &Shell, person: &Key) -> Presence {
     shell.people_state.hub.presence_of(person)
 }
 
-/// The layout's typing slot: what a direct row says while someone is typing in it.
+/// The layout's typing slot: what a row says while someone is typing, recording, or uploading in it.
 pub fn typing_slot(shell: &Shell, conversation: &Key) -> Option<SharedString> {
     let typists = shell.people_state.hub.typists_in(conversation);
-    let names: Vec<&str> = typists.iter().map(|typist| typist.name.as_str()).collect();
     // CONTRACT: the slot is handed a key, not the row, so a group cannot be told from a direct
-    // conversation here; two typists can only be a group.
-    typing_preview(&names, names.len() > 1).map(SharedString::from)
+    // conversation here unless it is open; two typists can only be a group.
+    let group = typists.len() > 1
+        || shell
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.open.as_ref())
+            .is_some_and(|open| open.key == *conversation && open.kind != protocol::ConversationKind::Direct);
+    typing_preview_for(&typists, group).map(SharedString::from)
 }
 
 fn draw_members(shell: &Shell, _: &mut Window, cx: &mut Context<Shell>) -> AnyElement {
@@ -360,6 +376,8 @@ impl Shell {
                     me: account.me.clone(),
                     presence: account.presence,
                     status: account.status.clone(),
+                    status_emoji: account.status_emoji.clone(),
+                    status_until: account.status_until,
                     avatar: account.avatar.clone(),
                     can: account.can,
                 })
@@ -396,9 +414,28 @@ impl Shell {
         self.people_state.hub.changed(change, cx);
         let state = &self.people_state;
         match change {
-            Change::People { account } => {
-                if let Some(list) = state.list.get() {
-                    list.update(cx, |list, cx| list.people_changed(account, cx));
+            Change::People { account, person } => {
+                // A list refresh is account-wide. A note from another device names one person
+                // and must not refetch every open card or restart the people list.
+                if person.is_none() {
+                    if let Some(list) = state.list.get() {
+                        list.update(cx, |list, cx| list.people_changed(account, cx));
+                    }
+                } else if let Some(who) = person {
+                    if let Some(floating) = state.floating.get() {
+                        floating.update(cx, |floating, cx| {
+                            if floating.card_person() == Some(who) {
+                                floating.refresh_profile(account, cx);
+                            }
+                        });
+                    }
+                    if let Some(info) = state.info.get() {
+                        info.update(cx, |info, cx| {
+                            if info.person() == Some(who) {
+                                info.refresh_profile(account, cx);
+                            }
+                        });
+                    }
                 }
             }
             Change::Members { conversation } => {
@@ -555,6 +592,7 @@ impl Shell {
     }
 
     fn open_row_menu(&mut self, person: Key, anchor: Point<Pixels>, cx: &mut Context<Self>) {
+        self.ask_person_apps(&person, cx);
         let floating = self.floating_entity(cx);
         floating.update(cx, |floating, cx| floating.open(Float::Menu(person), anchor, cx));
         cx.notify();
@@ -820,7 +858,7 @@ mod tests {
             shared: false,
             encryption: protocol::Encryption::Unknown,
             draft: String::new(),
-            folders: Vec::new(), archived: false, pin: None, hidden: false, followed: false, bot: false, meeting: false, special: Default::default(), mark: None, topic_icon: None, opted_out: false, quiet: false, preview_from: String::new(), preview_mine: false, seen: false, delivered: false, sending: false, max_file_bytes: 0, read_only_reason: String::new(), spam: false, rights: Default::default(), disappearing: None, moderate: false, can_pin: false, joined: true,
+            folders: Vec::new(), archived: false, pin: None, hidden: false, followed: false, bot: false, meeting: false, special: Default::default(), mark: None, topic_icon: None, opted_out: false, quiet: false, preview_from: String::new(), preview_mine: false, seen: false, delivered: false, sending: false, max_file_bytes: 0, read_only_reason: String::new(), spam: false, rights: Default::default(), disappearing: None, moderate: false, can_pin: false, joined: true, slowmode_seconds: 0, slowmode_until: None, locked: false, age_restricted: false, tags: Vec::new(), message_count: 0, total_message_sent: 0, thumbnail: None, reaction: String::new(), owner: String::new(), voice_notes_forbidden: String::new(),
         }
     }
 

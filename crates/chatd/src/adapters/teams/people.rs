@@ -1315,7 +1315,7 @@ impl Teams {
             let owned = id == self.me() || self.state().partners.contains_key(id);
             self.ctx.presence(id, presence_of(presence["availability"].as_str().unwrap_or("")), &status, owned);
             let kind = doing(doing_now);
-            self.ctx.activity(id, "", kind.map(|kind| Activity { kind, name: String::new(), place: String::new(), conversation: None }), owned);
+            self.ctx.activity(id, "", kind.map(|kind| Activity::new(kind, "")), owned);
             self.save_away(id, ooo);
         }
     }

@@ -10,8 +10,8 @@ use super::{call, composer, conversation, people};
 use crate::client::ask;
 use gpui::{Context, FocusHandle, Subscription, Task, Window};
 use protocol::{
-    AccountKey, AccountStatus, Call, Change, Conversation, ErrorCode, Group, Key, Link, MediaFile,
-    Network, NetworkStatus, Occupants, Page, Relation, Request, Response, Space,
+    AccountKey, AccountStatus, AppCommand, Call, Change, CommandKind, Conversation, ErrorCode, Group, Key, Link,
+    MediaFile, Network, NetworkStatus, Occupants, Page, Relation, Request, Response, Space,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -150,6 +150,7 @@ struct Dirty {
     spaces: bool,
     inbox: bool,
     trees: HashSet<Key>,
+    events: HashSet<Key>,
     rows: Vec<Key>,
 }
 
@@ -170,6 +171,9 @@ impl Dirty {
             Change::Tree { space } => {
                 self.trees.insert(space.clone());
             }
+            Change::Events { space } => {
+                self.events.insert(space.clone());
+            }
             Change::Messages { .. }
             | Change::People { .. }
             | Change::Media { .. }
@@ -187,7 +191,9 @@ impl Dirty {
             | Change::Settings
             | Change::Meter { .. }
             | Change::Open { .. }
-            | Change::Tiny { .. } => {}
+            | Change::Tiny { .. }
+            | Change::InteractionModal { .. }
+            | Change::InteractionFailed { .. } => {}
             Change::Folders { .. } => self.spaces = true,
         }
     }
@@ -212,6 +218,12 @@ pub struct Shell {
     /// Files that landed after the row naming them was read.
     media: HashMap<(AccountKey, String), PathBuf>,
     media_asked: HashSet<(AccountKey, String)>,
+    /// Discord message-menu commands already fetched, by conversation. Empty until the first menu.
+    pub(in crate::gui) message_commands: HashMap<Key, Vec<AppCommand>>,
+    /// Discord person-menu commands already fetched, by the open conversation.
+    pub(in crate::gui) user_commands: HashMap<Key, Vec<AppCommand>>,
+    message_commands_asked: HashSet<Key>,
+    user_commands_asked: HashSet<Key>,
     /// When each account's link was first seen down, for the banner's threshold.
     pub(super) trouble: HashMap<AccountKey, Instant>,
     /// The window's top left corner in screen points, as last drawn: where sign-in opens.
@@ -238,6 +250,12 @@ pub struct Shell {
     pub(super) playing_state: super::playing::State,
     /// The Tiny server on show.
     pub(super) tiny_state: super::tiny::State,
+    /// Discord server settings overlay, when open.
+    pub(super) discord_settings: super::discord_settings::State,
+    /// Discord admin modals (permissions, audit log, AutoMod & safety).
+    pub(super) discord_admin_state: super::discord_admin::State,
+    /// Discord server management modal (webhooks, integrations, emoji & stickers).
+    pub(super) discord_admin: super::discord_manage::State,
 
     /// chatd as the shell sees it: starting, live, reconnecting, given up; the keychain.
     pub(super) service: Service,
@@ -300,6 +318,10 @@ impl Shell {
             trees: HashMap::new(),
             media: HashMap::new(),
             media_asked: HashSet::new(),
+            message_commands: HashMap::new(),
+            user_commands: HashMap::new(),
+            message_commands_asked: HashSet::new(),
+            user_commands_asked: HashSet::new(),
             trouble: HashMap::new(),
             window_at: Cell::new(None),
             focus: cx.focus_handle(),
@@ -322,6 +344,9 @@ impl Shell {
             call_state: call::State::default(),
             playing_state: super::playing::State::default(),
             tiny_state: super::tiny::State::new(cx),
+            discord_settings: super::discord_settings::State::default(),
+            discord_admin_state: super::discord_admin::State::default(),
+            discord_admin: super::discord_manage::State::default(),
             service: Service::new(!cfg!(feature = "gui-shot") || std::env::args().any(|arg| arg == "--start-chatd")),
             crashed: app::crash::relaunched_after(),
             restore: Some((prefs.open.clone(), prefs.mode.clone())),
@@ -355,6 +380,96 @@ impl Shell {
         }
         super::lock::note_active(shell.active);
         shell
+    }
+
+    /// Fetches Discord's message or person commands for one conversation, once.
+    /// The menu that is already open redraws when the list arrives.
+    pub(in crate::gui) fn ask_app_commands(&mut self, conversation: Key, kind: CommandKind, cx: &mut Context<Self>) {
+        if conversation.network != Network::Discord || !matches!(kind, CommandKind::User | CommandKind::Message) {
+            return;
+        }
+        if super::people::only_draws() {
+            return;
+        }
+        let fresh = match kind {
+            CommandKind::User => self.user_commands_asked.insert(conversation.clone()),
+            CommandKind::Message => self.message_commands_asked.insert(conversation.clone()),
+            CommandKind::ChatInput => return,
+        };
+        if !fresh {
+            return;
+        }
+        let request = Request::Commands { conversation: conversation.clone(), query: String::new(), kind: Some(kind) };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let Ok(Response::Commands { commands }) = answer else {
+                // A refusal or a dropped answer must not stick, or the next Apps open never asks again.
+                let _ = this.update(cx, |this, _| match kind {
+                    CommandKind::User => {
+                        this.user_commands_asked.remove(&conversation);
+                    }
+                    CommandKind::Message => {
+                        this.message_commands_asked.remove(&conversation);
+                    }
+                    CommandKind::ChatInput => {}
+                });
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                match kind {
+                    CommandKind::User => {
+                        this.user_commands.insert(conversation, commands);
+                    }
+                    CommandKind::Message => {
+                        this.message_commands.insert(conversation, commands);
+                    }
+                    CommandKind::ChatInput => {}
+                }
+                this.conversation_state.wake_panes(cx);
+                this.people_state.wake_floating(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The open Discord conversation, when `person` is on that account. User commands run there.
+    pub(in crate::gui) fn ask_person_apps(&mut self, person: &Key, cx: &mut Context<Self>) {
+        let Some(open) = self.snapshot.as_ref().and_then(|snapshot| snapshot.open.as_ref()) else {
+            return;
+        };
+        if open.key.network == Network::Discord && open.key.account() == person.account() {
+            self.ask_app_commands(open.key.clone(), CommandKind::User, cx);
+        }
+    }
+
+    /// Runs one context-menu command against a message or a person. A refusal is a toast.
+    pub(in crate::gui) fn run_app_command(&mut self, conversation: Key, command: AppCommand, target: String, cx: &mut Context<Self>) {
+        let request = Request::RunCommand {
+            conversation,
+            command_id: command.id,
+            application_id: command.application_id,
+            version: command.version,
+            kind: command.kind,
+            name: command.name,
+            arguments: Vec::new(),
+            target_id: Some(target),
+            files: Vec::new(),
+        };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let detail = match answer {
+                Ok(Response::Error { detail, .. }) => Some(detail),
+                Err(_) => Some("Couldn't run that command.".to_owned()),
+                _ => None,
+            };
+            if let Some(detail) = detail {
+                let _ = this.update(cx, |this, cx| {
+                    this.toast(Some(("icons/circle-alert.svg", super::theme::danger())), detail, cx);
+                });
+            }
+        })
+        .detach();
     }
 
     /// Open at login (G1): while the switch is on, the sign-in entry is rewritten with this
@@ -553,6 +668,7 @@ impl Shell {
             spaces: true,
             inbox: true,
             trees: self.trees.keys().cloned().collect(),
+            events: HashSet::new(),
             rows: self.open.iter().cloned().collect(),
         };
         self.reload(dirty, cx);
@@ -620,6 +736,13 @@ impl Shell {
         for space in dirty.trees {
             if self.trees.contains_key(&space) {
                 self.load_tree(space, cx);
+            }
+        }
+        for space in dirty.events {
+            let viewing = matches!(&self.sidebar_state.mode, super::sidebar::Mode::Space(shown) if shown == &space)
+                || self.sidebar_state.events_modal.as_ref().is_some_and(|m| m.space == space);
+            if viewing {
+                self.load_space_events(space, cx);
             }
         }
         let mut directs = false;
@@ -1014,7 +1137,7 @@ impl Shell {
             }
         }
         for (account, ids) in wanted {
-            let request = Request::Fetch { retry: false, size: None, account: account.clone(), ids };
+            let request = Request::Fetch { retry: false, size: None, account: account.clone(), ids, span: None };
             self.off_thread(cx, move || ask(&request), move |this, answer, cx| {
                 if let Ok(Response::Media { files }) = answer {
                     for file in &files {
@@ -1126,6 +1249,7 @@ mod tests {
             spaces: false,
             inbox: true,
             trees: HashSet::from([key("server")]),
+            events: HashSet::new(),
             rows: vec![key("a")],
         };
         assert_eq!(dirty, expected);
@@ -1200,6 +1324,7 @@ mod tests {
             },
             Change::People {
                 account: account.clone(),
+                person: None,
             },
             Change::Media {
                 account,

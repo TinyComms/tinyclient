@@ -11,7 +11,8 @@
 //!
 //! Keys: ↓ from the search goes into the grid; arrows move by cell (↑↓ to the nearest cell of
 //! the next row, keeping the column); Page Up/Down and ⌘↑/⌘↓ go by section; Return chooses and
-//! closes, ⇧Return chooses and keeps it open; F stars the chosen GIF or sticker (`kept`).
+//! closes, ⇧Return chooses and keeps it open; F stars the chosen GIF or sticker (`kept`), or on
+//! Discord writes the account's favourite list. A right-click there does the same.
 
 pub mod emoji;
 mod kept;
@@ -24,7 +25,7 @@ pub(in crate::gui) use crate::gui::conversation::images;
 use palette::IntoColor;
 use crate::frames;
 use crate::gui::anim::{self, Play};
-use crate::gui::components::{field, glyph, segment, segmented};
+use crate::gui::components::{field, glyph, menu, menu_item, placed, segment, segmented, Layer, Place};
 use crate::gui::input::{self, InputEvent, InputGrid, InputKey, TextInput};
 use crate::gui::people::ask_later;
 use crate::gui::theme::{self, Type};
@@ -177,7 +178,17 @@ pub struct Picker {
     /// Files asked for once, so a still that has not landed is not asked again each frame.
     fetched: HashSet<String>,
     scroll: UniformListScrollHandle,
+    /// A right-click on Discord: favourite or unfavourite this emoji or sticker.
+    menu: Option<FavMenu>,
     _listening: Vec<Subscription>,
+}
+
+#[derive(Clone)]
+struct FavMenu {
+    at: gpui::Point<gpui::Pixels>,
+    kind: CatalogKind,
+    id: String,
+    on: bool,
 }
 
 impl Picker {
@@ -299,6 +310,7 @@ impl Picker {
             images: Images::with_limits(frames::SMALL),
             fetched: HashSet::new(),
             scroll: UniformListScrollHandle::new(),
+            menu: None,
             _listening: vec![changed, keys, grid, released],
         };
         picker.switch(tab, cx);
@@ -365,6 +377,7 @@ impl Picker {
             return;
         }
         self.tab = tab;
+        self.menu = None;
         self.select(None, cx);
         self.hovered = None;
         self.hovered_item = None;
@@ -428,7 +441,7 @@ impl Picker {
                         let _ = this.update(cx, |this, cx| this.ask(Tab::Gifs, wanted, None, cx));
                     }));
                 }
-                let sectioned = self.gifs.answered.is_empty();
+                let sectioned = self.gifs.answered.is_empty() || self.gifs.items.iter().any(|item| !item.pack.is_empty());
                 self.set_lines(gif_lines(&self.gifs.items, self.width - 2. * PAD, sectioned, &self.favorites));
             }
             Tab::Stickers => {
@@ -479,12 +492,16 @@ impl Picker {
     fn answered(&mut self, tab: Tab, query: String, more: bool, answer: std::io::Result<Response>, cx: &mut Context<Self>) {
         if tab == Tab::Emoji {
             if let Ok(Response::Catalog { items, .. }) = answer {
-                let customs = items.into_iter().map(|item| Custom {
-                    name: if item.name.starts_with(':') { item.name } else { format!(":{}:", item.name) },
-                    id: item.id,
-                    file: item.file,
-                    pack: item.pack,
-                    animated: item.animated,
+                let customs = items.into_iter().map(|item| {
+                    // A Unicode favourite has no file. Wrapping it as `:glyph:` would draw a blank tile.
+                    let glyph = item.file.is_none() && !item.name.starts_with(':') && !item.id.starts_with("emoji:");
+                    Custom {
+                        name: if glyph || item.name.starts_with(':') { item.name } else { format!(":{}:", item.name) },
+                        id: if glyph { String::new() } else { item.id },
+                        file: item.file,
+                        pack: item.pack,
+                        animated: item.animated,
+                    }
                 });
                 self.customs = customs.collect();
                 // Every picture is asked for as the tab opens, so it shows as soon as it lands.
@@ -494,12 +511,16 @@ impl Picker {
             }
             return;
         }
+        let discord_stickers = tab == Tab::Stickers && self.setup.network == Some(Network::Discord);
+        let discord_gifs = tab == Tab::Gifs && self.setup.network == Some(Network::Discord);
+        let account = self.setup.account.clone();
         let catalog = self.catalog(tab);
         if catalog.asking.as_ref() != Some(&query) {
             return;
         }
         catalog.asking = None;
         let mut want = None;
+        let mut account_favorites = None;
         match answer {
             Ok(Response::Catalog { items, cursor }) => {
                 if !more {
@@ -510,11 +531,36 @@ impl Picker {
                 catalog.cursor = cursor;
                 catalog.answered = query;
                 catalog.failed = None;
+                if discord_stickers {
+                    account_favorites = Some(
+                        catalog.items.iter().filter(|item| item.pack == "Favorites").map(|item| item.id.clone()).collect(),
+                    );
+                }
+                if discord_gifs {
+                    let on_account: Vec<String> = catalog.items.iter().filter(|item| item.pack == "Favorites").map(|item| item.id.clone()).collect();
+                    account_favorites = Some(on_account);
+                }
             }
             Ok(Response::Error { code: ErrorCode::Offline, .. }) => catalog.failed = Some("offline".into()),
             Ok(Response::Error { detail, .. }) => catalog.failed = Some(detail),
             Ok(_) => catalog.failed = Some(String::new()),
             Err(_) => catalog.failed = Some("tinyclient's background process is not answering.".into()),
+        }
+        if let Some(favorites) = account_favorites {
+            if discord_gifs {
+                // Sticker ids stay. Page addresses move to the account once, then leave this list.
+                let already = favorites;
+                self.favorites.retain(|id| !(id.starts_with("http://") || id.starts_with("https://")));
+                if let Some(account) = account {
+                    for id in kept::take_gif_stars(&account) {
+                        if !already.iter().any(|held| held == &id) {
+                            self.favourite(CatalogKind::Gifs, &id, true, cx);
+                        }
+                    }
+                }
+            } else {
+                self.favorites = favorites;
+            }
         }
         if let Some(want) = want {
             let edge = if tab == Tab::Gifs { GIF_ROW * 2. } else { STICKER * 2. };
@@ -551,7 +597,7 @@ impl Picker {
         if ids.is_empty() {
             return;
         }
-        let request = Request::Fetch { account, ids, size: Some(edge), retry: false };
+        let request = Request::Fetch { account, ids, size: Some(edge), retry: false, span: None };
         let this = cx.weak_entity();
         ask_later(cx, request, move |answer, cx| {
             if let Ok(Response::Media { files }) = answer {
@@ -615,6 +661,14 @@ impl Picker {
             return;
         }
         let id = item.id.clone();
+        if tab == Tab::Gifs {
+            if let Some(term) = id.strip_prefix("cat:") {
+                let term = term.to_owned();
+                self.input.update(cx, |input, cx| input.set_text(&term, cx));
+                self.requery(cx);
+                return;
+            }
+        }
         if let (Tab::Stickers, Some(account)) = (tab, &self.setup.account) {
             kept::sent_sticker(account, &id);
             self.recent_stickers = kept::list(account, Kept::RecentStickers);
@@ -745,8 +799,28 @@ impl Picker {
     }
 
     /// F, or the star on a cell: a GIF or sticker into Favorites or out of it. The keyboard's
-    /// cell follows it to where it now sits.
+    /// cell follows it to where it now sits. Discord writes the account's sticker list.
     fn star(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if self.setup.network == Some(Network::Discord) && self.tab == Tab::Stickers {
+            let Some(id) = self.stickers.items.get(ix).map(|item| item.id.clone()) else {
+                return;
+            };
+            let on = !self.favorites.contains(&id);
+            self.favourite(CatalogKind::Stickers, &id, on, cx);
+            return;
+        }
+        if self.setup.network == Some(Network::Discord) && self.tab == Tab::Gifs {
+            let Some(item) = self.gifs.items.get(ix) else {
+                return;
+            };
+            if item.id.starts_with("cat:") {
+                return;
+            }
+            let on = item.pack != "Favorites";
+            let id = item.id.clone();
+            self.favourite(CatalogKind::Gifs, &id, on, cx);
+            return;
+        }
         let Some(account) = self.setup.account.clone() else {
             return;
         };
@@ -833,11 +907,88 @@ impl Picker {
 
     fn star_selected(&mut self, cx: &mut Context<Self>) {
         if self.tab == Tab::Emoji {
+            if self.setup.network == Some(Network::Discord) {
+                if let Some(cell) = self.selected_cell() {
+                    if let Some((id, on)) = self.fav_target(&cell) {
+                        self.favourite(CatalogKind::Emoji, &id, !on, cx);
+                    }
+                }
+            }
             return;
         }
         if let Some(ix) = self.selected.and_then(|(row, column)| self.lines.get(row)?.items.get(column).map(|(ix, _)| *ix)) {
             self.star(ix, cx);
         }
+    }
+
+    /// Discord's account favourite: emoji, stickers, and GIFs.
+    fn favourite(&mut self, kind: CatalogKind, id: &str, on: bool, cx: &mut Context<Self>) {
+        let Some(account) = self.setup.account.clone() else {
+            return;
+        };
+        let id = id.to_owned();
+        let request = Request::Favourite { account, kind, id, on };
+        let refresh = match kind {
+            CatalogKind::Emoji => Tab::Emoji,
+            CatalogKind::Stickers => Tab::Stickers,
+            CatalogKind::Gifs => Tab::Gifs,
+        };
+        let query = if refresh == Tab::Emoji { String::new() } else { self.query(cx) };
+        let this = cx.weak_entity();
+        ask_later(cx, request, move |answer, cx| {
+            if matches!(answer, Ok(Response::Ok)) {
+                let _ = this.update(cx, |this, cx| match refresh {
+                    Tab::Emoji => {
+                        this.custom_asked = true;
+                        this.ask(Tab::Emoji, String::new(), None, cx);
+                    }
+                    Tab::Stickers => this.ask(Tab::Stickers, query, None, cx),
+                    Tab::Gifs => this.ask(Tab::Gifs, query, None, cx),
+                });
+            }
+        });
+    }
+
+    fn fav_target(&self, cell: &Cell) -> Option<(String, bool)> {
+        match cell {
+            Cell::Custom(ix) => {
+                let custom = self.customs.get(*ix as usize)?;
+                let id = if custom.id.is_empty() { custom.name.clone() } else { custom.id.clone() };
+                if id.is_empty() {
+                    return None;
+                }
+                let on = custom.pack == "Favorites" || self.emoji_favoured(&id, &custom.name);
+                Some((id, on))
+            }
+            Cell::Glyph(glyph) => Some((glyph.clone(), self.emoji_favoured(glyph, glyph))),
+            Cell::Unicode(_) => {
+                let glyph = emoji::text_of(cell, self.tone, &self.customs);
+                if glyph.is_empty() {
+                    None
+                } else {
+                    Some((glyph.clone(), self.emoji_favoured(&glyph, &glyph)))
+                }
+            }
+        }
+    }
+
+    fn emoji_favoured(&self, id: &str, name: &str) -> bool {
+        self.customs.iter().any(|custom| {
+            custom.pack == "Favorites"
+                && (custom.id == id || custom.name == name || custom.name == id || (!id.is_empty() && custom.id == id))
+        })
+    }
+
+    fn open_emoji_menu(&mut self, cell: &Cell, at: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        if self.setup.network != Some(Network::Discord) {
+            return;
+        }
+        let Some((id, on)) = self.fav_target(cell) else {
+            return;
+        };
+        cx.stop_propagation();
+        self.menu = Some(FavMenu { at, kind: CatalogKind::Emoji, id, on });
+        cx.notify();
     }
 
     fn jump(&mut self, section: usize, cx: &mut Context<Self>) {
@@ -1219,6 +1370,7 @@ impl Picker {
                         };
                         let picked = cell.clone();
                         let hovered = cell.clone();
+                        let menu_cell = cell.clone();
                         line = line.child(
                             div()
                                 .id(("cell", ix * COLUMNS + column))
@@ -1237,6 +1389,12 @@ impl Picker {
                                         cx.notify();
                                     }
                                 }))
+                                .on_mouse_down(
+                                    gpui::MouseButton::Right,
+                                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                        this.open_emoji_menu(&menu_cell, event.position, cx);
+                                    }),
+                                )
                                 .on_click(cx.listener(move |this, _, _, cx| this.emit_cell(&picked, false, cx)))
                                 .child(shown),
                         );
@@ -1304,7 +1462,11 @@ impl Picker {
             let (w, h) = if gifs { (width, GIF_ROW) } else { (STICKER, STICKER) };
             let selected = self.selected == Some((ix, column));
             let hovered = self.hovered_item == Some(at);
-            let starred = self.favorites.contains(&item.id);
+            let starred = if gifs && self.setup.network == Some(Network::Discord) {
+                item.pack == "Favorites"
+            } else {
+                self.favorites.contains(&item.id)
+            };
             let path = item.file.as_ref().and_then(|file| file.path.clone());
             let tile = || div().size_full().rounded(px(theme::R_CONTROL)).bg(theme::raised()).into_any_element();
             let picture = match (&path, &item.file) {
@@ -1328,6 +1490,7 @@ impl Picker {
                 }
                 (None, None) => tile(),
             };
+            let fav_id = item.id.clone();
             let saved_on_net = gifs && self.setup.save_gif && item.pack == "Saved";
             let star_tip = if saved_on_net {
                 "Remove GIF"
@@ -1378,6 +1541,26 @@ impl Picker {
                     .when(selected || hovered, |cell| cell.border_2().border_color(if selected { theme::focus() } else { theme::border_strong() }))
                     .when(!gifs, |cell| cell.hover(|style| style.bg(theme::selected())))
                     .on_hover(cx.listener(move |this, on: &bool, _, cx| this.hover_item(at, *on, cx)))
+                    .on_mouse_down(
+                        gpui::MouseButton::Right,
+                        cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                            let discord = this.setup.network == Some(Network::Discord);
+                            let stickers = this.tab == Tab::Stickers;
+                            let gif = this.tab == Tab::Gifs && !fav_id.starts_with("cat:");
+                            if !discord || (!stickers && !gif) {
+                                return;
+                            }
+                            cx.stop_propagation();
+                            let on = if gif {
+                                this.gifs.items.iter().any(|item| item.id == fav_id && item.pack == "Favorites")
+                            } else {
+                                this.favorites.contains(&fav_id)
+                            };
+                            let kind = if stickers { CatalogKind::Stickers } else { CatalogKind::Gifs };
+                            this.menu = Some(FavMenu { at: event.position, kind, id: fav_id.clone(), on });
+                            cx.notify();
+                        }),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| this.emit_item(at, false, cx)))
                     .child(picture)
                     .children(star),
@@ -1563,6 +1746,14 @@ fn sticker_lines(items: &[CatalogItem], query: &str, pack: Option<&str>, favorit
             .filter(|(_, item)| item.pack == name && (query.is_empty() || item.name.to_lowercase().contains(&query) || name.to_lowercase().contains(&query)))
             .map(|(ix, _)| ix)
             .collect();
+        // Discord already drew these ids in the leading Favorites section.
+        let covered = query.is_empty()
+            && pack.is_none()
+            && name == "Favorites"
+            && shown.iter().all(|ix| favorites.contains(&items[*ix].id));
+        if covered {
+            continue;
+        }
         let label = format!("{} · {}", if name.is_empty() { "Stickers" } else { name }, shown.len());
         section(&mut lines, label, &shown);
     }
@@ -1576,9 +1767,30 @@ impl Focusable for Picker {
 }
 
 impl Render for Picker {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.images.begin_frame();
         let this = cx.entity();
+        let fav_menu = self.menu.clone().map(|open| {
+            let label = if open.on { "Unfavourite" } else { "Favourite" };
+            let kind = open.kind;
+            let id = open.id.clone();
+            let turn_on = !open.on;
+            placed(
+                "picker-fav-menu",
+                Place::Pointer(open.at),
+                Layer::Menu,
+                window,
+                menu().child(
+                    menu_item("picker-fav", Some("icons/star.svg"), label, None)
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.menu = None;
+                            this.favourite(kind, &id, turn_on, cx);
+                        })),
+                ),
+            )
+        });
         let tabs = self.tabs_band(cx);
         let strip = self.strip_band(cx);
         let bands = tabs.as_ref().map_or(6., |_| TABS) + SEARCH + strip.as_ref().map_or(0., |_| STRIP) + FOOTER;
@@ -1606,14 +1818,25 @@ impl Render for Picker {
             .flex_col()
             .on_action(cx.listener(|this, _: &input::Tab, _, cx| this.cycle(cx)))
             .on_action(cx.listener(|this, _: &input::Star, _, cx| this.star_selected(cx)))
-            // F stars only while a GIF or sticker is chosen; otherwise it is typed.
-            .when(self.tab != Tab::Emoji && self.selected.is_some() && self.setup.account.is_some(), |picker| picker.key_context("PickerGrid"))
+            .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _, cx| {
+                if this.menu.take().is_some() {
+                    cx.notify();
+                }
+            }))
+            // F stars only while a cell is chosen; otherwise it is typed. Discord emoji uses it too.
+            .when(
+                self.selected.is_some()
+                    && self.setup.account.is_some()
+                    && (self.tab != Tab::Emoji || self.setup.network == Some(Network::Discord)),
+                |picker| picker.key_context("PickerGrid"),
+            )
             .children(tabs)
             .when(self.setup.tabs.len() < 2, |picker| picker.pt(px(6.)))
             .child(self.search_band())
             .children(strip)
             .child(grid)
             .child(self.footer_band(cx))
+            .children(fav_menu)
             // After the cells are laid out: frames of cells scrolled away go.
             .child(canvas(|_, _, _| (), move |_, (), window, cx| this.update(cx, |this, cx| this.images.sweep(window, cx))).absolute().size_0())
     }
@@ -1673,6 +1896,23 @@ mod tests {
         let last = lines.last().unwrap();
         assert!(last.items.iter().all(|(_, w)| *w <= 3. * GIF_ROW));
         assert!(gif_lines(&[], 332., true, &[]).is_empty());
+    }
+
+    #[test]
+    fn gif_sections_follow_the_packs_the_network_sent() {
+        let item = |id: &str, pack: &str| CatalogItem { id: id.into(), name: id.into(), file: None, pack: pack.into(), animated: false, set: String::new(), locked: false };
+        let home = vec![
+            item("https://tenor.com/view/fav", "Favorites"),
+            item("cat:happy", "Categories"),
+            item("https://tenor.com/view/trend", "Trending"),
+        ];
+        let lines = gif_lines(&home, 400., true, &[]);
+        let labels: Vec<&str> = lines.iter().filter_map(|line| line.label.as_deref()).collect();
+        assert_eq!(labels, ["Favorites", "Categories", "Trending"]);
+        let search = vec![item("https://tenor.com/view/wave-0", ""), item("cat:otter", "Suggestions")];
+        let lines = gif_lines(&search, 400., true, &[]);
+        assert!(lines[0].label.is_none(), "search hits stay unlabeled");
+        assert_eq!(lines.iter().filter_map(|line| line.label.as_deref()).collect::<Vec<_>>(), ["Suggestions"]);
     }
 
     #[test]
@@ -1754,5 +1994,19 @@ mod tests {
         assert_eq!(lines[3].items, [(6, STICKER)]);
         assert_eq!(lines[4].label.as_deref(), Some("Forest Friends · 6"));
         assert!(sticker_lines(&items, "", Some("Foxes"), &["x".to_owned()], &["2".to_owned()])[0].label.as_deref() == Some("Foxes · 1"));
+    }
+
+    #[test]
+    fn a_favorites_pack_is_not_listed_twice_when_its_ids_already_lead() {
+        let sticker = |id: &str, name: &str, pack: &str| CatalogItem { id: id.into(), name: name.into(), file: None, pack: pack.into(), animated: false, set: String::new(), locked: false };
+        let items = vec![sticker("a", "wave", "Favorites"), sticker("b", "dance", "Frequently used"), sticker("c", "hi", "Forest Friends")];
+        let lines = sticker_lines(&items, "", None, &["a".into()], &[]);
+        let labels: Vec<&str> = lines.iter().filter_map(|line| line.label.as_deref()).collect();
+        assert_eq!(labels.iter().filter(|label| label.starts_with("Favorites")).count(), 1);
+        assert!(labels.iter().any(|label| label.starts_with("Frequently used")));
+        assert!(labels.iter().any(|label| label.starts_with("Forest Friends")));
+        // A pack named Favorites whose ids are not the account list still shows.
+        let other = sticker_lines(&items, "", None, &[], &[]);
+        assert!(other.iter().any(|line| line.label.as_deref() == Some("Favorites · 1")));
     }
 }

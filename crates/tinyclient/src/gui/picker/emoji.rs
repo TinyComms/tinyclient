@@ -104,6 +104,15 @@ pub fn find(glyph: &str) -> Option<usize> {
     EMOJI.iter().position(|emoji| bare(emoji.glyph).eq(wanted.iter().copied()))
 }
 
+/// A Unicode favourite from the account: no picture, so it draws as text rather than a blank tile.
+fn account_glyph(custom: &Custom) -> Option<&str> {
+    if custom.file.is_none() && !custom.name.starts_with(':') && !custom.id.starts_with("emoji:") {
+        Some(custom.name.as_str()).filter(|name| !name.is_empty())
+    } else {
+        None
+    }
+}
+
 fn chunked(rows: &mut Vec<Row>, cells: Vec<Cell>) {
     for chunk in cells.chunks(COLUMNS) {
         rows.push(Row::Cells(chunk.to_vec()));
@@ -130,7 +139,9 @@ pub fn browse(recent: &[String], customs: &[Custom]) -> (Vec<Row>, Sections) {
             }),
         })
         .collect();
-    if !recent.is_empty() {
+    // The account's own sections replace the local recent row, so "Frequently used" is not drawn twice.
+    let account_sections = customs.iter().any(|custom| custom.pack == "Favorites" || custom.pack == "Frequently used");
+    if !recent.is_empty() && !account_sections {
         sections.push(("Frequently used".to_owned(), rows.len()));
         rows.push(Row::Label("Frequently used".to_owned()));
         chunked(&mut rows, recent);
@@ -145,7 +156,15 @@ pub fn browse(recent: &[String], customs: &[Custom]) -> (Vec<Row>, Sections) {
         let label = if pack.is_empty() { "Custom".to_owned() } else { pack.to_owned() };
         sections.push((label.clone(), rows.len()));
         rows.push(Row::Label(label));
-        let cells = customs.iter().enumerate().filter(|(_, custom)| custom.pack == pack).map(|(ix, _)| Cell::Custom(ix as u32)).collect();
+        let cells = customs
+            .iter()
+            .enumerate()
+            .filter(|(_, custom)| custom.pack == pack)
+            .map(|(ix, custom)| match account_glyph(custom) {
+                Some(glyph) => Cell::Glyph(glyph.to_owned()),
+                None => Cell::Custom(ix as u32),
+            })
+            .collect();
         chunked(&mut rows, cells);
     }
     for (group, label) in GROUPS.iter().enumerate() {
@@ -183,6 +202,12 @@ pub fn search(query: &str, recent: &[String], customs: &[Custom], limit: usize) 
     let used = |text: &str| recent.iter().position(|held| held == text).unwrap_or(usize::MAX);
     let mut found: Vec<(u8, usize, usize, Cell)> = Vec::new();
     for (ix, custom) in customs.iter().enumerate() {
+        if let Some(glyph) = account_glyph(custom) {
+            if glyph.to_lowercase().contains(&query) {
+                found.push((0, used(glyph), ix, Cell::Glyph(glyph.to_owned())));
+            }
+            continue;
+        }
         let name = custom.name.trim_matches(':').to_lowercase();
         if let Some(score) = score(&name, &name.replace('_', " "), &query) {
             found.push((score, used(&custom.name), ix, Cell::Custom(ix as u32)));
@@ -555,12 +580,29 @@ mod tests {
         assert_eq!(sections.len(), GROUPS.len());
     }
 
+    #[test]
+    fn account_favorites_replace_the_local_recent_row_and_draw_as_glyphs() {
+        let customs = [
+            Custom { name: "😀".into(), id: String::new(), file: None, pack: "Favorites".into(), animated: false },
+            custom(":mossparrot:", "Rustaceans"),
+            Custom { name: "🎉".into(), id: String::new(), file: None, pack: "Frequently used".into(), animated: false },
+        ];
+        let (rows, sections) = browse(&["🚀".into()], &customs);
+        let labels: Vec<&str> = sections.iter().map(|(label, _)| label.as_str()).collect();
+        assert_eq!(labels[0], "Favorites");
+        assert_eq!(labels.iter().filter(|label| **label == "Frequently used").count(), 1);
+        assert_eq!(rows[0], Row::Label("Favorites".into()));
+        let Row::Cells(first) = &rows[1] else { panic!("cells") };
+        assert_eq!(first[0], Cell::Glyph("😀".into()));
+        assert!(rows.iter().any(|row| matches!(row, Row::Cells(cells) if cells.contains(&Cell::Custom(1)))));
+    }
+
     fn cells(rows: &[Row]) -> Vec<Cell> {
         rows.iter().flat_map(|row| if let Row::Cells(cells) = row { cells.clone() } else { Vec::new() }).collect()
     }
 
     fn on(emoji: &str, count: u32, mine: bool) -> Reaction {
-        Reaction { emoji: emoji.into(), file: None, count, mine, who: Vec::new() }
+        Reaction { emoji: emoji.into(), file: None, count, mine, who: Vec::new(), ..Reaction::default() }
     }
 
     #[test]

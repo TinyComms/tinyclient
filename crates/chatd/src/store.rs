@@ -82,6 +82,12 @@ const TABLES: &str = "
         muted    INTEGER NOT NULL DEFAULT 0,
         hide_muted INTEGER NOT NULL DEFAULT 0,
         can_create_channels INTEGER NOT NULL DEFAULT 0,
+        can_create_invites INTEGER NOT NULL DEFAULT 0,
+        rights   INTEGER NOT NULL DEFAULT 0,
+        opt_in_channels INTEGER NOT NULL DEFAULT 0,
+        can_manage_webhooks INTEGER NOT NULL DEFAULT 0,
+        can_manage_guild INTEGER NOT NULL DEFAULT 0,
+        can_manage_expressions INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (network, account, id)
     ) WITHOUT ROWID;
     -- A folder: of chats (Telegram, membership on the conversation) or of Spaces (Discord,
@@ -186,8 +192,20 @@ const TABLES: &str = "
         can_pin INTEGER NOT NULL DEFAULT 0,
         joined INTEGER NOT NULL DEFAULT 1,
         call_video INTEGER NOT NULL DEFAULT 0,
+        -- A forum post's card: tag ids as ',a,b,', counts, the first message's picture, its
+        -- strongest reaction, and who started it. Written by the post list, not by a thread row.
+        tags TEXT NOT NULL DEFAULT '',
+        message_count INTEGER NOT NULL DEFAULT 0,
+        total_message_sent INTEGER NOT NULL DEFAULT 0,
+        thumbnail TEXT NOT NULL DEFAULT '',
+        reaction TEXT NOT NULL DEFAULT '',
+        owner TEXT NOT NULL DEFAULT '',
         shared INTEGER NOT NULL DEFAULT 0,
         unread_reactions INTEGER NOT NULL DEFAULT 0,
+        slowmode_seconds INTEGER NOT NULL DEFAULT 0,
+        locked INTEGER NOT NULL DEFAULT 0,
+        age_restricted INTEGER NOT NULL DEFAULT 0,
+        voice_notes_forbidden TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (network, account, id)
     ) WITHOUT ROWID;
     CREATE INDEX conversation_threads ON conversation (network, account, parent) WHERE parent != '';
@@ -307,9 +325,12 @@ const CONVERSATION: &str = "
            (c.preview_mine AND c.delivered_to != '' AND (length(c.delivered_to), c.delivered_to) >= (length(c.preview_id), c.preview_id)),
            (c.preview_mine AND EXISTS (SELECT 1 FROM message f WHERE f.network = c.network AND f.account = c.account
                                          AND f.conversation = c.id AND f.id = c.preview_id AND f.pending = 1)),
-           c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason, c.spam, c.rights, c.disappearing, c.moderate, c.can_pin, c.joined, c.call_video, c.shared, c.unread_reactions
+           c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason, c.spam, c.rights, c.disappearing, c.moderate, c.can_pin, c.joined, c.call_video,
+           c.tags, c.message_count, c.total_message_sent, c.reaction, c.owner, c.shared, c.unread_reactions,
+           th.id, th.kind, th.width, th.height, th.bytes, th.path, th.failed, c.slowmode_seconds, c.locked, c.age_restricted, c.voice_notes_forbidden
     FROM conversation c
     LEFT JOIN media m ON m.network = c.network AND m.account = c.account AND m.id = c.avatar
+    LEFT JOIN media th ON th.network = c.network AND th.account = c.account AND th.id = c.thumbnail AND c.thumbnail != ''
     LEFT JOIN space s ON s.network = c.network AND s.account = c.account AND s.id = c.space
     LEFT JOIN section g ON g.network = c.network AND g.account = c.account AND g.space = c.space
                        AND g.id = c.section";
@@ -371,6 +392,8 @@ pub struct ConversationRow {
     pub call: CallSupport,
     /// The other side supports video calls (Telegram's `video_calls_available`).
     pub call_video: bool,
+    /// Marked age-restricted / NSFW by the network (Discord `nsfw`, inherited by threads).
+    pub age_restricted: bool,
     /// The most who may be in a voice channel at once, 0 when it has none.
     pub limit: u32,
     /// Show it in the Inbox even though it is a channel nobody mentioned me in.
@@ -416,6 +439,12 @@ pub struct ConversationRow {
     pub can_pin: bool,
     /// Whether this account has joined the conversation (`false` for an unjoined channel preview).
     pub joined: bool,
+    /// Slowmode interval in seconds (`0` when off). Exemption is `rights.slowmode_exempt`.
+    pub slowmode_seconds: u32,
+    /// Thread is locked by a moderator (Discord `thread_metadata.locked`).
+    pub locked: bool,
+    /// Why voice and round video messages are not allowed here (empty when allowed).
+    pub voice_notes_forbidden: String,
     /// How the network files it. `None` leaves what is stored, so a tree that does not know
     /// (a Slack tree reload) never undoes a pin or a follow; `Some` replaces it.
     pub filing: Option<Filing>,
@@ -432,6 +461,19 @@ pub struct Filing {
     pub pin: Option<i32>,
     pub hidden: bool,
     pub followed: bool,
+}
+
+/// What a forum post's card shows beyond the conversation row. The post list writes it. A thread
+/// update that does not know these leaves them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PostCard {
+    pub tags: Vec<String>,
+    pub message_count: u32,
+    pub total_message_sent: u32,
+    /// A media id already registered, or empty.
+    pub thumbnail: String,
+    pub reaction: String,
+    pub owner: String,
 }
 
 /// One folder as an adapter reports it. chatd counts what is in it.
@@ -495,6 +537,7 @@ impl ConversationRow {
             peer: None,
             call: CallSupport::None,
             call_video: false,
+            age_restricted: false,
             limit: 0,
             listed: false,
             topic: String::new(),
@@ -519,6 +562,9 @@ impl ConversationRow {
             moderate: false,
             can_pin: false,
             joined: true,
+            slowmode_seconds: 0,
+            locked: false,
+            voice_notes_forbidden: String::new(),
         }
     }
 }
@@ -761,8 +807,19 @@ fn conversation_from(row: &Row) -> rusqlite::Result<Conversation> {
         can_pin: row.get(57)?,
         joined: row.get(58)?,
         call_video: row.get(59)?,
-        shared: row.get(60)?,
-        unread_reactions: row.get(61)?,
+        tags: from_id_list(&row.get::<_, String>(60)?),
+        message_count: row.get(61)?,
+        total_message_sent: row.get(62)?,
+        reaction: row.get(63)?,
+        owner: row.get(64)?,
+        shared: row.get(65)?,
+        unread_reactions: row.get(66)?,
+        thumbnail: file_at(row, 67)?,
+        slowmode_seconds: row.get(74)?,
+        slowmode_until: None,
+        locked: row.get(75)?,
+        age_restricted: row.get(76)?,
+        voice_notes_forbidden: row.get(77)?,
     })
 }
 
@@ -802,7 +859,9 @@ fn person_from(row: &Row) -> rusqlite::Result<Person> {
         utc_offset: row.get(17)?,
         mark: mark_from(row.get(18)?)?,
         emoji: String::new(),
+        emoji_file: None,
         activity: None,
+        nickname: String::new(),
         role_color: None,
         role_icon: None,
         role_emoji: None,
@@ -930,9 +989,9 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
         "INSERT INTO conversation
              (network, account, id, kind, title, space, section, position, avatar, peer, call, listed,
               topic, parent, root, read_only, private, bot, meeting, special, mark, opted_out,
-              folders, archived, pin, hidden, followed, voice_limit, encryption, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin, joined, call_video, shared)
+              folders, archived, pin, hidden, followed, voice_limit, encryption, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin, joined, call_video, shared, slowmode_seconds, locked, age_restricted, voice_notes_forbidden)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41)
+                 ?20, ?21, ?22, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45)
          ON CONFLICT (network, account, id) DO UPDATE SET
              kind = excluded.kind, title = excluded.title, space = excluded.space,
              section = excluded.section, position = excluded.position, avatar = excluded.avatar,
@@ -953,6 +1012,10 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
              joined = excluded.joined,
              call_video = excluded.call_video,
              shared = excluded.shared,
+             slowmode_seconds = excluded.slowmode_seconds,
+             locked = excluded.locked,
+             age_restricted = excluded.age_restricted,
+             voice_notes_forbidden = excluded.voice_notes_forbidden,
              folders = CASE WHEN ?23 THEN excluded.folders ELSE folders END,
              archived = CASE WHEN ?23 THEN excluded.archived ELSE archived END,
              pin = CASE WHEN ?23 THEN excluded.pin ELSE pin END,
@@ -1000,6 +1063,10 @@ fn upsert_conversation(tx: &Transaction, account: &AccountKey, row: &Conversatio
             row.joined,
             row.call_video,
             row.shared,
+            row.slowmode_seconds,
+            row.locked,
+            row.age_restricted,
+            row.voice_notes_forbidden,
         ],
     )?;
     Ok(())
@@ -1087,13 +1154,50 @@ fn keep_added_columns(db: &Connection, version: i32) -> rusqlite::Result<bool> {
     if !column(db, "conversation", "call_video")? {
         db.execute_batch("ALTER TABLE conversation ADD COLUMN call_video INTEGER NOT NULL DEFAULT 0")?;
     }
+    ensure_post_columns(db)?;
     if !column(db, "conversation", "shared")? {
         db.execute_batch("ALTER TABLE conversation ADD COLUMN shared INTEGER NOT NULL DEFAULT 0")?;
     }
     if !column(db, "conversation", "unread_reactions")? {
         db.execute_batch("ALTER TABLE conversation ADD COLUMN unread_reactions INTEGER NOT NULL DEFAULT 0")?;
     }
+    if !column(db, "conversation", "slowmode_seconds")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN slowmode_seconds INTEGER NOT NULL DEFAULT 0")?;
+    }
+    if !column(db, "conversation", "locked")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN locked INTEGER NOT NULL DEFAULT 0")?;
+    }
+    if !column(db, "conversation", "age_restricted")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN age_restricted INTEGER NOT NULL DEFAULT 0")?;
+    }
+    if !column(db, "conversation", "voice_notes_forbidden")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN voice_notes_forbidden TEXT NOT NULL DEFAULT ''")?;
+    }
     Ok(true)
+}
+
+/// Forum-post columns on a cache that is already at [`SCHEMA`]. Adding them does not bump the
+/// version: a bump would drop a schema-11 cache, and these have defaults.
+fn ensure_post_columns(db: &Connection) -> rusqlite::Result<()> {
+    if !column(db, "conversation", "tags")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN tags TEXT NOT NULL DEFAULT ''")?;
+    }
+    if !column(db, "conversation", "message_count")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0")?;
+    }
+    if !column(db, "conversation", "total_message_sent")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN total_message_sent INTEGER NOT NULL DEFAULT 0")?;
+    }
+    if !column(db, "conversation", "thumbnail")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN thumbnail TEXT NOT NULL DEFAULT ''")?;
+    }
+    if !column(db, "conversation", "reaction")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN reaction TEXT NOT NULL DEFAULT ''")?;
+    }
+    if !column(db, "conversation", "owner")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN owner TEXT NOT NULL DEFAULT ''")?;
+    }
+    Ok(())
 }
 
 fn column(db: &Connection, table: &str, name: &str) -> rusqlite::Result<bool> {
@@ -1167,14 +1271,45 @@ impl Store {
         if !column(&store.db, "conversation", "call_video")? {
             store.db.execute_batch("ALTER TABLE conversation ADD COLUMN call_video INTEGER NOT NULL DEFAULT 0")?;
         }
+        ensure_post_columns(&store.db)?;
         if !column(&store.db, "conversation", "shared")? {
             store.db.execute_batch("ALTER TABLE conversation ADD COLUMN shared INTEGER NOT NULL DEFAULT 0")?;
         }
         if !column(&store.db, "conversation", "unread_reactions")? {
             store.db.execute_batch("ALTER TABLE conversation ADD COLUMN unread_reactions INTEGER NOT NULL DEFAULT 0")?;
         }
+        if !column(&store.db, "conversation", "slowmode_seconds")? {
+            store.db.execute_batch("ALTER TABLE conversation ADD COLUMN slowmode_seconds INTEGER NOT NULL DEFAULT 0")?;
+        }
+        if !column(&store.db, "conversation", "locked")? {
+            store.db.execute_batch("ALTER TABLE conversation ADD COLUMN locked INTEGER NOT NULL DEFAULT 0")?;
+        }
+        if !column(&store.db, "conversation", "age_restricted")? {
+            store.db.execute_batch("ALTER TABLE conversation ADD COLUMN age_restricted INTEGER NOT NULL DEFAULT 0")?;
+        }
+        if !column(&store.db, "conversation", "voice_notes_forbidden")? {
+            store.db.execute_batch("ALTER TABLE conversation ADD COLUMN voice_notes_forbidden TEXT NOT NULL DEFAULT ''")?;
+        }
         if !column(&store.db, "space", "can_create_channels")? {
             store.db.execute_batch("ALTER TABLE space ADD COLUMN can_create_channels INTEGER NOT NULL DEFAULT 0")?;
+        }
+        if !column(&store.db, "space", "can_create_invites")? {
+            store.db.execute_batch("ALTER TABLE space ADD COLUMN can_create_invites INTEGER NOT NULL DEFAULT 0")?;
+        }
+        if !column(&store.db, "space", "opt_in_channels")? {
+            store.db.execute_batch("ALTER TABLE space ADD COLUMN opt_in_channels INTEGER NOT NULL DEFAULT 0")?;
+        }
+        if !column(&store.db, "space", "rights")? {
+            store.db.execute_batch("ALTER TABLE space ADD COLUMN rights INTEGER NOT NULL DEFAULT 0")?;
+        }
+        if !column(&store.db, "space", "can_manage_webhooks")? {
+            store.db.execute_batch("ALTER TABLE space ADD COLUMN can_manage_webhooks INTEGER NOT NULL DEFAULT 0")?;
+        }
+        if !column(&store.db, "space", "can_manage_guild")? {
+            store.db.execute_batch("ALTER TABLE space ADD COLUMN can_manage_guild INTEGER NOT NULL DEFAULT 0")?;
+        }
+        if !column(&store.db, "space", "can_manage_expressions")? {
+            store.db.execute_batch("ALTER TABLE space ADD COLUMN can_manage_expressions INTEGER NOT NULL DEFAULT 0")?;
         }
         if !column(&store.db, "section", "emoji")? {
             store.db.execute_batch("ALTER TABLE section ADD COLUMN emoji TEXT NOT NULL DEFAULT ''")?;
@@ -1218,6 +1353,46 @@ impl Store {
     /// convert: the table is new.
     fn migrate_reminders(&mut self) -> rusqlite::Result<()> {
         self.db.execute_batch(REMINDERS_TABLE)
+    }
+
+    /// On-disk media attributed to a conversation through its cached messages.
+    /// A chat with nothing on disk is omitted. The same file in one chat counts once.
+    pub fn chat_cache(&self, limit: u32) -> rusqlite::Result<Vec<protocol::ChatCache>> {
+        let mut query = self.db.prepare(
+            "SELECT network, account, conversation, MAX(title), SUM(bytes) FROM (
+                SELECT DISTINCT r.network AS network, r.account AS account, r.conversation AS conversation,
+                       c.title AS title, r.fid AS fid, media.bytes AS bytes
+                  FROM (
+                    SELECT network, account, conversation, json_extract(j.value, '$.file.id') AS fid
+                      FROM message, json_each(message.body, '$.attachments') j
+                     WHERE json_extract(j.value, '$.file.id') IS NOT NULL
+                    UNION
+                    SELECT network, account, conversation, json_extract(j.value, '$.thumb.id')
+                      FROM message, json_each(message.body, '$.attachments') j
+                     WHERE json_extract(j.value, '$.thumb.id') IS NOT NULL
+                    UNION
+                    SELECT network, account, conversation, json_extract(j.value, '$.preview.id')
+                      FROM message, json_each(message.body, '$.attachments') j
+                     WHERE json_extract(j.value, '$.preview.id') IS NOT NULL
+                  ) r
+                  JOIN media ON media.network = r.network AND media.account = r.account AND media.id = r.fid
+                   AND media.path IS NOT NULL
+                  JOIN conversation c ON c.network = r.network AND c.account = r.account AND c.id = r.conversation
+             )
+             GROUP BY network, account, conversation
+             HAVING SUM(bytes) > 0
+             ORDER BY SUM(bytes) DESC
+             LIMIT ?1",
+        )?;
+        let rows = query.query_map(params![limit], |row| {
+            let bytes: i64 = row.get(4)?;
+            Ok(protocol::ChatCache {
+                conversation: Key { network: from_word(row.get(0)?)?, account: row.get(1)?, id: row.get(2)? },
+                title: row.get(3)?,
+                bytes: bytes.max(0) as u64,
+            })
+        })?;
+        rows.collect()
     }
 
     /// Every stored setting, the version row included.
@@ -1392,13 +1567,15 @@ impl Store {
                     (SELECT f.id FROM folder f
                       WHERE f.network = s.network AND f.account = s.account
                         AND instr(f.spaces, ',' || s.id || ',') > 0 LIMIT 1),
-                    s.muted, s.hide_muted, s.can_create_channels
+                    s.muted, s.hide_muted, s.can_create_channels, s.can_create_invites, s.opt_in_channels, s.rights,
+                    s.can_manage_webhooks, s.can_manage_guild, s.can_manage_expressions
              FROM space s
              LEFT JOIN media m ON m.network = s.network AND m.account = s.account AND m.id = s.icon
              WHERE ?1 IS NULL OR s.network = ?1
              ORDER BY s.network, s.account, s.position, s.id"
         ))?;
         let rows = query.query_map(params![network.map(|network| word(&network))], |row| {
+            let rights_bits: u32 = row.get(20)?;
             Ok(Space {
                 key: key_at(row)?,
                 name: row.get(3)?,
@@ -1410,6 +1587,12 @@ impl Store {
                 muted: row.get(15)?,
                 hide_muted: row.get(16)?,
                 can_create_channels: row.get(17)?,
+                can_create_invites: row.get(18)?,
+                opt_in_channels: row.get(19)?,
+                rights: protocol::SpaceRights::from_bits(rights_bits),
+                can_manage_webhooks: row.get(21)?,
+                can_manage_guild: row.get(22)?,
+                can_manage_expressions: row.get(23)?,
             })
         })?;
         rows.collect()
@@ -1643,6 +1826,53 @@ impl Store {
         tx.commit()
     }
 
+    /// Drops all cached messages sent by `sender_id` in `conversation` (and any of its forum topic
+    /// child conversations) and returns the affected conversation IDs.
+    pub fn clear_sender_messages(&mut self, conversation: &Key, sender_id: &str) -> rusqlite::Result<Vec<String>> {
+        let tx = self.db.transaction()?;
+        let net = word(&conversation.network);
+        let escaped = conversation.id.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let prefix = format!("{escaped}\\_%");
+        let mut stmt = tx.prepare(
+            "SELECT conversation, id, text, body FROM message
+              WHERE network = ?1 AND account = ?2 AND (conversation = ?3 OR conversation LIKE ?4 ESCAPE '\\')",
+        )?;
+        let mut to_delete: Vec<(String, String)> = Vec::new();
+        for row in stmt.query_map(params![net, conversation.account, conversation.id, prefix], |row| {
+            let conv: String = row.get(0)?;
+            let id: String = row.get(1)?;
+            let text: String = row.get(2)?;
+            let body: String = row.get(3)?;
+            Ok((conv, id, text, body))
+        })? {
+            let (conv, id, text, body) = row?;
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
+                let matches_sender = parsed
+                    .get("sender")
+                    .and_then(|s| s.get("id"))
+                    .and_then(|s| s.as_str())
+                    == Some(sender_id);
+                let _ = text;
+                if matches_sender {
+                    to_delete.push((conv, id));
+                }
+            }
+        }
+        drop(stmt);
+        let mut affected: Vec<String> = Vec::new();
+        for (conv, id) in to_delete {
+            tx.execute(
+                "DELETE FROM message WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4",
+                params![net, conversation.account, conv, id],
+            )?;
+            if !affected.contains(&conv) {
+                affected.push(conv);
+            }
+        }
+        tx.commit()?;
+        Ok(affected)
+    }
+
     /// Drops the stored messages of a conversation while keeping its row in the list.
     pub fn clear_messages(&mut self, conversation: &Key) -> rusqlite::Result<bool> {
         let tx = self.db.transaction()?;
@@ -1667,6 +1897,17 @@ impl Store {
             .optional()
     }
 
+    /// Known threads whose `parent` is `parent` (active or archived, in or out of the tree).
+    pub fn child_threads(&self, parent: &Key) -> rusqlite::Result<Vec<Conversation>> {
+        let mut stmt = self.db.prepare(&format!(
+            "{CONVERSATION} WHERE c.network = ?1 AND c.account = ?2 AND c.kind = 'thread' AND c.parent = ?3"
+        ))?;
+        let rows = stmt.query_map(
+            params![word(&parent.network), parent.account, parent.id],
+            conversation_from,
+        )?;
+        rows.collect()
+    }
     /// Unread conversations for the All Unreads view (#606): unmuted (or mentioning me), not hidden,
     /// not archived, not threads; ordered by mentions first, then newest activity.
     pub fn unread_conversations(
@@ -1842,15 +2083,23 @@ impl Store {
                 return None;
             }
             if let Some(space) = &link.space {
+                let discord = link.network == Network::Discord;
                 let lower = space.to_ascii_lowercase();
                 if let Some(hit) = candidates.iter().find(|c| {
-                    c.space.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(space))
-                        || c.space_title.to_ascii_lowercase().contains(&lower)
-                        || c.key.account.to_ascii_lowercase().contains(&lower)
+                    let same_space = c.space.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(space));
+                    if discord {
+                        same_space
+                    } else {
+                        same_space
+                            || c.space_title.to_ascii_lowercase().contains(&lower)
+                            || c.key.account.to_ascii_lowercase().contains(&lower)
+                    }
                 }) {
                     return Some(hit.clone());
                 }
-                if link.network == Network::Slack {
+                // A Discord guild that did not match must not fall through to another row
+                // that happens to share the channel id.
+                if link.network == Network::Slack || discord {
                     return None;
                 }
             }
@@ -1962,7 +2211,7 @@ impl Store {
         let mut stmt = self.db.prepare(
             "SELECT id, kind, title, space, section, position, avatar, peer, call, voice_limit,
                     listed, topic, read_only, private, encryption, bot, meeting, special, mark,
-                    opted_out, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin, joined, call_video, shared
+                    opted_out, icon, max_file_bytes, read_only_reason, spam, rights, disappearing, moderate, can_pin, joined, call_video, shared, slowmode_seconds, locked, age_restricted, voice_notes_forbidden
                FROM conversation
               WHERE network = ?1 AND account = ?2 AND space = ?3 AND parent = ''
               ORDER BY position, id",
@@ -2016,6 +2265,10 @@ impl Store {
                         joined: row.get(28)?,
                         call_video: row.get(29)?,
                         shared: row.get(30)?,
+                        slowmode_seconds: row.get(31)?,
+                        locked: row.get(32)?,
+                        age_restricted: row.get(33)?,
+                        voice_notes_forbidden: row.get(34)?,
                     },
                 ))
             })?
@@ -2205,6 +2458,31 @@ impl Store {
         Ok((rows, total))
     }
 
+    /// A forum's topics whose title matches `query` (case-insensitive substring).
+    pub fn topics_matching(&self, forum: &Key, query: &str, offset: u32, limit: u32) -> rusqlite::Result<(Vec<Conversation>, u32)> {
+        let escaped = query
+            .to_lowercase()
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let belongs = "c.network = ?1 AND c.account = ?2 AND c.parent = ?3 AND NOT c.hidden AND lower(c.title) LIKE ?4 ESCAPE '\\'";
+        let total = self.db.query_row(
+            &format!("SELECT COUNT(*) FROM conversation c WHERE {belongs}"),
+            params![word(&forum.network), forum.account, forum.id, pattern],
+            |row| row.get(0),
+        )?;
+        let rows = self
+            .db
+            .prepare(&format!(
+                "{CONVERSATION} WHERE {belongs}
+                 ORDER BY coalesce(c.pin, 2147483647), c.updated DESC, c.id LIMIT ?5 OFFSET ?6"
+            ))?
+            .query_map(params![word(&forum.network), forum.account, forum.id, pattern, limit, offset], conversation_from)?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok((rows, total))
+    }
+
     /// The topic of a forum that opening it lands on, as a page of one. Telegram lands on the
     /// newest unread (a mention counts as unread here, as everywhere), else General, its own
     /// first topic (`polish/03` §2), once its topics were asked of the network. Discord's posts
@@ -2242,6 +2520,33 @@ impl Store {
         Ok((rows, total))
     }
 
+    /// The composer lock on threads and forum posts already stored under this server.
+    /// A tree replacement leaves a row that names its parent, so the gate has to be written
+    /// onto those rows itself. Each pair is the conversation and the space it sits in, empty
+    /// when a post has no place in the tree. Only rows whose lock changed are returned.
+    pub fn restamp_threads(&mut self, space: &Key, read_only: bool, reason: &str) -> rusqlite::Result<Vec<(String, String)>> {
+        let belongs = "network = ?1 AND account = ?2 AND kind = 'thread' AND parent != ''
+            AND (space = ?3 OR parent IN (
+                SELECT parent_row.id FROM conversation AS parent_row
+                 WHERE parent_row.network = ?1 AND parent_row.account = ?2 AND parent_row.space = ?3
+            ))
+            AND (read_only != ?4 OR read_only_reason != ?5)";
+        let network = word(&space.network);
+        let changed: Vec<(String, String)> = self
+            .db
+            .prepare(&format!("SELECT id, space FROM conversation WHERE {belongs}"))?
+            .query_map(params![network, space.account, space.id, read_only, reason], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        if changed.is_empty() {
+            return Ok(changed);
+        }
+        self.db.execute(
+            &format!("UPDATE conversation SET read_only = ?4, read_only_reason = ?5 WHERE {belongs}"),
+            params![network, space.account, space.id, read_only, reason],
+        )?;
+        Ok(changed)
+    }
+
     /// Where the network files a conversation. True if anything changed.
     pub fn set_filing(&mut self, conversation: &Key, filing: &Filing) -> rusqlite::Result<bool> {
         let changed = self.db.execute(
@@ -2257,6 +2562,35 @@ impl Store {
                 filing.pin,
                 filing.hidden,
                 filing.followed,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// A forum post's tags, counts, picture, reaction, and owner. True if a row changed.
+    pub fn set_post(&mut self, conversation: &Key, card: &PostCard) -> rusqlite::Result<bool> {
+        let tags = id_list(&card.tags, 20);
+        let mut reaction = card.reaction.clone();
+        clip(&mut reaction, 80);
+        let mut owner = card.owner.clone();
+        clip(&mut owner, 80);
+        let thumbnail = card.thumbnail.replace(',', "");
+        let changed = self.db.execute(
+            "UPDATE conversation SET tags = ?4, message_count = ?5, total_message_sent = ?6,
+                    thumbnail = ?7, reaction = ?8, owner = ?9
+              WHERE network = ?1 AND account = ?2 AND id = ?3
+                AND (tags != ?4 OR message_count != ?5 OR total_message_sent != ?6
+                     OR thumbnail != ?7 OR reaction != ?8 OR owner != ?9)",
+            params![
+                word(&conversation.network),
+                conversation.account,
+                conversation.id,
+                tags,
+                card.message_count,
+                card.total_message_sent,
+                thumbnail,
+                reaction,
+                owner,
             ],
         )?;
         Ok(changed == 1)
@@ -2359,6 +2693,44 @@ impl Store {
         Ok(changed == 1)
     }
 
+    pub fn set_space_can_create_invites(&mut self, space: &Key, can: bool) -> rusqlite::Result<bool> {
+        let changed = self.db.execute(
+            "UPDATE space SET can_create_invites = ?4
+              WHERE network = ?1 AND account = ?2 AND id = ?3 AND can_create_invites != ?4",
+            params![word(&space.network), space.account, space.id, can],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn set_space_opt_in(&mut self, space: &Key, opt_in: bool) -> rusqlite::Result<bool> {
+        let changed = self.db.execute(
+            "UPDATE space SET opt_in_channels = ?4
+              WHERE network = ?1 AND account = ?2 AND id = ?3 AND opt_in_channels != ?4",
+            params![word(&space.network), space.account, space.id, opt_in],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn set_space_rights(&mut self, space: &Key, rights: protocol::SpaceRights) -> rusqlite::Result<bool> {
+        let bits = rights.to_bits();
+        let changed = self.db.execute(
+            "UPDATE space SET rights = ?4
+              WHERE network = ?1 AND account = ?2 AND id = ?3 AND rights != ?4",
+            params![word(&space.network), space.account, space.id, bits],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub fn set_space_manage(&mut self, space: &Key, webhooks: bool, guild: bool, expressions: bool) -> rusqlite::Result<bool> {
+        let changed = self.db.execute(
+            "UPDATE space SET can_manage_webhooks = ?4, can_manage_guild = ?5, can_manage_expressions = ?6
+              WHERE network = ?1 AND account = ?2 AND id = ?3
+                AND (can_manage_webhooks != ?4 OR can_manage_guild != ?5 OR can_manage_expressions != ?6)",
+            params![word(&space.network), space.account, space.id, webhooks, guild, expressions],
+        )?;
+        Ok(changed == 1)
+    }
+
     // Previews.
 
     /// The newest message as a line, for a network that lists only that. Kept only when it is
@@ -2452,7 +2824,7 @@ impl Store {
         let pattern = format!("%{}%", like_prefix(query));
         let mut stmt = self.db.prepare(
             "SELECT m.network, m.account, m.conversation, m.id, m.sent, m.text, m.body, c.title,
-                    COALESCE(s.name, '')
+                    COALESCE(s.name, ''), c.age_restricted
                FROM message m
                JOIN conversation c ON c.network = m.network AND c.account = m.account
                   AND c.id = m.conversation
@@ -2465,6 +2837,7 @@ impl Store {
                  AND (?6 IS NULL OR m.sent < ?6)
                  AND (?7 IS NULL OR m.sent > ?7)
                  AND (m.expires IS NULL OR m.expires > ?8)
+                 AND IFNULL(json_extract(m.body, '$.ephemeral'), 0) != 1
                  AND NOT c.hidden AND c.special != 'request'
                ORDER BY m.sent DESC, length(m.id) DESC, m.id DESC",
         )?;
@@ -2493,6 +2866,7 @@ impl Store {
                         title: row.get(7)?,
                         space_title: row.get(8)?,
                         outgoing: message.outgoing,
+                        age_restricted: row.get(9)?,
                     },
                     message,
                 ))
@@ -2509,6 +2883,16 @@ impl Store {
             if filters.mentions_me && !msg.mentions_me {
                 continue;
             }
+            if let Some(in_ch) = &filters.in_channel {
+                if hit.conversation.id != in_ch.id {
+                    continue;
+                }
+            }
+            if let Some(pinned) = filters.pinned {
+                if msg.pinned != pinned {
+                    continue;
+                }
+            }
             if let Some(has) = filters.has {
                 let ok = match has {
                     protocol::SearchHas::Files => !msg.attachments.is_empty(),
@@ -2516,6 +2900,17 @@ impl Store {
                         .attachments
                         .iter()
                         .any(|a| matches!(a.file.kind, protocol::MediaKind::Image | protocol::MediaKind::Gif)),
+                    protocol::SearchHas::Videos => msg
+                        .attachments
+                        .iter()
+                        .any(|a| matches!(a.file.kind, protocol::MediaKind::Video)),
+                    protocol::SearchHas::Sounds => msg
+                        .attachments
+                        .iter()
+                        .any(|a| matches!(a.file.kind, protocol::MediaKind::Audio)),
+                    protocol::SearchHas::Stickers => msg.attachments.iter().any(|a| a.sticker),
+                    protocol::SearchHas::Embeds => !msg.previews.is_empty(),
+                    protocol::SearchHas::Polls => msg.poll.is_some(),
                     protocol::SearchHas::Links => {
                         !msg.previews.is_empty()
                             || msg.text.contains("http://")
@@ -2551,7 +2946,7 @@ impl Store {
         self.db
             .prepare(&format!(
                 "SELECT m.network, m.account, m.conversation, m.id, m.sent, m.text, m.body, c.title,
-                        COALESCE(s.name, '')
+                        COALESCE(s.name, ''), c.age_restricted
                    FROM message m
                    JOIN conversation c ON c.network = m.network AND c.account = m.account
                       AND c.id = m.conversation
@@ -2561,6 +2956,7 @@ impl Store {
                      AND (?2 IS NULL OR (m.network = ?2 AND m.account = ?3 AND m.conversation = ?4))
                      AND (?5 IS NULL OR (c.network = ?5 AND c.account = ?6 AND c.space = ?7))
                      AND (m.expires IS NULL OR m.expires > ?10)
+                     AND IFNULL(json_extract(m.body, '$.ephemeral'), 0) != 1
                      AND NOT c.hidden AND c.special != 'request'
                    ORDER BY m.sent DESC, length(m.id) DESC, m.id DESC LIMIT ?9",
             ))?
@@ -2590,6 +2986,7 @@ impl Store {
                         title: row.get(7)?,
                         space_title: row.get(8)?,
                         outgoing: message.outgoing,
+                        age_restricted: row.get(9)?,
                     })
                 },
             )?
@@ -3242,6 +3639,13 @@ impl Store {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
+        // What the shell called a send of ours stays when a fetched page repeats the message:
+        // no network carries it, and the shell still finds its send by it.
+        if incoming.outgoing && incoming.client_id.is_none() {
+            if let Some((_, old)) = &before {
+                incoming.client_id = serde_json::from_str::<Message>(old).ok().and_then(|had| had.client_id);
+            }
+        }
         // A sealed conversation's wire rows never carry reactions — they are folded ciphertexts
         // of their own, on a route of theirs — so what this store folded stays when a fetched
         // page replaces the row.
@@ -3414,7 +3818,7 @@ impl Store {
         Ok(outcome)
     }
 
-    /// A transcript line that is not a message. The conversation must already exist. A row
+    /// A transcription line that is not a message. The conversation must already exist. A row
     /// with this id is left alone, so a replay does not count twice. `bump_unread` adds one
     /// to the unread count and changes nothing else on the conversation: not the preview,
     /// not when it was updated, not whether it is hidden.
@@ -3694,6 +4098,54 @@ impl Store {
         Ok(true)
     }
 
+    /// Ephemeral rows do not outlive the session. Returns the conversations that lost one.
+    pub fn drop_ephemeral(&mut self, account: &AccountKey) -> rusqlite::Result<Vec<String>> {
+        let network = word(&account.network);
+        let rows: Vec<(String, String)> = self
+            .db
+            .prepare(
+                "SELECT conversation, id FROM message
+                  WHERE network = ?1 AND account = ?2 AND json_extract(body, '$.ephemeral') = 1",
+            )?
+            .query_map(params![network, account.account.as_str()], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut conversations = Vec::new();
+        for (conversation, id) in rows {
+            self.db.execute(
+                "DELETE FROM message WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND id = ?4",
+                params![network, account.account.as_str(), conversation, id],
+            )?;
+            if !conversations.contains(&conversation) {
+                conversations.push(conversation);
+            }
+        }
+        Ok(conversations)
+    }
+    /// Clears a stored message's `media_unread` flag in place. Returns true if the message existed
+    /// and its flag changed from true to false.
+    pub fn clear_media_unread(&mut self, conversation: &Key, id: &str) -> rusqlite::Result<bool> {
+        let Some(mut message) = self.message(conversation, id)? else {
+            return Ok(false);
+        };
+        if !message.media_unread {
+            return Ok(false);
+        }
+        message.media_unread = false;
+        self.ingest(conversation, &message, false)?;
+        Ok(true)
+    }
+
+    /// Decrements a conversation's unread mention count by one when an individual message's
+    /// mention is consumed (e.g., Telegram's `readMessageContents`).
+    pub fn consume_mention(&mut self, conversation: &Key) -> rusqlite::Result<bool> {
+        let changed = self.db.execute(
+            "UPDATE conversation SET mentions = max(0, mentions - 1)
+              WHERE network = ?1 AND account = ?2 AND id = ?3 AND mentions > 0",
+            params![word(&conversation.network), conversation.account, conversation.id],
+        )?;
+        Ok(changed == 1)
+    }
+
     pub fn delete_message(&mut self, conversation: &Key, id: &str) -> rusqlite::Result<bool> {
         let Some(mut message) = self.message(conversation, id)? else {
             return Ok(false);
@@ -3787,39 +4239,72 @@ impl Store {
             have.emoji == reaction.emoji || have.file.as_ref().is_some_and(|file| file.id == reaction.emoji)
         };
         let at = message.reactions.iter().position(same);
-        match (at, added) {
-            (Some(at), true) if reaction.mine && message.reactions[at].mine => return Ok(false),
-            (Some(at), false) if reaction.mine && !message.reactions[at].mine => return Ok(false),
-            (Some(at), true) => {
-                message.reactions[at].count += 1;
-                message.reactions[at].mine |= reaction.mine;
-                // Events arrive one person at a time; the list keeps who it was told of,
-                // newest last, and stays within the cap a payload is held to.
-                for id in &reaction.who {
-                    if !message.reactions[at].who.contains(id) {
-                        message.reactions[at].who.push(id.clone());
+        let is_burst = reaction.burst > 0 || reaction.mine_burst;
+        if is_burst {
+            match (at, added) {
+                (Some(at), true) if reaction.mine_burst && message.reactions[at].mine_burst => return Ok(false),
+                (Some(at), false) if reaction.mine_burst && !message.reactions[at].mine_burst => return Ok(false),
+                (Some(at), true) => {
+                    message.reactions[at].burst += 1;
+                    message.reactions[at].mine_burst |= reaction.mine_burst;
+                    if message.reactions[at].burst_colors.is_empty() && !reaction.burst_colors.is_empty() {
+                        message.reactions[at].burst_colors = reaction.burst_colors.clone();
                     }
                 }
-                message.reactions[at].who.truncate(protocol::REACTION_REACTORS);
-            }
-            (None, true) => message.reactions.push(Reaction {
-                count: 1,
-                ..reaction.clone()
-            }),
-            (Some(at), false) => {
-                let have = &mut message.reactions[at];
-                have.count = have.count.saturating_sub(1);
-                have.mine &= !reaction.mine;
-                // The one who took theirs back leaves the list; a removal that names nobody
-                // (ours, before the network's word) leaves it as it was.
-                if !reaction.who.is_empty() {
-                    have.who.retain(|id| !reaction.who.contains(id));
+                (None, true) => message.reactions.push(Reaction {
+                    count: 0,
+                    mine: false,
+                    burst: 1,
+                    mine_burst: reaction.mine_burst,
+                    ..reaction.clone()
+                }),
+                (Some(at), false) => {
+                    let have = &mut message.reactions[at];
+                    have.burst = have.burst.saturating_sub(1);
+                    have.mine_burst &= !reaction.mine_burst;
+                    if have.count == 0 && have.burst == 0 {
+                        message.reactions.remove(at);
+                    }
                 }
-                if have.count == 0 {
-                    message.reactions.remove(at);
-                }
+                (None, false) => return Ok(false),
             }
-            (None, false) => return Ok(false),
+        } else {
+            match (at, added) {
+                (Some(at), true) if reaction.mine && message.reactions[at].mine => return Ok(false),
+                (Some(at), false) if reaction.mine && !message.reactions[at].mine => return Ok(false),
+                (Some(at), true) => {
+                    message.reactions[at].count += 1;
+                    message.reactions[at].mine |= reaction.mine;
+                    // Events arrive one person at a time; the list keeps who it was told of,
+                    // newest last, and stays within the cap a payload is held to.
+                    for id in &reaction.who {
+                        if !message.reactions[at].who.contains(id) {
+                            message.reactions[at].who.push(id.clone());
+                        }
+                    }
+                    message.reactions[at].who.truncate(protocol::REACTION_REACTORS);
+                }
+                (None, true) => message.reactions.push(Reaction {
+                    count: 1,
+                    burst: 0,
+                    mine_burst: false,
+                    ..reaction.clone()
+                }),
+                (Some(at), false) => {
+                    let have = &mut message.reactions[at];
+                    have.count = have.count.saturating_sub(1);
+                    have.mine &= !reaction.mine;
+                    // The one who took theirs back leaves the list; a removal that names nobody
+                    // (ours, before the network's word) leaves it as it was.
+                    if !reaction.who.is_empty() {
+                        have.who.retain(|id| !reaction.who.contains(id));
+                    }
+                    if have.count == 0 && have.burst == 0 {
+                        message.reactions.remove(at);
+                    }
+                }
+                (None, false) => return Ok(false),
+            }
         }
         Ok(self.ingest(conversation, &message, false)? != Stored::Same)
     }
@@ -3858,7 +4343,9 @@ impl Store {
         }
         // The body is the protocol's JSON, so a message that holds one says so in these words.
         let holds = match kind {
-            SharedKind::Media | SharedKind::Files => "instr(body, '\"attachments\"') > 0",
+            SharedKind::Media | SharedKind::Files | SharedKind::Music | SharedKind::Voice | SharedKind::Gifs => {
+                "instr(body, '\"attachments\"') > 0"
+            }
             SharedKind::Links => "(instr(body, '\"previews\"') > 0 OR instr(body, '\"style\":\"link\"') > 0)",
         };
         let below = match before {
@@ -3899,6 +4386,28 @@ impl Store {
                     let wanted = message.attachments.iter().filter(|attachment| {
                         !attachment.sticker && pictured(attachment.file.kind) == (kind == SharedKind::Media)
                     });
+                    items.extend(wanted.map(|attachment| item(Some(attachment.clone()), "", "")));
+                }
+                SharedKind::Music => {
+                    let wanted = message.attachments.iter().filter(|attachment| {
+                        !attachment.sticker
+                            && attachment.file.kind == protocol::MediaKind::Audio
+                            && attachment.waveform.is_empty()
+                            && !attachment.round
+                    });
+                    items.extend(wanted.map(|attachment| item(Some(attachment.clone()), "", "")));
+                }
+                SharedKind::Voice => {
+                    let wanted = message.attachments.iter().filter(|attachment| {
+                        attachment.round || !attachment.waveform.is_empty()
+                    });
+                    items.extend(wanted.map(|attachment| item(Some(attachment.clone()), "", "")));
+                }
+                SharedKind::Gifs => {
+                    let wanted = message
+                        .attachments
+                        .iter()
+                        .filter(|attachment| !attachment.sticker && attachment.file.kind == protocol::MediaKind::Gif);
                     items.extend(wanted.map(|attachment| item(Some(attachment.clone()), "", "")));
                 }
                 SharedKind::Links => {
@@ -4791,6 +5300,32 @@ mod tests {
     }
 
     #[test]
+    fn chat_cache_counts_only_files_on_disk_and_only_the_chat_that_shows_them() {
+        let (mut store, key) = store();
+        let mut message = said("1", "ridge", NOW);
+        let mut file = MediaFile::new("ridge-full", protocol::MediaKind::Image);
+        file.bytes = 9_000;
+        message.attachments.push(protocol::Attachment::new("ridge.jpg", file));
+        store.ingest(&key, &message, false).unwrap();
+        store.db.execute(
+            "INSERT INTO media (network, account, id, kind, bytes, path, used) VALUES ('discord', 'me', 'ridge-full', 'image', 4096, 'ridge.jpg', 1)",
+            [],
+        ).unwrap();
+        store.db.execute(
+            "INSERT INTO media (network, account, id, kind, bytes, used) VALUES ('discord', 'me', 'missing', 'image', 100, 1)",
+            [],
+        ).unwrap();
+        let mut other = said("2", "not on disk", NOW + 1);
+        other.attachments.push(protocol::Attachment::new("gone.jpg", MediaFile::new("missing", protocol::MediaKind::Image)));
+        store.ingest(&key, &other, false).unwrap();
+        let rows = store.chat_cache(40).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].conversation, key);
+        assert_eq!(rows[0].title, "#general");
+        assert_eq!(rows[0].bytes, 4096);
+    }
+
+    #[test]
     fn a_reminder_is_set_on_a_stored_message_and_answers_what_is_due() {
         let (mut store, key) = store();
         store.ingest(&key, &said("m1", "read this later", NOW), false).unwrap();
@@ -5170,7 +5705,7 @@ mod tests {
             message.seq = seq;
             message.previews.push(protocol::Preview {
                 url: format!("https://example.com/{id}"),
-                site: String::new(), title: id.into(), description: String::new(), image: None,
+                site: String::new(), title: id.into(), description: String::new(), image: None, duration: 0, opens_in_browser: false,
             });
             messages.push(message);
         }
@@ -5804,6 +6339,22 @@ mod tests {
     }
 
     #[test]
+    fn a_fetched_page_keeps_what_the_shell_called_a_sent_message() {
+        let (mut store, key) = store();
+        let mut echoed = Message::plain("777", "me", "on it", 101, true);
+        echoed.client_id = Some("c-1".into());
+        store.ingest(&key, &echoed, true).unwrap();
+        // History read after the send repeats the message. The network never carries the client id.
+        let fetched = Message::plain("777", "me", "on it", 101, true);
+        store.ingest(&key, &fetched, false).unwrap();
+        assert_eq!(store.message(&key, "777").unwrap().unwrap().client_id.as_deref(), Some("c-1"));
+        // Somebody else's message has none to keep.
+        let theirs = Message::plain("778", "Ana", "ok", 102, false);
+        store.ingest(&key, &theirs, true).unwrap();
+        assert_eq!(store.message(&key, "778").unwrap().unwrap().client_id, None);
+    }
+
+    #[test]
     fn a_replaced_tree_drops_what_left_and_keeps_what_the_user_did() {
         let (mut store, key) = store();
         let account = key.account();
@@ -5848,7 +6399,7 @@ mod tests {
         store.register_media(&account, &[(thumb, "https://cdn.example/att-1".into())]).unwrap();
         store.ingest(&key, &message, false).unwrap();
 
-        let thumbs_up = |mine| Reaction { emoji: "👍".into(), file: None, count: 1, mine, who: Vec::new() };
+        let thumbs_up = |mine| Reaction { emoji: "👍".into(), file: None, count: 1, mine, who: Vec::new(), ..Reaction::default() };
         assert!(store.react(&key, "1", &thumbs_up(false), true).unwrap());
         assert!(store.react(&key, "1", &thumbs_up(true), true).unwrap());
         assert!(store.react(&key, "1", &thumbs_up(false), false).unwrap());
@@ -5874,7 +6425,7 @@ mod tests {
     fn a_reaction_keeps_who_the_network_named_and_lets_them_go() {
         let (mut store, key) = store();
         store.ingest(&key, &said("1", "look", 10), false).unwrap();
-        let by = |id: &str| Reaction { emoji: "👍".into(), file: None, count: 1, mine: false, who: vec![id.into()] };
+        let by = |id: &str| Reaction { emoji: "👍".into(), file: None, count: 1, mine: false, who: vec![id.into()], ..Reaction::default() };
         // One event at a time, as an event that names its one person arrives.
         assert!(store.react(&key, "1", &by("u-ana"), true).unwrap());
         assert!(store.react(&key, "1", &by("u-bea"), true).unwrap());
@@ -5890,7 +6441,7 @@ mod tests {
         let shown = store.message(&key, "1").unwrap().unwrap();
         assert_eq!((shown.reactions[0].count, shown.reactions[0].who.as_slice()), (2u32, &["u-bea".to_owned(), "u-cy".to_owned()][..]));
         // Ours goes before the network says who: the count moves, the list stands.
-        let ours = |on| Reaction { emoji: "👍".into(), file: None, count: 1, mine: true, who: Vec::new() };
+        let ours = |on| Reaction { emoji: "👍".into(), file: None, count: 1, mine: true, who: Vec::new(), ..Reaction::default() };
         assert!(store.react(&key, "1", &ours(true), true).unwrap());
         assert!(store.react(&key, "1", &ours(false), false).unwrap());
         let shown = store.message(&key, "1").unwrap().unwrap();

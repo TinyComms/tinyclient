@@ -86,6 +86,51 @@ impl Shell {
             .tooltip(tip("Search in conversation", Some("⌘F")))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(|this, _, window, cx| this.toggle_conversation_search(window, cx)));
+        let threads_btn = (open.key.network == Network::Discord
+            && matches!(open.kind, ConversationKind::Channel | ConversationKind::Announcement))
+        .then(|| {
+            icon_button("channel-threads", "icons/messages-square.svg", self.pane_shows(|layer| matches!(layer, Layer::Threads(_))))
+                .tooltip(tip("Threads", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_channel_threads(cx)))
+        });
+        let thread_settings = (open.key.network == Network::Discord
+            && open.kind == ConversationKind::Thread
+            && (open.rights.manage_threads || open.rights.rename))
+        .then(|| {
+            icon_button("thread-settings", "icons/pencil.svg", false)
+                .tooltip(tip("Thread settings", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(|this, _, _, cx| this.composer_toggle_thread_settings(cx)))
+        });
+        let thread_membership = (open.key.network == Network::Discord && open.kind == ConversationKind::Thread).then(|| {
+            let key = open.key.clone();
+            let joined = open.followed;
+            let label = if joined { "Leave thread" } else { "Join thread" };
+            div()
+                .id("thread-follow-toggle")
+                .h(px(26.))
+                .px(px(8.))
+                .rounded(px(theme::R_CONTROL))
+                .border_1()
+                .border_color(theme::border())
+                .flex()
+                .items_center()
+                .type_small()
+                .text_color(theme::text_soft())
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::hover()).text_color(theme::text()))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| this.toggle_follow_thread(key.clone(), !joined, cx)))
+                .child(label)
+        });
+        let setup = (open.key.network == Network::Discord && open.space.is_some()).then(|| {
+            let space = Key { id: open.space.clone().unwrap_or_default(), ..open.key.clone() };
+            icon_button("server-setup", "icons/list.svg", false)
+                .tooltip(tip("Server setup", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| this.open_server_gate(space.clone(), cx)))
+        });
         let live_hint = self.snapshot.as_ref().and_then(|snapshot| self.call_live_hint(snapshot, cx));
         let call = self.snapshot.as_ref().and_then(|snapshot| self.call_pill(snapshot, cx)).map(|call| {
             let call = call.h(px(28.)).rounded(px(theme::R_CONTROL)).whitespace_nowrap();
@@ -153,6 +198,14 @@ impl Shell {
         };
         let space = open.space.clone().map(|id| Key { id, ..open.key.clone() });
         let line = beside.map(|beside| match beside {
+            Beside::Activity(words) => div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .type_ui()
+                .text_color(theme::accent_text())
+                .child(words)
+                .into_any_element(),
             Beside::Person(line) => person_line(&line).into_any_element(),
             Beside::Path(subtitle) => div()
                 .id("reveal")
@@ -213,8 +266,51 @@ impl Shell {
                     .children(trouble.map(|words| div().flex_none().type_small().text_color(theme::text_faint()).child(words))),
             )
             .children(live_hint.map(|hint| div().flex_none().ml(px(8.)).child(hint)))
+            .children(self.follow_button(open, cx).map(|follow| div().flex_none().ml(px(8.)).child(follow)))
             .children(call.map(|call| div().flex_none().ml(px(8.)).child(call)))
-            .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).child(search).children(members).children(details).child(windowed))
+            .children(thread_membership.map(|btn| div().flex_none().ml(px(8.)).child(btn)))
+            .child(div().flex_none().ml(px(8.)).flex().gap(px(4.)).children(setup).children(thread_settings).children(threads_btn).child(search).children(members).children(details).child(windowed))
+    }
+
+    /// Follow button in the header strip for Discord announcement channels.
+    fn follow_button(&self, open: &Conversation, cx: &mut Context<Self>) -> Option<gpui::Stateful<Div>> {
+        if open.kind != ConversationKind::Announcement {
+            return None;
+        }
+        let allowed = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.account(&open.key.account()))
+            .is_some_and(|a| a.can.announcement_follow);
+        if !allowed {
+            return None;
+        }
+        let conv = open.clone();
+        Some(
+            div()
+                .id("announcement-follow")
+                .flex_none()
+                .h(px(26.))
+                .px(px(10.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(theme::field())
+                .border_1()
+                .border_color(theme::border())
+                .hover(|style| style.bg(theme::selected()).border_color(theme::border_strong()))
+                .active(|style| style.bg(theme::pressed()))
+                .flex()
+                .items_center()
+                .gap(px(5.))
+                .cursor_pointer()
+                .type_small()
+                .font_weight(theme::MEDIUM)
+                .text_color(theme::text())
+                .tooltip(tip("Follow this announcement channel into one of your servers", None))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, window, cx| this.open_follow(&conv, window, cx)))
+                .child(glyph("icons/megaphone.svg", 13., theme::text_soft()))
+                .child("Follow"),
+        )
     }
 
     /// Whether the conversation is end-to-end encrypted, where its network says: a lock and the
@@ -320,9 +416,13 @@ impl Shell {
         )
     }
 
-    /// The line after the title (07 §1): beside a direct conversation the person's status or
-    /// presence; elsewhere where it is (`Space › group`) and its topic.
+    /// The line after the title (07 §1): active typing/recording status first, then beside a direct
+    /// conversation the person's status or presence; elsewhere where it is (`Space › group`) and its topic.
     fn beside(&self, open: &Conversation) -> Option<Beside> {
+        let typists = self.people_state.hub().typists_in(&open.key);
+        if let Some(words) = crate::gui::composer::typing_preview_for(&typists, open.kind != ConversationKind::Direct) {
+            return Some(Beside::Activity(words));
+        }
         if open.kind == ConversationKind::Direct {
             if let Some(mut line) = self.peer_line(&open.key) {
                 // The avatar's dot says it; the word is its tooltip. A call and Telegram's
@@ -349,6 +449,7 @@ fn title_floor(title: &str, window: &Window) -> gpui::Pixels {
 
 /// What follows the title. A person's presence is not a place, so it does not reveal the sidebar.
 enum Beside {
+    Activity(String),
     Person(crate::gui::people::PeerLine),
     Path(String),
 }

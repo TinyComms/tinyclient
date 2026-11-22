@@ -1,0 +1,12 @@
+{
+  "id": "telegram-wave9f",
+  "title": "Wave 9F Telegram clickable text, media edits, profile, groups and channels, invites, and public search with preview and join",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "Desktop Wave 9F Telegram enhancements verified by unit and integration test suites.",
+    "ios": "Desktop Wave 9F Telegram enhancements verified by unit and integration test suites."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

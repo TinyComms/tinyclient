@@ -566,6 +566,21 @@ pub fn run(args: &[String]) -> u8 {
                 }
             };
         }
+        // One round video message: camera, square H.264, video-only MP4, at most a minute.
+        Some("--rec-video") => {
+            let Some(path) = args.get(1).map(std::path::PathBuf::from) else {
+                tracing::warn!("mediad: --rec-video needs a file to record to");
+                return 2;
+            };
+            let input = args.get(2).filter(|flag| flag.as_str() == "--input").and_then(|_| args.get(3)).cloned();
+            return match crate::rec_video::run(path, input) {
+                Ok(()) => 0,
+                Err(err) => {
+                    tracing::warn!("mediad: {err}");
+                    1
+                }
+            };
+        }
         // S13: checks a sound file the user chose and saves it beside the database.
         Some("--import-sound") => {
             let (Some(source), Some(id)) = (args.get(1), args.get(2)) else {

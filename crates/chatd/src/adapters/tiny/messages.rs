@@ -525,6 +525,8 @@ pub(crate) fn serve(ctx: &Context, saved: &Saved, live: &Live, command: Command)
             message_id,
             text,
             spans,
+            suppress_embeds: _,
+            keep_attachments: _,
             reply,
         } => edit(ctx, saved, &conversation_id, &message_id, &text, &spans, reply),
         Command::Delete {
@@ -1616,7 +1618,7 @@ fn merge_reaction(ctx: &Context, saved: &Saved, frame: &Value) {
             message.reactions[at].mine = mine;
         }
     } else {
-        message.reactions.push(Reaction { emoji: emoji.to_owned(), file: None, count, mine: mine.unwrap_or(false), who: Vec::new() });
+        message.reactions.push(Reaction { emoji: emoji.to_owned(), file: None, count, mine: mine.unwrap_or(false), who: Vec::new(), ..Reaction::default() });
     }
     let _ = ctx.message(conversation_id, &message);
 }
@@ -1640,7 +1642,7 @@ fn apply_reaction(ctx: &Context, conversation_id: &str, landed: &e2ee::ReactionL
         message.reactions[at].count = landed.count;
         message.reactions[at].mine = landed.mine;
     } else {
-        message.reactions.push(Reaction { emoji: landed.emoji.clone(), file: None, count: landed.count, mine: landed.mine, who: Vec::new() });
+        message.reactions.push(Reaction { emoji: landed.emoji.clone(), file: None, count: landed.count, mine: landed.mine, who: Vec::new(), ..Reaction::default() });
     }
     let _ = ctx.message(conversation_id, &message);
     true
@@ -2699,13 +2701,13 @@ fn search(
                     .store()
                     .search_messages(Some(&key), None, None, trimmed, 25)
                     .unwrap_or_default();
-                let _ = reply.send(Ok(crate::adapters::SearchPage { hits, cursor: None }));
+                let _ = reply.send(Ok(hits.into()));
                 return;
             }
             path.push_str("&conversation_id=");
             path.push_str(conv_id);
         }
-        crate::adapters::SearchScope::Space(_) | crate::adapters::SearchScope::Account => {}
+        crate::adapters::SearchScope::Space(_) | crate::adapters::SearchScope::Account | crate::adapters::SearchScope::Home => {}
     }
     match super::asked("GET", saved, &path, None) {
         Ok((200, body)) => {
@@ -2749,6 +2751,7 @@ fn search(
                     snippet,
                     title,
                     space_title: space_title.clone(),
+                    age_restricted: false,
                 });
             }
             // If the server skipped encrypted conversations in a space-wide search, merge cached hits
@@ -2768,7 +2771,7 @@ fn search(
                     hits.sort_by(|a, b| b.sent.cmp(&a.sent));
                 }
             }
-            let _ = reply.send(Ok(crate::adapters::SearchPage { hits, cursor: None }));
+            let _ = reply.send(Ok(hits.into()));
         }
         Ok((404, _)) => {
             let _ = reply.send(Err(Refusal::Unsupported));
@@ -3043,9 +3046,9 @@ fn map_message(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessag
         if let Some(emoji_id) = reaction.emoji_id.as_deref().filter(|id| super::safe_id(id)) {
             let file = emoji_media_for(saved, emoji_id);
             let label = reaction.name.as_deref().map(|n| format!(":{n}:")).unwrap_or_else(|| reaction.emoji.clone());
-            message.reactions.push(Reaction { emoji: label, file, count: reaction.count, mine: reaction.me, who: Vec::new() });
+            message.reactions.push(Reaction { emoji: label, file, count: reaction.count, mine: reaction.me, who: Vec::new(), ..Reaction::default() });
         } else if unicode_emoji(&reaction.emoji) {
-            message.reactions.push(Reaction { emoji: reaction.emoji.clone(), file: None, count: reaction.count, mine: reaction.me, who: Vec::new() });
+            message.reactions.push(Reaction { emoji: reaction.emoji.clone(), file: None, count: reaction.count, mine: reaction.me, who: Vec::new(), ..Reaction::default() });
         }
     }
     if !deleted {
@@ -3141,6 +3144,8 @@ fn apply_wire_previews(
             title: super::preview::clean_field(&p.title, 200),
             description: super::preview::clean_field(&p.description, 500),
             image,
+            duration: 0,
+            opens_in_browser: false,
         });
     }
 }
@@ -3178,6 +3183,8 @@ fn apply_sealed_previews(
             title: super::preview::clean_field(&p.title, 200),
             description: super::preview::clean_field(&p.description, 500),
             image,
+            duration: 0,
+            opens_in_browser: false,
         });
     }
 }
@@ -3303,7 +3310,7 @@ fn map_sealed(saved: &Saved, names: &HashMap<String, String>, wire: &WireMessage
         if reaction.count == 0 || !unicode_emoji(&reaction.emoji) {
             continue;
         }
-        message.reactions.push(Reaction { emoji: reaction.emoji.clone(), file: None, count: reaction.count, mine: reaction.me, who: Vec::new() });
+        message.reactions.push(Reaction { emoji: reaction.emoji.clone(), file: None, count: reaction.count, mine: reaction.me, who: Vec::new(), ..Reaction::default() });
     }
     relink(&mut message);
     Some(message)
@@ -4055,7 +4062,7 @@ fn format_call_duration(seconds: u32) -> String {
     }
 }
 
-/// The transcript line for a finished call. Nothing about the conversation row changes except the
+/// The transcription line for a finished call. Nothing about the conversation row changes except the
 /// unread count, and only for a missed call we did not place.
 fn record_call(
     ctx: &Context,

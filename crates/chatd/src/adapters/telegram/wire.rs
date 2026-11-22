@@ -15,6 +15,9 @@ pub enum Fault {
     Rpc { code: i32, name: String, value: Option<u32> },
     /// The request never got an answer.
     Net(String),
+    /// Refused before or after the wire, in words to show as they are: a bad invite link, a
+    /// taken username, people whose privacy settings kept them out of a group.
+    Refused(String),
 }
 
 impl Fault {
@@ -22,10 +25,11 @@ impl Fault {
         matches!(self, Fault::Rpc { name: have, .. } if have == name)
     }
 
-    /// The seconds Telegram said to wait before asking again.
+    /// The seconds Telegram said to wait before asking again. Slow-mode waits carry code 420 too,
+    /// so exclude them: a slow-mode wait belongs to the chat's cooldown, not a global flood retry.
     pub fn flood(&self) -> Option<u64> {
         match self {
-            Fault::Rpc { code: 420, value: Some(seconds), .. } => Some(u64::from(*seconds)),
+            Fault::Rpc { code: 420, name, value: Some(seconds) } if name != "SLOWMODE_WAIT" => Some(u64::from(*seconds)),
             _ => None,
         }
     }
@@ -49,16 +53,37 @@ impl Fault {
     pub fn words(&self) -> String {
         match self {
             Fault::Rpc { .. } if self.flood().is_some() => wait_words(self.flood().unwrap_or(0)),
-            Fault::Rpc { name, .. } => match name.as_str() {
+            Fault::Rpc { name, value, .. } => match name.as_str() {
+                "CHAT_ADMIN_REQUIRED" => "You don't have permission to do that in this chat.".to_owned(),
                 "CHAT_WRITE_FORBIDDEN" | "CHAT_SEND_PLAIN_FORBIDDEN" => "You can't write in this chat.".to_owned(),
                 "USER_IS_BLOCKED" | "YOU_BLOCKED_USER" => "You can't message this person.".to_owned(),
                 "USER_BANNED_IN_CHANNEL" => "You are not allowed to post here.".to_owned(),
-                "SLOWMODE_WAIT" => "Slow mode is on in this chat. Try again in a moment.".to_owned(),
+                "SLOWMODE_WAIT" => match value {
+                    Some(secs) if *secs >= 90 => format!("Slow mode is on in this chat. Try again in {} minutes.", secs.div_ceil(60)),
+                    Some(secs) if *secs > 0 => format!("Slow mode is on in this chat. Try again in {secs} seconds."),
+                    _ => "Slow mode is on in this chat. Try again in a moment.".to_owned(),
+                },
+                "CHAT_SEND_MEDIA_FORBIDDEN" => "Admins don't allow media in this chat.".to_owned(),
+                "CHAT_SEND_PHOTOS_FORBIDDEN" => "Admins don't allow photos in this chat.".to_owned(),
+                "CHAT_SEND_VIDEOS_FORBIDDEN" => "Admins don't allow videos in this chat.".to_owned(),
+                "CHAT_SEND_AUDIOS_FORBIDDEN" => "Admins don't allow audio files in this chat.".to_owned(),
+                "CHAT_SEND_DOCS_FORBIDDEN" => "Admins don't allow files in this chat.".to_owned(),
+                "CHAT_SEND_STICKERS_FORBIDDEN" => "Admins don't allow stickers in this chat.".to_owned(),
+                "CHAT_SEND_GIFS_FORBIDDEN" => "Admins don't allow GIFs in this chat.".to_owned(),
+                "CHAT_SEND_POLL_FORBIDDEN" => "Admins don't allow polls in this chat.".to_owned(),
+                "CHAT_SEND_INLINE_FORBIDDEN" => "Admins don't allow inline bots in this chat.".to_owned(),
+                "CHAT_SEND_WEBPAGE_FORBIDDEN" => "Admins don't allow link previews in this chat.".to_owned(),
+                "ALLOW_PAYMENT_REQUIRED" => match value {
+                    Some(stars) if *stars > 0 => format!("Sending a message here costs {stars} Telegram Stars."),
+                    _ => "Sending a message here requires Telegram Stars.".to_owned(),
+                },
                 "MESSAGE_TOO_LONG" => "That message is too long for Telegram.".to_owned(),
                 "MESSAGE_EDIT_TIME_EXPIRED" => "This message is too old to edit.".to_owned(),
                 "MESSAGE_NOT_MODIFIED" => "Nothing was changed.".to_owned(),
                 "CHAT_FORWARDS_RESTRICTED" | "MESSAGE_FORWARDS_RESTRICTED" => "Forwarding is disabled in this chat.".to_owned(),
-                "MESSAGE_DELETE_FORBIDDEN" => "You can't delete this message.".to_owned(),
+                "MESSAGE_DELETE_FORBIDDEN" => "You can't delete this message (it may be older than Telegram's 48-hour limit or require admin rights).".to_owned(),
+                "CHANNEL_DELETE_FOR_EVERYONE_ONLY" => "In channels and supergroups, deleting a message removes it for everyone.".to_owned(),
+                "USER_ADMIN_INVALID" => "You can't delete messages from another admin.".to_owned(),
                 "MESSAGE_ID_INVALID" => "That message is no longer there.".to_owned(),
                 "REACTION_INVALID" | "REACTIONS_TOO_MANY" => "That reaction isn't allowed here.".to_owned(),
                 "PAID_REACTION_CONFIRM_REQUIRED" => "Paid Star reactions must be confirmed before spending Stars.".to_owned(),
@@ -71,11 +96,51 @@ impl Fault {
                 "PEER_ID_INVALID" | "CHANNEL_INVALID" | "CHANNEL_PRIVATE" | "USER_ID_INVALID" => {
                     "Telegram no longer lets this account reach that chat.".to_owned()
                 }
+                "RIGHT_FORBIDDEN" => "You don't have admin permission to do that here.".to_owned(),
+                "USER_CREATOR" => "You can't modify the group or channel creator.".to_owned(),
+                "ADMINS_TOO_MUCH" => "This group or channel already has the maximum number of admins.".to_owned(),
+                "PASSWORD_HASH_INVALID" => "That two-step verification password is incorrect.".to_owned(),
+                "PASSWORD_REQUIRED" => "Two-step verification must be enabled on your Telegram account to transfer ownership.".to_owned(),
+                "FRESH_CHANGE_ADMINS_FORBIDDEN" => "Telegram requires a newer session to transfer ownership. Try again later.".to_owned(),
+                "CHAT_NOT_MODIFIED" => "Nothing was changed.".to_owned(),
+                "SEND_AS_PEER_INVALID" => "You can't send messages as that peer here.".to_owned(),
+                "CHANNEL_ONLY" => "That setting is only available in a channel or supergroup.".to_owned(),
                 "PARTICIPANTS_HIDDEN" => "This group hides its member list.".to_owned(),
                 "USER_PRIVACY_RESTRICTED" => "This person's privacy settings don't allow calls.".to_owned(),
+                "VOICE_MESSAGES_FORBIDDEN" => "This person doesn't accept voice and video messages.".to_owned(),
+                "CHAT_SEND_VOICES_FORBIDDEN" | "CHAT_SEND_ROUNDVIDEOS_FORBIDDEN" => {
+                    "Voice and video messages aren't allowed in this group.".to_owned()
+                }
                 "CALL_PROTOCOL_COMPAT_LAYER_INVALID" => "This call protocol version isn't supported.".to_owned(),
                 "PARTICIPANT_VERSION_OUTDATED" => "The other person's Telegram app needs an update for this call.".to_owned(),
                 "PREMIUM_ACCOUNT_REQUIRED" => "This needs Telegram Premium.".to_owned(),
+                "FILTERS_TOO_MUCH" => "You've reached Telegram's 10-folder limit. Delete a folder or upgrade to Telegram Premium for more.".to_owned(),
+                "FILTER_TITLE_EMPTY" => "Give the folder a name.".to_owned(),
+                "FILTER_TITLE_TOO_LONG" => "Folder names can be at most 12 characters on Telegram.".to_owned(),
+                "FILTER_INCLUDE_EMPTY" => "Include at least one chat or chat type in the folder.".to_owned(),
+                "FILTER_ID_INVALID" => "That folder no longer exists.".to_owned(),
+                "TOPIC_TITLE_EMPTY" => "Give the topic a name.".to_owned(),
+                "TOPIC_CLOSED" => "This topic is closed.".to_owned(),
+                "TOPIC_DELETED" => "This topic was deleted.".to_owned(),
+                "TOPIC_NOT_MODIFIED" => "Nothing was changed.".to_owned(),
+                "TOPIC_ID_INVALID" => "That topic no longer exists.".to_owned(),
+                "PINNED_TOO_MUCH" => "You can pin at most five topics in a forum.".to_owned(),
+                "ICON_EMOJI_INVALID" => "That topic icon isn't valid.".to_owned(),
+                "DATE_INVALID" => "Choose a valid date.".to_owned(),
+                "SCHEDULE_TOO_MUCH" => "You can have at most 100 scheduled messages in one chat.".to_owned(),
+                "SCHEDULE_DATE_TOO_LATE" => "Scheduled messages can be at most one year ahead.".to_owned(),
+                "SCHEDULE_DATE_INVALID" => "Pick a future time for this scheduled message.".to_owned(),
+                "SCHEDULE_STATUS_PRIVATE" => "Send when online is only available in direct chats with people whose last seen time is visible.".to_owned(),
+                "INVITE_REQUEST_SENT" => "Request sent.".to_owned(),
+                // A channel cap, not a length past the free plan. Named before the `_TOO_MUCH` rule.
+                "CHANNELS_TOO_MUCH" | "USER_CHANNELS_TOO_MUCH" => "This account can't join any more channels.".to_owned(),
+                "TRANSLATE_REQ_QUOTA_EXCEEDED" => "Telegram's translation limit was reached. Try again later.".to_owned(),
+                "CHAT_SECRET" => "A sealed or secret chat is not translated.".to_owned(),
+                "BOOSTS_EMPTY" => "No boost is free to give.".to_owned(),
+                "BOT_INVALID" => "This bot cannot be started.".to_owned(),
+                "PHONE_NUMBER_INVALID" => "Telegram did not share a phone number.".to_owned(),
+                "TRANSCRIPTION_FAILED" => "Couldn't transcribe this message.".to_owned(),
+                "MSG_VOICE_MISSING" => "This message has no voice or video to transcribe.".to_owned(),
                 // A length or a count past the free plan. `MESSAGE_TOO_LONG` and
                 // `REACTIONS_TOO_MANY` are named above and are not this.
                 name if name.ends_with("_TOO_MUCH") => "This needs Telegram Premium.".to_owned(),
@@ -83,6 +148,7 @@ impl Fault {
                 other => format!("Telegram refused this ({other})."),
             },
             Fault::Net(_) => "Telegram did not answer.".to_owned(),
+            Fault::Refused(why) => why.clone(),
         }
     }
 }
@@ -93,6 +159,7 @@ impl std::fmt::Display for Fault {
             Fault::Rpc { code, name, value: Some(value) } => write!(f, "{code} {name} ({value})"),
             Fault::Rpc { code, name, value: None } => write!(f, "{code} {name}"),
             Fault::Net(why) => f.write_str(why),
+            Fault::Refused(why) => f.write_str(why),
         }
     }
 }
@@ -215,5 +282,28 @@ mod tests {
         assert!(compat.words().contains("protocol"), "{}", compat.words());
         let outdated = Fault::Rpc { code: 400, name: "PARTICIPANT_VERSION_OUTDATED".into(), value: None };
         assert!(outdated.words().contains("update"), "{}", outdated.words());
+    }
+
+    #[test]
+    fn slowmode_media_and_paid_errors_map_to_plain_words() {
+        let slow = Fault::Rpc { code: 420, name: "SLOWMODE_WAIT".into(), value: Some(25) };
+        assert_eq!(slow.flood(), None, "slow mode is not a global flood wait");
+        assert!(slow.words().contains("25 seconds"), "{}", slow.words());
+        let media = Fault::Rpc { code: 403, name: "CHAT_SEND_MEDIA_FORBIDDEN".into(), value: None };
+        assert!(media.words().contains("media"), "{}", media.words());
+        let stickers = Fault::Rpc { code: 403, name: "CHAT_SEND_STICKERS_FORBIDDEN".into(), value: None };
+        assert!(stickers.words().contains("stickers"), "{}", stickers.words());
+        let paid = Fault::Rpc { code: 403, name: "ALLOW_PAYMENT_REQUIRED".into(), value: Some(50) };
+        assert!(paid.words().contains("50 Telegram Stars"), "{}", paid.words());
+    }
+
+    #[test]
+    fn voice_message_refusal_rpc_errors_map_to_plain_words() {
+        let user = Fault::Rpc { code: 403, name: "VOICE_MESSAGES_FORBIDDEN".into(), value: None };
+        assert!(user.words().contains("voice and video messages"), "{}", user.words());
+        let group = Fault::Rpc { code: 403, name: "CHAT_SEND_VOICES_FORBIDDEN".into(), value: None };
+        assert!(group.words().contains("aren't allowed in this group"), "{}", group.words());
+        let round = Fault::Rpc { code: 403, name: "CHAT_SEND_ROUNDVIDEOS_FORBIDDEN".into(), value: None };
+        assert!(round.words().contains("aren't allowed in this group"), "{}", round.words());
     }
 }

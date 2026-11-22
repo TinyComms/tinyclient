@@ -9,7 +9,7 @@ use super::wire::Fault;
 use super::{live, random_id, remember_random, reply_header, Account, Options};
 use crate::blobs::upload::{self, Upload};
 use grammers_tl_types as tl;
-use protocol::{Message, Outgoing, VoiceNote};
+use protocol::{Message, Outgoing, VideoNote, VoiceNote};
 use std::sync::Arc;
 
 /// Telegram's part size, which every part but the last must be exactly.
@@ -27,12 +27,20 @@ fn options(with: &Outgoing) -> Options {
         silent: with.silent,
         no_webpage: with.suppress_embeds,
         schedule: with.schedule.and_then(|at| i32::try_from(at).ok()),
+        allow_paid_stars: with.allow_paid_stars.and_then(|n| i64::try_from(n).ok()).filter(|&n| n > 0),
+        send_as: with.send_as.as_deref().and_then(|id| Who::parse(id).map(|(who, _)| who)),
     }
 }
 
 pub(super) fn send_with(account: &Arc<Account>, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, with: Outgoing) {
     let ctx = account.ctx.clone();
     let opts = options(&with);
+    if let Some((who, _)) = Who::parse(conversation) {
+        if let Err(fault) = super::check_schedule_target(account, who, opts) {
+            ctx.sent(conversation, client_id, Err(fault.words()));
+            return;
+        }
+    }
     account.here();
     if super::secret::is_row(conversation) {
         let fault = Fault::Rpc { code: 400, name: "SECRET_CHAT".to_owned(), value: None };
@@ -60,8 +68,9 @@ pub(super) fn send_with(account: &Arc<Account>, conversation: &str, client_id: &
     let (account, conversation_id, client, text, reply) =
         (account.clone(), conversation.to_owned(), client_id.to_owned(), text.to_owned(), reply_to.map(str::to_owned));
     let voice: Option<VoiceNote> = (with.files.len() == 1).then_some(()).and_then(|_| with.voice.clone());
+    let video: Option<VideoNote> = (with.files.len() == 1 && voice.is_none()).then_some(()).and_then(|_| with.video.clone());
     upload::spawn(&ctx, conversation, client_id, &with.files, move |up| {
-        files(&account, &conversation_id, &client, &text, reply.as_deref(), opts, voice.as_ref(), up)
+        files(&account, &conversation_id, &client, &text, reply.as_deref(), opts, voice.as_ref(), video.as_ref(), up)
     });
 }
 
@@ -75,15 +84,17 @@ struct Target {
     who: Who,
     peer: tl::enums::InputPeer,
     reply_to: Option<tl::enums::InputReplyTo>,
+    send_as: Option<tl::enums::InputPeer>,
 }
 
-fn target(account: &Account, conversation: &str, reply_to: Option<&str>) -> Result<Target, Fault> {
+fn target(account: &Account, conversation: &str, reply_to: Option<&str>, send_as: Option<Who>) -> Result<Target, Fault> {
     let (who, topic) = Who::parse(conversation).ok_or_else(|| Fault::Rpc { code: 400, name: "PEER_ID_INVALID".to_owned(), value: None })?;
     let reply = reply_to.and_then(|id| id.parse::<i32>().ok());
     // The comments of a channel post are held in the discussion group behind it: like a
     // forum's send names its topic, theirs names the echo of the post there.
     let (who, topic) = super::sync::comment_target(account, conversation)?.map(|(group, echo)| (group, Some(echo))).unwrap_or((who, topic));
-    Ok(Target { who, peer: account.input(who)?, reply_to: reply_header(reply, topic) })
+    let send_as = send_as.and_then(|peer| account.input(peer).ok());
+    Ok(Target { who, peer: account.input(who)?, reply_to: reply_header(reply, topic), send_as })
 }
 
 /// The message Telegram made of a send, or of a scheduled one, from its answer.
@@ -94,7 +105,7 @@ fn made(account: &Account, conversation: &str, target: &Target, text: &str, opts
 }
 
 fn send_pick(account: &Account, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, pick: &str, opts: Options) -> Result<Message, Fault> {
-    let target = target(account, conversation, reply_to)?;
+    let target = target(account, conversation, reply_to, opts.send_as)?;
     let random = random_id(client_id);
     let (plain, entities) = super::prepared(account, conversation, text);
     let (answer, caption) = match catalog::find(account, pick).ok_or_else(|| Fault::Rpc { code: 400, name: "PICK_EXPIRED".to_owned(), value: None })? {
@@ -124,9 +135,9 @@ fn send_pick(account: &Account, conversation: &str, client_id: &str, text: &str,
                 query_id,
                 id: result,
                 schedule_date: opts.schedule,
-                send_as: None,
+                send_as: opts.send_as.and_then(|who| account.input(who).ok()),
                 quick_reply_shortcut: None,
-                allow_paid_stars: None,
+                allow_paid_stars: opts.allow_paid_stars,
             })?;
             (sent, "")
         }
@@ -191,7 +202,7 @@ pub(super) fn pasted_media(place: &PastedPlace) -> tl::enums::InputMedia {
 
 /// A pasted place, sent as the location itself. The numbers are not a caption.
 fn send_place(account: &Account, conversation: &str, client_id: &str, reply_to: Option<&str>, place: &PastedPlace, opts: Options) -> Result<Message, Fault> {
-    let target = target(account, conversation, reply_to)?;
+    let target = target(account, conversation, reply_to, opts.send_as)?;
     let random = random_id(client_id);
     remember_random(account, random, client_id);
     let answer = account.ask(&send_media(&target, pasted_media(place), "", None, random, opts))?;
@@ -209,7 +220,7 @@ pub(super) fn dice_emoticon(text: &str) -> Option<&'static str> {
 /// A lone dice emoji, sent as the roll rather than as text. The caption stays empty: the
 /// emoji is the roll, and the value comes back on the message Telegram makes.
 fn send_dice(account: &Account, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, emoticon: &str, opts: Options) -> Result<Message, Fault> {
-    let target = target(account, conversation, reply_to)?;
+    let target = target(account, conversation, reply_to, opts.send_as)?;
     let random = random_id(client_id);
     remember_random(account, random, client_id);
     let media = tl::types::InputMediaDice { emoticon: emoticon.to_owned() }.into();
@@ -218,7 +229,7 @@ fn send_dice(account: &Account, conversation: &str, client_id: &str, text: &str,
 }
 
 /// Shares a contact card via `messages.sendMedia` (`InputMediaContact`).
-fn send_contact(
+pub(super) fn send_contact(
     account: &Account,
     conversation: &str,
     client_id: &str,
@@ -227,7 +238,7 @@ fn send_contact(
     contact: &protocol::SharedContact,
     opts: Options,
 ) -> Result<Message, Fault> {
-    let target = target(account, conversation, reply_to)?;
+    let target = target(account, conversation, reply_to, opts.send_as)?;
     let random = random_id(client_id);
     remember_random(account, random, client_id);
     let (first_name, last_name) = super::split_name(contact.name.trim());
@@ -286,10 +297,10 @@ fn send_media(
         entities,
         schedule_date: opts.schedule,
         schedule_repeat_period: None,
-        send_as: None,
+        send_as: target.send_as.clone(),
         quick_reply_shortcut: None,
         effect: None,
-        allow_paid_stars: None,
+        allow_paid_stars: opts.allow_paid_stars,
         suggested_post: None,
     }
 }
@@ -301,9 +312,19 @@ struct Uploaded {
     visual: bool,
 }
 
-fn files(account: &Account, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, opts: Options, voice: Option<&VoiceNote>, up: &mut Upload) -> Result<Message, String> {
+fn files(
+    account: &Account,
+    conversation: &str,
+    client_id: &str,
+    text: &str,
+    reply_to: Option<&str>,
+    opts: Options,
+    voice: Option<&VoiceNote>,
+    video: Option<&VideoNote>,
+    up: &mut Upload,
+) -> Result<Message, String> {
     let words = |fault: Fault| fault.words();
-    let target = target(account, conversation, reply_to).map_err(words)?;
+    let target = target(account, conversation, reply_to, opts.send_as).map_err(words)?;
     let premium = account.dir().get(Who::User(account.me)).is_some_and(|known| known.premium);
     let limit = account.live().limits.caption(premium) as usize;
     let (plain, entities) = super::prepared(account, conversation, text);
@@ -318,7 +339,7 @@ fn files(account: &Account, conversation: &str, client_id: &str, text: &str, rep
     let mut uploaded = Vec::with_capacity(up.files().len());
     for at in 0..up.files().len() {
         // `voice` is only set for a send of one file: a voice message is one file.
-        uploaded.push(file(account, conversation, client_id, at, voice, up)?);
+        uploaded.push(file(account, conversation, client_id, at, voice, video, up)?);
     }
     up.check()?;
     let random = random_id(client_id);
@@ -327,7 +348,21 @@ fn files(account: &Account, conversation: &str, client_id: &str, text: &str, rep
         let Some(one) = uploaded.pop() else {
             return Err("Nothing was sent.".to_owned());
         };
-        let answer = account.ask(&send_media(&target, one.media, caption, entities.clone(), random, opts)).map_err(words)?;
+        let answer = match account.ask(&send_media(&target, one.media, caption, entities.clone(), random, opts)) {
+            Ok(answer) => answer,
+            Err(fault) => {
+                if fault.is("VOICE_MESSAGES_FORBIDDEN") {
+                    if account.dir().set_voice_forbidden(target.who, true) {
+                        super::sync::refresh_row(account, target.who);
+                    }
+                } else if fault.is("CHAT_SEND_VOICES_FORBIDDEN") || fault.is("CHAT_SEND_ROUNDVIDEOS_FORBIDDEN") {
+                    if account.dir().set_voice_banned(target.who, true) {
+                        super::sync::refresh_row(account, target.who);
+                    }
+                }
+                return Err(fault.words());
+            }
+        };
         return made(account, conversation, &target, caption, opts, &answer).map_err(words);
     }
     // Albums: pictures and videos together, documents together, ten at most each. The caption
@@ -380,10 +415,10 @@ fn files(account: &Account, conversation: &str, client_id: &str, text: &str, rep
                     reply_to: target.reply_to.clone(),
                     multi_media: items,
                     schedule_date: opts.schedule,
-                    send_as: None,
+                    send_as: opts.send_as.and_then(|who| account.input(who).ok()),
                     quick_reply_shortcut: None,
                     effect: None,
-                    allow_paid_stars: None,
+                    allow_paid_stars: opts.allow_paid_stars,
                 })
                 .map_err(words)?;
             if first.is_none() {
@@ -396,9 +431,72 @@ fn files(account: &Account, conversation: &str, client_id: &str, text: &str, rep
     first.ok_or_else(|| "Nothing was sent.".to_owned())
 }
 
+/// Uploads one local file in 512 KB parts and returns Telegram's `InputFile` handle
+/// (used for profile photos and chat avatars).
+pub(super) fn upload_input_file(account: &Account, key_seed: &str, path: &str) -> Result<tl::enums::InputFile, String> {
+    let source = protocol::OutgoingFile { path: path.to_owned(), ..Default::default() };
+    let mut up = Upload::with_progress(&account.ctx.account, key_seed, std::slice::from_ref(&source), |_, _| {})?;
+    let (name, bytes) = {
+        let s = &up.files()[0];
+        (s.name.clone(), s.bytes)
+    };
+    let file_id = random_id(&format!("{key_seed}/{name}"));
+    let big = bytes > BIG;
+    let mut parts = 1;
+    let result = up.parts(0, PART, 0, |part| {
+        parts = part.count as i32;
+        let saved = match big {
+            true => account.ask(&tl::functions::upload::SaveBigFilePart {
+                file_id,
+                file_part: part.index as i32,
+                file_total_parts: part.count as i32,
+                bytes: part.bytes.to_vec(),
+            }),
+            false => account.ask(&tl::functions::upload::SaveFilePart {
+                file_id,
+                file_part: part.index as i32,
+                bytes: part.bytes.to_vec(),
+            }),
+        };
+        match saved {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(format!("{name} could not be uploaded: Telegram did not keep a part of it.")),
+            Err(fault) => Err(format!("{name} could not be uploaded: {}", fault.words())),
+        }
+    });
+    up.done();
+    result?;
+    Ok(match big {
+        true => tl::types::InputFileBig { id: file_id, parts, name }.into(),
+        false => tl::types::InputFile { id: file_id, parts, name, md5_checksum: String::new() }.into(),
+    })
+}
+
+/// Uploads one replacement file for `messages.editMessage` (`media`), reusing the same
+/// part-streaming, photo/document detection, spoiler, and video/audio probing as sends.
+pub(super) fn upload_single(
+    account: &Account,
+    conversation: &str,
+    key_seed: &str,
+    source: &protocol::OutgoingFile,
+) -> Result<tl::enums::InputMedia, String> {
+    let mut up = Upload::with_progress(&account.ctx.account, key_seed, std::slice::from_ref(source), |_, _| {})?;
+    let uploaded = file(account, conversation, key_seed, 0, None, None, &mut up);
+    up.done();
+    uploaded.map(|u| u.media)
+}
+
 /// One file of a send, in parts, as Telegram's `InputMedia`. A voice send carries its facts in
 /// `voice` and is sent as a voice note, as Telegram's apps send one.
-fn file(account: &Account, conversation: &str, client_id: &str, at: usize, voice: Option<&VoiceNote>, up: &mut Upload) -> Result<Uploaded, String> {
+fn file(
+    account: &Account,
+    conversation: &str,
+    client_id: &str,
+    at: usize,
+    voice: Option<&VoiceNote>,
+    video: Option<&VideoNote>,
+    up: &mut Upload,
+) -> Result<Uploaded, String> {
     let (name, bytes, mime, spoiler, as_file, path, staged_media, thumb_path) = {
         let source = &up.files()[at];
         (
@@ -412,9 +510,9 @@ fn file(account: &Account, conversation: &str, client_id: &str, at: usize, voice
             source.thumb.clone(),
         )
     };
-    let photo = !as_file && PHOTOS.contains(&mime) && bytes <= BIG;
-    let is_video = !as_file && voice.is_none() && mime.starts_with("video/");
-    let is_audio = !as_file && voice.is_none() && mime.starts_with("audio/");
+    let photo = !as_file && video.is_none() && PHOTOS.contains(&mime) && bytes <= BIG;
+    let is_video = video.is_some() || (!as_file && voice.is_none() && mime.starts_with("video/"));
+    let is_audio = !as_file && voice.is_none() && video.is_none() && mime.starts_with("audio/");
     let activity = if voice.is_some() {
         protocol::Compose::UploadingAudio
     } else if photo {
@@ -462,16 +560,30 @@ fn file(account: &Account, conversation: &str, client_id: &str, at: usize, voice
     // A voice note is one Ogg Opus file and its own attribute: no file name, which Telegram's
     // own voice notes carry none of (their rows read "Voice message"). The loudness bars go
     // from the contract's byte a bar to Telegram's five bits a bar.
-    let attributes: Vec<tl::enums::DocumentAttribute> = match voice {
-        Some(voice) => vec![tl::types::DocumentAttributeAudio {
+    let round = video.map(protocol::round_wire);
+    let attributes: Vec<tl::enums::DocumentAttribute> = if let Some(voice) = voice {
+        vec![tl::types::DocumentAttributeAudio {
             voice: true,
             duration: (voice.duration / 1000) as i32,
             title: None,
             performer: None,
             waveform: Some(packed(&voice.waveform)),
         }
-        .into()],
-        None => {
+        .into()]
+    } else if let Some(wire) = round {
+        vec![tl::types::DocumentAttributeVideo {
+            round_message: wire.round_message,
+            supports_streaming: false,
+            nosound: wire.nosound,
+            duration: wire.duration_secs,
+            w: wire.side,
+            h: wire.side,
+            preload_prefix_size: None,
+            video_start_ts: None,
+            video_codec: None,
+        }
+        .into()]
+    } else {
             let mut attrs: Vec<tl::enums::DocumentAttribute> = vec![tl::types::DocumentAttributeFilename { file_name: name }.into()];
             if is_video {
                 let probed = probe_mp4(&path);
@@ -525,17 +637,16 @@ fn file(account: &Account, conversation: &str, client_id: &str, at: usize, voice
                 }
             }
             attrs
-        }
     };
     let media: tl::enums::InputMedia = match photo {
         true => tl::types::InputMediaUploadedPhoto { spoiler, live_photo: false, file: input, stickers: None, ttl_seconds: None, video: None }.into(),
         false => tl::types::InputMediaUploadedDocument {
-            nosound_video: false,
-            force_file: as_file,
-            spoiler: spoiler && !as_file,
+            nosound_video: round.is_some_and(|wire| wire.nosound),
+            force_file: as_file && video.is_none(),
+            spoiler: spoiler && !as_file && video.is_none(),
             file: input,
             thumb,
-            mime_type: mime.to_owned(),
+            mime_type: if video.is_some() { "video/mp4".to_owned() } else { mime.to_owned() },
             attributes,
             stickers: None,
             video_cover: None,
@@ -875,8 +986,9 @@ mod tests {
             who: Who::User(7_002),
             peer: tl::types::InputPeerUser { user_id: 7_002, access_hash: 1 }.into(),
             reply_to: None,
+            send_as: None,
         };
-        let opts = Options { silent: false, no_webpage: false, schedule: None };
+        let opts = Options::default();
         let request = send_media(&target, tl::types::InputMediaDice { emoticon: "\u{1F3B2}".into() }.into(), "", None, 1, opts);
         match request.media {
             tl::enums::InputMedia::Dice(dice) => assert_eq!(dice.emoticon, "\u{1F3B2}"),

@@ -1490,6 +1490,8 @@ fn message(account: &Account, note: &bugle::Note, page: &[bugle::Note]) -> Messa
             round: false,
             view_once: false,
             sticker_set: String::new(),
+            page: String::new(),
+            transcription: None,
             transcript: None,
         });
     }
@@ -1529,6 +1531,7 @@ fn message(account: &Account, note: &bugle::Note, page: &[bugle::Note]) -> Messa
                 mine: mark.who.iter().any(|who| who == &account.me),
                 // The phone names the participants who reacted, as the sender ids do.
                 who: mark.who.iter().take(protocol::REACTION_REACTORS).cloned().collect(),
+                ..Reaction::default()
             }
         })
         .collect();
@@ -2266,6 +2269,8 @@ fn serve(account: &Arc<Account>, command: Command) {
             message_id,
             text,
             spans: _,
+            suppress_embeds: _,
+            keep_attachments: _,
             reply,
         } => {
             let answer = edit_message(account, &conversation_id, &message_id, text);
@@ -2758,6 +2763,8 @@ fn deliver_files(
             round: false,
             view_once: false,
             sticker_set: String::new(),
+            page: String::new(),
+            transcription: None,
             transcript: None,
         });
     }

@@ -32,7 +32,7 @@ impl Slack {
         let page_num: u32 = cursor.and_then(|c| c.parse().ok()).unwrap_or(1).max(1);
         let page_str = page_num.to_string();
         let sort_param = match filters.sort {
-            SearchSort::Newest => "timestamp",
+            SearchSort::Newest | SearchSort::Oldest => "timestamp",
             SearchSort::Relevance => "score",
         };
         let found = match self.api(
@@ -165,9 +165,10 @@ impl Slack {
                 title,
                 space_title,
                 outgoing: !me.is_empty() && found["user"].as_str() == Some(me),
+                age_restricted: false,
             });
         }
-        Ok(SearchPage { hits, cursor: next_cursor })
+        Ok(SearchPage { hits, cursor: next_cursor, total: None })
     }
 
     /// Searches workspace files (`search.files`, with fallback to `search.modules` `module=files`).
@@ -184,7 +185,7 @@ impl Slack {
         let page_num: u32 = cursor.and_then(|c| c.parse().ok()).unwrap_or(1).max(1);
         let page_str = page_num.to_string();
         let sort_param = match sort {
-            SearchSort::Newest => "timestamp",
+            SearchSort::Newest | SearchSort::Oldest => "timestamp",
             SearchSort::Relevance => "score",
         };
         let found = match self.api(
@@ -405,9 +406,12 @@ pub(super) fn format_slack_query(
     if let Some(has) = filters.has {
         if !has_modifier(trimmed, "has:") {
             let word = match has {
-                protocol::SearchHas::Links => "link",
+                protocol::SearchHas::Links | protocol::SearchHas::Embeds => "link",
                 protocol::SearchHas::Files => "file",
-                protocol::SearchHas::Images => "image",
+                protocol::SearchHas::Images | protocol::SearchHas::Stickers => "image",
+                protocol::SearchHas::Videos => "video",
+                protocol::SearchHas::Sounds => "audio",
+                protocol::SearchHas::Polls => "poll",
             };
             parts.push(format!("has:{word}"));
         }
@@ -447,6 +451,7 @@ mod tests {
             after: Some(1_735_689_600),  // 2025-01-01
             mentions_me: true,
             sort: SearchSort::Newest,
+            ..SearchFilters::default()
         };
         let formatted = format_slack_query("deploy", &filters, Some("#general"), Some("U0ME"));
         assert_eq!(

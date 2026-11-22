@@ -5,11 +5,61 @@ use super::draw;
 use super::facts::{self, MembersShown, NotifyControl};
 use crate::gui::components::{button, button_with_icon, glyph, icon_button, pair, segment, segmented, tip, Avatar, ButtonKind, Shape as Plate};
 use crate::gui::people::card::Float;
-use crate::gui::people::info::{InfoPane, ManageKind};
+use crate::gui::people::info::{InfoPane, ManageKind, PendingMod};
 use crate::gui::people::presence::{self, Ring, Shape};
 use crate::gui::theme::{self, Type};
 use gpui::{div, prelude::*, px, Context, Div, MouseButton, Window};
 use protocol::{CallSupport, Conversation, ConversationKind, Key, MeetingResponse, Network, Notify, Presence, Request};
+
+/// A Telegram channel's boost level, and a confirmed Boost for a Premium account.
+fn boost_row(pane: &InfoPane, row: &Conversation, cx: &mut Context<InfoPane>) -> Option<Div> {
+    if row.key.network != Network::Telegram || row.kind != ConversationKind::Channel {
+        return None;
+    }
+    if pane.boosts_waiting(&row.key) {
+        return Some(div().type_small().text_color(theme::text_faint()).child("Loading boosts…"));
+    }
+    let status = pane.channel_boosts(&row.key)?;
+    let mut line = div().flex().flex_col().gap(px(6.)).child(div().type_ui().text_color(theme::text()).child(format!("Boosts: level {}", status.level)));
+    let progress = match status.next_level_boosts {
+        Some(next) => format!("{} of {next} boosts", status.boosts),
+        None => format!("{} boosts", status.boosts),
+    };
+    line = line.child(div().type_small().text_color(theme::text_soft()).child(progress));
+    if pane.boost_confirming(&row.key) {
+        line = line.child(
+            div()
+                .p(px(8.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(theme::raised())
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(div().type_small().child("Give this channel one of your boosts?"))
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(6.))
+                        .child(button("boost-cancel", ButtonKind::Ghost, "Cancel").h(px(24.)).px(px(8.)).type_small().on_click(cx.listener(|pane, _, _, cx| pane.cancel_boost(cx))))
+                        .child(button("boost-confirm", ButtonKind::Primary, "Boost").h(px(24.)).px(px(10.)).type_small().on_click(cx.listener(|pane, _, _, cx| pane.confirm_boost(cx)))),
+                ),
+        );
+        return Some(line);
+    }
+    if status.my_boost {
+        line = line.child(div().type_small().text_color(theme::text_soft()).child("You boosted this channel."));
+    } else if status.can_boost && !status.slots.is_empty() {
+        line = line.child(
+            button("details-boost", ButtonKind::Secondary, "Boost")
+                .h(px(26.))
+                .px(px(8.))
+                .type_small()
+                .on_click(cx.listener(|pane, _, _, cx| pane.ask_boost_confirm(cx))),
+        );
+    }
+    Some(line)
+}
 
 /// S6: this conversation's own notification sound, kept here only (the network never sees it),
 /// over its account's and the global one. Picking one plays it.
@@ -84,12 +134,17 @@ fn disappearing_row(
         };
         choices = choices.child(seg);
     }
+    let heading = if row.key.network == Network::Telegram {
+        format!("Auto-delete: {}", protocol::format_disappearing(active))
+    } else {
+        format!("Disappearing messages: {}", protocol::format_disappearing(active))
+    };
     Some(
         div()
             .flex()
             .flex_col()
             .gap(px(6.))
-            .child(div().type_ui().child("Disappearing messages"))
+            .child(div().type_ui().child(heading))
             .child(div().flex().flex_wrap().gap(px(4.)).child(choices))
             .child(div().type_small().text_color(theme::text_faint()).child("Auto-deletes on the network (separate from local retention).")),
     )
@@ -272,11 +327,20 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
         top = top.child(div().type_small().text_color(theme::text_faint()).child("Kept on this device."));
     }
     top = top.child(sound_row(row, cx).mt(px(8.)));
+    if let Some(boosts) = boost_row(pane, row, cx) {
+        top = top.child(boosts.mt(px(8.)));
+    }
     if let Some(timer_row) = disappearing_row(pane, row, info, cx) {
         top = top.child(timer_row.mt(px(8.)));
     }
-    if facts::can_rename(row) || facts::can_edit_topic(row) || facts::can_add_members(row) {
-        let mut manage_bar = div().mt(px(10.)).flex().flex_wrap().gap(px(6.));
+    let show_manage = facts::can_rename(row)
+        || facts::can_edit_topic(row)
+        || facts::can_add_members(row)
+        || facts::can_edit_picture(row)
+        || facts::can_manage_settings(row)
+        || facts::can_view_admin_log(row);
+    if show_manage {
+        let mut manage_bar = div().mt(px(10.)).flex().flex_wrap().items_center().gap(px(6.));
         if facts::can_rename(row) {
             let key = row.key.clone();
             let current = row.title.clone();
@@ -289,6 +353,30 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                         pane.start_manage(key.clone(), ManageKind::Rename, &current, "Conversation name", cx);
                     })),
             );
+        }
+        if facts::can_edit_picture(row) {
+            let key = row.key.clone();
+            manage_bar = manage_bar.child(
+                button("details-picture", ButtonKind::Secondary, "Change picture…")
+                    .h(px(26.))
+                    .px(px(8.))
+                    .type_small()
+                    .on_click(cx.listener(move |pane, _, _, cx| {
+                        pane.pick_conversation_picture(key.clone(), cx);
+                    })),
+            );
+            if row.avatar.is_some() {
+                let clear_key = row.key.clone();
+                manage_bar = manage_bar.child(
+                    button("details-picture-clear", ButtonKind::Ghost, "Remove picture")
+                        .h(px(26.))
+                        .px(px(8.))
+                        .type_small()
+                        .on_click(cx.listener(move |pane, _, _, cx| {
+                            pane.clear_conversation_picture(clear_key.clone(), cx);
+                        })),
+                );
+            }
         }
         if facts::can_edit_topic(row) {
             let key = row.key.clone();
@@ -326,10 +414,154 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                     })),
             );
         }
+        if facts::can_edit_picture(row) {
+            let key = row.key.clone();
+            manage_bar = manage_bar.child(
+                button("details-picture", ButtonKind::Secondary, "Change photo")
+                    .h(px(26.))
+                    .px(px(8.))
+                    .type_small()
+                    .on_click(cx.listener(move |pane, _, _, cx| pane.pick_picture(key.clone(), cx))),
+            );
+        }
+        if facts::can_manage_settings(row) {
+            let protect = row.key.clone();
+            let allow = row.key.clone();
+            let approve = row.key.clone();
+            let open = row.key.clone();
+            manage_bar = manage_bar.child(
+                button("details-protect", ButtonKind::Secondary, "Protect content")
+                    .h(px(26.))
+                    .px(px(8.))
+                    .type_small()
+                    .on_click(cx.listener(move |pane, _, _, cx| {
+                        pane.update_chat_settings(
+                            protect.clone(),
+                            protocol::ChatSettings { no_forwards: Some(true), ..protocol::ChatSettings::default() },
+                            cx,
+                        );
+                    })),
+            );
+            manage_bar = manage_bar.child(
+                button("details-forward", ButtonKind::Secondary, "Allow forwarding")
+                    .h(px(26.))
+                    .px(px(8.))
+                    .type_small()
+                    .on_click(cx.listener(move |pane, _, _, cx| {
+                        pane.update_chat_settings(
+                            allow.clone(),
+                            protocol::ChatSettings { no_forwards: Some(false), ..protocol::ChatSettings::default() },
+                            cx,
+                        );
+                    })),
+            );
+            manage_bar = manage_bar.child(
+                button("details-approve", ButtonKind::Secondary, "Require approval")
+                    .h(px(26.))
+                    .px(px(8.))
+                    .type_small()
+                    .on_click(cx.listener(move |pane, _, _, cx| {
+                        pane.update_chat_settings(
+                            approve.clone(),
+                            protocol::ChatSettings { join_request: Some(true), ..protocol::ChatSettings::default() },
+                            cx,
+                        );
+                    })),
+            );
+            manage_bar = manage_bar.child(
+                button("details-open", ButtonKind::Secondary, "Open joining")
+                    .h(px(26.))
+                    .px(px(8.))
+                    .type_small()
+                    .on_click(cx.listener(move |pane, _, _, cx| {
+                        pane.update_chat_settings(
+                            open.clone(),
+                            protocol::ChatSettings { join_request: Some(false), ..protocol::ChatSettings::default() },
+                            cx,
+                        );
+                    })),
+            );
+        }
+        if facts::can_view_admin_log(row) {
+            let key = row.key.clone();
+            let label = if pane.admin_log_for(&row.key).is_some() { "Hide actions" } else { "Recent actions" };
+            manage_bar = manage_bar.child(
+                button("details-admin-log", ButtonKind::Secondary, label)
+                    .h(px(26.))
+                    .px(px(8.))
+                    .type_small()
+                    .on_click(cx.listener(move |pane, _, _, cx| pane.load_admin_log(key.clone(), cx))),
+            );
+        }
         top = top.child(manage_bar);
+        if facts::can_manage_settings(row) {
+            let key = row.key.clone();
+            let speeds = [(0u32, "Off"), (10, "10s"), (30, "30s"), (60, "1m"), (300, "5m"), (900, "15m"), (3_600, "1h")];
+            let mut chips = div().flex().flex_wrap().gap(px(4.));
+            for (ix, &(secs, label)) in speeds.iter().enumerate() {
+                let key = key.clone();
+                chips = chips.child(segment(("details-slow", ix), label, false).on_click(cx.listener(move |pane, _, _, cx| {
+                    pane.update_chat_settings(
+                        key.clone(),
+                        protocol::ChatSettings { slowmode_seconds: Some(secs), ..protocol::ChatSettings::default() },
+                        cx,
+                    );
+                })));
+            }
+            top = top.child(
+                div()
+                    .mt(px(8.))
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(div().type_small().text_color(theme::text_soft()).child("Slow mode"))
+                    .child(chips),
+            );
+        }
+        if facts::can_view_admin_log(row) {
+            if let Some(entries) = pane.admin_log_for(&row.key) {
+                let mut list = div().mt(px(8.)).flex().flex_col().gap(px(4.));
+                if entries.is_empty() {
+                    list = list.child(div().type_small().text_color(theme::text_faint()).child("No recent actions."));
+                } else {
+                    for entry in entries.iter().take(20) {
+                        let line = if entry.actor.is_empty() {
+                            entry.summary.clone()
+                        } else {
+                            format!("{} · {}", entry.actor, entry.summary)
+                        };
+                        list = list.child(div().type_small().text_color(theme::text_soft()).child(line));
+                    }
+                }
+                top = top.child(list);
+            } else if pane.admin_log_loading() {
+                top = top.child(div().mt(px(8.)).type_small().text_color(theme::text_faint()).child("Loading recent actions…"));
+            }
+        }
+    }
+    if network == Network::Discord
+        && row.rights.manage_permissions
+        && !row.kind.is_direct()
+        && row.kind != ConversationKind::Thread
+    {
+        let perm_key = row.key.clone();
+        top = top.child(
+            div().mt(px(8.)).child(
+                button_with_icon("details-discord-perms", ButtonKind::Secondary, "icons/lock.svg", "Permissions…")
+                    .h(px(28.))
+                    .px(px(10.))
+                    .type_small()
+                    .on_click(cx.listener(move |pane, _, _, cx| {
+                        let key = perm_key.clone();
+                        pane.shell_do(cx, move |shell, cx| shell.open_channel_permissions(key, cx));
+                    })),
+            ),
+        );
     }
     if let Some((mkey, mkind, input)) = pane.managing() {
         if mkey == &row.key {
+            let discord_friends_hint = *mkind == ManageKind::AddMembers && row.key.network == Network::Discord;
             let show_history = *mkind == ManageKind::AddMembers
                 && row.key.network == Network::Teams
                 && row.kind == ConversationKind::Group;
@@ -348,6 +580,14 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                     .flex()
                     .flex_col()
                     .gap(px(6.))
+                    .when(discord_friends_hint, |box_| {
+                        box_.child(
+                            div()
+                                .type_micro()
+                                .text_color(theme::text_faint())
+                                .child("Only Discord friends can be added (up to 10 people including you)."),
+                        )
+                    })
                     .child(input.clone())
                     .when(show_history, |box_| {
                         box_.child(
@@ -403,6 +643,52 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
             );
         }
     }
+    if let Some(action) = pane.pending_mod().filter(|action| action.conversation() == &row.key) {
+        let (prompt, field, confirm, kind) = match action {
+            PendingMod::Ban { person_name, .. } => (
+                format!("Ban {person_name} from {}? They cannot rejoin until an admin unbans them.", row.title),
+                None,
+                "Ban",
+                ButtonKind::Danger,
+            ),
+            PendingMod::Promote { person_name, rank, .. } => (
+                format!("Make {person_name} an admin of {}?", row.title),
+                Some(rank.clone()),
+                "Promote",
+                ButtonKind::Primary,
+            ),
+            PendingMod::TransferOwner { person_name, password, .. } => (
+                format!("Transfer ownership of {} to {person_name}?", row.title),
+                Some(password.clone()),
+                "Transfer",
+                ButtonKind::Danger,
+            ),
+        };
+        top = top.child(
+            div()
+                .mt(px(8.))
+                .p(px(8.))
+                .rounded(px(theme::R_CONTROL))
+                .bg(theme::raised())
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(div().type_small().child(prompt))
+                .children(field)
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(6.))
+                        .child(button("mod-cancel", ButtonKind::Ghost, "Cancel").h(px(24.)).px(px(8.)).type_small().on_click(
+                            cx.listener(|pane, _, _, cx| pane.cancel_mod(cx)),
+                        ))
+                        .child(button("mod-confirm", kind, confirm).h(px(24.)).px(px(10.)).type_small().on_click(
+                            cx.listener(|pane, _, _, cx| pane.confirm_mod(cx)),
+                        )),
+                ),
+        );
+    }
     if !online {
         let words = facts::heads_up_words(&facts::HeadsUp::Offline, &row.title, network, crate::view::now());
         top = top.child(draw::heads_up_banner(&words, None).mt(px(12.)));
@@ -416,14 +702,61 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
         any = true;
         sections = sections.child(draw::label("About", true)).child(div().type_ui().line_clamp(6).child(about));
     }
+    if network == Network::Telegram && row.kind != ConversationKind::Direct {
+        if let Some(url) = link.as_ref().filter(|url| protocol::link::telegram_invite_hash(url).is_some()) {
+            let first = !any;
+            any = true;
+            let shown = url.clone();
+            let copy = url.clone();
+            sections = sections.child(draw::label("Invite link", first)).child(
+                div()
+                    .min_h(px(theme::ROW_ONE))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text()).child(shown))
+                    .child(
+                        button("details-invite-copy", ButtonKind::Secondary, "Copy")
+                            .h(px(26.))
+                            .px(px(8.))
+                            .type_small()
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.clone()));
+                            })),
+                    ),
+            );
+        }
+        if let Some(count) = info.map(|info| info.pending_requests).filter(|count| *count > 0) {
+            let first = !any;
+            any = true;
+            sections = sections.child(
+                div()
+                    .h(px(theme::ROW_ONE))
+                    .mt(px(if first { 0. } else { 8. }))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .type_ui()
+                    .text_color(theme::text())
+                    .child(glyph("icons/users.svg", 16., theme::text_soft()))
+                    .child(format!("Requests ({count})")),
+            );
+        }
+    }
     match facts::members_shown(row, info) {
         MembersShown::Inline => {
-            let (hub, ..) = pane.parts();
-            let (_, _, _, _, _, members) = pane.parts();
+            let (hub, scene, _, _, _, members) = pane.parts();
+            let me_id = scene
+                .accounts
+                .iter()
+                .find(|a| a.key == row.key.account())
+                .map(|a| a.me.as_str())
+                .unwrap_or("");
             if !members.is_empty() {
                 sections = sections.child(draw::label("Members", !any));
                 any = true;
                 let ring = Ring::on(theme::sidebar());
+                let mods = facts::member_mod_actions(row);
                 for (ix, person) in members.iter().enumerate() {
                     let shown = match hub.presence_of(&person.key) {
                         Presence::Unknown => person.presence,
@@ -434,10 +767,14 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                     let face = Avatar::new(&person.key, &person.name, 24.).image(avatar.as_ref()).build();
                     let face = face.children(Shape::of(shown).and_then(|shape| presence::dot(shape, 24., &ring)));
                     let key = person.key.clone();
-                    let can_remove = facts::can_remove_members(row);
+                    let is_self = !me_id.is_empty() && person.key.id == me_id;
+                    let can_remove = facts::can_remove_members(row) && !is_self;
+                    let can_transfer = can_remove && row.key.network == Network::Discord && person.title != "Owner";
                     let remove_conv = row.key.clone();
                     let remove_id = person.key.id.clone();
                     let remove_name = person.name.clone();
+                    let owner_conv = row.key.clone();
+                    let owner_id = person.key.id.clone();
                     sections = sections.child(
                         div()
                             .id(("details-member", ix))
@@ -454,6 +791,18 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                             .child(div().flex_1().min_w_0().truncate().type_ui().child(person.name.clone()))
                             .children((person.title == "Owner").then(|| div().flex_none().type_small().text_color(theme::text_faint()).child("Owner")))
                             .children((!word.is_empty()).then(|| div().flex_none().type_small().text_color(theme::text_faint()).child(format!("· {word}"))))
+                            .when(can_transfer, |item| {
+                                item.child(
+                                    button(("details-member-owner", ix), ButtonKind::Ghost, "Make owner")
+                                        .h(px(22.))
+                                        .px(px(6.))
+                                        .type_micro()
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                        .on_click(cx.listener(move |pane, _, _, cx| {
+                                            pane.transfer_owner(owner_conv.clone(), owner_id.clone(), cx);
+                                        })),
+                                )
+                            })
                             .when(can_remove, |item| {
                                 item.child(
                                     icon_button(("details-member-remove", ix), "icons/x.svg", false)
@@ -461,6 +810,54 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                         .on_click(cx.listener(move |pane, _, _, cx| {
                                             pane.ask_remove_member(remove_conv.clone(), remove_id.clone(), remove_name.clone(), cx);
+                                        })),
+                                )
+                            })
+                            .when(mods.ban && person.title != "Owner", |item| {
+                                let conv = row.key.clone();
+                                let id = person.key.id.clone();
+                                let name = person.name.clone();
+                                item.child(
+                                    button(("details-member-ban", ix), ButtonKind::Ghost, "Ban")
+                                        .h(px(22.))
+                                        .px(px(6.))
+                                        .type_small()
+                                        .tooltip(tip("Ban from group", None))
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                        .on_click(cx.listener(move |pane, _, _, cx| {
+                                            pane.ask_ban_member(conv.clone(), id.clone(), name.clone(), cx);
+                                        })),
+                                )
+                            })
+                            .when(mods.promote && person.title != "Owner", |item| {
+                                let conv = row.key.clone();
+                                let id = person.key.id.clone();
+                                let name = person.name.clone();
+                                item.child(
+                                    button(("details-member-admin", ix), ButtonKind::Ghost, "Admin")
+                                        .h(px(22.))
+                                        .px(px(6.))
+                                        .type_small()
+                                        .tooltip(tip("Make admin", None))
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                        .on_click(cx.listener(move |pane, _, _, cx| {
+                                            pane.ask_promote_admin(conv.clone(), id.clone(), name.clone(), cx);
+                                        })),
+                                )
+                            })
+                            .when(mods.transfer && person.title != "Owner", |item| {
+                                let conv = row.key.clone();
+                                let id = person.key.id.clone();
+                                let name = person.name.clone();
+                                item.child(
+                                    button(("details-member-owner", ix), ButtonKind::Ghost, "Owner")
+                                        .h(px(22.))
+                                        .px(px(6.))
+                                        .type_small()
+                                        .tooltip(tip("Transfer ownership", None))
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                        .on_click(cx.listener(move |pane, _, _, cx| {
+                                            pane.ask_transfer_owner(conv.clone(), id.clone(), name.clone(), cx);
                                         })),
                                 )
                             })
@@ -760,6 +1157,22 @@ pub fn space(pane: &InfoPane, key: &Key, cx: &mut Context<InfoPane>) -> Div {
     let info = info.filter(|info| info.space.key == *key).cloned();
     let name = known.map(|space| space.name.clone()).or_else(|| info.as_ref().map(|info| info.space.name.clone())).unwrap_or_default();
     let icon = known.and_then(|space| space.icon.clone()).map(|icon| hub.file(&key.account(), &icon, cx));
+    let banner = info
+        .as_ref()
+        .and_then(|info| info.banner.as_ref())
+        .map(|file| hub.file(&key.account(), file, cx))
+        .and_then(|file| file.path);
+    let mark = (info.as_ref().and_then(|info| info.mark) == Some(protocol::Mark::Verified)).then(|| {
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .child(glyph("icons/badge-check.svg", 14., theme::text_soft()))
+    });
+    let boost_line = info
+        .as_ref()
+        .filter(|_| key.network == Network::Discord)
+        .and_then(|info| facts::space_boost_line(info.boost_level, info.boosts));
     let (waiting, failed, late) = pane.waiting();
     let line = match (key.network, info.as_ref()) {
         (Network::Discord, Some(info)) => match (info.members, info.online) {
@@ -786,25 +1199,267 @@ pub fn space(pane: &InfoPane, key: &Key, cx: &mut Context<InfoPane>) -> Div {
         .flex()
         .flex_col()
         .child(div().pt(px(16.)).child(Avatar::new(key, &name, draw::AVATAR).shape(Plate::Place).image(icon.as_ref()).build()))
-        .child(div().mt(px(12.)).min_w_0().truncate().type_title().child(name.clone()))
-        .children(line.map(|line| line.type_ui().text_color(theme::text_soft())));
-    // CONTRACT: no request sets a Space's notifications, so the setting `SpaceInfo` gives is
-    // shown as it is, read-only, and changed in the network's app.
-    let notify = info.as_ref().filter(|_| key.network == Network::Discord).map(|info| info.notify);
-    let top = top.children(notify.map(|notify| {
-        let shown = |ix: usize, words: &'static str, at: Notify| segment(("space-notify", ix), words, notify == at).px(px(8.)).cursor_default();
-        div()
+        .child(draw::name_line(name.clone(), mark).mt(px(12.)))
+        .children(line.map(|line| line.type_ui().text_color(theme::text_soft())))
+        .children(boost_line.map(|words| div().mt(px(2.)).type_small().text_color(theme::text_faint()).child(words)));
+    let top = if let Some(info) = info.as_ref().filter(|_| key.network == Network::Discord) {
+        let notify = pane.space_notify_shown(key, info.notify);
+        let level_seg = |ix: usize, words: &'static str, at: Notify, cx: &mut Context<InfoPane>| {
+            let space_key = key.clone();
+            segment(("space-notify", ix), words, notify == at)
+                .px(px(8.))
+                .on_click(cx.listener(move |pane, _, _, cx| {
+                    let req = Request::SetSpaceOptions {
+                        space: space_key.clone(),
+                        notify: Some(at),
+                        suppress_everyone: None,
+                        suppress_roles: None,
+                        highlights: None,
+                        events: None,
+                        mobile_push: None,
+                        reset_channel: None,
+                    };
+                    pane.set_space_options(req, move |s| s.notify = at, cx);
+                }))
+        };
+        let mut notify_box = div()
             .id("space-notify-row")
             .mt(px(12.))
-            .tooltip(tip(format!("Change this in {}", key.network.label()), None))
+            .flex()
+            .flex_col()
+            .gap(px(8.))
             .child(draw::notifications_row(
                 segmented()
-                    .child(shown(0, "All", Notify::All))
-                    .child(shown(1, "Mentions", Notify::Mentions))
-                    .child(shown(2, "Nothing", Notify::Nothing)),
-            ))
-    }));
-    let mut body = div().flex().flex_col().pb(px(theme::PANE_PAD)).child(top);
+                    .child(level_seg(0, "All", Notify::All, cx))
+                    .child(level_seg(1, "Mentions", Notify::Mentions, cx))
+                    .child(level_seg(2, "Nothing", Notify::Nothing, cx)),
+            ));
+        let toggle_row = |id: &'static str, label: &'static str, caption: Option<&'static str>, click: gpui::Stateful<Div>| {
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(div().type_small().text_color(theme::text()).child(label))
+                        .children(caption.map(|c| div().type_micro().text_color(theme::text_faint()).child(c))),
+                )
+                .child(click)
+        };
+        let sk_ev = key.clone();
+        let cur_everyone = info.suppress_everyone;
+        notify_box = notify_box.child(toggle_row(
+            "space-opt-everyone-row",
+            "Suppress @everyone and @here",
+            None,
+            draw::switch("space-opt-everyone", cur_everyone).on_click(cx.listener(move |pane, _, _, cx| {
+                let next = !cur_everyone;
+                let req = Request::SetSpaceOptions {
+                    space: sk_ev.clone(),
+                    notify: None,
+                    suppress_everyone: Some(next),
+                    suppress_roles: None,
+                    highlights: None,
+                    events: None,
+                    mobile_push: None,
+                    reset_channel: None,
+                };
+                pane.set_space_options(req, move |s| s.suppress_everyone = next, cx);
+            })),
+        ));
+        let sk_roles = key.clone();
+        let cur_roles = info.suppress_roles;
+        notify_box = notify_box.child(toggle_row(
+            "space-opt-roles-row",
+            "Suppress all role @mentions",
+            None,
+            draw::switch("space-opt-roles", cur_roles).on_click(cx.listener(move |pane, _, _, cx| {
+                let next = !cur_roles;
+                let req = Request::SetSpaceOptions {
+                    space: sk_roles.clone(),
+                    notify: None,
+                    suppress_everyone: None,
+                    suppress_roles: Some(next),
+                    highlights: None,
+                    events: None,
+                    mobile_push: None,
+                    reset_channel: None,
+                };
+                pane.set_space_options(req, move |s| s.suppress_roles = next, cx);
+            })),
+        ));
+        let sk_hl = key.clone();
+        let cur_suppress_hl = !info.highlights;
+        notify_box = notify_box.child(toggle_row(
+            "space-opt-highlights-row",
+            "Suppress highlights",
+            None,
+            draw::switch("space-opt-highlights", cur_suppress_hl).on_click(cx.listener(move |pane, _, _, cx| {
+                let next_highlights = cur_suppress_hl;
+                let req = Request::SetSpaceOptions {
+                    space: sk_hl.clone(),
+                    notify: None,
+                    suppress_everyone: None,
+                    suppress_roles: None,
+                    highlights: Some(next_highlights),
+                    events: None,
+                    mobile_push: None,
+                    reset_channel: None,
+                };
+                pane.set_space_options(req, move |s| s.highlights = next_highlights, cx);
+            })),
+        ));
+        let sk_events = key.clone();
+        let cur_mute_events = !info.events;
+        notify_box = notify_box.child(toggle_row(
+            "space-opt-events-row",
+            "Mute new events",
+            None,
+            draw::switch("space-opt-events", cur_mute_events).on_click(cx.listener(move |pane, _, _, cx| {
+                let next_events = cur_mute_events;
+                let req = Request::SetSpaceOptions {
+                    space: sk_events.clone(),
+                    notify: None,
+                    suppress_everyone: None,
+                    suppress_roles: None,
+                    highlights: None,
+                    events: Some(next_events),
+                    mobile_push: None,
+                    reset_channel: None,
+                };
+                pane.set_space_options(req, move |s| s.events = next_events, cx);
+            })),
+        ));
+        let sk_push = key.clone();
+        let cur_push = info.mobile_push;
+        notify_box = notify_box.child(toggle_row(
+            "space-opt-push-row",
+            "Mobile push notifications",
+            Some("Only affects Discord's own phone app."),
+            draw::switch("space-opt-push", cur_push).on_click(cx.listener(move |pane, _, _, cx| {
+                let next = !cur_push;
+                let req = Request::SetSpaceOptions {
+                    space: sk_push.clone(),
+                    notify: None,
+                    suppress_everyone: None,
+                    suppress_roles: None,
+                    highlights: None,
+                    events: None,
+                    mobile_push: Some(next),
+                    reset_channel: None,
+                };
+                pane.set_space_options(req, move |s| s.mobile_push = next, cx);
+            })),
+        ));
+        if !info.channel_overrides.is_empty() {
+            let mut list = div()
+                .mt(px(4.))
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(div().type_micro().font_weight(theme::MEDIUM).text_color(theme::text_faint()).child("CHANNEL OVERRIDES"));
+            for (ix, over) in info.channel_overrides.iter().enumerate() {
+                let level_word = match over.notify {
+                    Notify::All => "All",
+                    Notify::Mentions => "Mentions",
+                    Notify::Nothing => "Nothing",
+                };
+                let sk_reset = key.clone();
+                let ch_id = over.channel_id.clone();
+                list = list.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(6.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .type_small()
+                                .text_color(theme::text_soft())
+                                .child(format!("#{} · {level_word}", over.name)),
+                        )
+                        .child(
+                            button(("space-override-reset", ix), ButtonKind::Ghost, "Reset")
+                                .h(px(22.))
+                                .px(px(6.))
+                                .type_micro()
+                                .on_click(cx.listener(move |pane, _, _, cx| {
+                                    let ch = ch_id.clone();
+                                    let req = Request::SetSpaceOptions {
+                                        space: sk_reset.clone(),
+                                        notify: None,
+                                        suppress_everyone: None,
+                                        suppress_roles: None,
+                                        highlights: None,
+                                        events: None,
+                                        mobile_push: None,
+                                        reset_channel: Some(ch.clone()),
+                                    };
+                                    pane.set_space_options(
+                                        req,
+                                        move |s| s.channel_overrides.retain(|o| o.channel_id != ch),
+                                        cx,
+                                    );
+                                })),
+                        ),
+                );
+            }
+            notify_box = notify_box.child(list);
+        }
+        if let Some(priv_opts) = info.privacy {
+            let sk_dms = key.clone();
+            let cur_dms = priv_opts.allow_dms;
+            let cur_reqs = priv_opts.allow_requests;
+            let sk_reqs = key.clone();
+            notify_box = notify_box
+                .child(div().mt(px(6.)).type_micro().font_weight(theme::MEDIUM).text_color(theme::text_faint()).child("PRIVACY"))
+                .child(toggle_row(
+                    "space-priv-dms-row",
+                    "Allow direct messages from members",
+                    None,
+                    draw::switch("space-priv-dms", cur_dms).on_click(cx.listener(move |pane, _, _, cx| {
+                        let next = protocol::SpacePrivacy { allow_dms: !cur_dms, allow_requests: cur_reqs };
+                        let req = Request::SetSpacePrivacy { space: sk_dms.clone(), privacy: next };
+                        pane.set_space_options(req, move |s| s.privacy = Some(next), cx);
+                    })),
+                ))
+                .child(toggle_row(
+                    "space-priv-reqs-row",
+                    "Allow message requests from members",
+                    None,
+                    draw::switch("space-priv-reqs", cur_reqs).on_click(cx.listener(move |pane, _, _, cx| {
+                        let next = protocol::SpacePrivacy { allow_dms: cur_dms, allow_requests: !cur_reqs };
+                        let req = Request::SetSpacePrivacy { space: sk_reqs.clone(), privacy: next };
+                        pane.set_space_options(req, move |s| s.privacy = Some(next), cx);
+                    })),
+                ));
+        }
+        top.child(notify_box)
+    } else {
+        top
+    };
+    let mut body = div()
+        .flex()
+        .flex_col()
+        .pb(px(theme::PANE_PAD))
+        .children(banner.map(|path| {
+            div()
+                .w_full()
+                .h(px(96.))
+                .overflow_hidden()
+                .bg(theme::raised())
+                .child(gpui::img(std::path::PathBuf::from(path)).size_full().object_fit(gpui::ObjectFit::Cover))
+        }))
+        .child(top);
     let mut sections = div().px(px(theme::PANE_PAD)).flex().flex_col();
     let mut any = false;
     if let Some(info) = &info {
@@ -812,18 +1467,70 @@ pub fn space(pane: &InfoPane, key: &Key, cx: &mut Context<InfoPane>) -> Div {
             any = true;
             sections = sections.child(draw::label("About", true)).child(div().type_ui().line_clamp(6).child(info.description.trim().to_owned()));
         }
-        if !info.nickname.is_empty() || !info.roles.is_empty() {
+        let show_role = !info.nickname.is_empty() || !info.roles.is_empty() || info.can_change_nickname;
+        if show_role {
             sections = sections.child(draw::label("Role", !any));
             any = true;
-            let shown = info.roles.len().min(facts::ROLES_SHOWN);
-            let role = facts::Role::Place {
-                nickname: info.nickname.clone(),
-                place: name.clone(),
-                roles: info.roles[..shown].to_vec(),
-                more: info.roles.len() - shown,
-            };
-            let small = Avatar::new(key, &name, 16.).shape(Plate::Place).image(icon.as_ref()).build();
-            sections = sections.child(draw::role(&role, Some(small), None));
+            if !info.nickname.is_empty() || !info.roles.is_empty() {
+                let shown = info.roles.len().min(facts::ROLES_SHOWN);
+                let role = facts::Role::Place {
+                    nickname: info.nickname.clone(),
+                    place: name.clone(),
+                    roles: info.roles[..shown].to_vec(),
+                    more: info.roles.len() - shown,
+                };
+                let small = Avatar::new(key, &name, 16.).shape(Plate::Place).image(icon.as_ref()).build();
+                sections = sections.child(draw::role(&role, Some(small), None));
+            }
+            if info.can_change_nickname && pane.online_of(key.network) {
+                let editing_nick = pane
+                    .managing()
+                    .filter(|(k, kind, _)| k == key && *kind == ManageKind::Nickname)
+                    .map(|(_, _, input)| input.clone());
+                if let Some(input) = editing_nick {
+                    sections = sections.child(
+                        div()
+                            .mt(px(8.))
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .h(px(28.))
+                                    .px(px(8.))
+                                    .rounded(px(theme::R_CONTROL))
+                                    .bg(theme::field())
+                                    .border_1()
+                                    .border_color(theme::border())
+                                    .flex()
+                                    .items_center()
+                                    .child(input),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .child(button("space-nick-save", ButtonKind::Primary, "Save").h(px(24.)).px(px(8.)).type_small().on_click(cx.listener(|pane, _, _, cx| pane.submit_manage(cx))))
+                                    .child(button("space-nick-cancel", ButtonKind::Ghost, "Cancel").h(px(24.)).px(px(8.)).type_small().on_click(cx.listener(|pane, _, _, cx| pane.cancel_manage(cx)))),
+                            ),
+                    );
+                } else {
+                    let nick_key = key.clone();
+                    let current_nick = info.nickname.clone();
+                    sections = sections.child(
+                        div().mt(px(6.)).child(
+                            button("space-change-nick", ButtonKind::Secondary, "Change nickname")
+                                .h(px(26.))
+                                .px(px(8.))
+                                .type_small()
+                                .on_click(cx.listener(move |pane, _, _, cx| {
+                                    pane.start_manage(nick_key.clone(), ManageKind::Nickname, &current_nick, "Server nickname (empty to clear)", cx);
+                                })),
+                        ),
+                    );
+                }
+            }
         }
         if !info.tags.is_empty() {
             sections = sections.child(draw::label("Tags", !any));

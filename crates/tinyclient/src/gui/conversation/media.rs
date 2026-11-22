@@ -411,6 +411,8 @@ mod tests {
             round: false,
             view_once: false,
             sticker_set: String::new(),
+            page: String::new(),
+            transcription: None,
             transcript: None,
         };
         assert_eq!(shape(&attachment("a.png", MediaKind::Image, "image/png", true, 0)), Shape::Image);

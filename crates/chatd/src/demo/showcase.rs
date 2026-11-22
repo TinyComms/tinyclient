@@ -351,6 +351,8 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
         title: "Lepraria".to_owned(),
         description: "A genus of leprose crustose lichens that grow on rock, bark and soil as patches of powdery granules.".to_owned(),
         image: Some(s.photo(account, "preview-small", MediaKind::Image, "preview-lichen.webp", look, 120, 120)?),
+        duration: 0,
+        opens_in_browser: false,
     });
     feed.push(small);
     let look = s.look(Art::Bands);
@@ -364,6 +366,8 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
         title: "Forty species in one morning on the creek route".to_owned(),
         description: "Volunteers recorded forty bryophytes and a first county record along two kilometres of bank.".to_owned(),
         image: Some(s.photo(account, "preview-large", MediaKind::Image, "preview-creek.webp", look, 800, 420)?),
+        duration: 0,
+        opens_in_browser: false,
     });
     feed.push(large);
 
@@ -372,7 +376,7 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
     let counted = [("👍", 4, true), ("❤️", 12, false), ("🎉", 9, true), ("👀", 7, false), ("🔥", 5, false), ("💯", 3, false), ("😂", 3, false), ("🙏", 2, false), ("🚀", 2, false), ("🤔", 1, false), ("🌿", 1, false)];
     loved.reactions = counted
         .into_iter()
-        .map(|(emoji, count, mine)| Reaction { emoji: emoji.to_owned(), file: None, count, mine, who: Vec::new() })
+        .map(|(emoji, count, mine)| Reaction { emoji: emoji.to_owned(), file: None, count, mine, who: Vec::new(), ..Reaction::default() })
         .collect();
     loved.reactions.insert(2, Reaction {
         emoji: ":mossparrot:".to_owned(),
@@ -380,6 +384,7 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
         count: 6,
         mine: false,
         who: Vec::new(),
+        ..Reaction::default()
     });
     loved.reactions.insert(3, Reaction {
         emoji: ":tailwag:".to_owned(),
@@ -387,6 +392,7 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
         count: 3,
         mine: false,
         who: Vec::new(),
+        ..Reaction::default()
     });
     feed.push(loved);
 

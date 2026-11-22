@@ -17,6 +17,10 @@ mod composer;
 mod conversation;
 #[cfg(debug_assertions)]
 pub(crate) mod debug_launch;
+mod discord_settings;
+mod discord_admin;
+// Webhooks, integrations, emoji and stickers. It shared a file name with the permissions, audit and AutoMod panes.
+mod discord_manage;
 mod hotkeys;
 mod input;
 mod keymap;

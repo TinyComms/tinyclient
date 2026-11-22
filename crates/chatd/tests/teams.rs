@@ -1861,7 +1861,7 @@ fn a_channel_page_is_the_one_message_model_and_reply_chains_are_threads() {
     assert_eq!((file.id.as_str(), file.kind, file.width, file.height), ("img:0-weu-d1-0123456789abcdef", MediaKind::Image, 640, 360));
     assert_eq!(picture.attachments[0].thumb.as_ref().map(|thumb| thumb.id.as_str()), Some("img:0-weu-d1-0123456789abcdef"));
     let fetched = world.until("the picture to be fetched", || {
-        let asked = Request::Fetch { retry: false, size: None, account: general.account(), ids: vec![file.id.clone()] };
+        let asked = Request::Fetch { retry: false, size: None, account: general.account(), ids: vec![file.id.clone()], span: None };
         match world.ask(asked) {
             Response::Media { files } => files.into_iter().find(|file| file.path.is_some()),
             _ => None,
@@ -1886,7 +1886,7 @@ fn a_channel_page_is_the_one_message_model_and_reply_chains_are_threads() {
     let content = format!("/v1.0/shares/u!{encoded}/driveItem/content");
     let file_id = attached.file.id.clone();
     let fetched = world.until("the shared file to be fetched or refused", || {
-        let asked = Request::Fetch { retry: false, size: None, account: general.account(), ids: vec![file_id.clone()] };
+        let asked = Request::Fetch { retry: false, size: None, account: general.account(), ids: vec![file_id.clone()], span: None };
         match world.ask(asked) {
             Response::Media { files } => files.into_iter().find(|file| file.id == file_id && (file.path.is_some() || file.failed.is_some())),
             _ => None,
@@ -2071,7 +2071,7 @@ fn sending_editing_reacting_deleting_and_reading_go_to_teams() {
     assert_eq!(failed.state, SendState::Failed { reason: "Teams is rate limiting you. Try again in 7 s.".to_owned() });
 
     // Edit: Teams is asked first, and the message changes once it agreed.
-    let edit = Request::Edit { conversation: ana.clone(), message_id: sent.id.clone(), text: "hello Ana".to_owned(), spans: Vec::new() };
+    let edit = Request::Edit { conversation: ana.clone(), message_id: sent.id.clone(), text: "hello Ana".to_owned(), spans: Vec::new(), suppress_embeds: false, keep_attachments: None };
     assert_eq!(world.ask(edit), Response::Ok);
     let put = world.fake.calls("PUT", &path("/messages/1760001000000")).pop().expect("the edit reached Teams");
     assert_eq!((put.json()["content"].as_str(), put.json()["messagetype"].as_str()), (Some("<p>hello Ana</p>"), Some("RichText/Html")));
@@ -2474,7 +2474,7 @@ fn leaving_a_group_chat_removes_myself_and_drops_the_row() {
     let grp1 = key("19:grp1@thread.v2");
     assert!(world.conversation(&grp1).is_some());
 
-    assert_eq!(world.ask(Request::Leave { conversation: grp1.clone() }), Response::Ok);
+    assert_eq!(world.ask(Request::Leave { conversation: grp1.clone(), silent: false }), Response::Ok);
     let left = world.fake.calls("DELETE", &format!("/v1/threads/19:grp1@thread.v2/members/{ME}"));
     assert_eq!(left.len(), 1);
     assert!(world.conversation(&grp1).is_none());
@@ -2573,6 +2573,8 @@ fn editing_a_message_preserves_formatting_mentions_images_and_subject() {
         message_id: post_id.to_string(),
         text: format!("**Release plan**\nShip **tomorrow** with <@{ANA}|Ana Ruiz>"),
         spans: Vec::new(),
+        suppress_embeds: false,
+        keep_attachments: None,
     };
     assert_eq!(world.ask(edit), Response::Ok);
     let put = world.fake.calls("PUT", &format!("/chat/v1/users/ME/conversations/{GENERAL}/messages/{post_id}")).pop().expect("edit PUT");
@@ -2877,6 +2879,8 @@ fn scheduled_chat_message_send_edit_cancel_and_channel_refusal() {
             message_id: scheduled.id.clone(),
             text: "Updated reminder".to_owned(),
             spans: Vec::new(),
+            suppress_embeds: false,
+            keep_attachments: None,
         }),
         Response::Ok
     );
@@ -4192,6 +4196,7 @@ fn server_side_search_across_account_team_conversation_filters_and_jump() {
         query: "budget".to_owned(),
         filters: protocol::SearchFilters::default(),
         cursor: None,
+        home: false,
     }) {
         Response::MessageHits { hits, .. } => hits,
         other => panic!("unexpected: {other:?}"),
@@ -4231,6 +4236,7 @@ fn server_side_search_across_account_team_conversation_filters_and_jump() {
         query: "budget".to_owned(),
         filters: protocol::SearchFilters::default(),
         cursor: None,
+        home: false,
     }) {
         Response::MessageHits { hits, .. } => hits,
         other => panic!("unexpected: {other:?}"),
@@ -4247,6 +4253,7 @@ fn server_side_search_across_account_team_conversation_filters_and_jump() {
         query: "deploy".to_owned(),
         filters: protocol::SearchFilters::default(),
         cursor: None,
+        home: false,
     }) {
         Response::MessageHits { hits, .. } => hits,
         other => panic!("unexpected: {other:?}"),
@@ -4267,6 +4274,7 @@ fn server_side_search_across_account_team_conversation_filters_and_jump() {
             ..Default::default()
         },
         cursor: None,
+        home: false,
     }) {
         Response::MessageHits { hits, .. } => hits,
         other => panic!("unexpected: {other:?}"),
@@ -4602,6 +4610,7 @@ fn team_and_channel_browse_join_create_rename_delete_members_leave_and_manage_li
     let preview = match world.ask(Request::InvitePreview {
         account: acc_key.clone(),
         code: "https://teams.microsoft.com/l/team/join?code=TEAM42".into(),
+        event_id: None,
     }) {
         Response::InvitePreview { preview } => preview,
         other => panic!("unexpected invite preview: {other:?}"),
@@ -4634,6 +4643,8 @@ fn team_and_channel_browse_join_create_rename_delete_members_leave_and_manage_li
         kind: ConversationKind::Channel,
         private: false,
         group: None,
+        description: None,
+        username: None,
     }) {
         Response::Error { detail, .. } => assert!(detail.contains("organization's policy"), "detail: {detail}"),
         other => panic!("expected channel create policy refusal, got {other:?}"),
@@ -4645,6 +4656,8 @@ fn team_and_channel_browse_join_create_rename_delete_members_leave_and_manage_li
         kind: ConversationKind::Channel,
         private: false,
         group: None,
+        description: None,
+        username: None,
     }) {
         Response::Conversation { conversation } => conversation,
         other => panic!("unexpected create channel: {other:?}"),
@@ -4821,6 +4834,7 @@ fn wave7b_review_regressions_pin_failure_activity_dedup_blocklist_group_search_a
         query: "roadmap".to_owned(),
         filters: protocol::SearchFilters::default(),
         cursor: None,
+        home: false,
     }) {
         Response::MessageHits { hits, .. } => hits,
         other => panic!("unexpected search: {other:?}"),
@@ -5353,7 +5367,7 @@ fn voice_messages_and_video_clips_can_be_played_and_recorded() {
     assert_eq!(voice.attachments[0].waveform, vec![5, 18, 29, 12]);
     let voice_id = voice.attachments[0].file.id.clone();
     let fetched_voice = world.until("voice message audio to be fetched", || {
-        match world.ask(Request::Fetch { retry: false, size: None, account: ana.account(), ids: vec![voice_id.clone()] }) {
+        match world.ask(Request::Fetch { retry: false, size: None, account: ana.account(), ids: vec![voice_id.clone()], span: None }) {
             Response::Media { files } => files.into_iter().find(|f| f.id == voice_id && f.path.is_some()),
             _ => None,
         }
@@ -5370,7 +5384,7 @@ fn voice_messages_and_video_clips_can_be_played_and_recorded() {
     assert_eq!(thumb.kind, MediaKind::Image);
     let video_id = video.attachments[0].file.id.clone();
     let fetched_video = world.until("video clip to be fetched", || {
-        match world.ask(Request::Fetch { retry: false, size: None, account: ana.account(), ids: vec![video_id.clone()] }) {
+        match world.ask(Request::Fetch { retry: false, size: None, account: ana.account(), ids: vec![video_id.clone()], span: None }) {
             Response::Media { files } => files.into_iter().find(|f| f.id == video_id && f.path.is_some()),
             _ => None,
         }

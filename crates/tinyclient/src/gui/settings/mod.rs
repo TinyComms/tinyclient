@@ -29,7 +29,7 @@ use gpui::{
     div, point, prelude::*, px, size, App, Bounds, Context, Div, Entity, FocusHandle, Focusable, Global, KeyBinding, Pixels,
     SharedString, Subscription, Task, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowHandle, WindowOptions,
 };
-use protocol::{AccountStatus, Request, Response};
+use protocol::{AccountStatus, Key, Request, Response};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -391,7 +391,7 @@ pub struct SettingsWindow {
     /// The camera list is being read: each camera opens for a frame, which takes a moment.
     pub(super) cameras_reading: bool,
     /// Bytes on this Mac: messages, files.
-    pub(super) storage: Option<(u64, u64)>,
+    pub(super) storage: Option<(u64, u64, Vec<protocol::ChatCache>)>,
     /// The row whose value could not be stored, or whose action did not happen.
     pub(super) failed: Option<&'static str>,
     /// Why the last sound file could not be added (S13), in the picker's own words.
@@ -412,6 +412,14 @@ pub struct SettingsWindow {
     /// Never written back until loaded so existing exceptions are always preserved.
     pub(super) tg_privacy: HashMap<(protocol::AccountKey, protocol::PrivacyKey), protocol::PrivacyPolicy>,
     pub(super) tg_privacy_requested: std::collections::HashSet<protocol::AccountKey>,
+    /// Loaded Telegram account default auto-delete timer (`GetDefaultDisappearing`).
+    pub(super) tg_default_ttl: HashMap<protocol::AccountKey, u32>,
+    pub(super) tg_default_ttl_requested: std::collections::HashSet<protocol::AccountKey>,
+    /// Loaded Telegram chat folders for Settings › Accounts folder management.
+    pub(super) tg_folders: HashMap<protocol::AccountKey, Vec<protocol::Folder>>,
+    pub(super) tg_folders_requested: std::collections::HashSet<protocol::AccountKey>,
+    pub(super) tg_folder_name: HashMap<protocol::AccountKey, Entity<TextInput>>,
+    pub(super) tg_folder_error: HashMap<protocol::AccountKey, String>,
     /// Loaded account-wide notification defaults and exceptions (Telegram).
     pub(super) tg_notify_defaults: HashMap<protocol::AccountKey, protocol::NotifyDefaults>,
     pub(super) tg_notify_requested: std::collections::HashSet<protocol::AccountKey>,
@@ -420,6 +428,12 @@ pub struct SettingsWindow {
     pub(super) tg_sessions_requested: std::collections::HashSet<protocol::AccountKey>,
     pub(super) tg_session_confirm: Option<(protocol::AccountKey, String)>,
     pub(super) tg_session_error: Option<String>,
+    /// Loaded Discord Privacy & Safety settings (`GetNetworkPrivacy`), keyed by account.
+    pub(super) discord_privacy: HashMap<protocol::AccountKey, protocol::NetworkPrivacy>,
+    pub(super) discord_privacy_requested: std::collections::HashSet<protocol::AccountKey>,
+    /// Telegram auto-download presets and local chat-kind gates, once `GetAutoDownload` returns.
+    pub(super) tg_download: HashMap<protocol::AccountKey, protocol::AutoDownload>,
+    pub(super) tg_download_requested: std::collections::HashSet<protocol::AccountKey>,
     /// Drawn as the phone's page: a list of sections, then one section at a time.
     pub(super) phone: bool,
     /// On a phone: the list of sections is on show, not `section`.
@@ -452,6 +466,16 @@ pub struct SettingsWindow {
     pub(super) profile_name: Entity<TextInput>,
     pub(super) profile_about: Entity<TextInput>,
     pub(super) profile_pronouns: Entity<TextInput>,
+    /// Accent colour as hex (`5865F2`). Empty leaves the current colour.
+    pub(super) profile_accent: Entity<TextInput>,
+    /// Per-server profile, sent only for the signed-in account when a server is chosen.
+    pub(super) profile_space: Option<Key>,
+    pub(super) profile_server_about: Entity<TextInput>,
+    pub(super) profile_server_pronouns: Entity<TextInput>,
+    pub(super) profile_server_accent: Entity<TextInput>,
+    pub(super) profile_username: Entity<TextInput>,
+    pub(super) profile_birthday: Entity<TextInput>,
+    pub(super) profile_emoji_status: Entity<TextInput>,
     /// The Linux passphrase for the screen lock. Other systems use the device prompt.
     #[cfg(target_os = "linux")]
     lock_phrase: Entity<TextInput>,
@@ -497,6 +521,13 @@ impl SettingsWindow {
         let profile_name = cx.new(|cx| TextInput::new("Display name", cx));
         let profile_about = cx.new(|cx| TextInput::new("About me", cx));
         let profile_pronouns = cx.new(|cx| TextInput::new("Pronouns", cx));
+        let profile_accent = cx.new(|cx| TextInput::new("5865F2", cx));
+        let profile_server_about = cx.new(|cx| TextInput::new("About me on this server", cx));
+        let profile_server_pronouns = cx.new(|cx| TextInput::new("Pronouns on this server", cx));
+        let profile_server_accent = cx.new(|cx| TextInput::new("5865F2", cx));
+        let profile_username = cx.new(|cx| TextInput::new("@username", cx));
+        let profile_birthday = cx.new(|cx| TextInput::new("YYYY-MM-DD or MM-DD", cx));
+        let profile_emoji_status = cx.new(|cx| TextInput::new("Custom emoji id (empty clears)", cx));
         #[cfg(target_os = "linux")]
         let lock_phrase = cx.new(|cx| TextInput::secret("Passphrase", cx));
         let mut subscriptions = vec![
@@ -564,12 +595,22 @@ impl SettingsWindow {
             tiny,
             tg_privacy: HashMap::new(),
             tg_privacy_requested: std::collections::HashSet::new(),
+            tg_default_ttl: HashMap::new(),
+            tg_default_ttl_requested: std::collections::HashSet::new(),
+            tg_folders: HashMap::new(),
+            tg_folders_requested: std::collections::HashSet::new(),
+            tg_folder_name: HashMap::new(),
+            tg_folder_error: HashMap::new(),
             tg_notify_defaults: HashMap::new(),
             tg_notify_requested: std::collections::HashSet::new(),
             tg_sessions: HashMap::new(),
             tg_sessions_requested: std::collections::HashSet::new(),
             tg_session_confirm: None,
             tg_session_error: None,
+            discord_privacy: HashMap::new(),
+            discord_privacy_requested: std::collections::HashSet::new(),
+            tg_download: HashMap::new(),
+            tg_download_requested: std::collections::HashSet::new(),
             phone,
             listing: phone,
             shown: phone,
@@ -589,6 +630,14 @@ impl SettingsWindow {
             profile_name,
             profile_about,
             profile_pronouns,
+            profile_accent,
+            profile_space: None,
+            profile_server_about,
+            profile_server_pronouns,
+            profile_server_accent,
+            profile_username,
+            profile_birthday,
+            profile_emoji_status,
             #[cfg(target_os = "linux")]
             lock_phrase,
             _subscriptions: subscriptions,
@@ -639,6 +688,8 @@ impl SettingsWindow {
             Section::Accounts => {
                 self.tiny.forget_names();
                 self.read_tiny_names(cx);
+                self.tg_default_ttl_requested.clear();
+                self.tg_folders_requested.clear();
             }
             _ => {}
         }
@@ -905,8 +956,8 @@ impl SettingsWindow {
 
     pub(super) fn read_storage(&mut self, cx: &mut Context<Self>) {
         self.off_thread(cx, || crate::client::ask(&Request::Storage), |this, answer, cx| {
-            if let Ok(Response::Storage { messages, files }) = answer {
-                this.storage = Some((messages, files));
+            if let Ok(Response::Storage { messages, files, chats }) = answer {
+                this.storage = Some((messages, files, chats));
                 cx.notify();
             }
         });

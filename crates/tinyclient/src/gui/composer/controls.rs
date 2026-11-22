@@ -67,6 +67,32 @@ pub fn controls(can: &Capabilities, editing: bool) -> Controls {
     }
 }
 
+impl Controls {
+    /// Narrows account-level controls by per-conversation send rules (Telegram group restrictions).
+    pub fn apply_rules(mut self, rules: &protocol::SendRules) -> Self {
+        if !rules.allows_any_attachment() {
+            self.attach = false;
+        }
+        if !rules.send_gifs {
+            self.gif = false;
+            self.tabs.retain(|tab| *tab != Tab::Gifs);
+        }
+        if !rules.send_stickers {
+            self.tabs.retain(|tab| *tab != Tab::Stickers);
+        }
+        if !rules.send_voices || !rules.send_media {
+            self.voice = false;
+        }
+        if !rules.send_polls {
+            self.poll = false;
+        }
+        if !rules.embed_links {
+            self.link_chip = false;
+        }
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +199,42 @@ mod tests {
         let t = controls(&telegram, false);
         assert!(t.effects && t.view_once && !t.importance && !t.broadcast);
         assert!(!controls(&telegram, true).effects);
+    }
+
+    #[test]
+    fn per_chat_send_rules_hide_disallowed_media_stickers_gifs_voice_polls_and_links() {
+        let telegram = Capabilities {
+            max_file_bytes: 2 << 30,
+            max_files: 10,
+            gifs: true,
+            stickers: true,
+            voice_notes: true,
+            suppress_embeds: true,
+            polls: Some(protocol::PollCapabilities { max_options: 10, max_duration_secs: 0, multiple: true, anonymous: true }),
+            ..Capabilities::default()
+        };
+        let open = controls(&telegram, false).apply_rules(&protocol::SendRules::default());
+        assert!(open.attach && open.gif && open.voice && open.poll && open.link_chip);
+        assert_eq!(open.tabs, [Tab::Emoji, Tab::Gifs, Tab::Stickers]);
+
+        let no_media = controls(&telegram, false).apply_rules(&protocol::SendRules {
+            send_media: false,
+            ..protocol::SendRules::default()
+        });
+        assert!(!no_media.attach, "media ban hides attach button");
+        assert!(!no_media.voice, "media ban hides voice button");
+        assert!(no_media.gif && no_media.poll && no_media.link_chip);
+
+        let strict = controls(&telegram, false).apply_rules(&protocol::SendRules {
+            send_stickers: false,
+            send_gifs: false,
+            send_voices: false,
+            send_polls: false,
+            embed_links: false,
+            ..protocol::SendRules::default()
+        });
+        assert!(strict.attach);
+        assert!(!strict.gif && !strict.voice && !strict.poll && !strict.link_chip);
+        assert_eq!(strict.tabs, [Tab::Emoji]);
     }
 }

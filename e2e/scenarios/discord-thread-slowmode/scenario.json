@@ -1,0 +1,12 @@
+{
+  "id": "discord-thread-slowmode",
+  "title": "Discord keeps the real slowmode interval for an exempt member, and a cross-channel system line is not a jump",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run the desktop window. The same thread row is what a phone Discord thread uses.",
+    "ios": "The phone proof build does not run the desktop window. The same thread row is what a phone Discord thread uses."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

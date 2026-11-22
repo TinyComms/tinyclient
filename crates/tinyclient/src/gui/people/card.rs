@@ -6,18 +6,21 @@ use super::info::profile::draw;
 use super::info::profile::facts::{self, Act, Call, CardBody, Item, Seen, Surface};
 use super::presence::Ring;
 use super::{existing_direct, in_call, only_draws, person_avatar, shown_presence, Hub, Scene};
+use crate::gui::components::place::{placed, Layer, Place};
 use crate::gui::components::{
-    button, button_with_icon, fade_in, menu, menu_item, menu_item_danger, menu_separator, modal_body,
-    modal_buttons, network_icon, scrim, search_field, sensitive_cover, Avatar, ButtonKind, Shape as Plate,
+    button, button_with_icon, fade_in, menu, menu_item, menu_item_danger, menu_item_more, menu_label, menu_separator,
+    modal_body, modal_buttons, network_icon, scrim, search_field, sensitive_cover, Avatar, ButtonKind, Shape as Plate,
 };
 use crate::gui::input::{InputEvent, TextInput};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
 use gpui::{
-    anchored, deferred, div, point, prelude::*, px, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable,
-    KeyDownEvent, Pixels, Point, WeakEntity, Window,
+    anchored, canvas, deferred, div, point, prelude::*, px, AnyElement, Bounds, ClipboardItem, Context, Div, Entity,
+    FocusHandle, Focusable, KeyDownEvent, MouseDownEvent, Pixels, Point, WeakEntity, Window,
 };
-use protocol::{Conversation, Key, Link, Notify, Person, Profile, RelateAction, Request, Response};
+use protocol::{AccountKey, AppCommand, CommandKind, Conversation, Key, Link, Network, Notify, Person, Profile, RelateAction, Request, Response, SpaceRole};
+use std::cell::Cell;
+use std::rc::Rc;
 
 const CARD_WIDTH: f32 = 300.;
 const CONFIRM_WIDTH: f32 = 360.;
@@ -35,8 +38,8 @@ pub enum Float {
     Confirm(Key, RelateAction),
     /// One-line modal to set or clear a friend's private nickname.
     FriendNickname(Key),
-    /// Asked once before leaving a group.
-    Leave(Conversation),
+    /// Asked once before leaving a group (`silent` suppresses Discord's leave notice).
+    Leave { conversation: Conversation, silent: bool },
     /// Asked once before clearing history or deleting a chat on the network.
     ClearHistory { conversation: Conversation, delete_chat: bool, revoke: bool },
     /// Confirm sheet before reporting a message, person, or conversation to the network.
@@ -57,7 +60,7 @@ impl Float {
             | Float::Person { person, .. }
             | Float::Confirm(person, _)
             | Float::FriendNickname(person) => Some(person),
-            Float::Conversation { .. } | Float::Leave(_) | Float::ClearHistory { .. } | Float::Report { .. } => None,
+            Float::Conversation { .. } | Float::Leave { .. } | Float::ClearHistory { .. } | Float::Report { .. } => None,
         }
     }
 }
@@ -145,6 +148,21 @@ pub struct Floating {
     /// One-line input for setting a friend's private nickname (`Float::FriendNickname`).
     nick_input: Option<Entity<TextInput>>,
     nick_error: Option<String>,
+    /// Editable private note on the person whose card is open (`Capabilities::person_notes`).
+    note_input: Option<(Key, Entity<TextInput>)>,
+    note_baseline: String,
+    note_saving: bool,
+    note_saved: bool,
+    note_error: Option<String>,
+    /// Roles of the Discord server this card was opened from, when we may assign them.
+    space_roles: Vec<SpaceRole>,
+    roles_loaded: bool,
+    roles_error: Option<String>,
+    manage_roles: bool,
+    /// The Apps submenu of a person menu is open.
+    apps: bool,
+    apps_anchor: Rc<Cell<Option<Bounds<Pixels>>>>,
+    apps_menu: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// The open card's bio was revealed in Streamer mode. A new card hides it again.
     bio_revealed: bool,
 }
@@ -164,6 +182,18 @@ impl Floating {
             direct: None,
             nick_input: None,
             nick_error: None,
+            note_input: None,
+            note_baseline: String::new(),
+            note_saving: false,
+            note_saved: false,
+            note_error: None,
+            space_roles: Vec::new(),
+            roles_loaded: false,
+            roles_error: None,
+            manage_roles: false,
+            apps: false,
+            apps_anchor: Rc::default(),
+            apps_menu: Rc::default(),
             bio_revealed: false,
         }
     }
@@ -176,7 +206,20 @@ impl Floating {
         self.open.is_some()
     }
 
+    /// The person whose card is up, when the float is a profile card.
+    pub fn card_person(&self) -> Option<&Key> {
+        match self.open.as_ref() {
+            Some((Float::Card(person), _)) => Some(person),
+            _ => None,
+        }
+    }
+
     pub fn open(&mut self, float: Float, anchor: Point<Pixels>, cx: &mut Context<Self>) {
+        let next = match &float {
+            Float::Card(person) => Some(person),
+            _ => None,
+        };
+        self.release_note(next, cx);
         // On a phone a person's card is their Profile page, never a popover over the screen.
         if let (true, Float::Card(person)) = (crate::gui::phone::active(), &float) {
             let person = person.clone();
@@ -189,6 +232,9 @@ impl Floating {
         if let Float::Card(person) | Float::Menu(person) = &float {
             self.learn_place(person.clone(), matches!(float, Float::Card(_)), cx);
         }
+        self.apps = false;
+        self.apps_anchor.set(None);
+        self.apps_menu.set(None);
         self.bio_revealed = false;
         self.open = Some((float, anchor));
         self.opened += 1;
@@ -204,13 +250,22 @@ impl Floating {
         }
         self.place = None;
         self.direct = None;
+        self.space_roles.clear();
+        self.roles_loaded = false;
+        self.roles_error = None;
+        self.manage_roles = false;
         let (asked, shell, this) = (self.profile_asked, self.shell.clone(), cx.weak_entity());
         cx.spawn(async move |_, cx| {
             let held = shell.read_with(cx, |shell, _| {
                 let open = shell.held_rows().next().cloned();
-                (super::info::space_of(open.as_ref(), &person), existing_direct(shell.held_rows(), &person).cloned())
+                let place = super::info::space_of(open.as_ref(), &person);
+                let direct = existing_direct(shell.held_rows(), &person).cloned();
+                let manage = place.as_ref().is_some_and(|(key, _)| {
+                    shell.spaces.iter().any(|space| space.key == *key && space.key.network == Network::Discord && space.rights.manage_roles)
+                });
+                (place, direct, manage)
             });
-            let Ok((place, direct)) = held else {
+            let Ok((place, direct, manage)) = held else {
                 return;
             };
             let space = place.as_ref().map(|(key, _)| key.clone());
@@ -221,9 +276,30 @@ impl Floating {
                 }
                 this.place = place;
                 this.direct = direct;
+                this.manage_roles = manage;
                 cx.notify();
                 if !card {
                     return;
+                }
+                if manage {
+                    if let Some(space_key) = space.clone() {
+                        let weak_roles = weak.clone();
+                        super::ask_later(cx, Request::Roles { space: space_key }, move |answer, cx| {
+                            let _ = weak_roles.update(cx, |this, cx| {
+                                if this.profile_asked != asked {
+                                    return;
+                                }
+                                this.roles_loaded = true;
+                                match answer {
+                                    Ok(Response::Roles { roles, .. }) => this.space_roles = roles,
+                                    Ok(Response::Error { detail, .. }) => this.roles_error = Some(detail),
+                                    Err(err) => this.roles_error = Some(err.to_string()),
+                                    _ => {}
+                                }
+                                cx.notify();
+                            });
+                        });
+                    }
                 }
                 super::ask_later(cx, Request::Profile { person, space }, move |answer, cx| {
                     let Ok(Response::Profile { profile }) = answer else {
@@ -232,6 +308,10 @@ impl Floating {
                     let _ = weak.update(cx, |this, cx| {
                         if this.profile_asked == asked {
                             this.hub.learn(std::slice::from_ref(&profile.person));
+                            this.sync_note_input(&profile.person.key, &profile.note, cx);
+                            if !profile.mutual_people.is_empty() {
+                                this.hub.learn(&profile.mutual_people);
+                            }
                             this.profile = Some(*profile);
                             cx.notify();
                         }
@@ -242,8 +322,152 @@ impl Floating {
         .detach();
     }
 
+    fn can_note(&self, person: &Key) -> bool {
+        self.scene.accounts.iter().any(|own| own.key == person.account() && own.can.person_notes)
+    }
+
+    fn sync_note_input(&mut self, person: &Key, note: &str, cx: &mut Context<Self>) {
+        if !self.can_note(person) {
+            self.note_input = None;
+            return;
+        }
+        let same = self.note_input.as_ref().is_some_and(|(k, _)| k == person);
+        if same {
+            let current = self.note_input.as_ref().map(|(_, e)| e.read(cx).text().to_owned()).unwrap_or_default();
+            if current == self.note_baseline {
+                if let Some((_, input)) = &self.note_input {
+                    input.update(cx, |i, cx| i.set_text(note, cx));
+                }
+                self.note_baseline = note.to_owned();
+            }
+            return;
+        }
+        let input = cx.new(|cx| {
+            let mut field = TextInput::new("Add a note…", cx);
+            field.set_text(note, cx);
+            field
+        });
+        cx.subscribe(&input, |this, _, event: &InputEvent, cx| match event {
+            InputEvent::Changed => {
+                this.note_saved = false;
+                this.note_error = None;
+                cx.notify();
+            }
+            InputEvent::Submit => this.save_note(cx),
+        })
+        .detach();
+        self.note_input = Some((person.clone(), input));
+        self.note_baseline = note.to_owned();
+        self.note_saving = false;
+        self.note_saved = false;
+        self.note_error = None;
+    }
+
+    /// Saves a dirty note. `force` sends even when a save is already in flight, so switching
+    /// people does not drop the latest text.
+    fn write_note(&mut self, cx: &mut Context<Self>, force: bool) {
+        let Some((person, input)) = self.note_input.clone() else {
+            return;
+        };
+        let text = input.read(cx).text().to_owned();
+        if text == self.note_baseline || only_draws() || (!force && self.note_saving) {
+            return;
+        }
+        if text.chars().count() > 256 {
+            self.note_error = Some("Notes can be at most 256 characters.".to_owned());
+            cx.notify();
+            return;
+        }
+        self.note_saving = true;
+        self.note_saved = false;
+        self.note_error = None;
+        cx.notify();
+        let this = cx.weak_entity();
+        let saved_text = text.clone();
+        super::ask_later(cx, Request::SetNote { person: person.clone(), text }, move |answer, cx| {
+            let _ = this.update(cx, |this, cx| {
+                let still = this.note_input.as_ref().is_some_and(|(key, _)| key == &person);
+                let profile_hit = this.profile.as_ref().is_some_and(|profile| profile.person.key == person);
+                if still {
+                    this.note_saving = false;
+                    match &answer {
+                        Ok(Response::Ok) => {
+                            this.note_baseline = saved_text.clone();
+                            this.note_saved = true;
+                            this.note_error = None;
+                        }
+                        Ok(Response::Error { detail, .. }) => this.note_error = Some(detail.clone()),
+                        Ok(_) => this.note_error = Some("Could not save note.".to_owned()),
+                        Err(err) => this.note_error = Some(err.to_string()),
+                    }
+                }
+                if profile_hit {
+                    if let Ok(Response::Ok) = &answer {
+                        if let Some(profile) = this.profile.as_mut() {
+                            profile.note = saved_text;
+                        }
+                    }
+                }
+                if still || profile_hit {
+                    cx.notify();
+                }
+            });
+        });
+    }
+
+    fn save_note(&mut self, cx: &mut Context<Self>) {
+        self.write_note(cx, false);
+    }
+
+    /// Sends the latest note for whoever is open, then forgets the editor when `next` is someone else.
+    fn release_note(&mut self, next: Option<&Key>, cx: &mut Context<Self>) {
+        let current = self.note_input.as_ref().map(|(key, _)| key);
+        if current == next {
+            return;
+        }
+        if current.is_some() {
+            self.write_note(cx, true);
+            self.note_input = None;
+            self.note_baseline.clear();
+            self.note_saving = false;
+            self.note_saved = false;
+            self.note_error = None;
+        }
+    }
+
+    /// Re-fetches the open card's profile when `Change::People` signals a live update (e.g. `USER_NOTE_UPDATE`).
+    pub fn refresh_profile(&mut self, account: &AccountKey, cx: &mut Context<Self>) {
+        let Some((Float::Card(person), _)) = self.open.as_ref() else {
+            return;
+        };
+        if person.account() != *account || self.note_saving {
+            return;
+        }
+        let person = person.clone();
+        let space = self.place.as_ref().map(|(key, _)| key.clone());
+        let asked = self.profile_asked;
+        let weak = cx.weak_entity();
+        super::ask_later(cx, Request::Profile { person, space }, move |answer, cx| {
+            let Ok(Response::Profile { profile }) = answer else {
+                return;
+            };
+            let _ = weak.update(cx, |this, cx| {
+                if this.profile_asked == asked {
+                    this.sync_note_input(&profile.person.key, &profile.note, cx);
+                    this.profile = Some(*profile);
+                    cx.notify();
+                }
+            });
+        });
+    }
+
     /// Swaps what floats for something else in the same place.
     fn turn_to(&mut self, float: Float, cx: &mut Context<Self>) {
+        let next = match &float {
+            Float::Card(person) => Some(person),
+            _ => None,
+        };
+        self.release_note(next, cx);
         let anchor = self.open.as_ref().map(|(_, anchor)| *anchor).unwrap_or_default();
         self.bio_revealed = false;
         self.open = Some((float, anchor));
@@ -253,6 +477,7 @@ impl Floating {
 
     /// The shell is told after this update: a float may be closed from inside the shell's own.
     fn close(&mut self, cx: &mut Context<Self>) {
+        self.release_note(None, cx);
         if self.open.take().is_some() {
             self.hub.watch("profile", [], cx);
             let shell = self.shell.clone();
@@ -302,24 +527,62 @@ impl Floating {
         let actions = facts::actions(person, &seen, Surface::Card);
         let place = self.place.as_ref().map(|(_, name)| name.as_str());
         let ring = Ring::on(theme::overlay());
+        let shown_person = profile.map(|p| &p.person).unwrap_or(person);
+        let banner_path = profile
+            .and_then(|p| p.banner.as_ref())
+            .and_then(|file| self.hub.file(&person.key.account(), file, cx).path);
         let head = div()
             .relative()
             .h(px(16. + draw::AVATAR))
-            .children(profile.and_then(|profile| profile.accent).map(|color| {
-                div().absolute().top_0().left_0().right_0().h(px(draw::BAND)).bg(draw::band(color, theme::overlay()))
-            }))
-            .child(div().absolute().top(px(16.)).left(px(16.)).child(person_avatar(&self.hub, person, draw::AVATAR, &ring, calling, cx)));
+            .children(draw::banner_band(banner_path, profile.and_then(|p| p.accent), theme::overlay()))
+            .child(div().absolute().top(px(16.)).left(px(16.)).child(person_avatar(&self.hub, shown_person, draw::AVATAR, &ring, calling, cx)));
+        let badges: Vec<(String, Option<String>)> = profile
+            .map(|p| {
+                p.badges
+                    .iter()
+                    .map(|b| {
+                        let path = b.icon.as_ref().and_then(|file| self.hub.file(&person.key.account(), file, cx).path);
+                        (b.name.clone(), path)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mark = draw::mark_of(person).or_else(|| {
+            profile
+                .map(|p| p.server_tag.as_str())
+                .filter(|t| !t.is_empty())
+                .map(|t| draw::tag(t.to_owned(), false))
+        });
         let mut top = div()
             .px(px(16.))
             .flex()
             .flex_col()
-            .child(draw::name_line(person.name.clone(), draw::mark_of(person)).mt(px(12.)))
+            .child(draw::name_line(person.name.clone(), mark).mt(px(12.)))
+            .children(profile.filter(|p| p.server_profile).and_then(|_| draw::soft_line("Server profile".to_owned())))
             .children(draw::soft_line(facts::handle_line(person, profile)))
+            .children(draw::badge_strip("card-badge", &badges))
             .children(draw::presence_row(&line, theme::overlay(), 2))
             .when(actions.message || actions.request || actions.call.is_some(), |top| {
                 top.child(self.card_actions(person, &actions, cx).mt(px(16.)))
             });
         let is_self = self.scene.accounts.iter().any(|own| own.key == person.key.account() && own.me == person.key.id);
+        let can_edit_self = is_self
+            && self
+                .scene
+                .accounts
+                .iter()
+                .any(|own| own.key == person.key.account() && own.can.can_edit_profile());
+        if can_edit_self {
+            top = top.child(
+                button("card-edit-profile", ButtonKind::Secondary, "Edit profile")
+                    .w_full()
+                    .mt(px(12.))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.close(cx);
+                        crate::gui::settings::open(crate::gui::settings::Section::Accounts, cx);
+                    })),
+            );
+        }
         if let Some((action, label)) = facts::friendship_action(person).filter(|_| !is_self) {
             let who = person.clone();
             let friendship = button("card-friendship", ButtonKind::Secondary, label).w_full();
@@ -343,9 +606,45 @@ impl Floating {
         }
         let mut body = div().px(px(16.)).flex().flex_col().gap(px(10.));
         let mut any = false;
+        if !person.bot && person.activity.is_some() && seen.online {
+            let now = crate::view::now();
+            let ours = own_offset(now);
+            for (ix, fact) in facts::right_now(person, profile, &line, now, ours)
+                .into_iter()
+                .filter(|f| f.glyph != "icons/clock.svg")
+                .enumerate()
+            {
+                any = true;
+                let opens = fact.opens.clone();
+                let url = fact.url.clone().filter(|_| opens.is_none());
+                let title = fact.words.clone();
+                let art_path = fact
+                    .art
+                    .as_ref()
+                    .and_then(|file| self.hub.file(&person.key.account(), file, cx).path);
+                let row = match art_path {
+                    Some(path) => draw::fact_inline_art(("card-now", ix), path, fact.words, fact.soft),
+                    None => draw::fact_inline(("card-now", ix), fact.glyph, fact.words, fact.soft),
+                };
+                body = body.child(
+                    row.when_some(opens, |row, key| {
+                        row.cursor_pointer().hover(|row| row.bg(theme::hover())).on_click(cx.listener(move |this, _, _, cx| {
+                            let (key, title) = (key.clone(), title.clone());
+                            this.shell_do(cx, move |shell, cx| shell.select(key, &title, cx));
+                        }))
+                    })
+                    .when_some(url, |row, url| {
+                        row.cursor_pointer().hover(|row| row.bg(theme::hover())).on_click(cx.listener(move |this, _, window, cx| {
+                            this.close(cx);
+                            let _ = this.shell.update(cx, |shell, cx| shell.open_external_link(&url, window, cx));
+                        }))
+                    }),
+                );
+            }
+        }
         if let Some(profile) = profile.filter(|_| seen.online) {
             match facts::card_body(person, profile, place) {
-                Some(CardBody::Role(role)) => {
+                Some(CardBody::Role(role)) if !self.manage_roles => {
                     any = true;
                     let spaces = self.spaces(cx);
                     let icon = self.place.as_ref().map(|(key, name)| {
@@ -355,6 +654,7 @@ impl Floating {
                     });
                     body = body.child(draw::role(&role, icon, Some(3)));
                 }
+                Some(CardBody::Role(_)) => {}
                 Some(CardBody::About(bio)) => {
                     any = true;
                     let hide = crate::gui::streamer::is_active()
@@ -398,26 +698,151 @@ impl Floating {
                         })),
                 );
             }
+            if self.manage_roles {
+                any = true;
+                body = body.child(self.member_roles(person, profile, cx));
+            }
+            let friend_count = profile.mutual_friends.max(profile.mutual_people.len() as u32);
+            if friend_count > 0 {
+                any = true;
+                let (key, space, given) = (person.key.clone(), self.place.as_ref().map(|(key, _)| key.clone()), Some(profile.clone()));
+                let ring = Ring::on(theme::overlay());
+                let faces: Vec<Div> = profile
+                    .mutual_people
+                    .iter()
+                    .take(3)
+                    .map(|friend| person_avatar(&self.hub, friend, 18., &ring, false, cx))
+                    .collect();
+                body = body.child(
+                    div()
+                        .id("card-mutual-friends")
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .cursor_pointer()
+                        .rounded(px(theme::R_CONTROL))
+                        .hover(|r| r.bg(theme::hover()))
+                        .children(faces)
+                        .child(div().ml(px(4.)).type_small().text_color(theme::text_soft()).child(facts::mutual_friends_words(friend_count)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let (key, space, given) = (key.clone(), space.clone(), given.clone());
+                            this.shell_do(cx, move |shell, cx| shell.details_person_with(key, space, given, cx));
+                        })),
+                );
+            }
             if let Some(common) = facts::in_common(network, profile) {
                 any = true;
                 let spaces = self.spaces(cx);
                 let account = person.key.account();
-                let icons = common.names.iter().map(|name| {
-                    let known = spaces.iter().find(|space| space.key.account() == account && space.name == *name);
-                    let key = known.map(|space| space.key.clone()).unwrap_or_else(|| Key { id: name.clone(), ..person.key.clone() });
-                    let icon = known.and_then(|space| space.icon.as_ref()).map(|icon| self.hub.file(&account, icon, cx));
-                    Avatar::new(&key, name, 20.).shape(Plate::Place).image(icon.as_ref()).build()
-                });
-                let icons: Vec<Div> = icons.collect();
+                let mut row = div().flex().items_center().gap(px(4.));
+                if !profile.mutual_space_items.is_empty() {
+                    for (ix, item) in profile.mutual_space_items.iter().take(facts::SPACES_SHOWN).enumerate() {
+                        let known = spaces.iter().find(|space| space.key == item.key);
+                        let icon = known.and_then(|space| space.icon.as_ref()).map(|icon| self.hub.file(&account, icon, cx));
+                        let tip_text = if item.nickname.is_empty() {
+                            item.name.clone()
+                        } else {
+                            format!("{} ({})", item.name, item.nickname)
+                        };
+                        let key = item.key.clone();
+                        row = row.child(
+                            div()
+                                .id(("card-mutual-space", ix))
+                                .cursor_pointer()
+                                .rounded(px(4.))
+                                .tooltip(crate::gui::components::tip(tip_text, None))
+                                .child(Avatar::new(&item.key, &item.name, 20.).shape(Plate::Place).image(icon.as_ref()).build())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let key = key.clone();
+                                    this.shell_do(cx, move |shell, cx| shell.go(crate::gui::sidebar::Mode::Space(key), cx));
+                                })),
+                        );
+                    }
+                } else {
+                    for (ix, name) in common.names.iter().enumerate() {
+                        let known = spaces.iter().find(|space| space.key.account() == account && space.name == *name);
+                        let key = known.map(|space| space.key.clone()).unwrap_or_else(|| Key { id: name.clone(), ..person.key.clone() });
+                        let icon = known.and_then(|space| space.icon.as_ref()).map(|icon| self.hub.file(&account, icon, cx));
+                        let clickable = known.is_some();
+                        let click_key = key.clone();
+                        row = row.child(
+                            div()
+                                .id(("card-mutual-space", ix))
+                                .when(clickable, |el| {
+                                    el.cursor_pointer()
+                                        .tooltip(crate::gui::components::tip(name.clone(), None))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            let key = click_key.clone();
+                                            this.shell_do(cx, move |shell, cx| shell.go(crate::gui::sidebar::Mode::Space(key), cx));
+                                        }))
+                                })
+                                .child(Avatar::new(&key, name, 20.).shape(Plate::Place).image(icon.as_ref()).build()),
+                        );
+                    }
+                }
+                body = body.child(row.child(div().ml(px(4.)).type_small().text_color(theme::text_soft()).child(common.words)));
+            }
+            if !profile.connections.is_empty() {
+                any = true;
+                let mut conns = div().flex().flex_col();
+                for (ix, conn) in profile.connections.iter().take(4).enumerate() {
+                    let url = conn.url.clone();
+                    let row = draw::connection_row(("card-conn", ix), conn).when(!url.is_empty(), |row| {
+                        row.on_click(cx.listener(move |this, _, window, cx| {
+                            let url = url.clone();
+                            let _ = this.shell.update(cx, |shell, cx| shell.open_web_link(&url, window, cx));
+                        }))
+                    });
+                    conns = conns.child(row);
+                }
+                body = body.child(conns);
+            }
+            if let Some((_, input)) = self.note_input.as_ref().filter(|(k, _)| *k == person.key) {
+                any = true;
+                let focused = input.focus_handle(cx).is_focused(window);
+                let dirty = input.read(cx).text() != self.note_baseline;
+                let status = if self.note_saving {
+                    Some("Saving…")
+                } else if self.note_saved && !dirty {
+                    Some("Saved")
+                } else {
+                    None
+                };
                 body = body.child(
                     div()
                         .flex()
-                        .items_center()
+                        .flex_col()
                         .gap(px(4.))
-                        .children(icons)
-                        .child(div().ml(px(4.)).type_small().text_color(theme::text_soft()).child(common.words)),
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(div().type_micro().text_color(theme::text_faint()).child("Note · only you see this"))
+                                .children(status.map(|s| div().type_micro().text_color(theme::text_faint()).child(s))),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(4.))
+                                .child(search_field(focused).flex_1().min_w_0().line_height(px(18.)).child(input.clone()))
+                                .when(dirty && !self.note_saving, |row| {
+                                    row.child(
+                                        button("card-note-save", ButtonKind::Secondary, "Save")
+                                            .h(px(24.))
+                                            .px(px(8.))
+                                            .type_small()
+                                            .on_click(cx.listener(|this, _, _, cx| this.save_note(cx))),
+                                    )
+                                }),
+                        )
+                        .children(self.note_error.as_ref().map(|err| div().type_micro().text_color(theme::danger()).child(err.clone()))),
                 );
             }
+        } else if self.manage_roles && seen.online {
+            any = true;
+            body = body.child(div().type_small().text_color(theme::text_soft()).child("Loading roles…"));
         }
         let max = f32::from(window.viewport_size().height) - 16.;
         let (key, space, given) = (person.key.clone(), self.place.as_ref().map(|(key, _)| key.clone()), profile.cloned());
@@ -457,6 +882,109 @@ impl Floating {
             .when(any, |card| card.child(div().id("card-body").min_h_0().flex_shrink(1.).overflow_y_scroll().pt(px(12.)).child(body)))
             .child(div().h(px(12.)))
             .child(foot)
+    }
+
+    /// Checkboxes for roles we may give or take. A picture URL is never fetched or linked:
+    /// a colour swatch and a unicode emoji are the only marks drawn beside the name.
+    fn member_roles(&self, person: &Person, profile: &Profile, cx: &mut Context<Self>) -> Div {
+        if !self.roles_loaded && self.roles_error.is_none() {
+            return div().type_small().text_color(theme::text_soft()).child("Loading roles…");
+        }
+        let space_id = self.place.as_ref().map(|(key, _)| key.id.as_str()).unwrap_or("");
+        let mut col = div().flex().flex_col().gap(px(4.)).child(div().type_small().text_color(theme::text_soft()).child("Roles"));
+        for (ix, role) in self.space_roles.iter().enumerate() {
+            if role.id == space_id {
+                continue;
+            }
+            let held = profile.role_ids.iter().any(|id| id == &role.id);
+            if !role.assignable && !held {
+                continue;
+            }
+            let on = held;
+            let mut row = div()
+                .id(("card-role", ix))
+                .h(px(28.))
+                .px(px(6.))
+                .rounded(px(4.))
+                .flex()
+                .items_center()
+                .gap(px(6.));
+            if role.assignable {
+                let who = person.key.clone();
+                let role_id = role.id.clone();
+                row = row.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_member_role(who.clone(), role_id.clone(), cx);
+                }));
+            } else {
+                row = row.opacity(0.55).cursor_default();
+            }
+            row = row
+                .child(crate::gui::components::glyph(
+                    if on { "icons/square-check.svg" } else { "icons/square.svg" },
+                    14.,
+                    if on { theme::accent() } else { theme::text_soft() },
+                ))
+                .when(role.color != 0, |row| row.child(div().w(px(10.)).h(px(10.)).rounded(px(4.)).bg(gpui::rgb(role.color))))
+                .when(!role.icon.is_empty() && !role.icon.contains("://"), |row| {
+                    row.child(div().type_small().child(role.icon.clone()))
+                })
+                .child(div().min_w_0().truncate().type_small().text_color(theme::text()).child(role.name.clone()));
+            col = col.child(row);
+        }
+        if let Some(error) = &self.roles_error {
+            col = col.child(div().type_small().text_color(theme::danger()).child(error.clone()));
+        }
+        col
+    }
+
+    /// The full desired set, including roles we cannot change, so the server does not treat them as removed.
+    fn toggle_member_role(&mut self, person: Key, role_id: String, cx: &mut Context<Self>) {
+        if !self.roles_loaded {
+            self.roles_error = Some("Loading roles…".to_owned());
+            cx.notify();
+            return;
+        }
+        let Some(held) = self.profile.as_ref().filter(|profile| profile.person.key == person).map(|profile| profile.role_ids.clone()) else {
+            self.roles_error = Some("Loading roles…".to_owned());
+            cx.notify();
+            return;
+        };
+        let Some(space) = self.place.as_ref().map(|(key, _)| key.clone()) else {
+            return;
+        };
+        let mut ids = held;
+        if ids.iter().any(|id| id == &role_id) {
+            ids.retain(|id| id != &role_id);
+        } else {
+            ids.push(role_id);
+        }
+        self.roles_error = None;
+        let asked = self.profile_asked;
+        let weak = cx.weak_entity();
+        super::ask_later(cx, Request::SetMemberRoles { space, person: person.clone(), roles: ids.clone() }, move |answer, cx| {
+            let _ = weak.update(cx, |this, cx| {
+                if this.profile_asked != asked {
+                    return;
+                }
+                match answer {
+                    Ok(Response::Ok) => {
+                        let names: Vec<String> = ids
+                            .iter()
+                            .filter_map(|id| this.space_roles.iter().find(|role| role.id == *id).map(|role| role.name.clone()))
+                            .take(protocol::PROFILE_ROLES)
+                            .collect();
+                        if let Some(profile) = this.profile.as_mut().filter(|profile| profile.person.key == person) {
+                            profile.role_ids = ids;
+                            profile.roles = names;
+                        }
+                    }
+                    Ok(Response::Error { detail, .. }) => this.roles_error = Some(detail),
+                    Err(err) => this.roles_error = Some(err.to_string()),
+                    _ => {}
+                }
+                cx.notify();
+            });
+        });
     }
 
     fn spaces(&self, cx: &mut Context<Self>) -> Vec<protocol::Space> {
@@ -681,11 +1209,78 @@ impl Floating {
                 let words = if row.as_ref().is_some_and(|row| row.kind == protocol::ConversationKind::Group) { "Leave group" } else { "Leave" };
                 div().child(menu_item_danger("menu-leave", Some("icons/log-out.svg"), words).on_click(cx.listener(move |this, _, _, cx| {
                     if let Some(row) = row.clone() {
-                        this.turn_to(Float::Leave(row), cx);
+                        this.turn_to(Float::Leave { conversation: row, silent: false }, cx);
                     }
                 })))
             }
         }
+    }
+
+    /// Discord user commands for the open conversation, when this person is on that account.
+    fn user_app_commands(&self, person: &Person, cx: &Context<Self>) -> Option<(Key, Vec<AppCommand>)> {
+        let shell = self.shell.upgrade()?;
+        let shell = shell.read(cx);
+        let open = shell.snapshot.as_ref()?.open.as_ref()?;
+        if open.key.network != protocol::Network::Discord || open.key.account() != person.key.account() {
+            return None;
+        }
+        let mut commands = shell.user_commands.get(&open.key).cloned().unwrap_or_default();
+        commands.retain(|command| command.kind == CommandKind::User && !command.application_id.is_empty());
+        commands.sort_by(|a, b| {
+            a.app_name
+                .to_ascii_lowercase()
+                .cmp(&b.app_name.to_ascii_lowercase())
+                .then(a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+        });
+        Some((open.key.clone(), commands))
+    }
+
+    /// The row is measured while painting, so the submenu is placed on the next frame.
+    fn show_apps(&mut self, cx: &mut Context<Self>) {
+        if self.apps {
+            return;
+        }
+        self.apps = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(16)).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
+    }
+
+    fn apps_flyout(&self, person: &Person, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.apps {
+            return None;
+        }
+        let anchor = self.apps_anchor.get()?;
+        let (channel, commands) = self.user_app_commands(person, cx)?;
+        if commands.is_empty() {
+            return None;
+        }
+        let mark = self.apps_menu.clone();
+        let mut list = menu().w(px(220.)).relative().child(
+            canvas(move |bounds, _, _| mark.set(Some(bounds)), |_, _, _, _| {}).absolute().top_0().left_0().size_full(),
+        );
+        let mut last = String::new();
+        let target = person.key.id.clone();
+        for (ix, command) in commands.iter().enumerate() {
+            if !command.app_name.is_empty() && command.app_name != last {
+                if !last.is_empty() {
+                    list = list.child(menu_separator());
+                }
+                list = list.child(menu_label(command.app_name.clone()));
+                last = command.app_name.clone();
+            }
+            let (chosen, channel, target) = (command.clone(), channel.clone(), target.clone());
+            list = list.child(menu_item(("person-app", ix), None, command.name.clone(), None).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    let (chosen, channel, target) = (chosen.clone(), channel.clone(), target.clone());
+                    this.shell_do(cx, move |shell, cx| shell.run_app_command(channel, chosen, target, cx));
+                },
+            )));
+        }
+        Some(placed("person-apps", Place::Beside(anchor), Layer::Menu, window, list))
     }
 
     fn person_menu(&self, person: &Person, seen: &Seen, alt: bool, with_profile: bool, cx: &mut Context<Self>) -> Div {
@@ -706,6 +1301,27 @@ impl Floating {
         }
         for item in items {
             list = list.child(self.item(item, Some(person), None, link.clone(), cx));
+        }
+        if self.user_app_commands(person, cx).is_some_and(|(_, commands)| !commands.is_empty()) {
+            let open = self.apps;
+            let mut row = menu_item_more("menu-apps", Some("icons/bot.svg"), "Apps", open)
+                .on_hover(cx.listener(|this, over: &bool, _, cx| {
+                    if *over {
+                        this.show_apps(cx);
+                    }
+                }))
+                .on_click(cx.listener(|this, _, _, cx| this.show_apps(cx)));
+            if open {
+                let anchor = self.apps_anchor.clone();
+                row = row.relative().child(
+                    canvas(move |bounds, _, _| anchor.set(Some(bounds)), |_, _, _, _| {})
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full(),
+                );
+            }
+            list = list.child(menu_separator()).child(row);
         }
         list
     }
@@ -749,6 +1365,80 @@ impl Floating {
                         this.shell_do(cx, move |shell, cx| then(shell, cx));
                     }))),
             );
+        div()
+            .w(size.width)
+            .h(size.height)
+            .relative()
+            .child(scrim().id("confirm-scrim").on_click(cx.listener(|this, _, _, cx| this.close(cx))))
+            .child(div().absolute().top_0().left_0().size_full().flex().items_center().justify_center().pb(px(80.)).child(panel))
+    }
+
+    fn confirm_leave(&self, row: &Conversation, silent: bool, window: &Window, cx: &mut Context<Self>) -> Div {
+        let (title, words, verb) = facts::confirm_words(Act::Leave, &row.title, row.key.network);
+        let size = window.viewport_size();
+        let wide = if crate::gui::phone::active() { CONFIRM_WIDTH.min(f32::from(size.width) - 32.) } else { CONFIRM_WIDTH };
+        let can_silent = row.key.network == protocol::Network::Discord && row.kind == protocol::ConversationKind::Group;
+        let toggle_row = row.clone();
+        let target = row.clone();
+        let mut panel = div()
+            .w(px(wide))
+            .p(px(20.))
+            .rounded(px(theme::R_MODAL))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .shadow(theme::shadow_modal())
+            .font_family(theme::FONT)
+            .text_color(theme::text())
+            .occlude()
+            .flex()
+            .flex_col()
+            .child(div().type_title().child(title))
+            .child(modal_body(words));
+        if can_silent {
+            panel = panel.child(
+                div()
+                    .id("confirm-leave-silent")
+                    .mt(px(12.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .cursor_pointer()
+                    .text_size(px(13.))
+                    .text_color(theme::text())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.turn_to(
+                            Float::Leave { conversation: toggle_row.clone(), silent: !silent },
+                            cx,
+                        );
+                    }))
+                    .child(
+                        div()
+                            .w(px(14.))
+                            .h(px(14.))
+                            .flex_none()
+                            .rounded(px(3.))
+                            .border_1()
+                            .border_color(if silent { theme::accent() } else { theme::border() })
+                            .bg(if silent { theme::accent() } else { theme::canvas() })
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(silent, |box_el| {
+                                box_el.child(crate::gui::components::glyph("icons/check.svg", 10., theme::on_accent()))
+                            }),
+                    )
+                    .child("Leave without telling the group"),
+            );
+        }
+        panel = panel.child(
+            modal_buttons()
+                .child(button("confirm-cancel", ButtonKind::Secondary, "Cancel").on_click(cx.listener(|this, _, _, cx| this.close(cx))))
+                .child(button("confirm-do", ButtonKind::Danger, verb).on_click(cx.listener(move |this, _, _, cx| {
+                    let target = target.clone();
+                    this.shell_do(cx, move |shell, cx| shell.leave(&target, silent, cx));
+                }))),
+        );
         div()
             .w(size.width)
             .h(size.height)
@@ -1054,9 +1744,8 @@ impl Render for Floating {
                 (self.confirm(act, &person.name, person.key.network, window, cx, move |shell, cx| shell.relate(&target, action, cx)), true)
             }
             (Float::FriendNickname(_), Some(person)) => (self.confirm_friend_nickname(person, window, cx), true),
-            (Float::Leave(row), _) => {
-                let target = row.clone();
-                (self.confirm(Act::Leave, &row.title, row.key.network, window, cx, move |shell, cx| shell.leave(&target, cx)), true)
+            (Float::Leave { conversation, silent }, _) => {
+                (self.confirm_leave(conversation, *silent, window, cx), true)
             }
             (Float::ClearHistory { conversation, delete_chat, revoke }, _) => {
                 (self.confirm_clear_history(conversation, *delete_chat, *revoke, window, cx), true)
@@ -1066,25 +1755,43 @@ impl Render for Floating {
             }
             _ => return div(),
         };
-        // Escape goes to whatever has the keys, so the float takes them while it is up.
+        // Escape goes to whatever has the keys, so the float takes them while it is up,
+        // without stealing focus away from an inline input (like the note or nickname field).
         let focus = self.focus.get_or_insert_with(|| cx.focus_handle()).clone();
-        if !focus.is_focused(window) {
+        if !focus.contains_focused(window, cx) {
             window.focus(&focus, cx);
         }
         let surface = surface.track_focus(&focus).on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
             if event.keystroke.key == "escape" {
+                if this.apps {
+                    this.apps = false;
+                    this.apps_anchor.set(None);
+                    this.apps_menu.set(None);
+                    cx.notify();
+                    return;
+                }
                 this.close(cx);
             }
         }));
         if modal {
             return div().child(deferred(anchored().position(point(px(0.), px(0.))).child(fade_in(("float", self.opened), 160, surface))).priority(3));
         }
-        let surface = surface.on_mouse_down_out(cx.listener(|this, _, _, cx| this.close(cx)));
+        let (row_at, menu_at) = (self.apps_anchor.clone(), self.apps_menu.clone());
+        let surface = surface.on_mouse_down_out(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+            let at = event.position;
+            let on_apps = row_at.get().is_some_and(|bounds| bounds.contains(&at)) || menu_at.get().is_some_and(|bounds| bounds.contains(&at));
+            if !on_apps {
+                this.close(cx);
+            }
+        }));
         let offset = if matches!(float, Float::Card(_)) { point(px(8.), px(0.)) } else { point(px(2.), px(2.)) };
-        div().child(
-            deferred(anchored().position(anchor + offset).snap_to_window_with_margin(px(8.)).child(fade_in(("float", self.opened), 120, surface)))
-                .priority(2),
-        )
+        let flyout = person.as_ref().and_then(|person| self.apps_flyout(person, window, cx));
+        div()
+            .child(
+                deferred(anchored().position(anchor + offset).snap_to_window_with_margin(px(8.)).child(fade_in(("float", self.opened), 120, surface)))
+                    .priority(2),
+            )
+            .children(flyout)
     }
 }
 
