@@ -10674,6 +10674,7 @@ name = "tinyclient"
 version = "0.2.86"
 dependencies = [
  "android-activity",
+ "async-io",
  "block2 0.6.2",
  "chatd",
  "dispatch2",
@@ -10704,6 +10705,7 @@ dependencies = [
  "objc2-video-toolbox",
  "palette",
  "protocol",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "smallvec",
@@ -10713,6 +10715,7 @@ dependencies = [
  "ureq 3.4.2",
  "url",
  "windows-sys 0.61.2",
+ "zbus",
 ]
 
 [[package]]

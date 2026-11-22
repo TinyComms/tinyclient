@@ -257,8 +257,11 @@ pub fn key_action(id: &str) -> Option<Action> {
 fn keys_caption() -> &'static str {
     match hotkeys::reach() {
         Reach::Everywhere => "These keys work in any app, even with tinyclient in the background.",
+        #[cfg(target_os = "linux")]
+        Reach::Portal => "Shortcuts approved by the desktop work in any app. The active keys appear below.",
         Reach::Permission => "To work in other apps, these keys need Input Monitoring in System Settings › Privacy & Security.",
-        Reach::Window => "This system shows keys only to the app in front: they work while tinyclient's window is, and push to talk needs an X11 session.",
+        Reach::Window if hotkeys::wayland_session() => "Approve shortcuts in the desktop portal to use them in other apps. Without approval or portal support, mute and deafen work only in tinyclient.",
+        Reach::Window => "Mute and deafen work only while tinyclient is in front. Push to talk needs system shortcut support.",
     }
 }
 
@@ -2091,9 +2094,18 @@ impl SettingsWindow {
         let side = bound.is_some_and(|b| matches!(b.key, protocol::hotkey::Key::Mouse4 | protocol::hotkey::Key::Mouse5)) && !hotkeys::side_buttons();
         let second = match action {
             Action::Priority => Some("Push to talk that also asks to be heard over everyone, where you hold priority speech."),
-            _ if side => Some("This system doesn't show the mouse's side buttons to apps. Pick a key."),
+            _ if side && !hotkeys::wayland_session() => Some("This system doesn't show the mouse's side buttons to apps. Pick a key."),
             _ => None,
         };
+        let portal = hotkeys::portal_trigger(action).map(|trigger| format!("Desktop shortcut: {trigger}")).or_else(|| {
+            (hotkeys::wayland_session() && bound.is_some()).then(|| {
+                if bound.is_some_and(|binding| binding.key.is_mouse()) {
+                    "The Wayland shortcut portal has no standard mouse-button binding. Pick a keyboard key.".to_owned()
+                } else {
+                    "No desktop shortcut is active for this action.".to_owned()
+                }
+            })
+        });
         let clash = self.clash.as_ref().filter(|(row, _)| *row == id).map(|(_, words)| div().px(px(12.)).pb(px(8.)).type_small().text_color(theme::danger()).child(words.clone()));
         let failed = self.failed.filter(|row| *row == id).map(|row| div().px(px(12.)).pb(px(8.)).type_small().text_color(theme::danger()).child(failure_words(row, self.reachable(cx))));
         let waiting = self.waits_on_chatd(id, cx);
@@ -2105,6 +2117,7 @@ impl SettingsWindow {
             .when(lit, |row| row.bg(theme::selected()))
             .when(waiting, |row| row.opacity(0.4))
             .child(row(label, second.map(SharedString::from), div().flex().items_center().child(reset_slot(reset)).child(field)))
+            .children(portal.map(|words| div().px(px(12.)).pb(px(8.)).type_small().text_color(theme::text_soft()).child(words)))
             .children(clash)
             .children(failed)
     }
