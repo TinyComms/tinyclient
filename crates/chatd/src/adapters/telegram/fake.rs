@@ -2922,6 +2922,108 @@ impl World {
                 self.log(&format!("effects asked {}", self.effects_asked));
                 Vec::new()
             }
+            // A finished call with Odalys that Telegram asks to rate (and asks for debug, which
+            // tinyclient does not send), plus a call row in Odalys's chat carrying its call_id.
+            "call-rate" => {
+                let protocol = tl::types::PhoneCallProtocol {
+                    udp_p2p: true,
+                    udp_reflector: true,
+                    min_layer: 65,
+                    max_layer: 92,
+                    library_versions: vec!["1.0".into()],
+                }
+                .into();
+                let waiting = tl::types::UpdatePhoneCall {
+                    phone_call: tl::types::PhoneCallWaiting {
+                        video: false,
+                        id: 90_001,
+                        access_hash: 4_242,
+                        date: t0() + 85,
+                        admin_id: ME,
+                        participant_id: ODALYS,
+                        protocol,
+                        receive_date: None,
+                    }
+                    .into(),
+                };
+                let discarded = tl::types::UpdatePhoneCall {
+                    phone_call: tl::types::PhoneCallDiscarded {
+                        need_rating: true,
+                        need_debug: true,
+                        video: false,
+                        id: 90_001,
+                        reason: Some(tl::enums::PhoneCallDiscardReason::Hangup),
+                        duration: Some(95),
+                    }
+                    .into(),
+                };
+                let service = tl::types::MessageService {
+                    out: true,
+                    mentioned: false,
+                    media_unread: false,
+                    reactions_are_possible: false,
+                    silent: false,
+                    post: false,
+                    legacy: false,
+                    id: 72,
+                    from_id: Some(Who::User(ME).peer()),
+                    peer_id: odalys.peer(),
+                    saved_peer_id: None,
+                    reply_to: None,
+                    date: t0() + 90,
+                    action: tl::types::MessageActionPhoneCall {
+                        video: false,
+                        call_id: 90_001,
+                        reason: Some(tl::enums::PhoneCallDiscardReason::Hangup),
+                        duration: Some(95),
+                    }
+                    .into(),
+                    reactions: None,
+                    ttl_period: None,
+                };
+                self.messages.entry(key(odalys, None)).or_default().insert(service.id, service.clone().into());
+                vec![
+                    update(waiting.into()),
+                    update(discarded.into()),
+                    update(tl::types::UpdateNewMessage { message: service.into(), pts: 0, pts_count: 0 }.into()),
+                ]
+            }
+            // A finished call that Telegram does NOT ask to rate.
+            "call-discard-no-rate" => {
+                let protocol = tl::types::PhoneCallProtocol {
+                    udp_p2p: true,
+                    udp_reflector: true,
+                    min_layer: 65,
+                    max_layer: 92,
+                    library_versions: vec!["1.0".into()],
+                }
+                .into();
+                let waiting = tl::types::UpdatePhoneCall {
+                    phone_call: tl::types::PhoneCallWaiting {
+                        video: false,
+                        id: 90_002,
+                        access_hash: 4_243,
+                        date: t0() + 80,
+                        admin_id: ME,
+                        participant_id: ODALYS,
+                        protocol,
+                        receive_date: None,
+                    }
+                    .into(),
+                };
+                let discarded = tl::types::UpdatePhoneCall {
+                    phone_call: tl::types::PhoneCallDiscarded {
+                        need_rating: false,
+                        need_debug: false,
+                        video: false,
+                        id: 90_002,
+                        reason: Some(tl::enums::PhoneCallDiscardReason::Hangup),
+                        duration: Some(15),
+                    }
+                    .into(),
+                };
+                vec![update(waiting.into()), update(discarded.into())]
+            }
             "pins-full" => {
                 self.pins_full = true;
                 Vec::new()
@@ -3655,6 +3757,26 @@ impl World {
                 documents: Vec::new(),
             };
             return answer(tl::enums::messages::AvailableEffects::Effects(found));
+        }
+        if let Some(request) = asked::<f::phone::SetCallRating>(body) {
+            let tl::enums::InputPhoneCall::Call(peer) = request.peer;
+            if peer.id != 90_001 || peer.access_hash != 4_242 {
+                return Err(rpc(400, "CALL_PEER_INVALID", None));
+            }
+            if !(1..=5).contains(&request.rating) {
+                return Err(rpc(400, "RATING_INVALID", None));
+            }
+            let flat = request.comment.replace('\n', "\\n");
+            self.log(&format!(
+                "SetCallRating {} stars={} user={} comment={flat}",
+                peer.id, request.rating, request.user_initiative
+            ));
+            return answer(updates(Vec::new()));
+        }
+        if let Some(request) = asked::<f::phone::SaveCallDebug>(body) {
+            let tl::enums::InputPhoneCall::Call(peer) = request.peer;
+            self.log(&format!("SaveCallDebug {}", peer.id));
+            return answer(true);
         }
         // Who reacted, and who read: Odalys and Tobin reacted in the group and Odalys read it.
         // Odalys shares when she read a private message, and Tobin's chat needs mine shared.

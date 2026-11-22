@@ -3198,6 +3198,20 @@ pub enum Request {
     CallDecline,
     /// Leaves. Stops mediad.
     CallEnd,
+    /// Rates a finished call (1 to 5 stars, optional issue tags and comment).
+    /// `user_initiative` is `false` when answering `Change::CallRating` and `true` when
+    /// opened from a finished call's row.
+    CallRate {
+        account: AccountKey,
+        call_id: String,
+        rating: u8,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reasons: Vec<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        comment: String,
+        #[serde(default)]
+        user_initiative: bool,
+    },
     CallSet {
         muted: bool,
         deafened: bool,
@@ -4189,6 +4203,10 @@ pub enum Change {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ring: Option<Call>,
     },
+    /// Ephemeral. The network asked the user to rate a call that just ended.
+    CallRating {
+        prompt: CallRatingPrompt,
+    },
     /// Ephemeral. A sign-in the shell is drawing moved on by itself: the code was scanned, or
     /// ran out and was replaced.
     SignIn { network: Network, step: SignInStep },
@@ -4231,6 +4249,7 @@ impl Change {
         match (self, other) {
             (Change::Status, Change::Status)
             | (Change::Call { .. }, Change::Call { .. })
+            | (Change::CallRating { .. }, Change::CallRating { .. })
             | (Change::Playback { .. }, Change::Playback { .. })
             | (Change::Recording { .. }, Change::Recording { .. })
             | (Change::Settings, Change::Settings)
@@ -4276,6 +4295,7 @@ impl Change {
                 | Change::Ephemeral { .. }
                 | Change::Presence { .. }
                 | Change::Call { .. }
+                | Change::CallRating { .. }
                 | Change::Occupants { .. }
                 | Change::Searched { .. }
                 | Change::SignIn { .. }
@@ -5997,12 +6017,29 @@ mod sock_path_tests {
         assert_eq!(serde_json::from_str::<Change>(&serde_json::to_string(&modal_change).unwrap()).unwrap(), modal_change);
 
         let fail_change = Change::InteractionFailed {
-            conversation: conv,
+            conversation: conv.clone(),
             message_id: "msg1".into(),
             action_id: "btn1".into(),
             reason: "Interaction failed.".into(),
         };
         assert!(fail_change.is_ephemeral());
         assert_eq!(serde_json::from_str::<Change>(&serde_json::to_string(&fail_change).unwrap()).unwrap(), fail_change);
+
+        let rate_req = Request::CallRate {
+            account: AccountKey { network: Network::Telegram, account: "7001".into() },
+            call_id: "90001".into(),
+            rating: 3,
+            reasons: vec!["Echo".into(), "Noise".into()],
+            comment: "Crackled".into(),
+            user_initiative: false,
+        };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&rate_req).unwrap()).unwrap(), rate_req);
+
+        let rate_change = Change::CallRating {
+            prompt: CallRatingPrompt { conversation: conv, call_id: "90001".into(), video: false, seconds: Some(95) },
+        };
+        assert!(rate_change.is_ephemeral());
+        assert!(rate_change.same_scope(&rate_change));
+        assert_eq!(serde_json::from_str::<Change>(&serde_json::to_string(&rate_change).unwrap()).unwrap(), rate_change);
     }
 }

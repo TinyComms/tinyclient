@@ -4428,6 +4428,33 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::CallRate { account, call_id, rating, mut reasons, mut comment, user_initiative } => {
+                if !(1..=5).contains(&rating) {
+                    return error(ErrorCode::Refused, "Choose a rating between one and five stars.");
+                }
+                if call_id.trim().is_empty() {
+                    return error(ErrorCode::Refused, "Missing call id.");
+                }
+                reasons.truncate(8);
+                for reason in &mut reasons {
+                    protocol::clip(reason, 64);
+                }
+                protocol::clip(&mut comment, 512);
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::CallRate {
+                    call_id,
+                    rating,
+                    reasons,
+                    comment,
+                    user_initiative,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
             Request::TopicIcons { account } => {
                 if let Err(refused) = self.online(&account) {
                     return *refused;

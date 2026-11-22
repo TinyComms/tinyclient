@@ -1398,6 +1398,9 @@ impl Demo {
                     .collect();
                 let _ = reply.send(Ok(crate::adapters::CatalogPage { items, cursor: None }));
             }
+            Command::CallRate { reply, .. } => {
+                let _ = reply.send(Ok(()));
+            }
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CancelScheduled { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendScheduledNow { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

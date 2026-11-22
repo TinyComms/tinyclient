@@ -2425,7 +2425,7 @@ pub(super) fn call_action(
                     (CallOutcome::Ended, line)
                 }
             };
-            Some((text, CallNote { outcome, caller_id, seconds, participants: Vec::new(), video }))
+            Some((text, CallNote { outcome, caller_id, seconds, participants: Vec::new(), video, call_id: Some(call.call_id.to_string()) }))
         }
         MessageAction::GroupCall(call) => {
             let (outcome, seconds, text) = match call.duration {
@@ -2436,7 +2436,7 @@ pub(super) fn call_action(
                 ),
                 None => (CallOutcome::Live, None, format!("{who} started a video chat")),
             };
-            Some((text, CallNote { outcome, caller_id, seconds, participants: Vec::new(), video: true }))
+            Some((text, CallNote { outcome, caller_id, seconds, participants: Vec::new(), video: true, call_id: None }))
         }
         MessageAction::ConferenceCall(conf) => {
             let video = conf.video;
@@ -2457,7 +2457,7 @@ pub(super) fn call_action(
                 let line = if video { "Declined group video call" } else { "Declined group call" };
                 (CallOutcome::Declined, line.to_owned())
             };
-            Some((text, CallNote { outcome, caller_id, seconds, participants: Vec::new(), video }))
+            Some((text, CallNote { outcome, caller_id, seconds, participants: Vec::new(), video, call_id: None }))
         }
         _ => None,
     }
@@ -2516,7 +2516,7 @@ fn action(dir: &Directory, who: &str, action: &MessageAction) -> (String, bool) 
         A::GroupCallScheduled(_) => named(format!("{who} scheduled a video chat")),
         A::ConferenceCall(conf) => {
             let (text, _) = call_action(&A::ConferenceCall(conf.clone()), false, who, String::new())
-                .unwrap_or_else(|| (format!("{who} started a group call"), protocol::CallNote { outcome: protocol::CallOutcome::Live, caller_id: String::new(), seconds: None, participants: Vec::new(), video: conf.video }));
+                .unwrap_or_else(|| (format!("{who} started a group call"), protocol::CallNote { outcome: protocol::CallOutcome::Live, caller_id: String::new(), seconds: None, participants: Vec::new(), video: conf.video, call_id: None }));
             named(text)
         }
         A::ScreenshotTaken => named(format!("{who} took a screenshot")),

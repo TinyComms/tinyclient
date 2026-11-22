@@ -1126,6 +1126,7 @@ fn build_call_note(
             seconds,
             participants,
             video: false,
+            call_id: None,
         },
         text,
     )

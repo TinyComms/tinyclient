@@ -1561,6 +1561,9 @@ pub struct CallNote {
     pub participants: Vec<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub video: bool,
+    /// Network call id for rating a finished call from its row (`Request::CallRate`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
 }
 
 /// An earlier wording of one message, oldest first when several are kept. Only a network that

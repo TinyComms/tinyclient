@@ -129,6 +129,8 @@ impl Fault {
                 "CHAT_TOO_BIG" => "Telegram only says who read a message in small groups.".to_owned(),
                 "MESSAGE_TOO_OLD" => "Telegram no longer keeps who read this message.".to_owned(),
                 "EFFECT_ID_INVALID" => "That effect can't be sent here. Telegram plays effects in private chats only.".to_owned(),
+                "CALL_PEER_INVALID" => "Telegram no longer accepts a rating for that call.".to_owned(),
+                "RATING_INVALID" => "Choose a rating between one and five stars.".to_owned(),
                 "PINNED_DIALOGS_TOO_MUCH" => "You've pinned as many chats as Telegram allows. Unpin one first.".to_owned(),
                 "ICON_EMOJI_INVALID" => "That topic icon isn't valid.".to_owned(),
                 "DATE_INVALID" => "Choose a valid date.".to_owned(),

@@ -275,6 +275,9 @@ struct Live {
     /// and whether a message that carries one has already made us ask.
     effects: Option<Vec<protocol::CatalogItem>>,
     effects_asked: bool,
+    /// Recent phone calls seen on this connection: `(call_id, access_hash, peer)` so
+    /// `phoneCallDiscarded` can prompt for a rating and `phone.setCallRating` can name the call.
+    phone_calls: VecDeque<(i64, i64, Option<Who>)>,
     /// The newest post of each broadcast channel told to Telegram as viewed (`sync::viewed`).
     viewed: HashMap<Who, i32>,
     /// What the picker's items send.
@@ -772,6 +775,7 @@ fn offline(ctx: &Context, command: Command) {
         Command::TopicCreate { reply, .. } => drop(reply.send(Err(down()))),
         Command::TopicUpdate { reply, .. } | Command::TopicDelete { reply, .. } => drop(reply.send(Err(down()))),
         Command::TopicIcons { reply } | Command::MessageEffects { reply } => drop(reply.send(Err(down()))),
+        Command::CallRate { reply, .. } => drop(reply.send(Err(down()))),
         Command::ScheduledList { reply, .. } => drop(reply.send(Err(down()))),
         Command::CancelScheduled { reply, .. } | Command::SendScheduledNow { reply, .. } => drop(reply.send(Err(down()))),
         Command::Reschedule { reply, .. } => drop(reply.send(Err(down()))),
@@ -878,6 +882,9 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::MessageEffects { reply } => {
             let _ = reply.send(catalog::effects(account).map(|items| crate::adapters::CatalogPage { items, cursor: None }).map_err(refused));
+        }
+        Command::CallRate { call_id, rating, reasons, comment, user_initiative, reply } => {
+            let _ = reply.send(rate_call(account, &call_id, rating, &reasons, &comment, user_initiative).map_err(refused));
         }
         Command::ScheduledList { conversation_id, reply } => {
             let _ = reply.send(info::scheduled_list(account, &conversation_id).map_err(refused));
@@ -2500,4 +2507,82 @@ pub fn prove_telegram_block_contact() -> Result<(), String> {
 /// The lab's telegram-checklist driver. A build without this stays up and the driver fails.
 pub fn prove_telegram_checklist() -> Result<(), String> {
     content::prove_checklist()
+}
+
+/// Formats Telegram's `phone.setCallRating` comment from selected issue tags and optional note.
+/// Reason chips apply only below five stars; five-star ratings send the trimmed note alone.
+pub(super) fn format_call_rating_comment(rating: u8, reasons: &[String], comment: &str) -> String {
+    let mut tags = Vec::new();
+    if rating < 5 {
+        for raw in reasons {
+            let slug: String = raw
+                .trim()
+                .to_ascii_lowercase()
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
+            let slug = slug.trim_matches('_');
+            if !slug.is_empty() {
+                let tag = format!("#{slug}");
+                if !tags.contains(&tag) {
+                    tags.push(tag);
+                }
+            }
+        }
+    }
+    let note = comment.trim();
+    match (tags.is_empty(), note.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => note.to_owned(),
+        (false, true) => tags.join(" "),
+        (false, false) => format!("{}\n{note}", tags.join(" ")),
+    }
+}
+
+/// Sends `phone.setCallRating` for a call seen on this connection.
+fn rate_call(
+    account: &Account,
+    call_id: &str,
+    rating: u8,
+    reasons: &[String],
+    comment: &str,
+    user_initiative: bool,
+) -> Result<(), Fault> {
+    if !(1..=5).contains(&rating) {
+        return Err(Fault::Refused("Choose a rating between one and five stars.".to_owned()));
+    }
+    let id: i64 = call_id
+        .trim()
+        .parse()
+        .map_err(|_| Fault::Refused("That call couldn't be identified.".to_owned()))?;
+    let access_hash = account
+        .live()
+        .phone_calls
+        .iter()
+        .rev()
+        .find_map(|(known_id, hash, _)| (*known_id == id).then_some(*hash))
+        .ok_or_else(|| Fault::Refused("Telegram only accepts ratings for calls from this session.".to_owned()))?;
+    let comment = format_call_rating_comment(rating, reasons, comment);
+    let answer = account.ask(&tl::functions::phone::SetCallRating {
+        user_initiative,
+        peer: tl::types::InputPhoneCall { id, access_hash }.into(),
+        rating: i32::from(rating),
+        comment,
+    })?;
+    live::answered(account, &answer);
+    Ok(())
+}
+
+#[cfg(test)]
+mod call_rating_tests {
+    use super::format_call_rating_comment;
+
+    #[test]
+    fn rating_comment_formats_reason_tags_only_below_five_stars() {
+        let reasons = vec!["Echo".into(), "Distorted speech".into(), "echo".into()];
+        assert_eq!(format_call_rating_comment(3, &reasons, "  kept dropping  "), "#echo #distorted_speech\nkept dropping");
+        assert_eq!(format_call_rating_comment(2, &reasons, "   "), "#echo #distorted_speech");
+        assert_eq!(format_call_rating_comment(5, &reasons, "  Crystal clear  "), "Crystal clear");
+        assert_eq!(format_call_rating_comment(5, &reasons, ""), "");
+    }
 }

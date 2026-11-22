@@ -185,6 +185,7 @@ impl Dirty {
             | Change::Searched { .. }
             | Change::SignIn { .. }
             | Change::Call { .. }
+            | Change::CallRating { .. }
             | Change::Upload { .. }
             | Change::Playback { .. }
             | Change::Recording { .. }

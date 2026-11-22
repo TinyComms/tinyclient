@@ -4882,6 +4882,105 @@ fn message_effects_are_listed_sent_and_shown_by_their_emoji() {
 }
 
 #[test]
+fn a_call_discard_with_need_rating_prompts_and_sends_set_call_rating() {
+    let world = World::signed_in();
+    world.connected();
+    world.arrived("u7002", "12");
+
+    // A discard with need_rating=false does not prompt.
+    let since = world.status().1;
+    world.steer("call-discard-no-rate");
+
+    // A discard with need_rating=true and need_debug=true prompts for a rating (never sends SaveCallDebug)
+    // and stores the finished call row with its call_id so the user can also rate from the row.
+    world.steer("call-rate");
+    let mut cursor = since;
+    let prompt = world.until("Change::CallRating prompt", || {
+        match world.ask(Request::Wait { since: cursor }) {
+            Response::Changes { seq, changes, .. } => {
+                cursor = seq;
+                changes.into_iter().find_map(|change| match change {
+                    protocol::Change::CallRating { prompt } => Some(prompt),
+                    _ => None,
+                })
+            }
+            other => panic!("unexpected Wait response: {other:?}"),
+        }
+    });
+    assert_eq!(prompt.conversation, key("u7002"));
+    assert_eq!(prompt.call_id, "90001");
+    assert_eq!(prompt.seconds, Some(95));
+    assert!(!prompt.video);
+
+    // Wait for the call service row in Odalys's chat and confirm it carries call_id.
+    let row = world.arrived("u7002", "72");
+    assert_eq!(row.call.as_ref().and_then(|c| c.call_id.as_deref()), Some("90001"));
+    assert_eq!(row.call.as_ref().map(|c| c.outcome), Some(protocol::CallOutcome::Ended));
+
+    // Tinyclient does not upload non-tgcalls debug logs even when need_debug is true.
+    assert_eq!(world.called("SaveCallDebug"), 0, "{:?}", world.calls());
+
+    // Submitting a 3-star rating from the prompt sends phone.setCallRating with user_initiative=false
+    // and includes the selected issue hashtags plus optional comment.
+    let rated = world.ask(Request::CallRate {
+        account: account(),
+        call_id: "90001".into(),
+        rating: 3,
+        reasons: vec!["Echo".into(), "Noise".into()],
+        comment: "Audio cut out".into(),
+        user_initiative: false,
+    });
+    assert!(matches!(rated, Response::Ok), "expected Ok, got {rated:?}");
+    assert_eq!(
+        world.called("SetCallRating 90001 stars=3 user=false comment=#echo #noise\\nAudio cut out"),
+        1,
+        "{:?}",
+        world.calls()
+    );
+
+    // Rating again from the finished call row sends user_initiative=true; 5 stars omits reason tags.
+    let from_row = world.ask(Request::CallRate {
+        account: account(),
+        call_id: "90001".into(),
+        rating: 5,
+        reasons: vec!["Echo".into()],
+        comment: "Great".into(),
+        user_initiative: true,
+    });
+    assert!(matches!(from_row, Response::Ok), "expected Ok, got {from_row:?}");
+    assert_eq!(
+        world.called("SetCallRating 90001 stars=5 user=true comment=Great"),
+        1,
+        "{:?}",
+        world.calls()
+    );
+
+    // Out-of-range rating and unknown call id are refused with clear words.
+    assert!(matches!(
+        world.ask(Request::CallRate {
+            account: account(),
+            call_id: "90001".into(),
+            rating: 0,
+            reasons: Vec::new(),
+            comment: String::new(),
+            user_initiative: false,
+        }),
+        Response::Error { code: protocol::ErrorCode::Refused, detail } if detail.contains("one and five stars")
+    ));
+    assert!(matches!(
+        world.ask(Request::CallRate {
+            account: account(),
+            call_id: "55555".into(),
+            rating: 4,
+            reasons: Vec::new(),
+            comment: String::new(),
+            user_initiative: true,
+        }),
+        Response::Error { code: protocol::ErrorCode::Refused, detail } if detail.contains("this session")
+    ));
+}
+
+#[test]
 fn who_reacted_and_who_read_a_message_are_asked_of_telegram_only_on_demand() {
     let world = World::signed_in();
     world.connected();

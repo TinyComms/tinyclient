@@ -1239,6 +1239,15 @@ pub enum Command {
     MessageEffects {
         reply: Reply<CatalogPage>,
     },
+    /// Rates a finished call on Telegram (`phone.setCallRating`).
+    CallRate {
+        call_id: String,
+        rating: u8,
+        reasons: Vec<String>,
+        comment: String,
+        user_initiative: bool,
+        reply: Reply<()>,
+    },
     /// Fetch network-suggested chat folders.
     SuggestedFolders {
         reply: Reply<Vec<protocol::SuggestedFolder>>,
@@ -2119,6 +2128,7 @@ impl Command {
             Command::LoadTopics { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::TopicCreate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::TopicIcons { reply } | Command::MessageEffects { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::CallRate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SuggestedFolders { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ScheduledList { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

@@ -634,6 +634,42 @@ impl Pane {
             Some(div().flex_none().flex().items_center().gap(px(3.)).children(shown))
         });
         let call_support = self.open.as_ref().map_or(protocol::CallSupport::None, |open| open.call);
+        let rate_pill = message
+            .call
+            .as_ref()
+            .filter(|note| note.outcome == protocol::CallOutcome::Ended)
+            .and_then(|note| {
+                let call_id = note.call_id.clone()?;
+                let key = open_key.clone()?;
+                let shell = self.shell.clone();
+                let prompt = protocol::CallRatingPrompt {
+                    conversation: key,
+                    call_id,
+                    video: note.video,
+                    seconds: note.seconds,
+                };
+                Some(
+                    div()
+                        .id(SharedString::from(format!("call-row-rate-{}", message.id)))
+                        .flex_none()
+                        .h(px(24.))
+                        .px(px(10.))
+                        .rounded_full()
+                        .bg(theme::quiet_fill())
+                        .text_color(theme::text_soft())
+                        .hover(|style| style.bg(theme::hover()).text_color(theme::text()))
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .type_micro()
+                        .font_weight(theme::SEMIBOLD)
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            let prompt = prompt.clone();
+                            let _ = shell.update(cx, |shell, cx| shell.call_open_rating(prompt, true, cx));
+                        }))
+                        .child("Rate"),
+                )
+            });
         let shell = self.shell.clone();
         let pill = spec.pill.and_then(|words| {
             let key = open_key?;
@@ -710,6 +746,7 @@ impl Pane {
                     .children(faces)
                     .child(div().type_micro().text_color(theme::text_faint()).child(short_clock(message.sent))),
             )
+            .children(rate_pill)
             .children(pill)
     }
 
@@ -5421,7 +5458,7 @@ mod tests {
         let make = |outcome, outgoing, seconds| {
             let mut m = Message::plain("r1", "Bea", "fallback", 100, outgoing);
             m.kind = MessageKind::System;
-            m.call = Some(protocol::CallNote { outcome, caller_id: "u1".into(), seconds, participants: Vec::new(), video: false });
+            m.call = Some(protocol::CallNote { outcome, caller_id: "u1".into(), seconds, participants: Vec::new(), video: false, call_id: None });
             m
         };
         let missed_in = call_line_spec(&make(protocol::CallOutcome::Missed, false, None), "Bea");
