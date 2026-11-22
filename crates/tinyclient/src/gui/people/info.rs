@@ -1900,8 +1900,11 @@ impl InfoPane {
         let chosen_history = self.share_history;
         self.share_history = protocol::HistoryShare::None;
         let value = input.read(cx).text().trim().to_owned();
+        // A Tiny group's name may be cleared: it is then called by its people again.
+        let clears = conversation.network == Network::Tiny
+            && self.row.as_ref().is_some_and(|row| row.key == conversation && row.kind == protocol::ConversationKind::Group);
         let request = match kind {
-            ManageKind::Rename if !value.is_empty() => Request::ConversationUpdate {
+            ManageKind::Rename if !value.is_empty() || clears => Request::ConversationUpdate {
                 conversation,
                 title: Some(value),
                 topic: None,

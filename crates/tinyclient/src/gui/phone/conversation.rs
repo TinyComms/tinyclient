@@ -80,6 +80,13 @@ impl Shell {
         };
         let members = (!direct).then(|| action("phone-members", "icons/users.svg").aria_label("Members")
             .on_click(cx.listener(|this, _, _, cx| this.toggle_member_list(cx))));
+        // "Add people" on a Tiny direct message or group; the picker is the full-height sheet.
+        let add_people = self.can_add_people(open).then(|| {
+            let conversation = open.clone();
+            action("phone-add-people", "icons/user-plus.svg")
+                .aria_label("Add people")
+                .on_click(cx.listener(move |this, _, window, cx| this.open_add_people(&conversation, window, cx)))
+        });
         let details = action("phone-details", if direct { "icons/user.svg" } else { "icons/info.svg" })
             .aria_label(if direct { "Profile details" } else { "Conversation details" })
             .on_click(cx.listener(|this, _, _, cx| this.toggle_details(cx)));
@@ -125,6 +132,7 @@ impl Shell {
                     }),
             )
             .children(call)
+            .children(add_people)
             .children(members)
             .child(details);
         let state = trouble(link).map(|(words, tone, sign_in)| {

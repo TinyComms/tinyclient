@@ -4,7 +4,8 @@
 //! chatd's socket with no Signal behind it and no Signal library linked.
 //!
 //! Signal names a message by who wrote it and the millisecond they sent it, and has no list of
-//! conversations or history on its servers: what arrives is all there is.
+//! conversations or on-demand history on its servers: what arrives live — plus any encrypted
+//! message history archive transferred from the primary phone at link time — is all there is.
 
 use super::style::Range;
 use protocol::Span;
@@ -543,7 +544,7 @@ pub const FLAG_BORDERLESS: u32 = 2;
 pub const FLAG_GIF: u32 = 8;
 
 /// An encrypted attachment pointer carried on a Signal `DataMessage` or `Quote`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Pointer {
     pub cdn_number: u32,
     pub cdn_id: Option<u64>,
@@ -1384,10 +1385,48 @@ pub struct PersonProfile {
     pub key_known: bool,
 }
 
+/// Progress reported while waiting for or downloading a linked-device history transfer archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferProgress {
+    Waiting,
+    Downloading { downloaded_bytes: u64, total_bytes: u64 },
+}
+
+/// Result of waiting for and downloading a linked-device history transfer archive.
+#[derive(Debug)]
+pub enum TransferOutcome {
+    /// Encrypted archive downloaded to `path`, ready for streaming decryption and store import.
+    Ready {
+        path: std::path::PathBuf,
+        ephemeral_key: [u8; 32],
+        total_bytes: u64,
+    },
+    /// Primary phone declined or skipped transferring history.
+    Declined(String),
+    /// Transfer window or CDN archive expired (e.g. HTTP 404/410 or timeout).
+    Expired(String),
+    /// The user chose to skip the transfer.
+    Skipped,
+    /// Network or server error (the device remains linked).
+    Failed(String),
+}
+
+/// Waits for the primary phone to upload a linked-device message history archive and streams the
+/// encrypted archive to disk. Respects `skip` promptly so the user can skip at any time.
+pub trait HistoryTransfer: Send {
+    fn fetch(
+        self: Box<Self>,
+        on_progress: &dyn Fn(TransferProgress),
+        skip: Arc<AtomicBool>,
+    ) -> TransferOutcome;
+}
+
 /// What a finished link produced.
 pub struct Linked {
     /// What the keychain keeps (`super::Saved`, as JSON).
     pub session: String,
+    /// Optional post-link history transfer when the primary phone supplied an ephemeral backup key.
+    pub transfer: Option<Box<dyn HistoryTransfer>>,
 }
 
 /// Links this computer to an account as a new device: shows the link to scan, waits for the

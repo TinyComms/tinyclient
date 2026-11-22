@@ -638,7 +638,7 @@ impl Shell {
                 (_, _, Network::Slack) => "Every workspace from one sign-in".into(),
                 (_, _, Network::Telegram) => "Scan a code with your phone, or use your number".into(),
                 (_, _, Network::Teams) => "Work and school accounts; calls open in Teams".into(),
-                (_, _, Network::Signal) => "Link this computer from your phone; text for now".into(),
+                (_, _, Network::Signal) => "Link this device from your primary Signal app".into(),
                 (_, _, Network::Messages) => "Pair from your Android phone. It has to stay online.".into(),
                 (_, _, Network::Tiny) => "A server you already run".into(),
             };
@@ -1983,7 +1983,7 @@ impl Shell {
             list.push(row(ix, network, title.to_owned().into(), line.to_owned().into(), available).when(phone, |row| row.h(px(56.))));
         };
         // A phone offers only the networks it can sign in to (`signin::welcome::on_phone`), as
-        // its first run does: Signal links from a computer; Google Messages pairs by QR.
+        // its first run does.
         let offered = |network: &Network| !phone || super::signin::welcome::on_phone(*network);
         for network in AVAILABLE.into_iter().filter(offered) {
             if snapshot.link(network) == Link::SignedOut {

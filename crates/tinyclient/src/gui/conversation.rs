@@ -3401,7 +3401,7 @@ impl Pane {
             return None;
         }
         let open = self.open.as_ref()?;
-        let (key, occupants) = self.shell.upgrade().and_then(|shell| {
+        let (key, kind, occupants) = self.shell.upgrade().and_then(|shell| {
             let shell = shell.read(cx);
             let conv = shell.snapshot.as_ref()?.open.as_ref()?;
             if conv.key != open.key || conv.kind == protocol::ConversationKind::Voice {
@@ -3412,10 +3412,16 @@ impl Pane {
                 return None;
             }
             let occ = conv.occupants.as_ref().filter(|o| o.total > 0)?;
-            Some((conv.key.clone(), occ.clone()))
+            Some((conv.key.clone(), conv.kind, occ.clone()))
         })?;
         let names: Vec<&str> = occupants.people.iter().take(3).map(|p| p.name.as_str()).collect();
-        let summary = if names.is_empty() {
+        let summary = if kind == protocol::ConversationKind::Group {
+            if names.is_empty() {
+                format!("{} in this call", occupants.total)
+            } else {
+                format!("{} in this call · {}", occupants.total, names.join(", "))
+            }
+        } else if names.is_empty() {
             format!("Call in progress · {}", occupants.total)
         } else {
             format!("Call in progress · {}", names.join(", "))

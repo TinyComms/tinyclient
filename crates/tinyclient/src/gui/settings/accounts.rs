@@ -109,8 +109,7 @@ impl SettingsWindow {
         let mut pane = div().flex().flex_col().gap(px(20.));
         for network in NETWORK_ORDER {
             let mine: Vec<&AccountStatus> = accounts.iter().filter(|a| a.key.network == network && a.link != Link::SignedOut).collect();
-            // A phone cannot sign in to Signal (`signin::welcome::on_phone`): its group shows only
-            // for an account that came from elsewhere. Google Messages pairs by QR on phone/tablet.
+            // A phone offers every network supported on phone (`signin::welcome::on_phone`).
             if phone::active() && mine.is_empty() && !crate::gui::signin::welcome::on_phone(network) {
                 continue;
             }

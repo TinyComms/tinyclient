@@ -801,6 +801,20 @@ pub fn network_pin_label(conversation: &Conversation) -> String {
     }
 }
 
+/// Whether "Add people" is offered: a Tiny direct message with a person, or a Tiny group, on a
+/// server that has group conversations. Absent, not disabled, everywhere else.
+pub fn can_add_people(conversation: &Conversation, can: &protocol::Capabilities) -> bool {
+    conversation.key.network == Network::Tiny
+        && can.groups > 0
+        && match conversation.kind {
+            ConversationKind::Group => true,
+            ConversationKind::Direct => {
+                !conversation.bot && conversation.peer.as_deref().is_some_and(|peer| !peer.is_empty() && peer != conversation.key.account)
+            }
+            _ => false,
+        }
+}
+
 /// Whether this account may add people to this group or channel.
 pub fn can_add_members(conversation: &Conversation) -> bool {
     conversation.kind != ConversationKind::Direct && conversation.rights.add_members
@@ -1486,6 +1500,23 @@ mod tests {
         assert!(can_archive(&slack_chan, &tg_file), "Slack channel can be archived when account supports archive");
         assert_eq!(network_pin_label(&tg_dm), "Pin on Telegram");
         assert_eq!(network_pin_label(&tg_pinned), "Unpin on Telegram");
+
+        // "Add people": a Tiny direct with a person or a Tiny group, only where the server has groups.
+        let (with_groups, without) = (protocol::Capabilities { groups: u32::MAX, ..Default::default() }, protocol::Capabilities::default());
+        let mut tiny_dm = row(Network::Tiny, ConversationKind::Direct);
+        tiny_dm.peer = Some("bea".into());
+        let tiny_group = row(Network::Tiny, ConversationKind::Group);
+        assert!(can_add_people(&tiny_dm, &with_groups) && can_add_people(&tiny_group, &with_groups));
+        assert!(!can_add_people(&tiny_dm, &without) && !can_add_people(&tiny_group, &without), "nothing shows on a server without groups");
+        assert!(!can_add_people(&row(Network::Tiny, ConversationKind::Channel), &with_groups) && !can_add_people(&row(Network::Tiny, ConversationKind::Voice), &with_groups));
+        let mut slack_dm = row(Network::Slack, ConversationKind::Direct);
+        slack_dm.peer = Some("bea".into());
+        assert!(!can_add_people(&slack_dm, &with_groups) && !can_add_people(&row(Network::Discord, ConversationKind::Group), &with_groups));
+        let mut with_self = tiny_dm.clone();
+        with_self.peer = Some(with_self.key.account.clone());
+        let mut with_bot = tiny_dm.clone();
+        with_bot.bot = true;
+        assert!(!can_add_people(&with_self, &with_groups) && !can_add_people(&with_bot, &with_groups) && !can_add_people(&row(Network::Tiny, ConversationKind::Direct), &with_groups));
 
         let mut grp = row(Network::Slack, ConversationKind::Group);
         assert!(!can_add_members(&grp) && !can_remove_members(&grp) && !can_rename(&grp) && !can_edit_topic(&grp) && !can_edit_picture(&grp));

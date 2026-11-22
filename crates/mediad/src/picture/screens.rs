@@ -1,8 +1,7 @@
 //! What a share sends. The share picker lists every screen and, on Windows, every window a person
 //! would call one (`--screens`), each with a small JPEG of it; the share then captures the one
 //! chosen with `ShareSend`. Windows reads a screen with GDI from the desktop and a window with
-//! `PrintWindow`, which draws it even when it is covered. macOS and an X11 session share the
-//! primary screen alone, so they list just that. A Wayland session lists the same one row; the
+//! `PrintWindow`, which draws it even when it is covered. X11 uses RandR and EWMH, and macOS uses ScreenCaptureKit. A Wayland session lists one row; the
 //! picture is the frame a share already recording last produced, and the system's own picker is
 //! what chooses the monitor or the window when the share actually starts.
 
@@ -12,7 +11,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 /// The picker's pictures are fitted inside this.
-const THUMB: (u32, u32) = (320, 180);
+pub(super) const THUMB: (u32, u32) = (320, 180);
 const THUMB_QUALITY: u8 = 70;
 
 /// The screen or window the share captures, by id. `None` is the primary screen. One call per
@@ -84,8 +83,27 @@ pub(super) fn shrink(grab: &Rgba, width: u32, height: u32) -> Vec<u8> {
     rgb
 }
 
-#[cfg(not(windows))]
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 fn listed() -> Vec<ScreenSource> {
+    if super::session::current() == super::session::Kind::X11 {
+        super::x11::listed()
+    } else {
+        default_source()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn listed() -> Vec<ScreenSource> {
+    super::mac_screen::listed()
+}
+
+#[cfg(not(any(windows, target_os = "macos", all(target_os = "linux", not(target_env = "ohos")))))]
+fn listed() -> Vec<ScreenSource> {
+    default_source()
+}
+
+#[cfg(not(windows))]
+pub(super) fn default_source() -> Vec<ScreenSource> {
     vec![ScreenSource { id: "display:primary".to_owned(), name: "Your screen".to_owned(), primary: true, ..ScreenSource::default() }]
 }
 

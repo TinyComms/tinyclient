@@ -290,6 +290,9 @@ fn new_call(conversation: Key, state: CallState) -> Live {
         share_view: None,
         picture_source: None,
         video_allowed: true,
+        ringing: Vec::new(),
+        moved_from: None,
+        move_notice: None,
     };
     Live {
         intent: NEXT_INTENT.fetch_add(1, Ordering::Relaxed),
@@ -1842,6 +1845,49 @@ impl Calls {
     /// The other side of a ring we placed picked up.
     pub fn answered(&self, hub: &Hub, conversation: &Key) {
         if self.update(hub, conversation, Live::answer) {
+            self.tell(hub);
+        }
+    }
+
+    /// People rung into this call who have not joined. Replaces the list.
+    pub fn set_ringing(&self, hub: &Hub, conversation: &Key, ringing: Vec<protocol::CallRing>) {
+        let mut next = ringing;
+        let mut changed = false;
+        let known = self.update(hub, conversation, |live| {
+            if live.call.ringing != next {
+                live.call.ringing = std::mem::take(&mut next);
+                changed = true;
+            }
+        });
+        if known && changed {
+            self.tell(hub);
+        }
+    }
+
+    /// One sentence about a move into a group call, or why that move came back.
+    pub fn set_move_notice(&self, hub: &Hub, conversation: &Key, notice: Option<String>) {
+        let mut changed = false;
+        let known = self.update(hub, conversation, |live| {
+            if live.call.move_notice != notice {
+                live.call.move_notice = notice.clone();
+                changed = true;
+            }
+        });
+        if known && changed {
+            self.tell(hub);
+        }
+    }
+
+    /// The direct conversation a group call is moving out of, while that move is settling.
+    pub fn set_moved_from(&self, hub: &Hub, conversation: &Key, moved_from: Option<Key>) {
+        let mut changed = false;
+        let known = self.update(hub, conversation, |live| {
+            if live.call.moved_from != moved_from {
+                live.call.moved_from = moved_from.clone();
+                changed = true;
+            }
+        });
+        if known && changed {
             self.tell(hub);
         }
     }

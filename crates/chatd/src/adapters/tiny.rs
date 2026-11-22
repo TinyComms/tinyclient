@@ -115,6 +115,11 @@ pub fn prove_keep_opened_sealed() -> Result<(), String> {
     messages::prove_keep_opened_sealed()
 }
 
+/// The lab's tiny-groups proof. See `messages::prove_tiny_groups`.
+pub fn prove_tiny_groups() -> Result<(), String> {
+    messages::prove_tiny_groups()
+}
+
 /// The lab's refused-list proof. See `messages::prove_refused_list`.
 pub fn prove_refused_list() -> Result<(), String> {
     messages::prove_refused_list()
@@ -1438,6 +1443,10 @@ fn serve_inbox(ctx: &Context, saved: &Saved, live: &live::Live, inbox: Receiver<
             Command::Tiny(ask) => live.ask(ask),
             // A direct call's join is a ring, or an accept when one is already ringing in.
             // Media starts only once the server says the ring was accepted.
+            Command::CallJoin(id) if messages::is_group(ctx, &id) => {
+                let (reply, _) = std::sync::mpsc::channel();
+                live.ask(live::Ask::GroupJoin { group_id: id, reply });
+            }
             Command::CallJoin(id) => {
                 let key = ctx.key(&id);
                 let (call, _) = ctx.hub.calls.describe();
@@ -1463,7 +1472,16 @@ fn serve_inbox(ctx: &Context, saved: &Saved, live: &live::Live, inbox: Receiver<
                 }
             }
             // chatd's call in a room ended (hung up, or failed), or its mute changed.
+            Command::CallLeave(room_id) if messages::is_group(ctx, &room_id) => {
+                live.ask(live::Ask::GroupLeave { group_id: room_id });
+            }
             Command::CallLeave(room_id) => live.ask(live::Ask::Hangup { room_id }),
+            Command::CallRing { conversation_id, people, reply } if messages::is_group(ctx, &conversation_id) => {
+                live.ask(live::Ask::GroupRing { group_id: conversation_id, people, reply });
+            }
+            Command::CallStopRinging { conversation_id, people, reply } if messages::is_group(ctx, &conversation_id) => {
+                live.ask(live::Ask::GroupUnring { group_id: conversation_id, people, reply });
+            }
             Command::CallAudio { muted, deafened } => live.ask(live::Ask::State { muted, deafened }),
             Command::SignOut(reply) => {
                 // This install stops being a device of the person: revoked on the server
