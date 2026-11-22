@@ -4098,6 +4098,22 @@ impl Store {
         Ok(true)
     }
 
+    /// Clears the pin on every stored message of a conversation. True when one was pinned.
+    pub fn unpin_all(&mut self, conversation: &Key) -> rusqlite::Result<bool> {
+        let ids: Vec<String> = self
+            .db
+            .prepare(
+                "SELECT id FROM message
+                  WHERE network = ?1 AND account = ?2 AND conversation = ?3 AND json_extract(body, '$.pinned') = 1",
+            )?
+            .query_map(params![word(&conversation.network), conversation.account.as_str(), conversation.id.as_str()], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for id in &ids {
+            self.set_pinned(conversation, id, false)?;
+        }
+        Ok(!ids.is_empty())
+    }
+
     /// Ephemeral rows do not outlive the session. Returns the conversations that lost one.
     pub fn drop_ephemeral(&mut self, account: &AccountKey) -> rusqlite::Result<Vec<String>> {
         let network = word(&account.network);

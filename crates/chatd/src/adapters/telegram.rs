@@ -768,7 +768,7 @@ fn offline(ctx: &Context, command: Command) {
         Command::CancelScheduled { reply, .. } | Command::SendScheduledNow { reply, .. } => drop(reply.send(Err(down()))),
         Command::Reschedule { reply, .. } => drop(reply.send(Err(down()))),
         Command::Pinned { reply, .. } => drop(reply.send(Err(down()))),
-        Command::Pin { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Pin { reply, .. } | Command::UnpinAll { reply, .. } => drop(reply.send(Err(down()))),
         Command::Forward { reply, .. } => drop(reply.send(Err(down()))),
         Command::Report { reply, .. } => drop(reply.send(Err(down()))),
         Command::ReportReasons { reply, .. } => drop(reply.send(Err(down()))),
@@ -1121,6 +1121,9 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::Pin { conversation_id, message_id, pinned, notify, me_only, reply } => {
             let _ = reply.send(info::pin(account, &conversation_id, &message_id, pinned, notify, me_only).map_err(refused));
+        }
+        Command::UnpinAll { conversation_id, reply } => {
+            let _ = reply.send(info::unpin_all(account, &conversation_id).map_err(refused));
         }
         Command::Forward { from_conversation_id, message_ids, to_conversation_ids, note, reply } => {
             let _ = reply.send(info::forward(account, &from_conversation_id, &message_ids, &to_conversation_ids, &note).map_err(refused));

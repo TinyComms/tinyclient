@@ -788,6 +788,10 @@ impl Demo {
                 let done = demo.ctx.pinned(&conversation_id, &message_id, pinned);
                 let _ = reply.send(done.map_err(|err| Refusal::Refused(err.to_string())));
             }
+            Command::UnpinAll { conversation_id, reply } => {
+                let done = demo.ctx.unpin_all(&conversation_id);
+                let _ = reply.send(done.map_err(|err| Refusal::Refused(err.to_string())));
+            }
             Command::Forward { from_conversation_id, message_ids, to_conversation_ids, note, reply } => {
                 let from_key = demo.key(&from_conversation_id);
                 let (from_title, from_space) = demo

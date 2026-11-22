@@ -620,6 +620,23 @@ pub(super) fn apply(account: &Account, update: &Update) {
             read(account, &conversation, seen.max_id, seen.still_unread_count);
         }
         Update::ReadChannelInbox(seen) => read(account, &Who::Channel(seen.channel_id).text(), seen.max_id, seen.still_unread_count),
+        // A pin or an unpin made on another device, or by someone else in the chat.
+        Update::PinnedMessages(p) => {
+            let conversation = Who::of(&p.peer).text();
+            for id in &p.messages {
+                let _ = account.ctx.pinned(&conversation, &id.to_string(), p.pinned);
+            }
+        }
+        Update::PinnedChannelMessages(p) => {
+            let who = Who::Channel(p.channel_id);
+            let forum = account.dir().get(who).is_some_and(|known| known.forum);
+            for id in &p.messages {
+                let conversation = if forum { account.placed(Some(who), *id) } else { Some(who.text()) };
+                if let Some(conversation) = conversation {
+                    let _ = account.ctx.pinned(&conversation, &id.to_string(), p.pinned);
+                }
+            }
+        }
         Update::PinnedForumTopic(p) => sync::note_topic_pin(account, Who::of(&p.peer), p.topic_id, p.pinned),
         Update::PinnedForumTopics(p) => {
             if let Some(order) = &p.order {

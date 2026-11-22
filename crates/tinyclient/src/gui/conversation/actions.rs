@@ -1367,7 +1367,8 @@ impl Pane {
             conversation: conversation.clone(),
             message_id: message.id.clone(),
             pinned,
-            notify: true,
+            // A pin from the menu does not notify the whole group: there is no box to ask in.
+            notify: false,
             me_only: false,
         };
         cx.spawn(async move |this, cx| {
@@ -1375,6 +1376,7 @@ impl Pane {
             let _ = this.update(cx, |this, cx| {
                 match answer {
                     Ok(Response::Ok) => {
+                        this.refresh_pin_bar(cx);
                         let _ = this.shell.update(cx, |shell, cx| shell.refresh_pins(&conversation, cx));
                     }
                     Ok(Response::Error { detail, .. }) => {

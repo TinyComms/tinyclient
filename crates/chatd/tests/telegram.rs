@@ -44,6 +44,11 @@ fn account() -> AccountKey {
     AccountKey { network: Network::Telegram, account: "7001".into() }
 }
 
+/// `CHATD_TEST_BIN` names a copy of the binary, for a target directory other builds also write to.
+fn chatd_bin() -> String {
+    std::env::var("CHATD_TEST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_chatd").to_owned())
+}
+
 struct World {
     child: Child,
     dir: PathBuf,
@@ -113,7 +118,7 @@ impl World {
         std::fs::create_dir_all(&dir).unwrap();
         seed(&mut chatd::store::Store::open(&dir.join("chat.sqlite")).unwrap());
         let log = std::fs::File::create(dir.join("stderr.log")).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_chatd"));
+        let mut command = Command::new(chatd_bin());
         command
             .env("TINYCLIENT_DIR", &dir)
             .env("TINYCLIENT_TELEGRAM_FAKE", qr_seconds)
@@ -146,7 +151,7 @@ impl World {
         let _ = self.child.wait();
         let _ = std::fs::remove_file(self.dir.join("chat.sock"));
         let log = std::fs::File::create(self.dir.join("stderr.log")).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_chatd"))
+        let child = Command::new(chatd_bin())
             .env("TINYCLIENT_DIR", &self.dir)
             .env("TINYCLIENT_TELEGRAM_FAKE", "30")
             .env("TINYCLIENT_TELEGRAM_T0", t0().to_string())
@@ -4738,6 +4743,46 @@ fn forum_topics_crud_search_icons_and_paging_past_fifty() {
     // Delete the topic.
     assert_eq!(world.ask(Request::TopicDelete { topic: created.key.clone() }), Response::Ok);
     world.until("deleted topic gone", || world.conversation(&created.key.id).is_none().then_some(()));
+}
+
+#[test]
+fn a_message_is_pinned_unpinned_and_follows_the_pins_made_elsewhere() {
+    let world = World::signed_in();
+    world.connected();
+    // The group's history is here before anything is pinned in it.
+    assert!(!world.arrived("g8001", "20").pinned);
+    let pins = || match world.ask(Request::Pinned { conversation: key("g8001") }) {
+        Response::Pinned { messages, .. } => messages.into_iter().map(|message| message.id).collect::<Vec<_>>(),
+        other => panic!("{other:?}"),
+    };
+    let pinned = |on: bool| world.until(&format!("message 20 pinned={on}"), || world.message("g8001", "20").filter(|message| message.pinned == on).map(drop));
+    let pin = |id: &str, on: bool| world.ask(Request::Pin { conversation: key("g8001"), message_id: id.into(), pinned: on, notify: false, me_only: false });
+
+    // Pinned from here: one request, silent, and the message says so.
+    assert_eq!(pin("20", true), Response::Ok);
+    assert_eq!(world.called("UpdatePinnedMessage g8001 20 unpin=false silent=true oneside=false"), 1, "{:?}", world.calls());
+    pinned(true);
+    assert_eq!(pins(), ["20"]);
+
+    // Unpinned and pinned again on another device: the stored message follows, with no request.
+    let asked = world.called("UpdatePinnedMessage");
+    world.steer("message-unpin 20");
+    pinned(false);
+    world.steer("message-pin 20");
+    pinned(true);
+    assert_eq!(world.called("UpdatePinnedMessage"), asked);
+
+    // Unpin all is one request for the whole chat.
+    assert_eq!(world.ask(Request::UnpinAll { conversation: key("g8001") }), Response::Ok);
+    assert_eq!(world.called("UnpinAllMessages g8001 topic=None"), 1);
+    pinned(false);
+    assert!(pins().is_empty());
+
+    // A refusal is said in Telegram's words, not as a dropped link.
+    match pin("999999", true) {
+        Response::Error { detail, .. } => assert_eq!(detail, "That message is no longer there."),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]

@@ -1413,6 +1413,8 @@ pub enum Command {
         me_only: bool,
         reply: Reply<()>,
     },
+    /// Unpins every message of a conversation on the network.
+    UnpinAll { conversation_id: String, reply: Reply<()> },
     /// Executes an interactive control on a message (Slack `blocks.actions`, Telegram giveaways / games / callbacks).
     MessageAction {
         conversation_id: String,
@@ -2118,7 +2120,7 @@ impl Command {
             Command::Reschedule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StarredMessages { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Pinned { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
-            Command::Pin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Pin { reply, .. } | Command::UnpinAll { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::MessageAction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::PressButton { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::GetNotifyDefaults { reply }
@@ -2846,6 +2848,15 @@ impl Context {
     pub fn pinned(&self, conversation_id: &str, message_id: &str, pinned: bool) -> Stores {
         let conversation = self.key(conversation_id);
         if self.hub.store().set_pinned(&conversation, message_id, pinned)? {
+            self.hub.changed(Change::Messages { conversation });
+        }
+        Ok(())
+    }
+
+    /// Clears the pin on every stored message of a conversation.
+    pub fn unpin_all(&self, conversation_id: &str) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().unpin_all(&conversation)? {
             self.hub.changed(Change::Messages { conversation });
         }
         Ok(())

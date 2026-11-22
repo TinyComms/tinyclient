@@ -9,7 +9,7 @@ use palette::IntoColor;
 use crate::gui::pane::{self, Layer, Showing, Stack, Step};
 use super::{Pane, PaneEvent};
 use crate::client::ask;
-use crate::gui::components::{empty_state, glyph};
+use crate::gui::components::{button, empty_state, glyph, ButtonKind};
 use crate::gui::input::{InputEvent, InputKey, TextInput};
 use crate::gui::layout::{RightKind, RightPane};
 use crate::gui::sidebar::chat;
@@ -1925,19 +1925,22 @@ impl Shell {
         }
     }
 
-    /// Unpins a message from the pins pane, reloading the list once the network confirms.
-    fn unpin_message(&mut self, conversation: Key, message_id: String, cx: &mut Context<Self>) {
-        let request = Request::Pin {
-            conversation: conversation.clone(),
-            message_id,
-            pinned: false,
-            notify: false,
-            me_only: false,
+    /// Unpins a message from the pins pane (every pin for `None`), reloading the list once the
+    /// network confirms.
+    fn unpin_message(&mut self, conversation: Key, message_id: Option<String>, cx: &mut Context<Self>) {
+        let request = match message_id {
+            Some(message_id) => Request::Pin { conversation: conversation.clone(), message_id, pinned: false, notify: false, me_only: false },
+            None => Request::UnpinAll { conversation: conversation.clone() },
         };
         cx.spawn(async move |this, cx| {
             let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
             let _ = this.update(cx, |this, cx| match answer {
-                Ok(Response::Ok) => this.refresh_pins(&conversation, cx),
+                Ok(Response::Ok) => {
+                    this.refresh_pins(&conversation, cx);
+                    if let Some(pane) = this.conversation_state.pane.get().cloned() {
+                        pane.update(cx, |pane, cx| pane.refresh_pin_bar(cx));
+                    }
+                }
                 Ok(Response::Error { detail, .. }) => {
                     if let Some(pane) = this.conversation_state.pane.get().cloned() {
                         pane.update(cx, |pane, cx| pane.say(detail, cx));
@@ -2703,7 +2706,7 @@ fn draw_pins(shell: &Shell, conversation: &Key, cx: &mut Context<Shell>) -> AnyE
                             .child("Unpin")
                             .on_click(cx.listener(move |shell, _, _, cx| {
                                 cx.stop_propagation();
-                                shell.unpin_message(unpin_conv.clone(), unpin_id.clone(), cx);
+                                shell.unpin_message(unpin_conv.clone(), Some(unpin_id.clone()), cx);
                             }))
                     })),
             )
@@ -2717,7 +2720,23 @@ fn draw_pins(shell: &Shell, conversation: &Key, cx: &mut Context<Shell>) -> AnyE
             }))
             .on_click(cx.listener(move |shell, _, _, cx| shell.jump_to_pin(&id, cx)))
     });
-    crate::gui::components::scroll::scroll_page("pins-scroll-frame", div().id("pins").size_full().overflow_y_scroll().py(px(4.)).children(rows)).into_any_element()
+    // Telegram unpins a whole chat in one request.
+    let unpin_all = (can_unpin && unpin_all_offered(conversation.network, messages.len())).then(|| {
+        let all = conversation.clone();
+        div().px(px(theme::PANE_PAD)).py(px(6.)).flex().justify_end().child(
+            button("unpin-all", ButtonKind::Ghost, "Unpin all").on_click(cx.listener(move |shell, _, _, cx| shell.unpin_message(all.clone(), None, cx))),
+        )
+    });
+    crate::gui::components::scroll::scroll_page(
+        "pins-scroll-frame",
+        div().id("pins").size_full().overflow_y_scroll().py(px(4.)).children(unpin_all).children(rows),
+    )
+    .into_any_element()
+}
+
+/// "Unpin all" is drawn where the network has the request and there is more than one pin.
+fn unpin_all_offered(network: protocol::Network, pins: usize) -> bool {
+    network == protocol::Network::Telegram && pins > 1
 }
 
 /// Active and archived threads of one Discord channel. Clicking a thread opens it without joining;
@@ -3304,6 +3323,13 @@ pub fn parse_search_query(
 mod tests {
     use super::*;
     use protocol::{AccountKey, Network, ReplyTo, ThreadSummary};
+
+    #[test]
+    fn unpin_all_is_offered_on_telegram_with_more_than_one_pin() {
+        assert!(unpin_all_offered(Network::Telegram, 2));
+        assert!(!unpin_all_offered(Network::Telegram, 1));
+        assert!(!unpin_all_offered(Network::Discord, 5));
+    }
 
     fn key(id: &str) -> Key {
         Key::new(&AccountKey { network: Network::Slack, account: "T1".into() }, id)

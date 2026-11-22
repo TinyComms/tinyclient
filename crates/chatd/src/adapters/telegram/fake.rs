@@ -1118,6 +1118,44 @@ impl World {
         answer(updates(all))
     }
 
+    /// What is pinned in a chat, newest first: what a test pinned, and in the chat with Odalys
+    /// message 12, which was pinned before the script starts.
+    fn pinned_ids(&self, peer: Who) -> Vec<i32> {
+        let mut ids: Vec<i32> = self
+            .messages
+            .get(&peer.text())
+            .into_iter()
+            .flat_map(|held| held.values())
+            .filter_map(|message| match message {
+                tl::enums::Message::Message(message) if message.pinned => Some(message.id),
+                _ => None,
+            })
+            .rev()
+            .collect();
+        if peer == Who::User(ODALYS) && !ids.contains(&12) {
+            ids.push(12);
+        }
+        ids
+    }
+
+    /// Pins or unpins one message of a chat (every pinned one for `None`), and the update
+    /// Telegram tells every session of it.
+    fn pin_messages(&mut self, peer: Who, id: Option<i32>, pinned: bool) -> tl::enums::Update {
+        let mut ids = Vec::new();
+        for message in self.messages.get_mut(&peer.text()).into_iter().flat_map(|held| held.values_mut()) {
+            if let tl::enums::Message::Message(message) = message {
+                if id.map_or(message.pinned, |id| id == message.id) {
+                    message.pinned = pinned;
+                    ids.push(message.id);
+                }
+            }
+        }
+        match peer {
+            Who::Channel(channel_id) => tl::types::UpdatePinnedChannelMessages { pinned, channel_id, messages: ids, pts: 0, pts_count: 0 }.into(),
+            _ => tl::types::UpdatePinnedMessages { pinned, peer: peer.peer(), messages: ids, pts: 0, pts_count: 0 }.into(),
+        }
+    }
+
     fn store(&mut self, topic: Option<i32>, message: tl::types::Message) {
         let peer = Who::of(&message.peer_id);
         self.messages.entry(key(peer, topic)).or_default().insert(message.id, message.into());
@@ -2844,6 +2882,12 @@ impl World {
             // Telegram's own apps pinned the group; then reordered the pins without saying how.
             "pin" => vec![update(tl::types::UpdateDialogPinned { pinned: true, folder_id: None, peer: tl::types::DialogPeer { peer: Who::Group(CREW).peer() }.into() }.into())],
             "pins" => vec![update(tl::types::UpdatePinnedDialogs { folder_id: None, order: None }.into())],
+            // Someone pinned or unpinned a message of the group from another device:
+            // `message-pin 20`, `message-unpin 20`.
+            word @ ("message-pin" | "message-unpin") => {
+                let id = words.next().and_then(|id| id.parse().ok()).unwrap_or(0);
+                vec![update(self.pin_messages(Who::Group(CREW), Some(id), word == "message-pin"))]
+            }
             // Tobin was added to the Family folder.
             "folder" => {
                 self.family_grew = true;
@@ -3545,6 +3589,27 @@ impl World {
                 make(100, "Unread", false, true, "Only unread chats."),
                 make(101, "Personal", true, false, "Only private chats with contacts."),
             ]);
+        }
+        if let Some(request) = asked::<f::messages::UpdatePinnedMessage>(body) {
+            let peer = input_who(&request.peer);
+            self.log(&format!(
+                "UpdatePinnedMessage {} {} unpin={} silent={} oneside={}",
+                peer.text(),
+                request.id,
+                request.unpin,
+                request.silent,
+                request.pm_oneside
+            ));
+            if !self.messages.get(&peer.text()).is_some_and(|held| held.contains_key(&request.id)) {
+                return Err(rpc(400, "MESSAGE_ID_INVALID", None));
+            }
+            return answer(updates(vec![self.pin_messages(peer, Some(request.id), !request.unpin)]));
+        }
+        if let Some(request) = asked::<f::messages::UnpinAllMessages>(body) {
+            let peer = input_who(&request.peer);
+            self.log(&format!("UnpinAllMessages {} topic={:?}", peer.text(), request.top_msg_id));
+            self.pin_messages(peer, None, false);
+            return answer(tl::enums::messages::AffectedHistory::History(tl::types::messages::AffectedHistory { pts: 0, pts_count: 0, offset: 0 }));
         }
         if let Some(request) = asked::<f::messages::GetPinnedDialogs>(body) {
             self.log(&format!("GetPinnedDialogs {}", request.folder_id));
@@ -5319,7 +5384,7 @@ impl World {
             }
             let peer = input_who(&request.peer);
             let (name, mut count, ids): (&str, i32, Vec<i32>) = match request.filter {
-                tl::enums::MessagesFilter::InputMessagesFilterPinned => ("pinned", 1, vec![12]),
+                tl::enums::MessagesFilter::InputMessagesFilterPinned => ("pinned", 1, self.pinned_ids(peer)),
                 tl::enums::MessagesFilter::InputMessagesFilterPhotoVideo => ("media", 37, vec![14]),
                 tl::enums::MessagesFilter::InputMessagesFilterUrl => ("links", 4, vec![17]),
                 tl::enums::MessagesFilter::InputMessagesFilterMusic => ("music", 1, Vec::new()),

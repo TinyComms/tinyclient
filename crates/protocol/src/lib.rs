@@ -2278,6 +2278,10 @@ pub enum Request {
         #[serde(default)]
         me_only: bool,
     },
+    /// Unpins every message of a conversation (or of one forum topic) on the network.
+    UnpinAll {
+        conversation: Key,
+    },
     /// The pictures, files or links said in a conversation, newest first, from what is cached:
     /// what the info pane lists under a person or a channel. `before` continues below a
     /// message already listed. With `search`, the network is asked instead, because the user

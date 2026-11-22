@@ -5729,6 +5729,7 @@ impl Chat {
                     reply,
                 })
             }
+            Request::UnpinAll { conversation } => self.act(&conversation, |conversation_id, reply| Command::UnpinAll { conversation_id, reply }),
             Request::StarMessage { conversation, message_id, starred } => {
                 let account = conversation.account();
                 if let Err(refused) = self.online(&account) {
