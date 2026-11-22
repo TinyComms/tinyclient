@@ -1603,11 +1603,35 @@ pub struct AdminLogEntry {
     pub summary: String,
 }
 
+/// The subscription plan Discord reports for the signed-in account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscordPlan {
+    Free,
+    Classic,
+    Nitro,
+    Basic,
+}
+
+impl DiscordPlan {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Free => "No Nitro",
+            Self::Classic => "Nitro Classic",
+            Self::Nitro => "Nitro",
+            Self::Basic => "Nitro Basic",
+        }
+    }
+}
+
 /// What an account may send and do on messages, as the session says (the plan, the workspace's
 /// settings). A control the account lacks is absent in the shell, never disabled. Nothing is
 /// allowed until the adapter reports it (`Context::capabilities`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
+    /// Absent for other networks and before Discord reports its plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discord_plan: Option<DiscordPlan>,
     /// This Tiny account can ring a member before a direct conversation exists.
     #[serde(default, skip_serializing_if = "is_false")]
     pub direct_calls: bool,

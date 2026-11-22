@@ -168,6 +168,9 @@ pub fn refusal(found: Found, can: &Capabilities, network: Network) -> Option<Str
         Found::Folder => Some("Folders can't be sent".to_owned()),
         Found::Missing => Some("Not on disk anymore".to_owned()),
         Found::File(_) if can.max_file_bytes == 0 => Some(format!("{name} can't take files here")),
+        Found::File(bytes) if network == Network::Discord && bytes > can.max_file_bytes => {
+            Some(format!("Too big for Discord · {} max here", size(can.max_file_bytes)))
+        }
         Found::File(bytes) if bytes > can.max_file_bytes => Some(format!("Too big for {name} · limit {}", size(can.max_file_bytes))),
         Found::File(_) => None,
     }
@@ -393,7 +396,7 @@ mod tests {
     fn a_file_over_the_limit_is_refused_on_its_chip_before_anything_is_sent() {
         let can = discord();
         let big = chip(1, "clip.mov", Found::File(84_000_000), &can, Network::Discord);
-        assert_eq!(big.refused.as_deref(), Some("Too big for Discord · limit 20 MB"));
+        assert_eq!(big.refused.as_deref(), Some("Too big for Discord · 20 MB max here"));
         assert!(big.outgoing().is_none());
         let fits = chip(2, "photo.jpg", Found::File(20_000_000), &can, Network::Discord);
         assert!(fits.refused.is_none());

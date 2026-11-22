@@ -1711,7 +1711,7 @@ impl Chat {
             match std::fs::metadata(&real) {
                 Ok(meta) if meta.is_dir() => return refuse(format!("{named}: folders can't be sent. Zip it first.")),
                 Ok(meta) if meta.len() > max_file_bytes => {
-                    return refuse(format!("{named} is too big for {name} (limit {}).", megabytes(max_file_bytes)))
+                    return refuse(crate::blobs::upload::size_refusal(account.network, &named, max_file_bytes))
                 }
                 Ok(_) => {}
                 Err(_) => return refuse(format!("{named} is no longer there.")),
@@ -7472,13 +7472,6 @@ fn kind_of(path: &str) -> MediaKind {
         "mp4" | "mov" | "m4v" | "webm" => MediaKind::Video,
         "mp3" | "m4a" | "ogg" | "opus" | "wav" => MediaKind::Audio,
         _ => MediaKind::File,
-    }
-}
-
-fn megabytes(bytes: u64) -> String {
-    match bytes {
-        bytes if bytes >= 1 << 30 => format!("{} GB", bytes >> 30),
-        bytes => format!("{} MB", bytes >> 20),
     }
 }
 

@@ -199,6 +199,23 @@ impl SettingsWindow {
             None,
             "https://discord.com/feature/family-center",
         ));
+        let plan = account.can.discord_plan.filter(|_| account.link == Link::Connected);
+        rows = rows.child(rule()).child(link_row(
+            ("discord-nitro", ix),
+            "Nitro & billing",
+            plan.map(|plan| plan.label().into()),
+            "https://discord.com/settings/subscriptions",
+        )).child(rule()).child(link_row(
+            ("discord-shop", ix),
+            "Shop",
+            None,
+            "https://discord.com/shop",
+        )).child(rule()).child(link_row(
+            ("discord-quests", ix),
+            "Quests",
+            None,
+            "https://discord.com/discovery/quests",
+        ));
         if account.link != Link::Connected {
             return rows;
         }

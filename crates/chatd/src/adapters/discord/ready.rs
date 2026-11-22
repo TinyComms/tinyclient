@@ -1196,6 +1196,13 @@ impl Discord {
             _ => (10 << 20, protocol::EmojiScope::Space),
         };
         protocol::Capabilities {
+            discord_plan: match premium {
+                0 => Some(protocol::DiscordPlan::Free),
+                1 => Some(protocol::DiscordPlan::Classic),
+                2 => Some(protocol::DiscordPlan::Nitro),
+                3 => Some(protocol::DiscordPlan::Basic),
+                _ => None,
+            },
             max_file_bytes,
             max_files: 10,
             caption_limit: 0,

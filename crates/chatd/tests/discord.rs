@@ -2490,6 +2490,7 @@ fn sending_echoes_once_and_failures_say_why() {
 fn nitro_plain_text_uses_the_four_thousand_character_limit() {
     let three = "n".repeat(3000);
     let free = account_with_premium(0);
+    assert_eq!(can(&free).discord_plan, Some(protocol::DiscordPlan::Free));
     assert_eq!(text_limit_of(&free), 2000);
     let before = free.discord.requests_to("POST", "/channels/3002/messages").len();
     free.send("3002", "free-3000", &three, None);
@@ -2509,12 +2510,14 @@ fn nitro_plain_text_uses_the_four_thousand_character_limit() {
     }
     assert!(free.discord.requests_to("PATCH", "/channels/3001/messages/1300000000000000009").is_empty());
 
-    let basic = account_with_premium(1);
+    let basic = account_with_premium(3);
+    assert_eq!(can(&basic).discord_plan, Some(protocol::DiscordPlan::Basic));
     assert_eq!(text_limit_of(&basic), 2000);
     basic.send("3002", "basic-3000", &three, None);
     assert_eq!(basic.failure("3002", "basic-3000"), "Message too long: Discord allows 2000 characters.");
 
     let nitro = account_with_premium(2);
+    assert_eq!(can(&nitro).discord_plan, Some(protocol::DiscordPlan::Nitro));
     assert_eq!(text_limit_of(&nitro), 4000);
     // A nonce is kept only when it is digits, at most 25, which is what the shell's client id is.
     nitro.send("3002", "1730000000000000102", &three, None);
@@ -5287,7 +5290,7 @@ fn files_go_up_from_their_paths_with_the_senders_options_and_a_cancel_stops_them
     let with = protocol::Outgoing { files: vec![file(&big.to_string_lossy(), false)], ..Default::default() };
     let asked = Request::Send { conversation: world.key("4101"), client_id: "77002".into(), text: String::new(), reply_to: None, with };
     match world.ask(asked) {
-        Response::Error { detail, .. } => assert_eq!(detail, "big.mov is too big for Discord (limit 10 MB)."),
+        Response::Error { detail, .. } => assert_eq!(detail, "big.mov is too big. Discord allows up to 10 MB per file here."),
         other => panic!("{other:?}"),
     }
     assert_eq!(world.discord.asked().len(), before);
@@ -5525,7 +5528,7 @@ fn upload_limit_honors_server_boost_tier() {
         with: outgoing(),
     });
     match refused {
-        Response::Error { detail, .. } => assert_eq!(detail, "boosted.bin is too big for Discord (limit 10 MB)."),
+        Response::Error { detail, .. } => assert_eq!(detail, "boosted.bin is too big. Discord allows up to 10 MB per file here."),
         other => panic!("tier-0 server should refuse 40 MB, got {other:?}"),
     }
 

@@ -80,7 +80,7 @@ These are part of the goal. They are not in the product yet, so each one opens i
 | Canvases, lists, Loop, whiteboards | A link card |
 | Teams meetings, stage channels, huddle extras | `06-calls.md` |
 | Video grid, virtual backgrounds, soundboard | `06-calls.md` |
-| Commerce, discovery, Premium, Nitro | Open in the official app |
+| Commerce, discovery, Premium, Nitro | Discord's Nitro & billing, Shop and Quests open Discord from Settings → Accounts. Gift redemption belongs in Discord. |
 | Password, 2FA, billing, and the network's own privacy screens | Open in the official app. Mutes, presence, and the local settings in `09` are here. |
 | Discord Family Centre | Opens Discord from Settings → Accounts. |
 | Telegram secret chats | grammers does not carry them. Say so on the row. |
