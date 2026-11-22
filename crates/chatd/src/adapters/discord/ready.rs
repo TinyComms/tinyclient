@@ -14,6 +14,7 @@ use crate::hub::now;
 use crate::store::{ConversationRow, Filing, FolderRow, PersonRow, SpaceRow};
 use protocol::{CallSupport, ConversationKind, Group, MediaFile, Presence, Relation, Special};
 use serde::Deserialize;
+use serde_json::value::RawValue;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Deserialize)]
@@ -41,7 +42,7 @@ struct LegacySettings {
 
 /// The parts of READY that are used. Everything else in it is skipped while parsing.
 #[derive(Deserialize)]
-pub struct Ready {
+pub struct Ready<'a> {
     user: User,
     session_id: String,
     #[serde(default)]
@@ -53,8 +54,10 @@ pub struct Ready {
     relationships: Vec<Relationship>,
     #[serde(default)]
     private_channels: Vec<Channel>,
-    #[serde(default)]
-    guilds: Vec<Guild>,
+    /// Each server as its own text, read one at a time: a hundred servers held as parsed
+    /// channels, roles, emoji and stickers at once is most of what connecting costs in memory.
+    #[serde(borrow, default)]
+    guilds: Vec<&'a RawValue>,
     /// Our own member of each server, in the order of `guilds`.
     #[serde(default)]
     merged_members: Vec<Vec<Member>>,
@@ -70,6 +73,14 @@ pub struct Ready {
     notes: HashMap<String, String>,
     #[serde(default)]
     presences: Vec<PresenceUpdate>,
+}
+
+/// What placing a server in the list needs, without reading the rest of it.
+#[derive(Deserialize)]
+struct GuildHead {
+    id: String,
+    #[serde(default)]
+    joined_at: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -1127,7 +1138,7 @@ impl Discord {
 
     /// The user's server folders as JSON settings or protobuf ones carry them. Only a folder with
     /// an id is one; a server alone in a nameless one is simply not in a folder.
-    fn folders(ready: &Ready) -> Option<Vec<proto::GuildFolder>> {
+    fn folders(ready: &Ready<'_>) -> Option<Vec<proto::GuildFolder>> {
         let legacy = ready.user_settings.as_ref().map(|settings| {
             let folders = settings.guild_folders.iter().map(|folder| proto::GuildFolder {
                 id: folder.id,
@@ -1244,7 +1255,7 @@ impl Discord {
 
     /// The user's own order of servers: folders flattened, then anything they do not mention on
     /// top, newest first, which is where Discord puts a server just joined.
-    fn order(ready: &Ready) -> Vec<String> {
+    fn order(ready: &Ready<'_>) -> Vec<String> {
         let legacy = ready.user_settings.as_ref().map(|settings| {
             let folders: Vec<String> = settings.guild_folders.iter().flat_map(|folder| folder.guild_ids.clone()).collect();
             if folders.is_empty() { settings.guild_positions.clone() } else { folders }
@@ -1252,13 +1263,14 @@ impl Discord {
         let stated = legacy.filter(|order| !order.is_empty());
         let stated = stated.or_else(|| ready.user_settings_proto.as_deref().and_then(proto::guild_order));
         let stated = stated.unwrap_or_default();
-        let mut unplaced: Vec<&Guild> = ready.guilds.iter().filter(|guild| !stated.contains(&guild.id)).collect();
+        let heads = ready.guilds.iter().filter_map(|guild| serde_json::from_str::<GuildHead>(guild.get()).ok());
+        let mut unplaced: Vec<GuildHead> = heads.filter(|guild| !stated.contains(&guild.id)).collect();
         unplaced.sort_by(|a, b| b.joined_at.cmp(&a.joined_at));
-        unplaced.into_iter().map(|guild| guild.id.clone()).chain(stated).collect()
+        unplaced.into_iter().map(|guild| guild.id).chain(stated).collect()
     }
 
     /// Takes READY apart into the store. Only [`super::State`] outlives this call.
-    pub(super) fn ready(&self, ready: Ready) -> Result<(), Failure> {
+    pub(super) fn ready(&self, ready: Ready<'_>) -> Result<(), Failure> {
         // Ephemeral replies exist only for the session that received them.
         self.ctx.drop_ephemeral()?;
         let me = ready.user.id.clone();
@@ -1367,6 +1379,15 @@ impl Discord {
         // Servers: what is kept of each, then its tree.
         let mut icons = Vec::new();
         for (index, guild) in ready.guilds.iter().enumerate() {
+            let guild: Guild = match serde_json::from_str(guild.get()) {
+                Ok(guild) => guild,
+                // Asking again would get the same answer: it counts as a refused session.
+                Err(err) => {
+                    self.identify_failed(&format!("its first message could not be read: {err}"));
+                    return Err(err.into());
+                }
+            };
+            let guild = &guild;
             if guild.unavailable == Some(true) {
                 continue;
             }
