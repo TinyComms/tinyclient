@@ -193,6 +193,11 @@ impl SettingsWindow {
             "Account on Discord",
             Some("Email, password, phone, 2FA, passkeys and account removal".into()),
             DISCORD_ACCOUNT,
+        )).child(rule()).child(link_row(
+            ("discord-family-centre", ix),
+            "Family Centre",
+            None,
+            "https://discord.com/feature/family-center",
         ));
         if account.link != Link::Connected {
             return rows;

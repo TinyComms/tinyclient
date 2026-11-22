@@ -82,6 +82,7 @@ These are part of the goal. They are not in the product yet, so each one opens i
 | Video grid, virtual backgrounds, soundboard | `06-calls.md` |
 | Commerce, discovery, Premium, Nitro | Open in the official app |
 | Password, 2FA, billing, and the network's own privacy screens | Open in the official app. Mutes, presence, and the local settings in `09` are here. |
+| Discord Family Centre | Opens Discord from Settings → Accounts. |
 | Telegram secret chats | grammers does not carry them. Say so on the row. |
 | Scheduled send | Not in the composer. Voice messages play, and Telegram records one on the composer's mic. |
 | Light theme | Search says so. Dark only. |
