@@ -617,20 +617,38 @@ pub struct CardAction {
 pub struct Card {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub author: String,
+    /// Where a click on the author line goes. Empty: nowhere.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub author_link: String,
+    /// The small picture before the author's name (when hosted by the network).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_icon: Option<MediaFile>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub title: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub title_link: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
+    /// Styles over `text`, as on a message: a masked link stays a link.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text_spans: Vec<Span>,
     /// Label and value, in the network's order, at most [`CARD_FIELDS`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<(String, String)>,
+    /// One for each of `fields`: it shares its row with its neighbours. Empty: every field does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inline: Vec<bool>,
     /// Labelled links or action buttons, in the network's order, at most [`CARD_ACTIONS`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<CardAction>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub footer: String,
+    /// The small picture before the footer (when hosted by the network).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footer_icon: Option<MediaFile>,
+    /// Unix seconds the card names as its own time, shown after the footer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<i64>,
     /// Full-width image inside the card (when hosted by the network).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<MediaFile>,
@@ -648,11 +666,16 @@ pub struct Card {
 impl Card {
     pub fn bound(&mut self) {
         clip(&mut self.author, 256);
+        clip(&mut self.author_link, 2_000);
         clip(&mut self.title, 256);
         clip(&mut self.title_link, 2_000);
         clip(&mut self.text, 4_000);
+        // A style that reached past the cut goes with it.
+        let kept = self.text.len();
+        self.text_spans.retain(|span| span.start <= span.end && span.end as usize <= kept);
         clip(&mut self.footer, 256);
         self.fields.truncate(CARD_FIELDS);
+        self.inline.truncate(self.fields.len());
         for (label, value) in &mut self.fields {
             clip(label, 256);
             clip(value, 1_000);
@@ -2134,6 +2157,26 @@ mod tests {
         };
         let mwire = serde_json::to_string(&modal).unwrap();
         assert_eq!(serde_json::from_str::<InteractionModal>(&mwire).unwrap(), modal);
+    }
+
+    #[test]
+    fn a_cards_styles_and_row_flags_never_outlast_what_they_describe() {
+        let link = |start, end| Span { start, end, style: Style::Link { url: "https://ci.example".into() } };
+        let mut card = Card {
+            text: "a".repeat(4_010),
+            text_spans: vec![link(0, 8), link(3_990, 4_010)],
+            fields: vec![("Duration".into(), "3m".into())],
+            inline: vec![false, true, true],
+            ..Card::default()
+        };
+        card.bound();
+        assert_eq!(card.text.len(), 4_000);
+        assert_eq!(card.text_spans, [link(0, 8)], "a style past the cut goes with it");
+        assert_eq!(card.inline, [false]);
+        // An old card has none of the new parts, and says nothing about them on the wire.
+        let plain: Card = serde_json::from_str(r#"{"title":"Build"}"#).unwrap();
+        assert!(plain.text_spans.is_empty() && plain.inline.is_empty() && plain.time.is_none() && plain.author_icon.is_none());
+        assert_eq!(serde_json::to_string(&plain).unwrap(), r#"{"title":"Build"}"#);
     }
 
     #[test]

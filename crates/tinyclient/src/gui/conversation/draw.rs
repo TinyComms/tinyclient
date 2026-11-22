@@ -1247,7 +1247,7 @@ impl Pane {
                                 .child(via.to_owned()),
                         )
                 }))
-                .children(message.all_cards().enumerate().map(|(ix, card)| self.app_card(message, ix, card, cx)))
+                .children(message.all_cards().enumerate().map(|(ix, card)| self.app_card(message, ix, card, window, cx)))
                 .children(message.poll.as_deref().map(|poll| self.poll_card(message, poll, cx)))
                 .children(message.contacts.iter().enumerate().map(|(idx, contact)| self.contact_card(message, contact, idx, cx)))
                 .children(message.invites.iter().enumerate().map(|(ix, invite)| self.invite_card(message, ix, invite, window, cx)))
@@ -3136,16 +3136,91 @@ impl Pane {
     }
 
     /// What a bot or app posts instead of text: one framed card, its bar in one of our colors.
-    fn app_card(&self, message: &Message, ix: usize, card: &Card, cx: &mut Context<Self>) -> AnyElement {
+    /// A small picture inside a card (an icon, a thumbnail), once it is on disk. Nothing until then.
+    fn card_picture(&mut self, file: &MediaFile, edge: f32, radius: f32, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.held_back(file) {
+            return None;
+        }
+        let size = media::decode_edge((file.width, file.height), edge, edge, Fit::Cover, window.scale_factor());
+        let Picture::Ready(decoded) = self.still(file, size, size, None, cx) else {
+            return None;
+        };
+        let shown = anim::picture(decoded, ObjectFit::Cover, radius, Play::Inline);
+        Some(div().size(px(edge)).flex_none().rounded(px(radius)).overflow_hidden().child(shown).into_any_element())
+    }
+
+    /// A card's own words with their styles: a link opens on a click and a spoiler shows. Text
+    /// here is not part of a selection.
+    fn card_text(&mut self, message: &Message, ix: usize, card: &Card, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let key = format!("{}/card{ix}", message.id);
+        let revealed: Vec<u32> = self.revealed.iter().filter(|(id, _)| *id == key).map(|(_, span)| *span).collect();
+        let me = self.open.as_ref().map(|open| open.me.clone()).unwrap_or_default();
+        let edge = media::square_size(18., window.scale_factor());
+        let color = theme::text_soft().into_color();
+        let mut out = Vec::new();
+        for (at, block) in rich::blocks(&card.text, &card.text_spans).iter().enumerate() {
+            let inline = match block {
+                Block::Code { text, .. } => {
+                    out.push(div().px(px(6.)).py(px(4.)).rounded(px(theme::R_CONTROL)).bg(tokens::code_bg()).type_code().child(text.clone()).into_any_element());
+                    continue;
+                }
+                Block::Text(inline) | Block::Small(inline) | Block::Quote(inline) | Block::Heading { text: inline, .. } | Block::Item { text: inline, .. } => inline,
+            };
+            // What each run does on a click, read once: the handler outlives this draw.
+            let acts: Vec<(Option<String>, Option<u32>)> = inline.runs.iter().map(|run| (run.link.clone(), run.spoiler)).collect();
+            let (this, key) = (cx.weak_entity(), key.clone());
+            let mut emoji = |file: &MediaFile| match self.still(file, edge, edge, None, cx) {
+                Picture::Ready(image) => Some(image),
+                _ => None,
+            };
+            let look = Look {
+                color,
+                hovered: None,
+                revealed: &|span| revealed.contains(&span),
+                me: &me,
+                mentions_me: false,
+                emoji: &mut emoji,
+                selection: None,
+                dragging: false,
+                history: false,
+            };
+            let words = Rich::new(("card-text", ix * 256 + at), inline, look, move |event, window, cx| {
+                let TextEvent::Click(run, alt) = event else { return };
+                let Some((link, spoiler)) = acts.get(run).cloned() else { return };
+                let _ = this.update(cx, |this, cx| {
+                    if spoiler.is_some_and(|spoiler| this.revealed.insert((key.clone(), spoiler))) {
+                        cx.notify();
+                    } else if let Some(url) = link {
+                        this.open_link(&url, alt, window, cx);
+                    }
+                });
+            });
+            let body = div().min_w_0().flex_1().flex().flex_col().type_ui().child(words);
+            let marker = |words: String| div().w(px(20.)).flex_none().type_ui().text_color(theme::text_faint()).child(words);
+            out.push(match block {
+                Block::Heading { .. } => body.font_weight(theme::SEMIBOLD).into_any_element(),
+                Block::Quote(_) => div().flex().gap(px(8.)).child(div().w(px(3.)).flex_none().rounded(px(2.)).bg(tokens::border_strong())).child(body).into_any_element(),
+                Block::Item { ordered, depth, number, .. } => {
+                    let words = if *ordered { format!("{number}.") } else { "\u{2022}".to_owned() };
+                    div().pl(px(20. * f32::from(*depth))).flex().child(marker(words)).child(body).into_any_element()
+                }
+                _ => body.into_any_element(),
+            });
+        }
+        out
+    }
+
+    fn app_card(&mut self, message: &Message, ix: usize, card: &Card, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let bar = match media::card_tone(card.color) {
             media::Tone::Positive => theme::positive(),
             media::Tone::Danger => theme::danger(),
             media::Tone::Warning => theme::warning(),
             media::Tone::Neutral => tokens::border_strong(),
         };
-        let field = |(label, value): &(String, String)| {
+        let field = |(at, (label, value)): (usize, &(String, String))| {
             div()
-                .w(px(190.))
+                // A field that does not share its row takes the row.
+                .map(|field| if media::card_field_inline(card, at) { field.w(px(190.)) } else { field.w_full() })
                 .min_w_0()
                 .flex()
                 .flex_col()
@@ -3248,10 +3323,39 @@ impl Pane {
                     )
                     .into_any_element(),
             )
-        } else if !card.footer.is_empty() {
-            Some(div().mt(px(2.)).type_small().text_color(theme::text_faint()).child(card.footer.clone()).into_any_element())
         } else {
-            None
+            let said = media::card_footer(card, |unix| time::stamp(crate::view::now(), unix));
+            let icon = card.footer_icon.as_ref().and_then(|file| self.card_picture(file, 16., 8., window, cx));
+            (!said.is_empty()).then(|| {
+                let words = div().min_w_0().type_small().text_color(theme::text_faint()).child(said);
+                let line = div().mt(px(2.)).flex().items_center().gap(px(6.)).children(icon).child(words);
+                match card.time {
+                    Some(unix) => line.id(SharedString::from(format!("card-time-{}-{ix}", message.id))).tooltip(tip(time::tooltip(unix), None)).into_any_element(),
+                    None => line.into_any_element(),
+                }
+            })
+        };
+        let author_el = (!card.author.is_empty()).then(|| {
+            let icon = card.author_icon.as_ref().and_then(|file| self.card_picture(file, 20., 10., window, cx));
+            let name = div().min_w_0().truncate().type_small().font_weight(theme::MEDIUM).text_color(theme::text_soft()).child(card.author.clone());
+            let line = div().flex().items_center().gap(px(6.)).children(icon).child(name);
+            if card.author_link.is_empty() {
+                return line.into_any_element();
+            }
+            let url = card.author_link.clone();
+            line.id(SharedString::from(format!("card-author-{}-{ix}", message.id)))
+                .cursor_pointer()
+                .hover(|s| s.underline())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.open_external_link(&url, window, cx);
+                }))
+                .into_any_element()
+        });
+        let thumbnail_el = card.thumbnail.as_ref().and_then(|file| self.card_picture(file, 72., 6., window, cx));
+        let text_el: Vec<AnyElement> = match card.text_spans.is_empty() {
+            true => (!card.text.is_empty()).then(|| div().type_ui().text_color(theme::text_soft()).child(card.text.clone()).into_any_element()).into_iter().collect(),
+            false => self.card_text(message, ix, card, window, cx),
         };
         let title_el = (!card.title.is_empty()).then(|| {
             if card.title_link.is_empty() {
@@ -3306,10 +3410,10 @@ impl Pane {
             .flex()
             .flex_col()
             .gap(px(4.))
-            .children((!card.author.is_empty()).then(|| div().type_small().font_weight(theme::MEDIUM).text_color(theme::text_soft()).child(card.author.clone())))
+            .children(author_el)
             .children(title_el)
-            .children((!card.text.is_empty()).then(|| div().type_ui().text_color(theme::text_soft()).child(card.text.clone())))
-            .children((!card.fields.is_empty()).then(|| div().mt(px(2.)).flex().flex_wrap().gap_x(px(12.)).gap_y(px(6.)).children(card.fields.iter().map(field))))
+            .children(text_el)
+            .children((!card.fields.is_empty()).then(|| div().mt(px(2.)).flex().flex_wrap().gap_x(px(12.)).gap_y(px(6.)).children(card.fields.iter().enumerate().map(field))))
             .children(actions_el)
             .children(footer_el);
         let framed = div()
@@ -3323,7 +3427,8 @@ impl Pane {
             .overflow_hidden()
             .flex()
             .child(div().w(px(3.)).flex_none().bg(bar))
-            .child(words);
+            .child(words)
+            .children(thumbnail_el.map(|picture| div().flex_none().pt(px(10.)).pr(px(12.)).child(picture)));
         div().pt(px(5.)).flex().child(framed).into_any_element()
     }
 

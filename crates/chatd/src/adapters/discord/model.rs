@@ -1652,6 +1652,12 @@ pub struct EmbedImage {
 pub struct Named {
     #[serde(default, deserialize_with = "nullable")]
     pub name: String,
+    /// An embed author's own link.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// An embed author's picture, on Discord's proxy.
+    #[serde(default)]
+    pub proxy_icon_url: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -1660,12 +1666,16 @@ pub struct EmbedField {
     pub name: String,
     #[serde(default)]
     pub value: String,
+    #[serde(default, deserialize_with = "nullable")]
+    pub inline: bool,
 }
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct Footer {
     #[serde(default, deserialize_with = "nullable")]
     pub text: String,
+    #[serde(default)]
+    pub proxy_icon_url: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -1697,6 +1707,9 @@ pub struct Embed {
     pub video: Option<EmbedImage>,
     #[serde(default, deserialize_with = "nullable")]
     pub fields: Vec<EmbedField>,
+    /// The time the embed names as its own, ISO 8601.
+    #[serde(default)]
+    pub timestamp: Option<String>,
     /// Bit 4 marks explicit media (`CONTAINS_EXPLICIT_MEDIA`).
     #[serde(default, deserialize_with = "nullable")]
     pub flags: u32,

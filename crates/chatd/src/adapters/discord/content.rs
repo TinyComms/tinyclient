@@ -738,21 +738,52 @@ fn whole_seconds(value: f64) -> u32 {
     value.round().clamp(0.0, u32::MAX as f64) as u32
 }
 
-/// What a bot or webhook composed, as the one framed card a message can carry. Its text is
-/// plain: the markup goes, the words stay.
-fn card(embed: &Embed, names: &dyn Names) -> Card {
+/// A small picture of an embed (an author's or footer's icon), from Discord's proxy only.
+fn embed_icon(rich: &mut Rich, id: String, proxy: Option<&str>) -> Option<MediaFile> {
+    let proxy = proxy.filter(|proxy| !proxy.is_empty())?;
+    let file = MediaFile { width: 40, height: 40, ..MediaFile::new(id, MediaKind::Image) };
+    rich.files.push((file.clone(), resized(proxy, 40, 40, false)));
+    Some(file)
+}
+
+/// What a bot or webhook composed, as a framed card. Its description keeps its styles and
+/// links; a title, a field and a footer are plain: the markup goes, the words stay. Pictures
+/// come from Discord's proxy or not at all.
+fn card(rich: &mut Rich, message: &str, index: usize, embed: &Embed, names: &dyn Names, blur_explicit: bool) -> Card {
     let plain = |text: &str| {
         let mut rich = Rich::default();
         markdown(&mut rich, text, names);
         rich.text
     };
-    let author = embed.author.as_ref().map_or("", |author| author.name.as_str());
-    let title = embed.title.as_deref().filter(|title| !title.is_empty()).unwrap_or(author);
+    let mut said = Rich::default();
+    markdown(&mut said, embed.description.as_deref().unwrap_or(""), names);
+    // A custom emoji in the description is fetched like one in a message.
+    rich.files.merge(std::mem::take(&mut said.files));
+    let link = |url: Option<&String>| url.filter(|url| is_safe_http_url(url)).cloned().unwrap_or_default();
+    let author = embed.author.as_ref();
+    let author_name = author.map_or("", |author| author.name.as_str());
+    // With no title, the author's name is the title, as before; it is not said twice.
+    let title = embed.title.as_deref().filter(|title| !title.is_empty());
+    let shown = !blur_explicit || !embed.is_explicit();
+    let thumbnail = embed.thumbnail.as_ref().filter(|_| shown);
     Card {
-        title: plain(title),
-        text: plain(embed.description.as_deref().unwrap_or("")),
+        author: title.map_or_else(String::new, |_| plain(author_name)),
+        author_link: link(author.and_then(|author| author.url.as_ref())),
+        author_icon: author.and_then(|author| embed_icon(rich, format!("embed:{message}:{index}:author"), author.proxy_icon_url.as_deref())),
+        title: plain(title.unwrap_or(author_name)),
+        title_link: link(embed.url.as_ref()),
+        text: said.text,
+        text_spans: said.spans,
         fields: embed.fields.iter().map(|field| (plain(&field.name), plain(&field.value))).collect(),
+        // Nothing to say when every field shares its row: that is what a card does anyway.
+        inline: match embed.fields.iter().all(|field| field.inline) {
+            true => Vec::new(),
+            false => embed.fields.iter().map(|field| field.inline).collect(),
+        },
         footer: embed.footer.as_ref().map_or_else(String::new, |footer| footer.text.clone()),
+        footer_icon: embed.footer.as_ref().and_then(|footer| embed_icon(rich, format!("embed:{message}:{index}:footer"), footer.proxy_icon_url.as_deref())),
+        time: embed.timestamp.as_deref().and_then(model::iso_seconds),
+        thumbnail: thumbnail.and_then(|picture| embed_still(rich, format!("embed:{message}:{index}:thumb"), picture)),
         color: embed.color,
         sponsored: false,
         ..Card::default()
@@ -1203,7 +1234,8 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         }
         composed |= part.author.as_ref().is_some_and(|author| author.bot) || part.webhook_id.is_some();
     }
-    let (card, previews, moving_pictures) = cards(&mut rich, &posted.id, &embeds, place.names, composed, place.blur_explicit);
+    let (mut composed_cards, previews, moving_pictures) = cards(&mut rich, &posted.id, &embeds, place.names, composed, place.blur_explicit);
+    let card = (!composed_cards.is_empty()).then(|| Box::new(composed_cards.remove(0)));
     attachments.extend(moving_pictures);
     if flags & model::FLAG_IS_VOICE_MESSAGE != 0 {
         for attachment in &mut attachments {
@@ -1347,7 +1379,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         sent_subsec_millis: 0,
         seal: protocol::Seal::Plain,
         card,
-        cards: Vec::new(),
+        cards: composed_cards,
         deleted: false,
         moderated: false,
         forwarded: forwarded_from,
@@ -1473,9 +1505,10 @@ fn remembered_flags(message: &Message) -> u64 {
     flags
 }
 
-/// The first embed a bot or webhook composed (`by_bot`, type `rich`) is the message's card;
-/// every other one is a link's preview: a person's link that Discord unfurled is `rich` too.
-/// A composed embed's picture rides along as a preview with nothing but the picture.
+/// Every embed a bot or webhook composed (`by_bot`, type `rich`) is a card, in Discord's
+/// order; every other one is a link's preview: a person's link that Discord unfurled is `rich`
+/// too. A composed embed's picture rides along as a preview with nothing but the picture, and
+/// an embed that repeats an earlier one's address is only another picture of it (a gallery).
 fn cards(
     rich: &mut Rich,
     message: &str,
@@ -1483,20 +1516,25 @@ fn cards(
     names: &dyn Names,
     by_bot: bool,
     blur_explicit: bool,
-) -> (Option<Box<Card>>, Vec<Preview>, Vec<Attachment>) {
-    let mut composed = None;
+) -> (Vec<Card>, Vec<Preview>, Vec<Attachment>) {
+    let mut composed = Vec::new();
     let mut previews = Vec::new();
     let mut moving_pictures = Vec::new();
+    let mut carded: Vec<&str> = Vec::new();
     for (index, embed) in embeds.iter().enumerate() {
         if let Some(attachment) = moving(rich, message, index, embed, blur_explicit) {
             moving_pictures.push(attachment);
             continue;
         }
-        if !by_bot || composed.is_some() || embed.kind.as_deref() != Some("rich") {
+        if !by_bot || embed.kind.as_deref() != Some("rich") {
             previews.push(preview(rich, message, index, embed, blur_explicit));
             continue;
         }
-        composed = Some(Box::new(card(embed, names)));
+        let address = embed.url.as_deref().filter(|url| !url.is_empty());
+        if !address.is_some_and(|url| carded.contains(&url)) {
+            composed.push(card(rich, message, index, embed, names, blur_explicit));
+            carded.extend(address);
+        }
         if embed.image.is_some() {
             let picture = Embed {
                 title: None,
@@ -1540,8 +1578,9 @@ pub fn patch(stored: &mut Message, update: &Posted, place: &Place) -> Files {
         stored.attachments.extend(stickers);
     }
     if let Some(embeds) = &update.embeds {
-        let (card, previews, moving_pictures) = cards(&mut rich, &stored.id, embeds, place.names, stored.sender.bot, place.blur_explicit);
-        stored.card = card;
+        let (mut composed, previews, moving_pictures) = cards(&mut rich, &stored.id, embeds, place.names, stored.sender.bot, place.blur_explicit);
+        stored.card = (!composed.is_empty()).then(|| Box::new(composed.remove(0)));
+        stored.cards = composed;
         stored.previews = previews;
         stored.attachments.retain(|kept| !kept.file.id.starts_with("embed:"));
         stored.attachments.extend(moving_pictures);

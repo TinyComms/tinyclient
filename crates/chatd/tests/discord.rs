@@ -12945,3 +12945,73 @@ fn an_image_description_is_kept_on_the_way_in_and_sent_on_the_way_out() {
     let posted = &world.discord.requests_to("POST", "/channels/4101/messages")[1].body["attachments"][0];
     assert!(posted.get("description").is_none(), "an empty description is left off: {posted}");
 }
+
+/// A CI bot's embeds keep what they said: the author and its picture, the title's link, a
+/// masked link in the description, which fields share a row, the thumbnail, the footer's
+/// picture and time, and every embed of the message, with a repeated address as one gallery.
+#[test]
+fn a_bots_embeds_keep_their_links_author_pictures_time_and_every_embed() {
+    let world = polished();
+    open_channel(&world, "4101");
+    let proxied = |name: &str| format!("{}/media/external/{name}", world.api);
+    let picture = |name: &str| json!({"url": format!("https://ci.example/{name}"), "proxy_url": proxied(name), "width": 800, "height": 400});
+    let bot = json!({"id": "2900", "username": "ci", "global_name": null, "discriminator": "0000", "avatar": null, "bot": true});
+    let embeds = json!([
+        {
+            "type": "rich",
+            "url": "https://ci.example/runs/812",
+            "title": "Build **#812** passed",
+            "description": "[View run](https://ci.example/runs/812/log) on `main`",
+            "color": 0x2ecc71,
+            "timestamp": "2026-10-13T08:15:00.000000+00:00",
+            "author": {"name": "Rustaceans CI", "url": "https://ci.example", "icon_url": "https://ci.example/a.png", "proxy_icon_url": proxied("author.png")},
+            "thumbnail": picture("thumb.png"),
+            "image": picture("one.png"),
+            "footer": {"text": "ci.example", "icon_url": "https://ci.example/f.png", "proxy_icon_url": proxied("footer.png")},
+            "fields": [
+                {"name": "Duration", "value": "3m 12s", "inline": true},
+                {"name": "Branch", "value": "main", "inline": true},
+                {"name": "Commit", "value": "4f2a9c1 fix the flaky test"},
+            ],
+        },
+        // The same address again: one more picture of the first card, not a card of its own.
+        {"type": "rich", "url": "https://ci.example/runs/812", "image": picture("two.png")},
+        {"type": "rich", "title": "Coverage", "description": "81.4%", "author": {"name": "Unproxied", "icon_url": "https://elsewhere.example/a.png"}},
+    ]);
+    let id = world.incoming("4101", Some("4000"), "", json!({"author": bot, "embeds": embeds}));
+    let message = wait("the bot's message", || world.messages("4101").into_iter().find(|message| message.id == id));
+    let cards: Vec<&protocol::Card> = message.all_cards().collect();
+    assert_eq!(cards.len(), 2, "{cards:?}");
+    let run = cards[0];
+    assert_eq!((run.author.as_str(), run.author_link.as_str()), ("Rustaceans CI", "https://ci.example"));
+    assert_eq!((run.title.as_str(), run.title_link.as_str()), ("Build #812 passed", "https://ci.example/runs/812"));
+    assert_eq!(run.text, "View run on main");
+    let linked: Vec<&str> = run.text_spans.iter().filter_map(|span| match &span.style {
+        Style::Link { url } if url == "https://ci.example/runs/812/log" => Some(&run.text[span.start as usize..span.end as usize]),
+        _ => None,
+    }).collect();
+    assert_eq!(linked, ["View run"]);
+    assert!(run.text_spans.iter().any(|span| span.style == Style::Code && &run.text[span.start as usize..span.end as usize] == "main"));
+    assert_eq!(run.fields.len(), 3);
+    assert_eq!(run.inline, [true, true, false]);
+    assert_eq!((run.footer.as_str(), run.time), ("ci.example", Some(1_791_879_300)));
+    assert_eq!(run.color, Some(0x2ecc71));
+    let (author_icon, footer_icon, thumbnail) = (run.author_icon.as_ref().unwrap(), run.footer_icon.as_ref().unwrap(), run.thumbnail.as_ref().unwrap());
+    // Both pictures of the gallery ride under the card.
+    assert_eq!(message.previews.len(), 2, "{:?}", message.previews);
+    assert!(message.previews.iter().all(|preview| preview.image.is_some() && preview.title.is_empty()));
+
+    let coverage = cards[1];
+    assert_eq!((coverage.author.as_str(), coverage.title.as_str(), coverage.text.as_str()), ("Unproxied", "Coverage", "81.4%"));
+    assert!(coverage.author_icon.is_none() && coverage.inline.is_empty(), "a picture Discord does not proxy is never fetched");
+
+    // Every picture comes from Discord's proxy, and only once it is asked for.
+    settled(&world);
+    assert!(world.discord.requests_to("GET", "/media/external/author.png").is_empty());
+    for (file, path) in [(author_icon, "author.png"), (footer_icon, "footer.png"), (thumbnail, "thumb.png")] {
+        world.fetched(&file.id, None, false);
+        assert_eq!(world.discord.requests_to("GET", &format!("/media/external/{path}")).len(), 1, "{path}");
+    }
+    let asked: Vec<String> = world.discord.requests.lock().unwrap().iter().map(|seen| seen.path.clone()).collect();
+    assert!(!asked.iter().any(|path| path.contains("elsewhere") || path.contains("ci.example")), "{asked:?}");
+}
