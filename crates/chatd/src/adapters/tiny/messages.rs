@@ -4234,7 +4234,7 @@ fn record_group_call(ctx: &Context, saved: &Saved, names: &HashMap<String, Strin
     let mut message = Message::plain(call_id, starter, text, rfc3339(&call.ended_at).unwrap_or(0), started);
     message.kind = MessageKind::System;
     message.sender.id = call.started_by.clone();
-    message.call = Some(protocol::CallNote { outcome, caller_id: call.started_by.clone(), seconds, participants: call.joined.clone(), video: false });
+    message.call = Some(protocol::CallNote { outcome, caller_id: call.started_by.clone(), seconds, participants: call.joined.clone(), video: false, call_id: None });
     let counts = missed && ctx.hub.settings().on(protocol::settings::NOTIFY_GROUPS);
     let _ = ctx.quiet_line(group_id, &message, counts);
 }
