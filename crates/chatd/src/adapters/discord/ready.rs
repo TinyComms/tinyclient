@@ -1003,6 +1003,8 @@ impl Discord {
         }
         let mut row = ConversationRow::new(&channel.id, kind, names.join(", "));
         row.call = super::private_call(false);
+        // Anyone in a DM or a group DM may pin there; a server channel asks its permissions.
+        row.rights.pin = true;
         // Unverified against a real account: the flags are the community's names. A request
         // and one Discord judged spam both wait behind Message Requests.
         if channel.is_message_request || channel.is_spam {

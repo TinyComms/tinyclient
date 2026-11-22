@@ -3325,7 +3325,7 @@ impl Chat {
         let conversation_id = conversation.id.clone();
         match self.ask(&account, |reply| Command::Pinned { conversation_id, reply }) {
             Ok(mut messages) => {
-                messages.truncate(protocol::PINNED_LIMIT);
+                messages.truncate(protocol::PINNED_PAGED_LIMIT);
                 messages.iter_mut().for_each(Message::bound);
                 Response::Pinned { conversation, messages }
             }

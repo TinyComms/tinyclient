@@ -3134,6 +3134,11 @@ impl Context {
         self.hub.changed(Change::Tiny { account: self.account.clone() });
     }
 
+    /// Something was pinned or unpinned in a conversation.
+    pub fn pins_changed(&self, conversation_id: &str) {
+        self.hub.changed(Change::Pins { conversation: self.key(conversation_id) });
+    }
+
     /// Rows of a conversation's member list were added, removed or moved.
     pub fn members_changed(&self, conversation_id: &str) {
         self.hub.changed(Change::Members { conversation: self.key(conversation_id) });

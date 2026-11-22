@@ -1772,7 +1772,11 @@ impl Discord {
 
     fn pin(&self, channel: &str, message: &str, pinned: bool) -> Result<(), Refusal> {
         let method = if pinned { "PUT" } else { "DELETE" };
-        self.call(method, &format!("/channels/{channel}/pins/{message}"), None).map_err(refusal)?;
+        // The route the pins are read from; a server that does not have it yet takes the older one.
+        match self.call(method, &format!("/channels/{channel}/messages/pins/{message}"), None) {
+            Err(Refused::Status { status: 404, .. }) => self.call(method, &format!("/channels/{channel}/pins/{message}"), None).map_err(refusal)?,
+            other => other.map_err(refusal)?,
+        };
         self.ctx.pinned(channel, message, pinned).map_err(|err| Refusal::Refused(err.to_string()))
     }
 

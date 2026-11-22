@@ -59,6 +59,9 @@ pub const ATTACHMENTS_LIMIT: usize = 10;
 pub const CATALOG_LIMIT: usize = 200;
 /// Most pinned messages one `Pinned` answer carries.
 pub const PINNED_LIMIT: usize = 50;
+/// Most pinned messages an answer carries from a network that pages its pins (Discord keeps
+/// 250 a channel, 50 a page).
+pub const PINNED_PAGED_LIMIT: usize = 250;
 /// Most people each section of `Around` lists.
 pub const AROUND_LIMIT: usize = 100;
 /// Most channel or chat tabs listed in [`ConversationInfo::tabs`].

@@ -244,6 +244,13 @@ impl Discord {
             }
             "PRESENCE_UPDATE" => self.presence(&from_str(data)?),
             "TYPING_START" => self.typing_started(from_str(data)?),
+            // Says only that the channel's pins changed, never which: an open pins list asks again.
+            "CHANNEL_PINS_UPDATE" => {
+                let pins: serde_json::Value = from_str(data)?;
+                if let Some(channel) = pins["channel_id"].as_str() {
+                    self.ctx.pins_changed(channel);
+                }
+            }
             "CHANNEL_UNREAD_UPDATE" | "PASSIVE_UPDATE_V2" => self.passive(from_str(data)?)?,
             "USER_UPDATE" => {
                 let user: User = from_str(data)?;

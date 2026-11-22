@@ -370,6 +370,12 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
         ("PUT", ["channels", _channel, "permissions", _target]) => (204, Value::Null),
         ("DELETE", ["channels", _channel, "permissions", _target]) => (204, Value::Null),
         ("PUT", ["channels", channel, "recipients", "@me"]) => (200, json!({"id": channel, "type": 1, "is_message_request": false})),
+        // Pinning tells every session: the message says it is pinned, and the channel's pins changed.
+        ("PUT" | "DELETE", ["channels", channel, "messages", "pins", message] | ["channels", channel, "pins", message]) => {
+            shared.push("MESSAGE_UPDATE", json!({"id": message, "channel_id": channel, "pinned": seen.method == "PUT"}));
+            shared.push("CHANNEL_PINS_UPDATE", json!({"channel_id": channel, "guild_id": "4000", "last_pin_timestamp": "2026-10-13T09:00:00.000000+00:00"}));
+            (204, Value::Null)
+        }
         ("GET", ["channels", channel, "messages", "pins"]) => {
             let pinned = json!({
                 "id": "1300000000000000700", "channel_id": channel, "type": 0, "author": me(), "content": "Read the rules first",
@@ -13014,4 +13020,85 @@ fn a_bots_embeds_keep_their_links_author_pictures_time_and_every_embed() {
     }
     let asked: Vec<String> = world.discord.requests.lock().unwrap().iter().map(|seen| seen.path.clone()).collect();
     assert!(!asked.iter().any(|path| path.contains("elsewhere") || path.contains("ci.example")), "{asked:?}");
+}
+
+/// Whether a change like `wanted` has been told since `seq`.
+fn told(world: &World, seq: u64, wanted: &Change) -> bool {
+    match world.ask(Request::Wait { since: seq }) {
+        Response::Changes { changes, .. } => changes.contains(wanted),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A pin goes to the route the pins are read from, or to the older one where Discord has no
+/// such route; the shell hears that the pins changed, from us or anyone; and the list is read
+/// page after page.
+#[test]
+fn pinning_takes_either_route_tells_the_pins_list_and_the_list_is_read_in_pages() {
+    let world = polished();
+    let general = world.key("4101");
+    let plan = "1300000000000000100";
+    wait("the channel's history", || world.messages("4101").into_iter().find(|message| message.id == plan));
+    // Offered in every DM, and in a server channel only with Pin Messages or Manage Messages.
+    assert!(can(&world).pins && world.conversation("3001").rights.pin && !world.conversation("4101").rights.pin);
+    let pin = |pinned: bool| world.ask(Request::Pin { conversation: general.clone(), message_id: plan.into(), pinned, notify: false, me_only: false });
+    let pinned_in_store = |want: bool| {
+        wait("the message to follow", || world.messages("4101").into_iter().find(|message| message.id == plan && message.pinned == want));
+    };
+
+    let seq = world.status().4;
+    assert_eq!(pin(true), Response::Ok);
+    pinned_in_store(true);
+    assert_eq!(world.discord.requests_to("PUT", &format!("/channels/4101/messages/pins/{plan}")).len(), 1);
+    assert!(world.discord.requests_to("PUT", "/channels/4101/pins/").is_empty(), "the older route is only the fallback");
+    wait("the pins list to be told", || told(&world, seq, &Change::Pins { conversation: general.clone() }).then_some(()));
+
+    // A server without the newer route answers 404: the older one is tried, once.
+    world.discord.script(&format!("/channels/4101/messages/pins/{plan}"), 404, json!({"message": "404: Not Found", "code": 0}));
+    assert_eq!(pin(false), Response::Ok);
+    pinned_in_store(false);
+    assert_eq!(world.discord.requests_to("DELETE", &format!("/channels/4101/pins/{plan}")).len(), 1);
+
+    // Someone else pins in a channel: nothing is fetched, the shell is only told.
+    let seq = world.status().4;
+    let before = world.discord.requests_to("GET", "/channels/4101/messages/pins").len();
+    world.discord.push("CHANNEL_PINS_UPDATE", json!({"channel_id": "4101", "guild_id": "4000", "last_pin_timestamp": null}));
+    wait("the pins list to be told again", || told(&world, seq, &Change::Pins { conversation: general.clone() }).then_some(()));
+    settled(&world);
+    assert_eq!(world.discord.requests_to("GET", "/channels/4101/messages/pins").len(), before);
+
+    // What Discord refuses is said, and the message stays as it was.
+    world.discord.forbidden.lock().unwrap().push("/channels/4101/messages/pins/".to_owned());
+    assert!(matches!(pin(true), Response::Error { .. }));
+    world.discord.forbidden.lock().unwrap().clear();
+    assert!(!world.messages("4101").into_iter().find(|message| message.id == plan).unwrap().pinned);
+
+    // Two pages: the second is asked for with the first's oldest pin time, escaped.
+    let page = |ids: std::ops::Range<u64>, at: &str, more: bool| {
+        let items: Vec<Value> = ids
+            .map(|id| {
+                let message = json!({
+                    "id": format!("13000000000000{id:05}"), "channel_id": "4101", "type": 0, "author": me(), "content": format!("pin {id}"),
+                    "timestamp": "2026-10-13T08:15:00.000000+00:00", "edited_timestamp": null, "mentions": [], "mention_roles": [],
+                    "mention_everyone": false, "attachments": [], "embeds": [], "pinned": true,
+                });
+                json!({"pinned_at": at, "message": message})
+            })
+            .collect();
+        json!({"items": items, "has_more": more})
+    };
+    world.discord.script("/channels/4101/messages/pins", 200, page(0..50, "2026-10-12T09:00:00.000000+00:00", true));
+    world.discord.script("/channels/4101/messages/pins", 200, page(50..60, "2026-10-11T09:00:00.000000+00:00", false));
+    let asked = world.discord.requests_to("GET", "/channels/4101/messages/pins").len();
+    let pins = match world.ask(Request::Pinned { conversation: general.clone() }) {
+        Response::Pinned { messages, .. } => messages,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(pins.len(), 60);
+    assert!(pins.iter().all(|message| message.pinned));
+    assert_eq!((pins[0].text.as_str(), pins[59].text.as_str()), ("pin 0", "pin 59"));
+    let pages = world.discord.requests_to("GET", "/channels/4101/messages/pins");
+    assert_eq!(pages.len(), asked + 2);
+    assert!(pages[asked].path.ends_with("pins?limit=50"), "{}", pages[asked].path);
+    assert!(pages[asked + 1].path.ends_with("pins?limit=50&before=2026-10-12T09%3A00%3A00.000000%2B00%3A00"), "{}", pages[asked + 1].path);
 }

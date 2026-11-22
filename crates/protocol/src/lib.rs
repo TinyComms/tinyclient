@@ -4146,6 +4146,9 @@ pub enum Change {
     /// Rows of a conversation's member list were added, removed or moved: ask `Members` again
     /// for the rows on screen.
     Members { conversation: Key },
+    /// Something was pinned or unpinned in a conversation, by anyone: ask `Pinned` again if its
+    /// pins are on screen.
+    Pins { conversation: Key },
     /// A requested file is on disk (`path`), or could not be fetched (`failed` says why).
     Media { account: AccountKey, file: MediaFile },
     /// Ephemeral. Who is in a voice channel now; no people and a total of 0 when it emptied.
@@ -4231,6 +4234,7 @@ impl Change {
             | (Change::Messages { conversation: a }, Change::Messages { conversation: b })
             | (Change::Typing { conversation: a, .. }, Change::Typing { conversation: b, .. })
             | (Change::Members { conversation: a }, Change::Members { conversation: b })
+            | (Change::Pins { conversation: a }, Change::Pins { conversation: b })
             | (Change::Occupants { conversation: a, .. }, Change::Occupants { conversation: b, .. })
             | (Change::Tree { space: a }, Change::Tree { space: b })
             | (Change::Events { space: a }, Change::Events { space: b })

@@ -419,12 +419,17 @@ struct GuildCounts {
 #[derive(Deserialize)]
 struct Pin {
     message: Posted,
+    /// Where the next page starts: the pins older than this.
+    #[serde(default)]
+    pinned_at: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct Pins {
     #[serde(default)]
     items: Vec<Pin>,
+    #[serde(default)]
+    has_more: bool,
 }
 
 #[derive(Deserialize)]
@@ -3044,17 +3049,29 @@ impl Discord {
     /// unconfirmed against a real account.
     pub(super) fn pinned(&self, channel: &str) -> Result<Vec<Message>, Refusal> {
         let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
-        let posted: Vec<Posted> = match self.call("GET", &format!("/channels/{channel}/messages/pins?limit=50"), None) {
-            Ok(answer) => serde_json::from_str::<Pins>(&answer).map_err(refused)?.items.into_iter().map(|pin| pin.message).collect(),
-            Err(super::Refused::Status { status: 404, .. }) => {
-                let answer = self.call("GET", &format!("/channels/{channel}/pins"), None).map_err(refusal)?;
-                serde_json::from_str(&answer).map_err(refused)?
+        let mut posted: Vec<Posted> = Vec::new();
+        let mut before = String::new();
+        // Because the user opened the pins: a page of 50 at a time, as far as Discord keeps them.
+        while posted.len() < protocol::PINNED_PAGED_LIMIT {
+            let page = match self.call("GET", &format!("/channels/{channel}/messages/pins?limit=50{before}"), None) {
+                Ok(answer) => serde_json::from_str::<Pins>(&answer).map_err(refused)?,
+                Err(super::Refused::Status { status: 404, .. }) if posted.is_empty() => {
+                    let answer = self.call("GET", &format!("/channels/{channel}/pins"), None).map_err(refusal)?;
+                    posted = serde_json::from_str(&answer).map_err(refused)?;
+                    break;
+                }
+                Err(other) => return Err(refusal(other)),
+            };
+            let oldest = page.items.last().and_then(|pin| pin.pinned_at.clone());
+            posted.extend(page.items.into_iter().map(|pin| pin.message));
+            match (page.has_more, oldest) {
+                (true, Some(at)) => before = format!("&before={}", escaped(&at)),
+                _ => break,
             }
-            Err(other) => return Err(refusal(other)),
-        };
+        }
         let guild = self.guild_of(&known);
         let mut messages = Vec::with_capacity(posted.len());
-        for posted in posted.iter().take(protocol::PINNED_LIMIT) {
+        for posted in posted.iter().take(protocol::PINNED_PAGED_LIMIT) {
             let (mut message, files) = self.convert(posted, guild.as_deref(), known.kind);
             files.register(&self.ctx).map_err(refused)?;
             message.pinned = true;
