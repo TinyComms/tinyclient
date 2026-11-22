@@ -1030,6 +1030,16 @@ fn main() -> io::Result<()> {
         eprintln!("prove-signal-group-rename:0");
         return Ok(());
     }
+    // The lab's signal-wave13 driver. A build without this returns to the server below and stays up.
+    if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-wave13") {
+        if let Err(err) = chatd::adapters::signal::prove_signal_wave13() {
+            eprintln!("signal-wave13: {err}");
+            std::process::exit(1);
+        }
+        eprintln!("prove-signal-wave13:0");
+        return Ok(());
+    }
+
     // The lab's signal-send-file driver. A build without this returns to the server below and stays up.
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("signal-send-file") {
         if let Err(err) = chatd::adapters::signal::prove_signal_send_file() {

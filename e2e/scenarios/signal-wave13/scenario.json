@@ -1,0 +1,12 @@
+{
+  "id": "signal-wave13",
+  "title": "Signal mobile companion linking and linked-device message history transfer",
+  "platforms": ["windows", "linux", "macos"],
+  "not_applicable": {
+    "android": "The phone proof build does not run desktop chatd. Signal companion linking and history transfer are covered by desktop chatd prove + unit tests.",
+    "ios": "The phone proof build does not run desktop chatd. Signal companion linking and history transfer are covered by desktop chatd prove + unit tests."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}
