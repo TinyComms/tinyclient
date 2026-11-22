@@ -310,6 +310,7 @@ struct Target {
     /// When this direct conversation's peer is blocked, the composer is replaced by an unblock bar.
     blocked_peer: Option<protocol::Person>,
     special: protocol::Special,
+    /// A Telegram bot, so `/` lists its commands and an empty chat can Start.
     bot: bool,
     /// The direct peer hides an exact last-seen time (Telegram's rough "last seen …" words).
     hidden_last_seen: bool,
@@ -317,8 +318,6 @@ struct Target {
     can: Capabilities,
     /// Selectable sending identities or lines (e.g. dual-SIM cards on Messages).
     send_as: Vec<protocol::SendAs>,
-    /// A Telegram bot, so `/` lists its commands and an empty chat can Start.
-    bot: bool,
 }
 
 /// Why nothing can be typed here, when that is so.
@@ -5101,7 +5100,6 @@ impl Shell {
             hidden_last_seen,
             can,
             send_as: self.send_as_of(&open.key),
-            bot: open.bot,
         };
         let composer = self.composer_in(false, cx);
         composer.update(cx, |composer, cx| composer.aim(target, &open.draft, cx));
@@ -5137,7 +5135,6 @@ impl Shell {
             hidden_last_seen: false,
             can: self.can_of(thread),
             send_as: self.send_as_of(thread),
-            bot: false,
         };
         let composer = self.composer_in(true, cx);
         // A thread's row is not handed over, so its draft is the one this window remembers.
@@ -5789,7 +5786,6 @@ mod tests {
             joined: true,
             can: Capabilities::default(),
             send_as: Vec::new(),
-            bot: false,
         }
     }
 

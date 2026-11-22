@@ -63,9 +63,7 @@ impl Fault {
                 "CHAT_SEND_MEDIA_FORBIDDEN" => "Admins don't allow media in this chat.".to_owned(),
                 "CHAT_SEND_PHOTOS_FORBIDDEN" => "Admins don't allow photos in this chat.".to_owned(),
                 "CHAT_SEND_VIDEOS_FORBIDDEN" => "Admins don't allow videos in this chat.".to_owned(),
-                "CHAT_SEND_ROUNDVIDEOS_FORBIDDEN" => "Admins don't allow video messages in this chat.".to_owned(),
                 "CHAT_SEND_AUDIOS_FORBIDDEN" => "Admins don't allow audio files in this chat.".to_owned(),
-                "CHAT_SEND_VOICES_FORBIDDEN" => "Admins don't allow voice messages in this chat.".to_owned(),
                 "CHAT_SEND_DOCS_FORBIDDEN" => "Admins don't allow files in this chat.".to_owned(),
                 "CHAT_SEND_STICKERS_FORBIDDEN" => "Admins don't allow stickers in this chat.".to_owned(),
                 "CHAT_SEND_GIFS_FORBIDDEN" => "Admins don't allow GIFs in this chat.".to_owned(),
@@ -95,7 +93,7 @@ impl Fault {
                 "PEER_ID_INVALID" | "CHANNEL_INVALID" | "CHANNEL_PRIVATE" | "USER_ID_INVALID" => {
                     "Telegram no longer lets this account reach that chat.".to_owned()
                 }
-                "CHAT_ADMIN_REQUIRED" | "RIGHT_FORBIDDEN" => "You don't have admin permission to do that here.".to_owned(),
+                "RIGHT_FORBIDDEN" => "You don't have admin permission to do that here.".to_owned(),
                 "USER_CREATOR" => "You can't modify the group or channel creator.".to_owned(),
                 "ADMINS_TOO_MUCH" => "This group or channel already has the maximum number of admins.".to_owned(),
                 "PASSWORD_HASH_INVALID" => "That two-step verification password is incorrect.".to_owned(),

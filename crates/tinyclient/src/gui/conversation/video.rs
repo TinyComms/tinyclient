@@ -132,6 +132,7 @@ impl Pane {
             let speed_file = file_id.clone();
             tile = tile.child(
                 div()
+                    .id("round-speed")
                     .absolute()
                     .bottom(px(6.))
                     .right(px(6.))
@@ -224,7 +225,7 @@ impl Pane {
             account: key.account(),
             file: file.to_owned(),
             path,
-            conversation: key,
+            conversation: key.clone(),
             message: message.id.clone(),
             title,
             at,

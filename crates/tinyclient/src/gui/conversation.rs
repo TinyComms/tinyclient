@@ -2507,7 +2507,9 @@ impl Render for Pane {
             .children(self.action_layers(window, cx))
             .children(self.viewer_layer(window, cx))
     }
+}
 
+impl Pane {
     /// The latest reply keyboard while `key` is the open conversation.
     /// A selective one stays hidden unless it mentions the reader or answers one of theirs,
     /// and an older keyboard is not used in its place.
