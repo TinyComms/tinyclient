@@ -72,6 +72,8 @@ def run(ctx):
     rid = "%s-%s" % (sha, ctx.label)
     started = time.time()
     sabotage = os.environ.get("E2E_SABOTAGE") == "1"
+    headless = ctx.scenario["id"] == "tiny-video-received"
+    driver_timeout = BUILD_TIMEOUT if headless else DRIVER_TIMEOUT
     os.makedirs(ctx.out_dir, exist_ok=True)
     notes = []
     try:
@@ -81,7 +83,9 @@ def run(ctx):
             return "\\".join((work,) + parts)
         tools_ffmpeg = w("tools", "ffmpeg", "bin", "ffmpeg.exe")
         cfg = {"ffmpeg": tools_ffmpeg, "app_dir": w("runs", rid, "app"), "src_dir": w("src", sha),
-               "driver": w("runs", rid, "scenario", "drive.windows.ps1"), "driver_timeout": DRIVER_TIMEOUT, "sabotage": sabotage}
+               "driver": w("runs", rid, "scenario", "drive.windows.ps1"), "driver_timeout": driver_timeout,
+               "sabotage": sabotage, "headless": headless,
+               "target_dir": w("target")}
         bundle = os.path.join(ctx.out_dir, "bundle.tar")
         with tarfile.open(bundle, "w") as t:
             for name in SCRIPTS:
@@ -96,9 +100,9 @@ def run(ctx):
         os.remove(bundle)
         step1 = ssh(host, "Remove-Item -Recurse -Force %s -ErrorAction SilentlyContinue; tar.exe -xf %s -C %s; Remove-Item %s; "
                     "powershell -NoProfile -ExecutionPolicy Bypass -File %s -Work %s; "
-                    "if (Test-Path %s) { 'BUILT=yes' } else { 'BUILT=no' }" % (
+                    "if ((Test-Path %s) -and (Test-Path %s)) { 'BUILT=yes' } else { 'BUILT=no' }" % (
                         w("in", "scenario-" + rid), w("in", "bundle-%s.tar" % rid), work, w("in", "bundle-%s.tar" % rid),
-                        w("host", "tools.ps1"), work, w("bin", sha, "tinyclient.exe")), timeout=900)
+                        w("host", "tools.ps1"), work, w("bin", sha, "tinyclient.exe"), w("src", sha, ".unpacked")), timeout=900)
         ffmpeg = marker(step1.stdout, "ffmpeg")
         if not ffmpeg or ffmpeg.lower() != tools_ffmpeg.lower():
             raise RuntimeError("tools.ps1 did not report ffmpeg: " + step1.stdout[-400:])
@@ -126,8 +130,8 @@ def run(ctx):
         log("build: %s (%.0fs), tinyclient.exe sha256 %s" % ("reused" if have == "built" else "done", time.time() - t_build, binary_sha[:12]))
 
         # 3. Recorder, app and driver in the console session; wait for the one-shot task to finish.
-        session = ps(host, w("host", "run-session.ps1"), "-Id %s -Sha %s -Work %s -Timeout %d" % (rid, sha, work, DRIVER_TIMEOUT + 120),
-                     timeout=DRIVER_TIMEOUT + 300, check=False)
+        session = ps(host, w("host", "run-session.ps1"), "-Id %s -Sha %s -Work %s -Timeout %d" % (rid, sha, work, driver_timeout + 120),
+                     timeout=driver_timeout + 300, check=False)
         raw = marker(session.stdout, "SESSION")
         if not raw or raw == "timeout":
             notes.append("the session did not finish: " + (session.stdout + session.stderr)[-300:].strip())
