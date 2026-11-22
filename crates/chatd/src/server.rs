@@ -129,6 +129,53 @@ fn search_fate(fresh_sent: Option<&str>, waiting: Option<&str>, query: &str) -> 
     }
 }
 
+/// One everywhere page: local offset `o`, and the account cursors `a` that produced this window.
+/// A missing cursor or a bare number means every account, each asked with no cursor.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EverywhereWindow {
+    o: usize,
+    a: Vec<EverywhereAccount>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EverywhereAccount {
+    n: Network,
+    id: String,
+    c: Option<String>,
+}
+
+fn decode_everywhere(cursor: Option<&str>) -> (usize, Option<Vec<(AccountKey, Option<String>)>>) {
+    let Some(cursor) = cursor else {
+        return (0, None);
+    };
+    if let Some(rest) = cursor.strip_prefix("e1:") {
+        if let Ok(parsed) = serde_json::from_str::<EverywhereWindow>(rest) {
+            let accounts = parsed
+                .a
+                .into_iter()
+                .map(|row| (AccountKey { network: row.n, account: row.id }, row.c))
+                .collect();
+            return (parsed.o, Some(accounts));
+        }
+    }
+    (cursor.parse().unwrap_or(0), None)
+}
+
+fn encode_everywhere(offset: usize, accounts: &[(AccountKey, Option<String>)]) -> Option<String> {
+    let body = EverywhereWindow {
+        o: offset,
+        a: accounts
+            .iter()
+            .map(|(key, cursor)| EverywhereAccount {
+                n: key.network,
+                id: key.account.clone(),
+                c: cursor.clone(),
+            })
+            .collect(),
+    };
+    serde_json::to_string(&body).ok().map(|json| format!("e1:{json}"))
+}
+
 pub struct Chat {
     pub(crate) hub: Arc<Hub>,
     adapters: Adapters,
@@ -2095,9 +2142,13 @@ impl Chat {
             notify: about.notify,
             tags: about.tags,
             link,
+            domain: about.domain,
+            url: about.url,
         };
         clip(&mut info.description, 4_000);
         clip(&mut info.nickname, 100);
+        clip(&mut info.domain, 128);
+        clip(&mut info.url, 512);
         info.roles.truncate(protocol::PROFILE_ROLES);
         info.roles.iter_mut().for_each(|role| clip(role, 100));
         info.tags.truncate(200);
@@ -2996,7 +3047,7 @@ impl Chat {
                         at: std::time::Instant::now(),
                         reply,
                     }) {
-                        Ok(hits) => Response::MessageHits { hits, cursor: None, not_searched: Vec::new() },
+                        Ok(page) => Response::MessageHits { hits: page.hits, cursor: page.cursor, not_searched: Vec::new() },
                         Err(refused) => *refused,
                     }
                 } else {
@@ -3004,7 +3055,7 @@ impl Chat {
                     // connected account whose adapter supports account-wide search, merge by time,
                     // and honestly list connected networks that were not asked.
                     const PAGE: usize = 25;
-                    let offset: usize = cursor.as_deref().and_then(|c| c.parse().ok()).unwrap_or(0);
+                    let (offset, window) = decode_everywhere(cursor.as_deref());
                     let accounts: Vec<AccountKey> = match self.hub.store().accounts() {
                         Ok(rows) => rows
                             .into_iter()
@@ -3018,21 +3069,42 @@ impl Chat {
                     let mut merged: Vec<protocol::MessageHit> = Vec::new();
                     let mut not_searched: Vec<Network> = Vec::new();
                     let mut asked_networks: Vec<Network> = Vec::new();
-                    for acct in accounts {
-                        let can = self.hub.capabilities(&acct);
-                        if self.hub.link(&acct) == Link::Connected && can.search_global {
-                            if let Ok(hits) = self.ask(&acct, |reply| Command::Search {
-                                query: query.clone(),
-                                scope: SearchScope::Account,
-                                filters: filters.clone(),
-                                cursor: None,
-                                at: std::time::Instant::now(),
-                                reply,
-                            }) {
+                    // Cursors sent on this ask. A later local slice repeats them instead of
+                    // dropping the rest of the page Slack already returned.
+                    let mut sent: Vec<(AccountKey, Option<String>)> = Vec::new();
+                    let mut next_remote: Vec<(AccountKey, Option<String>)> = Vec::new();
+                    for acct in &accounts {
+                        let can = self.hub.capabilities(acct);
+                        let connected = self.hub.link(acct) == Link::Connected && can.search_global;
+                        let planned = match &window {
+                            None => Some(None),
+                            Some(list) => list.iter().find(|(key, _)| key == acct).map(|(_, cursor)| cursor.clone()),
+                        };
+                        if connected {
+                            if let Some(cur) = planned {
+                                if let Ok(page) = self.ask(acct, |reply| Command::Search {
+                                    query: query.clone(),
+                                    scope: SearchScope::Account,
+                                    filters: filters.clone(),
+                                    cursor: cur.clone(),
+                                    at: std::time::Instant::now(),
+                                    reply,
+                                }) {
+                                    if !asked_networks.contains(&acct.network) {
+                                        asked_networks.push(acct.network);
+                                    }
+                                    sent.push((acct.clone(), cur));
+                                    if page.cursor.is_some() {
+                                        next_remote.push((acct.clone(), page.cursor));
+                                    }
+                                    merged.extend(page.hits);
+                                    continue;
+                                }
+                            } else {
+                                // This account already finished. It stays searched, and is not asked again.
                                 if !asked_networks.contains(&acct.network) {
                                     asked_networks.push(acct.network);
                                 }
-                                merged.extend(hits);
                                 continue;
                             }
                         }
@@ -3044,7 +3116,15 @@ impl Chat {
                     merged.sort_by(|a, b| b.sent.cmp(&a.sent).then_with(|| b.message_id.cmp(&a.message_id)));
                     let mut seen = std::collections::HashSet::new();
                     merged.retain(|hit| seen.insert((hit.conversation.clone(), hit.message_id.clone())));
-                    let next_cursor = (offset + PAGE < merged.len()).then(|| (offset + PAGE).to_string());
+                    let shown = merged.len().saturating_sub(offset).min(PAGE);
+                    let more_in_window = offset + shown < merged.len();
+                    let next_cursor = if shown > 0 && more_in_window {
+                        encode_everywhere(offset + shown, &sent)
+                    } else if shown > 0 && !next_remote.is_empty() {
+                        encode_everywhere(0, &next_remote)
+                    } else {
+                        None
+                    };
                     let page: Vec<protocol::MessageHit> = merged.into_iter().skip(offset).take(PAGE).collect();
                     Response::MessageHits { hits: page, cursor: next_cursor, not_searched }
                 }
@@ -4243,6 +4323,235 @@ impl Chat {
                 values,
                 reply,
             }),
+            Request::InviteMember { account, email, channels, real_name } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::InviteMember { email, channels, real_name, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::AddCustomEmoji { account, name, path } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::AddCustomEmoji { name, path, reply }) {
+                    Ok(()) => {
+                        self.hub.catalogs.forget_where(|(acct, kind, ..)| acct == &account && *kind == CatalogKind::Emoji);
+                        Response::Ok
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::UserGroups { account } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::UserGroups { reply }) {
+                    Ok(groups) => Response::UserGroups { groups },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::UserGroupCreate { account, name, handle, description } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::UserGroupCreate { name, handle, description, reply }) {
+                    Ok(group) => Response::UserGroup { group },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::UserGroupUpdate { account, group_id, name, handle, description } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::UserGroupUpdate { group_id, name, handle, description, reply }) {
+                    Ok(group) => Response::UserGroup { group },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::UserGroupMembers { account, group_id, users } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::UserGroupMembers { group_id, users, reply }) {
+                    Ok(group) => Response::UserGroup { group },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::AppView { conversation, include_home } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id;
+                match self.ask(&account, |reply| Command::AppView { conversation_id, include_home, reply }) {
+                    Ok(view) => Response::AppView { view: Box::new(view) },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SearchFiles { conversation, space, account, query, sort, cursor } => {
+                let query = query.trim().to_owned();
+                if query.is_empty() {
+                    return Response::AccountFiles { items: Vec::new(), cursor: None, more: false };
+                }
+                let (target_account, scope) = match (&conversation, &space, &account) {
+                    (Some(key), ..) => (key.account(), SearchScope::Conversation(key.id.clone())),
+                    (None, Some(key), _) => (key.account(), SearchScope::Space(key.id.clone())),
+                    (None, None, Some(acct)) => (acct.clone(), SearchScope::Account),
+                    (None, None, None) => {
+                        return Response::AccountFiles { items: Vec::new(), cursor: None, more: false };
+                    }
+                };
+                if let Err(refused) = self.online(&target_account) {
+                    return *refused;
+                }
+                match self.ask(&target_account, |reply| Command::SearchFiles { query, scope, sort, cursor, reply }) {
+                    Ok(mut page) => {
+                        for item in &mut page.items {
+                            clip(&mut item.title, 256);
+                            clip(&mut item.url, 2_000);
+                        }
+                        Response::AccountFiles { items: page.items, cursor: page.cursor, more: page.more }
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SectionCreate { space, name, emoji } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id;
+                match self.ask(&account, |reply| Command::SectionCreate { space_id, name, emoji, reply }) {
+                    Ok(group) => Response::Section { group },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SectionRename { space, section_id, name, emoji } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id;
+                match self.ask(&account, |reply| Command::SectionRename { space_id, section_id, name, emoji, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SectionDelete { space, section_id } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id;
+                match self.ask(&account, |reply| Command::SectionDelete { space_id, section_id, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SectionReorder { space, section_ids } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id;
+                match self.ask(&account, |reply| Command::SectionReorder { space_id, section_ids, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SectionMoveChannel { space, conversation, from_section, to_section } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id;
+                let conversation_id = conversation.id;
+                match self.ask(&account, |reply| Command::SectionMoveChannel {
+                    space_id,
+                    conversation_id,
+                    from_section,
+                    to_section,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SlashCommands { account } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::SlashCommands { reply }) {
+                    Ok(commands) => Response::SlashCommands { commands },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::AllUnreads { network, space, limit } => {
+                let cap = if limit == 0 { 15 } else { limit.clamp(1, 30) };
+                let mut groups: Vec<protocol::UnreadGroup> = Vec::new();
+                let mut fetched_accounts: std::collections::HashSet<AccountKey> = std::collections::HashSet::new();
+                // Ask connected Slack accounts live (paced and capped inside the Slack adapter).
+                let live_slack_accounts: Vec<AccountKey> = if let Some(sp) = &space {
+                    let acct = sp.account();
+                    if sp.network == Network::Slack && self.shows(&acct) && self.hub.link(&acct) == Link::Connected {
+                        vec![acct]
+                    } else {
+                        Vec::new()
+                    }
+                } else if network.is_none() || network == Some(Network::Slack) {
+                    self.hub
+                        .store()
+                        .accounts()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|a| a.key)
+                        .filter(|k| k.network == Network::Slack && self.shows(k) && self.hub.link(k) == Link::Connected)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                for acct in live_slack_accounts {
+                    if let Ok(live_groups) = self.ask(&acct, |reply| Command::AllUnreads { limit: cap, reply }) {
+                        fetched_accounts.insert(acct);
+                        groups.extend(live_groups);
+                    }
+                }
+                // Fill any remaining networks (or offline Slack accounts) from the local SQLite store.
+                let now = crate::hub::now();
+                let cached = match self.hub.store().unread_conversations(network, space.as_ref(), None, cap) {
+                    Ok(rows) => rows,
+                    Err(err) => return internal(err),
+                };
+                for conv in cached {
+                    let acct = conv.key.account();
+                    if !self.shows(&acct) || fetched_accounts.contains(&acct) {
+                        continue;
+                    }
+                    let messages = self
+                        .hub
+                        .store()
+                        .unread_messages(&conv.key, conv.last_read.as_deref().unwrap_or(""), 50, now)
+                        .unwrap_or_default();
+                    let total_unread = conv.unread.max(messages.len() as u32);
+                    groups.push(protocol::UnreadGroup {
+                        conversation: conv,
+                        messages,
+                        total_unread,
+                    });
+                }
+                groups.sort_by(|a, b| {
+                    let a_m = a.conversation.mentions > 0;
+                    let b_m = b.conversation.mentions > 0;
+                    let a_ts = a.messages.last().map_or(a.conversation.updated, |m| m.sent);
+                    let b_ts = b.messages.last().map_or(b.conversation.updated, |m| m.sent);
+                    b_m.cmp(&a_m).then_with(|| b_ts.cmp(&a_ts))
+                });
+                groups.truncate(cap as usize);
+                Response::AllUnreads { groups }
+            }
             Request::PressButton { conversation, message_id, data } => {
                 let account = conversation.account();
                 let conversation_id = conversation.id;

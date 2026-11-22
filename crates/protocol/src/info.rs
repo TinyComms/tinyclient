@@ -5,7 +5,7 @@
 //! Every field here is optional on the wire and every list has a cap, as in the rest of the
 //! contract.
 
-use crate::{is_false, is_zero, Conversation, Key, MediaFile, Network, Space};
+use crate::{is_false, is_zero, Conversation, Key, MediaFile, Message, Network, Space};
 use serde::{Deserialize, Serialize};
 
 /// Most folders an account lists. Telegram allows 30 with Premium; Discord's server folders are
@@ -462,6 +462,117 @@ pub struct SpaceInfo {
     /// Optional `https://` hand-off link to open or manage this Space in the network's app.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub link: String,
+    /// Workspace subdomain (e.g. `acme` for `acme.slack.com`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub domain: String,
+    /// Canonical HTTPS workspace URL (e.g. `https://acme.slack.com`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+}
+
+/// One workspace user group (e.g. Slack `@oncall`, `@design`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserGroup {
+    pub id: String,
+    pub name: String,
+    pub handle: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub member_count: u32,
+}
+
+/// One slash command exposed by a Slack app (shown in its About tab).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppSlashCommand {
+    pub command: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub usage: String,
+}
+
+/// One validated external link on a Slack app's About tab.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppLink {
+    pub label: String,
+    pub url: String,
+}
+
+/// A Slack app's About metadata, fetched on demand when its conversation opens.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppProfile {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub app_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bot_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<AppSlashCommand>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<AppLink>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub installed_by: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub open_url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub directory_url: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub home_enabled: bool,
+}
+
+/// A Slack app's published Home tab (Block Kit view), fetched on demand.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppHome {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub app_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub view_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spans: Vec<crate::Span>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cards: Vec<crate::Card>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub controls: Vec<crate::MessageControl>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub empty_reason: String,
+}
+
+/// Combined About + optional Home view for a Slack app conversation (`Request::AppView`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppView {
+    pub profile: AppProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<AppHome>,
+}
+
+/// One slash command available in a workspace (`Request::SlashCommands`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlashCommand {
+    pub command: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub usage: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub builtin: bool,
+}
+
+/// One conversation's unread messages in the All Unreads view (`Request::AllUnreads`, #606).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnreadGroup {
+    pub conversation: Conversation,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<Message>,
+    /// Exact unread count known after fetching messages past `last_read`.
+    #[serde(default)]
+    pub total_unread: u32,
 }
 
 /// Which of a custom emoji set this account may send.
@@ -822,6 +933,10 @@ pub struct Capabilities {
     /// This account supports reading and setting out-of-office / automatic replies (`Request::GetOutOfOffice`, `Request::SetOutOfOffice`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub out_of_office: bool,
+    /// This account supports creating, renaming, deleting, reordering, and moving channels
+    /// between custom sidebar sections (Slack paid plans).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sidebar_sections: bool,
     /// This account supports muting a conversation for a chosen duration (`SetMute` with `until`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub timed_mute: bool,
@@ -1095,6 +1210,21 @@ pub enum SearchHas {
     Images,
 }
 
+/// Sort order for network search (`SearchFilters::sort`, `Request::SearchFiles`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchSort {
+    #[default]
+    Newest,
+    Relevance,
+}
+
+impl SearchSort {
+    pub fn is_newest(&self) -> bool {
+        *self == SearchSort::Newest
+    }
+}
+
 /// Optional filters on `Request::SearchNetwork`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchFilters {
@@ -1108,6 +1238,8 @@ pub struct SearchFilters {
     pub after: Option<i64>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub mentions_me: bool,
+    #[serde(default, skip_serializing_if = "SearchSort::is_newest")]
+    pub sort: SearchSort,
 }
 
 impl SearchFilters {
@@ -1555,6 +1687,8 @@ mod tests {
             roles: vec!["Owner".into()],
             notify: Notify::All,
             tags: Vec::new(),
+            domain: String::new(),
+            url: String::new(),
             link: "https://teams.microsoft.com/l/team/19%3Ag/conversations?groupId=g1&tenantId=t1".into(),
         };
         let wire = serde_json::to_string(&info).unwrap();

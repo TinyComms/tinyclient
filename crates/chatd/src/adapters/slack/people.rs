@@ -357,6 +357,11 @@ impl Slack {
                 portrait,
             };
             self.ctx.set_note(&format!("u:{id}"), &serde_json::to_string(&kept).unwrap_or_default());
+            let api_app_id = profile["api_app_id"].as_str().unwrap_or("");
+            let bot_id = profile["bot_id"].as_str().or_else(|| user["bot_id"].as_str()).unwrap_or("");
+            if !api_app_id.is_empty() || !bot_id.is_empty() {
+                self.ctx.set_note(&format!("app:{id}"), &format!("{api_app_id}|{bot_id}"));
+            }
             self.remember(id, &known);
             learned.push((id.to_owned(), known));
         }

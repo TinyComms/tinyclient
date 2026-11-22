@@ -614,6 +614,99 @@ pub struct Composer {
     /// Cached mentionable team tags per Space (Teams `@tag` completion).
     space_tags: HashMap<Key, Vec<protocol::TeamTag>>,
     space_tags_asked: HashSet<Key>,
+    /// Slack `/` slash-command completion state and cached workspace commands (#602).
+    slash: Option<SlashList>,
+    slash_dismissed: bool,
+    slash_commands: HashMap<AccountKey, Vec<protocol::SlashCommand>>,
+    slash_asked: HashSet<AccountKey>,
+}
+
+struct SlashList {
+    rows: Vec<protocol::SlashCommand>,
+    selected: usize,
+}
+
+impl SlashList {
+    fn step(&mut self, down: bool) {
+        if self.rows.is_empty() {
+            return;
+        }
+        self.selected = if down {
+            (self.selected + 1) % self.rows.len()
+        } else {
+            (self.selected + self.rows.len() - 1) % self.rows.len()
+        };
+    }
+}
+
+/// Built-in Slack slash commands supported directly by chatd (used immediately before `commands.list` loads).
+const SLACK_BUILTIN_COMMANDS: &[(&str, &str, &str)] = &[
+    ("/me", "Send an italicized action", "[action]"),
+    ("/shrug", "Append ¯\\_(ツ)_/¯ to a message", "[message]"),
+    ("/topic", "Set the channel topic", "[topic]"),
+    ("/invite", "Invite a member to this channel", "@user"),
+    ("/kick", "Remove a member from this channel", "@user"),
+    ("/remove", "Remove a member from this channel", "@user"),
+    ("/leave", "Leave this channel", ""),
+    ("/join", "Join a channel", "#channel"),
+    ("/archive", "Archive this channel", ""),
+    ("/mute", "Mute this channel", ""),
+    ("/away", "Set yourself as away", ""),
+    ("/active", "Set yourself as active", ""),
+    ("/status", "Set or clear your status", "[text]"),
+    ("/dnd", "Pause notifications", "[minutes | off]"),
+    ("/remind", "Set a reminder", "[text]"),
+];
+
+fn default_slack_slash_commands() -> Vec<protocol::SlashCommand> {
+    SLACK_BUILTIN_COMMANDS
+        .iter()
+        .map(|(command, description, usage)| protocol::SlashCommand {
+            command: (*command).to_owned(),
+            description: (*description).to_owned(),
+            usage: (*usage).to_owned(),
+            builtin: true,
+        })
+        .collect()
+}
+
+fn slack_slash_trigger(text: &str, caret: usize) -> Option<&str> {
+    if !text.starts_with('/') || caret == 0 || caret > text.len() || !text.is_char_boundary(caret) {
+        return None;
+    }
+    let prefix = &text[..caret];
+    if prefix.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(prefix)
+}
+
+fn slack_unknown_slash_command(text: &str) -> Option<String> {
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    let first = trimmed.split_whitespace().next()?;
+    if first.len() <= 1 {
+        return None;
+    }
+    let cmd = first.to_ascii_lowercase();
+    let is_builtin = SLACK_BUILTIN_COMMANDS.iter().any(|(name, _, _)| *name == cmd);
+    if is_builtin {
+        return None;
+    }
+    let has_space = trimmed.len() > first.len();
+    let matches_builtin_prefix = SLACK_BUILTIN_COMMANDS.iter().any(|(name, _, _)| name.starts_with(&cmd));
+    if has_space || !matches_builtin_prefix {
+        Some(cmd)
+    } else {
+        None
+    }
+}
+
+fn slack_channel_app_url(team: &str, channel: &str) -> Option<String> {
+    let ok = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    (ok(team) && ok(channel)).then(|| format!("https://app.slack.com/client/{team}/{channel}"))
 }
 
 impl Composer {
@@ -723,6 +816,10 @@ impl Composer {
             peer_away_gen: HashMap::new(),
             space_tags: HashMap::new(),
             space_tags_asked: HashSet::new(),
+            slash: None,
+            slash_dismissed: false,
+            slash_commands: HashMap::new(),
+            slash_asked: HashSet::new(),
         }
     }
 
@@ -995,11 +1092,14 @@ impl Composer {
 
     /// Escape: the first that applies. It never clears what was typed.
     fn escape(&mut self, cx: &mut Context<Self>) {
+        let slash = self.slash.take();
         let list = self.list.take();
         let colon = self.colon.take();
         self.close_list(cx);
         // A list with no row was never on screen, so Escape is not spent on it.
-        if let Some(list) = list.filter(|list| !list.rows.is_empty()) {
+        if slash.is_some_and(|slash| !slash.rows.is_empty()) {
+            self.slash_dismissed = true;
+        } else if let Some(list) = list.filter(|list| !list.rows.is_empty()) {
             self.dismissed = Some(list.trigger.start);
         } else if let Some(colon) = colon.filter(|colon| !colon.cells.is_empty()) {
             self.colon_dismissed = Some(colon.trigger.start);
@@ -2212,6 +2312,10 @@ impl Composer {
                 PickerEvent::Picked(text) => this.insert_text(text, cx),
                 PickerEvent::Custom { name, id, animated } => this.insert_custom(name, id, *animated, cx),
                 PickerEvent::Send(pick) => this.send_pick(pick.clone(), cx),
+                PickerEvent::OpenUrl(url) => {
+                    let url = url.clone();
+                    let _ = this.shell.update(cx, |shell, cx| shell.open_external_link(&url, window, cx));
+                }
                 PickerEvent::Kept(_) | PickerEvent::Closed => {}
             }
             if !keep {
@@ -2455,6 +2559,7 @@ impl Composer {
     fn close_list(&mut self, cx: &mut Context<Self>) {
         self.list = None;
         self.colon = None;
+        self.slash = None;
         self.lookup = None;
         self.input.update(cx, |input, _| input.set_list_open(false));
     }
@@ -2464,6 +2569,7 @@ impl Composer {
         let open = !list.rows.is_empty();
         self.list = Some(list);
         self.colon = None;
+        self.slash = None;
         self.input.update(cx, |input, _| input.set_list_open(open));
     }
 
@@ -2483,6 +2589,35 @@ impl Composer {
             let input = self.input.read(cx);
             (input.text().to_owned(), input.cursor())
         };
+        if target.key.network == Network::Slack && self.editing.is_none() {
+            if let Some(prefix) = slack_slash_trigger(&text, caret) {
+                if self.slash_dismissed {
+                    self.close_list(cx);
+                    return;
+                }
+                self.ask_slash(&target, cx);
+                let needle = prefix.to_ascii_lowercase();
+                let source = self
+                    .slash_commands
+                    .get(&target.key.account())
+                    .cloned()
+                    .unwrap_or_else(default_slack_slash_commands);
+                let rows: Vec<protocol::SlashCommand> = source
+                    .into_iter()
+                    .filter(|cmd| cmd.command.to_ascii_lowercase().starts_with(&needle))
+                    .take(8)
+                    .collect();
+                let open = !rows.is_empty();
+                self.list = None;
+                self.colon = None;
+                self.lookup = None;
+                self.slash = Some(SlashList { rows, selected: 0 });
+                self.input.update(cx, |input, _| input.set_list_open(open));
+                return;
+            }
+        }
+        self.slash = None;
+        self.slash_dismissed = false;
         if let Some(found) = colon::trigger(&text, caret) {
             if self.colon_dismissed == Some(found.start) {
                 self.close_list(cx);
@@ -2544,6 +2679,26 @@ impl Composer {
             let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
             let _ = this.update(cx, |this, cx| this.looked_up(&target, &trigger, answer, cx));
         }));
+    }
+
+    /// The Slack workspace's slash commands (built-ins + cached `commands.list`), asked once per account.
+    fn ask_slash(&mut self, target: &Target, cx: &mut Context<Self>) {
+        let account = target.key.account();
+        if self.slash_asked.contains(&account) || !live() {
+            return;
+        }
+        self.slash_asked.insert(account.clone());
+        let this = cx.weak_entity();
+        ask_later(cx, Request::SlashCommands { account: account.clone() }, move |answer, cx| {
+            let Ok(Response::SlashCommands { commands }) = answer else {
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.slash_commands.insert(account, commands);
+                this.look_up(cx);
+                cx.notify();
+            });
+        });
     }
 
     /// The account's own emoji for `:`, asked the first time a colon list opens on it.
@@ -2671,7 +2826,9 @@ impl Composer {
     }
 
     fn step(&mut self, down: bool, cx: &mut Context<Self>) {
-        if let Some(colon) = &mut self.colon {
+        if let Some(slash) = &mut self.slash {
+            slash.step(down);
+        } else if let Some(colon) = &mut self.colon {
             colon.step(down);
         } else if let Some(list) = &mut self.list {
             list.step(down);
@@ -2680,12 +2837,32 @@ impl Composer {
     }
 
     fn complete_selected(&mut self, cx: &mut Context<Self>) {
-        if let Some(selected) = self.colon.as_ref().map(|colon| colon.selected) {
+        if let Some(selected) = self.slash.as_ref().map(|slash| slash.selected) {
+            self.complete_slash(selected, cx);
+        } else if let Some(selected) = self.colon.as_ref().map(|colon| colon.selected) {
             self.complete_colon(selected, cx);
         } else {
             let selected = self.list.as_ref().map_or(0, |list| list.selected);
             self.complete(selected, cx);
         }
+    }
+
+    fn complete_slash(&mut self, row: usize, cx: &mut Context<Self>) {
+        let Some(list) = self.slash.take() else {
+            return;
+        };
+        self.close_list(cx);
+        self.follow_text(cx);
+        let (caret, text_len) = {
+            let input = self.input.read(cx);
+            (input.cursor(), input.text().len())
+        };
+        let Some(cmd) = list.rows.get(row).filter(|_| caret <= text_len) else {
+            return;
+        };
+        self.input.update(cx, |input, cx| input.replace(0..caret, &format!("{} ", cmd.command), cx));
+        self.follow_text(cx);
+        cx.notify();
     }
 
     /// Tab, Return or a click: the row's name takes the place of what was typed to find it,
@@ -3473,6 +3650,35 @@ impl Composer {
             let tone = if length::over(counted, target.can.text_limit) { Tone::Warning } else { Tone::Note };
             length::line(counted, target.can.text_limit).map(|words| (words, tone))
         };
+        let slack_handoff = (target.key.network == Network::Slack && self.editing.is_none())
+            .then(|| slack_unknown_slash_command(&text))
+            .flatten()
+            .map(|cmd| {
+                let url = slack_channel_app_url(&target.key.account, &target.key.id);
+                let shell = self.shell.clone();
+                div()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .text_color(theme::text_soft())
+                    .child(glyph("icons/info.svg", 12., theme::text_soft()))
+                    .child(div().min_w_0().truncate().child(format!("{cmd}: Commands run in the official app.")))
+                    .when_some(url, |row, url| {
+                        row.child(
+                            div()
+                                .id("slack-command-open")
+                                .flex_none()
+                                .cursor_pointer()
+                                .text_color(theme::accent_text())
+                                .hover(|s| s.underline())
+                                .child("Open in Slack")
+                                .on_click(move |_, window, cx| {
+                                    let _ = shell.update(cx, |shell, cx| shell.open_external_link(&url, window, cx));
+                                }),
+                        )
+                    })
+            });
         let said = self.caption.clone().or(recording).or_else(length_note).or_else(note).or_else(|| (unlocked && target.link == Link::Offline).then(offline));
         let tiny_previews_off = target.key.network == Network::Tiny && !super::app::prefs::choices().send_link_previews;
         let hosts = if self.controls().link_chip && unlocked && !tiny_previews_off { niceties::link_hosts(&text) } else { Vec::new() };
@@ -3510,7 +3716,7 @@ impl Composer {
                         })),
                 )
         });
-        if said.is_none() && chip.is_none() {
+        if said.is_none() && chip.is_none() && slack_handoff.is_none() {
             return None;
         }
         let said = said.map(|(words, tone)| {
@@ -3542,12 +3748,83 @@ impl Composer {
                 .gap(px(10.))
                 .type_small()
                 .children(chip)
+                .children(slack_handoff)
                 .children(said),
         )
     }
 
     /// The completion lists, 6 pt above the card and over the messages.
     fn popover(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if let Some(slash) = self.slash.as_ref().filter(|slash| !slash.rows.is_empty()) {
+            let selected = slash.selected;
+            let mut panel = div()
+                .w(px(360.))
+                .max_w_full()
+                .p(px(4.))
+                .rounded(px(theme::R_FLOAT))
+                .bg(theme::overlay())
+                .border_1()
+                .border_color(theme::overlay_edge())
+                .shadow(theme::shadow_popover())
+                .flex()
+                .flex_col()
+                .gap(px(1.))
+                .occlude();
+            for (index, cmd) in slash.rows.iter().enumerate() {
+                let active = index == selected;
+                let hint = if cmd.usage.is_empty() { None } else { Some(cmd.usage.clone()) };
+                let desc = if cmd.description.is_empty() { None } else { Some(cmd.description.clone()) };
+                let official = !cmd.builtin;
+                panel = panel.child(
+                    div()
+                        .id(("slash-cmd", index))
+                        .px(px(8.))
+                        .py(px(5.))
+                        .rounded(px(theme::R_CONTROL))
+                        .when(active, |r| r.bg(theme::selected()))
+                        .hover(|s| s.bg(theme::hover()))
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.))
+                        .on_click(cx.listener(move |this, _, _, cx| this.complete_slash(index, cx)))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .type_small()
+                                        .child(div().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(cmd.command.clone()))
+                                        .when_some(hint, |r, hint| r.child(div().text_color(theme::text_faint()).child(hint))),
+                                )
+                                .when_some(desc, |r, desc| {
+                                    r.child(div().type_small().text_color(theme::text_soft()).truncate().child(desc))
+                                }),
+                        )
+                        .when(official, |r| {
+                            r.child(
+                                div()
+                                    .flex_none()
+                                    .px(px(5.))
+                                    .py(px(1.))
+                                    .rounded(px(theme::R_CHIP))
+                                    .bg(theme::hover())
+                                    .type_small()
+                                    .text_color(theme::text_faint())
+                                    .child("official app"),
+                            )
+                        }),
+                );
+            }
+            return Some(deferred(div().absolute().left_0().bottom(relative(1.)).pb(px(6.)).child(panel)).priority(1).into_any_element());
+        }
         if self.colon.as_ref().is_some_and(|colon| !colon.cells.is_empty()) {
             let this = cx.weak_entity();
             let pick = move |row: usize, _: &mut Window, cx: &mut App| {
@@ -4986,5 +5263,24 @@ mod tests {
         assert!(!pasted.exists());
         let _ = std::fs::remove_file(&notes);
         let _ = std::fs::remove_file(&huge);
+    }
+
+    #[test]
+    fn slack_slash_trigger_and_unknown_handoff() {
+        assert_eq!(slack_slash_trigger("/", 1), Some("/"));
+        assert_eq!(slack_slash_trigger("/to", 3), Some("/to"));
+        assert_eq!(slack_slash_trigger("/topic hello", 12), None);
+        assert_eq!(slack_slash_trigger("hello /me", 9), None);
+
+        assert_eq!(slack_unknown_slash_command("/me waves"), None);
+        assert_eq!(slack_unknown_slash_command("/to"), None);
+        assert_eq!(slack_unknown_slash_command("/deploy staging"), Some("/deploy".to_owned()));
+        assert_eq!(slack_unknown_slash_command("/giphy cats"), Some("/giphy".to_owned()));
+
+        assert_eq!(
+            slack_channel_app_url("T01ALPHA", "C0GEN").as_deref(),
+            Some("https://app.slack.com/client/T01ALPHA/C0GEN")
+        );
+        assert_eq!(slack_channel_app_url("T01/evil", "C0GEN"), None);
     }
 }

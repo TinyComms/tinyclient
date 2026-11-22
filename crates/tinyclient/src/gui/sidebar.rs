@@ -673,9 +673,10 @@ impl Shell {
             Mode::Space(space) => flat(space, 0),
             Mode::Network(Network::Slack) => match self.slack_space() {
                 Some(space) => {
+                    let unreads = self.unreads_row(&space);
                     let threads = self.threads_row(&space);
                     let drafts = self.drafts_row(&space);
-                    threads.into_iter().chain(drafts).chain(flat(&space, 0)).collect()
+                    unreads.into_iter().chain(threads).chain(drafts).chain(flat(&space, 0)).collect()
                 }
                 None => Vec::new(),
             },
@@ -1013,6 +1014,7 @@ impl Shell {
         match row {
             Row::Conversation { conversation, .. } => self.pick_row(&conversation, cx),
             Row::Group { space, id, collapsed, .. } => self.collapse(space, id, !collapsed, cx),
+            Row::Unreads { space, .. } => self.drill(home::Drill::Unreads(Some(space)), cx),
             Row::Threads { space, .. } => self.drill(home::Drill::Threads(space), cx),
             Row::Drafts { space, .. } => self.drill(home::Drill::Drafts(space), cx),
             Row::Fold { reveal, .. } => {
@@ -1411,6 +1413,15 @@ impl Shell {
                 let bar = div().h(px(8.)).w(gpui::relative(widths[ix % widths.len()])).rounded(px(theme::R_CHIP)).bg(theme::raised());
                 list_row(("loading", ix), height, false, false, div().children(indent(*depth, 8.)).gap(px(8.)).child(skeleton(20., 20.)).child(bar)).cursor_default()
             }
+            Row::Unreads { count, mention, .. } => {
+                let trailing = match (*count, *mention) {
+                    (0, _) => None,
+                    (count, true) => Some(badge_mention(count)),
+                    (count, false) => Some(super::components::badge_count_unread(count)),
+                };
+                self.action_row(("unreads", ix), Some("icons/inbox.svg"), "Unreads".into(), *count > 0, trailing, focused)
+                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, cx| this.activate(ix, cx), cx))
+            }
             Row::Threads { count, mention, .. } => {
                 let trailing = match (*count, *mention) {
                     (0, _) => None,
@@ -1758,6 +1769,7 @@ impl Shell {
         };
         if let Some(drill) = &self.sidebar_state.drill {
             let title = match drill {
+                home::Drill::Unreads(_) => "All unreads".to_owned(),
                 home::Drill::Threads(_) => "Threads".to_owned(),
                 home::Drill::Drafts(_) => "Drafts & sent".to_owned(),
                 home::Drill::Archive => "Archive".to_owned(),
@@ -1766,7 +1778,9 @@ impl Shell {
                 home::Drill::Topics(forum) => forum.title.clone(),
             };
             let place = match drill {
-                home::Drill::Threads(space) | home::Drill::Drafts(space) => self.spaces.iter().find(|s| &s.key == space).map(|s| s.name.clone()),
+                home::Drill::Unreads(Some(space)) | home::Drill::Threads(space) | home::Drill::Drafts(space) => {
+                    self.spaces.iter().find(|s| &s.key == space).map(|s| s.name.clone())
+                }
                 _ => None,
             };
             return strip
@@ -1999,6 +2013,32 @@ impl Shell {
         }
         let account = current.as_ref().map(Key::account);
         let name = current.as_ref().and_then(|key| self.spaces.iter().find(|s| &s.key == key)).map_or_else(String::new, |s| s.name.clone());
+        if let Some(space_key) = current.clone() {
+            let team_id = space_key.id.clone();
+            let info_key = space_key.clone();
+            menu = menu.child(
+                super::components::menu_item("slack-workspace-info", Some("icons/info.svg"), "Workspace info", None).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        this.sidebar_state.slack_menu = false;
+                        this.details_space(info_key.clone(), cx);
+                    }),
+                ),
+            );
+            menu = menu.child(super::components::menu_separator());
+            menu = menu.child(super::components::menu_label("Workspace settings · Opens in your browser"));
+            for (ix, &(label, rel)) in super::people::SLACK_WORKSPACE_LINKS.iter().enumerate() {
+                let url = super::people::slack_workspace_url("", &team_id, rel);
+                menu = menu.child(
+                    super::components::menu_item(("slack-admin-link", ix), Some("icons/external-link.svg"), label, None)
+                        .tooltip(tip(format!("{label} · Opens in your browser"), None))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.sidebar_state.slack_menu = false;
+                            this.open_external_link(&url, window, cx);
+                        })),
+                );
+            }
+            menu = menu.child(super::components::menu_separator());
+        }
         menu = menu.child(super::components::menu_item_danger("slack-sign-out", Some("icons/log-out.svg"), format!("Sign out of {name}")).on_click(cx.listener(move |this, _, _, cx| {
             this.sidebar_state.slack_menu = false;
             if let Some(account) = account.clone() {
@@ -2030,6 +2070,32 @@ impl Shell {
             cx.notify();
         }
         was
+    }
+
+    /// Moves a Slack conversation into another sidebar section (`Request::SectionMoveChannel`).
+    pub(in crate::gui) fn move_to_section(
+        &mut self,
+        space: Key,
+        conversation: Key,
+        from_section: Option<String>,
+        to_section: String,
+        cx: &mut Context<Self>,
+    ) {
+        let request = Request::SectionMoveChannel {
+            space,
+            conversation,
+            from_section,
+            to_section,
+        };
+        self.off_thread(
+            cx,
+            move || crate::client::ask(&request),
+            |this, answer, cx| {
+                if let Some(why) = refused(&answer) {
+                    this.toast(None, why, cx);
+                }
+            },
+        );
     }
 
     /// The Slack header's menu on a phone: the same rows as a bottom sheet over the screen.

@@ -303,6 +303,12 @@ pub struct Group {
     /// drawn, except the open one and starred ones.
     #[serde(default, skip_serializing_if = "is_false")]
     pub unread_only: bool,
+    /// Optional section icon / emoji (e.g. Slack custom sidebar section emoji).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub emoji: String,
+    /// Optional per-section sort order (e.g. `"alphabetical"`, `"recent"`, `"priority"`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sort: String,
 }
 
 impl Group {
@@ -316,6 +322,8 @@ impl Group {
             count: 0,
             muted: false,
             unread_only: false,
+            emoji: String::new(),
+            sort: String::new(),
         }
     }
 }
@@ -2754,6 +2762,125 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         values: Vec<String>,
     },
+    /// Invite someone by email to a workspace (Slack `users.admin.invite`). Answers `Response::Ok`.
+    InviteMember {
+        account: AccountKey,
+        email: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        channels: Vec<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        real_name: String,
+    },
+    /// Upload a custom emoji to a workspace (Slack `emoji.add`). Answers `Response::Ok`.
+    AddCustomEmoji {
+        account: AccountKey,
+        name: String,
+        path: String,
+    },
+    /// List active workspace user groups (Slack `usergroups.list`). Answers `Response::UserGroups`.
+    UserGroups {
+        account: AccountKey,
+    },
+    /// Create a workspace user group (Slack `usergroups.create`). Answers `Response::UserGroup`.
+    UserGroupCreate {
+        account: AccountKey,
+        name: String,
+        handle: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        description: String,
+    },
+    /// Update a workspace user group's name, handle, or description (Slack `usergroups.update`).
+    /// Answers `Response::UserGroup`.
+    UserGroupUpdate {
+        account: AccountKey,
+        group_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handle: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+    },
+    /// Replace a workspace user group's members (Slack `usergroups.users.update`).
+    /// Answers `Response::UserGroup`.
+    UserGroupMembers {
+        account: AccountKey,
+        group_id: String,
+        users: Vec<String>,
+    },
+    /// Fetch a Slack app's About profile and (when `include_home` is true) its published Home tab.
+    /// Fetched on open only; never at connect. Answers `Response::AppView`.
+    AppView {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "is_false")]
+        include_home: bool,
+    },
+    /// Search files on a network (`search.files` on Slack). Answers `Response::AccountFiles`.
+    SearchFiles {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation: Option<Key>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<Key>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<AccountKey>,
+        query: String,
+        #[serde(default, skip_serializing_if = "SearchSort::is_newest")]
+        sort: SearchSort,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+    },
+    /// Create a custom sidebar section in a Space (Slack `users.channelSections.create`).
+    /// Answers `Response::Section`.
+    SectionCreate {
+        space: Key,
+        name: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        emoji: String,
+    },
+    /// Rename or update a custom sidebar section (Slack `users.channelSections.update`).
+    SectionRename {
+        space: Key,
+        section_id: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emoji: Option<String>,
+    },
+    /// Delete a custom sidebar section (Slack `users.channelSections.delete`).
+    SectionDelete {
+        space: Key,
+        section_id: String,
+    },
+    /// Reorder sidebar sections (Slack `users.channelSections.order`).
+    SectionReorder {
+        space: Key,
+        section_ids: Vec<String>,
+    },
+    /// Move a conversation between sidebar sections (Slack `users.channelSections.channels.bulkUpdate`).
+    SectionMoveChannel {
+        space: Key,
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_section: Option<String>,
+        to_section: String,
+    },
+    /// List available slash commands for an account (built-ins + cached `commands.list`).
+    /// Answers `Response::SlashCommands`.
+    SlashCommands {
+        account: AccountKey,
+    },
+    /// Reads unread messages grouped by conversation across a network or workspace (All Unreads, #606).
+    /// On Slack this runs paced, capped `conversations.history` calls (`oldest = last_read`) ONLY
+    /// when opened (never at connect), upgrading coarse unread flags to real counts.
+    /// Answers `Response::AllUnreads`.
+    AllUnreads {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        network: Option<Network>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<Key>,
+        /// Maximum unread conversations to include (server-clamped; 0 uses default 15).
+        #[serde(default)]
+        limit: u32,
+    },
     /// Who has read a given message in a chat (`Capabilities::read_by`).
     ReadBy {
         conversation: Key,
@@ -2858,6 +2985,9 @@ pub enum Change {
     Searched { account: AccountKey, query: String },
     /// Ephemeral. Everyone typing in the conversation now; empty when they stopped.
     Typing { conversation: Key, typists: Vec<Typist> },
+    /// Ephemeral. A message visible only to the current user (e.g. Slack ephemeral reply).
+    /// Never stored in persistent channel history.
+    Ephemeral { conversation: Key, message: Box<Message> },
     /// A network's folders, or their counts: ask `Folders`.
     Folders { account: AccountKey },
     /// Ephemeral. Presence, status and what they are doing, all of it.
@@ -2940,6 +3070,7 @@ impl Change {
         matches!(
             self,
             Change::Typing { .. }
+                | Change::Ephemeral { .. }
                 | Change::Presence { .. }
                 | Change::Call { .. }
                 | Change::Occupants { .. }
@@ -3363,6 +3494,30 @@ pub enum Response {
     /// One updated/rescheduled message (`Request::RescheduleMessage`).
     ScheduledMessage {
         message: ScheduledMessage,
+    },
+    /// Active workspace user groups (`Request::UserGroups`).
+    UserGroups {
+        groups: Vec<UserGroup>,
+    },
+    /// One created or updated workspace user group.
+    UserGroup {
+        group: UserGroup,
+    },
+    /// A Slack app's About profile and optional Home tab (`Request::AppView`).
+    AppView {
+        view: Box<AppView>,
+    },
+    /// A newly created custom sidebar section (`Request::SectionCreate`).
+    Section {
+        group: Group,
+    },
+    /// Built-in and workspace slash commands (`Request::SlashCommands`).
+    SlashCommands {
+        commands: Vec<SlashCommand>,
+    },
+    /// Unread messages grouped by conversation (`Request::AllUnreads`, #606).
+    AllUnreads {
+        groups: Vec<UnreadGroup>,
     },
     /// Members who have read a given message (`Request::ReadBy`).
     ReadBy {

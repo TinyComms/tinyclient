@@ -1,10 +1,10 @@
 //! A workspace as a Space: its sidebar as the tree, and the unread state Slack keeps for it.
 
-use super::{fnv, seconds, thread_id, thread_of, Fault, Slack};
+use super::{emoji, fnv, seconds, thread_id, thread_of, Fault, Slack};
 use crate::adapters::{BrowsedPage, Command, Failure};
 use crate::store::{ConversationRow, SpaceRow};
 use protocol::{BrowsedChannel, CallSupport, Conversation, ConversationKind, Group, GroupKind, MediaFile, MediaKind, Relation};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -31,7 +31,17 @@ struct Section {
     name: String,
     /// Slack's type: `standard` for the user's own, or the built-in it is.
     kind: String,
+    emoji: String,
+    sort: String,
     channels: Vec<String>,
+}
+
+fn section_emoji(raw: Option<&str>) -> String {
+    let clean = raw.unwrap_or("").trim().trim_matches(':');
+    if clean.is_empty() {
+        return String::new();
+    }
+    emoji::standard(clean).unwrap_or_else(|| format!(":{clean}:"))
 }
 
 /// Channel ids Slack filed in its stars section. Those rows are starred on Slack.
@@ -56,6 +66,8 @@ pub(super) fn starred_from(kinds: &[(&str, &[&str])]) -> Vec<String> {
             id: format!("S{at}"),
             name: String::new(),
             kind: (*kind).to_owned(),
+            emoji: String::new(),
+            sort: String::new(),
             channels: channels.iter().map(|id| (*id).to_owned()).collect(),
         })
         .collect();
@@ -67,6 +79,8 @@ fn section(id: &str, name: &str) -> Section {
         id: id.to_owned(),
         name: name.to_owned(),
         kind: id.to_owned(),
+        emoji: String::new(),
+        sort: String::new(),
         channels: Vec::new(),
     }
 }
@@ -406,6 +420,9 @@ impl Slack {
         // Looked up once: `-` when the workspace has only Slack's default picture.
         let icon = self.ctx.note("icon").or_else(|| {
             let info = self.api("team.info", &[]).ok()?;
+            if let Some(domain) = info["team"]["domain"].as_str().filter(|d| !d.is_empty()) {
+                self.ctx.set_note("team:domain", domain);
+            }
             let icon = &info["team"]["icon"];
             let urls = [&icon["image_88"], &icon["image_68"], &icon["image_132"]];
             let url = urls.into_iter().filter_map(Value::as_str).find(|url| self.hosted(url));
@@ -427,6 +444,265 @@ impl Slack {
             position: 0,
         }])?;
         self.ctx.set_space_can_create_channels(&self.ctx.account.account, true)?;
+        Ok(())
+    }
+
+    fn disable_sidebar_sections(&self) {
+        let mut caps = super::capabilities();
+        caps.sidebar_sections = false;
+        self.ctx.capabilities(caps);
+    }
+
+    fn check_paid_section_error(&self, err: &Fault) {
+        if let Fault::Slack(code) = err {
+            if matches!(code.as_str(), "paid_only" | "paid_teams_only" | "enterprise_is_restricted" | "not_allowed") {
+                self.disable_sidebar_sections();
+            }
+        }
+    }
+
+    /// Creates a custom sidebar section (`users.channelSections.create`, web-client call).
+    /// On paid-plan refusals (`paid_only` / `paid_teams_only`), turns off `Capabilities::sidebar_sections`
+    /// so the shell hides custom section controls on free workspaces.
+    pub(super) fn section_create(&self, name: &str, emoji_raw: &str) -> Result<Group, Fault> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(Fault::Slack("invalid_name_required".to_owned()));
+        }
+        let mut params = vec![("name", name)];
+        let clean_emoji = emoji_raw.trim().trim_matches(':');
+        if !clean_emoji.is_empty() {
+            params.push(("emoji", clean_emoji));
+        }
+        let resp = match self.api("users.channelSections.create", &params) {
+            Ok(resp) => resp,
+            Err(err) => {
+                self.check_paid_section_error(&err);
+                return Err(err);
+            }
+        };
+        let id = resp["channel_section_id"]
+            .as_str()
+            .or_else(|| resp["channel_section"]["channel_section_id"].as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Fault::Net("users.channelSections.create: no section id".to_owned()))?;
+        let group = Group {
+            emoji: section_emoji((!clean_emoji.is_empty()).then_some(clean_emoji)),
+            ..Group::new(id, name, 0)
+        };
+        self.ctx
+            .group(&self.ctx.account.account, &group)
+            .map_err(|err| Fault::Net(err.to_string()))?;
+        Ok(group)
+    }
+
+    /// Sections already stored for this workspace. The conversation page size does not drop groups.
+    fn known_sections(&self) -> Result<Vec<String>, Fault> {
+        let space = self.ctx.key(&self.ctx.account.account);
+        let tree = self
+            .ctx
+            .hub
+            .store()
+            .tree(&space, 0, 1)
+            .map_err(|err| Fault::Net(err.to_string()))?
+            .ok_or_else(|| Fault::Slack("section_not_found".to_owned()))?;
+        Ok(tree.groups.into_iter().map(|group| group.id).collect())
+    }
+
+    /// Refuses before the API unless every id is already in this workspace's section list.
+    fn require_sections(&self, ids: &[&str]) -> Result<(), Fault> {
+        let known = self.known_sections()?;
+        if ids.iter().all(|id| known.iter().any(|have| have == id)) {
+            Ok(())
+        } else {
+            Err(Fault::Slack("section_not_found".to_owned()))
+        }
+    }
+
+    /// Renames or updates a custom sidebar section (`users.channelSections.update`).
+    pub(super) fn section_rename(&self, section_id: &str, name: &str, emoji_raw: Option<&str>) -> Result<(), Fault> {
+        let section_id = section_id.trim();
+        let name = name.trim();
+        if section_id.is_empty() || name.is_empty() {
+            return Err(Fault::Slack("invalid_arguments".to_owned()));
+        }
+        self.require_sections(&[section_id])?;
+        let mut params = vec![("channel_section_id", section_id), ("name", name)];
+        let clean_emoji = emoji_raw.map(|e| e.trim().trim_matches(':'));
+        if let Some(e) = clean_emoji {
+            params.push(("emoji", e));
+        }
+        if let Err(err) = self.api("users.channelSections.update", &params) {
+            self.check_paid_section_error(&err);
+            return Err(err);
+        }
+        // The store guard has to end before `group` takes it again.
+        let updated = self
+            .ctx
+            .hub
+            .store()
+            .tree(&self.ctx.key(&self.ctx.account.account), 0, 1)
+            .ok()
+            .flatten()
+            .and_then(|t| t.groups.into_iter().find(|g| g.id == section_id));
+        if let Some(mut group) = updated {
+            group.name = name.to_owned();
+            if let Some(e) = clean_emoji {
+                group.emoji = section_emoji((!e.is_empty()).then_some(e));
+            }
+            self.ctx
+                .group(&self.ctx.account.account, &group)
+                .map_err(|err| Fault::Net(err.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Deletes a custom sidebar section (`users.channelSections.delete`).
+    pub(super) fn section_delete(&self, section_id: &str) -> Result<(), Fault> {
+        let section_id = section_id.trim();
+        if section_id.is_empty() {
+            return Err(Fault::Slack("invalid_arguments".to_owned()));
+        }
+        self.require_sections(&[section_id])?;
+        if let Err(err) = self.api("users.channelSections.delete", &[("channel_section_id", section_id)]) {
+            self.check_paid_section_error(&err);
+            return Err(err);
+        }
+        self.ctx
+            .group_gone(&self.ctx.account.account, section_id)
+            .map_err(|err| Fault::Net(err.to_string()))?;
+        Ok(())
+    }
+
+    /// Reorders sidebar sections (`users.channelSections.order`).
+    pub(super) fn section_reorder(&self, section_ids: &[String]) -> Result<(), Fault> {
+        if section_ids.is_empty() {
+            return Err(Fault::Slack("invalid_arguments".to_owned()));
+        }
+        let ids: Vec<&str> = section_ids.iter().map(String::as_str).collect();
+        self.require_sections(&ids)?;
+        let ids_json = json!(section_ids).to_string();
+        if let Err(err) = self.api("users.channelSections.order", &[("channel_section_ids", ids_json.as_str())]) {
+            self.check_paid_section_error(&err);
+            return Err(err);
+        }
+        self.ctx
+            .reorder_groups(&self.ctx.account.account, section_ids)
+            .map_err(|err| Fault::Net(err.to_string()))?;
+        Ok(())
+    }
+
+    /// Moves a channel, DM, or app between sidebar sections (`users.channelSections.channels.bulkUpdate`).
+    pub(super) fn section_move_channel(
+        &self,
+        conversation_id: &str,
+        from_section: Option<&str>,
+        to_section: &str,
+    ) -> Result<(), Fault> {
+        let cid = super::thread_of(conversation_id).map_or(conversation_id, |(c, _)| c);
+        let to = to_section.trim();
+        if cid.is_empty() || to.is_empty() {
+            return Err(Fault::Slack("invalid_arguments".to_owned()));
+        }
+        let from = from_section.map(str::trim).filter(|section| !section.is_empty() && *section != to);
+        let mut ids = vec![to];
+        if let Some(from) = from {
+            ids.push(from);
+        }
+        self.require_sections(&ids)?;
+        let insert = json!([{"channel_section_id": to, "channel_ids": [cid]}]).to_string();
+        let remove = from_section
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != to && *s != DIRECTS)
+            .map(|from| json!([{"channel_section_id": from, "channel_ids": [cid]}]).to_string());
+        let mut params = vec![("insert", insert.as_str())];
+        if let Some(ref rem) = remove {
+            params.push(("remove", rem.as_str()));
+        }
+        if let Err(err) = self.api("users.channelSections.channels.bulkUpdate", &params) {
+            self.check_paid_section_error(&err);
+            return Err(err);
+        }
+        self.ctx
+            .move_conversation_group(&self.ctx.account.account, cid, to)
+            .map_err(|err| Fault::Net(err.to_string()))?;
+        Ok(())
+    }
+
+    /// Live socket event `channel_sections_upserted`: adds/updates custom sidebar sections.
+    pub(super) fn sections_upserted(&self, event: &Value) -> Result<(), Failure> {
+        let items = event["channel_sections"]
+            .as_array()
+            .or_else(|| event["sections"].as_array())
+            .map_or(&[][..], Vec::as_slice);
+        for (ix, item) in items.iter().enumerate() {
+            let Some(id) = item["channel_section_id"].as_str().filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let kind = item["type"].as_str().unwrap_or("standard");
+            if matches!(kind, "direct_messages" | "recent_apps") {
+                continue;
+            }
+            let name = item["name"].as_str().filter(|s| !s.is_empty()).unwrap_or("Section");
+            let group = Group {
+                emoji: section_emoji(item["emoji"].as_str()),
+                sort: item["sort"].as_str().or_else(|| item["channel_sort"].as_str()).unwrap_or("").to_ascii_lowercase(),
+                ..Group::new(id, name, ix as i32)
+            };
+            self.ctx.group(&self.ctx.account.account, &group)?;
+        }
+        Ok(())
+    }
+
+    /// Live socket event `channel_sections_removed` / `channel_sections_deleted`.
+    pub(super) fn sections_removed(&self, event: &Value) -> Result<(), Failure> {
+        let ids: Vec<&str> = event["channel_section_ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .chain(event["channel_section_id"].as_str())
+            .filter(|s| !s.is_empty())
+            .collect();
+        for id in ids {
+            self.ctx.group_gone(&self.ctx.account.account, id)?;
+        }
+        Ok(())
+    }
+
+    /// Live socket events `channel_sections_channels_upserted` and `channel_sections_channels_removed`.
+    pub(super) fn sections_channels_changed(&self, event: &Value, added: bool) -> Result<(), Failure> {
+        let fallback_chan = self.ctx.note("group:channel").unwrap_or_default();
+        let entries = event["channel_sections"]
+            .as_array()
+            .or_else(|| event["sections"].as_array())
+            .map_or(&[][..], Vec::as_slice);
+        for entry in entries {
+            let sec_id = entry["channel_section_id"].as_str().unwrap_or("");
+            for cid in entry["channel_ids"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                if cid.is_empty() {
+                    continue;
+                }
+                if added && !sec_id.is_empty() {
+                    self.ctx.move_conversation_group(&self.ctx.account.account, cid, sec_id)?;
+                } else if !added {
+                    let is_direct = self.ctx.known(cid)?.is_some_and(|r| r.kind.is_direct());
+                    let target = if is_direct { DIRECTS } else { fallback_chan.as_str() };
+                    self.ctx.move_conversation_group(&self.ctx.account.account, cid, target)?;
+                }
+            }
+        }
+        if let Some(sec_id) = event["channel_section_id"].as_str().filter(|s| !s.is_empty()) {
+            for cid in event["channel_ids"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                if added {
+                    self.ctx.move_conversation_group(&self.ctx.account.account, cid, sec_id)?;
+                } else {
+                    let is_direct = self.ctx.known(cid)?.is_some_and(|r| r.kind.is_direct());
+                    let target = if is_direct { DIRECTS } else { fallback_chan.as_str() };
+                    self.ctx.move_conversation_group(&self.ctx.account.account, cid, target)?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -516,15 +792,69 @@ impl Slack {
                     (None, "slack_connect") => "External connections",
                     (None, _) => "More",
                 };
-                let channels = listed["channel_ids_page"]["channel_ids"].as_array();
+                let page = &listed["channel_ids_page"];
+                let mut channels: Vec<String> = page["channel_ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect();
+                let mut cursor = page["next_cursor"]
+                    .as_str()
+                    .or_else(|| listed["response_metadata"]["next_cursor"].as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let sec_id = id_of(listed);
+                let mut extra_pages = 0usize;
+                while !cursor.is_empty() && !sec_id.is_empty() && extra_pages < 10 {
+                    extra_pages += 1;
+                    let Ok(more) = self.api(
+                        "users.channelSections.channels.list",
+                        &[("channel_section_id", sec_id.as_str()), ("cursor", cursor.as_str())],
+                    ) else {
+                        break;
+                    };
+                    for cid in more["channel_ids"]
+                        .as_array()
+                        .or_else(|| more["channel_ids_page"]["channel_ids"].as_array())
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                    {
+                        if !channels.iter().any(|existing| existing == cid) {
+                            channels.push(cid.to_owned());
+                        }
+                    }
+                    cursor = more["response_metadata"]["next_cursor"]
+                        .as_str()
+                        .or_else(|| more["channel_ids_page"]["next_cursor"].as_str())
+                        .or_else(|| more["next_cursor"].as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                }
+                let emoji_str = section_emoji(listed["emoji"].as_str());
+                let sort = listed["sort"]
+                    .as_str()
+                    .or_else(|| listed["channel_sort"].as_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
                 Section {
-                    id: id_of(listed),
+                    id: sec_id,
                     name: name.to_owned(),
                     kind: kind.to_owned(),
-                    channels: channels.into_iter().flatten().filter_map(Value::as_str).map(str::to_owned).collect(),
+                    emoji: emoji_str,
+                    sort,
+                    channels,
                 }
             })
             .collect();
+        let recent_apps: Vec<String> = sections
+            .iter()
+            .filter(|section| section.kind == "recent_apps")
+            .flat_map(|section| section.channels.iter().cloned())
+            .collect();
+        self.ctx.set_note("recent_apps", &recent_apps.join(","));
         sections.retain(|section| !matches!(section.kind.as_str(), "direct_messages" | "recent_apps"));
         // The built-in holds whatever no other section claims, so it must exist.
         if !sections.iter().any(|section| section.kind == "channels") {
@@ -544,6 +874,14 @@ impl Slack {
         // is what `client.counts` reports (unverified: taken from what the web client draws).
         let open: HashSet<&str> = listed("ims").chain(listed("mpims")).collect();
         let sections = self.sections();
+        let recent_app_channels: HashSet<String> = self
+            .ctx
+            .note("recent_apps")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .collect();
         // The mutes and the sidebar's "unreads only" are in the same prefs, read once here.
         let prefs = self.prefs()?;
         let unread_only = matches!(prefs["sidebar_behavior"].as_str(), Some("hide_read_channels" | "hide_read_channels_unless_starred"));
@@ -566,7 +904,11 @@ impl Slack {
             if let Some(Value::Array(found)) = page.get_mut("channels").map(Value::take) {
                 let direct = |channel: &Value| channel["is_im"] == true || channel["is_mpim"] == true;
                 let shown = |channel: &Value| {
-                    !direct(channel) || open.is_empty() || channel["id"].as_str().is_some_and(|id| open.contains(id))
+                    !direct(channel)
+                        || open.is_empty()
+                        || channel["id"]
+                            .as_str()
+                            .is_some_and(|id| open.contains(id) || recent_app_channels.contains(id))
                 };
                 channels.extend(found.into_iter().filter(shown));
             }
@@ -579,18 +921,33 @@ impl Slack {
         // Before any row: this registers each partner's picture and records them as people.
         self.users(&partners);
 
-        let mut rows: Vec<(usize, ConversationRow)> = Vec::with_capacity(channels.len());
+        let mut rows: Vec<(usize, i64, ConversationRow)> = Vec::with_capacity(channels.len());
         let mut direct = HashMap::new();
         for channel in &channels {
             let Some(mut row) = self.row(channel) else {
                 continue;
             };
+            // `updated` lives on Slack's channel, not on the stored row.
+            let updated = match channel["updated"].as_str() {
+                Some(ts) => seconds(ts),
+                None => channel["updated"].as_i64().unwrap_or(0),
+            };
             if let Some(person) = partner(channel) {
                 direct.insert(person, row.id.clone());
             }
             if row.kind.is_direct() {
-                // After every section.
-                rows.push((sections.len(), row));
+                // Keep a DM or app inside a custom (`standard`) section when the user filed it there;
+                // otherwise place it under the workspace's Direct messages group.
+                if let Some(at) = sections
+                    .iter()
+                    .position(|section| section.kind == "standard" && section.channels.contains(&row.id))
+                {
+                    row.group = Some(sections[at].id.clone());
+                    rows.push((at, updated, row));
+                } else {
+                    // After every section.
+                    rows.push((sections.len(), updated, row));
+                }
                 continue;
             }
             // A section the user filed it under wins over the built-in for its kind.
@@ -598,16 +955,24 @@ impl Slack {
             let at = filed.or_else(|| sections.iter().position(|section| Some(&section.id) == row.group.as_ref()));
             let at = at.unwrap_or(0);
             row.group = Some(sections[at].id.clone());
-            rows.push((at, row));
+            rows.push((at, updated, row));
         }
         drop(channels);
-        // Slack sorts a section by name unless told otherwise; the position runs through the
-        // whole Space, sections included.
-        rows.sort_by_cached_key(|(at, row)| (*at, row.title.to_lowercase()));
+        // Honour per-section sort ("recent" puts newest first; default is alphabetical).
+        rows.sort_by(|(at_a, updated_a, row_a), (at_b, updated_b, row_b)| {
+            at_a.cmp(at_b).then_with(|| {
+                let recent = sections.get(*at_a).is_some_and(|s| s.sort == "recent");
+                if recent {
+                    updated_b.cmp(updated_a).then_with(|| row_a.title.to_lowercase().cmp(&row_b.title.to_lowercase()))
+                } else {
+                    row_a.title.to_lowercase().cmp(&row_b.title.to_lowercase())
+                }
+            })
+        });
         let rows: Vec<ConversationRow> = rows
             .into_iter()
             .enumerate()
-            .map(|(position, (_, row))| ConversationRow {
+            .map(|(position, (_, _, row))| ConversationRow {
                 position: position as i32,
                 ..row
             })
@@ -619,6 +984,8 @@ impl Slack {
             .filter(|(_, section)| used(&section.id))
             .map(|(position, section)| Group {
                 unread_only,
+                emoji: section.emoji.clone(),
+                sort: section.sort.clone(),
                 ..Group::new(&section.id, &section.name, position as i32)
             })
             .collect();
@@ -1002,7 +1369,7 @@ pub(super) fn parse_notification_prefs(value: &Value) -> Option<NotificationPref
     Some(out)
 }
 
-/// Splits Slack's comma-separated `highlight_words` pref into trimmed, lowercased keywords.
+    /// Splits Slack's comma-separated `highlight_words` pref into trimmed, lowercased keywords.
 pub(super) fn parse_highlight_words(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(|w| w.trim().to_lowercase())

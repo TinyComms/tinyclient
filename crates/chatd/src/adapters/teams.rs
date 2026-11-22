@@ -1222,7 +1222,8 @@ impl Teams {
                 let _ = reply.send(self.activity_mark_read(item_id.as_deref()).map_err(refuse));
             }
             Command::Search { query, scope, filters, cursor, at, reply } => {
-                let _ = reply.send(self.search_messages(&query, &scope, &filters, cursor.as_deref(), at).map_err(refuse));
+                let found = self.search_messages(&query, &scope, &filters, cursor.as_deref(), at);
+                let _ = reply.send(found.map(|hits| super::SearchPage { hits, cursor: None }).map_err(refuse));
             }
             Command::Relate { person_id, action, reply } => {
                 let _ = reply.send(self.relate(&person_id, action).map_err(refuse));

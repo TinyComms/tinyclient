@@ -2678,11 +2678,11 @@ fn search(
     saved: &Saved,
     query: &str,
     scope: crate::adapters::SearchScope,
-    reply: crate::adapters::Reply<Vec<protocol::MessageHit>>,
+    reply: crate::adapters::Reply<crate::adapters::SearchPage>,
 ) {
     let trimmed = query.trim();
     if trimmed.len() < 2 {
-        let _ = reply.send(Ok(Vec::new()));
+        let _ = reply.send(Ok(crate::adapters::SearchPage::default()));
         return;
     }
     let mut path = format!("/v1/search?q={}&limit=25", percent_encode(trimmed));
@@ -2701,7 +2701,7 @@ fn search(
                     .store()
                     .search_messages(Some(&key), None, None, trimmed, 25)
                     .unwrap_or_default();
-                let _ = reply.send(Ok(hits));
+                let _ = reply.send(Ok(crate::adapters::SearchPage { hits, cursor: None }));
                 return;
             }
             path.push_str("&conversation_id=");
@@ -2770,7 +2770,7 @@ fn search(
                     hits.sort_by(|a, b| b.sent.cmp(&a.sent));
                 }
             }
-            let _ = reply.send(Ok(hits));
+            let _ = reply.send(Ok(crate::adapters::SearchPage { hits, cursor: None }));
         }
         Ok((404, _)) => {
             let _ = reply.send(Err(Refusal::Unsupported));

@@ -1214,6 +1214,8 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
                     notify: Notify::Mentions,
                     tags: Vec::new(),
                     link: String::new(),
+                    domain: String::new(),
+                    url: String::new(),
                 }),
             },
             None => Response::Error { code: protocol::ErrorCode::NotFound, detail: "Not in the demo.".into() },

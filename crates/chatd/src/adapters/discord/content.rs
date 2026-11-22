@@ -967,6 +967,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         sent_via: None,
         permalink: String::new(),
         controls: Vec::new(),
+        ephemeral: false,
         buttons: Vec::new(),
     };
     (message, rich.files)

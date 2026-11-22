@@ -1350,6 +1350,45 @@ impl Shell {
                 );
             }
         }
+        if network == Network::Slack && can.sidebar_sections {
+            if let Some(space_id) = row.space.as_ref() {
+                let space_key = Key {
+                    network,
+                    account: key.account.clone(),
+                    id: space_id.clone(),
+                };
+                if let Some(tree) = self.trees.get(&space_key) {
+                    let targets: Vec<(String, String)> = tree
+                        .groups
+                        .iter()
+                        .filter(|g| g.kind == protocol::GroupKind::Section && row.group.as_deref() != Some(g.id.as_str()))
+                        .map(|g| (g.id.clone(), g.name.clone()))
+                        .collect();
+                    if !targets.is_empty() {
+                        items.push(menu_separator().into_any_element());
+                        items.push(menu_label("Move to section").into_any_element());
+                        for (ix, (to_id, to_name)) in targets.into_iter().enumerate() {
+                            let sp = space_key.clone();
+                            let conv = key.clone();
+                            let from = row.group.clone();
+                            items.push(
+                                menu_item(
+                                    SharedString::from(format!("row-move-section-{ix}")),
+                                    Some("icons/folder.svg"),
+                                    to_name,
+                                    None,
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.move_to_section(sp.clone(), conv.clone(), from.clone(), to_id.clone(), cx);
+                                }))
+                                .into_any_element(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let close = super::people::can_close_direct(&row, &can);
         let clear = super::people::can_clear_history(&row, &can);
         if close || clear || leave {

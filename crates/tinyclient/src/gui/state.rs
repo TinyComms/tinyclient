@@ -174,6 +174,7 @@ impl Dirty {
             | Change::People { .. }
             | Change::Media { .. }
             | Change::Typing { .. }
+            | Change::Ephemeral { .. }
             | Change::Presence { .. }
             | Change::Members { .. }
             | Change::Occupants { .. }

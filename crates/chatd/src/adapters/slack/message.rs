@@ -1814,13 +1814,32 @@ impl Slack {
         }
     }
 
+    /// Parses a Slack App Home tab's Block Kit `blocks` array into rich text, spans, and
+    /// interactive controls, reusing the same Block Kit parser as messages.
+    pub(super) fn parse_app_home_blocks(
+        &self,
+        blocks: &[Value],
+    ) -> (String, Vec<Span>, Vec<Card>, Vec<MessageControl>) {
+        let mut rich = Rich::new(self);
+        rich.blocks(blocks);
+        rich.finish();
+        let mut controls = Vec::new();
+        collect_block_controls(blocks, &mut controls);
+        controls.truncate(MESSAGE_CONTROLS_LIMIT);
+        (rich.text, rich.spans, Vec::new(), controls)
+    }
+
     /// A message event, or one entry of a page of history. `None` only for what Slack itself
     /// hides. Registers every file the message refers to.
     pub(super) fn message(&self, channel: &str, event: &Value) -> Option<Message> {
         let ts = event["ts"].as_str()?;
         let subtype = event["subtype"].as_str();
+        let ephemeral = event["is_ephemeral"] == true
+            || subtype == Some("ephemeral")
+            || event["message_type"].as_str() == Some("ephemeral")
+            || event["ephemeral_type"].is_string();
         let handled_apart = matches!(subtype, Some("message_changed" | "message_deleted" | "message_replied"));
-        if handled_apart || event["hidden"] == true {
+        if handled_apart || (event["hidden"] == true && !ephemeral) {
             return None;
         }
         let thread = event["thread_ts"].as_str();
@@ -2016,6 +2035,7 @@ impl Slack {
         message.card = framed;
         message.cards = extra_cards;
         message.controls = controls;
+        message.ephemeral = ephemeral;
         message.forwarded = forwarded;
         message.edited = event["edited"].is_object();
         message.edited_at = event["edited"]["ts"].as_str().map(seconds).filter(|at| *at > 0);

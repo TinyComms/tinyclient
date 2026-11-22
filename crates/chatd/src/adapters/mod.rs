@@ -223,6 +223,8 @@ pub struct SpaceAbout {
     pub notify: Notify,
     pub tags: Vec<protocol::TeamTag>,
     pub link: String,
+    pub domain: String,
+    pub url: String,
 }
 
 /// A page of what was shared, from the network's own search.
@@ -241,6 +243,13 @@ pub struct AccountFilesPage {
     pub items: Vec<SharedItem>,
     pub cursor: Option<String>,
     pub more: bool,
+}
+
+/// One page of network message search hits (`Command::Search`).
+#[derive(Debug, Clone, Default)]
+pub struct SearchPage {
+    pub hits: Vec<MessageHit>,
+    pub cursor: Option<String>,
 }
 
 /// A page of a picker's catalog, and where the next one starts.
@@ -932,7 +941,15 @@ pub enum Command {
         filters: protocol::SearchFilters,
         cursor: Option<String>,
         at: Instant,
-        reply: Reply<Vec<MessageHit>>,
+        reply: Reply<SearchPage>,
+    },
+    /// Search files on the network (e.g. Slack `search.files`).
+    SearchFiles {
+        query: String,
+        scope: SearchScope,
+        sort: protocol::SearchSort,
+        cursor: Option<String>,
+        reply: Reply<AccountFilesPage>,
     },
     /// The shell asked for these files and the media cache knows none of them, or knows them
     /// only by Telegram's name for a file it kept, since gone from disk. An adapter that fetches
@@ -983,6 +1000,94 @@ pub enum Command {
     /// The user signed out: end the session on the network, best effort, then answer. chatd
     /// waits five seconds for the answer and forgets the account either way.
     SignOut(Reply<()>),
+    /// Invite a member by email to a workspace (`users.admin.invite`).
+    InviteMember {
+        email: String,
+        channels: Vec<String>,
+        real_name: String,
+        reply: Reply<()>,
+    },
+    /// Upload a custom emoji (`emoji.add`).
+    AddCustomEmoji {
+        name: String,
+        path: String,
+        reply: Reply<()>,
+    },
+    /// List active workspace user groups (`usergroups.list`).
+    UserGroups {
+        reply: Reply<Vec<protocol::UserGroup>>,
+    },
+    /// Create a workspace user group (`usergroups.create`).
+    UserGroupCreate {
+        name: String,
+        handle: String,
+        description: String,
+        reply: Reply<protocol::UserGroup>,
+    },
+    /// Update a workspace user group (`usergroups.update`).
+    UserGroupUpdate {
+        group_id: String,
+        name: Option<String>,
+        handle: Option<String>,
+        description: Option<String>,
+        reply: Reply<protocol::UserGroup>,
+    },
+    /// Update members of a workspace user group (`usergroups.users.update`).
+    UserGroupMembers {
+        group_id: String,
+        users: Vec<String>,
+        reply: Reply<protocol::UserGroup>,
+    },
+    /// Fetch a Slack app's About profile and optional published Home tab on open.
+    AppView {
+        conversation_id: String,
+        include_home: bool,
+        reply: Reply<protocol::AppView>,
+    },
+    /// Create a custom sidebar section (`users.channelSections.create`).
+    SectionCreate {
+        space_id: String,
+        name: String,
+        emoji: String,
+        reply: Reply<Group>,
+    },
+    /// Rename or update a custom sidebar section (`users.channelSections.update`).
+    SectionRename {
+        space_id: String,
+        section_id: String,
+        name: String,
+        emoji: Option<String>,
+        reply: Reply<()>,
+    },
+    /// Delete a custom sidebar section (`users.channelSections.delete`).
+    SectionDelete {
+        space_id: String,
+        section_id: String,
+        reply: Reply<()>,
+    },
+    /// Reorder sidebar sections (`users.channelSections.order`).
+    SectionReorder {
+        space_id: String,
+        section_ids: Vec<String>,
+        reply: Reply<()>,
+    },
+    /// Move a conversation between sidebar sections (`users.channelSections.channels.bulkUpdate`).
+    SectionMoveChannel {
+        space_id: String,
+        conversation_id: String,
+        from_section: Option<String>,
+        to_section: String,
+        reply: Reply<()>,
+    },
+    /// List available slash commands for the account (`commands.list` + built-ins).
+    SlashCommands {
+        reply: Reply<Vec<protocol::SlashCommand>>,
+    },
+    /// Fetch unread messages across unread conversations for the All Unreads view (#606).
+    AllUnreads {
+        limit: u32,
+        reply: Reply<Vec<protocol::UnreadGroup>>,
+    },
     /// The adapter is being dropped. `serve_commands` returns on it; an adapter never sees it.
     Stop,
 }
@@ -1100,8 +1205,23 @@ impl Command {
             Command::MeetingRsvp { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             // Nothing to end on the network: the session is simply forgotten.
             Command::SignOut(reply) => drop(reply.send(Ok(()))),
+            Command::InviteMember { reply, .. }
+            | Command::AddCustomEmoji { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::UserGroups { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::UserGroupCreate { reply, .. }
+            | Command::UserGroupUpdate { reply, .. }
+            | Command::UserGroupMembers { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AppView { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SectionCreate { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SectionRename { reply, .. }
+            | Command::SectionDelete { reply, .. }
+            | Command::SectionReorder { reply, .. }
+            | Command::SectionMoveChannel { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SlashCommands { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::AllUnreads { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Download { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Search { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SearchFiles { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Send { conversation_id, client_id, .. } => {
                 ctx.sent(&conversation_id, &client_id, Err("Sending is not built for this network.".to_owned()));
             }
@@ -1274,6 +1394,25 @@ impl Context {
         if self.hub.store().remove_group(&space, group_id)? {
             self.hub.changed(Change::Tree { space });
         }
+        Ok(())
+    }
+
+    /// Moves a conversation into `group_id` within `space_id` and announces the tree change.
+    pub fn move_conversation_group(&self, space_id: &str, conversation_id: &str, group_id: &str) -> Stores {
+        let key = self.key(conversation_id);
+        let space = self.key(space_id);
+        if self.hub.store().set_conversation_group(&key, group_id)? {
+            self.hub.changed(Change::Tree { space });
+            self.hub.changed(Change::Conversation { conversation: key });
+        }
+        Ok(())
+    }
+
+    /// Updates section ordering within `space_id` and announces the tree change.
+    pub fn reorder_groups(&self, space_id: &str, section_ids: &[String]) -> Stores {
+        let space = self.key(space_id);
+        self.hub.store().reorder_groups(&space, section_ids)?;
+        self.hub.changed(Change::Tree { space });
         Ok(())
     }
 
@@ -1737,6 +1876,32 @@ impl Context {
             self.hub.changed(Change::Status);
         }
         Ok(())
+    }
+
+    /// Unread conversations on this account for the All Unreads view (#606).
+    pub fn unread_conversations(&self, limit: u32) -> rusqlite::Result<Vec<protocol::Conversation>> {
+        self.hub.store().unread_conversations(None, None, Some(&self.account), limit)
+    }
+
+    /// Delivers an ephemeral message (only visible to this user) without ever writing it to SQLite.
+    pub fn ephemeral(&self, conversation_id: &str, mut message: Message) {
+        message.ephemeral = true;
+        message.bound();
+        self.hub.changed(Change::Ephemeral {
+            conversation: self.key(conversation_id),
+            message: Box::new(message),
+        });
+    }
+
+    /// Completes a local slash command that produced no persistent channel message: removes the
+    /// temporary pending send row from SQLite and optionally emits an ephemeral notice.
+    pub fn command_done(&self, conversation_id: &str, client_id: &str, notice: Option<Message>) {
+        let conversation = self.key(conversation_id);
+        let _ = self.hub.store().delete_message(&conversation, client_id);
+        self.hub.changed(Change::Messages { conversation });
+        if let Some(msg) = notice {
+            self.ephemeral(conversation_id, msg);
+        }
     }
 
     /// Drops the cached messages and hides a direct or group conversation. The network is not

@@ -563,6 +563,7 @@ mod tests {
             before: Some(1_760_000_500),
             after: Some(1_760_000_100),
             mentions_me: true,
+            ..SearchFilters::default()
         };
         let q = build_query_string("deploy plan", Some("ana@contoso.com"), &filters);
         assert!(q.contains("deploy plan"), "{q}");
