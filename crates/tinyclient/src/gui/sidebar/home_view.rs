@@ -124,7 +124,23 @@ impl Shell {
                     }
                 }
                 Some((_, Some(space), _, false)) => read.drilled = conversations(&Request::Threads { space, offset: 0, limit: PAGE_LIMIT })?.0,
-                Some((_, _, Some(forum), false)) => read.drilled = conversations(&Request::Topics { forum, offset: 0, limit: PAGE_LIMIT, landing: false })?.0,
+                Some((_, _, Some(forum), false)) => {
+                    // A Discord forum's posts are the board's page, fetched on open and when
+                    // that page moves. Topics here would search again, without the board's
+                    // sort, tag, or offset, and again on every later home refresh.
+                    if forum.network != Network::Discord {
+                        read.drilled = conversations(&Request::Topics {
+                            forum,
+                            offset: 0,
+                            limit: PAGE_LIMIT,
+                            landing: false,
+                            sort: protocol::TopicSort::Activity,
+                            tag: None,
+                            query: None,
+                        })?
+                        .0
+                    }
+                }
                 Some((shelf, None, None, false)) => read.drilled = whole(network, None, shelf)?.0,
                 None => {}
             }
@@ -858,6 +874,9 @@ impl Shell {
             (_, Some(Drill::Archive)) => ("icons/inbox.svg", "Nothing archived".into(), "Chats you archive in Telegram show up here.".into()),
             (_, Some(Drill::Calls)) => ("icons/phone.svg", "No recent calls".into(), "Your Telegram calls show up here.".into()),
             (_, Some(Drill::Requests)) => ("icons/mail.svg", "No message requests".into(), "Messages from people you don't know wait here.".into()),
+            (_, Some(Drill::Topics(forum))) if forum.key.network == Network::Discord => {
+                ("icons/messages-square.svg", "Posts".into(), "This forum's posts are listed in the main pane.".into())
+            }
             (_, Some(Drill::Topics(_))) => ("icons/messages-square.svg", "No topics yet".into(), "Topics of this group show up here.".into()),
             (Some(Network::Discord), None) if state.home_unread => ("icons/check.svg", "Nothing unread".into(), String::new()),
             (Some(Network::Discord), None) => ("icons/hash.svg", "No servers yet".into(), "Servers you join in Discord show up here.".into()),

@@ -517,7 +517,15 @@ fn a_forum_opens_on_the_newest_unread_topic_else_general() {
     world.connected();
     // Opening the forum reads its topics and lands on the newest unread: Jigs here, active
     // after the unread Tools, General read all along (polish/03 §2, story T8).
-    let landing = || Request::Topics { forum: key("c9002"), offset: 0, limit: 1, landing: true };
+    let landing = || Request::Topics {
+        forum: key("c9002"),
+        offset: 0,
+        limit: 1,
+        landing: true,
+        sort: protocol::TopicSort::Activity,
+        tag: None,
+        query: None,
+    };
     let Response::Conversations { conversations, .. } = world.ask(landing()) else {
         panic!("no landing");
     };
@@ -525,7 +533,15 @@ fn a_forum_opens_on_the_newest_unread_topic_else_general() {
     assert_eq!((conversations[0].key.id.as_str(), conversations[0].title.as_str(), conversations[0].parent.as_deref()), ("c9002_55", "Jigs", Some("c9002")));
     // What the topics drill lists: the network's pins first (none is pinned), then the
     // activity, a count on every row.
-    let drill = Request::Topics { forum: key("c9002"), offset: 0, limit: 10, landing: false };
+    let drill = Request::Topics {
+        forum: key("c9002"),
+        offset: 0,
+        limit: 10,
+        landing: false,
+        sort: protocol::TopicSort::Activity,
+        tag: None,
+        query: None,
+    };
     let Response::Conversations { conversations: topics, total, .. } = world.ask(drill) else {
         panic!("no topics");
     };

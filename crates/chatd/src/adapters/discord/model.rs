@@ -37,6 +37,10 @@ pub const FORUM: u8 = 15;
 pub const MEDIA_FORUM: u8 = 16;
 
 pub const CREATE_INSTANT_INVITE: u64 = 1 << 0;
+/// Channel flags: bit 1 = pinned thread in a forum, bit 4 = tag required to post in a forum.
+pub const THREAD_PINNED: u32 = 1 << 1;
+pub const REQUIRE_TAG: u32 = 1 << 4;
+
 pub const KICK_MEMBERS: u64 = 1 << 1;
 pub const BAN_MEMBERS: u64 = 1 << 2;
 pub const ADMINISTRATOR: u64 = 1 << 3;
@@ -101,6 +105,17 @@ pub fn user_link(id: &str) -> String {
 pub fn seconds(id: &str) -> i64 {
     let id: u64 = id.parse().unwrap_or(0);
     (((id >> 22) + 1_420_070_400_000) / 1000) as i64
+}
+
+/// Lowest Discord snowflake for a Unix timestamp in seconds, clamped to Discord's 2015 epoch.
+pub fn snowflake_from_unix(unix_secs: i64) -> u64 {
+    const DISCORD_EPOCH_MS: i64 = 1_420_070_400_000;
+    let ms = unix_secs.saturating_mul(1000).saturating_sub(DISCORD_EPOCH_MS);
+    if ms <= 0 {
+        0
+    } else {
+        (ms as u64) << 22
+    }
 }
 
 pub fn number(id: &str) -> u64 {
@@ -567,6 +582,19 @@ pub struct ThreadMetadata {
     pub archive_timestamp: Option<String>,
 }
 
+#[derive(Deserialize, Serialize, Clone, Debug, Default)]
+pub struct ForumTag {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub moderated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emoji_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emoji_name: Option<String>,
+}
+
 #[derive(Deserialize, Clone, Debug, Default)]
 pub struct Channel {
     pub id: String,
@@ -595,7 +623,7 @@ pub struct Channel {
     pub recipients: Vec<User>,
     #[serde(default)]
     pub recipient_ids: Vec<String>,
-    /// Who owns a group DM.
+    /// Who owns a group DM or forum post thread.
     #[serde(default)]
     pub owner_id: Option<String>,
     #[serde(default)]
@@ -612,6 +640,20 @@ pub struct Channel {
     pub thread_metadata: Option<ThreadMetadata>,
     #[serde(default)]
     pub message_count: Option<u32>,
+    #[serde(default)]
+    pub total_message_sent: Option<u32>,
+    /// Channel flags (e.g. `THREAD_PINNED`, `REQUIRE_TAG`).
+    #[serde(default, deserialize_with = "nullable")]
+    pub flags: u32,
+    /// Tags defined on a forum or media channel.
+    #[serde(default, deserialize_with = "nullable")]
+    pub available_tags: Vec<ForumTag>,
+    /// Tag ids applied to a forum post thread.
+    #[serde(default, deserialize_with = "nullable")]
+    pub applied_tags: Vec<String>,
+    /// Default slowmode per newly created thread in a forum channel (seconds).
+    #[serde(default, deserialize_with = "nullable")]
+    pub default_thread_rate_limit_per_user: u32,
     /// Our own membership of a thread, present when we are in it.
     #[serde(default)]
     pub member: Option<IgnoredAny>,
@@ -621,9 +663,6 @@ pub struct Channel {
     pub is_message_request: bool,
     #[serde(default, deserialize_with = "nullable")]
     pub is_spam: bool,
-    /// Default slowmode interval for newly created threads under this channel.
-    #[serde(default, deserialize_with = "nullable")]
-    pub default_thread_rate_limit_per_user: u32,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -660,6 +699,12 @@ pub struct Kept {
     pub slowmode: u32,
     #[serde(rename = "x", default, skip_serializing_if = "is_false")]
     pub nsfw: bool,
+    #[serde(rename = "f", default, skip_serializing_if = "no_limit")]
+    pub flags: u32,
+    #[serde(rename = "g", default, skip_serializing_if = "Vec::is_empty")]
+    pub available_tags: Vec<ForumTag>,
+    #[serde(rename = "r", default, skip_serializing_if = "no_limit")]
+    pub default_thread_rate_limit_per_user: u32,
 }
 
 /// A count that means "none" stays off a note.
@@ -682,6 +727,9 @@ impl Kept {
             overwrites: overwrites.map(|over| (over.id.clone(), over.member, over.allow, over.deny)).collect(),
             slowmode: channel.rate_limit_per_user,
             nsfw: channel.nsfw,
+            flags: channel.flags,
+            available_tags: channel.available_tags.clone(),
+            default_thread_rate_limit_per_user: channel.default_thread_rate_limit_per_user,
         }
     }
 
@@ -699,6 +747,9 @@ impl Kept {
             permission_overwrites: overwrites.collect(),
             rate_limit_per_user: self.slowmode,
             nsfw: self.nsfw,
+            flags: self.flags,
+            available_tags: self.available_tags,
+            default_thread_rate_limit_per_user: self.default_thread_rate_limit_per_user,
             ..Channel::default()
         }
     }
@@ -1562,12 +1613,26 @@ impl Embed {
     }
 }
 
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct CountDetails {
+    #[serde(default)]
+    pub burst: u32,
+    #[serde(default)]
+    pub normal: u32,
+}
+
 #[derive(Deserialize, Clone, Debug)]
 pub struct Reacted {
     #[serde(default)]
     pub count: u32,
     #[serde(default)]
+    pub count_details: Option<CountDetails>,
+    #[serde(default)]
     pub me: bool,
+    #[serde(default)]
+    pub me_burst: bool,
+    #[serde(default, deserialize_with = "nullable")]
+    pub burst_colors: Vec<String>,
     pub emoji: Emoji,
 }
 

@@ -1517,6 +1517,7 @@ fn message(account: &Account, note: &bugle::Note, page: &[bugle::Note]) -> Messa
                 mine: mark.who.iter().any(|who| who == &account.me),
                 // The phone names the participants who reacted, as the sender ids do.
                 who: mark.who.iter().take(protocol::REACTION_REACTORS).cloned().collect(),
+                ..Reaction::default()
             }
         })
         .collect();

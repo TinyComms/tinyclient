@@ -187,6 +187,14 @@ const TABLES: &str = "
         can_pin INTEGER NOT NULL DEFAULT 0,
         joined INTEGER NOT NULL DEFAULT 1,
         call_video INTEGER NOT NULL DEFAULT 0,
+        -- A forum post's card: tag ids as ',a,b,', counts, the first message's picture, its
+        -- strongest reaction, and who started it. Written by the post list, not by a thread row.
+        tags TEXT NOT NULL DEFAULT '',
+        message_count INTEGER NOT NULL DEFAULT 0,
+        total_message_sent INTEGER NOT NULL DEFAULT 0,
+        thumbnail TEXT NOT NULL DEFAULT '',
+        reaction TEXT NOT NULL DEFAULT '',
+        owner TEXT NOT NULL DEFAULT '',
         shared INTEGER NOT NULL DEFAULT 0,
         unread_reactions INTEGER NOT NULL DEFAULT 0,
         slowmode_seconds INTEGER NOT NULL DEFAULT 0,
@@ -311,9 +319,12 @@ const CONVERSATION: &str = "
            (c.preview_mine AND c.delivered_to != '' AND (length(c.delivered_to), c.delivered_to) >= (length(c.preview_id), c.preview_id)),
            (c.preview_mine AND EXISTS (SELECT 1 FROM message f WHERE f.network = c.network AND f.account = c.account
                                          AND f.conversation = c.id AND f.id = c.preview_id AND f.pending = 1)),
-           c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason, c.spam, c.rights, c.disappearing, c.moderate, c.can_pin, c.joined, c.call_video, c.shared, c.unread_reactions, c.slowmode_seconds, c.locked, c.age_restricted
+           c.voice_limit, c.encryption, c.icon, c.max_file_bytes, c.read_only_reason, c.spam, c.rights, c.disappearing, c.moderate, c.can_pin, c.joined, c.call_video,
+           c.tags, c.message_count, c.total_message_sent, c.reaction, c.owner, c.shared, c.unread_reactions,
+           th.id, th.kind, th.width, th.height, th.bytes, th.path, th.failed, c.slowmode_seconds, c.locked, c.age_restricted
     FROM conversation c
     LEFT JOIN media m ON m.network = c.network AND m.account = c.account AND m.id = c.avatar
+    LEFT JOIN media th ON th.network = c.network AND th.account = c.account AND th.id = c.thumbnail AND c.thumbnail != ''
     LEFT JOIN space s ON s.network = c.network AND s.account = c.account AND s.id = c.space
     LEFT JOIN section g ON g.network = c.network AND g.account = c.account AND g.space = c.space
                        AND g.id = c.section";
@@ -442,6 +453,19 @@ pub struct Filing {
     pub pin: Option<i32>,
     pub hidden: bool,
     pub followed: bool,
+}
+
+/// What a forum post's card shows beyond the conversation row. The post list writes it. A thread
+/// update that does not know these leaves them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PostCard {
+    pub tags: Vec<String>,
+    pub message_count: u32,
+    pub total_message_sent: u32,
+    /// A media id already registered, or empty.
+    pub thumbnail: String,
+    pub reaction: String,
+    pub owner: String,
 }
 
 /// One folder as an adapter reports it. chatd counts what is in it.
@@ -774,12 +798,18 @@ fn conversation_from(row: &Row) -> rusqlite::Result<Conversation> {
         can_pin: row.get(57)?,
         joined: row.get(58)?,
         call_video: row.get(59)?,
-        shared: row.get(60)?,
-        unread_reactions: row.get(61)?,
-        slowmode_seconds: row.get(62)?,
+        tags: from_id_list(&row.get::<_, String>(60)?),
+        message_count: row.get(61)?,
+        total_message_sent: row.get(62)?,
+        reaction: row.get(63)?,
+        owner: row.get(64)?,
+        shared: row.get(65)?,
+        unread_reactions: row.get(66)?,
+        thumbnail: file_at(row, 67)?,
+        slowmode_seconds: row.get(74)?,
         slowmode_until: None,
-        locked: row.get(63)?,
-        age_restricted: row.get(64)?,
+        locked: row.get(75)?,
+        age_restricted: row.get(76)?,
     })
 }
 
@@ -1112,6 +1142,7 @@ fn keep_added_columns(db: &Connection, version: i32) -> rusqlite::Result<bool> {
     if !column(db, "conversation", "call_video")? {
         db.execute_batch("ALTER TABLE conversation ADD COLUMN call_video INTEGER NOT NULL DEFAULT 0")?;
     }
+    ensure_post_columns(db)?;
     if !column(db, "conversation", "shared")? {
         db.execute_batch("ALTER TABLE conversation ADD COLUMN shared INTEGER NOT NULL DEFAULT 0")?;
     }
@@ -1128,6 +1159,30 @@ fn keep_added_columns(db: &Connection, version: i32) -> rusqlite::Result<bool> {
         db.execute_batch("ALTER TABLE conversation ADD COLUMN age_restricted INTEGER NOT NULL DEFAULT 0")?;
     }
     Ok(true)
+}
+
+/// Forum-post columns on a cache that is already at [`SCHEMA`]. Adding them does not bump the
+/// version: a bump would drop a schema-11 cache, and these have defaults.
+fn ensure_post_columns(db: &Connection) -> rusqlite::Result<()> {
+    if !column(db, "conversation", "tags")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN tags TEXT NOT NULL DEFAULT ''")?;
+    }
+    if !column(db, "conversation", "message_count")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0")?;
+    }
+    if !column(db, "conversation", "total_message_sent")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN total_message_sent INTEGER NOT NULL DEFAULT 0")?;
+    }
+    if !column(db, "conversation", "thumbnail")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN thumbnail TEXT NOT NULL DEFAULT ''")?;
+    }
+    if !column(db, "conversation", "reaction")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN reaction TEXT NOT NULL DEFAULT ''")?;
+    }
+    if !column(db, "conversation", "owner")? {
+        db.execute_batch("ALTER TABLE conversation ADD COLUMN owner TEXT NOT NULL DEFAULT ''")?;
+    }
+    Ok(())
 }
 
 fn column(db: &Connection, table: &str, name: &str) -> rusqlite::Result<bool> {
@@ -1201,6 +1256,7 @@ impl Store {
         if !column(&store.db, "conversation", "call_video")? {
             store.db.execute_batch("ALTER TABLE conversation ADD COLUMN call_video INTEGER NOT NULL DEFAULT 0")?;
         }
+        ensure_post_columns(&store.db)?;
         if !column(&store.db, "conversation", "shared")? {
             store.db.execute_batch("ALTER TABLE conversation ADD COLUMN shared INTEGER NOT NULL DEFAULT 0")?;
         }
@@ -2224,6 +2280,35 @@ impl Store {
         Ok(changed == 1)
     }
 
+    /// A forum post's tags, counts, picture, reaction, and owner. True if a row changed.
+    pub fn set_post(&mut self, conversation: &Key, card: &PostCard) -> rusqlite::Result<bool> {
+        let tags = id_list(&card.tags, 20);
+        let mut reaction = card.reaction.clone();
+        clip(&mut reaction, 80);
+        let mut owner = card.owner.clone();
+        clip(&mut owner, 80);
+        let thumbnail = card.thumbnail.replace(',', "");
+        let changed = self.db.execute(
+            "UPDATE conversation SET tags = ?4, message_count = ?5, total_message_sent = ?6,
+                    thumbnail = ?7, reaction = ?8, owner = ?9
+              WHERE network = ?1 AND account = ?2 AND id = ?3
+                AND (tags != ?4 OR message_count != ?5 OR total_message_sent != ?6
+                     OR thumbnail != ?7 OR reaction != ?8 OR owner != ?9)",
+            params![
+                word(&conversation.network),
+                conversation.account,
+                conversation.id,
+                tags,
+                card.message_count,
+                card.total_message_sent,
+                thumbnail,
+                reaction,
+                owner,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// Per-conversation moderation and management rights. True if anything changed.
     pub fn set_rights(&mut self, conversation: &Key, rights: protocol::ConversationRights) -> rusqlite::Result<bool> {
         let bits = rights.to_bits();
@@ -2500,6 +2585,16 @@ impl Store {
             if filters.mentions_me && !msg.mentions_me {
                 continue;
             }
+            if let Some(in_ch) = &filters.in_channel {
+                if hit.conversation.id != in_ch.id {
+                    continue;
+                }
+            }
+            if let Some(pinned) = filters.pinned {
+                if msg.pinned != pinned {
+                    continue;
+                }
+            }
             if let Some(has) = filters.has {
                 let ok = match has {
                     protocol::SearchHas::Files => !msg.attachments.is_empty(),
@@ -2507,6 +2602,17 @@ impl Store {
                         .attachments
                         .iter()
                         .any(|a| matches!(a.file.kind, protocol::MediaKind::Image | protocol::MediaKind::Gif)),
+                    protocol::SearchHas::Videos => msg
+                        .attachments
+                        .iter()
+                        .any(|a| matches!(a.file.kind, protocol::MediaKind::Video)),
+                    protocol::SearchHas::Sounds => msg
+                        .attachments
+                        .iter()
+                        .any(|a| matches!(a.file.kind, protocol::MediaKind::Audio)),
+                    protocol::SearchHas::Stickers => msg.attachments.iter().any(|a| a.sticker),
+                    protocol::SearchHas::Embeds => !msg.previews.is_empty(),
+                    protocol::SearchHas::Polls => msg.poll.is_some(),
                     protocol::SearchHas::Links => {
                         !msg.previews.is_empty()
                             || msg.text.contains("http://")
@@ -3779,39 +3885,72 @@ impl Store {
             have.emoji == reaction.emoji || have.file.as_ref().is_some_and(|file| file.id == reaction.emoji)
         };
         let at = message.reactions.iter().position(same);
-        match (at, added) {
-            (Some(at), true) if reaction.mine && message.reactions[at].mine => return Ok(false),
-            (Some(at), false) if reaction.mine && !message.reactions[at].mine => return Ok(false),
-            (Some(at), true) => {
-                message.reactions[at].count += 1;
-                message.reactions[at].mine |= reaction.mine;
-                // Events arrive one person at a time; the list keeps who it was told of,
-                // newest last, and stays within the cap a payload is held to.
-                for id in &reaction.who {
-                    if !message.reactions[at].who.contains(id) {
-                        message.reactions[at].who.push(id.clone());
+        let is_burst = reaction.burst > 0 || reaction.mine_burst;
+        if is_burst {
+            match (at, added) {
+                (Some(at), true) if reaction.mine_burst && message.reactions[at].mine_burst => return Ok(false),
+                (Some(at), false) if reaction.mine_burst && !message.reactions[at].mine_burst => return Ok(false),
+                (Some(at), true) => {
+                    message.reactions[at].burst += 1;
+                    message.reactions[at].mine_burst |= reaction.mine_burst;
+                    if message.reactions[at].burst_colors.is_empty() && !reaction.burst_colors.is_empty() {
+                        message.reactions[at].burst_colors = reaction.burst_colors.clone();
                     }
                 }
-                message.reactions[at].who.truncate(protocol::REACTION_REACTORS);
-            }
-            (None, true) => message.reactions.push(Reaction {
-                count: 1,
-                ..reaction.clone()
-            }),
-            (Some(at), false) => {
-                let have = &mut message.reactions[at];
-                have.count = have.count.saturating_sub(1);
-                have.mine &= !reaction.mine;
-                // The one who took theirs back leaves the list; a removal that names nobody
-                // (ours, before the network's word) leaves it as it was.
-                if !reaction.who.is_empty() {
-                    have.who.retain(|id| !reaction.who.contains(id));
+                (None, true) => message.reactions.push(Reaction {
+                    count: 0,
+                    mine: false,
+                    burst: 1,
+                    mine_burst: reaction.mine_burst,
+                    ..reaction.clone()
+                }),
+                (Some(at), false) => {
+                    let have = &mut message.reactions[at];
+                    have.burst = have.burst.saturating_sub(1);
+                    have.mine_burst &= !reaction.mine_burst;
+                    if have.count == 0 && have.burst == 0 {
+                        message.reactions.remove(at);
+                    }
                 }
-                if have.count == 0 {
-                    message.reactions.remove(at);
-                }
+                (None, false) => return Ok(false),
             }
-            (None, false) => return Ok(false),
+        } else {
+            match (at, added) {
+                (Some(at), true) if reaction.mine && message.reactions[at].mine => return Ok(false),
+                (Some(at), false) if reaction.mine && !message.reactions[at].mine => return Ok(false),
+                (Some(at), true) => {
+                    message.reactions[at].count += 1;
+                    message.reactions[at].mine |= reaction.mine;
+                    // Events arrive one person at a time; the list keeps who it was told of,
+                    // newest last, and stays within the cap a payload is held to.
+                    for id in &reaction.who {
+                        if !message.reactions[at].who.contains(id) {
+                            message.reactions[at].who.push(id.clone());
+                        }
+                    }
+                    message.reactions[at].who.truncate(protocol::REACTION_REACTORS);
+                }
+                (None, true) => message.reactions.push(Reaction {
+                    count: 1,
+                    burst: 0,
+                    mine_burst: false,
+                    ..reaction.clone()
+                }),
+                (Some(at), false) => {
+                    let have = &mut message.reactions[at];
+                    have.count = have.count.saturating_sub(1);
+                    have.mine &= !reaction.mine;
+                    // The one who took theirs back leaves the list; a removal that names nobody
+                    // (ours, before the network's word) leaves it as it was.
+                    if !reaction.who.is_empty() {
+                        have.who.retain(|id| !reaction.who.contains(id));
+                    }
+                    if have.count == 0 && have.burst == 0 {
+                        message.reactions.remove(at);
+                    }
+                }
+                (None, false) => return Ok(false),
+            }
         }
         Ok(self.ingest(conversation, &message, false)? != Stored::Same)
     }
@@ -5840,7 +5979,7 @@ mod tests {
         store.register_media(&account, &[(thumb, "https://cdn.example/att-1".into())]).unwrap();
         store.ingest(&key, &message, false).unwrap();
 
-        let thumbs_up = |mine| Reaction { emoji: "👍".into(), file: None, count: 1, mine, who: Vec::new() };
+        let thumbs_up = |mine| Reaction { emoji: "👍".into(), file: None, count: 1, mine, who: Vec::new(), ..Reaction::default() };
         assert!(store.react(&key, "1", &thumbs_up(false), true).unwrap());
         assert!(store.react(&key, "1", &thumbs_up(true), true).unwrap());
         assert!(store.react(&key, "1", &thumbs_up(false), false).unwrap());
@@ -5866,7 +6005,7 @@ mod tests {
     fn a_reaction_keeps_who_the_network_named_and_lets_them_go() {
         let (mut store, key) = store();
         store.ingest(&key, &said("1", "look", 10), false).unwrap();
-        let by = |id: &str| Reaction { emoji: "👍".into(), file: None, count: 1, mine: false, who: vec![id.into()] };
+        let by = |id: &str| Reaction { emoji: "👍".into(), file: None, count: 1, mine: false, who: vec![id.into()], ..Reaction::default() };
         // One event at a time, as an event that names its one person arrives.
         assert!(store.react(&key, "1", &by("u-ana"), true).unwrap());
         assert!(store.react(&key, "1", &by("u-bea"), true).unwrap());
@@ -5882,7 +6021,7 @@ mod tests {
         let shown = store.message(&key, "1").unwrap().unwrap();
         assert_eq!((shown.reactions[0].count, shown.reactions[0].who.as_slice()), (2u32, &["u-bea".to_owned(), "u-cy".to_owned()][..]));
         // Ours goes before the network says who: the count moves, the list stands.
-        let ours = |on| Reaction { emoji: "👍".into(), file: None, count: 1, mine: true, who: Vec::new() };
+        let ours = |on| Reaction { emoji: "👍".into(), file: None, count: 1, mine: true, who: Vec::new(), ..Reaction::default() };
         assert!(store.react(&key, "1", &ours(true), true).unwrap());
         assert!(store.react(&key, "1", &ours(false), false).unwrap());
         let shown = store.message(&key, "1").unwrap().unwrap();

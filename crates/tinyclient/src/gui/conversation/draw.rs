@@ -27,7 +27,7 @@ use gpui::{
 };
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use protocol::{Attachment, Card, Forwarded, Key, MediaFile, MentionKind, Message, MessageKind, Network, Preview, Receipt, Request, Response, SendState};
+use protocol::{Attachment, Card, Forwarded, InviteState, Key, MediaFile, MentionKind, Message, MessageInvite, MessageKind, Network, Preview, Receipt, Request, Response, ScheduledEvent, SendState};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -1094,6 +1094,7 @@ impl Pane {
                 .children(message.all_cards().enumerate().map(|(ix, card)| self.app_card(message, ix, card, cx)))
                 .children(message.poll.as_deref().map(|poll| self.poll_card(message, poll, cx)))
                 .children(message.contacts.iter().enumerate().map(|(idx, contact)| self.contact_card(message, contact, idx, cx)))
+                .children(message.invites.iter().enumerate().map(|(ix, invite)| self.invite_card(message, ix, invite, window, cx)))
                 .children(self.message_controls(message, cx))
                 .children(self.message_buttons(message, cx))
                 .children(self.cards(message, window, cx));
@@ -1445,6 +1446,13 @@ impl Pane {
                 // block its layout belongs to the line box, and `Rich` reads its own layout.
                 Block::Text(inline) => {
                     let marked = inline.runs.iter().any(|run| run.mark);
+                    let hovered_time = self
+                        .hovered
+                        .as_ref()
+                        .filter(|(id, at, _)| *id == message.id && *at == ix)
+                        .and_then(|(_, _, run)| inline.runs.get(*run))
+                        .and_then(|run| run.time)
+                        .map(|(unix, _)| time::tooltip(unix));
                     let block = div()
                         .max_w(px(MEASURE))
                         .flex()
@@ -1452,7 +1460,9 @@ impl Pane {
                         .type_body()
                         .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
                         .child(self.rich(message, ix, inline, theme::text().into_color(), window, cx));
-                    if marked {
+                    if let Some(words) = hovered_time {
+                        block.id(name_id(&format!("time-{ix}"), &message.id)).tooltip(tip(words, None)).into_any_element()
+                    } else if marked {
                         block.id(name_id("edited", &message.id)).tooltip(tip(edited_tip(message.edited_at), None)).into_any_element()
                     } else {
                         block.into_any_element()
@@ -1490,33 +1500,57 @@ impl Pane {
                     .text_color(theme::text_faint())
                     .child(self.rich(message, ix, inline, theme::text_faint().into_color(), window, cx))
                     .into_any_element(),
-                Block::Quote(inline) => div()
-                    .max_w(px(MEASURE))
-                    .mt(px(3.))
-                    .flex()
-                    .child(div().w(px(3.)).flex_none().rounded(px(2.)).bg(tokens::border_strong()))
-                    .child(
-                        div()
-                            .pl(px(12.))
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .type_body()
-                            .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
-                            .child(self.rich(message, ix, inline, theme::text_soft().into_color(), window, cx)),
-                    )
-                    .into_any_element(),
+                Block::Quote(inline) => {
+                    let hovered_time = self
+                        .hovered
+                        .as_ref()
+                        .filter(|(id, at, _)| *id == message.id && *at == ix)
+                        .and_then(|(_, _, run)| inline.runs.get(*run))
+                        .and_then(|run| run.time)
+                        .map(|(unix, _)| time::tooltip(unix));
+                    let block = div()
+                        .max_w(px(MEASURE))
+                        .mt(px(3.))
+                        .flex()
+                        .child(div().w(px(3.)).flex_none().rounded(px(2.)).bg(tokens::border_strong()))
+                        .child(
+                            div()
+                                .pl(px(12.))
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .type_body()
+                                .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
+                                .child(self.rich(message, ix, inline, theme::text_soft().into_color(), window, cx)),
+                        );
+                    if let Some(words) = hovered_time {
+                        block.id(name_id(&format!("time-{ix}"), &message.id)).tooltip(tip(words, None)).into_any_element()
+                    } else {
+                        block.into_any_element()
+                    }
+                }
                 Block::Item { ordered, depth, number, text } => {
                     let marker = if *ordered { format!("{number}.") } else { "•".to_owned() };
-                    div()
+                    let hovered_time = self
+                        .hovered
+                        .as_ref()
+                        .filter(|(id, at, _)| *id == message.id && *at == ix)
+                        .and_then(|(_, _, run)| text.runs.get(*run))
+                        .and_then(|run| run.time)
+                        .map(|(unix, _)| time::tooltip(unix));
+                    let block = div()
                         .max_w(px(MEASURE))
                         .pl(px(22. * f32::from(*depth)))
                         .flex()
                         .type_body()
                         .when(phone, |div| div.text_size(px(tokens_phone::scaled(17.))).line_height(px(tokens_phone::scaled(24.))))
                         .child(div().w(px(22.)).flex_none().text_color(theme::text_faint()).child(marker))
-                        .child(div().min_w_0().flex_1().flex().flex_col().child(self.rich(message, ix, text, theme::text().into_color(), window, cx)))
-                        .into_any_element()
+                        .child(div().min_w_0().flex_1().flex().flex_col().child(self.rich(message, ix, text, theme::text().into_color(), window, cx)));
+                    if let Some(words) = hovered_time {
+                        block.id(name_id(&format!("time-{ix}"), &message.id)).tooltip(tip(words, None)).into_any_element()
+                    } else {
+                        block.into_any_element()
+                    }
                 }
                 Block::Code { language, text } => self.code_block(message, ix, language, text, cx),
             };
@@ -3868,6 +3902,278 @@ impl Pane {
         card.flex().gap(px(12.)).child(words).child(picture).into_any_element()
     }
 
+    /// Renders a Discord server invite card and/or scheduled event card under a message.
+    fn invite_card(
+        &mut self,
+        message: &Message,
+        ix: usize,
+        invite: &MessageInvite,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut space_name = invite.space_name.clone();
+        let mut space_id = invite.space_id.clone();
+        let mut icon_file = invite.icon.clone();
+        let mut members = invite.members;
+        let mut online = invite.online;
+        let mut state = invite.state;
+        let mut event: Option<ScheduledEvent> = invite.event.clone();
+        let mut error_note: Option<String> = None;
+
+        if !invite.code.is_empty() {
+            let ev_id = invite.event.as_ref().map(|e| e.id.as_str()).filter(|id| !id.is_empty());
+            let cache_key = match ev_id {
+                Some(ev) => format!("{}:{ev}", invite.code),
+                None => invite.code.clone(),
+            };
+            if let Some(cached) = self.invite_previews.get(&cache_key).cloned() {
+                match cached {
+                    Ok(preview) => {
+                        space_name = preview.name;
+                        space_id = preview.space_id;
+                        icon_file = preview.icon;
+                        members = preview.members;
+                        online = preview.online;
+                        state = if preview.joined { InviteState::Joined } else { InviteState::Valid };
+                        if preview.event.is_some() {
+                            event = preview.event;
+                        }
+                    }
+                    Err(err) => {
+                        state = InviteState::Invalid;
+                        error_note = Some(err);
+                    }
+                }
+            }
+        } else if let Some(ev) = invite.event.as_ref().filter(|e| !e.guild_id.is_empty() && !e.id.is_empty()) {
+            if let Some(cached) = self.event_previews.get(&(ev.guild_id.clone(), ev.id.clone())).cloned() {
+                match cached {
+                    Ok(resolved) => {
+                        state = InviteState::Valid;
+                        event = Some(resolved);
+                    }
+                    Err(err) => {
+                        state = InviteState::Invalid;
+                        error_note = Some(err);
+                    }
+                }
+            }
+        }
+
+        let mut card = div()
+            .id(name_id(&format!("invite-{ix}"), &message.id))
+            .mt(px(6.))
+            .max_w(px(432.))
+            .p(px(12.))
+            .rounded(px(theme::R_CARD))
+            .bg(tokens::card())
+            .border_1()
+            .border_color(theme::border())
+            .flex()
+            .flex_col()
+            .gap(px(10.));
+
+        if !invite.code.is_empty() {
+            let heading = match state {
+                InviteState::Invalid => "INVITE INVALID",
+                InviteState::Joined => "YOU'RE ALREADY IN THIS SERVER",
+                _ => "YOU'VE BEEN INVITED TO JOIN A SERVER",
+            };
+            let title = if !space_name.is_empty() {
+                space_name.clone()
+            } else if state == InviteState::Invalid {
+                "Invite invalid or expired".to_owned()
+            } else {
+                format!("discord.gg/{}", invite.code)
+            };
+            let counts = match (online, members) {
+                (Some(on), Some(all)) => Some(format!("{on} online · {all} members")),
+                (None, Some(all)) => Some(format!("{all} members")),
+                (Some(on), None) => Some(format!("{on} online")),
+                (None, None) => error_note.clone().or_else(|| (state == InviteState::Unresolved).then(|| "Loading invite…".to_owned())),
+            };
+            let place_id = space_id.as_deref().unwrap_or(invite.code.as_str());
+            let place_key = self.open.as_ref().map(|open| Key::new(&open.key.account(), place_id));
+            let tile = match &place_key {
+                Some(key) => Avatar::new(key, &title, 40.),
+                None => Avatar::named(&title, 40.),
+            }
+            .shape(Shape::Place);
+            let avatar = self.face(tile, icon_file.as_ref(), 40., Shape::Place, window, cx);
+            let code = invite.code.clone();
+            let url = invite.url.clone();
+            let valid_url = url.starts_with("https://") || url.starts_with("http://");
+            let handoff = self.invite_handoff.contains(&code);
+            let joining = self.invite_joining.contains(&code);
+
+            let action: Option<AnyElement> = match state {
+                InviteState::Joined => {
+                    let target_space = space_id.clone();
+                    Some(
+                        div()
+                            .id(name_id(&format!("invite-open-{ix}"), &message.id))
+                            .flex_none()
+                            .h(px(30.))
+                            .px(px(12.))
+                            .rounded(px(theme::R_CONTROL))
+                            .bg(theme::raised())
+                            .border_1()
+                            .border_color(theme::border())
+                            .hover(|s| s.bg(theme::selected()))
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .type_small()
+                            .font_weight(theme::MEDIUM)
+                            .text_color(theme::text())
+                            .when_some(target_space, |btn, gid| {
+                                btn.on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_invite_space(gid.clone(), cx);
+                                }))
+                            })
+                            .child("Joined")
+                            .into_any_element(),
+                    )
+                }
+                InviteState::Valid => {
+                    let label = if handoff {
+                        "Open in Discord"
+                    } else if joining {
+                        "Joining…"
+                    } else {
+                        "Join"
+                    };
+                    Some(
+                        div()
+                            .id(name_id(&format!("invite-join-{ix}"), &message.id))
+                            .flex_none()
+                            .h(px(30.))
+                            .px(px(14.))
+                            .rounded(px(theme::R_CONTROL))
+                            .bg(theme::accent())
+                            .text_color(theme::on_accent())
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .type_small()
+                            .font_weight(theme::SEMIBOLD)
+                            .when(handoff && valid_url, |btn| {
+                                let url = url.clone();
+                                btn.on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_external_link(&url, window, cx);
+                                }))
+                            })
+                            .when(!handoff && !joining, |btn| {
+                                let code = code.clone();
+                                btn.on_click(cx.listener(move |this, _, _, cx| {
+                                    this.join_invite(code.clone(), cx);
+                                }))
+                            })
+                            .child(label)
+                            .into_any_element(),
+                    )
+                }
+                InviteState::Invalid | InviteState::Unresolved => None,
+            };
+
+            card = card
+                .child(div().type_micro().font_weight(theme::SEMIBOLD).text_color(theme::text_faint()).child(heading))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.))
+                        .child(avatar)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.))
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .type_ui()
+                                        .font_weight(theme::SEMIBOLD)
+                                        .text_color(if state == InviteState::Invalid { theme::text_faint() } else { theme::text() })
+                                        .child(title),
+                                )
+                                .children(counts.map(|c| div().truncate().type_micro().text_color(theme::text_soft()).child(c))),
+                        )
+                        .children(action),
+                );
+        }
+
+        if let Some(ev) = event {
+            let ev_title = if !ev.name.is_empty() {
+                ev.name.clone()
+            } else if state == InviteState::Invalid {
+                "Event unavailable".to_owned()
+            } else {
+                "Scheduled Event".to_owned()
+            };
+            let when_text = ev.start.map(time::tooltip);
+            let mut meta_parts: Vec<String> = Vec::new();
+            if !ev.place.is_empty() {
+                meta_parts.push(ev.place.clone());
+            }
+            if let Some(count) = ev.interested_count {
+                meta_parts.push(format!("{count} interested"));
+            }
+            let meta_line = (!meta_parts.is_empty()).then(|| meta_parts.join(" · "));
+            let can_interest = state != InviteState::Invalid && !ev.guild_id.is_empty() && !ev.id.is_empty();
+            let toggling = self.event_toggling.contains(&(ev.guild_id.clone(), ev.id.clone()));
+            let ev_guild = ev.guild_id.clone();
+            let ev_id = ev.id.clone();
+            let next_interested = !ev.interested;
+
+            let mut ev_box = div()
+                .when(!invite.code.is_empty(), |d| d.pt(px(8.)).border_t_1().border_color(theme::border()))
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .children(when_text.map(|w| div().type_micro().font_weight(theme::SEMIBOLD).text_color(theme::accent_text()).child(w)))
+                        .child(div().truncate().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(ev_title))
+                        .children(meta_line.map(|m| div().truncate().type_micro().text_color(theme::text_soft()).child(m))),
+                );
+            if can_interest {
+                ev_box = ev_box.child(
+                    div()
+                        .id(name_id(&format!("event-interest-{ix}"), &message.id))
+                        .flex_none()
+                        .h(px(28.))
+                        .px(px(10.))
+                        .rounded(px(theme::R_CONTROL))
+                        .border_1()
+                        .when(ev.interested, |b| b.bg(theme::accent_soft()).border_color(theme::accent()).text_color(theme::accent_text()))
+                        .when(!ev.interested, |b| b.bg(theme::raised()).border_color(theme::border()).text_color(theme::text()))
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .type_small()
+                        .font_weight(theme::MEDIUM)
+                        .when(!toggling, |b| {
+                            b.on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_event_interest(ev_guild.clone(), ev_id.clone(), next_interested, cx);
+                            }))
+                        })
+                        .child(if ev.interested { "✓ Interested" } else { "Interested" }),
+                );
+            }
+            card = card.child(ev_box);
+        }
+
+        card.into_any_element()
+    }
+
     // Around the message.
 
     fn reactions(&mut self, message: &Rc<Message>, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -3898,8 +4204,51 @@ impl Pane {
                 chip.bg(theme::raised()).border_color(gpui::transparent_black()).hover(|style| style.border_color(tokens::border_strong()))
             }
         };
+        let burst_chip = |id: ElementId, mine: bool, colors: &[String]| {
+            let parsed = colors
+                .first()
+                .and_then(|s| s.strip_prefix('#').or(Some(s.as_str())))
+                .filter(|s| s.len() == 6)
+                .and_then(|hex| u32::from_str_radix(hex, 16).ok());
+            let base = parsed.unwrap_or(0x8b5cf6);
+            let accent = gpui::rgb(base);
+            let fill = gpui::rgba((base << 8) | if mine { if theme::is_light() { 0x33 } else { 0x42 } } else if theme::is_light() { 0x1a } else { 0x24 });
+            let edge_color = if mine { accent } else { gpui::rgba((base << 8) | 0x80) };
+            (
+                div()
+                    .id(id)
+                    .flex_none()
+                    .h(px(if phone { 32. } else { 26. }))
+                    .min_w(px(if phone { 48. } else { 0. }))
+                    .px(px(if phone { 10. } else { 8. }))
+                    .justify_center()
+                    .rounded_full()
+                    .border_1()
+                    .bg(fill)
+                    .border_color(edge_color)
+                    .hover(move |style| style.border_color(accent))
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .when(acts, |chip| chip.cursor_pointer()),
+                accent,
+            )
+        };
         let mut row = div().mt(px(6.)).mb(px(3.)).flex().flex_wrap().gap(px(if phone { 8. } else { 6. }));
-        for (ix, reaction) in message.reactions.iter().take(CHIPS).enumerate() {
+        // Flatten each reaction into its burst chip (if any) and normal chip (if any), so a
+        // message with both normal and super reactions for the same emoji shows both distinctly.
+        let mut entries: Vec<(usize, bool)> = Vec::new();
+        for (ix, reaction) in message.reactions.iter().enumerate() {
+            if reaction.burst > 0 {
+                entries.push((ix, true));
+            }
+            if reaction.count > 0 {
+                entries.push((ix, false));
+            }
+        }
+        let total_chips = entries.len();
+        for (chip_ix, (ix, is_burst)) in entries.into_iter().take(CHIPS).enumerate() {
+            let reaction = &message.reactions[ix];
             let picture = match &reaction.file {
                 Some(file) => match self.still(file, edge, edge, None, cx) {
                     Picture::Ready(image) => Some(div().size(px(18.)).flex_none().child(anim::picture(image, ObjectFit::Contain, 0., Play::Inline)).into_any_element()),
@@ -3912,15 +4261,11 @@ impl Pane {
                 let (size, line) = if phone { (17., 22.) } else { (15., 20.) };
                 div().text_size(px(size)).line_height(px(line)).child(emoji::display(&reaction.emoji)).into_any_element()
             });
-            let count = div()
-                .type_small()
-                .when(phone, |count| count.text_size(px(tokens_phone::scaled(14.))).line_height(px(tokens_phone::scaled(18.))))
-                .font_weight(theme::MEDIUM)
-                .text_color(if reaction.mine { theme::accent_text() } else { theme::text_soft() })
-                .child(reaction.count.to_string());
+            let mine = if is_burst { reaction.mine_burst } else { reaction.mine };
+            let shown_count = if is_burst { reaction.burst } else { reaction.count };
             // A custom one goes by its file, which names it where its `:name:` may not.
             let toggled = reaction.file.as_ref().map_or_else(|| reaction.emoji.clone(), |file| file.id.clone());
-            let (id, on) = (message.id.clone(), !reaction.mine);
+            let (id, on) = (message.id.clone(), !mine);
             let is_telegram = self.open.as_ref().is_some_and(|open| open.key.network == protocol::Network::Telegram);
             let is_paid_star = is_telegram && reaction.file.is_none() && protocol::bare_emoji(&reaction.emoji) == "⭐";
             let paid_allowed = is_paid_star && acts && self.rules().is_some_and(|rules| rules.paid);
@@ -3930,11 +4275,11 @@ impl Pane {
             let refused = if is_paid_star {
                 None
             } else {
-                (!reaction.mine).then(|| self.refusal(message, &toggled)).flatten()
+                (!mine).then(|| self.refusal_kind(message, &toggled, is_burst)).flatten()
             };
             // Who reacted, where the network said or after an on-demand fetch; a chip that is
             // only a count keeps its own words.
-            let named = !reaction.who.is_empty();
+            let named = !is_burst && !reaction.who.is_empty();
             let names = if named {
                 let said = |id: &str| match self.person(id) {
                     Some(person) => self.who(&person, cx).0,
@@ -3943,7 +4288,7 @@ impl Pane {
                 reactor_words(&reaction.who, said)
             } else {
                 self.fetched_reactors
-                    .get(&(message.id.clone(), toggled.clone()))
+                    .get(&(message.id.clone(), toggled.clone(), is_burst))
                     .and_then(|(reactors, _)| {
                         let ids: Vec<String> = reactors.iter().map(|r| r.name.clone()).collect();
                         reactor_words(&ids, |name| name.to_owned())
@@ -3959,8 +4304,11 @@ impl Pane {
             } else {
                 match (&refused, &names) {
                     (Some(why), _) => why.clone(),
+                    (None, Some(names)) if is_burst => format!("Super reaction · {names}"),
                     (None, Some(names)) => names.clone(),
-                    (None, None) if reaction.mine => "Take back your reaction".to_owned(),
+                    (None, None) if is_burst && mine => "Take back your super reaction".to_owned(),
+                    (None, None) if is_burst => "Super react with this too".to_owned(),
+                    (None, None) if mine => "Take back your reaction".to_owned(),
                     (None, None) if can_big => "React with this too (Shift+click for big)".to_owned(),
                     (None, None) => "React with this too".to_owned(),
                 }
@@ -3978,13 +4326,34 @@ impl Pane {
                     cx.stop_propagation();
                     let at = event.position;
                     let open = open.clone();
-                    this.open_reactors(open, ix, at, window, cx);
+                    this.open_reactors(open, ix, is_burst, at, window, cx);
                 })
             });
-            row = row.child(
-                chip(("chip", ix).into(), reaction.mine)
+            let built = if is_burst {
+                let (base_chip, accent) = burst_chip(("chip", chip_ix).into(), mine, &reaction.burst_colors);
+                let count = div()
+                    .type_small()
+                    .when(phone, |count| count.text_size(px(tokens_phone::scaled(14.))).line_height(px(tokens_phone::scaled(18.))))
+                    .font_weight(theme::SEMIBOLD)
+                    .text_color(if mine { accent } else { theme::text() })
+                    .child(shown_count.to_string());
+                base_chip
+                    .child(div().type_micro().text_color(accent).child("✦"))
                     .child(emoji)
                     .child(count)
+            } else {
+                let count = div()
+                    .type_small()
+                    .when(phone, |count| count.text_size(px(tokens_phone::scaled(14.))).line_height(px(tokens_phone::scaled(18.))))
+                    .font_weight(theme::MEDIUM)
+                    .text_color(if mine { theme::accent_text() } else { theme::text_soft() })
+                    .child(shown_count.to_string());
+                chip(("chip", chip_ix).into(), mine)
+                    .child(emoji)
+                    .child(count)
+            };
+            row = row.child(
+                built
                     .when((acts || is_paid_star) && !phone, |chip| chip.tooltip(tip(words, None)))
                     .when(paid_allowed, |chip| {
                         let id = id.clone();
@@ -3992,14 +4361,18 @@ impl Pane {
                     })
                     .when(joins, |chip| {
                         chip.on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
-                            this.react_with(&id, &toggled, on, can_big && event.modifiers().shift, cx);
+                            if is_burst {
+                                this.react_kind(&id, &toggled, on, true, cx);
+                            } else {
+                                this.react_with(&id, &toggled, on, can_big && event.modifiers().shift, cx);
+                            }
                         }))
                     })
                     .when_some(list, |chip, list| chip.on_mouse_down(MouseButton::Right, list))
                     .when(!clickable, |chip| chip.cursor_default()),
             );
         }
-        let hidden = message.reactions.len().saturating_sub(CHIPS);
+        let hidden = total_chips.saturating_sub(CHIPS);
         if hidden > 0 {
             row = row.child(chip("chips-more".into(), false).type_small().text_color(theme::text_soft()).child(format!("+{hidden}")));
         }

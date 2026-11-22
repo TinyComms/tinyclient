@@ -5,8 +5,8 @@ use super::model::{self, seconds, Attachment as Attached, Embed, EmbedImage, Pos
 use crate::adapters::Context;
 use base64::Engine;
 use protocol::{
-    AccountKey, Attachment, Card, Forwarded, Key, MediaFile, MediaKind, MentionKind, Message,
-    MessageKind, Preview, Reaction, ReplyTo, Sender, Span, Style, ThreadSummary,
+    AccountKey, Attachment, Card, Forwarded, InviteState, Key, MediaFile, MediaKind, MentionKind, Message,
+    MessageInvite, MessageKind, Preview, Reaction, ReplyTo, ScheduledEvent, Sender, Span, Style, ThreadSummary,
 };
 
 /// Names for what a message only gives ids for.
@@ -217,8 +217,24 @@ fn angle(rich: &mut Rich, text: &str, names: &dyn Names, guild: Option<&str>) ->
         rich.span(start, Style::Emoji { file: file.clone() });
         rich.files.push((file, url));
     } else if let Some(time) = inner.strip_prefix("t:") {
-        let (unix, style) = time.split_once(':').unwrap_or((time, "f"));
-        rich.text.push_str(&timestamp(unix.parse().ok()?, style));
+        let (unix_str, style_str) = time.split_once(':').unwrap_or((time, "f"));
+        let unix: i64 = unix_str.parse().ok()?;
+        let form = match style_str {
+            "t" => 't',
+            "T" => 'T',
+            "d" => 'd',
+            "D" => 'D',
+            "f" => 'f',
+            "F" => 'F',
+            "R" => 'R',
+            _ => 'f',
+        };
+        let fallback = timestamp(unix, style_str);
+        if fallback.is_empty() {
+            return None;
+        }
+        rich.text.push_str(&fallback);
+        rich.span(start, Style::Time { unix, form });
     } else if let Some(command) = inner.strip_prefix('/') {
         let (name, id) = command.rsplit_once(':')?;
         if !digits(id) {
@@ -715,21 +731,31 @@ fn card(embed: &Embed, names: &dyn Names) -> Card {
 }
 
 fn reactions(rich: &mut Rich, reacted: &[model::Reacted]) -> Vec<Reaction> {
-    let mapped = reacted.iter().filter(|reaction| reaction.count > 0).map(|reaction| {
+    let mapped = reacted.iter().filter_map(|reaction| {
+        let (normal, burst) = match &reaction.count_details {
+            Some(details) => (details.normal, details.burst),
+            None => (reaction.count, 0),
+        };
+        if normal == 0 && burst == 0 {
+            return None;
+        }
         let (emoji, file) = reaction.emoji.spelled();
         let file = file.map(|(file, url)| {
             rich.files.push((file.clone(), url));
             file
         });
-        Reaction {
+        Some(Reaction {
             emoji,
             file,
-            count: reaction.count,
+            count: normal,
             mine: reaction.me,
             // Discord's message payload counts reactions and never names who: the list
             // would need one request per emoji, which this build does not make.
             who: Vec::new(),
-        }
+            burst,
+            mine_burst: reaction.me_burst,
+            burst_colors: reaction.burst_colors.clone(),
+        })
     });
     mapped.collect()
 }
@@ -850,6 +876,117 @@ fn system_line(posted: &Posted, kind: u8, who: &str, content: &str, mentioned: &
             return Some(String::new());
         }
     })
+}
+
+/// Extracts Discord server invite links (`discord.gg/{code}`, `discord.com/invite/{code}`,
+/// `discordapp.com/invite/{code}`, with optional `?event={id}`) and scheduled event links
+/// (`discord.com/events/{guild}/{event}`) from translated link spans. No network calls are made.
+pub fn extract_invites(spans: &[Span]) -> Vec<MessageInvite> {
+    let mut found: Vec<MessageInvite> = Vec::new();
+    for span in spans {
+        if found.len() >= protocol::MESSAGE_INVITES_LIMIT {
+            break;
+        }
+        let Style::Link { url } = &span.style else {
+            continue;
+        };
+        let Some(invite) = parse_invite_or_event_url(url) else {
+            continue;
+        };
+        let dup = found.iter().any(|have| {
+            have.code == invite.code
+                && have.event.as_ref().map(|e| (&e.guild_id, &e.id))
+                    == invite.event.as_ref().map(|e| (&e.guild_id, &e.id))
+        });
+        if !dup {
+            found.push(invite);
+        }
+    }
+    found
+}
+
+fn parse_invite_or_event_url(raw: &str) -> Option<MessageInvite> {
+    let stripped = raw
+        .strip_prefix("https://")
+        .or_else(|| raw.strip_prefix("http://"))?;
+    let (without_frag, _) = stripped.split_once('#').unwrap_or((stripped, ""));
+    let (host_and_path, query) = without_frag.split_once('?').unwrap_or((without_frag, ""));
+    let (host, path) = host_and_path.split_once('/')?;
+    let host_lower = host.to_ascii_lowercase();
+    let path = path.trim_matches('/');
+    let event_param = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("event="))
+        .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+        .map(str::to_owned);
+
+    let valid_code = |code: &str| {
+        !code.is_empty()
+            && code.len() <= 64
+            && code.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    };
+
+    if host_lower == "discord.gg" || host_lower == "www.discord.gg" {
+        let code = path.split('/').next().unwrap_or("");
+        if !valid_code(code) {
+            return None;
+        }
+        let canonical = match &event_param {
+            Some(ev) => format!("https://discord.gg/{code}?event={ev}"),
+            None => format!("https://discord.gg/{code}"),
+        };
+        return Some(MessageInvite {
+            code: code.to_owned(),
+            url: canonical,
+            state: InviteState::Unresolved,
+            event: event_param.map(|id| ScheduledEvent { id, ..ScheduledEvent::default() }),
+            ..MessageInvite::default()
+        });
+    }
+
+    if matches!(
+        host_lower.as_str(),
+        "discord.com" | "www.discord.com" | "discordapp.com" | "www.discordapp.com" | "ptb.discord.com" | "canary.discord.com"
+    ) {
+        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        if segments.first() == Some(&"invite") {
+            let code = *segments.get(1)?;
+            if !valid_code(code) {
+                return None;
+            }
+            let canonical = match &event_param {
+                Some(ev) => format!("https://discord.gg/{code}?event={ev}"),
+                None => format!("https://discord.gg/{code}"),
+            };
+            return Some(MessageInvite {
+                code: code.to_owned(),
+                url: canonical,
+                state: InviteState::Unresolved,
+                event: event_param.map(|id| ScheduledEvent { id, ..ScheduledEvent::default() }),
+                ..MessageInvite::default()
+            });
+        }
+        if segments.first() == Some(&"events") {
+            let guild_id = *segments.get(1)?;
+            let event_id = *segments.get(2)?;
+            if !digits(guild_id) || !digits(event_id) {
+                return None;
+            }
+            return Some(MessageInvite {
+                code: String::new(),
+                url: format!("https://discord.com/events/{guild_id}/{event_id}"),
+                space_id: Some(guild_id.to_owned()),
+                state: InviteState::Unresolved,
+                event: Some(ScheduledEvent {
+                    id: event_id.to_owned(),
+                    guild_id: guild_id.to_owned(),
+                    ..ScheduledEvent::default()
+                }),
+                ..MessageInvite::default()
+            });
+        }
+    }
+    None
 }
 
 /// Where the official app shows this message.
@@ -1099,6 +1236,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
     };
     // Our own client's nonce is the shell's client id: digits, at most 25.
     let client_id = posted.nonce.clone().filter(|nonce| outgoing && digits(nonce) && nonce.len() <= 25);
+    let invites = extract_invites(&rich.spans);
     let message = Message {
         saved_history: false,
         sent_subsec_millis: 0,
@@ -1156,6 +1294,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         sent_via: None,
         permalink: String::new(),
         controls: Vec::new(),
+        invites,
         buttons: Vec::new(),
         jump,
     };
@@ -1229,6 +1368,7 @@ pub fn patch(stored: &mut Message, update: &Posted, place: &Place) -> Files {
             markdown_in(&mut rich, content, place.names, place.guild);
             stored.text = std::mem::take(&mut rich.text);
             stored.spans = std::mem::take(&mut rich.spans);
+            stored.invites = extract_invites(&stored.spans);
         }
     }
     if let Some(attached) = &update.attachments {
@@ -1409,6 +1549,51 @@ mod tests {
     fn unclosed_markup_stays_as_typed() {
         assert_eq!(parsed("2 ** 3 and a_b and `open").text, "2 ** 3 and a_b and `open");
         assert_eq!(parsed("\\*not italic\\*").text, "*not italic*");
+    }
+
+    #[test]
+    fn timestamp_tokens_emit_time_spans_over_neutral_fallback_text() {
+        let rich = parsed("Starts <t:1618953630:R> (default <t:1618953630>, short <t:1618953630:t>, long <t:1618953630:F>)");
+        let times: Vec<(i64, char, &str)> = rich
+            .spans
+            .iter()
+            .filter_map(|span| match span.style {
+                Style::Time { unix, form } => Some((unix, form, &rich.text[span.start as usize..span.end as usize])),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(times.len(), 4);
+        assert_eq!((times[0].0, times[0].1), (1_618_953_630, 'R'));
+        assert_eq!((times[1].0, times[1].1), (1_618_953_630, 'f'));
+        assert_eq!((times[2].0, times[2].1), (1_618_953_630, 't'));
+        assert_eq!((times[3].0, times[3].1), (1_618_953_630, 'F'));
+        // Fallback text is non-empty and neutral (never stale "ago"/"in " words for relative).
+        for (_, _, fallback) in &times {
+            assert!(!fallback.is_empty());
+        }
+        assert!(!times[0].2.contains("ago") && !times[0].2.starts_with("in "));
+
+        // Invalid timestamps stay literal.
+        let bad = parsed("<t:notanumber:R>");
+        assert_eq!(bad.text, "<t:notanumber:R>");
+        assert!(bad.spans.is_empty());
+    }
+
+    #[test]
+    fn invite_and_event_links_are_detected_and_deduplicated() {
+        let rich = parsed(
+            "Join https://discord.gg/rustlang?event=9001 or https://discord.com/invite/rustlang?event=9001 \
+             and event https://discord.com/events/4000/8002 (ignore https://example.com/invite/fake)",
+        );
+        let invites = extract_invites(&rich.spans);
+        assert_eq!(invites.len(), 2);
+        assert_eq!(invites[0].code, "rustlang");
+        assert_eq!(invites[0].event.as_ref().map(|e| e.id.as_str()), Some("9001"));
+        assert_eq!(invites[0].url, "https://discord.gg/rustlang?event=9001");
+        assert!(invites[1].code.is_empty());
+        assert_eq!(invites[1].space_id.as_deref(), Some("4000"));
+        assert_eq!(invites[1].event.as_ref().map(|e| e.id.as_str()), Some("8002"));
+        assert_eq!(invites[1].url, "https://discord.com/events/4000/8002");
     }
 
     #[test]

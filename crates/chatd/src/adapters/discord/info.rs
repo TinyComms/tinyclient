@@ -3,13 +3,17 @@
 //! the server-side search for what was shared. Each is one request at most, and only because
 //! the user opened or clicked something.
 
-use super::super::{About, ConversationAbout, Refusal, Reply, SearchScope, SharedPage, SpaceAbout};
+use super::super::{About, ConversationAbout, Failure, ForumPosts, Refusal, Reply, SearchPage, SearchScope, SharedPage, SpaceAbout};
 use super::model::{self, number, GuildSettings, Posted};
 use super::rest::Refused;
 use super::{escaped, refusal, Discord};
 use crate::hub::now;
 use base64::Engine;
-use protocol::{ConversationKind, MediaKind, Message, MessageHit, Notify, SharedItem, SharedKind, Style};
+use crate::store::{PostCard, PreviewLine};
+use protocol::{
+    ConversationKind, MediaKind, Message, MessageHit, Notify, SearchFilters, SearchHas, SearchSort,
+    SharedItem, SharedKind, Style, TopicSort,
+};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
@@ -22,6 +26,10 @@ const PROFILE_EVERY: Duration = Duration::from_secs(3);
 static PROFILE_TURN: Mutex<()> = Mutex::new(());
 /// Discord's search answers 25 messages a page at most.
 const SEARCH_PAGE: u32 = 25;
+/// Discord's forum thread search answers 25 posts a page at most.
+const FORUM_PAGE: u32 = 25;
+/// Most characters Discord's forum search accepts in `name`.
+const FORUM_NAME_MAX: usize = 100;
 /// Most characters Discord's message search accepts in `content`.
 const SEARCH_MAX_CHARS: usize = 1024;
 /// Most characters Discord accepts in a private note on a user.
@@ -52,9 +60,93 @@ pub(super) fn thread_notify_word(flags: u32) -> Option<&'static str> {
 
 #[derive(Default)]
 pub(super) struct MessageSearch {
-    in_flight: bool,
     last: Option<Instant>,
-    remembered: std::collections::VecDeque<(SearchScope, String, Vec<MessageHit>)>,
+    remembered: std::collections::VecDeque<(SearchScope, String, SearchPage)>,
+}
+
+fn search_has_param(has: SearchHas) -> &'static str {
+    match has {
+        SearchHas::Files => "file",
+        SearchHas::Links => "link",
+        SearchHas::Images => "image",
+        SearchHas::Videos => "video",
+        SearchHas::Embeds => "embed",
+        SearchHas::Sounds => "sound",
+        SearchHas::Stickers => "sticker",
+        SearchHas::Polls => "poll",
+    }
+}
+
+/// Builds Discord's search URL and resolved offset from structured filters, sort, and cursor.
+fn build_search_path(
+    base: &str,
+    scope_channel: Option<&str>,
+    query: &str,
+    filters: &SearchFilters,
+    cursor: Option<&str>,
+    me: &str,
+) -> (String, u32) {
+    let mut params: Vec<String> = Vec::new();
+    if let Some(ch) = scope_channel {
+        params.push(format!("channel_id={}", escaped(ch)));
+    } else if let Some(in_ch) = filters.in_channel.as_ref().filter(|k| !k.id.is_empty()) {
+        params.push(format!("channel_id={}", escaped(&in_ch.id)));
+    }
+    if !query.is_empty() {
+        params.push(format!("content={}", escaped(query)));
+    }
+    if let Some(from) = filters.from.as_ref().filter(|k| !k.id.is_empty()) {
+        params.push(format!("author_id={}", escaped(&from.id)));
+    }
+    if let Some(mentions) = filters.mentions.as_ref().filter(|k| !k.id.is_empty()) {
+        params.push(format!("mentions={}", escaped(&mentions.id)));
+    } else if filters.mentions_me && !me.is_empty() {
+        params.push(format!("mentions={}", escaped(me)));
+    }
+    if let Some(has) = filters.has {
+        params.push(format!("has={}", search_has_param(has)));
+    }
+    if let Some(after) = filters.after.filter(|ts| *ts > 0) {
+        params.push(format!("min_id={}", model::snowflake_from_unix(after)));
+    }
+    if let Some(before) = filters.before.filter(|ts| *ts > 0) {
+        params.push(format!("max_id={}", model::snowflake_from_unix(before)));
+    }
+    if let Some(pinned) = filters.pinned {
+        params.push(format!("pinned={}", if pinned { "true" } else { "false" }));
+    }
+    if let Some(kind) = filters.author_type.as_deref() {
+        let lower = kind.trim().to_ascii_lowercase();
+        if matches!(lower.as_str(), "user" | "bot" | "webhook") {
+            params.push(format!("author_type={lower}"));
+        }
+    }
+    match filters.sort {
+        SearchSort::Newest => {
+            params.push("sort_by=timestamp".into());
+            params.push("sort_order=desc".into());
+        }
+        SearchSort::Oldest => {
+            params.push("sort_by=timestamp".into());
+            params.push("sort_order=asc".into());
+        }
+        SearchSort::Relevant => {
+            params.push("sort_by=relevance".into());
+            params.push("sort_order=desc".into());
+        }
+    }
+    let offset: u32 = cursor
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(filters.offset);
+    if offset > 0 {
+        params.push(format!("offset={offset}"));
+    }
+    let path = if params.is_empty() {
+        base.to_owned()
+    } else {
+        format!("{base}?{}", params.join("&"))
+    };
+    (path, offset)
 }
 
 /// The file's magic matches the extension. A renamed text file is not an image.
@@ -227,6 +319,73 @@ mod role_tests {
         assert!(may_grant(MANAGE_ROLES, ADMINISTRATOR, 0), "taking away a bit we lack is allowed");
         assert!(may_grant(MANAGE_ROLES, ADMINISTRATOR, ADMINISTRATOR | MANAGE_ROLES));
     }
+}
+fn failure_words(failed: Failure) -> Refusal {
+    let why = match failed {
+        Failure::SignedOut(why) | Failure::Dropped(why) => why,
+    };
+    refused(why)
+}
+
+fn forum_search_failed(failed: Refused, plain: bool) -> Result<Option<ForumPosts>, Refusal> {
+    let denied = matches!(failed, Refused::Status { status: 403, .. } | Refused::Status { code: 50001, .. });
+    if denied || !plain {
+        return Err(refusal(failed));
+    }
+    Ok(None)
+}
+
+/// `GET /channels/{id}/threads/search`. `name` is the documented text query. `archived` is left
+/// off so both active and archived posts come back. Nothing pages past this one request.
+fn forum_search_path(channel: &str, sort: TopicSort, tag: &str, query: &str, offset: u32) -> String {
+    let sort_by = match sort {
+        TopicSort::Activity => "last_message_time",
+        TopicSort::Created => "creation_time",
+    };
+    let mut params = vec![format!("sort_by={sort_by}"), "sort_order=desc".to_owned(), format!("limit={FORUM_PAGE}")];
+    if !tag.is_empty() {
+        params.push(format!("tag={}", escaped(tag)));
+    }
+    let name: String = query.chars().take(FORUM_NAME_MAX).collect();
+    if !name.is_empty() {
+        params.push(format!("name={}", escaped(&name)));
+    }
+    if offset > 0 {
+        params.push(format!("offset={offset}"));
+    }
+    format!("/channels/{}/threads/search?{}", escaped(channel), params.join("&"))
+}
+
+fn post_thumb(message: &Message) -> String {
+    let pictured = |kind: MediaKind| matches!(kind, MediaKind::Image | MediaKind::Gif | MediaKind::Video);
+    message
+        .attachments
+        .iter()
+        .find(|attachment| !attachment.spoiler && (pictured(attachment.file.kind) || attachment.thumb.is_some()))
+        .map(|attachment| attachment.thumb.as_ref().map(|thumb| thumb.id.clone()).unwrap_or_else(|| attachment.file.id.clone()))
+        .unwrap_or_default()
+}
+
+fn top_reaction(message: &Message) -> String {
+    message
+        .reactions
+        .iter()
+        .max_by_key(|reaction| reaction.count.saturating_add(reaction.burst))
+        .filter(|reaction| reaction.count.saturating_add(reaction.burst) > 0)
+        .map(|reaction| reaction.emoji.clone())
+        .unwrap_or_default()
+}
+
+#[derive(Deserialize)]
+struct ThreadSearch {
+    #[serde(default)]
+    threads: Vec<model::Channel>,
+    #[serde(default)]
+    has_more: bool,
+    #[serde(default)]
+    total_results: Option<u32>,
+    #[serde(default)]
+    first_messages: Vec<Posted>,
 }
 
 #[derive(Deserialize)]
@@ -800,6 +959,121 @@ impl Discord {
             notify,
             ..ConversationAbout::default()
         })
+    }
+
+    /// A forum's posting rules, from the channel note READY kept. Nothing is asked of Discord.
+    pub(super) fn forum_info(&self, channel: &str) -> Result<protocol::ForumInfo, Refusal> {
+        let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
+        if known.kind != ConversationKind::Forum {
+            return Err(refused("This is not a forum."));
+        }
+        let guild = self.guild_of(&known).ok_or_else(|| refused("This forum is not here."))?;
+        let note = self.ctx.note(&format!("kept:{guild}"));
+        let kept: Vec<model::Kept> = note.and_then(|kept| serde_json::from_str(&kept).ok()).unwrap_or_default();
+        let kept = kept.into_iter().find(|kept| kept.id == channel).ok_or_else(|| refused("This forum is not here."))?;
+        let tags = kept.available_tags.iter().map(|tag| {
+            let emoji = tag
+                .emoji_name
+                .clone()
+                .filter(|name| !name.is_empty())
+                .or_else(|| tag.emoji_id.clone().filter(|id| !id.is_empty()))
+                .unwrap_or_default();
+            protocol::ForumTag { id: tag.id.clone(), name: tag.name.clone(), emoji, moderated: tag.moderated }
+        });
+        Ok(protocol::ForumInfo {
+            forum: known.key,
+            guidelines: kept.topic.unwrap_or_default(),
+            tags: tags.collect(),
+            require_tag: kept.flags & model::REQUIRE_TAG != 0,
+            media: kept.kind == model::MEDIA_FORUM,
+            default_slowmode: kept.default_thread_rate_limit_per_user,
+        })
+    }
+
+    /// One page of a forum's posts. Archived posts are in this search; nothing walks every page.
+    /// `Ok(None)` is an unfiltered first page Discord did not answer, so the cache can.
+    pub(super) fn forum_posts(
+        &self,
+        channel: &str,
+        sort: TopicSort,
+        tag: Option<String>,
+        query: Option<String>,
+        offset: u32,
+    ) -> Result<Option<ForumPosts>, Refusal> {
+        let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("You cannot read this channel."))?;
+        if known.kind != ConversationKind::Forum {
+            return Err(refused("This is not a forum."));
+        }
+        let tag = tag.unwrap_or_default();
+        let query = query.unwrap_or_default();
+        let plain = offset == 0 && sort == TopicSort::Activity && tag.trim().is_empty() && query.trim().is_empty();
+        let path = forum_search_path(channel, sort, tag.trim(), query.trim(), offset);
+        let body = match self.call("GET", &path, None) {
+            Ok(body) => body,
+            Err(failed) => return forum_search_failed(failed, plain),
+        };
+        let parsed: ThreadSearch = match serde_json::from_str(&body) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                if plain {
+                    return Ok(None);
+                }
+                return Err(refused(err));
+            }
+        };
+        let guild = self.guild_of(&known);
+        let wanted = tag.trim();
+        let ThreadSearch { threads, has_more, total_results, first_messages } = parsed;
+        let mut ids = Vec::new();
+        for thread in threads.into_iter().take(FORUM_PAGE as usize) {
+            if thread.parent_id.as_deref() != Some(channel) {
+                continue;
+            }
+            if !wanted.is_empty() && !thread.applied_tags.iter().any(|have| have == wanted) {
+                continue;
+            }
+            self.thread_changed(thread.clone(), false).map_err(failure_words)?;
+            if self.ctx.known(&thread.id).map_err(refused)?.is_none() {
+                continue;
+            }
+            let (thumbnail, reaction) = match first_messages.iter().find(|posted| posted.channel_id == thread.id) {
+                Some(posted) => self.record_starter(&thread, posted, guild.as_deref()),
+                None => (String::new(), String::new()),
+            };
+            let _ = self.ctx.post_card(&thread.id, &PostCard {
+                tags: thread.applied_tags.clone(),
+                message_count: thread.message_count.unwrap_or(0),
+                total_message_sent: thread.total_message_sent.unwrap_or(0),
+                thumbnail,
+                reaction,
+                owner: thread.owner_id.clone().unwrap_or_default(),
+            });
+            ids.push(thread.id);
+        }
+        let kept = ids.len() as u32;
+        let total = total_results.unwrap_or_else(|| {
+            if has_more { offset.saturating_add(kept).saturating_add(1) } else { offset.saturating_add(kept) }
+        });
+        Ok(Some(ForumPosts { ids, total }))
+    }
+
+    /// The starter message, its picture, and its strongest reaction. A failure here keeps the post.
+    fn record_starter(&self, thread: &model::Channel, posted: &Posted, guild: Option<&str>) -> (String, String) {
+        let (message, files) = self.convert(posted, guild, ConversationKind::Thread);
+        let _ = files.register(&self.ctx);
+        let _ = self.ctx.history(&thread.id, std::slice::from_ref(&message));
+        if !message.text.is_empty() {
+            let sent = thread.last_message_id.as_deref().map(model::seconds).filter(|sent| *sent > 0).unwrap_or(message.sent);
+            let _ = self.ctx.preview(&thread.id, &PreviewLine {
+                id: message.id.clone(),
+                text: message.text.clone(),
+                sender: message.sender.name.clone(),
+                mine: message.outgoing,
+                sent,
+                expires_at: message.expires_at,
+            });
+        }
+        (post_thumb(&message), top_reaction(&message))
     }
 
     /// A server's info: its description and counts in one request, our nickname, roles and the
@@ -2563,78 +2837,107 @@ impl Discord {
         })
     }
 
-    /// Runs a message search off the command thread, one at a time per account.
+    /// Runs a message search off the command thread, queued one at a time per account.
     pub(super) fn search_queued(
         discord: &Arc<Discord>,
         query: String,
         scope: SearchScope,
+        filters: SearchFilters,
+        cursor: Option<String>,
         at: Instant,
-        reply: Reply<Vec<MessageHit>>,
+        reply: Reply<SearchPage>,
     ) {
         let searching = discord.clone();
         let run = move || {
-            let _ = reply.send(searching.search_messages(&query, &scope, at));
+            let _ = reply.send(searching.search_messages(&query, &scope, &filters, cursor.as_deref(), at));
         };
         if let Err(err) = std::thread::Builder::new().name("discord-search".into()).spawn(run) {
             tracing::warn!("chatd: Discord: no thread for a search: {err}");
         }
     }
 
-    /// What the network itself finds for the pane's words, from Discord's own search: the
-    /// server's when a Space is the scope, the channel's when one conversation is. The hits
-    /// are mapped like the cache's, so the pane can merge the two lists and tell them apart.
-    pub(super) fn search_messages(&self, query: &str, scope: &SearchScope, at: Instant) -> Result<Vec<MessageHit>, Refusal> {
+    /// What the network itself finds for the pane's words and filters, from Discord's own search:
+    /// the server's when a Space is the scope, the channel's when one conversation is, or all DMs
+    /// (`/users/@me/messages/search`) for account scope. Paced requests queue and wait out the
+    /// remaining gap rather than refusing immediately.
+    pub(super) fn search_messages(
+        &self,
+        query: &str,
+        scope: &SearchScope,
+        filters: &SearchFilters,
+        cursor: Option<&str>,
+        at: Instant,
+    ) -> Result<SearchPage, Refusal> {
         if at.elapsed() >= super::SEARCH_PATIENCE {
             return Err(refused("That took too long. Try again."));
         }
         let capped: String = query.chars().take(SEARCH_MAX_CHARS).collect();
         let query = capped.trim();
-        let key = query.to_lowercase();
-        let path = match scope {
+        let (base, scope_channel, me) = match scope {
             SearchScope::Space(space) => {
-                // A Space's id is a guild's: one the account is in, as space_info checks.
-                if !crate::hub::lock(&self.state).guilds.contains_key(space) {
+                let state = crate::hub::lock(&self.state);
+                if !state.guilds.contains_key(space) {
                     return Err(refused("This server is gone."));
                 }
-                format!("/guilds/{space}/messages/search?content={}", escaped(query))
+                (format!("/guilds/{space}/messages/search"), None, state.me.clone())
             }
-            SearchScope::Account => return Err(Refusal::Unsupported),
+            SearchScope::Account => {
+                let me = crate::hub::lock(&self.state).me.clone();
+                ("/users/@me/messages/search".to_owned(), None, me)
+            }
             SearchScope::Conversation(channel) => {
                 let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
+                let me = crate::hub::lock(&self.state).me.clone();
                 match self.guild_of(&known) {
-                    Some(guild) => {
-                        format!("/guilds/{guild}/messages/search?channel_id={channel}&content={}", escaped(query))
-                    }
-                    None => format!("/channels/{channel}/messages/search?content={}", escaped(query)),
+                    Some(guild) => (format!("/guilds/{guild}/messages/search"), Some(channel.as_str()), me),
+                    None => (format!("/channels/{channel}/messages/search"), None, me),
                 }
             }
         };
-        // One search in flight per account, and at least SEARCH_GAP after the previous finished:
-        // no client turns Enter into a burst against Discord's tight search limits.
+        let (path, offset) = build_search_path(&base, scope_channel, query, filters, cursor, &me);
+        let cache_key = path.to_lowercase();
         {
-            let mut search = crate::hub::lock(&self.message_search);
-            if let Some((_, _, hits)) = search.remembered.iter().find(|(s, q, _)| s == scope && *q == key) {
-                return Ok(hits.clone());
+            let search = crate::hub::lock(&self.message_search);
+            if let Some((_, _, page)) = search.remembered.iter().find(|(s, k, _)| s == scope && *k == cache_key) {
+                return Ok(page.clone());
             }
-            if search.in_flight || search.last.is_some_and(|last| last.elapsed() < super::members::SEARCH_GAP) {
-                return Err(refused("Discord search is paced. Try again in a moment."));
-            }
-            search.in_flight = true;
         }
-        let outcome = self.run_message_search(&path, query, scope);
+        // One search in flight per account, waiting out SEARCH_GAP between requests rather than
+        // refusing with an error.
+        let _turn = crate::hub::lock(&self.search_turn);
+        if at.elapsed() >= super::SEARCH_PATIENCE {
+            return Err(refused("That took too long. Try again."));
+        }
+        let wait = {
+            let search = crate::hub::lock(&self.message_search);
+            if let Some((_, _, page)) = search.remembered.iter().find(|(s, k, _)| s == scope && *k == cache_key) {
+                return Ok(page.clone());
+            }
+            search
+                .last
+                .map_or(Duration::ZERO, |last| super::members::SEARCH_GAP.saturating_sub(last.elapsed()))
+        };
+        if !wait.is_zero() {
+            if at.elapsed() + wait >= super::SEARCH_PATIENCE {
+                return Err(refused("That took too long. Try again."));
+            }
+            if self.ctx.pause(wait) {
+                return Err(refused("Stopped."));
+            }
+        }
+        let outcome = self.run_message_search(&path, query, scope, offset);
         let mut search = crate::hub::lock(&self.message_search);
-        search.in_flight = false;
         search.last = Some(Instant::now());
-        if let Ok(hits) = &outcome {
+        if let Ok(page) = &outcome {
             if search.remembered.len() >= REMEMBERED_SEARCHES {
                 search.remembered.pop_front();
             }
-            search.remembered.push_back((scope.clone(), key, hits.clone()));
+            search.remembered.push_back((scope.clone(), cache_key, page.clone()));
         }
         outcome
     }
 
-    fn run_message_search(&self, path: &str, query: &str, scope: &SearchScope) -> Result<Vec<MessageHit>, Refusal> {
+    fn run_message_search(&self, path: &str, query: &str, scope: &SearchScope, offset: u32) -> Result<SearchPage, Refusal> {
         let answer = self.call("GET", path, None).map_err(refusal)?;
         let found: Found = serde_json::from_str(&answer).map_err(refused)?;
         // A 202 with no hits: the index is still being built.
@@ -2648,6 +2951,7 @@ impl Discord {
             }
             SearchScope::Account => None,
         };
+        let raw_count = hits.len();
         let mut found_hits = Vec::new();
         for posted in hits.iter().filter_map(|hit| hit.first()) {
             // Hidden conversations and message requests stay out of it, as they stay out of
@@ -2680,7 +2984,15 @@ impl Discord {
                 age_restricted,
             });
         }
-        Ok(found_hits)
+        let next_offset = offset.saturating_add(SEARCH_PAGE);
+        let cursor = found
+            .total_results
+            .and_then(|total| (next_offset < total && raw_count > 0).then(|| next_offset.to_string()));
+        Ok(SearchPage {
+            hits: found_hits,
+            cursor,
+            total: found.total_results,
+        })
     }
 
     /// Recent mentions from before tinyclient was open (`GET /users/@me/mentions`).
@@ -2858,6 +3170,86 @@ fn image_data_uri(path: &str, allow_gif: bool) -> Result<String, Refusal> {
     Ok(format!("data:{mime};base64,{encoded}"))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protocol::{AccountKey, Key, Network};
+
+    fn key(id: &str) -> Key {
+        Key::new(&AccountKey { network: Network::Discord, account: "1000".into() }, id)
+    }
+
+    #[test]
+    fn discord_search_path_maps_all_filters_dates_sort_and_offset() {
+        let filters = SearchFilters {
+            from: Some(key("2001")),
+            mentions: Some(key("2002")),
+            in_channel: Some(key("4101")),
+            has: Some(SearchHas::Videos),
+            before: Some(1_767_225_600),
+            after: Some(1_735_689_600),
+            mentions_me: false,
+            pinned: Some(true),
+            author_type: Some("bot".into()),
+            sort: SearchSort::Oldest,
+            offset: 25,
+        };
+        let (path, offset) = build_search_path(
+            "/guilds/4000/messages/search",
+            None,
+            "deploy",
+            &filters,
+            None,
+            "1000",
+        );
+        assert_eq!(offset, 25);
+        assert!(path.starts_with("/guilds/4000/messages/search?"), "{path}");
+        assert!(path.contains("channel_id=4101"), "{path}");
+        assert!(path.contains("content=deploy"), "{path}");
+        assert!(path.contains("author_id=2001"), "{path}");
+        assert!(path.contains("mentions=2002"), "{path}");
+        assert!(path.contains("has=video"), "{path}");
+        assert!(path.contains(&format!("min_id={}", model::snowflake_from_unix(1_735_689_600))), "{path}");
+        assert!(path.contains(&format!("max_id={}", model::snowflake_from_unix(1_767_225_600))), "{path}");
+        assert!(path.contains("pinned=true"), "{path}");
+        assert!(path.contains("author_type=bot"), "{path}");
+        assert!(path.contains("sort_by=timestamp&sort_order=asc"), "{path}");
+        assert!(path.contains("offset=25"), "{path}");
+
+        // Cursor overrides filters.offset, mentions_me maps to own user id, and Relevant maps to relevance.
+        let rel = SearchFilters {
+            mentions_me: true,
+            sort: SearchSort::Relevant,
+            has: Some(SearchHas::Polls),
+            author_type: Some("invalid".into()),
+            ..SearchFilters::default()
+        };
+        let (path2, offset2) = build_search_path(
+            "/users/@me/messages/search",
+            None,
+            "",
+            &rel,
+            Some("50"),
+            "1000",
+        );
+        assert_eq!(offset2, 50);
+        assert!(path2.starts_with("/users/@me/messages/search?"), "{path2}");
+        assert!(!path2.contains("content="), "{path2}");
+        assert!(path2.contains("mentions=1000"), "{path2}");
+        assert!(path2.contains("has=poll"), "{path2}");
+        assert!(!path2.contains("author_type="), "unknown author_type must be ignored: {path2}");
+        assert!(path2.contains("sort_by=relevance&sort_order=desc"), "{path2}");
+        assert!(path2.contains("offset=50"), "{path2}");
+    }
+
+    #[test]
+    fn snowflake_from_unix_round_trips_seconds() {
+        let ts = 1_735_689_600;
+        let sf = model::snowflake_from_unix(ts);
+        assert_eq!(model::seconds(&sf.to_string()), ts);
+        assert_eq!(model::snowflake_from_unix(0), 0);
+    }
+}
 
 /// Builds the `PATCH /users/@me/guilds/{guild}/settings` body for a timed or endless channel mute.
 pub(super) fn mute_override_body(
@@ -3173,7 +3565,7 @@ pub(super) fn space_view_body(
 }
 
 #[cfg(test)]
-mod tests {
+mod view_tests {
     use super::*;
 
     #[test]

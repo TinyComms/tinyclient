@@ -397,6 +397,47 @@ pub enum Warning {
     Spam,
 }
 
+/// How a forum's posts are ordered. Activity is Discord's `last_message_time`; Created is
+/// `creation_time`. Both are asked newest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TopicSort {
+    #[default]
+    Activity,
+    Created,
+}
+
+/// One tag defined on a forum or media channel (`ForumInfo::tags`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForumTag {
+    pub id: String,
+    pub name: String,
+    /// Unicode emoji or custom emoji name/id when the tag carries one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub emoji: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub moderated: bool,
+}
+
+/// Guidelines, available tags, and posting rules of a forum or media channel (`Request::ForumInfo`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForumInfo {
+    pub forum: Key,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub guidelines: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<ForumTag>,
+    /// True when every new post must carry at least one tag (Discord channel flags bit 4).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub require_tag: bool,
+    /// True for a media channel (Discord channel type 16), where posts require an attachment.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub media: bool,
+    /// Default per-post slowmode in seconds, when set on the forum.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub default_slowmode: u32,
+}
+
 /// A conversation's info pane: what the row does not carry, asked of the network once when the
 /// pane opens and kept five minutes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1336,6 +1377,12 @@ pub struct InvitePreview {
     pub space_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_id: Option<String>,
+    /// True when this account is already a member of `space_id`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub joined: bool,
+    /// Optional scheduled event attached to this invite (`?event=<id>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<crate::ScheduledEvent>,
 }
 
 /// One public channel returned by [`crate::Request::BrowseChannels`].
@@ -1455,19 +1502,44 @@ pub fn format_disappearing(seconds: u32) -> String {
 }
 
 /// Content-type filter for network message search (`SearchFilters::has`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchHas {
     Files,
     Links,
     Images,
+    Videos,
+    Embeds,
+    Sounds,
+    Stickers,
+    Polls,
+}
+
+/// Sort order for network message search (`SearchFilters::sort`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchSort {
+    #[default]
+    Newest,
+    Oldest,
+    Relevant,
+}
+
+impl SearchSort {
+    pub fn is_newest(&self) -> bool {
+        *self == SearchSort::Newest
+    }
 }
 
 /// Optional filters on `Request::SearchNetwork`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SearchFilters {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<Key>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mentions: Option<Key>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_channel: Option<Key>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has: Option<SearchHas>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1476,6 +1548,14 @@ pub struct SearchFilters {
     pub after: Option<i64>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub mentions_me: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_type: Option<String>,
+    #[serde(default, skip_serializing_if = "SearchSort::is_newest")]
+    pub sort: SearchSort,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub offset: u32,
 }
 
 impl SearchFilters {

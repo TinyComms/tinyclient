@@ -5605,6 +5605,7 @@ fn slack_search_filters_and_no_duplicate_in_modifier() {
         before: Some(1_767_225_600),
         after: Some(1_735_689_600),
         mentions_me: false,
+        ..Default::default()
     };
     let Response::MessageHits { .. } = world.ask(Request::SearchNetwork {
         conversation: Some(general.clone()),

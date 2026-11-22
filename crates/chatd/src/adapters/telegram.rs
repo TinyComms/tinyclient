@@ -765,9 +765,9 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::Watch(watching) => sync::on_screen(account, &watching),
         // Opening a forum lists its topics, once per open; the landing the shell then reads
         // from the store is named by what this read left.
-        Command::OpenForum { conversation_id, reply } => {
+        Command::OpenForum { conversation_id, reply, .. } => {
             sync::backfill(account, &conversation_id);
-            let _ = reply.send(Ok(()));
+            let _ = reply.send(Ok(None));
         }
         Command::Wanted(ids) => drop(account.files.asked(&ids)),
         Command::Previews(ids) => sync::previews(account, &ids),
@@ -888,7 +888,7 @@ fn serve(account: &Arc<Account>, command: Command) {
                 super::SearchScope::Account => info::search_global(account, &query, cursor.as_deref()).map_err(refused),
                 super::SearchScope::Space(_) => Err(Refusal::Unsupported),
             };
-            let _ = reply.send(result);
+            let _ = reply.send(result.map(super::SearchPage::from));
         }
         Command::SearchShared { conversation_id, kind, before, limit, reply } => {
             let _ = reply.send(info::shared(account, &conversation_id, kind, before.as_deref(), limit).map_err(refused));

@@ -1249,6 +1249,7 @@ impl Slack {
             mine: self.me.get().is_some_and(|me| event["user"] == me.as_str()),
             // The event names the one who acted; the store folds them into the list.
             who: event["user"].as_str().map(|user| vec![user.to_owned()]).unwrap_or_default(),
+            ..Reaction::default()
         };
         let added = event["type"] == "reaction_added";
         // The event does not say which thread a reply is in. The message is found in the
@@ -1581,7 +1582,7 @@ impl Slack {
                 if at.elapsed() >= SEARCH_PATIENCE {
                     drop(reply);
                 } else {
-                    answer(reply, self.search_messages(&query, &scope, &filters));
+                    answer(reply, self.search_messages(&query, &scope, &filters).map(super::SearchPage::from));
                 }
             }
             Command::SearchShared { conversation_id, kind, before, limit, reply } => {

@@ -202,12 +202,20 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
     }
     match (seen.method.as_str(), parts.as_slice()) {
         ("PUT", ["channels", channel, "messages", message, "reactions", emoji, "%40me"]) => {
-            let event = json!({"user_id": "1000", "channel_id": channel, "message_id": message, "emoji": emoji_of(emoji), "type": 0});
+            let burst = seen.path.contains("type=1");
+            let event = json!({
+                "user_id": "1000", "channel_id": channel, "message_id": message,
+                "emoji": emoji_of(emoji), "type": if burst { 1 } else { 0 }, "burst": burst,
+            });
             shared.push("MESSAGE_REACTION_ADD", event);
             (204, Value::Null)
         }
-        ("DELETE", ["channels", channel, "messages", message, "reactions", emoji, "0", "%40me"]) => {
-            let event = json!({"user_id": "1000", "channel_id": channel, "message_id": message, "emoji": emoji_of(emoji), "type": 0});
+        ("DELETE", ["channels", channel, "messages", message, "reactions", emoji, rtype, "%40me"]) => {
+            let burst = *rtype == "1" || seen.path.contains("burst=true");
+            let event = json!({
+                "user_id": "1000", "channel_id": channel, "message_id": message,
+                "emoji": emoji_of(emoji), "type": if burst { 1 } else { 0 }, "burst": burst,
+            });
             shared.push("MESSAGE_REACTION_REMOVE", event);
             (204, Value::Null)
         }
@@ -356,22 +364,16 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             });
             (200, json!({"items": [{"pinned_at": "2026-10-13T09:00:00.000000+00:00", "message": pinned}], "has_more": false}))
         }
-        ("GET", ["guilds", _, "messages", "search"]) | ("GET", ["channels", _, "messages", "search"]) => {
-            let channel = if parts[0] == "channels" { parts[1].to_owned() } else { "4101".to_owned() };
-            // The pane's words: text hits, and a 202 while the words ask for one being indexed.
-            if seen.path.contains("content=") {
-                if seen.path.contains("index") {
-                    return (202, json!({"code": 110000, "message": "Index not yet available"}));
-                }
-                let hit = json!({
-                    "id": "1300000000000000600", "channel_id": channel, "type": 0,
-                    "author": {"id": "200000000000000001", "username": "Ines Marchetti", "global_name": "Ines Marchetti", "discriminator": "0", "avatar": null},
-                    "content": "read the rules, they are short",
-                    "timestamp": "2026-10-13T08:15:00.000000+00:00", "edited_timestamp": null, "mentions": [], "mention_roles": [],
-                    "mention_everyone": false, "embeds": [], "pinned": false, "attachments": [],
-                });
-                (200, json!({"analytics_id": "a", "doing_deep_historical_index": false, "total_results": 1, "messages": [[hit]]}))
-            } else {
+        ("GET", ["guilds", _, "messages", "search"])
+        | ("GET", ["channels", _, "messages", "search"])
+        | ("GET", ["users", "@me", "messages", "search"]) => {
+            let channel = match parts[0] {
+                "channels" => parts[1].to_owned(),
+                "users" => "3001".to_owned(),
+                _ => "4101".to_owned(),
+            };
+            // Shared-pane queries always pass `limit=`; message searches use `sort_by=`.
+            if seen.path.contains("limit=") && !seen.path.contains("content=") {
                 let hit = json!({
                     "id": "1300000000000000600", "channel_id": channel, "type": 0, "author": me(), "content": "the map",
                     "timestamp": "2026-10-13T08:15:00.000000+00:00", "edited_timestamp": null, "mentions": [], "mention_roles": [],
@@ -380,6 +382,24 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
                                      "proxy_url": "https://media.discordapp.net/attachments/1/9001/map.png", "width": 640, "height": 480, "content_type": "image/png"}],
                 });
                 (200, json!({"analytics_id": "a", "doing_deep_historical_index": false, "total_results": 37, "messages": [[hit]]}))
+            } else if seen.path.contains("content=index") {
+                (202, json!({"code": 110000, "message": "Index not yet available"}))
+            } else {
+                let (id, text, total) = if seen.path.contains("offset=25") {
+                    ("1300000000000000601", "second page hit", 40)
+                } else if seen.path.contains("content=paged") {
+                    ("1300000000000000600", "first page hit", 40)
+                } else {
+                    ("1300000000000000600", "read the rules, they are short", 1)
+                };
+                let hit = json!({
+                    "id": id, "channel_id": channel, "type": 0,
+                    "author": {"id": "200000000000000001", "username": "Ines Marchetti", "global_name": "Ines Marchetti", "discriminator": "0", "avatar": null},
+                    "content": text,
+                    "timestamp": "2026-10-13T08:15:00.000000+00:00", "edited_timestamp": null, "mentions": [], "mention_roles": [],
+                    "mention_everyone": false, "embeds": [], "pinned": false, "attachments": [],
+                });
+                (200, json!({"analytics_id": "a", "doing_deep_historical_index": false, "total_results": total, "messages": [[hit]]}))
             }
         }
         ("GET", ["guilds", guild]) => (
@@ -480,7 +500,8 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
                 }),
             )
         }
-        ("POST", ["channels", channel, "threads"]) => {
+        // A plain thread. A forum post nests its starter under `message` and is answered further down.
+        ("POST", ["channels", channel, "threads"]) if seen.body.get("message").is_none() => {
             let id = shared.snowflake();
             let name = seen.body["name"].as_str().unwrap_or("Thread");
             let kind = seen.body["type"].as_u64().unwrap_or(11);
@@ -644,6 +665,53 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
                 "has_more": false,
             }),
         ),
+        // A forum or media post: the channel is the new thread, and the starter is nested.
+        ("POST", ["channels", channel, "threads"]) => {
+            let id = shared.snowflake();
+            let name = seen.body["name"].as_str().unwrap_or("Thread");
+            let starter = &seen.body["message"];
+            let sent = starter["attachments"].as_array().cloned().unwrap_or_default();
+            let attached: Vec<Value> = sent
+                .iter()
+                .enumerate()
+                .map(|(at, file)| {
+                    json!({"id": format!("880{at}"), "filename": file["filename"], "size": 4, "url": format!("https://cdn.discordapp.com/attachments/{id}/880{at}/f"),
+                           "content_type": "text/plain"})
+                })
+                .collect();
+            let message = json!({
+                "id": shared.snowflake(),
+                "channel_id": id,
+                "type": 0,
+                "author": me(),
+                "content": starter["content"],
+                "timestamp": "2026-10-13T08:15:00.000000+00:00",
+                "edited_timestamp": null,
+                "mentions": [],
+                "mention_roles": [],
+                "mention_everyone": false,
+                "attachments": attached,
+                "embeds": [],
+                "pinned": false,
+                "flags": starter["flags"],
+            });
+            (
+                200,
+                json!({
+                    "id": id,
+                    "type": 11,
+                    "name": name,
+                    "parent_id": channel,
+                    "guild_id": "4000",
+                    "owner_id": "1000",
+                    "message_count": 1,
+                    "member_count": 1,
+                    "thread_metadata": {"archived": false, "locked": false},
+                    "newly_created": true,
+                    "message": message,
+                }),
+            )
+        }
         ("POST", ["channels", _, "messages", _, "ack"]) => (200, json!({"token": null})),
         ("POST", ["read-states", "ack-bulk"]) => (200, json!({})),
         ("POST", ["channels", _, "typing"]) => (204, Value::Null),
@@ -1113,6 +1181,14 @@ fn allow_typing(world: &World, conversation: &Key) {
 
 /// Polls until `probe` has an answer. Everything here is the adapter reacting to the fake, so
 /// nothing is assumed to have happened by the time a request returns.
+/// A server channel keeps a live message once the shell has opened it. Opening is the history
+/// request: this channel has nothing cached, so the message has to be pushed after that request.
+fn open_channel(world: &World, id: &str) {
+    let _ = world.messages(id);
+    let path = format!("/channels/{id}/messages");
+    wait("the channel to be opened", || (!world.discord.requests_to("GET", &path).is_empty()).then_some(()));
+}
+
 fn wait<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -1283,7 +1359,15 @@ fn a_forum_opens_on_the_newest_activity_post_and_its_posts_are_no_tree_rows() {
     // lands on the post with the newest activity, read or not — here the read "Iterating",
     // though "Sorting" still sits unread. Telegram's own rule (newest unread, else General)
     // would have picked the other post.
-    let landing = || Request::Topics { forum: world.key("4106"), offset: 0, limit: 1, landing: true };
+    let landing = || Request::Topics {
+        forum: world.key("4106"),
+        offset: 0,
+        limit: 1,
+        landing: true,
+        sort: protocol::TopicSort::Activity,
+        tag: None,
+        query: None,
+    };
     let Response::Conversations { conversations, .. } = world.ask(landing()) else {
         panic!("no landing");
     };
@@ -1293,11 +1377,25 @@ fn a_forum_opens_on_the_newest_activity_post_and_its_posts_are_no_tree_rows() {
         ("4602", "Iterating a Vec in place", Some("4106")),
         "the landing is the newest activity, not the newest unread"
     );
-    // Opening the forum asked Discord nothing: its posts arrive on the socket as threads.
-    assert!(world.discord.requests_to("GET", "/channels/4106/").is_empty());
+    // Opening asks Discord for one page. This fake has no search answer, so the cache names
+    // the landing. The only ask under the forum is that search.
+    let searched = world.discord.requests_to("GET", "/channels/4106/");
+    assert_eq!(searched.len(), 1, "{searched:?}");
+    let path = searched[0].path.as_str();
+    assert!(path.starts_with("/channels/4106/threads/search"), "{path}");
+    assert!(path.contains("sort_by=last_message_time") && path.contains("sort_order=desc"), "{path}");
+    assert!(!path.contains("offset="), "{path}");
 
     // What the topics drill lists: the posts by their activity, a count on the unread one.
-    let drill = Request::Topics { forum: world.key("4106"), offset: 0, limit: 10, landing: false };
+    let drill = Request::Topics {
+        forum: world.key("4106"),
+        offset: 0,
+        limit: 10,
+        landing: false,
+        sort: protocol::TopicSort::Activity,
+        tag: None,
+        query: None,
+    };
     let Response::Conversations { conversations: posts, total, .. } = world.ask(drill) else {
         panic!("no posts");
     };
@@ -1315,6 +1413,317 @@ fn a_forum_opens_on_the_newest_activity_post_and_its_posts_are_no_tree_rows() {
     assert_eq!((forum.unread, forum.mentions), (1, 0), "{forum:?}");
 }
 
+fn forum_thread(id: &str, parent: &str, name: &str, tags: &[&str], flags: u64, last: &str, owner: &str, messages: u64, sent: u64) -> Value {
+    json!({
+        "id": id,
+        "type": 11,
+        "guild_id": "4000",
+        "parent_id": parent,
+        "name": name,
+        "owner_id": owner,
+        "flags": flags,
+        "applied_tags": tags,
+        "message_count": messages,
+        "total_message_sent": sent,
+        "last_message_id": last,
+    })
+}
+
+fn thread_search(threads: Vec<Value>, messages: Vec<Value>, total: u32, has_more: bool) -> Value {
+    json!({
+        "threads": threads,
+        "members": [],
+        "has_more": has_more,
+        "total_results": total,
+        "first_messages": messages,
+    })
+}
+
+fn forum_topics(world: &World, sort: protocol::TopicSort, tag: Option<&str>, query: Option<&str>, offset: u32) -> Response {
+    world.ask(Request::Topics {
+        forum: world.key("4106"),
+        offset,
+        limit: 25,
+        landing: false,
+        sort,
+        tag: tag.map(str::to_owned),
+        query: query.map(str::to_owned),
+    })
+}
+
+fn no_conversation(world: &World, id: &str) -> bool {
+    matches!(world.ask(Request::Conversation { conversation: world.key(id) }), Response::Error { code: ErrorCode::NotFound, .. })
+}
+
+/// True once CHANNEL_CREATE has written this channel into the guild note. That write happens
+/// before the view check, in the same call that stores a channel the account can read.
+fn forum_kept(world: &World, id: &str) -> bool {
+    let Ok(db) = rusqlite::Connection::open(world.dir.join("chat.sqlite")) else {
+        return false;
+    };
+    let Ok(value) = db.query_row(
+        "SELECT value FROM name WHERE network = 'discord' AND account = '1000' AND id = 'kept:4000'",
+        [],
+        |row| row.get::<_, String>(0),
+    ) else {
+        return false;
+    };
+    value.contains(&format!("\"i\":\"{id}\""))
+}
+
+#[test]
+fn a_forum_lists_a_tagged_page_then_a_sort_then_an_older_page_and_refuses_one_that_cannot_be_read() {
+    let world = World::start();
+    let search = "/channels/4106/threads/search";
+    let starter = json!({
+        "id": "1300000000000001001",
+        "channel_id": "4701",
+        "content": "lichen on the north plank",
+        "author": {"id": "2001", "username": "ada", "discriminator": "0"},
+        "attachments": [{
+            "id": "att1",
+            "filename": "lichen.jpg",
+            "size": 1200,
+            "url": "https://cdn.discordapp.com/attachments/4701/att1/lichen.jpg",
+            "proxy_url": "https://media.discordapp.net/attachments/4701/att1/lichen.jpg",
+            "width": 640,
+            "height": 480,
+            "content_type": "image/jpeg"
+        }],
+        "reactions": [{"count": 3, "emoji": {"id": null, "name": "👍"}}]
+    });
+    world.discord.script(search, 200, thread_search(
+        vec![
+            forum_thread("4701", "4106", "Lichen on the bench", &["9001"], 2, "1300080000000002000", "2001", 4, 6),
+            forum_thread("4799", "4101", "Not this forum", &["9001"], 0, "1300000000000000100", "2002", 1, 1),
+            forum_thread("4798", "4106", "Wrong tag", &["9002"], 0, "1300000000000000200", "2002", 1, 1),
+        ],
+        vec![starter],
+        1,
+        false,
+    ));
+    world.discord.script(search, 200, thread_search(
+        vec![
+            forum_thread("4702", "4106", "Older growth", &[], 0, "1300000000000000500", "2002", 1, 1),
+            forum_thread("4701", "4106", "Lichen on the bench", &["9001"], 0, "1300080000000002000", "2001", 4, 6),
+        ],
+        Vec::new(),
+        2,
+        false,
+    ));
+    world.discord.script(search, 200, thread_search(
+        vec![forum_thread("4703", "4106", "South plank", &["9001"], 0, "1300000000000000100", "2006", 2, 2)],
+        Vec::new(),
+        40,
+        true,
+    ));
+
+    let Response::Conversations { conversations, total, .. } = forum_topics(&world, protocol::TopicSort::Activity, Some("9001"), None, 0) else {
+        panic!("no tagged page");
+    };
+    assert_eq!(total, 1);
+    assert_eq!(ids(&conversations), ["4701"]);
+    let post = &conversations[0];
+    assert_eq!(post.tags, ["9001"]);
+    assert!(post.preview.contains("lichen"), "{post:?}");
+    assert_eq!((post.message_count, post.total_message_sent), (4, 6));
+    assert_eq!(post.pin, Some(0));
+    assert_eq!(post.reaction, "👍");
+    assert_eq!(post.owner, "2001");
+    assert_eq!(post.thumbnail.as_ref().map(|file| file.id.as_str()), Some("att:att1:thumb"));
+    assert_eq!(post.parent.as_deref(), Some("4106"));
+    assert!(no_conversation(&world, "4799"), "a post from another channel is not kept");
+    assert!(no_conversation(&world, "4798"), "a post that lacks the tag is not kept");
+    let asked = world.discord.requests_to("GET", "/channels/4106/");
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    let path = asked[0].path.as_str();
+    assert!(path.starts_with(search), "{path}");
+    assert!(path.contains("sort_by=last_message_time") && path.contains("sort_order=desc") && path.contains("tag=9001"), "{path}");
+    assert!(!path.contains("offset=") && !path.contains("name=") && !path.contains("archived"), "{path}");
+
+    // 4702's last message is older, so a cache ordered by activity would put 4701 first.
+    // Discord's creation order is what comes back, and flags 0 clears the pin from the page above.
+    let Response::Conversations { conversations, total, .. } = forum_topics(&world, protocol::TopicSort::Created, None, None, 0) else {
+        panic!("no sorted page");
+    };
+    assert_eq!(total, 2);
+    assert_eq!(ids(&conversations), ["4702", "4701"]);
+    assert_eq!(world.conversation("4701").pin, None);
+    let asked = world.discord.requests_to("GET", "/channels/4106/threads/search");
+    assert_eq!(asked.len(), 2, "{asked:?}");
+    let path = asked[1].path.as_str();
+    assert!(path.contains("sort_by=creation_time") && path.contains("sort_order=desc"), "{path}");
+    assert!(!path.contains("offset=") && !path.contains("tag=") && !path.contains("name="), "{path}");
+
+    let Response::Conversations { conversations, total, .. } = forum_topics(&world, protocol::TopicSort::Activity, None, Some("lichen"), 25) else {
+        panic!("no older page");
+    };
+    assert_eq!(total, 40);
+    assert_eq!(ids(&conversations), ["4703"]);
+    let asked = world.discord.requests_to("GET", "/channels/4106/threads/search");
+    assert_eq!(asked.len(), 3, "{asked:?}");
+    let path = asked[2].path.as_str();
+    assert!(path.contains("sort_by=last_message_time") && path.contains("name=lichen") && path.contains("offset=25"), "{path}");
+    assert!(path.starts_with(search) && !path.contains("archived"), "{path}");
+
+    // A forum the account cannot see is kept in the note and never stored. The search is
+    // scripted to succeed, so a fetch would come back as posts rather than a refusal.
+    world.discord.script("/channels/4109/threads/search", 200, thread_search(
+        vec![forum_thread("4710", "4109", "Should not load", &[], 0, "1300000000000003000", "2001", 1, 1)],
+        Vec::new(),
+        1,
+        false,
+    ));
+    world.discord.push("CHANNEL_CREATE", json!({
+        "id": "4109", "type": 15, "guild_id": "4000", "name": "sealed", "position": 9, "parent_id": "4100",
+        "permission_overwrites": [{"id": "4000", "type": 0, "allow": "0", "deny": "1024"}]
+    }));
+    let seen = std::cell::Cell::new(false);
+    wait("the sealed forum settled", || {
+        if !forum_kept(&world, "4109") {
+            seen.set(false);
+            return None;
+        }
+        if !seen.get() {
+            seen.set(true);
+            return None;
+        }
+        Some(())
+    });
+    assert!(no_conversation(&world, "4109"), "a forum the account cannot read is not stored");
+    match world.ask(Request::Topics {
+        forum: world.key("4109"),
+        offset: 0,
+        limit: 25,
+        landing: false,
+        sort: protocol::TopicSort::Activity,
+        tag: None,
+        query: None,
+    }) {
+        Response::Error { code, detail } => {
+            assert_eq!(code, ErrorCode::Refused);
+            assert!(detail.contains("cannot read"), "{detail}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(world.discord.requests_to("GET", "/channels/4109/").is_empty());
+}
+
+#[test]
+fn a_forum_post_is_created_with_a_tag_and_a_file_and_a_media_channel_needs_one() {
+    let world = World::start();
+    let info = world.ask(Request::ForumInfo { forum: world.key("4106") });
+    let Response::ForumInfo { info } = info else { panic!("{info:?}") };
+    assert_eq!(info.guidelines, "Say what you tried.");
+    assert!(info.require_tag && !info.media);
+    assert_eq!(info.default_slowmode, 30);
+    assert_eq!(info.tags.len(), 2);
+    assert_eq!((info.tags[0].id.as_str(), info.tags[0].name.as_str(), info.tags[0].emoji.as_str(), info.tags[0].moderated), ("9001", "question", "❓", false));
+    assert_eq!((info.tags[1].id.as_str(), info.tags[1].emoji.as_str(), info.tags[1].moderated), ("9002", "ferris", true));
+
+    let post = |title: &str, text: &str, tags: &[&str], with: protocol::Outgoing| {
+        world.ask(Request::ForumPost {
+            forum: world.key("4106"),
+            title: title.into(),
+            text: text.into(),
+            tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+            with,
+        })
+    };
+    match post("", "hello", &["9001"], Default::default()) {
+        Response::Error { code, detail } => {
+            assert_eq!(code, ErrorCode::Refused);
+            assert_eq!(detail, "A post needs a title.");
+        }
+        other => panic!("{other:?}"),
+    }
+    match post("Need a tag", "hello", &[], Default::default()) {
+        Response::Error { code, detail } => {
+            assert_eq!(code, ErrorCode::Refused);
+            assert_eq!(detail, "This forum requires a tag.");
+        }
+        other => panic!("{other:?}"),
+    }
+    match post("Bad tag", "hello", &["nope"], Default::default()) {
+        Response::Error { code, detail } => {
+            assert_eq!(code, ErrorCode::Refused);
+            assert_eq!(detail, "That tag is not on this forum.");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(world.discord.requests_to("POST", "/channels/4106/threads").is_empty());
+
+    let notes = staged(&world, "tried.txt", 4);
+    let with = protocol::Outgoing { files: vec![file(&notes, false)], ..Default::default() };
+    let created = post("  Cargo  won't  build  ", "I tried clean.", &["9001"], with);
+    let Response::Conversation { conversation } = created else { panic!("{created:?}") };
+    assert_eq!(conversation.title, "Cargo won't build");
+    assert_eq!(conversation.kind, ConversationKind::Thread);
+    assert_eq!(conversation.parent.as_deref(), Some("4106"));
+    assert_eq!(conversation.root.as_deref(), Some(conversation.key.id.as_str()));
+    assert!(conversation.space.is_none() && conversation.group.is_none());
+    let (_, rows) = world.tree("4000");
+    assert_eq!(ids(&rows), ["4105", "4101", "4500", "4102", "4104", "4106", "4201", "4202"]);
+    assert!(!ids(&rows).contains(&conversation.key.id.as_str()));
+    let Response::Conversations { conversations: posts, .. } = world.ask(Request::Topics {
+        forum: world.key("4106"),
+        offset: 0,
+        limit: 10,
+        landing: false,
+        sort: protocol::TopicSort::Activity,
+        tag: None,
+        query: None,
+    }) else {
+        panic!("no posts");
+    };
+    assert!(posts.iter().any(|row| row.key.id == conversation.key.id), "{posts:?}");
+    let stored = world.messages(&conversation.key.id);
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    assert_eq!(stored[0].text, "I tried clean.");
+    assert_eq!(stored[0].attachments.len(), 1);
+    assert_eq!(stored[0].attachments[0].name, "tried.txt");
+
+    let created_at = world.discord.requests_to("POST", "/channels/4106/threads");
+    assert_eq!(created_at.len(), 1);
+    assert!(created_at[0].path.contains("use_nested_fields=true"), "{}", created_at[0].path);
+    assert_eq!(created_at[0].body["name"], "Cargo won't build");
+    assert_eq!(created_at[0].body["auto_archive_duration"], 4320);
+    assert_eq!(created_at[0].body["applied_tags"], json!(["9001"]));
+    assert_eq!(created_at[0].body["message"]["content"], "I tried clean.");
+    assert_eq!(
+        created_at[0].body["message"]["attachments"],
+        json!([{"id": "0", "filename": "tried.txt", "uploaded_filename": "up/tried.txt"}])
+    );
+    assert_eq!(world.discord.requests_to("POST", "/channels/4106/attachments").len(), 1);
+
+    // A media channel (type 16) that also requires a tag. The tag is present and the file is
+    // not, so the refusal is the missing file and nothing is uploaded.
+    world.discord.push("CHANNEL_CREATE", json!({
+        "id": "4108", "type": 16, "guild_id": "4000", "name": "clips", "position": 5, "parent_id": "4100",
+        "flags": 16, "available_tags": [{"id": "9100", "name": "clip"}], "permission_overwrites": []
+    }));
+    wait("the media channel", || match world.ask(Request::Conversation { conversation: world.key("4108") }) {
+        Response::Conversation { conversation } if conversation.kind == ConversationKind::Forum => Some(()),
+        _ => None,
+    });
+    let media = world.ask(Request::ForumPost {
+        forum: world.key("4108"),
+        title: "A clip".into(),
+        text: "look".into(),
+        tags: vec!["9100".into()],
+        with: Default::default(),
+    });
+    match media {
+        Response::Error { code, detail } => {
+            assert_eq!(code, ErrorCode::Refused);
+            assert_eq!(detail, "A media channel needs a file.");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(world.discord.requests_to("POST", "/channels/4108/threads").is_empty());
+    assert!(world.discord.requests_to("POST", "/channels/4108/attachments").is_empty());
+}
+
 #[test]
 fn a_post_arriving_while_connected_is_recorded_under_its_forum_never_as_a_row() {
     let world = World::start();
@@ -1330,13 +1739,29 @@ fn a_post_arriving_while_connected_is_recorded_under_its_forum_never_as_a_row() 
 
     // It is read under the forum: the topics drill lists it by its activity, and the landing
     // is its own newest activity, though the tree never grows a row for it (`polish/01` §3).
-    let drill = || world.ask(Request::Topics { forum: world.key("4106"), offset: 0, limit: 10, landing: false });
+    let drill = || world.ask(Request::Topics {
+        forum: world.key("4106"),
+        offset: 0,
+        limit: 10,
+        landing: false,
+        sort: protocol::TopicSort::Activity,
+        tag: None,
+        query: None,
+    });
     let posts = wait("the post recorded under the forum", || match drill() {
         Response::Conversations { conversations, total, .. } if conversations.len() == 3 && total == 3 => Some(conversations),
         _ => None,
     });
     assert_eq!(ids(&posts), ["4603", "4602", "4601"], "{posts:?}");
-    let landing = Request::Topics { forum: world.key("4106"), offset: 0, limit: 1, landing: true };
+    let landing = Request::Topics {
+        forum: world.key("4106"),
+        offset: 0,
+        limit: 1,
+        landing: true,
+        sort: protocol::TopicSort::Activity,
+        tag: None,
+        query: None,
+    };
     let Response::Conversations { conversations, .. } = world.ask(landing) else {
         panic!("no landing");
     };
@@ -4034,9 +4459,101 @@ fn search_asks_discord_itself_for_a_space_and_a_conversation_and_tells_of_an_ind
     let not_ready = world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "index".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
     assert!(matches!(&not_ready, Response::Error { detail, .. } if detail.contains("isn't ready")), "{not_ready:?}");
 
-    // Paced: Enter again at once is refused in words, so no client can turn it into a burst.
-    let paced = world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "again".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None  });
-    assert!(matches!(&paced, Response::Error { detail, .. } if detail.contains("paced")), "{paced:?}");
+    // Paced: Enter again at once queues and waits out the gap instead of refusing.
+    let started = Instant::now();
+    let queued = world.ask(Request::SearchNetwork { conversation: None, space: Some(world.key("4000")), query: "again".into(), account: None, network: None, filters: protocol::SearchFilters::default(), cursor: None });
+    assert!(matches!(&queued, Response::MessageHits { hits, total: Some(1), .. } if hits.len() == 1), "{queued:?}");
+    assert!(started.elapsed() >= Duration::from_millis(350), "rapid search must wait its pacing gap");
+}
+
+#[test]
+fn search_maps_all_filters_sort_paging_and_all_dms_route() {
+    let world = polished();
+    let filters = protocol::SearchFilters {
+        from: Some(world.key("200000000000000001")),
+        mentions: Some(world.key("200000000000000002")),
+        in_channel: Some(world.key("4101")),
+        has: Some(protocol::SearchHas::Videos),
+        before: Some(1_767_225_600),
+        after: Some(1_735_689_600),
+        mentions_me: false,
+        pinned: Some(true),
+        author_type: Some("bot".into()),
+        sort: protocol::SearchSort::Oldest,
+        offset: 0,
+    };
+    let page1 = world.ask(Request::SearchNetwork {
+        conversation: None,
+        space: Some(world.key("4000")),
+        account: None,
+        network: None,
+        query: "paged".into(),
+        filters: filters.clone(),
+        cursor: None,
+    });
+    let Response::MessageHits { hits, cursor, total, .. } = page1 else {
+        panic!("expected MessageHits, got {page1:?}");
+    };
+    assert_eq!(hits.len(), 1);
+    assert_eq!(total, Some(40));
+    assert_eq!(cursor.as_deref(), Some("25"));
+    let req1 = world.discord.requests_to("GET", "/guilds/4000/messages/search").pop().unwrap();
+    for expected in [
+        "channel_id=4101",
+        "content=paged",
+        "author_id=200000000000000001",
+        "mentions=200000000000000002",
+        "has=video",
+        "min_id=",
+        "max_id=",
+        "pinned=true",
+        "author_type=bot",
+        "sort_by=timestamp&sort_order=asc",
+    ] {
+        assert!(req1.path.contains(expected), "missing {expected} in {}", req1.path);
+    }
+
+    // Second page passes offset=25 via cursor and exhausts cursor once offset+25 >= total (40).
+    let page2 = world.ask(Request::SearchNetwork {
+        conversation: None,
+        space: Some(world.key("4000")),
+        account: None,
+        network: None,
+        query: "paged".into(),
+        filters,
+        cursor,
+    });
+    let Response::MessageHits { hits: hits2, cursor: cursor2, total: total2, .. } = page2 else {
+        panic!("expected MessageHits page 2, got {page2:?}");
+    };
+    assert_eq!(hits2[0].message_id, "1300000000000000601");
+    assert_eq!(total2, Some(40));
+    assert_eq!(cursor2, None);
+    let req2 = world.discord.requests_to("GET", "/guilds/4000/messages/search").pop().unwrap();
+    assert!(req2.path.contains("offset=25"), "{}", req2.path);
+
+    // All-DMs scope hits /users/@me/messages/search and supports Relevance sort + mentions_me.
+    let all_dms = world.ask(Request::SearchNetwork {
+        conversation: None,
+        space: None,
+        account: Some(world.account()),
+        network: None,
+        query: "hello".into(),
+        filters: protocol::SearchFilters {
+            mentions_me: true,
+            sort: protocol::SearchSort::Relevant,
+            ..Default::default()
+        },
+        cursor: None,
+    });
+    let Response::MessageHits { hits: dm_hits, .. } = all_dms else {
+        panic!("expected MessageHits for all-DMs, got {all_dms:?}");
+    };
+    assert_eq!(dm_hits.len(), 1);
+    assert_eq!(dm_hits[0].conversation, world.key("3001"));
+    let req3 = world.discord.requests_to("GET", "/users/@me/messages/search").pop().unwrap();
+    assert!(req3.path.contains("mentions=1000"), "{}", req3.path);
+    assert!(req3.path.contains("sort_by=relevance&sort_order=desc"), "{}", req3.path);
 }
 
 /// A file of `size` bytes beside the world's directory: chatd never sends from its own.
@@ -5219,6 +5736,7 @@ fn invite_preview_join_and_error_translation() {
     match world.ask(Request::InvitePreview {
         account: account.clone(),
         code: "https://discord.gg/rustlang?foo=1".into(),
+        event_id: None,
     }) {
         Response::InvitePreview { preview } => {
             assert_eq!(preview.code, "rustlang");
@@ -5821,6 +6339,209 @@ fn recent_mentions_fetch_filter_and_dismiss() {
         Response::Ok
     );
     assert_eq!(world.discord.requests_to("DELETE", "/users/@me/mentions/1300000000000090001").len(), 1);
+}
+
+#[test]
+fn super_reactions_split_counts_follow_burst_events_and_send_with_nitro() {
+    // Nitro account (premium_type: 2) enables burst_reactions and ReactionRules::burst.
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    ready["user"]["premium_type"] = json!(2);
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+
+    let dm = "5001";
+    open_channel(&world, dm);
+    let msg_id = world.incoming(dm, None, "burst test", json!({
+        "reactions": [{
+            "count": 5,
+            "count_details": {"burst": 2, "normal": 3},
+            "me": false,
+            "me_burst": true,
+            "burst_colors": ["#ff6b6b", "#feca57"],
+            "emoji": {"id": null, "name": "🔥"}
+        }]
+    }));
+    let loaded = wait("message with count_details", || {
+        world.messages(dm).into_iter().find(|m| m.id == msg_id)
+    });
+    assert_eq!(loaded.reactions.len(), 1);
+    let r = &loaded.reactions[0];
+    assert_eq!((r.count, r.mine, r.burst, r.mine_burst), (3, false, 2, true));
+    assert_eq!(r.burst_colors, vec!["#ff6b6b", "#feca57"]);
+
+    // ReactionRules exposes burst = true for Nitro.
+    match world.ask(Request::Reactions { conversation: world.key(dm) }) {
+        Response::Reactions { rules, .. } => assert!(rules.burst),
+        other => panic!("expected Response::Reactions, got {other:?}"),
+    }
+
+    // Live MESSAGE_REACTION_ADD with burst=true increments burst without touching normal count.
+    world.discord.push("MESSAGE_REACTION_ADD", json!({
+        "user_id": "2002", "channel_id": dm, "message_id": msg_id,
+        "emoji": {"id": null, "name": "🔥"}, "burst": true, "type": 1,
+        "burst_colors": ["#ff6b6b"]
+    }));
+    let after_add = wait("burst increment", || {
+        world.messages(dm).into_iter().find(|m| m.id == msg_id && m.reactions.first().is_some_and(|r| r.burst == 3))
+    });
+    assert_eq!(after_add.reactions[0].count, 3);
+
+    // Removing my super reaction sends DELETE .../1/%40me?...&burst=true.
+    assert_eq!(
+        world.ask(Request::React {
+            conversation: world.key(dm),
+            message_id: msg_id.clone(),
+            emoji: "🔥".into(),
+            on: false,
+            burst: true,
+        }),
+        Response::Ok
+    );
+    let del_reqs = world.discord.requests_to("DELETE", &format!("/channels/{dm}/messages/{msg_id}/reactions/"));
+    assert_eq!(del_reqs.len(), 1);
+    assert!(del_reqs[0].path.contains("/1/%40me") && del_reqs[0].path.contains("burst=true"), "{}", del_reqs[0].path);
+
+    // Adding a super reaction sends PUT .../%40me?...&type=1.
+    assert_eq!(
+        world.ask(Request::React {
+            conversation: world.key(dm),
+            message_id: msg_id.clone(),
+            emoji: "🎉".into(),
+            on: true,
+            burst: true,
+        }),
+        Response::Ok
+    );
+    let put_reqs = world.discord.requests_to("PUT", &format!("/channels/{dm}/messages/{msg_id}/reactions/"));
+    assert_eq!(put_reqs.len(), 1);
+    assert!(put_reqs[0].path.contains("type=1"), "{}", put_reqs[0].path);
+}
+
+#[test]
+fn invite_and_event_cards_detect_resolve_cache_and_toggle_interest() {
+    let world = World::launch(&[], |_| {});
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+    let account = world.key("5001").account();
+
+    // 1. Incoming message with an invite+event link and a standalone event link attaches MessageInvite cards lazily.
+    let dm = "5001";
+    open_channel(&world, dm);
+    let msg_id = world.incoming(
+        dm,
+        None,
+        "Come hang out https://discord.gg/moss?event=777 and https://discord.com/events/4000/888",
+        json!({}),
+    );
+    let loaded = wait("message with invites", || {
+        world.messages(dm).into_iter().find(|m| m.id == msg_id)
+    });
+    assert_eq!(loaded.invites.len(), 2);
+    assert_eq!(loaded.invites[0].code, "moss");
+    assert_eq!(loaded.invites[0].event.as_ref().map(|e| e.id.as_str()), Some("777"));
+    assert_eq!(loaded.invites[1].space_id.as_deref(), Some("4000"));
+    assert_eq!(loaded.invites[1].event.as_ref().map(|e| e.id.as_str()), Some("888"));
+    // No HTTP requests happened during message translation.
+    assert!(world.discord.requests_to("GET", "/invites/").is_empty());
+
+    // 2. Resolving the invite with event_id fetches with guild_scheduled_event_id and caches per session.
+    world.discord.script(
+        "/invites/moss",
+        200,
+        json!({
+            "code": "moss",
+            "guild": {"id": "4000", "name": "Moss", "icon": null, "description": "Trail talk"},
+            "channel": {"id": "4101", "name": "general"},
+            "approximate_member_count": 420,
+            "approximate_presence_count": 88,
+            "guild_scheduled_event": {
+                "id": "777",
+                "guild_id": "4000",
+                "name": "Trail Cleanup",
+                "scheduled_start_time": "2026-11-22T18:00:00+00:00",
+                "entity_metadata": {"location": "North Ridge"},
+                "user_count": 14
+            }
+        }),
+    );
+    match world.ask(Request::InvitePreview {
+        account: account.clone(),
+        code: "moss".into(),
+        event_id: Some("777".into()),
+    }) {
+        Response::InvitePreview { preview } => {
+            assert_eq!(preview.name, "Moss");
+            assert!(preview.joined, "guild 4000 is already joined in READY");
+            let ev = preview.event.expect("attached scheduled event");
+            assert_eq!(ev.name, "Trail Cleanup");
+            assert_eq!(ev.place, "North Ridge");
+            assert_eq!(ev.interested_count, Some(14));
+            assert!(ev.start.is_some());
+        }
+        other => panic!("expected Response::InvitePreview, got {other:?}"),
+    }
+    let reqs = world.discord.requests_to("GET", "/invites/moss");
+    assert_eq!(reqs.len(), 1);
+    assert!(reqs[0].path.contains("guild_scheduled_event_id=777"), "{}", reqs[0].path);
+
+    // Second request hits the session cache with zero additional HTTP calls.
+    assert!(matches!(
+        world.ask(Request::InvitePreview {
+            account: account.clone(),
+            code: "moss".into(),
+            event_id: Some("777".into()),
+        }),
+        Response::InvitePreview { .. }
+    ));
+    assert_eq!(world.discord.requests_to("GET", "/invites/moss").len(), 1);
+
+    // 3. Standalone EventPreview + EventInterest PUT and DELETE.
+    world.discord.script(
+        "/guilds/4000/scheduled-events/888",
+        200,
+        json!({
+            "id": "888",
+            "guild_id": "4000",
+            "name": "Night Hike",
+            "scheduled_start_time": "2026-11-23T02:00:00+00:00",
+            "entity_metadata": {"location": "Pine Trail"},
+            "user_count": 7
+        }),
+    );
+    match world.ask(Request::EventPreview {
+        space: world.key("4000"),
+        event_id: "888".into(),
+    }) {
+        Response::EventPreview { event } => {
+            assert_eq!(event.name, "Night Hike");
+            assert_eq!(event.place, "Pine Trail");
+            assert_eq!(event.interested_count, Some(7));
+        }
+        other => panic!("expected Response::EventPreview, got {other:?}"),
+    }
+
+    world.discord.script("/guilds/4000/scheduled-events/888/users/@me", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::EventLinkInterest {
+            space: world.key("4000"),
+            event_id: "888".into(),
+            interested: true,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("PUT", "/guilds/4000/scheduled-events/888/users/@me").len(), 1);
+
+    world.discord.script("/guilds/4000/scheduled-events/888/users/@me", 204, json!(null));
+    assert_eq!(
+        world.ask(Request::EventLinkInterest {
+            space: world.key("4000"),
+            event_id: "888".into(),
+            interested: false,
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("DELETE", "/guilds/4000/scheduled-events/888/users/@me").len(), 1);
 }
 
 #[test]

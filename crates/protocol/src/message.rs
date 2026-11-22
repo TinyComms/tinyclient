@@ -24,6 +24,8 @@ pub const DELIVERIES_LIMIT: usize = 256;
 pub const MESSAGE_CONTROLS_LIMIT: usize = 32;
 /// Most selectable options on a single menu, radio group, or checkbox group.
 pub const CONTROL_OPTIONS_LIMIT: usize = 100;
+/// Most invite or event cards attached to one message.
+pub const MESSAGE_INVITES_LIMIT: usize = 3;
 
 /// Cuts text from a network to at most `chars` characters, so no frame grows with what a
 /// stranger typed.
@@ -140,6 +142,18 @@ pub enum Style {
     Emoji {
         file: MediaFile,
     },
+    /// A timestamp token (e.g. Discord `<t:unix:form>`). The underlying text carries neutral
+    /// fallback words for search snippets and notifications; the shell formats `unix` in the
+    /// user's locale and ticks relative (`'R'`) timestamps while on screen.
+    Time {
+        unix: i64,
+        #[serde(default = "default_time_form")]
+        form: char,
+    },
+}
+
+fn default_time_form() -> char {
+    'f'
 }
 
 /// A styled range of [`Message::text`]. `start` and `end` are byte offsets into the UTF-8 text
@@ -233,12 +247,13 @@ pub struct Preview {
 /// sends, never a reason to ask again.
 pub const REACTION_REACTORS: usize = 50;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reaction {
     /// The emoji itself, or `:name:` for a custom one.
     pub emoji: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<MediaFile>,
+    #[serde(default)]
     pub count: u32,
     #[serde(default, skip_serializing_if = "is_false")]
     pub mine: bool,
@@ -248,6 +263,15 @@ pub struct Reaction {
     /// (Telegram in channels and large groups): the chip then stays a number and says so.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub who: Vec<String>,
+    /// Discord super / burst reaction count. Separate from `count` (normal reactions).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub burst: u32,
+    /// Whether this account gave a super / burst reaction with this emoji.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mine_burst: bool,
+    /// Accent colours Discord assigns to a super reaction (`#RRGGBB` hex strings, at most 4).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub burst_colors: Vec<String>,
 }
 
 /// One person who reacted to a message (`Request::Reactors`).
@@ -713,6 +737,61 @@ pub struct MessageControl {
     pub kind: ControlKind,
 }
 
+/// Resolution state of a Space invite or scheduled-event card on a message.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InviteState {
+    #[default]
+    Unresolved,
+    Valid,
+    Joined,
+    Invalid,
+}
+
+/// Metadata for a scheduled event (e.g. Discord `guild_scheduled_event`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledEvent {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub guild_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// Unix seconds when the event starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<i64>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub place: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interested_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub interested: bool,
+}
+
+/// A Space invite or scheduled-event link detected inside a message, resolved lazily when on screen.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageInvite {
+    /// Invite code (e.g. `rustlang`), empty for a standalone event link.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub code: String,
+    /// Canonical HTTPS link to open in the official app / browser when handing off.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub space_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<MediaFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub members: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub online: Option<u32>,
+    #[serde(default)]
+    pub state: InviteState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<ScheduledEvent>,
+}
+
 /// Maximum inline button rows kept on a single message.
 pub const MESSAGE_BUTTON_ROWS_LIMIT: usize = 32;
 /// Maximum buttons kept in a single inline button row.
@@ -905,6 +984,9 @@ pub struct Message {
     /// Interactive app/bot controls (Slack Block Kit buttons, menus, pickers, checkboxes, radios).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub controls: Vec<MessageControl>,
+    /// Server invite or scheduled-event cards detected in the message text (resolved lazily on screen).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub invites: Vec<MessageInvite>,
     /// Inline keyboard button rows under a bot message (Telegram `replyInlineMarkup`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub buttons: Vec<Vec<InlineButton>>,
@@ -1026,6 +1108,7 @@ impl Message {
             sent_via: None,
             permalink: String::new(),
             controls: Vec::new(),
+            invites: Vec::new(),
             buttons: Vec::new(),
             jump: None,
             published: false,
@@ -1055,6 +1138,10 @@ impl Message {
             reaction.who.truncate(REACTION_REACTORS);
             for id in &mut reaction.who {
                 clip(id, 200);
+            }
+            reaction.burst_colors.truncate(4);
+            for color in &mut reaction.burst_colors {
+                clip(color, 16);
             }
         }
         if let Some(forwarded) = &mut self.forwarded {
@@ -1165,6 +1252,18 @@ impl Message {
                 }
             }
         }
+        self.invites.truncate(MESSAGE_INVITES_LIMIT);
+        for invite in &mut self.invites {
+            clip(&mut invite.code, 128);
+            clip(&mut invite.url, 512);
+            clip(&mut invite.space_name, 200);
+            if let Some(ev) = &mut invite.event {
+                clip(&mut ev.id, 64);
+                clip(&mut ev.guild_id, 64);
+                clip(&mut ev.name, 200);
+                clip(&mut ev.place, 200);
+            }
+        }
         self.buttons.truncate(MESSAGE_BUTTON_ROWS_LIMIT);
         for row in &mut self.buttons {
             row.truncate(MESSAGE_BUTTONS_PER_ROW_LIMIT);
@@ -1198,6 +1297,7 @@ impl Message {
         self.card = None;
         self.cards.clear();
         self.controls.clear();
+        self.invites.clear();
         self.buttons.clear();
         self.jump = None;
         self.poll = None;
@@ -1226,6 +1326,7 @@ impl Message {
         attached
             .chain(self.previews.iter().filter_map(|preview| preview.image.as_ref()))
             .chain(cards)
+            .chain(self.invites.iter().filter_map(|invite| invite.icon.as_ref()))
             .chain(self.reactions.iter().filter_map(|reaction| reaction.file.as_ref()))
             .chain(emoji)
             .chain(self.reply_to.as_ref().and_then(|reply| reply.thumb.as_ref()))
@@ -1251,6 +1352,7 @@ impl Message {
         attached
             .chain(self.previews.iter_mut().filter_map(|preview| preview.image.as_mut()))
             .chain(cards)
+            .chain(self.invites.iter_mut().filter_map(|invite| invite.icon.as_mut()))
             .chain(self.reactions.iter_mut().filter_map(|reaction| reaction.file.as_mut()))
             .chain(emoji)
             .chain(self.reply_to.as_mut().and_then(|reply| reply.thumb.as_mut()))
@@ -1266,17 +1368,32 @@ mod tests {
     /// holds the list to its cap.
     #[test]
     fn reaction_reactors_read_and_stay_bounded() {
-        let plain = Reaction { emoji: "👍".into(), file: None, count: 1, mine: false, who: Vec::new() };
+        let plain = Reaction { emoji: "👍".into(), file: None, count: 1, mine: false, who: Vec::new(), ..Reaction::default() };
         let on = serde_json::to_string(&plain).unwrap();
         assert!(!on.contains("who"), "an empty list stays off the wire");
+        assert!(!on.contains("burst"), "zero burst fields stay off the wire");
         assert_eq!(serde_json::from_str::<Reaction>(&on).unwrap(), plain);
 
         let older = r#"{"emoji":"👍","count":2,"mine":false}"#;
-        assert_eq!(serde_json::from_str::<Reaction>(older).unwrap().who, Vec::<String>::new());
+        let parsed: Reaction = serde_json::from_str(older).unwrap();
+        assert_eq!(parsed.who, Vec::<String>::new());
+        assert_eq!((parsed.burst, parsed.mine_burst), (0, false));
+
+        let super_rx = Reaction {
+            emoji: "🔥".into(),
+            count: 2,
+            mine: false,
+            burst: 3,
+            mine_burst: true,
+            burst_colors: vec!["#ff6b6b".into(), "#feca57".into()],
+            ..Reaction::default()
+        };
+        let wire = serde_json::to_string(&super_rx).unwrap();
+        assert_eq!(serde_json::from_str::<Reaction>(&wire).unwrap(), super_rx);
 
         let mut message = Message::plain("m1", "Ada", "hi", 1_700_000_000, false);
         let many: Vec<String> = (0..REACTION_REACTORS - 1).map(|one| format!("u{one}")).collect();
-        let mut named = Reaction { emoji: "👍".into(), file: None, count: 60, mine: false, who: many };
+        let mut named = Reaction { emoji: "👍".into(), file: None, count: 60, mine: false, who: many, ..Reaction::default() };
         named.who.insert(1, "u".repeat(500));
         message.reactions.push(named);
         message.bound();
@@ -1447,6 +1564,51 @@ mod tests {
         let story_wire = serde_json::to_string(&story_reply).unwrap();
         assert!(story_wire.contains(r#""story":true"#));
         assert!(serde_json::from_str::<ReplyTo>(&story_wire).unwrap().story);
+    }
+
+    #[test]
+    fn style_time_round_trips_and_defaults_form() {
+        let span = Span { start: 0, end: 10, style: Style::Time { unix: 1_618_953_630, form: 'R' } };
+        let wire = serde_json::to_string(&span).unwrap();
+        assert_eq!(serde_json::from_str::<Span>(&wire).unwrap(), span);
+        let omitted = r#"{"start":0,"end":10,"style":{"style":"time","unix":1618953630}}"#;
+        assert_eq!(
+            serde_json::from_str::<Span>(omitted).unwrap().style,
+            Style::Time { unix: 1_618_953_630, form: 'f' }
+        );
+    }
+
+    #[test]
+    fn message_invites_round_trip_bound_and_tombstone() {
+        let mut msg = Message::plain("m4", "Ana", "https://discord.gg/moss", 1_700_000_000, false);
+        assert!(!serde_json::to_string(&msg).unwrap().contains("invites"));
+        for i in 0..(MESSAGE_INVITES_LIMIT + 2) {
+            msg.invites.push(MessageInvite {
+                code: format!("code{i}"),
+                url: format!("https://discord.gg/code{i}"),
+                space_name: "X".repeat(300),
+                space_id: Some("4000".into()),
+                state: InviteState::Valid,
+                event: Some(ScheduledEvent {
+                    id: "888".into(),
+                    guild_id: "4000".into(),
+                    name: "E".repeat(300),
+                    start: Some(1_791_931_020),
+                    place: "North Ridge".into(),
+                    interested_count: Some(12),
+                    interested: true,
+                }),
+                ..MessageInvite::default()
+            });
+        }
+        msg.bound();
+        assert_eq!(msg.invites.len(), MESSAGE_INVITES_LIMIT);
+        assert_eq!(msg.invites[0].space_name.len(), 200);
+        assert_eq!(msg.invites[0].event.as_ref().unwrap().name.len(), 200);
+        let wire = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<Message>(&wire).unwrap().invites, msg.invites);
+        msg.tombstone();
+        assert!(msg.invites.is_empty());
     }
 
     #[test]

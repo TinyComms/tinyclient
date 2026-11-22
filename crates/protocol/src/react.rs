@@ -71,6 +71,9 @@ pub struct ReactionRules {
     /// Most different emoji one message holds. 0: no limit.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub distinct: u32,
+    /// Super / burst reactions may be sent here (Discord Nitro, when reactions are allowed).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub burst: bool,
     /// Why reactions are off, in words, when `set` is `Off`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub why: String,
@@ -102,6 +105,7 @@ impl Default for ReactionRules {
             mine: 0,
             replaces: false,
             distinct: 0,
+            burst: false,
             why: String::new(),
             paid: false,
             quick: None,
@@ -185,12 +189,20 @@ impl ReactionRules {
     /// reactions it replaces (oldest first); `Err` says why not, in words for a toast. Taking
     /// one back is never checked.
     pub fn check(&self, reactions: &[Reaction], emoji: &str, custom: bool) -> Result<Vec<String>, String> {
+        self.check_kind(reactions, emoji, custom, false)
+    }
+
+    /// Like [`Self::check`], also checking whether a super / burst reaction is allowed when `burst` is true.
+    pub fn check_kind(&self, reactions: &[Reaction], emoji: &str, custom: bool, burst: bool) -> Result<Vec<String>, String> {
         if self.set == ReactionSet::Off {
             return Err(if self.why.is_empty() { "Reactions are turned off here.".to_owned() } else { self.why.clone() });
         }
+        if burst && !self.burst {
+            return Err("Super reactions aren't allowed here.".to_owned());
+        }
         let on_it = reactions.iter().find(|have| same(have, emoji));
         match on_it {
-            Some(have) if have.mine => return Ok(Vec::new()),
+            Some(have) if (!burst && have.mine) || (burst && have.mine_burst) => return Ok(Vec::new()),
             Some(_) if self.join || self.offers(emoji, custom) => {}
             Some(_) => return Err("That reaction isn't allowed here any more.".to_owned()),
             None if self.join_only => return Err("You can only add to reactions already on this message.".to_owned()),
@@ -210,7 +222,7 @@ impl ReactionRules {
             replacing = mine.iter().take(drop).map(|have| have.emoji.clone()).collect();
         }
         if on_it.is_none() && self.distinct > 0 {
-            let freed = mine.iter().filter(|have| have.count == 1 && replacing.contains(&have.emoji)).count();
+            let freed = mine.iter().filter(|have| have.count == 1 && have.burst == 0 && replacing.contains(&have.emoji)).count();
             if reactions.len() - freed >= self.distinct as usize {
                 return Err(format!("This message has {} different reactions, as many as allowed.", self.distinct));
             }
@@ -224,7 +236,7 @@ mod tests {
     use super::*;
 
     fn on(emoji: &str, count: u32, mine: bool) -> Reaction {
-        Reaction { emoji: emoji.into(), file: None, count, mine, who: Vec::new() }
+        Reaction { emoji: emoji.into(), file: None, count, mine, who: Vec::new(), ..Reaction::default() }
     }
 
     #[test]
@@ -289,5 +301,15 @@ mod tests {
         assert!(join.check(&[], "👍", false).is_err());
         let json = serde_json::to_string(&off).unwrap();
         assert_eq!(serde_json::from_str::<ReactionRules>(&json).unwrap(), off);
+    }
+
+    #[test]
+    fn burst_reactions_are_gated_by_rules_burst() {
+        let normal_only = ReactionRules::default();
+        assert!(normal_only.check_kind(&[], "🔥", false, true).is_err());
+        let nitro = ReactionRules { burst: true, ..ReactionRules::default() };
+        assert_eq!(nitro.check_kind(&[], "🔥", false, true), Ok(Vec::new()));
+        // A message with my normal reaction still accepts my burst reaction, and vice versa.
+        assert_eq!(nitro.check_kind(&[on("🔥", 1, true)], "🔥", false, true), Ok(Vec::new()));
     }
 }

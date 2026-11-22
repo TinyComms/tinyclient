@@ -321,7 +321,7 @@ impl GuildInfo {
         let parent = channel.parent_id.as_deref();
         let category = parent.and_then(|parent| self.categories.get(parent)).map(|(position, _)| *position);
         let name = channel.name.clone().unwrap_or_else(|| "channel".to_owned());
-        let written = matches!(kind, ConversationKind::Channel | ConversationKind::Announcement);
+        let written = matches!(kind, ConversationKind::Channel | ConversationKind::Announcement | ConversationKind::Forum);
         let clock = now();
         let timed_out = self.timed_out(clock);
         let perms = self.permissions(guild, me, channel);
@@ -1039,6 +1039,7 @@ impl Discord {
             gifs: true,
             stickers: true,
             search: true,
+            search_global: true,
             custom_emoji: emoji,
             silent: true,
             schedule: false,
@@ -1069,7 +1070,7 @@ impl Discord {
             gif_file: false,
             mention_format: protocol::MentionFormat::Discord,
             mention_spans: false,
-            burst_reactions: false,
+            burst_reactions: matches!(premium, 1..=3),
             blocks: true,
             add_friend_by_username: true,
             friend_nickname: true,
@@ -1174,6 +1175,7 @@ impl Discord {
             // Whatever happened between the sessions was not heard: nothing fetched before
             // is known to be whole any more.
             state.covered.clear();
+            state.opened.clear();
             // A new session starts with no subscriptions and no voice connection.
             state.members.forget_sent();
             state.voice.reset();
@@ -1661,13 +1663,16 @@ impl Discord {
     /// tree but keeps its messages; a forum's post is recorded, and was never a tree row.
     pub(super) fn thread_changed(&self, thread: Channel, joined: bool) -> Result<(), Failure> {
         let known = self.ctx.known(&thread.id)?;
-        if known.is_none() && !joined && thread.member.is_none() {
-            return Ok(());
-        }
         let parent = match thread.parent_id.as_deref() {
             Some(parent) => self.ctx.known(parent)?,
             None => None,
         };
+        // An archived forum post arrives from search with no membership. Record it. Any other
+        // thread we have not joined and do not already list stays out.
+        let forum = parent.as_ref().is_some_and(|parent| parent.kind == ConversationKind::Forum);
+        if known.is_none() && !joined && thread.member.is_none() && !forum {
+            return Ok(());
+        }
         // A thread under a channel we cannot see is not ours to list.
         let Some(parent) = parent else {
             return Ok(());
@@ -1694,6 +1699,19 @@ impl Discord {
         let locked = thread.thread_metadata.as_ref().is_some_and(|metadata| metadata.locked);
         let followed = joined || thread.member.is_some() || known.as_ref().is_some_and(|k| k.followed);
         let (read_only, read_only_reason) = thread_read_only(timed_out, clock, locked, &thread_rights);
+        // A forum post keeps its folders and follow, and its pin is the forum's own flag.
+        // Any other thread still records a follow only when we joined it.
+        let filing = if forum {
+            Some(Filing {
+                followed: joined || thread.member.is_some() || known.as_ref().is_some_and(|row| row.followed),
+                pin: (thread.flags & model::THREAD_PINNED != 0).then_some(0),
+                folders: known.as_ref().map(|row| row.folders.clone()).unwrap_or_default(),
+                archived: known.as_ref().is_some_and(|row| row.archived),
+                hidden: known.as_ref().is_some_and(|row| row.hidden),
+            })
+        } else {
+            Some(super::kept_filing(known.as_ref(), archived, followed))
+        };
         let mut row = ConversationRow {
             parent: Some(parent.key.id.clone()),
             root: Some(thread.id.clone()),
@@ -1704,7 +1722,7 @@ impl Discord {
             slowmode_seconds: thread.rate_limit_per_user,
             locked,
             age_restricted: thread.nsfw || parent.age_restricted,
-            filing: Some(super::kept_filing(known.as_ref(), archived, followed)),
+            filing,
             ..ConversationRow::new(&thread.id, ConversationKind::Thread, name)
         };
         // An archived thread leaves the tree, and a forum's posts were never in it

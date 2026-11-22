@@ -115,6 +115,10 @@ pub(crate) fn is_zero_i64(value: &i64) -> bool {
     *value == 0
 }
 
+pub(crate) fn is_activity(sort: &TopicSort) -> bool {
+    matches!(sort, TopicSort::Activity)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Network {
@@ -689,6 +693,24 @@ pub struct Conversation {
     /// Marked age-restricted / NSFW by the network (Discord `channel.nsfw`, inherited by threads).
     #[serde(default, skip_serializing_if = "is_false")]
     pub age_restricted: bool,
+    /// Tag ids applied to a forum post.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Messages in a forum post that the network still counts.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub message_count: u32,
+    /// Messages ever sent in a forum post, including ones since deleted.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub total_message_sent: u32,
+    /// The first message's picture, for a post card and a media gallery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<MediaFile>,
+    /// The emoji of the post's strongest reaction.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reaction: String,
+    /// Who started the forum post.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub owner: String,
 }
 
 /// What became of my newest message, as its mark says it (`design/06-live-signals.md` §4).
@@ -764,6 +786,12 @@ impl Conversation {
             slowmode_until: None,
             locked: false,
             age_restricted: false,
+            tags: Vec::new(),
+            message_count: 0,
+            total_message_sent: 0,
+            thumbnail: None,
+            reaction: String::new(),
+            owner: String::new(),
         }
     }
 
@@ -1682,12 +1710,35 @@ pub enum Request {
     /// With `landing`, not a page but the one topic opening the forum lands on: the newest
     /// unread, else General. Asking for the landing is also what makes chatd read the
     /// topics from the network first, so the answer names the landing on Telegram's word now.
+    /// Discord pages archived posts with `offset` (25 a page), and `sort`, `tag`, and `query`
+    /// stay inside that forum.
     Topics {
         forum: Key,
         offset: u32,
         limit: u32,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         landing: bool,
+        #[serde(default, skip_serializing_if = "is_activity")]
+        sort: TopicSort,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
+    },
+    /// Reads a forum or media channel's posting rules: guidelines, available tags, whether a
+    /// tag or attachment is required, and default post slowmode.
+    ForumInfo {
+        forum: Key,
+    },
+    /// Creates a new post in a forum or media channel.
+    ForumPost {
+        forum: Key,
+        title: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
+        #[serde(default, skip_serializing_if = "Outgoing::is_plain")]
+        with: Outgoing,
     },
     /// Voice channels and calls with a friend in them now, across Spaces: the Discord home's
     /// "In voice". From what chatd holds live; at most 50.
@@ -2147,6 +2198,8 @@ pub enum Request {
     InvitePreview {
         account: AccountKey,
         code: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_id: Option<String>,
     },
     /// Join a Space from an invite link or code (e.g. Discord `POST /invites/{code}`).
     InviteJoin {
@@ -2274,6 +2327,17 @@ pub enum Request {
         person: Key,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         roles: Vec<String>,
+    },
+    /// Preview a scheduled event link (`GET /guilds/{id}/scheduled-events/{event}`).
+    EventPreview {
+        space: Key,
+        event_id: String,
+    },
+    /// Toggle "Interested" on a scheduled event (`PUT` / `DELETE /guilds/{id}/scheduled-events/{event}/users/@me`).
+    EventLinkInterest {
+        space: Key,
+        event_id: String,
+        interested: bool,
     },
     Watch(Watching),
 
@@ -3648,6 +3712,8 @@ pub enum Response {
         cursor: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         not_searched: Vec<Network>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total: Option<u32>,
     },
     /// Answers `Reminders`: what is still waiting in the conversation, due first.
     Reminders {
@@ -3755,6 +3821,10 @@ pub enum Response {
     /// Answers `CreateRole` / `EditRole`.
     Role {
         role: SpaceRole,
+    },
+    /// Answers `EventPreview`: metadata for a scheduled event.
+    EventPreview {
+        event: ScheduledEvent,
     },
     Pinned {
         conversation: Key,
@@ -3948,6 +4018,10 @@ pub enum Response {
     /// One updated/rescheduled message (`Request::RescheduleMessage`).
     ScheduledMessage {
         message: ScheduledMessage,
+    },
+    /// Posting rules, guidelines, and available tags of a forum or media channel (`Request::ForumInfo`).
+    ForumInfo {
+        info: ForumInfo,
     },
     /// Members who have read a given message (`Request::ReadBy`).
     ReadBy {
@@ -4271,9 +4345,39 @@ mod tests {
             age_restricted: false,
         };
         assert_eq!(
-            serde_json::to_string(&Response::MessageHits { hits: vec![hit], cursor: None, not_searched: Vec::new() }).unwrap(),
+            serde_json::to_string(&Response::MessageHits { hits: vec![hit], cursor: None, not_searched: Vec::new(), total: None }).unwrap(),
             r#"{"op":"message_hits","hits":[{"conversation":{"network":"discord","account":"1","id":"C2"},"message_id":"9","sent":20,"sender":"mara","snippet":"hello world"}]}"#
         );
+        // Structured search filters, sort, offset and total round-trip and omit defaults.
+        let filtered = Request::SearchNetwork {
+            conversation: None,
+            space: Some(Key { network: Network::Discord, account: "1".into(), id: "G1".into() }),
+            account: None,
+            network: None,
+            query: "release".into(),
+            filters: SearchFilters {
+                from: Some(Key { network: Network::Discord, account: "1".into(), id: "U1".into() }),
+                mentions: Some(Key { network: Network::Discord, account: "1".into(), id: "U2".into() }),
+                in_channel: Some(Key { network: Network::Discord, account: "1".into(), id: "C2".into() }),
+                has: Some(SearchHas::Videos),
+                before: Some(1_767_225_600),
+                after: Some(1_735_689_600),
+                mentions_me: false,
+                pinned: Some(true),
+                author_type: Some("bot".into()),
+                sort: SearchSort::Oldest,
+                offset: 25,
+            },
+            cursor: Some("25".into()),
+        };
+        let encoded = serde_json::to_string(&filtered).unwrap();
+        let decoded: Request = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, filtered);
+        let hits_total = Response::MessageHits { hits: Vec::new(), cursor: Some("25".into()), not_searched: Vec::new(), total: Some(142) };
+        let encoded_hits = serde_json::to_string(&hits_total).unwrap();
+        assert!(encoded_hits.contains(r#""total":142"#), "{encoded_hits}");
+        let decoded_hits: Response = serde_json::from_str(&encoded_hits).unwrap();
+        assert_eq!(decoded_hits, hits_total);
         // The network's own ask: the scope is a conversation, Space, account, network, or everywhere.
         let ask: Request = serde_json::from_str(r#"{"op":"search_network","query":"lichen"}"#).unwrap();
         let Request::SearchNetwork { conversation, space, query, filters, cursor, .. } = &ask else {
@@ -4635,5 +4739,85 @@ mod sock_path_tests {
         let old: Capabilities = serde_json::from_str("{}").unwrap();
         assert!(!old.follow_threads);
         assert!(!old.dnd_snooze);
+    }
+
+    #[test]
+    fn forum_post_request_and_info_round_trip() {
+        let forum = Key::new(&AccountKey { network: Network::Discord, account: "1000".into() }, "4106");
+        let req = Request::ForumPost {
+            forum: forum.clone(),
+            title: "Cargo won't build".into(),
+            text: "I tried clean.".into(),
+            tags: vec!["9001".into()],
+            with: Outgoing::default(),
+        };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&req).unwrap()).unwrap(), req);
+        let info = ForumInfo {
+            forum,
+            guidelines: "Say what you tried.".into(),
+            tags: vec![ForumTag { id: "9001".into(), name: "question".into(), emoji: "❓".into(), moderated: false }],
+            require_tag: true,
+            media: false,
+            default_slowmode: 30,
+        };
+        let response = Response::ForumInfo { info };
+        assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&response).unwrap()).unwrap(), response);
+    }
+
+    #[test]
+    fn forum_topics_request_keeps_old_json_and_post_fields() {
+        let forum = Key::new(&AccountKey { network: Network::Discord, account: "1000".into() }, "4106");
+        let req = Request::Topics {
+            forum: forum.clone(),
+            offset: 25,
+            limit: 25,
+            landing: false,
+            sort: TopicSort::Created,
+            tag: Some("9001".into()),
+            query: Some("lichen".into()),
+        };
+        assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&req).unwrap()).unwrap(), req);
+        let mut bare = serde_json::to_value(&Request::Topics {
+            forum: forum.clone(),
+            offset: 0,
+            limit: 10,
+            landing: false,
+            sort: TopicSort::Activity,
+            tag: None,
+            query: None,
+        })
+        .unwrap();
+        for key in ["sort", "tag", "query", "landing"] {
+            bare.as_object_mut().unwrap().remove(key);
+        }
+        assert_eq!(
+            serde_json::from_value::<Request>(bare).unwrap(),
+            Request::Topics {
+                forum: forum.clone(),
+                offset: 0,
+                limit: 10,
+                landing: false,
+                sort: TopicSort::Activity,
+                tag: None,
+                query: None,
+            }
+        );
+        let mut row = Conversation::new(forum, ConversationKind::Thread, "Lichen");
+        row.tags = vec!["9001".into()];
+        row.message_count = 4;
+        row.total_message_sent = 6;
+        row.reaction = "👍".into();
+        row.owner = "2001".into();
+        row.thumbnail = Some(MediaFile::new("att:1:thumb", MediaKind::Image));
+        assert_eq!(serde_json::from_value::<Conversation>(serde_json::to_value(&row).unwrap()).unwrap(), row);
+        let mut old = serde_json::to_value(&Conversation::new(row.key.clone(), ConversationKind::Thread, "Lichen")).unwrap();
+        for key in ["tags", "message_count", "total_message_sent", "thumbnail", "reaction", "owner"] {
+            old.as_object_mut().unwrap().remove(key);
+        }
+        let decoded = serde_json::from_value::<Conversation>(old).unwrap();
+        assert!(decoded.tags.is_empty());
+        assert_eq!((decoded.message_count, decoded.total_message_sent), (0, 0));
+        assert!(decoded.thumbnail.is_none());
+        assert!(decoded.reaction.is_empty() && decoded.owner.is_empty());
     }
 }

@@ -2021,9 +2021,9 @@ fn apply(account: &Account, event: Event) {
             let mine = by == account.me;
             let replaced = account.live().react(&id, &by, (!removed).then_some(emoji.as_str()));
             if let Some(old) = replaced {
-                let _ = ctx.reacted(&conversation, &id, &Reaction { emoji: old, file: None, count: 1, mine, who: vec![by.clone()] }, false);
+                let _ = ctx.reacted(&conversation, &id, &Reaction { emoji: old, file: None, count: 1, mine, who: vec![by.clone()], ..Reaction::default() }, false);
             }
-            let _ = ctx.reacted(&conversation, &id, &Reaction { emoji, file: None, count: 1, mine, who: vec![by] }, !removed);
+            let _ = ctx.reacted(&conversation, &id, &Reaction { emoji, file: None, count: 1, mine, who: vec![by], ..Reaction::default() }, !removed);
         }
         Event::ReadElsewhere(read) => read_elsewhere(account, &read),
         Event::Receipt { by, sent, read, viewed, at } => {
@@ -2443,14 +2443,14 @@ fn apply(account: &Account, event: Event) {
                 let _ = ctx.reacted(
                     STORIES_CONVERSATION,
                     &story_id,
-                    &Reaction { emoji: old, file: None, count: 1, mine, who: vec![by.clone()] },
+                    &Reaction { emoji: old, file: None, count: 1, mine, who: vec![by.clone()], burst: 0, mine_burst: false, burst_colors: Vec::new() },
                     false,
                 );
             }
             let _ = ctx.reacted(
                 STORIES_CONVERSATION,
                 &story_id,
-                &Reaction { emoji, file: None, count: 1, mine, who: vec![by] },
+                &Reaction { emoji, file: None, count: 1, mine, who: vec![by], burst: 0, mine_burst: false, burst_colors: Vec::new() },
                 !removed,
             );
         }
@@ -4546,7 +4546,7 @@ fn call_link_handoff(account: &Account, raw: &str) -> Result<String, Refusal> {
         let _ = account.ctx.reacted(
             STORIES_CONVERSATION,
             &story_id,
-            &Reaction { emoji: emoji.to_owned(), file: None, count: 1, mine: true, who: vec![account.me.clone()] },
+            &Reaction { emoji: emoji.to_owned(), file: None, count: 1, mine: true, who: vec![account.me.clone()], burst: 0, mine_burst: false, burst_colors: Vec::new() },
             true,
         );
         return Ok(story_id);
@@ -5229,7 +5229,7 @@ fn react(account: &Account, conversation: &str, message_id: &str, emoji: &str, o
     account.wire.send(&to, Body::React { author, target: sent, emoji: emoji.to_owned(), remove: !on })?;
     let replaced = account.live().react(message_id, &account.me, on.then_some(emoji));
     if let Some(old) = replaced.filter(|_| on) {
-        let _ = account.ctx.reacted(conversation, message_id, &Reaction { emoji: old, file: None, count: 1, mine: true, who: vec![account.me.clone()] }, false);
+        let _ = account.ctx.reacted(conversation, message_id, &Reaction { emoji: old, file: None, count: 1, mine: true, who: vec![account.me.clone()], ..Reaction::default() }, false);
     }
     Ok(())
 }

@@ -1108,6 +1108,12 @@ mod tests {
             slowmode_until: None,
             locked: false,
             age_restricted: false,
+            tags: Vec::new(),
+            message_count: 0,
+            total_message_sent: 0,
+            thumbnail: None,
+            reaction: String::new(),
+            owner: String::new(),
         }
     }
 

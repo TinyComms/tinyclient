@@ -36,6 +36,13 @@ struct Reacting {
     message_id: String,
     #[serde(default)]
     emoji: Option<Emoji>,
+    /// True for a Discord super (burst) reaction event; `type == 1` carries the same fact.
+    #[serde(default)]
+    burst: bool,
+    #[serde(rename = "type", default)]
+    kind: u8,
+    #[serde(default)]
+    burst_colors: Vec<String>,
     /// `MESSAGE_REACTION_ADD_MANY`: several people at once. Its shape is from the community
     /// documentation and unconfirmed against a real account.
     #[serde(default)]
@@ -495,7 +502,8 @@ impl Discord {
         let guild = posted.guild_id.clone().or_else(|| self.guild_of(&conversation));
         let (message, files) = self.convert(&posted, guild.as_deref(), conversation.kind);
         let always = conversation.kind.is_direct() || conversation.kind == ConversationKind::Thread;
-        if always || message.mentions_me || message.outgoing || self.ctx.newest(&channel)?.is_some() {
+        let opened = crate::hub::lock(&self.state).opened.contains(&channel);
+        if always || message.mentions_me || message.outgoing || opened || self.ctx.newest(&channel)?.is_some() {
             files.register(&self.ctx)?;
             self.thread_of(&posted, &conversation)?;
             self.ctx.message(&channel, &message)?;
@@ -555,6 +563,7 @@ impl Discord {
 
     fn reacted(&self, reacting: Reacting, added: bool) -> Result<(), Failure> {
         let me = self.me();
+        let is_burst = reacting.burst || reacting.kind == 1;
         let single = reacting.emoji.iter().map(|emoji| (emoji, std::slice::from_ref(&reacting.user_id)));
         let many = reacting.reactions.iter().map(|many| (&many.emoji, many.users.as_slice()));
         for (emoji, users) in single.chain(many) {
@@ -566,11 +575,14 @@ impl Discord {
                 let reaction = Reaction {
                     emoji: spelled.clone(),
                     file: file.as_ref().map(|(file, _)| file.clone()),
-                    count: 1,
-                    mine: *user == me,
+                    count: if is_burst { 0 } else { 1 },
+                    mine: !is_burst && *user == me,
                     // An event names one id, but a message read from history carries counts
                     // only, so the store keeps no list for Discord.
                     who: Vec::new(),
+                    burst: if is_burst { 1 } else { 0 },
+                    mine_burst: is_burst && *user == me,
+                    burst_colors: if is_burst { reacting.burst_colors.clone() } else { Vec::new() },
                 };
                 self.ctx.reacted(&reacting.channel_id, &reacting.message_id, &reaction, added)?;
             }

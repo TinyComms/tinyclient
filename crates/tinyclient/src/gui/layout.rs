@@ -2082,6 +2082,7 @@ impl Render for Shell {
             .children(self.move_channels_modal(cx))
             .children(self.delete_channel_modal(cx))
             .children(self.folder_edit_modal(cx))
+            .children(self.forum_post_modal(cx))
             .children(self.join_server_modal(cx))
             .children(self.create_server_modal(cx))
             .children(self.events_modal(cx))

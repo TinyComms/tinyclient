@@ -274,6 +274,7 @@ impl Shell {
             .children(self.browse_channels_modal(cx))
             .children(self.discord_admin_layer(cx))
             .children(self.folder_edit_modal(cx))
+            .children(self.forum_post_modal(cx))
             .children(self.phone_slack_sheet(window, cx))
             .children(self.phone_menu(snapshot, window, cx))
     }

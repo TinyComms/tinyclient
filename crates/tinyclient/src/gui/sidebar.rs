@@ -100,6 +100,20 @@ pub struct CreateChannelModal {
     pub private: bool,
 }
 
+pub struct ForumPostModal {
+    pub forum: Key,
+    pub title: gpui::Entity<crate::gui::input::TextInput>,
+    pub text: gpui::Entity<crate::gui::input::TextInput>,
+    pub tags: Vec<protocol::ForumTag>,
+    pub picked: Vec<String>,
+    pub files: Vec<protocol::OutgoingFile>,
+    pub require_tag: bool,
+    pub media: bool,
+    pub guidelines: String,
+    pub error: Option<String>,
+    pub busy: bool,
+}
+
 pub struct State {
     pub mode: Mode,
     pub filter: InboxFilter,
@@ -190,6 +204,7 @@ pub struct State {
     pub create_invite: Option<CreateInviteModal>,
     /// Rename of a Discord server folder.
     pub folder_edit: Option<FolderEdit>,
+    pub forum_post: Option<ForumPostModal>,
     pub join_server: Option<JoinServerModal>,
     pub create_server: Option<CreateServerModal>,
     /// Cached scheduled & active events per Discord Space.
@@ -437,6 +452,7 @@ impl State {
             create_channel: None,
             create_invite: None,
             folder_edit: None,
+            forum_post: None,
             join_server: None,
             create_server: None,
             space_events: HashMap::new(),
@@ -1626,20 +1642,32 @@ impl Shell {
         if row.key.network == Network::Discord && row.kind.is_direct() && matches!(&self.sidebar_state.mode, Mode::Space(space) if space.network == Network::Discord) {
             self.go(Mode::Network(Network::Discord), cx);
         }
-        if row.kind == ConversationKind::Forum && matches!(row.key.network, Network::Telegram | Network::Discord) {
+        if row.kind == ConversationKind::Forum && row.key.network == Network::Discord {
+            // The main pane is the post list. The sidebar still drills into the posts.
+            self.drill(home::Drill::Topics(Rc::new(row.clone())), cx);
+            self.select(row.key.clone(), &row.title, cx);
+            return;
+        }
+        if row.kind == ConversationKind::Forum && row.key.network == Network::Telegram {
             self.drill(home::Drill::Topics(Rc::new(row.clone())), cx);
             // The topics drill reads what the store holds; opening the forum asks once for
             // the landing. Telegram lists its topics only on demand, and lands on the newest
-            // unread topic, else General (`03` §2); Discord's posts came on the socket, so
-            // the ask is answered from the store and lands on the newest activity post
-            // (`01` §3, N14). The network catching up behind a later open cannot loop a
-            // change back into a request.
+            // unread topic, else General (`03` §2). The network catching up behind a later
+            // open cannot loop a change back into a request.
             let forum = row.key.clone();
             // Only this visit may choose the landing. Opening another forum (including this
             // same one again), picking a topic, or leaving the drill supersedes its reply.
             let navigation = self.sidebar_state.navigation;
             let requested_forum = forum.clone();
-            let landing = move || ask(&Request::Topics { forum, offset: 0, limit: 1, landing: true });
+            let landing = move || ask(&Request::Topics {
+                forum,
+                offset: 0,
+                limit: 1,
+                landing: true,
+                sort: protocol::TopicSort::Activity,
+                tag: None,
+                query: None,
+            });
             self.off_thread(cx, landing, move |this, answer, cx| {
                 let Ok(Response::Conversations { conversations, .. }) = answer else {
                     return;
@@ -2197,6 +2225,17 @@ impl Shell {
                 .on_click(cx.listener(|this, _, _, cx| this.up_level(cx)))
         };
         if let Some(drill) = &self.sidebar_state.drill {
+            let new_post = match drill {
+                home::Drill::Topics(forum) if matches!(forum.key.network, Network::Discord | Network::Telegram) && !forum.read_only => {
+                    let forum = Rc::clone(forum);
+                    Some(
+                        quiet(icon_button("new-post", "icons/plus.svg", false))
+                            .tooltip(tip("New post", None))
+                            .on_click(cx.listener(move |this, _, _, cx| this.begin_forum_post(&forum, cx))),
+                    )
+                }
+                _ => None,
+            };
             let title = match drill {
                 home::Drill::Threads(_) => "Threads".to_owned(),
                 home::Drill::Drafts(_) => "Drafts & sent".to_owned(),
@@ -2213,7 +2252,8 @@ impl Shell {
                 .pl(px(10.))
                 .child(back("drill-up", "Back".into(), cx))
                 .child(pane_title(title))
-                .children(place.map(|place| div().flex_none().max_w(px(120.)).truncate().type_small().text_color(theme::text_faint()).child(place)));
+                .children(place.map(|place| div().flex_none().max_w(px(120.)).truncate().type_small().text_color(theme::text_faint()).child(place)))
+                .children(new_post);
         }
         match mode {
             Mode::Inbox => {
@@ -3396,7 +3436,7 @@ impl Shell {
         modal.error = None;
         let account = modal.account.clone();
         cx.notify();
-        let req = Request::InvitePreview { account, code };
+        let req = Request::InvitePreview { account, code, event_id: None };
         cx.spawn(async move |shell, cx| {
             let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
             let _ = shell.update(cx, |this, cx| {
@@ -4202,6 +4242,176 @@ impl Shell {
                 }
                 Ok(Response::Error { detail, .. }) => this.toast(None, detail, cx),
                 _ => {}
+            });
+        })
+        .detach();
+    }
+
+    /// Asks the forum's posting rules, then opens the shared New post form. A network that
+    /// cannot describe a forum yet (Telegram, until it answers) still gets the empty form.
+    fn begin_forum_post(&mut self, forum: &Conversation, cx: &mut Context<Self>) {
+        if forum.read_only || !matches!(forum.key.network, Network::Discord | Network::Telegram) {
+            return;
+        }
+        let key = forum.key.clone();
+        cx.spawn(async move |shell, cx| {
+            let asked = key.clone();
+            let req = Request::ForumInfo { forum: key };
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| match answer {
+                Ok(Response::ForumInfo { info }) => this.show_forum_post(info, cx),
+                Ok(Response::Error { code: protocol::ErrorCode::Unsupported, .. }) => this.show_forum_post(
+                    protocol::ForumInfo {
+                        forum: asked,
+                        guidelines: String::new(),
+                        tags: Vec::new(),
+                        require_tag: false,
+                        media: false,
+                        default_slowmode: 0,
+                    },
+                    cx,
+                ),
+                Ok(Response::Error { detail, .. }) => this.toast(None, detail, cx),
+                Err(err) => this.toast(None, err.to_string(), cx),
+                _ => {}
+            });
+        })
+        .detach();
+    }
+
+    fn show_forum_post(&mut self, info: protocol::ForumInfo, cx: &mut Context<Self>) {
+        let title = cx.new(|cx| crate::gui::input::TextInput::new("Title", cx));
+        let text = cx.new(|cx| crate::gui::input::TextInput::multiline("Message", cx));
+        self.sidebar_state.forum_post = Some(ForumPostModal {
+            forum: info.forum,
+            title,
+            text,
+            tags: info.tags,
+            picked: Vec::new(),
+            files: Vec::new(),
+            require_tag: info.require_tag,
+            media: info.media,
+            guidelines: info.guidelines,
+            error: None,
+            busy: false,
+        });
+        cx.notify();
+    }
+
+    fn toggle_forum_tag(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(modal) = self.sidebar_state.forum_post.as_mut() else { return };
+        if modal.busy {
+            return;
+        }
+        if let Some(at) = modal.picked.iter().position(|picked| picked == id) {
+            modal.picked.remove(at);
+        } else {
+            modal.picked.push(id.to_owned());
+        }
+        modal.error = None;
+        cx.notify();
+    }
+
+    fn attach_forum_files(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_state.forum_post.as_ref().is_some_and(|modal| modal.busy) {
+            return;
+        }
+        let asked = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = asked.await {
+                let _ = this.update(cx, |this, cx| {
+                    let Some(modal) = this.sidebar_state.forum_post.as_mut() else { return };
+                    for path in paths {
+                        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("file").to_owned();
+                        modal.files.push(protocol::OutgoingFile {
+                            path: path.to_string_lossy().into_owned(),
+                            name,
+                            ..Default::default()
+                        });
+                    }
+                    modal.error = None;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn remove_forum_file(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(modal) = self.sidebar_state.forum_post.as_mut() else { return };
+        if modal.busy || index >= modal.files.len() {
+            return;
+        }
+        modal.files.remove(index);
+        modal.error = None;
+        cx.notify();
+    }
+
+    fn submit_forum_post(&mut self, cx: &mut Context<Self>) {
+        let Some(modal) = self.sidebar_state.forum_post.as_mut() else { return };
+        if modal.busy {
+            return;
+        }
+        let title = modal.title.read(cx).text().trim().to_owned();
+        let text = modal.text.read(cx).text().trim().to_owned();
+        if title.is_empty() {
+            modal.error = Some("A post needs a title.".into());
+            cx.notify();
+            return;
+        }
+        if modal.require_tag && modal.picked.is_empty() {
+            modal.error = Some("This forum requires a tag.".into());
+            cx.notify();
+            return;
+        }
+        if modal.media && modal.files.is_empty() {
+            modal.error = Some("A media channel needs a file.".into());
+            cx.notify();
+            return;
+        }
+        if text.is_empty() && modal.files.is_empty() {
+            modal.error = Some("Write a message or attach a file.".into());
+            cx.notify();
+            return;
+        }
+        modal.busy = true;
+        modal.error = None;
+        let forum = modal.forum.clone();
+        let tags = modal.picked.clone();
+        let files = modal.files.clone();
+        cx.notify();
+        let req = Request::ForumPost {
+            forum,
+            title,
+            text,
+            tags,
+            with: protocol::Outgoing { files, ..Default::default() },
+        };
+        cx.spawn(async move |shell, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&req) }).await;
+            let _ = shell.update(cx, |this, cx| match answer {
+                Ok(Response::Conversation { conversation }) => {
+                    this.sidebar_state.forum_post = None;
+                    this.open_now(conversation.key, &conversation.title, cx);
+                }
+                Ok(Response::Error { detail, .. }) => {
+                    if let Some(modal) = this.sidebar_state.forum_post.as_mut() {
+                        modal.busy = false;
+                        modal.error = Some(detail.clone());
+                    }
+                    this.toast(None, detail, cx);
+                }
+                _ => {
+                    if let Some(modal) = this.sidebar_state.forum_post.as_mut() {
+                        modal.busy = false;
+                    }
+                    cx.notify();
+                }
             });
         })
         .detach();
@@ -5253,6 +5463,143 @@ impl Shell {
                 .justify_center()
                 .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                     this.sidebar_state.folder_edit = None;
+                    cx.notify();
+                }))
+                .child(card),
+        )
+    }
+
+    pub(in crate::gui) fn forum_post_modal(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        let modal = self.sidebar_state.forum_post.as_ref()?;
+        let title = modal.title.clone();
+        let text = modal.text.clone();
+        let guidelines = modal.guidelines.clone();
+        let tags = modal.tags.clone();
+        let picked = modal.picked.clone();
+        let files = modal.files.clone();
+        let require_tag = modal.require_tag;
+        let media = modal.media;
+        let error = modal.error.clone();
+        let busy = modal.busy;
+        let title_text = title.read(cx).text().trim().to_owned();
+        let body_text = text.read(cx).text().trim().to_owned();
+        let ready = !busy
+            && !title_text.is_empty()
+            && (!require_tag || !picked.is_empty())
+            && (!media || !files.is_empty())
+            && !(body_text.is_empty() && files.is_empty());
+        let mut chips = div().flex().flex_wrap().gap(px(6.));
+        for (ix, tag) in tags.iter().enumerate() {
+            let on = picked.iter().any(|id| id == &tag.id);
+            let id = tag.id.clone();
+            let label = if tag.emoji.is_empty() { tag.name.clone() } else { format!("{} {}", tag.emoji, tag.name) };
+            chips = chips.child(
+                div()
+                    .id(("forum-tag", ix))
+                    .px(px(8.))
+                    .py(px(4.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(if on { theme::accent() } else { theme::canvas() })
+                    .border_1()
+                    .border_color(if on { theme::accent() } else { theme::border() })
+                    .type_small()
+                    .text_color(if on { theme::on_accent() } else { theme::text() })
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_forum_tag(&id, cx)))
+                    .child(label),
+            );
+        }
+        let mut attached = div().flex().flex_col().gap(px(4.));
+        for (index, file) in files.iter().enumerate() {
+            let name = file.name.clone();
+            attached = attached.child(
+                div()
+                    .id(("forum-file", index))
+                    .type_small()
+                    .text_color(theme::text_soft())
+                    .cursor_pointer()
+                    .hover(|style| style.underline())
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| this.remove_forum_file(index, cx)))
+                    .child(format!("{name}  ×")),
+            );
+        }
+        let card = div()
+            .id("forum-post-card")
+            .w(px(420.))
+            .max_w_full()
+            .p(px(16.))
+            .rounded(px(theme::R_FLOAT))
+            .bg(theme::overlay())
+            .border_1()
+            .border_color(theme::overlay_edge())
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(div().type_title().text_color(theme::text()).child("New post"))
+            .when(!guidelines.is_empty(), |card| {
+                card.child(div().type_small().text_color(theme::text_soft()).child(guidelines))
+            })
+            .child(
+                div()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::canvas())
+                    .border_1()
+                    .border_color(theme::border())
+                    .type_ui()
+                    .child(title),
+            )
+            .child(
+                div()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .h(px(96.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(theme::canvas())
+                    .border_1()
+                    .border_color(theme::border())
+                    .type_ui()
+                    .child(text),
+            )
+            .child(chips)
+            .child(attached)
+            .children(error.map(|err| div().type_small().text_color(theme::danger()).child(err)))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(
+                        button("forum-post-attach", ButtonKind::Ghost, "Attach")
+                            .when(!busy, |button| button.on_click(cx.listener(|this, _, _, cx| this.attach_forum_files(cx)))),
+                    )
+                    .child(
+                        button("forum-post-cancel", ButtonKind::Ghost, "Cancel").on_click(cx.listener(|this, _, _, cx| {
+                            this.sidebar_state.forum_post = None;
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        button("forum-post-submit", if ready { ButtonKind::Primary } else { ButtonKind::Ghost }, if busy { "Posting…" } else { "Post" })
+                            .when(ready, |button| button.on_click(cx.listener(|this, _, _, cx| this.submit_forum_post(cx)))),
+                    ),
+            );
+        Some(
+            div()
+                .id("forum-post-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(theme::scrim())
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                    this.sidebar_state.forum_post = None;
                     cx.notify();
                 }))
                 .child(card),

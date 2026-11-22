@@ -1962,6 +1962,7 @@ impl Slack {
                 count: reaction["count"].as_u64().or(users.map(|users| users.len() as u64)).unwrap_or(1) as u32,
                 mine: users.is_some_and(|users| users.iter().any(|user| user == mine)),
                 who,
+                ..Reaction::default()
             })
         });
         let reactions: Vec<Reaction> = reactions.collect();

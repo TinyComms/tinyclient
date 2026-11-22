@@ -106,9 +106,9 @@ pub struct Menu {
     pub at: Point<Pixels>,
     /// Which actionable row the keyboard has selected.
     pub cursor: usize,
-    /// The reaction whose reactors the menu lists, by its place on the message. `None` for
-    /// the message's own menu.
-    pub reactor: Option<usize>,
+    /// The reaction whose reactors the menu lists, by its place on the message and whether it is a super reaction.
+    /// `None` for the message's own menu.
+    pub reactor: Option<(usize, bool)>,
 }
 
 /// The forward / copy-to picker, open for one message.
@@ -140,6 +140,8 @@ pub struct Picking {
     pub message: String,
     pub at: Point<Pixels>,
     pub picker: Entity<Picker>,
+    /// When true, the chosen emoji is sent as a Discord Nitro super / burst reaction.
+    pub burst: bool,
     _listening: Subscription,
 }
 
@@ -682,9 +684,14 @@ impl Pane {
     /// Why this reaction cannot be added to this message, or `None` when it can (or nothing is
     /// known to say otherwise). Taking mine back is always allowed.
     pub(super) fn refusal(&self, message: &Message, emoji: &str) -> Option<String> {
+        self.refusal_kind(message, emoji, false)
+    }
+
+    /// Like [`Self::refusal`], also checking super / burst reaction permission when `burst` is true.
+    pub(super) fn refusal_kind(&self, message: &Message, emoji: &str, burst: bool) -> Option<String> {
         // A custom emoji is named by an id or `:name:`, which are plain text; a Unicode one never is.
         let custom = emoji.is_ascii() || message.reactions.iter().any(|have| have.emoji == emoji && have.file.is_some());
-        self.rules()?.check(&message.reactions, emoji, custom).err()
+        self.rules()?.check_kind(&message.reactions, emoji, custom, burst).err()
     }
 
     /// Asks what the open conversation takes as reactions; chatd keeps the answer five minutes.
@@ -1011,6 +1018,11 @@ impl Pane {
 
     /// Sends a reaction, optionally with `big` (`burst: true` on Telegram for the full animation).
     pub(super) fn react_with(&mut self, message_id: &str, emoji: &str, on: bool, big: bool, cx: &mut Context<Self>) {
+        let burst = big && on && self.open.as_ref().is_some_and(|open| open.can.burst_reactions);
+        self.react_kind(message_id, emoji, on, burst, cx);
+    }
+
+    pub(super) fn react_kind(&mut self, message_id: &str, emoji: &str, on: bool, burst: bool, cx: &mut Context<Self>) {
         let Some(conversation) = self.key().cloned() else {
             return;
         };
@@ -1020,7 +1032,7 @@ impl Pane {
             return;
         }
         if on {
-            if let Some(why) = self.find(message_id).and_then(|message| self.refusal(&message, emoji)) {
+            if let Some(why) = self.find(message_id).and_then(|message| self.refusal_kind(&message, emoji, burst)) {
                 self.say(format!("Couldn't react: {why}"), cx);
                 return;
             }
@@ -1029,7 +1041,6 @@ impl Pane {
                 emoji::used(emoji);
             }
         }
-        let burst = big && on && self.open.as_ref().is_some_and(|open| open.can.burst_reactions);
         let request = Request::React { conversation, message_id: message_id.to_owned(), emoji: emoji.to_owned(), on, burst };
         self.act_then(request, "Couldn't react", |this, cx| this.ask_reactions(cx), cx);
         cx.notify();
@@ -1129,11 +1140,17 @@ impl Pane {
 
     /// A reaction chosen where the message may already carry it: mine toggles off.
     fn react_toggle(&mut self, message_id: &str, emoji: &str, cx: &mut Context<Self>) {
+        self.react_toggle_kind(message_id, emoji, false, cx);
+    }
+
+    fn react_toggle_kind(&mut self, message_id: &str, emoji: &str, burst: bool, cx: &mut Context<Self>) {
         let same = |have: &protocol::Reaction| {
             have.emoji == emoji || have.file.as_ref().is_some_and(|file| file.id == emoji) || protocol::bare_emoji(&have.emoji) == protocol::bare_emoji(emoji)
         };
-        let mine = self.find(message_id).is_some_and(|message| message.reactions.iter().any(|have| have.mine && same(have)));
-        self.react(message_id, emoji, !mine, cx);
+        let mine = self.find(message_id).is_some_and(|message| {
+            message.reactions.iter().any(|have| (if burst { have.mine_burst } else { have.mine }) && same(have))
+        });
+        self.react_kind(message_id, emoji, !mine, burst, cx);
     }
 
     /// Replying and editing happen in the composer, which is the composer's owner's: this
@@ -1214,14 +1231,14 @@ impl Pane {
     /// The people behind one reaction, where the pointer was. When the message payload did not
     /// carry names and the account supports `Capabilities::reactors`, fetches them on demand and
     /// caches them for the session.
-    pub(super) fn open_reactors(&mut self, message: Rc<Message>, reaction: usize, at: Point<Pixels>,
+    pub(super) fn open_reactors(&mut self, message: Rc<Message>, reaction: usize, burst: bool, at: Point<Pixels>,
         window: &mut Window, cx: &mut Context<Self>) {
         self.close_picker(cx);
         self.revisions = None;
         self.hover = Some(message.id.clone());
         let can_reactors = self.open.as_ref().is_some_and(|open| open.can.reactors);
         let needs_fetch = message.reactions.get(reaction).and_then(|r| {
-            if r.who.is_empty() && can_reactors {
+            if (burst || r.who.is_empty()) && can_reactors {
                 let emoji = r.file.as_ref().map_or_else(|| r.emoji.clone(), |file| file.id.clone());
                 Some((message.id.clone(), emoji))
             } else {
@@ -1229,7 +1246,7 @@ impl Pane {
             }
         });
         if let Some((msg_id, emoji)) = needs_fetch {
-            let cache_key = (msg_id.clone(), emoji.clone());
+            let cache_key = (msg_id.clone(), emoji.clone(), burst);
             if !self.fetched_reactors.contains_key(&cache_key) && self.reactors_loading.as_ref() != Some(&cache_key) {
                 if let Some(conversation) = self.key().cloned() {
                     self.reactors_loading = Some(cache_key.clone());
@@ -1237,7 +1254,7 @@ impl Pane {
                         conversation: conversation.clone(),
                         message_id: msg_id,
                         emoji,
-                        burst: false,
+                        burst,
                         after: None,
                         limit: 100,
                     };
@@ -1260,7 +1277,7 @@ impl Pane {
             }
         }
         self.menu = Some(Menu { message, at,
-            cursor: 0, reactor: Some(reaction) });
+            cursor: 0, reactor: Some((reaction, burst)) });
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -2097,16 +2114,17 @@ impl Pane {
     /// Who one reaction came from, where the pointer was: the names the network sent with the
     /// message, in its own order, then how many are kept back. A row opens the person's card;
     /// a person the shell does not know yet reads Someone and opens nothing.
-    fn reactors_layer(&self, message: &Rc<Message>, reactor: usize, at: Point<Pixels>,
+    fn reactors_layer(&self, message: &Rc<Message>, reactor: (usize, bool), at: Point<Pixels>,
         window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let reaction = message.reactions.get(reactor)?;
+        let (index, burst) = reactor;
+        let reaction = message.reactions.get(index)?;
         let can_mod = self
             .open
             .as_ref()
             .is_some_and(|open| open.key.network == Network::Discord && (open.rights.delete_others || open.moderate));
         let emoji_key = reaction.file.as_ref().map_or_else(|| reaction.emoji.clone(), |file| file.id.clone());
         let mut list = menu().w(px(248.));
-        if !reaction.who.is_empty() {
+        if !burst && !reaction.who.is_empty() {
             for (ix, id) in reaction.who.iter().enumerate() {
                 if ix == REACTORS_SHOWN {
                     list = list.child(menu_separator()).child(menu_item(
@@ -2135,7 +2153,7 @@ impl Pane {
                 );
             }
         } else {
-            let cache_key = (message.id.clone(), emoji_key.clone());
+            let cache_key = (message.id.clone(), emoji_key.clone(), burst);
             if let Some((reactors, more)) = self.fetched_reactors.get(&cache_key) {
                 if reactors.is_empty() {
                     list = list.child(menu_item("reactors-empty", None, "No reactions found", None));
@@ -2254,16 +2272,63 @@ impl Pane {
         let (rules, account, space) = (self.rules().cloned(), self.key().map(protocol::Key::account), self.space(cx));
         let picker = cx.new(|cx| Picker::new(custom, rules, account, space, window, cx));
         let listening = cx.subscribe_in(&picker, window, |this, _, event: &PickerEvent, window, cx| {
-            let target = this.picker.as_ref().map(|picking| picking.message.clone());
-            if let (PickerEvent::Picked(emoji), Some(target)) = (event, target) {
-                this.react_toggle(&target, emoji, cx);
+            let picked = this.picker.as_ref().map(|picking| (picking.message.clone(), picking.burst));
+            if let (PickerEvent::Picked(emoji), Some((target, burst))) = (event, picked) {
+                this.react_toggle_kind(&target, emoji, burst, cx);
             }
             this.close_picker(cx);
             window.focus(&this.focus, cx);
         });
         self.hover = Some(message_id.to_owned());
-        self.picker = Some(Picking { message: message_id.to_owned(), at, picker, _listening: listening });
+        self.picker = Some(Picking { message: message_id.to_owned(), at, picker, burst: false, _listening: listening });
         cx.notify();
+    }
+
+    fn super_react_toggle(&self, active: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.rules().is_some_and(|rules| rules.burst) {
+            return None;
+        }
+        let bar = div()
+            .px(px(10.))
+            .py(px(6.))
+            .border_b_1()
+            .border_color(theme::border())
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(div().type_small().text_color(theme::text_soft()).child("Super React"))
+            .child(
+                div()
+                    .id("picker-super-toggle")
+                    .h(px(24.))
+                    .px(px(10.))
+                    .rounded_full()
+                    .border_1()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.))
+                    .cursor_pointer()
+                    .type_micro()
+                    .font_weight(theme::SEMIBOLD)
+                    .when(active, |pill| {
+                        pill.bg(gpui::rgba(0x8b5cf62e))
+                            .border_color(gpui::rgb(0x8b5cf6))
+                            .text_color(gpui::rgb(0x8b5cf6))
+                    })
+                    .when(!active, |pill| {
+                        pill.bg(theme::raised())
+                            .border_color(theme::border())
+                            .text_color(theme::text_soft())
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(picking) = this.picker.as_mut() {
+                            picking.burst = !picking.burst;
+                            cx.notify();
+                        }
+                    }))
+                    .child(if active { "✦ Super ON" } else { "✦ Super" }),
+            );
+        Some(bar.into_any_element())
     }
 
     pub(super) fn close_picker(&mut self, cx: &mut Context<Self>) {
@@ -2310,7 +2375,8 @@ impl Pane {
             picker.set_width(wide, cx);
             picker.set_height((tall * 0.6).min(crate::gui::composer::picker::HEIGHT), cx);
         });
-        let panel = sheet_panel().child(picking.picker.clone());
+        let toggle = self.super_react_toggle(picking.burst, cx);
+        let panel = sheet_panel().children(toggle).child(picking.picker.clone());
         let scrim = sheet_scrim(window).on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.close_picker(cx))).child(panel);
         Some(deferred(anchored().position(point(px(0.), px(0.))).child(fade_in("picker-sheet", 160, scrim))).priority(1).into_any_element())
     }
@@ -2326,10 +2392,14 @@ impl Pane {
         picking.picker.update(cx, |picker, cx| {
             picker.set_height(room.min(emoji::HEIGHT), cx)
         });
+        let toggle = self.super_react_toggle(picking.burst, cx);
         let panel = popover()
             .p(px(0.))
             .w(px(emoji::WIDTH))
             .max_w(px(emoji::WIDTH))
+            .flex()
+            .flex_col()
+            .children(toggle)
             .child(picking.picker.clone())
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_picker(cx)));
         Some(placed(

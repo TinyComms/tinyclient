@@ -290,7 +290,7 @@ fn span(text: &str, part: &str, style: Style) -> Span {
 }
 
 fn reaction(emoji: &str, count: u32, mine: bool) -> Reaction {
-    Reaction { emoji: emoji.into(), file: None, count, mine, who: Vec::new() }
+    Reaction { emoji: emoji.into(), file: None, count, mine, who: Vec::new(), ..Reaction::default() }
 }
 
 /// The conversation worth opening: four people planning a Saturday, over yesterday and today,
@@ -1124,11 +1124,25 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
             conversations(rows, *offset, *limit)
         }
         Request::Topics { .. } | Request::InVoice { .. } => conversations(Vec::new(), 0, 1),
+        Request::ForumInfo { forum } => Response::ForumInfo {
+            info: protocol::ForumInfo {
+                forum: forum.clone(),
+                guidelines: String::new(),
+                tags: Vec::new(),
+                require_tag: false,
+                media: false,
+                default_slowmode: 0,
+            },
+        },
+        Request::ForumPost { .. } => Response::Error {
+            code: protocol::ErrorCode::Unsupported,
+            detail: "Creating forum posts is not supported in demo mode.".into(),
+        },
         Request::Folders { .. } => Response::Folders { folders: Vec::new() },
         Request::SearchMessages { conversation, query, limit, .. } => {
-            Response::MessageHits { hits: hits(query, conversation.as_ref()).into_iter().take(*limit as usize).collect(), cursor: None, not_searched: Vec::new() }
+            Response::MessageHits { hits: hits(query, conversation.as_ref()).into_iter().take(*limit as usize).collect(), cursor: None, not_searched: Vec::new(), total: None }
         }
-        Request::SearchNetwork { conversation, query, .. } => Response::MessageHits { hits: hits(query, conversation.as_ref()), cursor: None, not_searched: Vec::new() },
+        Request::SearchNetwork { conversation, query, .. } => Response::MessageHits { hits: hits(query, conversation.as_ref()), cursor: None, not_searched: Vec::new(), total: None },
         Request::Messages { conversation, page: at, limit } => page(conversation, at, *limit),
         Request::Pinned { conversation } => Response::Pinned {
             conversation: conversation.clone(),

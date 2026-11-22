@@ -62,7 +62,7 @@ pub mod tiny_bots;
 use crate::hub::{lock, now, Hub};
 use crate::session;
 use crate::store::{
-    ConversationRow, Filing, FolderRow, PersonDetails, PersonRow, PreviewLine, SpaceRow, Stored,
+    ConversationRow, Filing, FolderRow, PersonDetails, PersonRow, PostCard, PreviewLine, SpaceRow, Stored,
     KEEP_MESSAGES,
 };
 use protocol::{
@@ -304,6 +304,19 @@ pub struct AutomodPage {
     pub rules: Vec<protocol::AutomodRule>,
     pub safety: protocol::SpaceSafety,
 }
+/// One page of network message search results (`Command::Search`).
+#[derive(Debug, Clone, Default)]
+pub struct SearchPage {
+    pub hits: Vec<MessageHit>,
+    pub cursor: Option<String>,
+    pub total: Option<u32>,
+}
+
+impl From<Vec<MessageHit>> for SearchPage {
+    fn from(hits: Vec<MessageHit>) -> Self {
+        Self { hits, cursor: None, total: None }
+    }
+}
 
 /// A picture on the call the user is in. Discord is the network that acts on it.
 pub enum Picture {
@@ -313,6 +326,13 @@ pub enum Picture {
     Share(bool),
     /// Whose share to watch. `None` stops watching.
     Watch(Option<String>),
+}
+
+/// One page of a forum's posts, in the network's order. `None` from [`Command::OpenForum`] means
+/// the cache still answers an unfiltered first page.
+pub struct ForumPosts {
+    pub ids: Vec<String>,
+    pub total: u32,
 }
 
 /// What chatd asks of an adapter. Ids are the network's own; the account is the adapter's.
@@ -623,6 +643,20 @@ pub enum Command {
         first_message: String,
         reply: Reply<String>,
     },
+    /// Guidelines, tags, and posting rules of a forum or media channel, from what is already kept.
+    ForumInfo {
+        conversation_id: String,
+        reply: Reply<protocol::ForumInfo>,
+    },
+    /// The id of a new post in a forum or media channel. One create, then the thread is recorded.
+    ForumPost {
+        conversation_id: String,
+        title: String,
+        text: String,
+        tags: Vec<String>,
+        with: Box<Outgoing>,
+        reply: Reply<String>,
+    },
     /// One person's card. One request to the network, and only because the user opened it.
     Profile { person_id: String, reply: Reply<About> },
     /// The same, opened from inside a Space: add the nickname, roles and join date there. An
@@ -736,12 +770,26 @@ pub enum Command {
     /// Preview a Space invite link or code.
     InvitePreview {
         code: String,
+        event_id: Option<String>,
         reply: Reply<protocol::InvitePreview>,
     },
     /// Join a Space from an invite link or code; returns `(space_id, channel_id)`.
     InviteJoin {
         code: String,
         reply: Reply<(Option<String>, Option<String>)>,
+    },
+    /// Preview a scheduled event by guild/space id and event id.
+    EventPreview {
+        space_id: String,
+        event_id: String,
+        reply: Reply<protocol::ScheduledEvent>,
+    },
+    /// Mark or unmark ourselves as interested in a scheduled event.
+    EventLinkInterest {
+        space_id: String,
+        event_id: String,
+        interested: bool,
+        reply: Reply<()>,
     },
     /// Moderate a member in a Space (kick, ban, timeout, untimeout, nickname).
     Moderate {
@@ -1181,9 +1229,16 @@ pub enum Command {
     /// The user opened a Space's Threads list: fetch the network's list of followed threads
     /// once, and record them with `Filing::followed`.
     OpenThreads(String),
-    /// The user opened a forum: fetch its topics once and answer, so the landing topic the
-    /// shell then reads from the store is named on what the network says now.
-    OpenForum { conversation_id: String, reply: Reply<()> },
+    /// The user opened a forum, or asked for another page of its posts. Discord answers with
+    /// the page (`Some`); a cache-only network answers `None`. `offset` is the existing cursor.
+    OpenForum {
+        conversation_id: String,
+        sort: protocol::TopicSort,
+        tag: Option<String>,
+        query: Option<String>,
+        offset: u32,
+        reply: Reply<Option<ForumPosts>>,
+    },
     /// The user answered, withdrew or ended a friendship, or blocked someone. Report the new
     /// relationship through [`Context::relation`] before answering.
     Relate {
@@ -1274,7 +1329,7 @@ pub enum Command {
         filters: protocol::SearchFilters,
         cursor: Option<String>,
         at: Instant,
-        reply: Reply<Vec<MessageHit>>,
+        reply: Reply<SearchPage>,
     },
     /// The shell asked for these files and the media cache knows none of them, or knows them
     /// only by Telegram's name for a file it kept, since gone from disk. An adapter that fetches
@@ -1349,6 +1404,7 @@ impl Command {
             | Command::CreateChannel { reply, .. }
             | Command::CreateGroup { reply, .. }
             | Command::StartThread { reply, .. }
+            | Command::ForumPost { reply, .. }
             | Command::Handoff { reply, .. }
             | Command::CallAddPeople { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
@@ -1359,6 +1415,7 @@ impl Command {
             Command::Profile { reply, .. } | Command::ProfileIn { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ConversationInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SpaceInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::ForumInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CreateInvite { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1380,6 +1437,8 @@ impl Command {
             Command::CreateEvent { reply, .. } | Command::EditEvent { reply, .. } => {
                 drop(reply.send(Err(Refusal::Unsupported)))
             }
+            Command::EventPreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::EventLinkInterest { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetMute { reply, .. }
             | Command::Moderate { reply, .. }
             | Command::Unban { reply, .. }
@@ -1472,8 +1531,8 @@ impl Command {
             | Command::SetNickname { reply, .. }
             | Command::SetNote { reply, .. }
             | Command::SetFriendNickname { reply, .. }
-            | Command::AnswerMessageRequest { reply, .. }
-            | Command::OpenForum { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            | Command::AnswerMessageRequest { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::OpenForum { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Source { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ReportReasons { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             // Nothing to end on the network: the session is simply forgotten.
@@ -1882,6 +1941,15 @@ impl Context {
         Ok(())
     }
 
+    /// Tags, counts, picture, reaction, and owner of one forum post.
+    pub fn post_card(&self, conversation_id: &str, card: &PostCard) -> Stores {
+        let conversation = self.key(conversation_id);
+        if self.hub.store().set_post(&conversation, card)? {
+            self.hub.changed(Change::Conversation { conversation });
+        }
+        Ok(())
+    }
+
     /// The other side has read my messages up to this one (Telegram's ✓✓, Teams' "Seen").
     pub fn seen(&self, conversation_id: &str, message_id: &str) -> Stores {
         let conversation = self.key(conversation_id);
@@ -2074,7 +2142,7 @@ impl Context {
         let conversation = self.key(conversation_id);
         if self.hub.store().react(&conversation, message_id, reaction, added)? {
             self.hub.changed(Change::Messages { conversation: conversation.clone() });
-            if added && !reaction.mine {
+            if added && !reaction.mine && !reaction.mine_burst {
                 if let Ok(Some(target)) = self.hub.store().message(&conversation, message_id) {
                     if target.outgoing {
                         let snippet = crate::store::preview_text(&target);
@@ -2973,7 +3041,7 @@ pub fn prove_reactors() -> Result<(), String> {
     let conversation = Key::new(&account, "c1");
     let said = Message::plain("m1", "Ada", "hello", 1_700_000_000, false);
     store.ingest(&conversation, &said, false).map_err(|err| err.to_string())?;
-    let by = |id: &str| protocol::Reaction { emoji: "👍".into(), file: None, count: 1, mine: false, who: vec![id.to_owned()] };
+    let by = |id: &str| protocol::Reaction { emoji: "👍".into(), file: None, count: 1, mine: false, who: vec![id.to_owned()], ..protocol::Reaction::default() };
     store.react(&conversation, "m1", &by("u-ana"), true).map_err(|err| err.to_string())?;
     store.react(&conversation, "m1", &by("u-bea"), true).map_err(|err| err.to_string())?;
     let who = |store: &crate::store::Store| -> Result<Vec<String>, String> {

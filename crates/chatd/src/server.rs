@@ -1,4 +1,4 @@
-use crate::adapters::{self, About, Adapter, Command, Picture, Refusal, Reply, SearchScope};
+use crate::adapters::{self, About, Adapter, Command, ForumPosts, Picture, Refusal, Reply, SearchScope};
 use crate::blobs::Blobs;
 use crate::hub::{lock, now, Hub, KEYCHAIN_PROMPT};
 use crate::media::CallError;
@@ -7,7 +7,7 @@ use crate::store::Store;
 use protocol::settings;
 use protocol::{
     clip, read_frame_bytes, support_dir, write_frame, CatalogKind, ConversationInfo, MediaFile, MediaKind, Outgoing, SharedKind, SpaceInfo, AccountKey, AccountStatus, CallSupport, Capabilities,
-    Change, ChatListener, ChatStream, Conversation, ConversationKind, ErrorCode, InboxCounts, Key,
+    Change, ChatListener, ChatStream, Conversation, ConversationKind, ErrorCode, InboxCounts, Key, TopicSort,
     Link, Media, MediaRequest, Message, MessageKind, Network, NetworkStatus, Page, Person, Presence,
     Profile, Reaction, RelateAction, Relation, Request, Response, SendState, Sender, Watching,
     MUTUAL_SPACES, PAGE_LIMIT, SEARCH_MIN_CHARS, WATCH_LIMIT,
@@ -1000,15 +1000,84 @@ impl Chat {
     /// open lands on. The landing's topics are asked of the network once first, and the
     /// answer waits for them, so it is named on what Telegram says now and not on what an
     /// earlier open left in the cache.
-    fn topics(&self, forum: Key, offset: u32, limit: u32, landing: bool) -> Response {
+    fn topics(&self, forum: Key, offset: u32, limit: u32, landing: bool, sort: TopicSort, tag: Option<String>, query: Option<String>) -> Response {
         if !self.shows(&forum.account()) {
             // Same refusal as Tree. An empty Conversations page looks like a real empty forum.
             return hidden_list();
         }
-        if landing && offset == 0 {
-            let _ = self.ask(&forum.account(), |reply| Command::OpenForum { conversation_id: forum.id.clone(), reply });
+        if forum.network == Network::Discord {
+            return self.discord_topics(forum, offset, limit, landing, sort, tag, query);
         }
-        let read = if landing { self.hub.store().landing(&forum) } else { self.hub.store().topics(&forum, offset, limit.min(PAGE_LIMIT)) };
+        if landing && offset == 0 {
+            let _ = self.ask(&forum.account(), |reply| Command::OpenForum {
+                conversation_id: forum.id.clone(),
+                sort,
+                tag,
+                query,
+                offset,
+                reply,
+            });
+        }
+        self.cached_topics(&forum, offset, limit, landing)
+    }
+
+    /// Discord's post list is one search page. A refusal is returned. An unfiltered first page
+    /// that Discord did not answer falls back to the cache; a filtered or older page does not.
+    fn discord_topics(
+        &self,
+        forum: Key,
+        offset: u32,
+        limit: u32,
+        landing: bool,
+        sort: TopicSort,
+        tag: Option<String>,
+        query: Option<String>,
+    ) -> Response {
+        let plain = offset == 0
+            && sort == TopicSort::Activity
+            && tag.as_deref().unwrap_or("").trim().is_empty()
+            && query.as_deref().unwrap_or("").trim().is_empty();
+        let asked = self.ask(&forum.account(), |reply| Command::OpenForum {
+            conversation_id: forum.id.clone(),
+            sort,
+            tag: tag.clone(),
+            query,
+            offset,
+            reply,
+        });
+        match asked {
+            Err(refused) => *refused,
+            Ok(Some(page)) => self.forum_page(&forum, page, limit, tag.as_deref()),
+            Ok(None) if plain => self.cached_topics(&forum, offset, limit, landing),
+            Ok(None) => error(ErrorCode::Offline, "Couldn't load posts."),
+        }
+    }
+
+    /// The posts Discord named, still inside this forum and this tag, pins first, at most one page.
+    fn forum_page(&self, forum: &Key, page: ForumPosts, limit: u32, tag: Option<&str>) -> Response {
+        let cap = limit.min(25) as usize;
+        let wanted = tag.map(str::trim).filter(|tag| !tag.is_empty());
+        let mut indexed = Vec::new();
+        for (index, id) in page.ids.into_iter().enumerate() {
+            let key = Key::new(&forum.account(), id);
+            let Ok(Some(row)) = self.hub.store().conversation(&key) else {
+                continue;
+            };
+            if row.parent.as_deref() != Some(forum.id.as_str()) {
+                continue;
+            }
+            if wanted.is_some_and(|tag| !row.tags.iter().any(|have| have == tag)) {
+                continue;
+            }
+            indexed.push((index, row));
+        }
+        indexed.sort_by_key(|(index, row)| (row.pin.is_none(), row.pin.unwrap_or(0), *index));
+        let conversations: Vec<_> = indexed.into_iter().take(cap).map(|(_, row)| row).collect();
+        Response::Conversations { conversations: self.rows(conversations), total: page.total, counts: InboxCounts::default() }
+    }
+
+    fn cached_topics(&self, forum: &Key, offset: u32, limit: u32, landing: bool) -> Response {
+        let read = if landing { self.hub.store().landing(forum) } else { self.hub.store().topics(forum, offset, limit.min(PAGE_LIMIT)) };
         match read {
             Ok((conversations, total)) => Response::Conversations { conversations: self.rows(conversations), total, counts: InboxCounts::default() },
             Err(err) => internal(err),
@@ -1566,21 +1635,24 @@ impl Chat {
         if let Err(refused) = self.online(&account) {
             return *refused;
         }
-        if burst && !self.hub.capabilities(&account).burst_reactions {
+        if on && burst && !self.hub.capabilities(&account).burst_reactions {
             return error(ErrorCode::Unsupported, "Super reactions are not available on this account.");
         }
         // Paid Telegram Star reactions cost real Stars and must never fire from a normal React call.
         if conversation.network == Network::Telegram && protocol::bare_emoji(&emoji) == "⭐" {
             return error(ErrorCode::Refused, "Paid Star reactions must be confirmed before spending Stars.");
         }
-        let ours = |emoji: &str| Reaction {
+        let ours = |emoji: &str, burst: bool| Reaction {
             emoji: emoji.to_owned(),
             file: None,
-            count: 1,
-            mine: true,
+            count: if burst { 0 } else { 1 },
+            mine: !burst,
             // Ours is one person the store cannot name here; the network's word of the
             // reaction carries the id, and a fresh payload corrects the list.
             who: Vec::new(),
+            burst: if burst { 1 } else { 0 },
+            mine_burst: burst,
+            burst_colors: Vec::new(),
         };
         let message = match self.hub.store().message(&conversation, &message_id) {
             Ok(Some(message)) => message,
@@ -1590,7 +1662,7 @@ impl Chat {
         let known = self.hub.store().media(&account, std::slice::from_ref(&emoji)).is_ok_and(|known| !known.is_empty());
         // Rules the adapter cannot give leave it to the network, as before there were any.
         let (emoji, replacing) = match (on, self.reaction_rules(&conversation)) {
-            (true, Ok(rules)) => match rules.check(&message.reactions, &emoji, known || emoji.starts_with(':')) {
+            (true, Ok(rules)) => match rules.check_kind(&message.reactions, &emoji, known || emoji.starts_with(':'), burst) {
                 // Sent as the network spells it, so its own word of it is the same reaction.
                 Ok(replacing) => (rules.spelled(&emoji).to_owned(), replacing),
                 Err(why) => return error(ErrorCode::Refused, why),
@@ -1600,7 +1672,7 @@ impl Chat {
         let shown = {
             let mut store = self.hub.store();
             for old in &replacing {
-                if let Err(err) = store.react(&conversation, &message_id, &ours(old), false) {
+                if let Err(err) = store.react(&conversation, &message_id, &ours(old, false), false) {
                     return internal(err);
                 }
             }
@@ -1608,7 +1680,7 @@ impl Chat {
             if known && !on_it {
                 false
             } else {
-                match store.react(&conversation, &message_id, &ours(&emoji), on) {
+                match store.react(&conversation, &message_id, &ours(&emoji, burst), on) {
                     Ok(changed) => changed,
                     Err(err) => return internal(err),
                 }
@@ -1632,10 +1704,10 @@ impl Chat {
                 // What the network refused may be what the kept rules allowed: ask again next time.
                 self.hub.reactions.forget(&conversation);
                 let mut store = self.hub.store();
-                let mut undone = shown && store.react(&conversation, &message_id, &ours(&emoji), !on).unwrap_or(false);
+                let mut undone = shown && store.react(&conversation, &message_id, &ours(&emoji, burst), !on).unwrap_or(false);
                 for old in &replacing {
-                    let had = message.reactions.iter().find(|have| have.emoji == *old).map(|have| Reaction { count: 1, ..have.clone() });
-                    undone |= store.react(&conversation, &message_id, &had.unwrap_or_else(|| ours(old)), true).unwrap_or(false);
+                    let had = message.reactions.iter().find(|have| have.emoji == *old).map(|have| Reaction { count: 1, burst: 0, mine_burst: false, ..have.clone() });
+                    undone |= store.react(&conversation, &message_id, &had.unwrap_or_else(|| ours(old, false)), true).unwrap_or(false);
                 }
                 drop(store);
                 if undone {
@@ -1813,7 +1885,7 @@ impl Chat {
         }
     }
 
-    fn invite_preview(&self, account: AccountKey, code: String) -> Response {
+    fn invite_preview(&self, account: AccountKey, code: String, event_id: Option<String>) -> Response {
         if let Err(refused) = self.online(&account) {
             return *refused;
         }
@@ -1821,8 +1893,38 @@ impl Chat {
         if code.is_empty() {
             return error(ErrorCode::Refused, "Enter an invite link or code.");
         }
-        match self.ask(&account, |reply| Command::InvitePreview { code, reply }) {
+        match self.ask(&account, |reply| Command::InvitePreview { code, event_id, reply }) {
             Ok(preview) => Response::InvitePreview { preview },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn event_preview(&self, space: Key, event_id: String) -> Response {
+        let account = space.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let event_id = event_id.trim().to_owned();
+        if event_id.is_empty() {
+            return error(ErrorCode::Refused, "Missing event id.");
+        }
+        match self.ask(&account, |reply| Command::EventPreview { space_id: space.id, event_id, reply }) {
+            Ok(event) => Response::EventPreview { event },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn event_link_interest(&self, space: Key, event_id: String, interested: bool) -> Response {
+        let account = space.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let event_id = event_id.trim().to_owned();
+        if event_id.is_empty() {
+            return error(ErrorCode::Refused, "Missing event id.");
+        }
+        match self.ask(&account, |reply| Command::EventLinkInterest { space_id: space.id, event_id, interested, reply }) {
+            Ok(()) => Response::Ok,
             Err(refused) => *refused,
         }
     }
@@ -3351,7 +3453,46 @@ impl Chat {
             Request::DeleteThread { conversation } => {
                 self.act(&conversation, |conversation_id, reply| Command::DeleteThread { conversation_id, reply })
             }
-            Request::Topics { forum, offset, limit, landing } => self.topics(forum, offset, limit, landing),
+            Request::Topics { forum, offset, limit, landing, sort, tag, query } => self.topics(forum, offset, limit, landing, sort, tag, query),
+            Request::ForumInfo { forum } => {
+                if !self.shows(&forum.account()) {
+                    return error(ErrorCode::NotFound, "no such conversation");
+                }
+                match self.ask(&forum.account(), |reply| Command::ForumInfo {
+                    conversation_id: forum.id.clone(),
+                    reply,
+                }) {
+                    Ok(info) => Response::ForumInfo { info },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::ForumPost { forum, title, text, tags, with } => {
+                let account = forum.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                if !self.shows(&account) {
+                    return error(ErrorCode::NotFound, "no such conversation");
+                }
+                match self.ask(&account, |reply| Command::ForumPost {
+                    conversation_id: forum.id.clone(),
+                    title,
+                    text,
+                    tags,
+                    with: Box::new(with),
+                    reply,
+                }) {
+                    Ok(thread_id) => {
+                        let key = Key::new(&account, &thread_id);
+                        match self.hub.store().conversation(&key) {
+                            Ok(Some(conversation)) => Response::Conversation { conversation: self.row(conversation) },
+                            Ok(None) => error(ErrorCode::Internal, "post created, but not recorded"),
+                            Err(err) => internal(err),
+                        }
+                    }
+                    Err(refused) => *refused,
+                }
+            }
             Request::InVoice { network } => self.in_voice(network),
             Request::Around { network } => self.around(network),
             Request::Catalog { account, kind, space, query, cursor } => self.catalog(account, kind, space, query, cursor),
@@ -3422,7 +3563,7 @@ impl Chat {
                 match found {
                     Ok(hits) => {
                         let hits: Vec<_> = hits.into_iter().filter(|hit| self.shows(&hit.conversation.account())).collect();
-                        Response::MessageHits { hits, cursor: None, not_searched: Vec::new() }
+                        Response::MessageHits { hits, cursor: None, not_searched: Vec::new(), total: None }
                     }
                     Err(err) => internal(err),
                 }
@@ -3430,7 +3571,7 @@ impl Chat {
             Request::SearchNetwork { conversation, space, account, network, query, filters, cursor } => {
                 let query = query.trim().to_owned();
                 if query.is_empty() && filters.is_empty() {
-                    Response::MessageHits { hits: Vec::new(), cursor: None, not_searched: Vec::new() }
+                    Response::MessageHits { hits: Vec::new(), cursor: None, not_searched: Vec::new(), total: None }
                 } else if conversation.is_some() || space.is_some() {
                     let (target_account, scope) = match (&conversation, &space) {
                         (Some(key), _) => (key.account(), SearchScope::Conversation(key.id.clone())),
@@ -3438,7 +3579,7 @@ impl Chat {
                         (None, None) => unreachable!(),
                     };
                     if !self.shows(&target_account) {
-                        return Response::MessageHits { hits: Vec::new(), cursor: None, not_searched: Vec::new() };
+                        return Response::MessageHits { hits: Vec::new(), cursor: None, not_searched: Vec::new(), total: None };
                     }
                     match self.ask(&target_account, |reply| Command::Search {
                         query,
@@ -3448,7 +3589,12 @@ impl Chat {
                         at: std::time::Instant::now(),
                         reply,
                     }) {
-                        Ok(hits) => Response::MessageHits { hits, cursor: None, not_searched: Vec::new() },
+                        Ok(page) => Response::MessageHits {
+                            hits: page.hits,
+                            cursor: page.cursor,
+                            not_searched: Vec::new(),
+                            total: page.total,
+                        },
                         Err(refused) => *refused,
                     }
                 } else {
@@ -3467,13 +3613,42 @@ impl Chat {
                             .collect(),
                         Err(err) => return internal(err),
                     };
+                    // Single-account scope (e.g. Discord all-DMs): preserve the adapter's cursor and total.
+                    if accounts.len() == 1 {
+                        let acct = &accounts[0];
+                        let can = self.hub.capabilities(acct);
+                        if self.hub.link(acct) == Link::Connected && can.search_global {
+                            return match self.ask(acct, |reply| Command::Search {
+                                query,
+                                scope: SearchScope::Account,
+                                filters,
+                                cursor,
+                                at: std::time::Instant::now(),
+                                reply,
+                            }) {
+                                Ok(page) => Response::MessageHits {
+                                    hits: page.hits,
+                                    cursor: page.cursor,
+                                    not_searched: Vec::new(),
+                                    total: page.total,
+                                },
+                                Err(refused) => *refused,
+                            };
+                        }
+                        return Response::MessageHits {
+                            hits: Vec::new(),
+                            cursor: None,
+                            not_searched: vec![acct.network],
+                            total: None,
+                        };
+                    }
                     let mut merged: Vec<protocol::MessageHit> = Vec::new();
                     let mut not_searched: Vec<Network> = Vec::new();
                     let mut asked_networks: Vec<Network> = Vec::new();
                     for acct in accounts {
                         let can = self.hub.capabilities(&acct);
                         if self.hub.link(&acct) == Link::Connected && can.search_global {
-                            if let Ok(hits) = self.ask(&acct, |reply| Command::Search {
+                            if let Ok(page) = self.ask(&acct, |reply| Command::Search {
                                 query: query.clone(),
                                 scope: SearchScope::Account,
                                 filters: filters.clone(),
@@ -3484,7 +3659,7 @@ impl Chat {
                                 if !asked_networks.contains(&acct.network) {
                                     asked_networks.push(acct.network);
                                 }
-                                merged.extend(hits);
+                                merged.extend(page.hits);
                                 continue;
                             }
                         }
@@ -3498,7 +3673,7 @@ impl Chat {
                     merged.retain(|hit| seen.insert((hit.conversation.clone(), hit.message_id.clone())));
                     let next_cursor = (offset + PAGE < merged.len()).then(|| (offset + PAGE).to_string());
                     let page: Vec<protocol::MessageHit> = merged.into_iter().skip(offset).take(PAGE).collect();
-                    Response::MessageHits { hits: page, cursor: next_cursor, not_searched }
+                    Response::MessageHits { hits: page, cursor: next_cursor, not_searched, total: None }
                 }
             }
             Request::SetDraft { conversation, text } => {
@@ -4242,7 +4417,7 @@ impl Chat {
             Request::SetNickname { space, nickname } => self.set_nickname(space, nickname),
             Request::SetNote { person, text } => self.set_note(person, text),
             Request::SetFriendNickname { person, nickname } => self.set_friend_nickname(person, nickname),
-            Request::InvitePreview { account, code } => self.invite_preview(account, code),
+            Request::InvitePreview { account, code, event_id } => self.invite_preview(account, code, event_id),
             Request::InviteJoin { account, code } => self.invite_join(account, code),
             Request::CreateInvite { conversation, space, account, max_age, max_uses, temporary } => {
                 self.create_invite(conversation, space, account, max_age, max_uses, temporary)
@@ -4265,6 +4440,8 @@ impl Chat {
             Request::MoveRoles { space, roles } => self.move_roles(space, roles),
             Request::DeleteRole { space, role_id } => self.delete_role(space, role_id),
             Request::SetMemberRoles { space, person, roles } => self.set_member_roles(space, person, roles),
+            Request::EventPreview { space, event_id } => self.event_preview(space, event_id),
+            Request::EventLinkInterest { space, event_id, interested } => self.event_link_interest(space, event_id, interested),
             Request::Watch(watching) => self.watch(watching),
 
             Request::Messages { conversation, page, limit } => self.messages(conversation, page, limit),

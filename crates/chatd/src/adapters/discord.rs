@@ -41,7 +41,7 @@ use protocol::{Conversation, ConversationKind, Key, Message, MessageKind, Presen
 use rest::{Refused, Rest};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
@@ -589,6 +589,12 @@ struct State {
     warming: HashSet<String>,
     /// What the last acknowledgement answered with; the web client sends it back on the next.
     ack_token: Option<String>,
+    /// Session cache of resolved invites (keyed by `"code"` or `"code:event_id"`).
+    invite_cache: HashMap<String, Result<protocol::InvitePreview, String>>,
+    /// Session cache of resolved scheduled events (keyed by `(guild_id, event_id)`).
+    event_cache: HashMap<(String, String), Result<protocol::ScheduledEvent, String>>,
+    /// Recent invite/event resolve timestamps, paced to avoid scraping bursts.
+    invite_recent: VecDeque<Instant>,
     /// Our own presence and status line as the settings have them, and those settings as
     /// Discord sent them (`proto::status_settings`), to change one part and send back the rest.
     own: (Presence, String),
@@ -603,6 +609,9 @@ struct State {
     /// Per conversation, the stretches of history fetched whole in this session, as message
     /// ids from and to: reading on inside one asks Discord nothing.
     covered: HashMap<String, Vec<(u64, u64)>>,
+    /// Server channels the shell has opened. A live message is kept from then on, even when
+    /// the channel had nothing cached yet.
+    opened: HashSet<String>,
     /// Files whose addresses ran out, waiting to be renewed together.
     renewing: Vec<(String, String, Reply<Download>)>,
     /// The last addresses renewed, old to fresh.
@@ -662,6 +671,8 @@ struct Discord {
     /// This account's message searches: one in flight at a time, paced from when the last
     /// finished, with recent answers kept in memory.
     message_search: Mutex<info::MessageSearch>,
+    /// Serialises queued message searches per account so rapid Enters wait their turn.
+    search_turn: Mutex<()>,
     /// One Go Live request at a time, so a stop cannot land before the start it was meant to end.
     stream_gate: Mutex<()>,
 }
@@ -708,6 +719,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
         refused_sessions: Mutex::new((0, String::new())),
         held: AtomicBool::new(false),
         message_search: Mutex::new(info::MessageSearch::default()),
+        search_turn: Mutex::new(()),
         stream_gate: Mutex::new(()),
     });
     let socket = discord.clone();
@@ -739,13 +751,25 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
                     sending.send_with(&channel, &client, &text, reply_to.as_deref(), &with, up)
                 });
             }
+            // A post with files uploads before Discord will name the thread. That waits on its
+            // own thread, so the commands behind it (a cancel among them) are not held up.
+            Command::ForumPost { conversation_id, title, text, tags, with, reply } if !with.files.is_empty() => {
+                discord.asked();
+                let sending = discord.clone();
+                let started = std::thread::Builder::new().name("forum-post".into()).spawn(move || {
+                    answer(reply, sending.forum_post(&conversation_id, &title, &text, &tags, &with));
+                });
+                if let Err(err) = started {
+                    discord.log("forum post", err);
+                }
+            }
             // A search can wait on Discord's tight search limits: it runs on a thread of its
             // own, so the sends and reactions behind it are not held up, and one queued past
             // the shell's patience does not ask at all.
-            Command::Search { query, scope, at, reply, .. } => {
+            Command::Search { query, scope, filters, cursor, at, reply } => {
                 discord.asked();
                 if at.elapsed() < SEARCH_PATIENCE {
-                    Discord::search_queued(&discord, query, scope, at, reply);
+                    Discord::search_queued(&discord, query, scope, filters, cursor, at, reply);
                 } else {
                     drop(reply);
                 }
@@ -1298,6 +1322,9 @@ impl Discord {
     }
 
     fn backfill(&self, channel: &str) {
+        // The shell asked for this channel. Live messages are kept from here, including the
+        // ones that arrive while the history page is still empty.
+        crate::hub::lock(&self.state).opened.insert(channel.to_owned());
         // Warming is nobody's click, so it does not run at a machine's pace.
         if crate::hub::lock(&self.state).warming.remove(channel) {
             std::thread::sleep(jitter(400, 2500));
@@ -1353,12 +1380,16 @@ impl Discord {
     /// The query is what the web client adds; it is from the community documentation and
     /// unconfirmed against a real account. So is sending a placeholder name with an id whose
     /// name is not known here (Discord is said to go by the id).
-    fn react(&self, channel: &str, message: &str, emoji: &str, on: bool) -> Result<(), Refusal> {
+    fn react(&self, channel: &str, message: &str, emoji: &str, on: bool, burst: bool) -> Result<(), Refusal> {
+        if on && burst && !matches!(crate::hub::lock(&self.state).premium, 1..=3) {
+            return Err(Refusal::Refused("Super reactions require Discord Nitro.".to_owned()));
+        }
         let named = self.reaction_emoji(channel, message, emoji)?;
         let reaction = format!("/channels/{channel}/messages/{message}/reactions/{}", escaped(&named));
+        let rtype = if burst { 1 } else { 0 };
         let asked = match on {
-            true => self.call("PUT", &format!("{reaction}/%40me?location=Message%20Reaction%20Picker&type=0"), None),
-            false => self.call("DELETE", &format!("{reaction}/0/%40me?location=Message%20Inline%20Button&burst=false"), None),
+            true => self.call("PUT", &format!("{reaction}/%40me?location=Message%20Reaction%20Picker&type={rtype}"), None),
+            false => self.call("DELETE", &format!("{reaction}/{rtype}/%40me?location=Message%20Inline%20Button&burst={burst}"), None),
         };
         asked.map(drop).map_err(refusal)
     }
@@ -1741,11 +1772,59 @@ impl Discord {
         Ok(())
     }
 
-    /// Previews a Discord server invite (`GET /invites/{code}?with_counts=true&with_expiration=true`).
-    fn invite_preview(&self, raw: &str) -> Result<protocol::InvitePreview, Refusal> {
+    /// Previews a Discord server invite (`GET /invites/{code}?with_counts=true&with_expiration=true`),
+    /// optionally including a scheduled event (`&guild_scheduled_event_id=...`). Session-cached
+    /// per code and paced so scrolling never bursts Discord.
+    fn invite_preview(&self, raw: &str, event_id: Option<&str>) -> Result<protocol::InvitePreview, Refusal> {
         let code = parse_discord_invite_code(raw).map_err(Refusal::Refused)?;
-        let path = format!("/invites/{}?with_counts=true&with_expiration=true", escaped(&code));
-        let body = self.call("GET", &path, None).map_err(invite_refusal)?;
+        let query_event = raw
+            .split_once('?')
+            .and_then(|(_, q)| q.split('#').next())
+            .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("event=")))
+            .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()));
+        let event_id = event_id.filter(|id| !id.is_empty()).or(query_event);
+        let cache_key = match event_id {
+            Some(ev) => format!("{code}:{ev}"),
+            None => code.clone(),
+        };
+        {
+            let mut state = crate::hub::lock(&self.state);
+            if let Some(cached) = state.invite_cache.get(&cache_key).cloned() {
+                return match cached {
+                    Ok(mut preview) => {
+                        if let Some(gid) = preview.space_id.as_deref() {
+                            preview.joined = state.guilds.contains_key(gid);
+                        }
+                        Ok(preview)
+                    }
+                    Err(msg) => Err(Refusal::Refused(msg)),
+                };
+            }
+            let now = Instant::now();
+            while state.invite_recent.front().is_some_and(|at| now.duration_since(*at) >= Duration::from_secs(60)) {
+                state.invite_recent.pop_front();
+            }
+            if state.invite_recent.len() >= 12 {
+                return Err(Refusal::Refused("Too many invite previews right now. Try again in a moment.".to_owned()));
+            }
+            state.invite_recent.push_back(now);
+        }
+        let mut path = format!("/invites/{}?with_counts=true&with_expiration=true", escaped(&code));
+        if let Some(ev) = event_id {
+            path.push_str(&format!("&guild_scheduled_event_id={}", escaped(ev)));
+        }
+        let body = match self.call("GET", &path, None) {
+            Ok(body) => body,
+            Err(err) => {
+                let refused = invite_refusal(err);
+                if let Refusal::Refused(ref msg) = refused {
+                    if msg.contains("invalid or has expired") {
+                        crate::hub::lock(&self.state).invite_cache.insert(cache_key, Err(msg.clone()));
+                    }
+                }
+                return Err(refused);
+            }
+        };
         let parsed: Value = serde_json::from_str(&body)
             .map_err(|err| Refusal::Refused(format!("Discord's answer was unreadable: {err}")))?;
         let guild = parsed.get("guild").filter(|v| v.is_object());
@@ -1777,7 +1856,15 @@ impl Discord {
             .and_then(|c| c.get("id"))
             .and_then(Value::as_str)
             .map(str::to_owned);
-        Ok(protocol::InvitePreview {
+        let event = parsed
+            .get("guild_scheduled_event")
+            .filter(|v| v.is_object())
+            .and_then(|ev| parse_scheduled_event(ev, space_id.as_deref()));
+        let joined = {
+            let state = crate::hub::lock(&self.state);
+            space_id.as_deref().is_some_and(|gid| state.guilds.contains_key(gid))
+        };
+        let preview = protocol::InvitePreview {
             code: parsed.get("code").and_then(Value::as_str).unwrap_or(&code).to_owned(),
             name,
             description,
@@ -1786,7 +1873,11 @@ impl Discord {
             online: parsed.get("approximate_presence_count").and_then(Value::as_u64).map(|n| n as u32),
             space_id,
             channel_id,
-        })
+            joined,
+            event,
+        };
+        crate::hub::lock(&self.state).invite_cache.insert(cache_key, Ok(preview.clone()));
+        Ok(preview)
     }
 
     /// Joins a Discord server from an invite code (`POST /invites/{code}`). Never retries on
@@ -1810,6 +1901,16 @@ impl Discord {
             .and_then(|c| c.get("id"))
             .and_then(Value::as_str)
             .map(str::to_owned);
+        {
+            let mut state = crate::hub::lock(&self.state);
+            for (k, v) in &mut state.invite_cache {
+                if k == &code || k.starts_with(&format!("{code}:")) {
+                    if let Ok(preview) = v {
+                        preview.joined = true;
+                    }
+                }
+            }
+        }
         Ok((space_id, channel_id))
     }
 
@@ -1941,6 +2042,82 @@ impl Discord {
             }
         }
         (None, trimmed.to_owned(), false)
+    }
+
+    /// Resolves a Discord scheduled event (`GET /guilds/{guild}/scheduled-events/{event}?with_user_count=true`).
+    fn event_preview(&self, guild_id: &str, event_id: &str) -> Result<protocol::ScheduledEvent, Refusal> {
+        let key = (guild_id.to_owned(), event_id.to_owned());
+        {
+            let mut state = crate::hub::lock(&self.state);
+            if let Some(cached) = state.event_cache.get(&key).cloned() {
+                return cached.map_err(Refusal::Refused);
+            }
+            let now = Instant::now();
+            while state.invite_recent.front().is_some_and(|at| now.duration_since(*at) >= Duration::from_secs(60)) {
+                state.invite_recent.pop_front();
+            }
+            if state.invite_recent.len() >= 12 {
+                return Err(Refusal::Refused("Too many event lookups right now. Try again in a moment.".to_owned()));
+            }
+            state.invite_recent.push_back(now);
+        }
+        let path = format!(
+            "/guilds/{}/scheduled-events/{}?with_user_count=true",
+            escaped(guild_id),
+            escaped(event_id)
+        );
+        let body = match self.call("GET", &path, None) {
+            Ok(body) => body,
+            Err(err) => {
+                let refused = invite_refusal(err);
+                if let Refusal::Refused(ref msg) = refused {
+                    if msg.contains("invalid or has expired") {
+                        crate::hub::lock(&self.state).event_cache.insert(key, Err(msg.clone()));
+                    }
+                }
+                return Err(refused);
+            }
+        };
+        let parsed: Value = serde_json::from_str(&body)
+            .map_err(|err| Refusal::Refused(format!("Discord's answer was unreadable: {err}")))?;
+        let event = parse_scheduled_event(&parsed, Some(guild_id))
+            .ok_or_else(|| Refusal::Refused("Discord's event response was incomplete.".to_owned()))?;
+        crate::hub::lock(&self.state).event_cache.insert(key, Ok(event.clone()));
+        Ok(event)
+    }
+
+    /// Marks or unmarks ourselves as interested in a Discord scheduled event
+    /// (`PUT` / `DELETE /guilds/{guild}/scheduled-events/{event}/users/@me`).
+    fn event_link_interest(&self, guild_id: &str, event_id: &str, interested: bool) -> Result<(), Refusal> {
+        let method = if interested { "PUT" } else { "DELETE" };
+        let path = format!(
+            "/guilds/{}/scheduled-events/{}/users/@me",
+            escaped(guild_id),
+            escaped(event_id)
+        );
+        self.call(method, &path, None).map_err(refusal)?;
+        let mut state = crate::hub::lock(&self.state);
+        if let Some(Ok(ev)) = state.event_cache.get_mut(&(guild_id.to_owned(), event_id.to_owned())) {
+            if ev.interested != interested {
+                ev.interested = interested;
+                if let Some(count) = ev.interested_count.as_mut() {
+                    *count = if interested { count.saturating_add(1) } else { count.saturating_sub(1) };
+                }
+            }
+        }
+        for cached in state.invite_cache.values_mut() {
+            if let Ok(preview) = cached {
+                if let Some(ev) = preview.event.as_mut().filter(|e| e.id == event_id) {
+                    if ev.interested != interested {
+                        ev.interested = interested;
+                        if let Some(count) = ev.interested_count.as_mut() {
+                            *count = if interested { count.saturating_add(1) } else { count.saturating_sub(1) };
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Our own presence, and custom status (text, emoji, clear-after) unless all three are `None`.
@@ -3171,10 +3348,11 @@ impl Discord {
             Command::Collapse { space_id, group_id, collapsed } => {
                 self.queue_collapse(&space_id, &group_id, collapsed);
             }
-            // Opening a forum asks Discord nothing: its posts arrive on the socket as threads,
-            // so the store the landing reads is as current as the link. Telegram needs this
-            // ask because it lists a forum's topics only on demand.
-            Command::OpenForum { reply, .. } => drop(reply.send(Ok(()))),
+            // A page of this forum's posts, including archived ones. Active posts also arrive
+            // on the socket; the search is what reaches the rest, one page at a time.
+            Command::OpenForum { conversation_id, sort, tag, query, offset, reply } => {
+                answer(reply, self.forum_posts(&conversation_id, sort, tag, query, offset))
+            }
             Command::MarkRead { conversation_id, message_id } => self.mark_read(&conversation_id, &message_id),
             Command::MarkUnread { conversation_id, message_id, mentions } => self.mark_unread(&conversation_id, &message_id, mentions),
             Command::AckBulk { reads } => {
@@ -3186,8 +3364,8 @@ impl Discord {
                 let outcome = self.send(&conversation_id, &client_id, &text, reply_to.as_deref());
                 self.ctx.sent(&conversation_id, &client_id, outcome);
             }
-            Command::React { conversation_id, message_id, emoji, on, burst: _, reply } => {
-                answer(reply, self.react(&conversation_id, &message_id, &emoji, on))
+            Command::React { conversation_id, message_id, emoji, on, burst, reply } => {
+                answer(reply, self.react(&conversation_id, &message_id, &emoji, on, burst))
             }
             Command::Reactors { conversation_id, message_id, emoji, burst, after, limit, reply } => {
                 answer(reply, self.reactors(&conversation_id, &message_id, &emoji, burst, after.as_deref(), limit))
@@ -3241,10 +3419,18 @@ impl Discord {
             Command::ProfileIn { person_id, space_id, reply } => answer(reply, self.profile(&person_id, Some(&space_id))),
             Command::ConversationInfo { conversation_id, reply } => answer(reply, self.conversation_info(&conversation_id)),
             Command::SpaceInfo { space_id, reply } => answer(reply, self.space_info(&space_id)),
-            Command::InvitePreview { code, reply } => answer(reply, self.invite_preview(&code)),
+            Command::InvitePreview { code, event_id, reply } => {
+                answer(reply, self.invite_preview(&code, event_id.as_deref()))
+            }
             Command::InviteJoin { code, reply } => answer(reply, self.invite_join(&code)),
             Command::CreateInvite { conversation_id, space_id, max_age, max_uses, temporary, reply } => {
                 answer(reply, self.create_invite(conversation_id.as_deref(), space_id.as_deref(), max_age, max_uses, temporary))
+            }
+            Command::EventPreview { space_id, event_id, reply } => {
+                answer(reply, self.event_preview(&space_id, &event_id))
+            }
+            Command::EventLinkInterest { space_id, event_id, interested, reply } => {
+                answer(reply, self.event_link_interest(&space_id, &event_id, interested))
             }
             Command::SetMute { conversation_id, notify, until, reply } => answer(reply, self.set_mute(&conversation_id, notify, until)),
             Command::Leave { conversation_id, silent, reply } => answer(reply, self.leave(&conversation_id, false, silent)),
@@ -3463,6 +3649,10 @@ impl Discord {
                 auto_archive_minutes,
                 &first_message,
             ))),
+            Command::ForumInfo { conversation_id, reply } => answer(reply, self.forum_info(&conversation_id)),
+            Command::ForumPost { conversation_id, title, text, tags, with, reply } => {
+                answer(reply, self.forum_post(&conversation_id, &title, &text, &tags, &with))
+            }
             Command::Download { id, url, reply } => self.download(id, url, reply),
             Command::Handoff { conversation_id, reply } => drop(reply.send(self.handoff(&conversation_id))),
             Command::CallJoin(conversation_id) => self.call_join(&conversation_id),
@@ -3901,6 +4091,38 @@ fn invite_refusal(err: Refused) -> Refusal {
         }
         other => refusal(other),
     }
+}
+
+/// Parses a Discord `guild_scheduled_event` JSON object into [`protocol::ScheduledEvent`].
+fn parse_scheduled_event(ev: &Value, fallback_guild: Option<&str>) -> Option<protocol::ScheduledEvent> {
+    let id = ev.get("id").and_then(Value::as_str)?.to_owned();
+    let guild_id = ev
+        .get("guild_id")
+        .and_then(Value::as_str)
+        .or(fallback_guild)
+        .unwrap_or_default()
+        .to_owned();
+    let name = ev.get("name").and_then(Value::as_str).unwrap_or_default().to_owned();
+    let start = ev
+        .get("scheduled_start_time")
+        .and_then(Value::as_str)
+        .and_then(model::iso_seconds);
+    let place = ev
+        .get("entity_metadata")
+        .and_then(|m| m.get("location"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let interested_count = ev.get("user_count").and_then(Value::as_u64).map(|n| n as u32);
+    Some(protocol::ScheduledEvent {
+        id,
+        guild_id,
+        name,
+        start,
+        place,
+        interested_count,
+        interested: false,
+    })
 }
 
 /// Sends the answer to a command the shell is waiting on.

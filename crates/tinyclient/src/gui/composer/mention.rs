@@ -196,6 +196,7 @@ pub fn source(message: &Message) -> (String, Vec<Token>) {
     // (offset, closes, order, marker): at one offset, what closes goes before what opens, and
     // line prefixes (`# `, `-# `) go before inline openers (`**`).
     let mut marks: Vec<(usize, bool, u8, &str)> = Vec::new();
+    let mut times: Vec<(usize, usize, String)> = Vec::new();
     let mut mentions = Vec::new();
     for span in &message.spans {
         let (Some(start), Some(end)) = (on_char(span.start), on_char(span.end)) else {
@@ -222,6 +223,10 @@ pub fn source(message: &Message) -> (String, Vec<Token>) {
             Style::Italic => "_",
             Style::Strike => "~~",
             Style::Code => "`",
+            Style::Time { unix, form } => {
+                times.push((start, end, format!("<t:{unix}:{form}>")));
+                continue;
+            }
             Style::Mention { kind, id } => {
                 // Skip message-link chips that also carry a Style::Link on the same range.
                 if spans.iter().any(|other| {
@@ -243,20 +248,57 @@ pub fn source(message: &Message) -> (String, Vec<Token>) {
         marks.push((start, false, 1, marker));
         marks.push((end, true, 1, marker));
     }
+    times.sort_by_key(|(start, _, _)| *start);
+    let mut kept_times: Vec<(usize, usize, String)> = Vec::with_capacity(times.len());
+    for time in times {
+        if kept_times.last().is_none_or(|(_, prev_end, _)| time.0 >= *prev_end) {
+            kept_times.push(time);
+        }
+    }
+    marks.retain(|(offset, _, _, _)| !kept_times.iter().any(|(s, e, _)| *offset > *s && *offset < *e));
     marks.sort_by_key(|(offset, closes, order, _)| (*offset, !*closes, *order));
     let mut out = String::with_capacity(text.len() + marks.len() * 2);
     let mut at = 0;
-    for (offset, _, _, marker) in &marks {
-        out.push_str(&text[at..*offset]);
-        out.push_str(marker);
-        at = *offset;
+    let mut mark_ix = 0;
+    let mut time_ix = 0;
+    while mark_ix < marks.len() || time_ix < kept_times.len() {
+        let pos = match (marks.get(mark_ix).map(|m| m.0), kept_times.get(time_ix).map(|t| t.0)) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => break,
+        };
+        if pos > at {
+            out.push_str(&text[at..pos]);
+            at = pos;
+        }
+        while let Some(&(off, _, _, marker)) = marks.get(mark_ix) {
+            if off != pos {
+                break;
+            }
+            out.push_str(marker);
+            mark_ix += 1;
+        }
+        if let Some((_, t_end, rep)) = kept_times.get(time_ix).filter(|t| t.0 == pos) {
+            out.push_str(rep);
+            at = *t_end;
+            time_ix += 1;
+        }
     }
     out.push_str(&text[at..]);
-    let moved = |offset: usize| -> usize { marks.iter().filter(|(at, ..)| *at <= offset).map(|(.., marker)| marker.len()).sum() };
+    let moved = |offset: usize| -> isize {
+        let mark_add: usize = marks.iter().filter(|(at, ..)| *at <= offset).map(|(.., marker)| marker.len()).sum();
+        let time_delta: isize = kept_times
+            .iter()
+            .filter(|(_, end, _)| *end <= offset)
+            .map(|(s, e, rep)| rep.len() as isize - (*e - *s) as isize)
+            .sum();
+        mark_add as isize + time_delta
+    };
     let tokens = mentions
         .into_iter()
         .map(|(range, kind, id)| {
-            let start = range.start + moved(range.start);
+            let start = (range.start as isize + moved(range.start)).max(0) as usize;
             Token { range: start..start + range.len(), label: text[range].to_owned(), kind, id }
         })
         .filter(|token| out.get(token.range.clone()) == Some(token.label.as_str()))
@@ -523,5 +565,22 @@ mod tests {
         assert!(field.contains("@Dev") && field.contains("#ops") && field.contains("@core"));
         assert!(field.contains(":ferris:") && field.contains(":party:"));
         assert_eq!(wire(&field, &tokens, MentionFormat::Discord), raw);
+    }
+
+    #[test]
+    fn source_writes_time_spans_back_as_discord_tokens_with_mention_offsets() {
+        let mut msg = Message::plain("3", "me", "meet 20 April 2021 18:40 with @Dev", 0, true);
+        let span = |part: &str, style: Style| {
+            let start = msg.text.find(part).expect("part") as u32;
+            Span { start, end: start + part.len() as u32, style }
+        };
+        msg.spans = vec![
+            span("20 April 2021 18:40", Style::Bold),
+            span("20 April 2021 18:40", Style::Time { unix: 1_618_953_630, form: 'R' }),
+            span("@Dev", Style::Mention { kind: MentionKind::User, id: "8".into() }),
+        ];
+        let (text, tokens) = source(&msg);
+        assert_eq!(text, "meet **<t:1618953630:R>** with @Dev");
+        assert_eq!(wire(&text, &tokens, MentionFormat::Discord), "meet **<t:1618953630:R>** with <@8>");
     }
 }
