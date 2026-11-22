@@ -1611,6 +1611,8 @@ fn message(account: &Account, conversation: &str, text: &Text, outgoing: bool) -
             title: preview.title.clone(),
             description: preview.description.clone(),
             image,
+            duration: 0,
+            opens_in_browser: false,
         });
     }
     if wire::find_group_invite_link(&message.text).is_some() {
@@ -2791,6 +2793,8 @@ fn apply_story(account: &Account, story: wire::StoryMessageData) {
         if let Some(preview) = &st.preview {
             if wire::story_preview_kept(&st.text, &preview.url) {
                 msg.previews.push(protocol::Preview {
+                    duration: 0,
+                    opens_in_browser: false,
                     url: preview.url.clone(),
                     site: crate::adapters::tiny::preview::real_host(&preview.url),
                     title: preview.title.clone(),

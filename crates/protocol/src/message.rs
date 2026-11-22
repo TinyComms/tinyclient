@@ -206,6 +206,10 @@ pub struct Attachment {
     /// Telegram sticker pack as `id:access_hash` or a short name. Empty on every other attachment.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub sticker_set: String,
+    /// The page a GIF was picked from (a Tenor or Giphy address). Empty for every other file.
+    /// Favouriting a GIF someone else posted uses this, not the file's name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub page: String,
 }
 
 impl Attachment {
@@ -224,6 +228,7 @@ impl Attachment {
             round: false,
             view_once: false,
             sticker_set: String::new(),
+            page: String::new(),
         }
     }
 }
@@ -243,6 +248,12 @@ pub struct Preview {
     /// Only when the network serves it from its own proxy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<MediaFile>,
+    /// Seconds, when the card is a video its site plays. Zero when it is not one.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub duration: u32,
+    /// The picture plays on its site. A click opens the browser; this client has no web view.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub opens_in_browser: bool,
 }
 
 /// How many reactors a reaction carries: what a network names in the payload it already

@@ -1119,7 +1119,7 @@ fn a_channel_page_is_the_one_message_model_and_reply_chains_are_threads() {
     assert_eq!((file.id.as_str(), file.kind, file.width, file.height), ("img:0-weu-d1-0123456789abcdef", MediaKind::Image, 640, 360));
     assert_eq!(picture.attachments[0].thumb.as_ref().map(|thumb| thumb.id.as_str()), Some("img:0-weu-d1-0123456789abcdef"));
     let fetched = world.until("the picture to be fetched", || {
-        let asked = Request::Fetch { retry: false, size: None, account: general.account(), ids: vec![file.id.clone()] };
+        let asked = Request::Fetch { retry: false, size: None, account: general.account(), ids: vec![file.id.clone()], span: None };
         match world.ask(asked) {
             Response::Media { files } => files.into_iter().find(|file| file.path.is_some()),
             _ => None,
@@ -1144,7 +1144,7 @@ fn a_channel_page_is_the_one_message_model_and_reply_chains_are_threads() {
     let content = format!("/v1.0/shares/u!{encoded}/driveItem/content");
     let file_id = attached.file.id.clone();
     let fetched = world.until("the shared file to be fetched or refused", || {
-        let asked = Request::Fetch { retry: false, size: None, account: general.account(), ids: vec![file_id.clone()] };
+        let asked = Request::Fetch { retry: false, size: None, account: general.account(), ids: vec![file_id.clone()], span: None };
         match world.ask(asked) {
             Response::Media { files } => files.into_iter().find(|file| file.id == file_id && (file.path.is_some() || file.failed.is_some())),
             _ => None,

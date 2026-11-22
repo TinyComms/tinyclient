@@ -1025,6 +1025,7 @@ impl Demo {
             Command::SendPaidReaction { reply, .. }
             | Command::TogglePaidReactionPrivacy { reply, .. }
             | Command::SetDefaultReaction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Favourite { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::PreviewChannel { reply, .. }
             | Command::Join { reply, .. }
             | Command::DeleteFile { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1296,6 +1297,8 @@ impl Demo {
             Command::Publish { reply, .. } | Command::Follow { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::FollowChannel { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetSpaceView { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetSpaceOptions { reply, .. } | Command::SetSpacePrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetNetworkPrivacy { reply } | Command::SetNetworkPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CreateCategory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::EditChannel { reply, .. }
             | Command::MoveChannels { reply, .. }

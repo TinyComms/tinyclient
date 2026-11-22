@@ -2,9 +2,9 @@
 //! ("Favorites") and the stickers sent last ("Recent"). A small file of the shell's beside the
 //! emoji recents (`emoji.rs`), read once and written off the main thread after each change.
 //!
-//! // CONTRACT: the design puts favorites on the network's own list (Discord's frecency
-//! // settings, Telegram's `saveGif` / `faveSticker`), which no request carries yet. Until one
-//! // does, a star is kept here, so it is this Mac's and not the account's other clients'.
+//! // CONTRACT: Discord emoji, sticker, and GIF favourites are the account's (`Request::Favourite`).
+//! // A GIF star kept here from before that is copied across once. Telegram still uses `saveGif`.
+//! // Everywhere else, a star is kept here, so it is this Mac's and not the account's other clients'.
 
 use super::emoji::account_word;
 use protocol::AccountKey;
@@ -21,6 +21,8 @@ pub const RECENT_SHOWN: usize = 4;
 pub enum List {
     Favorites,
     RecentStickers,
+    /// Set once local GIF page addresses have been offered to the account.
+    GifMoved,
 }
 
 impl List {
@@ -28,6 +30,7 @@ impl List {
         match self {
             List::Favorites => "favorites",
             List::RecentStickers => "recent-stickers",
+            List::GifMoved => "gif-moved",
         }
     }
 
@@ -35,6 +38,7 @@ impl List {
         match word {
             "favorites" => Some(List::Favorites),
             "recent-stickers" => Some(List::RecentStickers),
+            "gif-moved" => Some(List::GifMoved),
             _ => None,
         }
     }
@@ -136,6 +140,23 @@ pub fn star(account: &AccountKey, id: &str) -> bool {
     })
 }
 
+/// Page addresses starred on this Mac, once. Stickers in the same list stay. A later empty
+/// account list does not upload them again.
+pub fn take_gif_stars(account: &AccountKey) -> Vec<String> {
+    with(|kept| {
+        let word = account_word(account);
+        if kept.all.get(&(word.clone(), List::GifMoved)).is_some_and(|ids| !ids.is_empty()) {
+            return Vec::new();
+        }
+        let stars = kept.all.get(&(word.clone(), List::Favorites)).cloned().unwrap_or_default();
+        let gifs: Vec<String> = stars.into_iter().filter(|id| id.starts_with("http://") || id.starts_with("https://")).collect();
+        kept.all.entry((word.clone(), List::Favorites)).or_default().retain(|id| !(id.starts_with("http://") || id.starts_with("https://")));
+        kept.all.insert((word, List::GifMoved), vec!["1".to_owned()]);
+        save(kept);
+        gifs
+    })
+}
+
 /// A sticker was sent.
 pub fn sent_sticker(account: &AccountKey, id: &str) {
     with(|kept| {
@@ -188,5 +209,17 @@ mod tests {
         assert_eq!(back.get(&("discord:1".into(), List::Favorites)), Some(&ids));
         assert_eq!(back.get(&("telegram:7".into(), List::RecentStickers)).map(Vec::len), Some(2));
         assert!(parse("junk\nx\tnope\ta\n").is_empty());
+        all.insert(("discord:1".into(), List::GifMoved), vec!["1".into()]);
+        assert_eq!(parse(&write(&all)).get(&("discord:1".into(), List::GifMoved)).map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn gif_stars_move_once_and_stickers_stay() {
+        let account = AccountKey { network: protocol::Network::Discord, account: "gif-move".into() };
+        assert!(star(&account, "https://tenor.com/view/cat-1"));
+        assert!(star(&account, "sticker-fox"));
+        assert_eq!(take_gif_stars(&account), vec!["https://tenor.com/view/cat-1".to_owned()]);
+        assert!(take_gif_stars(&account).is_empty(), "a cleared account list must not upload the local stars again");
+        assert_eq!(list(&account, List::Favorites), vec!["sticker-fox".to_owned()]);
     }
 }

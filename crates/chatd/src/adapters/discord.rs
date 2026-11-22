@@ -161,16 +161,17 @@ struct Session {
 
 /// A server's settings as the user made them in Discord. Times are unix seconds; `i64::MAX` is
 /// "until I turn it back on".
-#[derive(Default)]
 struct Quiet {
     muted_until: Option<i64>,
     suppress_everyone: bool,
     suppress_roles: bool,
+    /// Discord `notify_highlights`: 0 default, 1 disabled (suppressed), 2 enabled.
+    notify_highlights: u8,
+    mute_scheduled_events: bool,
+    mobile_push: bool,
     channels: HashMap<String, i64>,
     /// "Hide muted channels", as the user set it for the server.
     hide_muted: bool,
-    /// "Mute new events" (`mute_scheduled_events`) in Discord's server notification settings.
-    mute_scheduled_events: bool,
     /// "Show all channels" is off: only what is opted in shows.
     opt_in: bool,
     /// Channels and categories opted in.
@@ -226,6 +227,36 @@ pub(super) fn collapse_settings_body(overrides: &HashMap<String, bool>) -> Value
         map.insert(category.clone(), json!({"collapsed": collapsed}));
     }
     json!({"channel_overrides": map})
+}
+
+impl Default for Quiet {
+    fn default() -> Quiet {
+        Quiet {
+            muted_until: None,
+            suppress_everyone: false,
+            suppress_roles: false,
+            notify_highlights: 0,
+            mute_scheduled_events: false,
+            mobile_push: true,
+            channels: HashMap::new(),
+            hide_muted: false,
+            opt_in: false,
+            opted_in: HashSet::new(),
+            level: 0,
+            levels: HashMap::new(),
+            raw_flags: 0,
+            channel_flags: HashMap::new(),
+            collapsed: HashSet::new(),
+        }
+    }
+}
+
+/// One sticker from a standard pack (`GET /sticker-packs`).
+struct PackedSticker {
+    id: String,
+    name: String,
+    format: u8,
+    pack: String,
 }
 
 /// One of a server's custom emoji or stickers, kept for the picker: about 40 bytes each.
@@ -608,6 +639,21 @@ struct State {
     /// or folder edits preserve unknown fields byte-for-byte.
     guild_folders_settings: Vec<u8>,
     folders: Vec<proto::GuildFolder>,
+    /// Raw `PreloadedUserSettings.privacy` bytes (field 8), preserved across updates.
+    privacy_settings: Vec<u8>,
+    /// Raw `PreloadedUserSettings.text_and_images` bytes (field 6). Explicit content and the
+    /// DM spam filter are written back into this block. Empty until Discord sends one: a
+    /// made-up field 6 would reset every other text-and-image setting.
+    text_and_images: Vec<u8>,
+    /// Raw `FrecencyUserSettings` (`settings-proto/2`). Empty until the picker first opens.
+    /// Favourite lists are the only part written back. Frecency scores are read for the
+    /// "Frequently used" section and never written: a wrong score would replace the account's
+    /// frecency on every device.
+    frecency: Vec<u8>,
+    frecency_loaded: bool,
+    /// Standard sticker packs from `GET /sticker-packs`, once a session, Nitro only.
+    standard_stickers: Vec<PackedSticker>,
+    standard_stickers_loaded: bool,
     /// Per conversation, the stretches of history fetched whole in this session, as message
     /// ids from and to: reading on inside one asks Discord nothing.
     covered: HashMap<String, Vec<(u64, u64)>>,
@@ -645,6 +691,8 @@ struct State {
     command_index: HashMap<String, Vec<protocol::AppCommand>>,
     /// Autocomplete waiters keyed by interaction nonce. The command thread waits; the gateway sends.
     autocomplete: HashMap<String, std::sync::mpsc::Sender<Vec<protocol::CommandChoice>>>,
+    /// Per thread, our own thread-member notification flags and muted flag.
+    thread_members: HashMap<String, model::ThreadMember>,
 }
 
 /// One channel's read acknowledgements.
@@ -3528,6 +3576,32 @@ impl Discord {
             Command::ProfileIn { person_id, space_id, reply } => answer(reply, self.profile(&person_id, Some(&space_id))),
             Command::ConversationInfo { conversation_id, reply } => answer(reply, self.conversation_info(&conversation_id)),
             Command::SpaceInfo { space_id, reply } => answer(reply, self.space_info(&space_id)),
+            Command::SetSpaceOptions {
+                space_id,
+                notify,
+                suppress_everyone,
+                suppress_roles,
+                highlights,
+                events,
+                mobile_push,
+                reset_channel,
+                reply,
+            } => answer(
+                reply,
+                self.set_space_options(
+                    &space_id,
+                    notify,
+                    suppress_everyone,
+                    suppress_roles,
+                    highlights,
+                    events,
+                    mobile_push,
+                    reset_channel.as_deref(),
+                ),
+            ),
+            Command::GetNetworkPrivacy { reply } => answer(reply, self.get_network_privacy()),
+            Command::SetNetworkPrivacy { privacy, reply } => answer(reply, self.set_network_privacy(privacy)),
+            Command::SetSpacePrivacy { space_id, privacy, reply } => answer(reply, self.set_space_privacy(&space_id, privacy)),
             Command::InvitePreview { code, event_id, reply } => {
                 answer(reply, self.invite_preview(&code, event_id.as_deref()))
             }
@@ -3681,6 +3755,7 @@ impl Discord {
             Command::Catalog { kind, space_id, query, cursor, reply } => {
                 answer(reply, self.catalog(kind, space_id.as_deref(), &query, cursor.as_deref()))
             }
+            Command::Favourite { kind, id, on, reply } => answer(reply, self.favourite(kind, &id, on)),
             Command::ReactionRules { conversation_id, reply } => drop(reply.send(Ok(self.reaction_rules(&conversation_id)))),
             Command::CancelSend { client_id, .. } => upload::cancel(&self.ctx.account, &client_id),
             // Never: a fetch per DM is the burst that flags accounts. chatd does not send it,

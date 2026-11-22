@@ -351,6 +351,8 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
         title: "Lepraria".to_owned(),
         description: "A genus of leprose crustose lichens that grow on rock, bark and soil as patches of powdery granules.".to_owned(),
         image: Some(s.photo(account, "preview-small", MediaKind::Image, "preview-lichen.webp", look, 120, 120)?),
+        duration: 0,
+        opens_in_browser: false,
     });
     feed.push(small);
     let look = s.look(Art::Bands);
@@ -364,6 +366,8 @@ pub fn seed(s: &mut Seeder, discord: &Discord) -> Fallible<Pending> {
         title: "Forty species in one morning on the creek route".to_owned(),
         description: "Volunteers recorded forty bryophytes and a first county record along two kilometres of bank.".to_owned(),
         image: Some(s.photo(account, "preview-large", MediaKind::Image, "preview-creek.webp", look, 800, 420)?),
+        duration: 0,
+        opens_in_browser: false,
     });
     feed.push(large);
 

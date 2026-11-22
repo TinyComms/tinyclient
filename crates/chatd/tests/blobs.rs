@@ -218,7 +218,7 @@ impl Daemon {
     /// What `Fetch` answers at once.
     fn fetch(&self, ids: &[&str]) -> Vec<MediaFile> {
         let ids = ids.iter().map(|id| (*id).to_owned()).collect();
-        match self.ask(Request::Fetch { retry: false, size: None, account: account(), ids }) {
+        match self.ask(Request::Fetch { retry: false, size: None, account: account(), ids, span: None }) {
             Response::Media { files } => files,
             other => panic!("unexpected {other:?}"),
         }
@@ -394,7 +394,7 @@ fn a_failure_says_why_and_is_not_tried_again_until_the_user_asks() {
 
     // The user asks again: once more, and the failure stands again after it.
     let since = chatd.seq();
-    let retried = chatd.ask(Request::Fetch { retry: true, size: None, account: account(), ids: vec!["gone".to_owned()] });
+    let retried = chatd.ask(Request::Fetch { retry: true, size: None, account: account(), ids: vec!["gone".to_owned()], span: None });
     assert!(matches!(&retried, Response::Media { files } if files[0].failed.is_none()), "{retried:?}");
     assert!(chatd.landed(since, "gone").failed.is_some());
     assert_eq!(files.hits(), 2);
@@ -420,7 +420,7 @@ fn the_size_asked_for_picks_the_smallest_registered_one_that_is_large_enough() {
     let chatd = Daemon::start_in(dir, &[]);
     let sized = |size: Option<u32>| {
         let since = chatd.seq();
-        let asked = Request::Fetch { retry: false, size, account: account(), ids: vec!["thumb".to_owned()] };
+        let asked = Request::Fetch { retry: false, size, account: account(), ids: vec!["thumb".to_owned()], span: None };
         match chatd.ask(asked) {
             Response::Media { files } if files[0].path.is_some() => files[0].clone(),
             Response::Media { .. } => chatd.landed(since, "thumb"),

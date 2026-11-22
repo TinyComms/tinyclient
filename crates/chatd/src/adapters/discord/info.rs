@@ -937,15 +937,18 @@ impl Discord {
         let noted = (known.kind == ConversationKind::Thread).then(|| self.ctx.note(&format!("thread-notify:{channel}"))).flatten();
         let state = crate::hub::lock(&self.state);
         let parent = known.parent.as_deref().or(known.group.as_deref());
+        let thread_notify = (known.kind == ConversationKind::Thread)
+            .then(|| state.thread_members.get(channel).and_then(|tm| tm.notify()))
+            .flatten();
         let notify = match noted.as_deref() {
             Some("all") => Notify::All,
             Some("mentions") => Notify::Mentions,
             Some("nothing") => Notify::Nothing,
-            _ => match guild.as_ref().map(|guild| state.guilds.get(guild)) {
+            _ => thread_notify.unwrap_or_else(|| match guild.as_ref().map(|guild| state.guilds.get(guild)) {
                 Some(Some(info)) => info.quiet.notify(channel, parent, now()),
                 Some(None) => Notify::All,
                 None => state.quiet_directs.notify(channel, None, now()),
-            },
+            }),
         };
         let members = match known.kind {
             ConversationKind::Direct => Some(2),
@@ -1103,6 +1106,13 @@ impl Discord {
             vanity_url,
             invites_disabled,
             can_change_nickname,
+            suppress_everyone,
+            suppress_roles,
+            highlights,
+            events,
+            mobile_push,
+            raw_overrides,
+            space_privacy,
         ) = {
             let state = crate::hub::lock(&self.state);
             let info = state.guilds.get(guild).ok_or_else(|| refused("This server is gone."))?;
@@ -1147,6 +1157,44 @@ impl Discord {
                 .vanity_url_code
                 .filter(|s| !s.is_empty())
                 .or_else(|| info.vanity_url_code.clone());
+            let now_ts = now();
+            let suppress_everyone = info.quiet.suppress_everyone;
+            let suppress_roles = info.quiet.suppress_roles;
+            let highlights = info.quiet.notify_highlights != 1;
+            let events = !info.quiet.mute_scheduled_events;
+            let mobile_push = info.quiet.mobile_push;
+            // Collect every channel (excluding categories) that overrides the server's own level or mute.
+            let mut override_ids: Vec<String> = info
+                .quiet
+                .channels
+                .iter()
+                .filter(|(_, until)| **until > now_ts)
+                .map(|(id, _)| id.clone())
+                .chain(info.quiet.levels.keys().cloned())
+                .filter(|id| !info.categories.contains_key(id))
+                .collect();
+            override_ids.sort();
+            override_ids.dedup();
+            let raw_overrides: Vec<(String, Notify)> = override_ids
+                .into_iter()
+                .map(|id| {
+                    let level = if info.quiet.channels.get(&id).is_some_and(|until| *until > now_ts) {
+                        Notify::Nothing
+                    } else {
+                        match info.quiet.levels.get(&id).copied().unwrap_or(info.quiet.level) {
+                            1 => Notify::Mentions,
+                            2 => Notify::Nothing,
+                            _ => Notify::All,
+                        }
+                    };
+                    (id, level)
+                })
+                .collect();
+            let decoded_privacy = super::proto::decode_privacy(&state.privacy_settings);
+            let space_privacy = protocol::SpacePrivacy {
+                allow_dms: !decoded_privacy.restricted_spaces.iter().any(|id| id == guild),
+                allow_requests: !decoded_privacy.request_restricted_spaces.iter().any(|id| id == guild),
+            };
             let can_change_nickname =
                 info.owner || (info.base_permissions(guild) & (model::ADMINISTRATOR | model::CHANGE_NICKNAME)) != 0;
             (
@@ -1165,6 +1213,13 @@ impl Discord {
                 vanity_url,
                 invites_disabled,
                 can_change_nickname,
+                suppress_everyone,
+                suppress_roles,
+                highlights,
+                events,
+                mobile_push,
+                raw_overrides,
+                space_privacy,
             )
         };
         let banner = match banner_hash.as_deref() {
@@ -1175,6 +1230,21 @@ impl Discord {
             }
             None => None,
         };
+        let mut channel_overrides = Vec::with_capacity(raw_overrides.len());
+        for (channel_id, ch_notify) in raw_overrides {
+            let name = self
+                .ctx
+                .known(&channel_id)
+                .ok()
+                .flatten()
+                .map(|row| row.title)
+                .unwrap_or_else(|| channel_id.clone());
+            channel_overrides.push(protocol::SpaceChannelOverride {
+                channel_id,
+                name,
+                notify: ch_notify,
+            });
+        }
         Ok(SpaceAbout {
             description,
             members: counts.approximate_member_count,
@@ -1182,6 +1252,13 @@ impl Discord {
             nickname,
             roles,
             notify,
+            suppress_everyone,
+            suppress_roles,
+            highlights,
+            events,
+            mobile_push,
+            channel_overrides,
+            privacy: Some(space_privacy),
             can_change_nickname,
             banner,
             boost_level,
@@ -1336,18 +1413,191 @@ impl Discord {
         }
         Ok(())
     }
+    /// Reads our Privacy & Safety settings from the cached privacy block (field 8) and the
+    /// explicit-content and DM-spam fields of the cached text-and-images block (field 6).
+    pub(super) fn get_network_privacy(&self) -> Result<protocol::NetworkPrivacy, Refusal> {
+        let state = crate::hub::lock(&self.state);
+        let mut privacy = super::proto::decode_privacy(&state.privacy_settings);
+        super::proto::apply_content_filters(&state.text_and_images, &mut privacy);
+        Ok(privacy)
+    }
+
+    /// Writes updated Privacy & Safety settings to `PATCH /users/@me/settings-proto/1`.
+    /// Privacy is field 8. Explicit content and the DM spam filter are merged into the cached
+    /// text-and-images block and sent as field 6. Every other protobuf field is copied.
+    pub(super) fn set_network_privacy(&self, privacy: protocol::NetworkPrivacy) -> Result<protocol::NetworkPrivacy, Refusal> {
+        let (kept, kept_text) = {
+            let state = crate::hub::lock(&self.state);
+            (state.privacy_settings.clone(), state.text_and_images.clone())
+        };
+        let updated = super::proto::with_privacy(&kept, &privacy);
+        let updated_text = (!kept_text.is_empty()).then(|| super::proto::with_content_filters(&kept_text, &privacy));
+        let body = json!({"settings": super::proto::privacy_update_settings(&updated, updated_text.as_deref())});
+        self.call("PATCH", "/users/@me/settings-proto/1", Some(body)).map_err(refusal)?;
+        {
+            let mut state = crate::hub::lock(&self.state);
+            state.privacy_settings = updated.clone();
+            if let Some(text) = &updated_text {
+                state.text_and_images = text.clone();
+            }
+        }
+        let mut decoded = super::proto::decode_privacy(&updated);
+        super::proto::apply_content_filters(updated_text.as_deref().unwrap_or(&[]), &mut decoded);
+        Ok(decoded)
+    }
+
+    /// Updates a single server's "Allow direct messages" / "Allow message requests" switches
+    /// by adding or removing `guild` in `restricted_guild_ids` / `message_request_restricted_guild_ids`
+    /// and writing `PATCH /users/@me/settings-proto/1`.
+    pub(super) fn set_space_privacy(&self, guild: &str, privacy: protocol::SpacePrivacy) -> Result<(), Refusal> {
+        let kept = {
+            let state = crate::hub::lock(&self.state);
+            if !state.guilds.contains_key(guild) {
+                return Err(refused("This server is gone."));
+            }
+            state.privacy_settings.clone()
+        };
+        let mut net = super::proto::decode_privacy(&kept);
+        net.restricted_spaces.retain(|id| id != guild);
+        if !privacy.allow_dms {
+            net.restricted_spaces.push(guild.to_owned());
+        }
+        net.request_restricted_spaces.retain(|id| id != guild);
+        if !privacy.allow_requests {
+            net.request_restricted_spaces.push(guild.to_owned());
+        }
+        let updated = super::proto::with_privacy(&kept, &net);
+        let body = json!({"settings": super::proto::privacy_update_settings(&updated, None)});
+        self.call("PATCH", "/users/@me/settings-proto/1", Some(body)).map_err(refusal)?;
+        crate::hub::lock(&self.state).privacy_settings = updated;
+        Ok(())
+    }
+
+    /// Updates a server's notification level, switches (`suppress_everyone`, `suppress_roles`,
+    /// `notify_highlights`, `mute_scheduled_events`, `mobile_push`), or resets a per-channel
+    /// notification override via `PATCH /users/@me/guilds/{guild}/settings`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn set_space_options(
+        &self,
+        guild: &str,
+        notify: Option<Notify>,
+        suppress_everyone: Option<bool>,
+        suppress_roles: Option<bool>,
+        highlights: Option<bool>,
+        events: Option<bool>,
+        mobile_push: Option<bool>,
+        reset_channel: Option<&str>,
+    ) -> Result<(), Refusal> {
+        if !crate::hub::lock(&self.state).guilds.contains_key(guild) {
+            return Err(refused("This server is gone."));
+        }
+        let mut map = serde_json::Map::new();
+        if let Some(level) = notify {
+            let num = match level {
+                Notify::All => 0,
+                Notify::Mentions => 1,
+                Notify::Nothing => 2,
+            };
+            map.insert("muted".to_owned(), json!(false));
+            map.insert("message_notifications".to_owned(), json!(num));
+        }
+        if let Some(v) = suppress_everyone {
+            map.insert("suppress_everyone".to_owned(), json!(v));
+        }
+        if let Some(v) = suppress_roles {
+            map.insert("suppress_roles".to_owned(), json!(v));
+        }
+        if let Some(v) = highlights {
+            // Discord: 1 = disabled (suppressed), 2 = enabled.
+            map.insert("notify_highlights".to_owned(), json!(if v { 2 } else { 1 }));
+        }
+        if let Some(v) = events {
+            map.insert("mute_scheduled_events".to_owned(), json!(!v));
+        }
+        if let Some(v) = mobile_push {
+            map.insert("mobile_push".to_owned(), json!(v));
+        }
+        if let Some(channel) = reset_channel.filter(|id| !id.is_empty()) {
+            map.insert(
+                "channel_overrides".to_owned(),
+                json!({
+                    channel: {
+                        "muted": false,
+                        "message_notifications": 3,
+                        "mute_config": {"end_time": null, "selected_time_window": -1},
+                    }
+                }),
+            );
+        }
+        if map.is_empty() {
+            return Ok(());
+        }
+        let path = format!("/users/@me/guilds/{guild}/settings");
+        let answer = self.call("PATCH", &path, Some(serde_json::Value::Object(map))).map_err(refusal)?;
+        match serde_json::from_str::<GuildSettings>(&answer) {
+            Ok(settings) if settings.guild_id.as_deref() == Some(guild) => {
+                self.settings_changed(settings).map_err(|failed| match failed {
+                    super::Failure::SignedOut(why) | super::Failure::Dropped(why) => refused(why),
+                })
+            }
+            _ => {
+                // Apply optimistically to in-memory state if the response didn't echo full settings.
+                let mut state = crate::hub::lock(&self.state);
+                if let Some(info) = state.guilds.get_mut(guild) {
+                    if let Some(level) = notify {
+                        info.quiet.muted_until = None;
+                        info.quiet.level = match level {
+                            Notify::All => 0,
+                            Notify::Mentions => 1,
+                            Notify::Nothing => 2,
+                        };
+                    }
+                    if let Some(v) = suppress_everyone {
+                        info.quiet.suppress_everyone = v;
+                    }
+                    if let Some(v) = suppress_roles {
+                        info.quiet.suppress_roles = v;
+                    }
+                    if let Some(v) = highlights {
+                        info.quiet.notify_highlights = if v { 2 } else { 1 };
+                    }
+                    if let Some(v) = events {
+                        info.quiet.mute_scheduled_events = !v;
+                    }
+                    if let Some(v) = mobile_push {
+                        info.quiet.mobile_push = v;
+                    }
+                    if let Some(channel) = reset_channel {
+                        info.quiet.channels.remove(channel);
+                        info.quiet.levels.remove(channel);
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
 
     /// Sets a conversation's notifications as Discord's own menu does: one settings change for
-    /// its server (`@me` for direct and group conversations). Discord answers with the server's
-    /// settings whole, which are applied as if they came from the gateway.
+    /// its server (`@me` for direct and group conversations), or thread-member settings for a
+    /// thread (`PATCH /channels/{id}/thread-members/@me/settings`).
     pub(super) fn set_mute(&self, channel: &str, notify: Notify, until: Option<i64>) -> Result<(), Refusal> {
         let known = self.ctx.known(channel).map_err(refused)?.ok_or_else(|| refused("This conversation is gone."))?;
         if known.kind == ConversationKind::Thread {
-            let (flags, muted) = match notify {
-                Notify::All => (2u32, false),
-                Notify::Mentions => (4u32, false),
-                Notify::Nothing => (8u32, true),
+            let word = match notify {
+                Notify::All => "all",
+                Notify::Mentions => "mentions",
+                Notify::Nothing => "nothing",
             };
+            let base = crate::hub::lock(&self.state)
+                .thread_members
+                .get(channel)
+                .map_or(0, |tm| tm.flags & !model::THREAD_NOTIFY_MASK);
+            let (muted, bits) = match notify {
+                Notify::All => (false, model::THREAD_NOTIFY_ALL),
+                Notify::Mentions => (false, model::THREAD_NOTIFY_MENTIONS),
+                Notify::Nothing => (true, model::THREAD_NOTIFY_NONE),
+            };
+            let flags = base | bits;
             let body = json!({
                 "flags": flags,
                 "muted": muted,
@@ -1355,13 +1605,11 @@ impl Discord {
             });
             self.call("PATCH", &format!("/channels/{channel}/thread-members/@me/settings"), Some(body))
                 .map_err(refusal)?;
-            let word = match notify {
-                Notify::All => "all",
-                Notify::Mentions => "mentions",
-                Notify::Nothing => "nothing",
-            };
+            crate::hub::lock(&self.state)
+                .thread_members
+                .insert(channel.to_owned(), model::ThreadMember { flags, muted });
             self.note_thread_notify(channel, word);
-            return self.ctx.muted(channel, notify == Notify::Nothing).map_err(refused);
+            return self.ctx.muted(channel, muted).map_err(refused);
         }
         let guild = self.guild_of(&known);
         let body = mute_override_body(channel, notify, until, now());

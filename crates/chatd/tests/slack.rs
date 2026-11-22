@@ -1424,7 +1424,7 @@ impl World {
     /// Asks for files as the shell does for what is on screen, until `id` is on disk.
     fn fetched(&self, account: &Key, id: &str, size: Option<u32>) -> protocol::MediaFile {
         self.until("the file to be on disk", || {
-            let asked = Request::Fetch { retry: false, size, account: account.account(), ids: vec![id.to_owned()] };
+            let asked = Request::Fetch { retry: false, size, account: account.account(), ids: vec![id.to_owned()], span: None };
             match self.ask(asked) {
                 Response::Media { mut files } => files.pop().filter(|file| file.path.is_some()),
                 other => panic!("{other:?}"),
@@ -1744,7 +1744,7 @@ fn a_channel_reads_as_it_does_in_slack_and_stays_current() {
     // Its files are registered with their sizes before any byte is fetched. Only the upload is
     // asked for here: its address is the fake's, and the avatar's and emoji's are Slack's own.
     let wanted = vec![image.file.id.clone(), thumb.id.clone(), "F0NOPE".to_owned()];
-    let Response::Media { files } = world.ask(Request::Fetch { retry: false, size: None, account: general.account(), ids: wanted }) else {
+    let Response::Media { files } = world.ask(Request::Fetch { retry: false, size: None, account: general.account(), ids: wanted, span: None }) else {
         panic!("no media");
     };
     let known: Vec<(&str, MediaKind, u32, u32)> = files.iter().map(|file| (file.id.as_str(), file.kind, file.width, file.height)).collect();
@@ -3143,7 +3143,7 @@ fn a_custom_emoji_is_a_picture_without_opening_the_picker() {
     });
     assert_eq!(ana.emoji, ":waveblob:");
     let id = emoji_id("waveblob", wave);
-    let Response::Media { files } = world.ask(Request::Fetch { retry: false, size: None, account: general.account(), ids: vec![id.clone()] }) else {
+    let Response::Media { files } = world.ask(Request::Fetch { retry: false, size: None, account: general.account(), ids: vec![id.clone()], span: None }) else {
         panic!("no media");
     };
     assert!(files.iter().any(|file| file.id == id && file.kind == MediaKind::Emoji), "the status emoji is registered as a file");

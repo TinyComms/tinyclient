@@ -1124,7 +1124,7 @@ impl Shell {
             }
         }
         for (account, ids) in wanted {
-            let request = Request::Fetch { retry: false, size: None, account: account.clone(), ids };
+            let request = Request::Fetch { retry: false, size: None, account: account.clone(), ids, span: None };
             self.off_thread(cx, move || ask(&request), move |this, answer, cx| {
                 if let Ok(Response::Media { files }) = answer {
                     for file in &files {

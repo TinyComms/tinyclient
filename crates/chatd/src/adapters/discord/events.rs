@@ -108,6 +108,8 @@ struct ThreadList {
 struct ThreadMemberUpdate {
     id: String,
     #[serde(default)]
+    muted: bool,
+    #[serde(default)]
     user_id: Option<String>,
     /// Discord thread notification flags. Absent on older events.
     #[serde(default)]
@@ -203,11 +205,12 @@ impl Discord {
             "THREAD_MEMBER_UPDATE" => {
                 let update: ThreadMemberUpdate = from_str(data)?;
                 let me = self.me();
-                if update.user_id.as_deref().is_none_or(|id| id == me) {
+                if update.user_id.as_deref().is_none_or(|id| id.is_empty() || id == me) {
                     self.set_thread_membership(&update.id, true)?;
                     if let Some(word) = update.flags.and_then(super::info::thread_notify_word) {
                         self.note_thread_notify(&update.id, word);
                     }
+                    self.thread_member_updated(update)?;
                 }
             }
             "THREAD_MEMBERS_UPDATE" => {
@@ -428,6 +431,15 @@ impl Discord {
         if changed {
             self.ctx.events_changed(&change.guild_id);
         }
+    }
+    /// Our own thread-member notification settings changed on another device.
+    fn thread_member_updated(&self, update: ThreadMemberUpdate) -> Result<(), Failure> {
+        let member = model::ThreadMember { flags: update.flags.unwrap_or(0), muted: update.muted };
+        let muted = member.notify() == Some(protocol::Notify::Nothing);
+        self.state.lock().unwrap().thread_members.insert(update.id.clone(), member);
+        self.ctx.muted(&update.id, muted)?;
+        self.ctx.info_stale(&update.id);
+        Ok(())
     }
 
     /// Someone joined or left a group DM. The list and an unnamed title follow. A named group keeps its name.
@@ -699,11 +711,28 @@ impl Discord {
     /// update carries only what changed, so the status is read from either kind and the order
     /// only from a whole one.
     fn settings_proto(&self, update: SettingsUpdate) -> Result<(), Failure> {
+        // Type 2 is `FrecencyUserSettings`: favourites and frecency for the picker. A partial
+        // update still carries the whole proto Discord sent, so the blob is replaced whole.
+        if update.settings.kind == 2 {
+            if let Some(bytes) = proto::decode_settings(&update.settings.proto) {
+                let mut state = self.state.lock().unwrap();
+                state.frecency = bytes;
+                state.frecency_loaded = true;
+            }
+            self.forget_gif_pages();
+            return Ok(());
+        }
         if update.settings.kind != 1 {
             return Ok(());
         }
         if let Some(status) = proto::status_settings(&update.settings.proto) {
             self.own_status(status);
+        }
+        if let Some(privacy) = proto::privacy_settings(&update.settings.proto) {
+            self.state.lock().unwrap().privacy_settings = privacy;
+        }
+        if let Some(text) = proto::text_and_images_settings(&update.settings.proto) {
+            self.state.lock().unwrap().text_and_images = text;
         }
         if update.partial {
             return Ok(());

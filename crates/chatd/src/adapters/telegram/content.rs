@@ -2241,6 +2241,8 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                             title: page.title.clone().unwrap_or_default(),
                             description: page.description.clone().unwrap_or_default(),
                             image: preview_image(page, &mut wants),
+                            duration: 0,
+                            opens_in_browser: false,
                         });
                     }
                 }

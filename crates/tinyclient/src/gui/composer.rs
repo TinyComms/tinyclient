@@ -3444,7 +3444,7 @@ impl Composer {
                     .collect();
                 let missing: Vec<String> = this.customs.iter().filter_map(|custom| custom.file.as_ref()).filter(|file| file.path.is_none()).map(|file| file.id.clone()).collect();
                 if !missing.is_empty() && live() {
-                    ask_later(cx, Request::Fetch { account, ids: missing, size: Some(40), retry: false }, |_, _| {});
+                    ask_later(cx, Request::Fetch { account, ids: missing, size: Some(40), retry: false, span: None }, |_, _| {});
                 }
                 this.look_up(cx);
                 cx.notify();

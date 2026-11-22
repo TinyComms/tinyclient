@@ -2503,6 +2503,11 @@ impl Pane {
         // are `video`'s (`Pane::moving`, where an inline player plugs in). A GIF that is a GIF
         // plays here in its tile, and opens in the viewer like a picture.
         let id = message.id.clone();
+        let page = attachment.page.clone();
+        let fav_file = attachment.file.id.clone();
+        let discord_gif = shape == MediaShape::Gif
+            && (page.starts_with("https://") || page.starts_with("http://"))
+            && self.open.as_ref().is_some_and(|open| open.key.network == protocol::Network::Discord);
         let tile = match shape {
             MediaShape::Video => self.moving(attachment, tile, cx),
             MediaShape::Gif if media::is_video(attachment) => self.moving(attachment, tile, cx),
@@ -2518,7 +2523,36 @@ impl Pane {
                 tile.on_click(cx.listener(move |this, _, window, cx| this.open_viewer(&id, index, window, cx)))
             }
         };
-        let tile = tile.child(edge_line()).children(more.map(|more| {
+        // The border covers the picture. The star is painted after it, so a click lands on the
+        // star and does not open the GIF. A "+N" cover, when there is one, stays on top.
+        let tile = tile.child(edge_line());
+        let tile = if discord_gif {
+            let star_id: SharedString = format!("gif-fav-{fav_file}").into();
+            tile.child(
+                div()
+                    .id(star_id)
+                    .absolute()
+                    .top(px(4.))
+                    .right(px(4.))
+                    .size(px(24.))
+                    .rounded(px(theme::R_CONTROL))
+                    .bg(gpui::rgba(0x00000099))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .tooltip(tip("Favourite GIF", None))
+                    .child(glyph("icons/star.svg", 14., gpui::white()))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.favourite_posted_gif(&page, cx);
+                    })),
+            )
+        } else {
+            tile
+        };
+        let tile = tile.children(more.map(|more| {
             div()
                 .absolute()
                 .inset_0()
@@ -3953,8 +3987,9 @@ impl Pane {
         let scale = window.scale_factor();
         let image = preview.image.as_ref();
         // Only the first card may be large, and only for a picture wide enough to deserve it.
-        let large = index == 0
-            && image.is_some_and(|image| image.width >= 400 && image.width as f32 >= image.height as f32 * 1.3);
+        // A site player is large even when its poster is small or missing.
+        let large = preview.opens_in_browser
+            || index == 0 && image.is_some_and(|image| image.width >= 400 && image.width as f32 >= image.height as f32 * 1.3);
         // A phone's card follows the phone's run: 12 / 16 / 14 over the desktop's 11 / 15 / 13.
         let phone = self.metrics == Metrics::PHONE;
         let sized = move |line: Div, size: f32, height: f32| match phone {
@@ -3981,6 +4016,9 @@ impl Pane {
             }))
             .children((!preview.description.is_empty()).then(|| {
                 clamp(sized(div().type_ui(), 14., 20.), 20.).text_color(theme::text_soft()).child(preview.description.clone())
+            }))
+            .children(preview.opens_in_browser.then(|| {
+                sized(div().truncate().type_micro(), 12., 16.).text_color(theme::text_faint()).child("Opens in browser")
             }));
         let url = preview.url.clone();
         let dismiss = can_suppress.then(|| {
@@ -4023,11 +4061,22 @@ impl Pane {
             .cursor_pointer()
             .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| this.open_link(&url, event.modifiers().alt, window, cx)))
             .children(dismiss);
-        let Some(image) = image.cloned() else {
-            return card.child(words).into_any_element();
-        };
         let holder = |id: &'static str, wide: f32, tall: f32, radius: f32| {
             div().id(id).relative().w(px(wide)).h(px(tall)).flex_none().rounded(px(radius)).bg(theme::hover()).overflow_hidden()
+        };
+        let dress = |picture: Stateful<Div>| match preview.opens_in_browser {
+            true => {
+                let length = (preview.duration > 0).then(|| badge(media::duration_label(preview.duration)).right(px(6.)));
+                picture.child(play_disc()).children(length)
+            }
+            false => picture,
+        };
+        let Some(image) = image.cloned() else {
+            if !preview.opens_in_browser {
+                return card.child(words).into_any_element();
+            }
+            let wide = if phone { self.media_width() - 26. } else { self.media_width().min(416.) };
+            return card.flex().flex_col().gap(px(8.)).child(words).child(dress(holder("preview", wide, 180., 8.))).into_any_element();
         };
         let shown = |image, radius: f32| anim::picture(image, ObjectFit::Cover, radius, Play::Inline);
         if large {
@@ -4038,14 +4087,14 @@ impl Pane {
             let edge = media::decode_edge((image.width, image.height), wide, tall, Fit::Cover, scale);
             if self.held_back(&image) {
                 let picture = self.load_box(holder("preview", wide, tall, 8.), &image, "Preview", image.bytes, true, cx);
-                return card.flex().flex_col().gap(px(8.)).child(words).child(picture).into_any_element();
+                return card.flex().flex_col().gap(px(8.)).child(words).child(dress(picture)).into_any_element();
             }
             let picture = match self.still(&image, edge, edge, None, cx) {
                 Picture::Ready(decoded) => holder("preview", wide, tall, 8.).child(shown(decoded, 8.)),
                 Picture::Loading => holder("preview", wide, tall, 8.).child(in_box(Icon::Image, None)),
                 Picture::Failed => self.failed_box(holder("preview", wide, tall, 8.), &image, false, cx),
             };
-            return card.flex().flex_col().gap(px(8.)).child(words).child(picture).into_any_element();
+            return card.flex().flex_col().gap(px(8.)).child(words).child(dress(picture)).into_any_element();
         }
         let edge = media::decode_edge((image.width, image.height), 72., 72., Fit::Cover, scale);
         if self.held_back(&image) {

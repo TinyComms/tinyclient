@@ -69,6 +69,7 @@ pub const CREATE_PRIVATE_THREADS: u64 = 1 << 36;
 pub const SEND_MESSAGES_IN_THREADS: u64 = 1 << 38;
 pub const MANAGE_WEBHOOKS: u64 = 1 << 29;
 pub const MANAGE_EVENTS: u64 = 1 << 33;
+pub const SEND_VOICE_MESSAGES: u64 = 1 << 46;
 pub const PIN_MESSAGES: u64 = 1 << 51;
 
 /// Formats Unix seconds as UTC ISO 8601 (`YYYY-MM-DDTHH:MM:SSZ`) for Discord REST bodies.
@@ -595,6 +596,36 @@ pub struct ForumTag {
     pub emoji_name: Option<String>,
 }
 
+/// Thread-member notification flags (`ThreadMember::flags`).
+pub const THREAD_NOTIFY_ALL: u32 = 1 << 1;
+pub const THREAD_NOTIFY_MENTIONS: u32 = 1 << 2;
+pub const THREAD_NOTIFY_NONE: u32 = 1 << 3;
+pub const THREAD_NOTIFY_MASK: u32 = THREAD_NOTIFY_ALL | THREAD_NOTIFY_MENTIONS | THREAD_NOTIFY_NONE;
+
+/// Our own membership of a thread: holds its per-thread notification flags and mute state.
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct ThreadMember {
+    #[serde(default, deserialize_with = "nullable")]
+    pub flags: u32,
+    #[serde(default, deserialize_with = "nullable")]
+    pub muted: bool,
+}
+
+impl ThreadMember {
+    /// This thread's explicit notification setting, or `None` when it inherits its parent.
+    pub fn notify(&self) -> Option<protocol::Notify> {
+        if self.muted || (self.flags & THREAD_NOTIFY_NONE != 0) {
+            Some(protocol::Notify::Nothing)
+        } else if self.flags & THREAD_NOTIFY_MENTIONS != 0 {
+            Some(protocol::Notify::Mentions)
+        } else if self.flags & THREAD_NOTIFY_ALL != 0 {
+            Some(protocol::Notify::All)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Deserialize, Clone, Debug, Default)]
 pub struct Channel {
     pub id: String,
@@ -656,7 +687,7 @@ pub struct Channel {
     pub default_thread_rate_limit_per_user: u32,
     /// Our own membership of a thread, present when we are in it.
     #[serde(default)]
-    pub member: Option<IgnoredAny>,
+    pub member: Option<ThreadMember>,
     /// A DM from someone who is not a friend, waiting behind Message Requests, and one Discord
     /// judged spam.
     #[serde(default, deserialize_with = "nullable")]
@@ -1264,12 +1295,17 @@ pub struct GuildSettings {
     pub suppress_everyone: bool,
     #[serde(default, deserialize_with = "nullable")]
     pub suppress_roles: bool,
+    /// 0 default, 1 disabled (suppressed), 2 enabled.
+    #[serde(default, deserialize_with = "nullable")]
+    pub notify_highlights: u8,
+    #[serde(default, deserialize_with = "nullable")]
+    pub mute_scheduled_events: bool,
+    #[serde(default = "yes", deserialize_with = "nullable_yes")]
+    pub mobile_push: bool,
     #[serde(default, deserialize_with = "nullable")]
     pub channel_overrides: Vec<ChannelOverride>,
     #[serde(default, deserialize_with = "nullable")]
     pub hide_muted_channels: bool,
-    #[serde(default, deserialize_with = "nullable")]
-    pub mute_scheduled_events: bool,
     #[serde(default, deserialize_with = "nullable")]
     pub flags: u32,
     /// 0 all, 1 mentions, 2 nothing.
@@ -1551,6 +1587,9 @@ pub struct EmbedImage {
     pub width: u32,
     #[serde(default, deserialize_with = "nullable")]
     pub height: u32,
+    /// Seconds, on a video or gifv. Absent on a thumbnail or a still.
+    #[serde(default, deserialize_with = "nullable")]
+    pub duration_secs: f64,
 }
 
 #[derive(Deserialize, Clone, Debug)]

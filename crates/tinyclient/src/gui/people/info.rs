@@ -621,6 +621,47 @@ impl InfoPane {
         });
     }
 
+    /// Sends `Request::SetSpaceOptions` after optimistically applying `apply` to the shown `SpaceInfo`.
+    /// On failure, restores the prior `SpaceInfo` and displays an error toast.
+    pub(in crate::gui) fn set_space_options(
+        &mut self,
+        request: Request,
+        apply: impl FnOnce(&mut SpaceInfo),
+        cx: &mut Context<Self>,
+    ) {
+        let previous = self.space_info.clone();
+        if let Answer::Got(ref mut info) = self.space_info {
+            apply(info);
+        }
+        cx.notify();
+        if only_draws() {
+            return;
+        }
+        let pane = cx.weak_entity();
+        let shell = self.shell.clone();
+        super::ask_later(cx, request, move |answer, cx| {
+            if matches!(&answer, Ok(Response::Ok)) {
+                return;
+            }
+            let _ = pane.update(cx, |this, cx| {
+                this.space_info = previous;
+                cx.notify();
+            });
+            let detail = match answer {
+                Ok(Response::Error { detail, .. }) => detail,
+                Err(err) => crate::client::trouble_words("save", &err),
+                _ => crate::client::OTHER_ANSWER.to_owned(),
+            };
+            let _ = shell.update(cx, |shell, cx| {
+                shell.toast(
+                    Some(("icons/circle-alert.svg", theme::danger())),
+                    format!("Can't change server settings: {detail}"),
+                    cx,
+                );
+            });
+        });
+    }
+
     fn with_shell(&self, cx: &mut App, then: impl FnOnce(&mut Shell, &mut Context<Shell>)) {
         let _ = self.shell.update(cx, then);
     }

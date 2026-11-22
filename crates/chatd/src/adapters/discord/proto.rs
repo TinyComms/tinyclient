@@ -1,5 +1,7 @@
-//! What is read from Discord's protobuf settings, and what is written back: the server list
-//! and its folders, and our own status.
+//! What is read from Discord's protobuf settings: the server list and its folders, our own status,
+//! privacy, and the picker's frecency (`settings-proto/2`). Status, privacy, and favourite
+//! emoji, sticker, and GIF lists are written back. Frecency scores are read and never written:
+//! a wrong score would replace the account's frecency on every device.
 //!
 //! Sessions that identify as the current web client get their settings as base64 protobuf
 //! (`user_settings_proto`) instead of JSON. The field numbers are from the community's
@@ -86,6 +88,7 @@ fn bytes_of(message: &[u8], wanted: u64) -> Option<&[u8]> {
     })
 }
 
+/// Encodes an unsigned varint into `into`.
 fn write_varint(into: &mut Vec<u8>, mut value: u64) {
     loop {
         let byte = (value & 0x7f) as u8;
@@ -96,11 +99,6 @@ fn write_varint(into: &mut Vec<u8>, mut value: u64) {
         }
         into.push(byte | 0x80);
     }
-}
-
-fn write_varint_field(into: &mut Vec<u8>, number: u64, value: u64) {
-    write_varint(into, number << 3);
-    write_varint(into, value);
 }
 
 /// A length-delimited field: its tag, its length, its bytes.
@@ -130,6 +128,34 @@ pub struct CustomStatus {
 impl CustomStatus {
     pub fn is_empty(&self) -> bool {
         self.text.is_empty() && self.emoji_name.is_empty() && self.emoji_id.is_none()
+    }
+}
+/// A varint field: its tag and value.
+fn write_varint_field(into: &mut Vec<u8>, number: u64, value: u64) {
+    write_varint(into, number << 3);
+    write_varint(into, value);
+}
+
+/// A wrapped scalar (`google.protobuf.BoolValue` / `UInt32Value`): length-delimited field
+/// containing varint field 1 when non-zero (empty message for 0/false).
+fn write_wrapped_varint(into: &mut Vec<u8>, number: u64, value: u64) {
+    let mut inner = Vec::new();
+    if value != 0 {
+        write_varint_field(&mut inner, 1, value);
+    }
+    write(into, number, &inner);
+}
+
+/// Packed repeated `fixed64` field for a list of numeric snowflake ids.
+fn write_packed_ids(into: &mut Vec<u8>, number: u64, list: &[String]) {
+    let mut packed = Vec::with_capacity(list.len() * 8);
+    for id in list {
+        if let Ok(parsed) = id.parse::<u64>() {
+            packed.extend_from_slice(&parsed.to_le_bytes());
+        }
+    }
+    if !packed.is_empty() {
+        write(into, number, &packed);
     }
 }
 
@@ -522,10 +548,459 @@ pub fn blur_explicit_media(settings: &str) -> bool {
     };
     wrapped_varint(filter).is_none_or(|value| value != 0)
 }
+/// Friend-source bitflags (`PrivacySettings.friend_source_flags`, field 11).
+/// Bit 1 mutual friends, bit 2 mutual guilds, bit 3 no relation (everyone).
+pub const FRIEND_SOURCE_MUTUAL_FRIENDS: u32 = 1 << 1;
+pub const FRIEND_SOURCE_MUTUAL_GUILDS: u32 = 1 << 2;
+pub const FRIEND_SOURCE_ALL: u32 = 1 << 3;
+
+/// `TextAndImagesSettings` (field 6 of `PreloadedUserSettings`). Explicit content and the DM
+/// spam filter live here, not in privacy. `None` when the blob has no text-and-images block.
+pub fn text_and_images_settings(settings: &str) -> Option<Vec<u8>> {
+    let bytes = base64::engine::general_purpose::STANDARD.decode(settings.trim()).ok()?;
+    bytes_of(&bytes, 6).map(<[u8]>::to_vec)
+}
+
+/// Our privacy settings as Discord sent them (field 8 of `PreloadedUserSettings`).
+/// `None` when the blob does not contain a privacy block.
+pub fn privacy_settings(settings: &str) -> Option<Vec<u8>> {
+    let bytes = base64::engine::general_purpose::STANDARD.decode(settings.trim()).ok()?;
+    bytes_of(&bytes, 8).map(<[u8]>::to_vec)
+}
+
+/// Decodes Discord's `PrivacySettings` block (field 8) into `NetworkPrivacy`.
+/// Explicit content and the DM spam filter are not in this message; see [`apply_content_filters`].
+/// Field numbers follow `discord-protos`:
+/// - 3: `restricted_guild_ids` (repeated fixed64)
+/// - 4: `default_guilds_restricted` (bool)
+/// - 11: `friend_source_flags` (`UInt32Value`)
+/// - 16: `message_request_restricted_guild_ids` (repeated fixed64)
+/// - 17: `default_message_request_restricted` (`BoolValue`)
+pub fn decode_privacy(privacy: &[u8]) -> protocol::NetworkPrivacy {
+    let mut out = protocol::NetworkPrivacy::default();
+    ids(privacy, 3, &mut out.restricted_spaces);
+    ids(privacy, 16, &mut out.request_restricted_spaces);
+    for (number, field, _) in fields(privacy) {
+        match (number, field) {
+            (4, Field::Varint(v)) => out.allow_dms_from_spaces = v == 0,
+            (11, Field::Bytes(inner)) => {
+                let flags = wrapped_varint(inner).unwrap_or(0) as u32;
+                out.friend_requests_everyone = flags & FRIEND_SOURCE_ALL != 0;
+                out.friend_requests_mutual_friends = flags & FRIEND_SOURCE_MUTUAL_FRIENDS != 0;
+                out.friend_requests_mutual_spaces = flags & FRIEND_SOURCE_MUTUAL_GUILDS != 0;
+            }
+            (17, Field::Bytes(inner)) => {
+                out.allow_message_requests = wrapped_varint(inner).unwrap_or(0) == 0;
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Reads explicit content and the DM spam filter from `TextAndImagesSettings`.
+/// An empty block is left alone. Field numbers follow `discord-protos`:
+/// - 19: `explicit_content_filter` (`UInt32Value`: 0 off, 1 non-friends, 2 everyone)
+/// - 26: deprecated `dm_spam_filter` (`UInt32Value`, same 0/1/2 scale), used when v2 is absent
+/// - 27: `dm_spam_filter_v2` (enum: 0 unset means non-friends, 1 off, 2 non-friends, 3 everyone)
+pub fn apply_content_filters(text: &[u8], out: &mut protocol::NetworkPrivacy) {
+    if text.is_empty() {
+        return;
+    }
+    let mut explicit = None;
+    let mut spam_v2 = None;
+    let mut spam_v1 = None;
+    for (number, field, _) in fields(text) {
+        match (number, field) {
+            (19, Field::Bytes(inner)) => explicit = Some(content_level(wrapped_varint(inner).unwrap_or(0))),
+            (26, Field::Bytes(inner)) => spam_v1 = Some(content_level(wrapped_varint(inner).unwrap_or(0))),
+            (27, Field::Varint(v)) => {
+                spam_v2 = Some(match v {
+                    0 | 2 => 1,
+                    3 => 2,
+                    _ => 0,
+                });
+            }
+            _ => {}
+        }
+    }
+    out.explicit_content_filter = explicit.unwrap_or(0);
+    // Unset v2 means non-friends. A present v2 wins over the deprecated field.
+    out.dm_spam_filter = spam_v2.or(spam_v1).unwrap_or(1);
+}
+
+/// `explicit_content_filter` / deprecated `dm_spam_filter`: 0 off, 1 non-friends, 2 everyone.
+fn content_level(value: u64) -> u8 {
+    match value {
+        1 => 1,
+        2 => 2,
+        _ => 0,
+    }
+}
+
+/// Re-encodes `privacy` with the fields in `next` updated while copying every other field
+/// byte-for-byte so the rest of `PrivacySettings` is never lost.
+pub fn with_privacy(privacy: &[u8], next: &protocol::NetworkPrivacy) -> Vec<u8> {
+    let mut out = Vec::with_capacity(privacy.len() + 64);
+    for (number, _, raw) in fields(privacy) {
+        if !matches!(number, 3 | 4 | 11 | 16 | 17) {
+            out.extend_from_slice(raw);
+        }
+    }
+    write_packed_ids(&mut out, 3, &next.restricted_spaces);
+    if !next.allow_dms_from_spaces {
+        write_varint_field(&mut out, 4, 1);
+    }
+    let mut flags = 0u32;
+    if next.friend_requests_everyone {
+        flags |= FRIEND_SOURCE_ALL;
+    }
+    if next.friend_requests_mutual_friends {
+        flags |= FRIEND_SOURCE_MUTUAL_FRIENDS;
+    }
+    if next.friend_requests_mutual_spaces {
+        flags |= FRIEND_SOURCE_MUTUAL_GUILDS;
+    }
+    write_wrapped_varint(&mut out, 11, u64::from(flags));
+    write_packed_ids(&mut out, 16, &next.request_restricted_spaces);
+    write_wrapped_varint(&mut out, 17, u64::from(!next.allow_message_requests));
+    out
+}
+
+/// Re-encodes `text` with explicit content and the DM spam filter from `next`.
+/// Every other text-and-images field is copied. Does not invent a block: the caller
+/// skips the write when Discord has not sent one, because a partial field 6 resets the rest.
+pub fn with_content_filters(text: &[u8], next: &protocol::NetworkPrivacy) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() + 24);
+    for (number, _, raw) in fields(text) {
+        if !matches!(number, 19 | 26 | 27) {
+            out.extend_from_slice(raw);
+        }
+    }
+    let plain = u64::from(content_level(u64::from(next.explicit_content_filter)));
+    write_wrapped_varint(&mut out, 19, plain);
+    let spam = u64::from(content_level(u64::from(next.dm_spam_filter)));
+    write_wrapped_varint(&mut out, 26, spam);
+    let spam_v2 = match next.dm_spam_filter {
+        1 => 2,
+        2 => 3,
+        _ => 1,
+    };
+    write_varint_field(&mut out, 27, spam_v2);
+    out
+}
+
+/// Base64 `PreloadedUserSettings` for `PATCH /users/@me/settings-proto/1`.
+/// Privacy is field 8. `text_and_images`, when present, is field 6. The privacy block is
+/// never written as field 6.
+pub fn privacy_update_settings(privacy: &[u8], text_and_images: Option<&[u8]>) -> String {
+    let mut whole = Vec::with_capacity(privacy.len() + text_and_images.map_or(0, <[u8]>::len) + 8);
+    if let Some(text) = text_and_images.filter(|text| !text.is_empty()) {
+        write(&mut whole, 6, text);
+    }
+    write(&mut whole, 8, privacy);
+    base64::engine::general_purpose::STANDARD.encode(whole)
+}
+
+/// Base64 protobuf as Discord puts it in `settings` or a gateway `proto` field.
+pub fn decode_settings(text: &str) -> Option<Vec<u8>> {
+    base64::engine::general_purpose::STANDARD.decode(text.trim()).ok()
+}
+
+/// `FrecencyUserSettings` as the body of `PATCH /users/@me/settings-proto/2`.
+pub fn encode_settings(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// One saved GIF. The map key on the wire is [`url`](FavoriteGif::url), the page that is sent.
+/// `format` is Discord's `GIFType`: 0 none, 1 image, 2 video.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FavoriteGif {
+    pub url: String,
+    pub src: String,
+    pub format: u32,
+    pub width: u32,
+    pub height: u32,
+    pub order: u32,
+}
+
+/// Favourite lists and frecency scores from `FrecencyUserSettings` (settings-proto/2).
+/// Field numbers follow the community `discord-protos`:
+/// - 2 `favorite_gifs` (map of page URL to `FavoriteGIF`, plus `hide_tooltip`)
+/// - 3 `favorite_stickers.sticker_ids` (repeated fixed64)
+/// - 4 `sticker_frecency` (map of fixed64 to `FrecencyItem`)
+/// - 5 `favorite_emojis.emojis` (repeated string)
+/// - 6 `emoji_frecency` (map of string to `FrecencyItem`)
+/// `FrecencyItem.score` is field 4; `frecency` (field 3) is used when score is absent.
+/// Scores are only read. Favourite writes replace only their own list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FrecencyLists {
+    pub favorite_gifs: Vec<FavoriteGif>,
+    pub favorite_emojis: Vec<String>,
+    pub favorite_stickers: Vec<String>,
+    /// `(key, score)`, wire order. The picker sorts.
+    pub emoji_frecency: Vec<(String, i32)>,
+    pub sticker_frecency: Vec<(String, i32)>,
+}
+
+/// Decodes a `FrecencyUserSettings` message. Unknown fields are ignored here; the raw bytes
+/// are what a later write copies.
+pub fn decode_frecency(bytes: &[u8]) -> FrecencyLists {
+    let mut lists = FrecencyLists::default();
+    for (number, field, _) in fields(bytes) {
+        let Field::Bytes(inner) = field else {
+            continue;
+        };
+        match number {
+            2 => lists.favorite_gifs = favorite_gif_list(inner),
+            3 => ids(inner, 1, &mut lists.favorite_stickers),
+            4 => lists.sticker_frecency = frecency_map(inner, true),
+            5 => lists.favorite_emojis = strings(inner, 1),
+            6 => lists.emoji_frecency = frecency_map(inner, false),
+            _ => {}
+        }
+    }
+    lists
+}
+
+/// Replaces favourite emoji (field 5) and copies every other field, including frecency scores
+/// and anything this client does not know.
+pub fn with_favorite_emojis(bytes: &[u8], emojis: &[String]) -> Vec<u8> {
+    replace_message(bytes, 5, &strings_message(emojis))
+}
+
+/// Replaces favourite stickers (field 3) and copies every other field, including frecency scores.
+pub fn with_favorite_stickers(bytes: &[u8], ids: &[String]) -> Vec<u8> {
+    let mut inner = Vec::new();
+    write_packed_ids(&mut inner, 1, ids);
+    replace_message(bytes, 3, &inner)
+}
+
+/// Replaces favourite GIFs (field 2) and copies every other field, including frecency scores.
+/// Inside the GIF message, map entries (field 1) are replaced and the rest is kept, so
+/// `hide_tooltip` survives. An empty list is still written: clearing favourites must clear them.
+pub fn with_favorite_gifs(bytes: &[u8], gifs: &[FavoriteGif]) -> Vec<u8> {
+    let existing = bytes_of(bytes, 2).unwrap_or(&[]);
+    let mut inner = Vec::new();
+    for (number, _, raw) in fields(existing) {
+        if number != 1 {
+            inner.extend_from_slice(raw);
+        }
+    }
+    for gif in gifs {
+        let mut value = Vec::new();
+        if gif.format != 0 {
+            write_varint_field(&mut value, 1, u64::from(gif.format));
+        }
+        if !gif.src.is_empty() {
+            write(&mut value, 2, gif.src.as_bytes());
+        }
+        if gif.width != 0 {
+            write_varint_field(&mut value, 3, u64::from(gif.width));
+        }
+        if gif.height != 0 {
+            write_varint_field(&mut value, 4, u64::from(gif.height));
+        }
+        if gif.order != 0 {
+            write_varint_field(&mut value, 5, u64::from(gif.order));
+        }
+        let mut entry = Vec::new();
+        write(&mut entry, 1, gif.url.as_bytes());
+        write(&mut entry, 2, &value);
+        write(&mut inner, 1, &entry);
+    }
+    replace_message(bytes, 2, &inner)
+}
+
+/// `FavoriteGIFs.gifs`, sorted by `order`. Anything that is not a map entry is ignored.
+fn favorite_gif_list(message: &[u8]) -> Vec<FavoriteGif> {
+    let mut out = Vec::new();
+    for (number, field, _) in fields(message) {
+        let Field::Bytes(entry) = field else {
+            continue;
+        };
+        if number != 1 {
+            continue;
+        }
+        let mut gif = FavoriteGif::default();
+        for (number, field, _) in fields(entry) {
+            match (number, field) {
+                (1, Field::Bytes(bytes)) => gif.url = String::from_utf8_lossy(bytes).into_owned(),
+                (2, Field::Bytes(value)) => {
+                    for (number, field, _) in fields(value) {
+                        match (number, field) {
+                            (1, Field::Varint(format)) => gif.format = format as u32,
+                            (2, Field::Bytes(src)) => gif.src = String::from_utf8_lossy(src).into_owned(),
+                            (3, Field::Varint(width)) => gif.width = width as u32,
+                            (4, Field::Varint(height)) => gif.height = height as u32,
+                            (5, Field::Varint(order)) => gif.order = order as u32,
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !gif.url.is_empty() {
+            out.push(gif);
+        }
+    }
+    out.sort_by_key(|gif| gif.order);
+    out
+}
+
+fn replace_message(bytes: &[u8], number: u64, inner: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + inner.len() + 8);
+    for (found, _, raw) in fields(bytes) {
+        if found != number {
+            out.extend_from_slice(raw);
+        }
+    }
+    write(&mut out, number, inner);
+    out
+}
+
+fn strings_message(list: &[String]) -> Vec<u8> {
+    let mut inner = Vec::new();
+    for text in list {
+        write(&mut inner, 1, text.as_bytes());
+    }
+    inner
+}
+
+fn strings(message: &[u8], wanted: u64) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut reader = Reader(message);
+    while let Some((number, field)) = reader.field() {
+        if number == wanted {
+            if let Field::Bytes(bytes) = field {
+                if let Ok(text) = std::str::from_utf8(bytes) {
+                    if !text.is_empty() {
+                        out.push(text.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Map field 1 of an `EmojiFrecency` or `StickerFrecency` message. `fixed_key` is a sticker id.
+fn frecency_map(message: &[u8], fixed_key: bool) -> Vec<(String, i32)> {
+    let mut out = Vec::new();
+    let mut reader = Reader(message);
+    while let Some((number, field)) = reader.field() {
+        let Field::Bytes(entry) = field else {
+            continue;
+        };
+        if number != 1 {
+            continue;
+        }
+        let mut key = String::new();
+        let mut score = 0i32;
+        let mut inner = Reader(entry);
+        while let Some((number, field)) = inner.field() {
+            match (number, field) {
+                (1, Field::Bytes(bytes)) if !fixed_key => key = String::from_utf8_lossy(bytes).into_owned(),
+                (1, Field::Fixed64(id)) if fixed_key => key = id.to_string(),
+                (2, Field::Bytes(item)) => score = frecency_score(item),
+                _ => {}
+            }
+        }
+        if !key.is_empty() {
+            out.push((key, score));
+        }
+    }
+    out
+}
+
+/// `FrecencyItem.score` (field 4), else `frecency` (field 3).
+fn frecency_score(item: &[u8]) -> i32 {
+    let mut score = None;
+    let mut frecency = 0i32;
+    for (number, field, _) in fields(item) {
+        if let Field::Varint(value) = field {
+            if number == 4 {
+                score = Some(value as i32);
+            } else if number == 3 {
+                frecency = value as i32;
+            }
+        }
+    }
+    score.unwrap_or(frecency)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn privacy_settings_round_trip_and_preserve_unknown_fields() {
+        // PrivacySettings (outer field 8): restricted guild 4000, default_guilds_restricted,
+        // detect_platform_accounts (field 8, left alone), friend sources = mutual guilds only,
+        // friend_discovery_flags (field 12, left alone), message-request guild 5000,
+        // default_message_request_restricted, and an unknown varint (field 99).
+        let mut raw = Vec::new();
+        write_packed_ids(&mut raw, 3, &["4000".to_owned()]);
+        write_varint_field(&mut raw, 4, 1);
+        write_wrapped_varint(&mut raw, 8, 1);
+        write_wrapped_varint(&mut raw, 11, u64::from(FRIEND_SOURCE_MUTUAL_GUILDS));
+        write_wrapped_varint(&mut raw, 12, 5);
+        write_packed_ids(&mut raw, 16, &["5000".to_owned()]);
+        write_wrapped_varint(&mut raw, 17, 1);
+        write_varint_field(&mut raw, 99, 77);
+
+        // TextAndImagesSettings (outer field 6): use_thread_sidebar left alone, explicit
+        // content 1 (UInt32Value, non-friends), dm_spam_filter_v2 3 (everyone).
+        let mut text = Vec::new();
+        write_wrapped_varint(&mut text, 3, 1);
+        write_wrapped_varint(&mut text, 19, 1);
+        write_varint_field(&mut text, 27, 3);
+
+        let encoded = privacy_update_settings(&raw, Some(&text));
+        let whole = decode_settings(&encoded).unwrap();
+        assert_eq!(bytes_of(&whole, 8), Some(raw.as_slice()));
+        assert_eq!(bytes_of(&whole, 6), Some(text.as_slice()));
+        let extracted = privacy_settings(&encoded).unwrap();
+        let mut decoded = decode_privacy(&extracted);
+        let text_extracted = text_and_images_settings(&encoded).unwrap();
+        apply_content_filters(&text_extracted, &mut decoded);
+        assert!(!decoded.friend_requests_everyone);
+        assert!(!decoded.friend_requests_mutual_friends);
+        assert!(decoded.friend_requests_mutual_spaces);
+        assert!(!decoded.allow_dms_from_spaces);
+        assert!(!decoded.allow_message_requests);
+        assert_eq!(decoded.explicit_content_filter, 1);
+        assert_eq!(decoded.dm_spam_filter, 2);
+        assert_eq!(decoded.restricted_spaces, vec!["4000".to_owned()]);
+        assert_eq!(decoded.request_restricted_spaces, vec!["5000".to_owned()]);
+
+        // Mutate and re-encode. detect_platform_accounts, friend discovery, the unknown
+        // varint, and use_thread_sidebar stay byte-for-byte. Privacy is not written as field 6.
+        let mut next = decoded.clone();
+        next.friend_requests_everyone = true;
+        next.allow_dms_from_spaces = true;
+        next.explicit_content_filter = 2;
+        next.dm_spam_filter = 1;
+        next.restricted_spaces.push("6000".to_owned());
+        let rewritten = with_privacy(&extracted, &next);
+        let rewritten_text = with_content_filters(&text_extracted, &next);
+        let mut again = decode_privacy(&rewritten);
+        apply_content_filters(&rewritten_text, &mut again);
+        assert_eq!(again, next);
+        assert_eq!(bytes_of(&rewritten, 8), Some(&[0x08, 0x01][..]), "detect_platform_accounts must survive");
+        assert_eq!(bytes_of(&rewritten, 12), Some(&[0x08, 0x05][..]), "friend_discovery_flags must survive");
+        assert!(
+            fields(&rewritten).iter().any(|(n, f, _)| *n == 99 && matches!(f, Field::Varint(77))),
+            "unknown field 99 must survive"
+        );
+        assert_eq!(bytes_of(&rewritten_text, 3), Some(&[0x08, 0x01][..]), "use_thread_sidebar must survive");
+        assert_eq!(bytes_of(&rewritten_text, 19), Some(&[0x08, 0x02][..]));
+        assert!(!fields(&rewritten).iter().any(|(n, _, _)| matches!(*n, 26 | 27)));
+        let sent = decode_settings(&privacy_update_settings(&rewritten, Some(&rewritten_text))).unwrap();
+        assert_eq!(bytes_of(&sent, 8), Some(rewritten.as_slice()));
+        assert_ne!(bytes_of(&sent, 6), Some(rewritten.as_slice()));
+    }
 
     #[test]
     fn folders_flatten_into_one_order() {
@@ -770,5 +1245,125 @@ mod tests {
         assert_eq!(guild_folders(&encoded).unwrap(), moved);
         let block = guild_folders_settings(&encoded).unwrap();
         assert!(fields(&block).iter().any(|(n, f, _)| *n == 7 && matches!(f, Field::Varint(1))));
+    }
+
+    #[test]
+    fn frecency_favourites_round_trip_and_leave_scores_and_unknown_fields() {
+        // Favourite emoji, favourite stickers, both frecency maps, a stand-in for favorite_gifs
+        // (field 2), and an unknown varint (field 99).
+        let mut emojis = Vec::new();
+        write(&mut emojis, 1, "😀".as_bytes());
+        write(&mut emojis, 1, b"ferris:5101");
+        let mut stickers = Vec::new();
+        write_packed_ids(&mut stickers, 1, &["111".into(), "222".into()]);
+        let mut item = Vec::new();
+        write_varint_field(&mut item, 1, 3);
+        write_varint_field(&mut item, 4, 40);
+        let mut entry = Vec::new();
+        write(&mut entry, 1, "🎉".as_bytes());
+        write(&mut entry, 2, &item);
+        let mut emoji_frecency = Vec::new();
+        write(&mut emoji_frecency, 1, &entry);
+        let mut scored = Vec::new();
+        write_varint_field(&mut scored, 3, 9);
+        let mut sticker_entry = Vec::new();
+        sticker_entry.push(0x09);
+        sticker_entry.extend_from_slice(&333u64.to_le_bytes());
+        write(&mut sticker_entry, 2, &scored);
+        let mut sticker_frecency = Vec::new();
+        write(&mut sticker_frecency, 1, &sticker_entry);
+        let mut whole = Vec::new();
+        write(&mut whole, 2, b"gif-unknown");
+        write(&mut whole, 3, &stickers);
+        write(&mut whole, 4, &sticker_frecency);
+        write(&mut whole, 5, &emojis);
+        write(&mut whole, 6, &emoji_frecency);
+        write_varint_field(&mut whole, 99, 77);
+
+        let lists = decode_frecency(&whole);
+        assert_eq!(lists.favorite_emojis, ["😀", "ferris:5101"]);
+        assert_eq!(lists.favorite_stickers, ["111", "222"]);
+        assert_eq!(lists.emoji_frecency, vec![("🎉".to_owned(), 40)]);
+        assert_eq!(lists.sticker_frecency, vec![("333".to_owned(), 9)]);
+
+        let next = with_favorite_emojis(&whole, &["ferris:5101".into(), "wave:1".into()]);
+        let again = decode_frecency(&next);
+        assert_eq!(again.favorite_emojis, ["ferris:5101", "wave:1"]);
+        assert_eq!(again.favorite_stickers, lists.favorite_stickers);
+        assert_eq!(again.emoji_frecency, lists.emoji_frecency);
+        assert_eq!(again.sticker_frecency, lists.sticker_frecency);
+        assert!(
+            fields(&next).iter().any(|(n, field, _)| *n == 2 && matches!(field, Field::Bytes(bytes) if bytes == b"gif-unknown")),
+            "favorite_gifs must survive an emoji favourite write"
+        );
+        assert!(
+            fields(&next).iter().any(|(n, field, _)| *n == 99 && matches!(field, Field::Varint(77))),
+            "unknown field 99 must survive"
+        );
+
+        let stick = with_favorite_stickers(&next, &["222".into()]);
+        let stick_lists = decode_frecency(&stick);
+        assert_eq!(stick_lists.favorite_stickers, ["222"]);
+        assert_eq!(stick_lists.favorite_emojis, again.favorite_emojis);
+        assert_eq!(stick_lists.emoji_frecency, lists.emoji_frecency, "frecency scores are not rewritten");
+        assert_eq!(stick_lists.sticker_frecency, lists.sticker_frecency, "frecency scores are not rewritten");
+        let encoded = encode_settings(&stick);
+        assert_eq!(decode_frecency(&decode_settings(&encoded).unwrap()).favorite_stickers, ["222"]);
+    }
+
+    #[test]
+    fn favorite_gifs_round_trip_and_leave_tooltip_scores_and_unknown_fields() {
+        // Two GIFs out of order, hide_tooltip, an emoji favourite, and an unknown varint.
+        let gif = |url: &str, src: &str, order: u64| {
+            let mut value = Vec::new();
+            write_varint_field(&mut value, 1, 1);
+            write(&mut value, 2, src.as_bytes());
+            write_varint_field(&mut value, 3, 220);
+            write_varint_field(&mut value, 4, 120);
+            write_varint_field(&mut value, 5, order);
+            let mut entry = Vec::new();
+            write(&mut entry, 1, url.as_bytes());
+            write(&mut entry, 2, &value);
+            entry
+        };
+        let mut gifs = Vec::new();
+        write_varint_field(&mut gifs, 2, 1);
+        write(&mut gifs, 1, &gif("https://tenor.com/view/later", "https://media.tenor.com/later.gif", 2));
+        write(&mut gifs, 1, &gif("https://tenor.com/view/first", "https://media.tenor.com/first.gif", 1));
+        let mut emojis = Vec::new();
+        write(&mut emojis, 1, "😀".as_bytes());
+        let mut whole = Vec::new();
+        write(&mut whole, 2, &gifs);
+        write(&mut whole, 5, &emojis);
+        write_varint_field(&mut whole, 99, 77);
+
+        let lists = decode_frecency(&whole);
+        assert_eq!(
+            lists.favorite_gifs.iter().map(|gif| gif.url.as_str()).collect::<Vec<_>>(),
+            ["https://tenor.com/view/first", "https://tenor.com/view/later"],
+            "favourites are ordered by their order field"
+        );
+        assert_eq!(lists.favorite_gifs[0].src, "https://media.tenor.com/first.gif");
+        assert_eq!((lists.favorite_gifs[0].width, lists.favorite_gifs[0].height, lists.favorite_gifs[0].format), (220, 120, 1));
+
+        let next = with_favorite_gifs(&whole, &lists.favorite_gifs[..1]);
+        let again = decode_frecency(&next);
+        assert_eq!(again.favorite_gifs.len(), 1);
+        assert_eq!(again.favorite_emojis, ["😀"]);
+        let inner = bytes_of(&next, 2).unwrap();
+        assert!(
+            fields(inner).iter().any(|(n, field, _)| *n == 2 && matches!(field, Field::Varint(1))),
+            "hide_tooltip survives a GIF favourite write"
+        );
+        assert!(
+            fields(&next).iter().any(|(n, field, _)| *n == 99 && matches!(field, Field::Varint(77))),
+            "unknown field 99 must survive a GIF favourite write"
+        );
+        let emoji_write = with_favorite_emojis(&next, &["😀".into()]);
+        assert_eq!(decode_frecency(&emoji_write).favorite_gifs, again.favorite_gifs, "an emoji write leaves GIF favourites");
+        let cleared = with_favorite_gifs(&next, &[]);
+        assert!(decode_frecency(&cleared).favorite_gifs.is_empty(), "an empty list is written, so a clear is a clear");
+        assert!(bytes_of(&cleared, 2).is_some());
+        assert!(fields(bytes_of(&cleared, 2).unwrap()).iter().any(|(n, _, _)| *n == 2));
     }
 }

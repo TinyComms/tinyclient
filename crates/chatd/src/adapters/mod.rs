@@ -223,7 +223,7 @@ pub struct ConversationAbout {
 }
 
 /// What a Space's info says, as the network tells it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SpaceAbout {
     pub description: String,
     pub members: Option<u32>,
@@ -243,6 +243,45 @@ pub struct SpaceAbout {
     pub vanity_url: Option<String>,
     pub invites_disabled: bool,
     pub can_change_nickname: bool,
+    pub suppress_everyone: bool,
+    pub suppress_roles: bool,
+    pub highlights: bool,
+    pub events: bool,
+    pub mobile_push: bool,
+    pub channel_overrides: Vec<protocol::SpaceChannelOverride>,
+    pub privacy: Option<protocol::SpacePrivacy>,
+}
+
+impl Default for SpaceAbout {
+    fn default() -> SpaceAbout {
+        SpaceAbout {
+            description: String::new(),
+            members: None,
+            online: None,
+            nickname: String::new(),
+            roles: Vec::new(),
+            notify: Notify::default(),
+            tags: Vec::new(),
+            banner: None,
+            boost_level: 0,
+            boosts: 0,
+            mark: None,
+            system_channel_id: None,
+            afk_channel_id: None,
+            afk_timeout: 0,
+            default_notify: None,
+            vanity_url: None,
+            invites_disabled: false,
+            can_change_nickname: false,
+            suppress_everyone: false,
+            suppress_roles: false,
+            highlights: true,
+            events: true,
+            mobile_push: true,
+            channel_overrides: Vec::new(),
+            privacy: None,
+        }
+    }
 }
 
 /// A page of what was shared, from the network's own search.
@@ -767,6 +806,18 @@ pub enum Command {
     },
     /// A Space's info, opened from its name.
     SpaceInfo { space_id: String, reply: Reply<SpaceAbout> },
+    /// Updates a Space's notification level, switches, or resets one channel override.
+    SetSpaceOptions {
+        space_id: String,
+        notify: Option<Notify>,
+        suppress_everyone: Option<bool>,
+        suppress_roles: Option<bool>,
+        highlights: Option<bool>,
+        events: Option<bool>,
+        mobile_push: Option<bool>,
+        reset_channel: Option<String>,
+        reply: Reply<()>,
+    },
     /// Preview a Space invite link or code.
     InvitePreview {
         code: String,
@@ -1162,6 +1213,14 @@ pub enum Command {
         unfave: bool,
         reply: Reply<()>,
     },
+    /// Favourite or unfavourite an emoji or sticker on the account (Discord settings-proto/2).
+    /// Frecency scores are not written.
+    Favourite {
+        kind: CatalogKind,
+        id: String,
+        on: bool,
+        reply: Reply<()>,
+    },
     /// What was shared in a conversation, from the network's own search, because the user
     /// clicked "Search all". `before` continues below an item already listed.
     SearchShared {
@@ -1208,6 +1267,21 @@ pub enum Command {
     SpaceTags {
         space_id: String,
         reply: Reply<Vec<protocol::TeamTag>>,
+    },
+    /// Read an account's Privacy & Safety settings (Discord).
+    GetNetworkPrivacy {
+        reply: Reply<protocol::NetworkPrivacy>,
+    },
+    /// Write an account's Privacy & Safety settings (Discord).
+    SetNetworkPrivacy {
+        privacy: protocol::NetworkPrivacy,
+        reply: Reply<protocol::NetworkPrivacy>,
+    },
+    /// Update a Space's per-server privacy switches (Discord).
+    SetSpacePrivacy {
+        space_id: String,
+        privacy: protocol::SpacePrivacy,
+        reply: Reply<()>,
     },
     /// A picker's catalog: custom emoji (of one Space when `space_id` is set), stickers, or GIFs
     /// for `query`. Register every preview through [`Context::media`]. Only on a key press:
@@ -1456,6 +1530,7 @@ impl Command {
             Command::ConversationInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SpaceInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ForumInfo { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetSpaceOptions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InvitePreview { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::InviteJoin { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CreateInvite { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1527,6 +1602,7 @@ impl Command {
             Command::Forward { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SaveGif { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::StickerSet { reply, .. } | Command::FaveSticker { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::Favourite { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SearchShared { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::CallHistory { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::DeleteCallEntries { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -1535,6 +1611,9 @@ impl Command {
             Command::GetOutOfOffice { reply } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SetOutOfOffice { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SpaceTags { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::GetNetworkPrivacy { reply } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetNetworkPrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::SetSpacePrivacy { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Catalog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityFeed { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ActivityMarkRead { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),

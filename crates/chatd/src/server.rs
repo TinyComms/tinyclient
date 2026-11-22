@@ -2616,6 +2616,13 @@ impl Chat {
             vanity_url: about.vanity_url,
             invites_disabled: about.invites_disabled,
             can_change_nickname: about.can_change_nickname,
+            suppress_everyone: about.suppress_everyone,
+            suppress_roles: about.suppress_roles,
+            highlights: about.highlights,
+            events: about.events,
+            mobile_push: about.mobile_push,
+            channel_overrides: about.channel_overrides,
+            privacy: about.privacy,
         };
         clip(&mut info.description, 4_000);
         clip(&mut info.nickname, 100);
@@ -2644,6 +2651,76 @@ impl Chat {
                     clip(&mut tag.description, 256);
                 }
                 Response::SpaceTags { space, tags }
+            }
+            Err(refused) => *refused,
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn set_space_options(
+        &self,
+        space: Key,
+        notify: Option<protocol::Notify>,
+        suppress_everyone: Option<bool>,
+        suppress_roles: Option<bool>,
+        highlights: Option<bool>,
+        events: Option<bool>,
+        mobile_push: Option<bool>,
+        reset_channel: Option<String>,
+    ) -> Response {
+        let account = space.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let space_id = space.id.clone();
+        match self.ask(&account, |reply| Command::SetSpaceOptions {
+            space_id,
+            notify,
+            suppress_everyone,
+            suppress_roles,
+            highlights,
+            events,
+            mobile_push,
+            reset_channel,
+            reply,
+        }) {
+            Ok(()) => {
+                self.hub.space_infos.forget(&space);
+                Response::Ok
+            }
+            Err(refused) => *refused,
+        }
+    }
+
+    fn get_network_privacy(&self, account: AccountKey) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::GetNetworkPrivacy { reply }) {
+            Ok(privacy) => Response::NetworkPrivacy { privacy },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn set_network_privacy(&self, account: AccountKey, privacy: protocol::NetworkPrivacy) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::SetNetworkPrivacy { privacy, reply }) {
+            Ok(privacy) => Response::NetworkPrivacy { privacy },
+            Err(refused) => *refused,
+        }
+    }
+
+    fn set_space_privacy(&self, space: Key, privacy: protocol::SpacePrivacy) -> Response {
+        let account = space.account();
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let space_id = space.id.clone();
+        match self.ask(&account, |reply| Command::SetSpacePrivacy { space_id, privacy, reply }) {
+            Ok(()) => {
+                self.hub.space_infos.forget(&space);
+                Response::Ok
             }
             Err(refused) => *refused,
         }
@@ -3523,6 +3600,15 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::Favourite { account, kind, id, on } => {
+                match self.ask(&account, |reply| Command::Favourite { kind, id, on, reply }) {
+                    Ok(()) => {
+                        self.hub.catalogs.forget_where(|(acct, cached, ..)| acct == &account && *cached == kind);
+                        Response::Ok
+                    }
+                    Err(refused) => *refused,
+                }
+            }
             Request::ReadSessions => {
                 let denied = self.hub.keychain().denied;
                 if let Some(chat) = self.this.get().and_then(Weak::upgrade) {
@@ -4248,6 +4334,16 @@ impl Chat {
             Request::Profile { person, space } => self.profile(person, space),
             Request::ConversationInfo { conversation } => self.conversation_info(conversation),
             Request::SpaceInfo { space } => self.space_info(space),
+            Request::SetSpaceOptions {
+                space,
+                notify,
+                suppress_everyone,
+                suppress_roles,
+                highlights,
+                events,
+                mobile_push,
+                reset_channel,
+            } => self.set_space_options(space, notify, suppress_everyone, suppress_roles, highlights, events, mobile_push, reset_channel),
             Request::SetMute { conversation, notify, until } => {
                 self.act(&conversation, |conversation_id, reply| Command::SetMute { conversation_id, notify, until, reply })
             }
@@ -4374,6 +4470,9 @@ impl Chat {
             Request::GetOutOfOffice { account } => self.get_out_of_office(account),
             Request::SetOutOfOffice { account, ooo } => self.set_out_of_office(account, ooo),
             Request::SpaceTags { space } => self.space_tags(space),
+            Request::GetNetworkPrivacy { account } => self.get_network_privacy(account),
+            Request::SetNetworkPrivacy { account, privacy } => self.set_network_privacy(account, privacy),
+            Request::SetSpacePrivacy { space, privacy } => self.set_space_privacy(space, privacy),
             Request::Relate { person, action } => self.relate(person, action),
             Request::AddFriend { account, username } => self.add_friend(account, username),
             Request::Moderate { space, person, action, reason } => {
@@ -4603,7 +4702,7 @@ impl Chat {
 
             Request::Poll { conversation, message_id, votes } => self.poll(conversation, message_id, votes),
 
-            Request::Fetch { account, ids, size, retry } => {
+            Request::Fetch { account, ids, size, retry, span } => {
                 let adapter = lock(&self.adapters).get(&account).map(Adapter::sender);
                 let ids = &ids[..ids.len().min(PAGE_LIMIT as usize)];
                 // What the cache is asked for is decided here: a failure the user wants tried
@@ -4623,7 +4722,11 @@ impl Chat {
                 if retry {
                     self.blobs.retried(&account, ids);
                 }
-                match self.blobs.request(&account, ids, adapter.clone()) {
+                let asked = match span {
+                    Some(span) => self.blobs.request_span(&account, ids, adapter.clone(), span),
+                    None => self.blobs.request(&account, ids, adapter.clone()),
+                };
+                match asked {
                     Ok(files) => {
                         // What the cache has never heard of may be the adapter's to fetch itself.
                         let unknown: Vec<String> = ids.iter().filter(|id| !files.iter().any(|file| file.id == **id)).cloned().collect();

@@ -752,7 +752,7 @@ impl Hub {
         }
         for (account, ids) in by_account {
             let hub = self.clone();
-            let request = Request::Fetch { retry: false, size: None, account: account.clone(), ids };
+            let request = Request::Fetch { retry: false, size: None, account: account.clone(), ids, span: None };
             ask_later(cx, request, move |answer, cx| {
                 let Ok(Response::Media { files }) = answer else {
                     return;

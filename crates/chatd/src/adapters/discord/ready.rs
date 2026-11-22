@@ -110,9 +110,11 @@ pub(super) fn quiet(settings: &GuildSettings) -> Quiet {
         muted_until: settings.muted.then(|| until(settings.mute_config.as_ref())),
         suppress_everyone: settings.suppress_everyone,
         suppress_roles: settings.suppress_roles,
+        notify_highlights: settings.notify_highlights,
+        mute_scheduled_events: settings.mute_scheduled_events,
+        mobile_push: settings.mobile_push,
         channels: muted.map(|channel| (channel.channel_id.clone(), until(channel.mute_config.as_ref()))).collect(),
         hide_muted: settings.hide_muted_channels,
-        mute_scheduled_events: settings.mute_scheduled_events,
         opt_in: settings.flags & model::OPT_IN_CHANNELS_ON != 0,
         opted_in: opted.map(|channel| channel.channel_id.clone()).collect(),
         raw_flags: settings.flags,
@@ -1050,7 +1052,7 @@ impl Discord {
             edit_window: 0,
             file_scan: false,
             allow_archives: false,
-            voice_notes: false,
+            voice_notes: true,
             direct_calls: false,
             revisions: false,
             close_direct: true,
@@ -1173,6 +1175,7 @@ impl Discord {
             state.doing.clear();
             state.notes = ready.notes.clone();
             state.guilds.clear();
+            state.thread_members.clear();
             state.quiet_directs = settings.remove(&None).unwrap_or_default();
             // Whatever happened between the sessions was not heard: nothing fetched before
             // is known to be whole any more.
@@ -1231,7 +1234,15 @@ impl Discord {
             self.plant(guild, &mut info, &me, &read)?;
             icons.extend(info.icon.as_deref().and_then(|hash| model::guild_icon(&guild.id, hash)));
             self.voice_states(Some(&guild.id), &guild.voice_states);
-            self.state.lock().unwrap().guilds.insert(guild.id.clone(), info);
+            {
+                let mut state = self.state.lock().unwrap();
+                for thread in &guild.threads {
+                    if let Some(member) = &thread.member {
+                        state.thread_members.insert(thread.id.clone(), member.clone());
+                    }
+                }
+                state.guilds.insert(guild.id.clone(), info);
+            }
         }
         self.spaces()?;
         {
@@ -1263,6 +1274,15 @@ impl Discord {
         }
         if let Some(status) = ready.user_settings_proto.as_deref().and_then(proto::status_settings) {
             self.own_status(status);
+        }
+        if let Some(proto) = ready.user_settings_proto.as_deref() {
+            let mut state = self.state.lock().unwrap();
+            if let Some(privacy) = proto::privacy_settings(proto) {
+                state.privacy_settings = privacy;
+            }
+            if let Some(text) = proto::text_and_images_settings(proto) {
+                state.text_and_images = text;
+            }
         }
 
         // A few unread conversations are fetched ahead, once per run and never on a reconnect.
@@ -1447,7 +1467,15 @@ impl Discord {
         // stage is known from the rows the tree just planted.
         self.plant(&guild, &mut info, &me, &HashMap::new())?;
         self.voice_states(Some(&guild.id), &guild.voice_states);
-        self.state.lock().unwrap().guilds.insert(guild.id.clone(), info);
+        {
+            let mut state = self.state.lock().unwrap();
+            for thread in &guild.threads {
+                if let Some(member) = &thread.member {
+                    state.thread_members.insert(thread.id.clone(), member.clone());
+                }
+            }
+            state.guilds.insert(guild.id.clone(), info);
+        }
         Ok(self.spaces()?)
     }
 
@@ -1737,6 +1765,9 @@ impl Discord {
         }
         if let Some(guild) = &parent.space {
             self.note_thread_listed(guild, &thread.id, thread.parent_id.as_deref(), in_tree);
+        }
+        if let Some(member) = &thread.member {
+            self.state.lock().unwrap().thread_members.insert(thread.id.clone(), member.clone());
         }
         self.ctx.conversation(&row)?;
         self.release_slowmode(&thread.id, row.slowmode_seconds, row.rights.slowmode_exempt);

@@ -5327,7 +5327,7 @@ mod tests {
             message.seq = seq;
             message.previews.push(protocol::Preview {
                 url: format!("https://example.com/{id}"),
-                site: String::new(), title: id.into(), description: String::new(), image: None,
+                site: String::new(), title: id.into(), description: String::new(), image: None, duration: 0, opens_in_browser: false,
             });
             messages.push(message);
         }

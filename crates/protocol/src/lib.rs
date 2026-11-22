@@ -1956,6 +1956,26 @@ pub enum Request {
     SpaceInfo {
         space: Key,
     },
+    /// Updates a Space's notification level, switches, or resets a per-channel override
+    /// (Discord `PATCH /users/@me/guilds/{id}/settings`). Omitted fields are left unchanged.
+    SetSpaceOptions {
+        space: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notify: Option<Notify>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        suppress_everyone: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        suppress_roles: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        highlights: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        events: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mobile_push: Option<bool>,
+        /// Channel id whose per-channel override should be reset to the Space's default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reset_channel: Option<String>,
+    },
     /// The network's notification setting for a conversation. The row changes when the network
     /// says so. `until` is when a mute ends, as Unix seconds. Absent means muted until it is
     /// turned off, or not muted when `notify` asks for everything.
@@ -2084,6 +2104,21 @@ pub enum Request {
     /// List mentionable tags in a Space (e.g. Teams team tags).
     SpaceTags {
         space: Key,
+    },
+    /// Read an account's Privacy & Safety settings (Discord `PreloadedUserSettings.privacy`).
+    GetNetworkPrivacy {
+        account: AccountKey,
+    },
+    /// Write an account's Privacy & Safety settings (Discord `PATCH /users/@me/settings-proto/1`
+    /// with all unknown fields preserved).
+    SetNetworkPrivacy {
+        account: AccountKey,
+        privacy: NetworkPrivacy,
+    },
+    /// Update a Space's per-server privacy switches (Discord: allow DMs and message requests).
+    SetSpacePrivacy {
+        space: Key,
+        privacy: SpacePrivacy,
     },
     /// Answer, withdraw or end a friendship, or block. The list changes when the network says so
     /// (a `People` change).
@@ -2600,6 +2635,15 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "is_false")]
         unfave: bool,
     },
+    /// Marks or unmarks an emoji or sticker as a favourite on the account (Discord
+    /// `settings-proto/2`). `on` adds it. Frecency scores are not written.
+    Favourite {
+        account: AccountKey,
+        kind: CatalogKind,
+        id: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        on: bool,
+    },
 
     /// Asks for these files to be on disk. Answers with what is known now; each file that lands
     /// later is a `Media` change. Ask only for what is on screen.
@@ -2617,6 +2661,10 @@ pub enum Request {
         /// with its `failed` reason and nothing is fetched.
         #[serde(default, skip_serializing_if = "is_false")]
         retry: bool,
+        /// A byte window of one file, inclusive start and exclusive end. Absent asks for the
+        /// whole file and stores it. A window is a `Range` read for the player and is not stored.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        span: Option<(u64, u64)>,
     },
 
     /// Fetches at most `max_bytes` (clamped to [`TEXT_PREVIEW_MAX_BYTES`]) from the head of
@@ -3840,6 +3888,9 @@ pub enum Response {
         space: Key,
         tags: Vec<TeamTag>,
     },
+    NetworkPrivacy {
+        privacy: NetworkPrivacy,
+    },
     Folders {
         folders: Vec<Folder>,
     },
@@ -4542,7 +4593,7 @@ mod tests {
     #[test]
     fn frames_written_before_these_fields_existed_still_read() {
         let request: Request = serde_json::from_str(r#"{"op":"fetch","account":{"network":"slack","account":"T1"},"ids":["a"]}"#).unwrap();
-        assert!(matches!(request, Request::Fetch { size: None, retry: false, .. }));
+        assert!(matches!(request, Request::Fetch { size: None, retry: false, span: None, .. }));
         let preview = Request::FetchPreview {
             account: AccountKey { network: Network::Discord, account: "1".into() },
             ids: vec!["att:42".into()],

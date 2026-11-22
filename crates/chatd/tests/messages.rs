@@ -448,6 +448,7 @@ fn a_named_file_stays_a_line_a_caption_keeps_the_photo_and_a_later_file_is_fetch
         ids: vec![id.clone()],
         size: None,
         retry: false,
+        span: None,
     });
     world.heard(&format!("fetch {} fake-photo", remote.id));
     world.until("the file on disk", || {
@@ -456,6 +457,7 @@ fn a_named_file_stays_a_line_a_caption_keeps_the_photo_and_a_later_file_is_fetch
             ids: vec![id.clone()],
             size: None,
             retry: false,
+            span: None,
         }) {
             Response::Media { files } => files
                 .into_iter()
@@ -2159,6 +2161,7 @@ fn shared_location_and_vcard_render_as_cards_without_leaking_coordinates() {
         ids: vec![file_id],
         size: None,
         retry: false,
+        span: None,
     });
     let upgraded = world.until("fetched vcard card", || {
         world

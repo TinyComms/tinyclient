@@ -711,7 +711,7 @@ fn what_only_a_network_can_answer_is_refused_in_words_and_the_cache_answers_the_
     assert_eq!(conversations.iter().map(|c| c.title.as_str()).collect::<Vec<_>>(), ["Mara"]);
 
     // Asking for a file names what is known; chatd holds no bytes and invents no path.
-    let fetched = chatd.ask(Request::Fetch { retry: false, size: None, account, ids: vec!["icon-1".into(), "nope".into()] });
+    let fetched = chatd.ask(Request::Fetch { retry: false, size: None, account, ids: vec!["icon-1".into(), "nope".into()], span: None });
     assert_eq!(fetched, Response::Media { files: vec![icon] });
 
     // Typing to a network that is not connected is dropped quietly; it is not an error to type.
@@ -1136,7 +1136,7 @@ fn a_picture_is_fetched_again_larger_when_it_is_drawn_larger_and_never_smaller()
     let account = demo("").account();
     let emoji = "emoji-mossparrot".to_owned();
     let fetch = |size| {
-        let request = Request::Fetch { account: account.clone(), ids: vec![emoji.clone()], size, retry: false };
+        let request = Request::Fetch { account: account.clone(), ids: vec![emoji.clone()], size, retry: false, span: None };
         let Response::Media { mut files } = chatd.ask(request) else { panic!("not media") };
         files.pop().expect("the emoji is registered")
     };

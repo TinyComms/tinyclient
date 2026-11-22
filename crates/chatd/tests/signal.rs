@@ -2836,7 +2836,7 @@ fn received_photos_videos_gifs_albums_files_and_quote_thumbs_decrypt_from_cdn_an
     assert!(photo_att.preview.as_ref().and_then(|p| p.path.as_ref()).is_some(), "BlurHash preview should land immediately");
 
     // Trigger download + decrypt via Request::Fetch
-    let _ = world.ask(Request::Fetch { account: account(), ids: vec![photo_att.file.id.clone()], size: None, retry: false });
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![photo_att.file.id.clone()], size: None, retry: false, span: None });
     let photo_path = world.until("photo decrypted to disk", || {
         world
             .messages(GRACE)
@@ -2856,7 +2856,7 @@ fn received_photos_videos_gifs_albums_files_and_quote_thumbs_decrypt_from_cdn_an
     let video_msg = world.arrived(GRACE, &id(T0 + 2_000, GRACE));
     assert_eq!(video_msg.attachments[0].file.kind, protocol::MediaKind::Video);
     assert!(video_msg.attachments[0].thumb.is_some(), "video with BlurHash should expose a poster thumb");
-    let _ = world.ask(Request::Fetch { account: account(), ids: vec![video_msg.attachments[0].file.id.clone()], size: None, retry: false });
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![video_msg.attachments[0].file.id.clone()], size: None, retry: false, span: None });
     let video_path = world.until("video decrypted to disk", || {
         world
             .messages(GRACE)
@@ -2875,7 +2875,7 @@ fn received_photos_videos_gifs_albums_files_and_quote_thumbs_decrypt_from_cdn_an
     ));
     let gif_msg = world.arrived(GRACE, &id(T0 + 3_000, GRACE));
     assert_eq!(gif_msg.attachments[0].file.kind, protocol::MediaKind::Gif);
-    let _ = world.ask(Request::Fetch { account: account(), ids: vec![gif_msg.attachments[0].file.id.clone()], size: None, retry: false });
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![gif_msg.attachments[0].file.id.clone()], size: None, retry: false, span: None });
     let gif_path = world.until("gif decrypted to disk", || {
         world
             .messages(GRACE)
@@ -2896,7 +2896,7 @@ fn received_photos_videos_gifs_albums_files_and_quote_thumbs_decrypt_from_cdn_an
     assert_eq!(pdf_msg.attachments[0].file.kind, protocol::MediaKind::File);
     assert_eq!(pdf_msg.attachments[0].name, "report.pdf");
     assert_eq!(pdf_msg.text, "Q4 summary");
-    let _ = world.ask(Request::Fetch { account: account(), ids: vec![pdf_msg.attachments[0].file.id.clone()], size: None, retry: false });
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![pdf_msg.attachments[0].file.id.clone()], size: None, retry: false, span: None });
     let pdf_path = world.until("pdf decrypted to disk", || {
         world
             .messages(GRACE)
@@ -2918,7 +2918,7 @@ fn received_photos_videos_gifs_albums_files_and_quote_thumbs_decrypt_from_cdn_an
     let album_msg = world.arrived(GRACE, &id(T0 + 5_000, GRACE));
     assert_eq!(album_msg.attachments.len(), 2);
     for att in &album_msg.attachments {
-        let _ = world.ask(Request::Fetch { account: account(), ids: vec![att.file.id.clone()], size: None, retry: false });
+        let _ = world.ask(Request::Fetch { account: account(), ids: vec![att.file.id.clone()], size: None, retry: false, span: None });
     }
     let album_paths = world.until("both album photos decrypted", || {
         let m = world.messages(GRACE).into_iter().find(|m| m.id == album_msg.id)?;
@@ -2941,7 +2941,7 @@ fn received_photos_videos_gifs_albums_files_and_quote_thumbs_decrypt_from_cdn_an
     let reply = quote_msg.reply_to.as_ref().expect("quoted photo reply_to");
     assert_eq!(reply.snippet, "Photo");
     let thumb = reply.thumb.as_ref().expect("quoted photo thumbnail");
-    let _ = world.ask(Request::Fetch { account: account(), ids: vec![thumb.id.clone()], size: None, retry: false });
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![thumb.id.clone()], size: None, retry: false, span: None });
     let thumb_path = world.until("quoted thumbnail decrypted", || {
         world
             .messages(GRACE)
@@ -2959,7 +2959,7 @@ fn received_photos_videos_gifs_albums_files_and_quote_thumbs_decrypt_from_cdn_an
         hex_of(&photo_dig),
     ));
     let gone_msg = world.arrived(GRACE, &id(T0 + 7_000, GRACE));
-    let _ = world.ask(Request::Fetch { account: account(), ids: vec![gone_msg.attachments[0].file.id.clone()], size: None, retry: false });
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![gone_msg.attachments[0].file.id.clone()], size: None, retry: false, span: None });
     let failed_reason = world.until("expired attachment marked failed", || {
         world
             .messages(GRACE)
@@ -3017,7 +3017,7 @@ fn voice_messages_download_populate_waveform_send_viewed_receipt_and_can_be_sent
 
     // 2. Fetching the voice note decrypts/lands it and populates exact duration (2s WAV) and waveform.
     let file_id = voice_msg.attachments[0].file.id.clone();
-    let _ = world.ask(Request::Fetch { account: account(), ids: vec![file_id.clone()], size: None, retry: false });
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![file_id.clone()], size: None, retry: false, span: None });
     let landed = world.until("voice message downloaded with real duration", || {
         let msg = world.messages(GRACE).into_iter().find(|m| m.id == voice_msg.id)?;
         let att = msg.attachments.first()?;
@@ -3050,6 +3050,7 @@ fn voice_messages_download_populate_waveform_send_viewed_receipt_and_can_be_sent
         ids: vec![alan_voice.attachments[0].file.id.clone()],
         size: None,
         retry: false,
+        span: None,
     });
     let alan_path = world.until("alan voice landed", || {
         world
@@ -3134,7 +3135,7 @@ fn voice_note_with_a_bad_digest_fails_and_sends_no_viewed_receipt() {
     let voice_msg = world.arrived(GRACE, &id(sent, GRACE));
     let file_id = voice_msg.attachments[0].file.id.clone();
     assert!(voice_msg.attachments[0].file.path.is_none());
-    let _ = world.ask(Request::Fetch { account: account(), ids: vec![file_id.clone()], size: None, retry: false });
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![file_id.clone()], size: None, retry: false, span: None });
     let failed = world.until("bad digest marked failed", || {
         let msg = world.messages(GRACE).into_iter().find(|m| m.id == voice_msg.id)?;
         let file = msg.attachments.first()?.file.clone();
@@ -3204,6 +3205,7 @@ fn stickers_render_inline_packs_install_sync_persist_and_stickers_send() {
         ids: vec![st_msg.attachments[0].file.id.clone()],
         size: None,
         retry: false,
+        span: None,
     });
     let st_path = world.until("sticker decrypted to disk", || {
         world
@@ -3247,7 +3249,7 @@ fn stickers_render_inline_packs_install_sync_persist_and_stickers_send() {
     assert_eq!(items[0].pack, "Signal Cats");
     assert_eq!(items[0].id, format!("{pack_id}:0"));
     let tile_id = items[0].file.as_ref().expect("catalog sticker tile").id.clone();
-    let _ = world.ask(Request::Fetch { account: account(), ids: vec![tile_id], size: None, retry: false });
+    let _ = world.ask(Request::Fetch { account: account(), ids: vec![tile_id], size: None, retry: false, span: None });
     world.heard(&format!("sticker-download {pack_id}:0"));
 
     // 4. Sending a picked sticker goes out on the wire and stores a local sticker attachment.

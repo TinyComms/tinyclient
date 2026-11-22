@@ -541,6 +541,8 @@ pub(super) fn parse_link_previews(
             title,
             description,
             image,
+            duration: 0,
+            opens_in_browser: false,
         });
     }
     previews
@@ -1717,6 +1719,8 @@ pub(super) fn invoke_card_action(
             title: title.to_owned(),
             description: description.to_owned(),
             image,
+            duration: 0,
+            opens_in_browser: false,
         };
         Some((entry, preview))
     }

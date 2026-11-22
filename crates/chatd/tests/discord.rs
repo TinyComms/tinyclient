@@ -271,6 +271,9 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             (204, Value::Null)
         }
         ("PATCH", ["users", "@me", "settings-proto", "1"]) => (200, json!({"settings": seen.body["settings"]})),
+        ("GET", ["users", "@me", "settings-proto", "2"]) => (200, json!({"settings": ""})),
+        ("PATCH", ["users", "@me", "settings-proto", "2"]) => (200, json!({"settings": seen.body["settings"]})),
+        ("GET", ["sticker-packs"]) => (200, json!({"sticker_packs": []})),
         ("GET", ["users", person, "profile"]) => {
             let mut profile = json!({
                 "user": {"id": person, "username": "sam", "global_name": "Sam Whitlock", "discriminator": "0", "avatar": "s4m", "bio": ""},
@@ -307,8 +310,11 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
                     "guild_id": guild_id,
                     "muted": muted,
                     "mute_config": mute_config,
-                    "suppress_everyone": false,
-                    "suppress_roles": false,
+                "suppress_everyone": seen.body.get("suppress_everyone").and_then(Value::as_bool).unwrap_or(false),
+                "suppress_roles": seen.body.get("suppress_roles").and_then(Value::as_bool).unwrap_or(false),
+                "notify_highlights": seen.body.get("notify_highlights").and_then(Value::as_u64).unwrap_or(0),
+                "mute_scheduled_events": seen.body.get("mute_scheduled_events").and_then(Value::as_bool).unwrap_or(false),
+                "mobile_push": seen.body.get("mobile_push").and_then(Value::as_bool).unwrap_or(true),
                     "message_notifications": message_notifications,
                     "hide_muted_channels": hide_muted,
                     "flags": flags,
@@ -316,6 +322,14 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
                 }),
             )
         }
+        ("PATCH", ["channels", _channel, "thread-members", "@me", "settings"]) => (
+            200,
+            json!({
+                "flags": seen.body.get("flags").and_then(Value::as_u64).unwrap_or(0),
+                "muted": seen.body.get("muted").and_then(Value::as_bool).unwrap_or(false),
+                "mute_config": seen.body["mute_config"],
+            }),
+        ),
         ("DELETE", ["channels", channel]) => (200, json!({"id": channel, "type": 1})),
         ("POST", ["guilds", guild, "channels"]) => {
             let id = shared.snowflake();
@@ -406,6 +420,8 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
             200,
             json!({"id": guild, "name": "Rustaceans", "description": "Crabs and their friends", "approximate_member_count": 1204, "approximate_presence_count": 230}),
         ),
+        ("GET", ["gifs", "trending"]) => (200, json!({"categories": []})),
+        ("GET", ["gifs", "suggest"]) => (200, json!([])),
         ("GET", ["gifs", "search" | "trending-gifs"]) => (
             200,
             json!([
@@ -467,8 +483,21 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
                 .iter()
                 .enumerate()
                 .map(|(at, file)| {
-                    json!({"id": format!("880{at}"), "filename": file["filename"], "size": 3, "url": format!("https://cdn.discordapp.com/attachments/1/880{at}/f"),
-                           "content_type": "text/plain"})
+                    let is_voice = file.get("waveform").and_then(Value::as_str).is_some();
+                    let mut entry = json!({
+                        "id": format!("880{at}"),
+                        "filename": file["filename"],
+                        "size": 3,
+                        "url": format!("https://cdn.discordapp.com/attachments/1/880{at}/f"),
+                        "content_type": if is_voice { "audio/ogg" } else { "text/plain" },
+                    });
+                    if let Some(secs) = file.get("duration_secs") {
+                        entry["duration_secs"] = secs.clone();
+                    }
+                    if let Some(wave) = file.get("waveform") {
+                        entry["waveform"] = wave.clone();
+                    }
+                    entry
                 })
                 .collect();
             message["attachments"] = json!(attached);
@@ -531,14 +560,6 @@ fn respond(shared: &Shared, seen: &Seen) -> (u16, Value) {
         }
         ("PUT", ["channels", _thread, "thread-members", _user]) => (204, Value::Null),
         ("DELETE", ["channels", _thread, "thread-members", _user]) => (204, Value::Null),
-        ("PATCH", ["channels", _thread, "thread-members", "@me", "settings"]) => (
-            200,
-            json!({
-                "flags": seen.body["flags"].as_u64().unwrap_or(2),
-                "muted": seen.body["muted"].as_bool().unwrap_or(false),
-                "mute_config": seen.body["mute_config"],
-            }),
-        ),
         ("GET", ["channels", thread, "thread-members"]) => (
             200,
             json!([
@@ -1058,7 +1079,7 @@ impl World {
     /// Asks for files and answers what is known at once.
     fn fetch(&self, ids: &[&str], size: Option<u32>, retry: bool) -> Vec<protocol::MediaFile> {
         let ids = ids.iter().map(|id| (*id).to_owned()).collect();
-        match self.ask(Request::Fetch { account: self.account(), ids, size, retry }) {
+        match self.ask(Request::Fetch { account: self.account(), ids, size, retry, span: None }) {
             Response::Media { files } => files,
             other => panic!("{other:?}"),
         }
@@ -1374,7 +1395,7 @@ fn ready_fills_spaces_trees_people_and_unread_state() {
 
     // Pictures are registered, so the shell can ask for them.
     let wanted = vec!["avatar:2001:a1b2c3".to_owned(), "icon:4000:gu1ldicon".to_owned()];
-    match world.ask(Request::Fetch { retry: false, size: None, account: world.account(), ids: wanted }) {
+    match world.ask(Request::Fetch { retry: false, size: None, account: world.account(), ids: wanted, span: None }) {
         Response::Media { files } => {
             assert_eq!(files.len(), 2);
             assert_eq!((files[0].kind, files[0].width), (MediaKind::Avatar, 80));
@@ -1958,7 +1979,7 @@ fn messages_map_to_the_one_model_and_follow_live_events() {
 
     // Everything the message refers to can be fetched by id; the addresses are Discord's own.
     let wanted: Vec<String> = rich.files().map(|file| file.id.clone()).collect();
-    match world.ask(Request::Fetch { retry: false, size: None, account: world.account(), ids: wanted.clone() }) {
+    match world.ask(Request::Fetch { retry: false, size: None, account: world.account(), ids: wanted.clone(), span: None }) {
         Response::Media { files } => assert_eq!(files.len(), wanted.len()),
         other => panic!("{other:?}"),
     }
@@ -4742,7 +4763,10 @@ fn files_go_up_from_their_paths_with_the_senders_options_and_a_cancel_stops_them
     let stickers = catalog(protocol::CatalogKind::Stickers, "", Some("4000"));
     assert_eq!(stickers.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(), ["5201", "5202"]);
     assert_eq!(stickers[1].file.as_ref().unwrap().kind, protocol::MediaKind::File, "Lottie JSON is offered to the native renderer");
-    assert_eq!(world.discord.asked().len(), before);
+    // The first emoji or sticker catalog reads settings-proto/2 once. No Nitro, so no sticker packs.
+    let grown: Vec<String> = world.discord.asked().into_iter().skip(before).collect();
+    assert_eq!(grown, vec!["GET /users/@me/settings-proto/2".to_owned()]);
+    assert!(world.discord.requests_to("GET", "/sticker-packs").is_empty());
     let pick = protocol::Pick { kind: protocol::CatalogKind::Stickers, id: "5201".into() };
     send_with(&world, "4101", "77005", "", None, protocol::Outgoing { pick: Some(pick), ..Default::default() });
     world.outcome("4101", "77005");
@@ -4822,6 +4846,7 @@ fn a_voice_message_and_a_gif_from_tenor_are_attachments_fetched_only_from_discor
     let gif = &message.attachments[1];
     assert_eq!((gif.name.as_str(), gif.file.kind, gif.mime.as_str()), ("GIF", MediaKind::Gif, "video/mp4"));
     assert_eq!((gif.file.width, gif.file.height), (498, 280));
+    assert_eq!(gif.page, "https://tenor.com/view/otter-123");
     let thumb = gif.thumb.as_ref().unwrap();
     assert_eq!((thumb.id.clone(), thumb.kind), (format!("embed:{id}:0"), MediaKind::Image));
 
@@ -11321,4 +11346,707 @@ fn automod_lists_and_edits_with_manage_guild_and_refuses_without() {
         other => panic!("expected a pending send, got {other:?}"),
     }
     assert_eq!(world.failure("4101", "automod-blocked"), "This server's AutoMod blocked your message.");
+}
+
+#[test]
+fn voice_message_sends_with_flag_waveform_audio_ogg_and_respects_permission() {
+    let world = World::start();
+    // 1. Account advertises voice_notes capability.
+    let can = match world.ask(Request::Status) {
+        Response::Status { accounts, .. } => accounts.into_iter().find(|a| a.key == world.account()).unwrap().can,
+        other => panic!("{other:?}"),
+    };
+    assert!(can.voice_notes, "Discord must advertise voice_notes");
+
+    let recording = staged(&world, "voice-12345.opus", 128);
+    let bars = vec![10u8, 80, 200, 140, 25];
+    let expected_wave = base64::engine::general_purpose::STANDARD.encode(&bars);
+
+    // 2. Sending a voice message in a DM (3001) succeeds with IS_VOICE_MESSAGE (8192),
+    //    filename voice-message.ogg, Content-Type: audio/ogg, empty content, duration_secs & waveform.
+    let with = protocol::Outgoing {
+        files: vec![file(&recording, false)],
+        voice: Some(protocol::VoiceNote { duration: 4_500, waveform: bars.clone() }),
+        ..Default::default()
+    };
+    send_with(&world, "3001", "88001", "ignored text", None, with);
+    let sent = world.outcome("3001", "88001");
+    assert_eq!(sent.state, SendState::Sent);
+    assert_eq!(sent.attachments.len(), 1);
+    assert_eq!(sent.attachments[0].file.kind, MediaKind::Audio);
+    assert_eq!(sent.attachments[0].waveform, bars);
+    assert_eq!(sent.attachments[0].duration, 5);
+
+    let named = world.discord.requests_to("POST", "/channels/3001/attachments");
+    assert_eq!(named.len(), 1);
+    assert_eq!(named[0].body["files"][0]["filename"], "voice-message.ogg");
+
+    let puts = world.discord.requests_to("PUT", "/upload/up/voice-message.ogg");
+    assert_eq!(puts.len(), 1);
+    assert_eq!(puts[0].headers.get("content-type").map(String::as_str), Some("audio/ogg"));
+
+    let posted = world.discord.requests_to("POST", "/channels/3001/messages");
+    assert_eq!(posted.len(), 1);
+    assert_eq!(posted[0].body["flags"], json!(8192));
+    assert_eq!(posted[0].body["content"], json!(""));
+    assert_eq!(posted[0].body["attachments"][0]["filename"], json!("voice-message.ogg"));
+    assert_eq!(posted[0].body["attachments"][0]["duration_secs"], json!(4.5));
+    assert_eq!(posted[0].body["attachments"][0]["waveform"], json!(expected_wave));
+
+    // 3. In server 4000 channel 4101, @everyone lacks SEND_VOICE_MESSAGES (bit 46): refused locally.
+    let with_denied = protocol::Outgoing {
+        files: vec![file(&recording, false)],
+        voice: Some(protocol::VoiceNote { duration: 2_000, waveform: vec![50, 100] }),
+        ..Default::default()
+    };
+    send_with(&world, "4101", "88002", "", None, with_denied);
+    let reason = world.failure("4101", "88002");
+    assert!(reason.contains("permission") && reason.contains("voice messages"), "got: {reason}");
+    assert!(world.discord.requests_to("POST", "/channels/4101/attachments").is_empty());
+    assert!(world.discord.requests_to("POST", "/channels/4101/messages").is_empty());
+
+    // 4. In owned server 5000 channel 5001, owner has all permissions: succeeds with flags 8192.
+    let with_owned = protocol::Outgoing {
+        files: vec![file(&recording, false)],
+        voice: Some(protocol::VoiceNote { duration: 3_000, waveform: vec![30, 90] }),
+        ..Default::default()
+    };
+    send_with(&world, "5001", "88003", "", None, with_owned);
+    let sent_owned = world.outcome("5001", "88003");
+    assert_eq!(sent_owned.state, SendState::Sent);
+    let posted_owned = world.discord.requests_to("POST", "/channels/5001/messages");
+    assert_eq!(posted_owned.len(), 1);
+    assert_eq!(posted_owned[0].body["flags"], json!(8192));
+}
+
+#[test]
+fn space_notification_switches_thread_settings_and_channel_overrides() {
+    let world = World::start();
+
+    // 1. SpaceInfo for guild 4000 exposes suppress_everyone (true in READY), suppress_roles (false),
+    //    highlights (true), events (true), mobile_push (true), and channel override 4105 (muted).
+    let info = match world.ask(Request::SpaceInfo { space: world.key("4000") }) {
+        Response::SpaceInfo { info } => info,
+        other => panic!("expected SpaceInfo, got {other:?}"),
+    };
+    assert!(info.suppress_everyone);
+    assert!(!info.suppress_roles);
+    assert!(info.highlights);
+    assert!(info.events);
+    assert!(info.mobile_push);
+    assert!(info.channel_overrides.iter().any(|o| o.channel_id == "4105" && o.notify == protocol::Notify::Nothing));
+
+    // 2. Updating all switches sends PATCH /users/@me/guilds/4000/settings with top-level fields.
+    assert_eq!(
+        world.ask(Request::SetSpaceOptions {
+            space: world.key("4000"),
+            notify: Some(protocol::Notify::Mentions),
+            suppress_everyone: Some(false),
+            suppress_roles: Some(true),
+            highlights: Some(false),
+            events: Some(false),
+            mobile_push: Some(false),
+            reset_channel: Some("4105".into()),
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/users/@me/guilds/4000/settings");
+    assert_eq!(patches.len(), 1);
+    assert_eq!(patches[0].body["message_notifications"], json!(1));
+    assert_eq!(patches[0].body["suppress_everyone"], json!(false));
+    assert_eq!(patches[0].body["suppress_roles"], json!(true));
+    assert_eq!(patches[0].body["notify_highlights"], json!(1));
+    assert_eq!(patches[0].body["mute_scheduled_events"], json!(true));
+    assert_eq!(patches[0].body["mobile_push"], json!(false));
+    assert_eq!(patches[0].body["channel_overrides"]["4105"]["message_notifications"], json!(3));
+    assert_eq!(patches[0].body["channel_overrides"]["4105"]["muted"], json!(false));
+
+    // Re-reading SpaceInfo reflects the updated switches and cleared override.
+    let updated = match world.ask(Request::SpaceInfo { space: world.key("4000") }) {
+        Response::SpaceInfo { info } => info,
+        other => panic!("expected SpaceInfo, got {other:?}"),
+    };
+    assert!(!updated.suppress_everyone);
+    assert!(updated.suppress_roles);
+    assert!(!updated.highlights);
+    assert!(!updated.events);
+    assert!(!updated.mobile_push);
+    assert!(updated.channel_overrides.is_empty());
+
+    // 3. Fixture test: with suppress_everyone turned OFF above, an @everyone message in 4101
+    //    raises mentions_me; turning suppress_everyone back ON stops @everyone from raising mentions_me.
+    let before_mentions = world.conversation("4101").mentions;
+    let m1 = world.incoming("4101", Some("4000"), "@everyone hello", json!({"mention_everyone": true}));
+    wait("first @everyone message to land", || world.messages("4101").into_iter().find(|m| m.id == m1));
+    let landed1 = world.messages("4101").into_iter().find(|m| m.id == m1).unwrap();
+    assert!(landed1.mentions_me, "@everyone should mention when suppress_everyone is false");
+    assert_eq!(world.conversation("4101").mentions, before_mentions + 1);
+
+    assert_eq!(
+        world.ask(Request::SetSpaceOptions {
+            space: world.key("4000"),
+            notify: None,
+            suppress_everyone: Some(true),
+            suppress_roles: None,
+            highlights: None,
+            events: None,
+            mobile_push: None,
+            reset_channel: None,
+        }),
+        Response::Ok
+    );
+    let m2 = world.incoming("4101", Some("4000"), "@everyone quiet", json!({"mention_everyone": true}));
+    wait("second @everyone message to land", || world.messages("4101").into_iter().find(|m| m.id == m2));
+    let landed2 = world.messages("4101").into_iter().find(|m| m.id == m2).unwrap();
+    assert!(!landed2.mentions_me, "@everyone must NOT mention when suppress_everyone is true");
+    assert_eq!(world.conversation("4101").mentions, before_mentions + 1);
+
+    // 4. Thread notification settings: PATCH /channels/4500/thread-members/@me/settings and THREAD_MEMBER_UPDATE.
+    assert_eq!(
+        world.ask(Request::SetMute {
+            conversation: world.key("4500"),
+            notify: protocol::Notify::Mentions,
+            until: None,
+        }),
+        Response::Ok
+    );
+    let thread_patches = world.discord.requests_to("PATCH", "/channels/4500/thread-members/@me/settings");
+    assert_eq!(thread_patches.len(), 1);
+    assert_eq!(thread_patches[0].body["muted"], json!(false));
+    // Bit 0 (HAS_INTERACTED = 1 from READY) preserved + bit 2 (ONLY_MENTIONS = 4) => 5.
+    assert_eq!(thread_patches[0].body["flags"], json!(5));
+    let tinfo = match world.ask(Request::ConversationInfo { conversation: world.key("4500") }) {
+        Response::ConversationInfo { info } => info,
+        other => panic!("expected ConversationInfo, got {other:?}"),
+    };
+    assert_eq!(tinfo.notify, protocol::Notify::Mentions);
+
+    // Live THREAD_MEMBER_UPDATE from another device updates thread notification state.
+    world.discord.push("THREAD_MEMBER_UPDATE", json!({"id": "4500", "user_id": "1000", "flags": 9, "muted": true}));
+    wait("thread 4500 to become muted", || world.conversation("4500").muted.then_some(()));
+    let tinfo2 = match world.ask(Request::ConversationInfo { conversation: world.key("4500") }) {
+        Response::ConversationInfo { info } => info,
+        other => panic!("expected ConversationInfo, got {other:?}"),
+    };
+    assert_eq!(tinfo2.notify, protocol::Notify::Nothing);
+}
+
+#[test]
+fn privacy_safety_decode_write_and_per_server_dm_switches() {
+    // PreloadedUserSettings. Text-and-images is field 6; privacy is field 8.
+    // PrivacySettings:
+    // - field 3 restricted_guild_ids: [4000]
+    // - field 4 default_guilds_restricted: true
+    // - field 8 detect_platform_accounts: BoolValue true (left alone)
+    // - field 11 friend_source_flags: 4 (mutual guilds only, bit 2)
+    // - field 17 default_message_request_restricted: true
+    // TextAndImagesSettings:
+    // - field 3 use_thread_sidebar: BoolValue true (left alone)
+    // - field 19 explicit_content_filter: UInt32Value 1 (non-friends)
+    // - field 27 dm_spam_filter_v2: 3 (everyone)
+    let mut priv_block = Vec::new();
+    proto_bytes(&mut priv_block, 3, &4000u64.to_le_bytes());
+    proto_varint_field(&mut priv_block, 4, 1);
+    proto_bytes(&mut priv_block, 8, &[0x08, 0x01]);
+    proto_bytes(&mut priv_block, 11, &[0x08, 0x04]);
+    proto_bytes(&mut priv_block, 17, &[0x08, 0x01]);
+    let mut text = Vec::new();
+    proto_bytes(&mut text, 3, &[0x08, 0x01]);
+    proto_bytes(&mut text, 19, &[0x08, 0x01]);
+    proto_varint_field(&mut text, 27, 3);
+    let mut outer = Vec::new();
+    proto_bytes(&mut outer, 6, &text);
+    proto_bytes(&mut outer, 8, &priv_block);
+    let encoded_proto = base64::engine::general_purpose::STANDARD.encode(&outer);
+
+    let mut ready: Value = serde_json::from_str(READY).unwrap();
+    ready["user_settings_proto"] = json!(encoded_proto);
+    let world = World::launch(&[], |shared| {
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("account connected", || (world.link() == Link::Connected).then_some(()));
+    let account = world.account();
+
+    // 1. GetNetworkPrivacy reflects READY's privacy block.
+    let initial = match world.ask(Request::GetNetworkPrivacy { account: account.clone() }) {
+        Response::NetworkPrivacy { privacy } => privacy,
+        other => panic!("expected NetworkPrivacy, got {other:?}"),
+    };
+    assert!(!initial.friend_requests_everyone);
+    assert!(!initial.friend_requests_mutual_friends);
+    assert!(initial.friend_requests_mutual_spaces);
+    assert!(!initial.allow_dms_from_spaces);
+    assert!(!initial.allow_message_requests);
+    assert_eq!(initial.explicit_content_filter, 1);
+    assert_eq!(initial.dm_spam_filter, 2);
+    assert_eq!(initial.restricted_spaces, vec!["4000".to_owned()]);
+
+    // SpaceInfo for 4000 shows allow_dms = false, allow_requests = true.
+    let s4000 = match world.ask(Request::SpaceInfo { space: world.key("4000") }) {
+        Response::SpaceInfo { info } => info,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(s4000.privacy, Some(protocol::SpacePrivacy { allow_dms: false, allow_requests: true }));
+
+    // 2. SetNetworkPrivacy sends PATCH /users/@me/settings-proto/1.
+    // detect_platform_accounts (privacy field 8) and use_thread_sidebar (text field 3) survive.
+    // The privacy block is field 8 of the outer message, not field 6.
+    let mut updated = initial.clone();
+    updated.friend_requests_everyone = true;
+    updated.allow_dms_from_spaces = true;
+    updated.dm_spam_filter = 1;
+    let saved = match world.ask(Request::SetNetworkPrivacy { account: account.clone(), privacy: updated.clone() }) {
+        Response::NetworkPrivacy { privacy } => privacy,
+        other => panic!("expected NetworkPrivacy, got {other:?}"),
+    };
+    assert_eq!(saved, updated);
+    let patches = world.discord.requests_to("PATCH", "/users/@me/settings-proto/1");
+    assert_eq!(patches.len(), 1);
+    let sent_bytes = base64::engine::general_purpose::STANDARD
+        .decode(patches[0].body["settings"].as_str().unwrap())
+        .unwrap();
+    assert!(sent_bytes.windows(4).any(|w| w == [0x42, 2, 0x08, 0x01]), "detect_platform_accounts was lost on write");
+    assert!(sent_bytes.windows(4).any(|w| w == [0x1a, 2, 0x08, 0x01]), "use_thread_sidebar was lost on write");
+    assert_eq!(sent_bytes.first().copied(), Some(0x32), "text-and-images must be outer field 6");
+    let privacy_at = sent_bytes.iter().position(|byte| *byte == 0x42).expect("privacy field");
+    assert!(privacy_at > 0, "privacy must be outer field 8, after text-and-images");
+
+    // 3. SetSpacePrivacy toggles allow_dms=true and allow_requests=false for guild 4000.
+    assert_eq!(
+        world.ask(Request::SetSpacePrivacy {
+            space: world.key("4000"),
+            privacy: protocol::SpacePrivacy { allow_dms: true, allow_requests: false },
+        }),
+        Response::Ok
+    );
+    assert_eq!(world.discord.requests_to("PATCH", "/users/@me/settings-proto/1").len(), 2);
+    let s4000_after = match world.ask(Request::SpaceInfo { space: world.key("4000") }) {
+        Response::SpaceInfo { info } => info,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(s4000_after.privacy, Some(protocol::SpacePrivacy { allow_dms: true, allow_requests: false }));
+}
+
+fn proto_varint(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            break;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn proto_bytes(out: &mut Vec<u8>, field: u64, bytes: &[u8]) {
+    proto_varint(out, field << 3 | 2);
+    proto_varint(out, bytes.len() as u64);
+    out.extend_from_slice(bytes);
+}
+
+fn proto_varint_field(out: &mut Vec<u8>, field: u64, value: u64) {
+    proto_varint(out, field << 3);
+    proto_varint(out, value);
+}
+
+/// A `FrecencyUserSettings` blob: unknown field 7 is the bytes `keep-me`.
+fn frecency_settings(emojis: &[&str], sticker_ids: &[u64], emoji_score: Option<(&str, u64)>, sticker_score: Option<(u64, u64)>) -> String {
+    let mut emojis_msg = Vec::new();
+    for emoji in emojis {
+        proto_bytes(&mut emojis_msg, 1, emoji.as_bytes());
+    }
+    let mut stickers_msg = Vec::new();
+    if !sticker_ids.is_empty() {
+        let mut packed = Vec::new();
+        for id in sticker_ids {
+            packed.extend_from_slice(&id.to_le_bytes());
+        }
+        proto_bytes(&mut stickers_msg, 1, &packed);
+    }
+    let mut whole = Vec::new();
+    proto_bytes(&mut whole, 7, b"keep-me");
+    if !stickers_msg.is_empty() {
+        proto_bytes(&mut whole, 3, &stickers_msg);
+    }
+    if let Some((id, score)) = sticker_score {
+        let mut item = Vec::new();
+        proto_varint_field(&mut item, 4, score);
+        let mut entry = Vec::new();
+        entry.push(0x09);
+        entry.extend_from_slice(&id.to_le_bytes());
+        proto_bytes(&mut entry, 2, &item);
+        let mut map = Vec::new();
+        proto_bytes(&mut map, 1, &entry);
+        proto_bytes(&mut whole, 4, &map);
+    }
+    proto_bytes(&mut whole, 5, &emojis_msg);
+    if let Some((glyph, score)) = emoji_score {
+        let mut item = Vec::new();
+        proto_varint_field(&mut item, 4, score);
+        let mut entry = Vec::new();
+        proto_bytes(&mut entry, 1, glyph.as_bytes());
+        proto_bytes(&mut entry, 2, &item);
+        let mut map = Vec::new();
+        proto_bytes(&mut map, 1, &entry);
+        proto_bytes(&mut whole, 6, &map);
+    }
+    base64::engine::general_purpose::STANDARD.encode(whole)
+}
+
+fn polished_premium(premium: u8) -> World {
+    let world = World::launch(&[], |shared| {
+        let mut ready: Value = serde_json::from_str(&polished_ready()).unwrap();
+        ready["user"]["premium_type"] = json!(premium);
+        *shared.ready.lock().unwrap() = ready.to_string();
+    });
+    wait("the account to connect", || (world.link() == Link::Connected).then_some(()));
+    world
+}
+
+fn catalog_of(world: &World, kind: protocol::CatalogKind, query: &str, space: Option<&str>) -> Vec<protocol::CatalogItem> {
+    match world.ask(Request::Catalog {
+        account: world.account(),
+        kind,
+        space: space.map(|space| world.key(space)),
+        query: query.into(),
+        cursor: None,
+    }) {
+        Response::Catalog { items, .. } => items,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn account_favourites_lead_the_picker_and_a_locked_emoji_is_a_public_link() {
+    let world = polished();
+    let settings = frecency_settings(&["😀", "ferris:5101"], &[5201], Some(("🎉", 40)), Some((5202, 9)));
+    world.discord.script("/users/@me/settings-proto/2", 200, json!({"settings": settings}));
+
+    let emoji = catalog_of(&world, protocol::CatalogKind::Emoji, "", Some("4000"));
+    let shown: Vec<(&str, &str, &str)> = emoji.iter().map(|item| (item.id.as_str(), item.name.as_str(), item.pack.as_str())).collect();
+    assert_eq!(
+        shown,
+        [
+            ("😀", "😀", "Favorites"),
+            ("emoji:5101", ":ferris:", "Favorites"),
+            ("🎉", "🎉", "Frequently used"),
+        ]
+    );
+    assert!(emoji[0].file.is_none(), "a Unicode favourite draws as the glyph");
+
+    let stickers = catalog_of(&world, protocol::CatalogKind::Stickers, "", Some("4000"));
+    let sticker_rows: Vec<(&str, &str)> = stickers.iter().map(|item| (item.id.as_str(), item.pack.as_str())).collect();
+    assert_eq!(sticker_rows, [("5201", "Favorites"), ("5202", "Frequently used")]);
+    assert!(world.discord.requests_to("GET", "/sticker-packs").is_empty(), "no Nitro, so no standard packs");
+    assert_eq!(world.discord.requests_to("GET", "/users/@me/settings-proto/2").len(), 1);
+
+    assert_eq!(
+        world.ask(Request::Favourite {
+            account: world.account(),
+            kind: protocol::CatalogKind::Emoji,
+            id: "emoji:5101".into(),
+            on: false,
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/users/@me/settings-proto/2");
+    assert_eq!(patches.len(), 1);
+    let sent = base64::engine::general_purpose::STANDARD.decode(patches[0].body["settings"].as_str().unwrap()).unwrap();
+    let sent = String::from_utf8_lossy(&sent);
+    assert!(sent.contains("keep-me"), "unknown fields survive a favourite write");
+    assert!(!sent.contains("ferris:5101"), "the unfavourited emoji leaves the list");
+    assert!(sent.contains("🎉"), "frecency scores are not rewritten");
+
+    assert_eq!(
+        world.ask(Request::Favourite {
+            account: world.account(),
+            kind: protocol::CatalogKind::Gifs,
+            id: "https://tenor.com/view/cat".into(),
+            on: true,
+        }),
+        Response::Ok
+    );
+
+    let next = frecency_settings(&["🎉"], &[], None, None);
+    world.discord.push("USER_SETTINGS_PROTO_UPDATE", json!({"settings": {"type": 2, "proto": next}, "partial": false}));
+    // Each try uses a new cursor so chatd's catalog cache cannot keep a page from before the
+    // gateway event landed. The adapter treats a non-numeric cursor as the first page.
+    let burst = std::cell::Cell::new(1usize);
+    let again = wait("the gateway frecency update to lead the picker", || {
+        let cursor = "x".repeat(burst.get());
+        burst.set(burst.get() + 1);
+        let items = match world.ask(Request::Catalog {
+            account: world.account(),
+            kind: protocol::CatalogKind::Emoji,
+            space: Some(world.key("4000")),
+            query: "🎉".into(),
+            cursor: Some(cursor),
+        }) {
+            Response::Catalog { items, .. } => items,
+            _ => return None,
+        };
+        items.first().is_some_and(|item| item.id == "🎉" && item.pack == "Favorites").then_some(items)
+    });
+    assert_eq!(again.iter().map(|item| (item.id.as_str(), item.pack.as_str())).collect::<Vec<_>>(), [("🎉", "Favorites")]);
+
+    send_with(
+        &world,
+        "4101",
+        "77101",
+        "hi <:ferris:5101> <a:party_blob:5103> <:core_only:5104> <:other:9999>",
+        None,
+        protocol::Outgoing::default(),
+    );
+    world.outcome("4101", "77101");
+    let posted = world.discord.requests_to("POST", "/channels/4101/messages");
+    assert_eq!(
+        posted.last().unwrap().body["content"],
+        "hi <:ferris:5101> https://cdn.discordapp.com/emojis/5103.gif https://cdn.discordapp.com/emojis/5104.webp https://cdn.discordapp.com/emojis/9999.webp"
+    );
+    let pick = protocol::Pick { kind: protocol::CatalogKind::Stickers, id: "9999".into() };
+    send_with(&world, "4101", "77102", "", None, protocol::Outgoing { pick: Some(pick), ..Default::default() });
+    world.outcome("4101", "77102");
+    let posted = world.discord.requests_to("POST", "/channels/4101/messages");
+    let body = &posted.last().unwrap().body;
+    assert_eq!(body["content"], "https://media.discordapp.net/stickers/9999.png");
+    assert!(body.get("sticker_ids").is_none());
+}
+
+#[test]
+fn nitro_offers_standard_sticker_packs_once_and_animated_emoji() {
+    let world = polished_premium(2);
+    world.discord.script(
+        "/sticker-packs",
+        200,
+        json!({"sticker_packs": [{"id": "pack1", "name": "Wumpus", "stickers": [
+            {"id": "9001", "name": "wumpus", "format_type": 1, "available": true},
+            {"id": "9002", "name": "gone", "format_type": 1, "available": false},
+            {"id": "9003", "name": "bad", "format_type": 0, "available": true}
+        ]}]}),
+    );
+    let emoji = catalog_of(&world, protocol::CatalogKind::Emoji, "", Some("4000"));
+    let ids: Vec<&str> = emoji.iter().map(|item| item.id.as_str()).collect();
+    assert_eq!(ids, ["emoji:5101", "emoji:5103"]);
+    let stickers = catalog_of(&world, protocol::CatalogKind::Stickers, "", Some("4000"));
+    let rows: Vec<(&str, &str)> = stickers.iter().map(|item| (item.id.as_str(), item.pack.as_str())).collect();
+    assert_eq!(rows, [("5201", "Rustaceans"), ("5202", "Rustaceans"), ("9001", "Wumpus")]);
+    assert_eq!(world.discord.requests_to("GET", "/sticker-packs").len(), 1);
+    assert_eq!(world.discord.requests_to("GET", "/users/@me/settings-proto/2").len(), 1);
+    let _ = catalog_of(&world, protocol::CatalogKind::Stickers, "", Some("4000"));
+    assert_eq!(world.discord.requests_to("GET", "/sticker-packs").len(), 1, "a pack list is asked once a session");
+}
+
+/// `FrecencyUserSettings` with one favourite GIF, `hide_tooltip`, unknown field 7, and field 99.
+fn gif_frecency() -> String {
+    let mut value = Vec::new();
+    proto_varint_field(&mut value, 1, 1);
+    proto_bytes(&mut value, 2, b"https://media.tenor.com/fav.gif");
+    proto_varint_field(&mut value, 3, 220);
+    proto_varint_field(&mut value, 4, 120);
+    proto_varint_field(&mut value, 5, 1);
+    let mut entry = Vec::new();
+    proto_bytes(&mut entry, 1, b"https://tenor.com/view/fav-1");
+    proto_bytes(&mut entry, 2, &value);
+    let mut gifs = Vec::new();
+    proto_varint_field(&mut gifs, 2, 1);
+    proto_bytes(&mut gifs, 1, &entry);
+    let mut whole = Vec::new();
+    proto_bytes(&mut whole, 2, &gifs);
+    proto_bytes(&mut whole, 7, b"keep-me");
+    proto_varint_field(&mut whole, 99, 77);
+    base64::engine::general_purpose::STANDARD.encode(whole)
+}
+
+fn gif_page(world: &World, query: &str, cursor: Option<&str>) -> (Vec<protocol::CatalogItem>, Option<String>) {
+    match world.ask(Request::Catalog {
+        account: world.account(),
+        kind: protocol::CatalogKind::Gifs,
+        space: None,
+        query: query.into(),
+        cursor: cursor.map(str::to_owned),
+    }) {
+        Response::Catalog { items, cursor } => (items, cursor),
+        other => panic!("{other:?}"),
+    }
+}
+
+fn holds(bytes: &[u8], needle: &[u8]) -> bool {
+    bytes.windows(needle.len()).any(|window| window == needle)
+}
+
+#[test]
+fn gif_favourites_lead_categories_and_search_pages_past_fifty() {
+    let world = World::start();
+    world.discord.script("/users/@me/settings-proto/2", 200, json!({"settings": gif_frecency()}));
+    world.discord.script(
+        "/gifs/trending",
+        200,
+        json!({"categories": [
+            {"name": "happy", "src": "https://media.tenor.com/happy.gif"},
+            {"name": "  ", "src": "https://media.tenor.com/skip.gif"}
+        ]}),
+    );
+    let page = |from: usize, count: usize| {
+        let gifs: Vec<Value> = (from..from + count)
+            .map(|n| {
+                json!({
+                    "id": n.to_string(),
+                    "title": format!("wave {n}"),
+                    "url": format!("https://tenor.com/view/wave-{n}"),
+                    "src": format!("https://media.tenor.com/wave-{n}.gif"),
+                    "width": 220,
+                    "height": 160,
+                })
+            })
+            .collect();
+        json!(gifs)
+    };
+    world.discord.script("/gifs/search", 200, page(0, 50));
+    world.discord.script("/gifs/search", 200, page(50, 1));
+    world.discord.script("/gifs/suggest", 200, json!(["otter"]));
+
+    let (home, _) = gif_page(&world, "", None);
+    let rows: Vec<(&str, &str)> = home.iter().map(|item| (item.id.as_str(), item.pack.as_str())).collect();
+    assert_eq!(
+        rows,
+        [
+            ("https://tenor.com/view/fav-1", "Favorites"),
+            ("cat:happy", "Categories"),
+            ("https://tenor.com/view/cat-typing-1", "Trending"),
+        ]
+    );
+    assert_eq!(world.discord.requests_to("GET", "/users/@me/settings-proto/2").len(), 1);
+
+    let added = "https://tenor.com/view/added";
+    assert_eq!(
+        world.ask(Request::Favourite {
+            account: world.account(),
+            kind: protocol::CatalogKind::Gifs,
+            id: added.into(),
+            on: true,
+        }),
+        Response::Ok
+    );
+    assert_eq!(
+        world.ask(Request::Favourite {
+            account: world.account(),
+            kind: protocol::CatalogKind::Gifs,
+            id: "https://tenor.com/view/fav-1".into(),
+            on: false,
+        }),
+        Response::Ok
+    );
+    let patches = world.discord.requests_to("PATCH", "/users/@me/settings-proto/2");
+    assert_eq!(patches.len(), 2);
+    let decode = |seen: &Seen| base64::engine::general_purpose::STANDARD.decode(seen.body["settings"].as_str().unwrap()).unwrap();
+    let first = decode(&patches[0]);
+    let second = decode(&patches[1]);
+    for body in [&first, &second] {
+        assert!(body.windows(7).any(|window| window == b"keep-me"), "unknown field 7 survives a GIF write");
+        assert!(holds(body, &[0x10, 0x01]), "hide_tooltip survives a GIF write");
+        assert!(holds(body, &[0x98, 0x06, 0x4d]), "unknown field 99 survives a GIF write");
+    }
+    assert!(first.windows(added.len()).any(|window| window == added.as_bytes()));
+    assert!(first.windows(b"https://tenor.com/view/fav-1".len()).any(|window| window == b"https://tenor.com/view/fav-1"));
+    assert!(!second.windows(b"https://tenor.com/view/fav-1".len()).any(|window| window == b"https://tenor.com/view/fav-1"));
+    assert!(second.windows(added.len()).any(|window| window == added.as_bytes()));
+
+    // A non-numeric cursor misses chatd's page cache and is still the first page.
+    let (again, _) = gif_page(&world, "", Some("x"));
+    assert!(again.iter().any(|item| item.id == added && item.pack == "Favorites"));
+    assert!(again.iter().all(|item| item.id != "https://tenor.com/view/fav-1"));
+
+    let (found, cursor) = gif_page(&world, "wave", None);
+    assert_eq!(found[0].id, "https://tenor.com/view/wave-0");
+    assert!(found[0].pack.is_empty());
+    assert_eq!(found.last().map(|item| (item.id.as_str(), item.pack.as_str())), Some(("cat:otter", "Suggestions")));
+    assert_eq!(cursor.as_deref(), Some("50"));
+    let (next, cursor) = gif_page(&world, "wave", Some("50"));
+    assert_eq!(next.iter().map(|item| item.id.as_str()).collect::<Vec<_>>(), ["https://tenor.com/view/wave-50"]);
+    assert!(cursor.is_none());
+    assert!(next.iter().all(|item| !item.id.starts_with("cat:")));
+    let searches = world.discord.requests_to("GET", "/gifs/search");
+    assert!(searches.iter().any(|seen| seen.path.contains("offset=0")));
+    assert!(searches.iter().any(|seen| seen.path.contains("offset=50")));
+    assert!(searches[0].path.starts_with("/gifs/search?q=wave&media_format=tinygif"));
+    assert_eq!(world.discord.requests_to("GET", "/gifs/suggest").len(), 1);
+    assert_eq!(world.discord.requests_to("GET", "/users/@me/settings-proto/2").len(), 1, "a search does not read frecency");
+}
+
+#[test]
+fn a_site_player_stays_a_card_and_a_byte_window_is_not_stored_as_the_file() {
+    let world = World::start();
+    let dm = "3002";
+    let still = format!("{}/media/external/yt-still.png", world.api);
+    let card_id = world.incoming(
+        dm,
+        None,
+        "https://www.youtube.com/watch?v=abc",
+        json!({
+            "embeds": [{
+                "type": "video",
+                "url": "https://www.youtube.com/watch?v=abc",
+                "title": "Otter",
+                "provider": {"name": "YouTube"},
+                "thumbnail": {"url": "https://i.ytimg.com/vi/abc/hqdefault.jpg", "proxy_url": still, "width": 480, "height": 360},
+                "video": {"url": "https://www.youtube.com/watch?v=abc", "width": 1280, "height": 720, "duration_secs": 84}
+            }]
+        }),
+    );
+    let card = wait("the site card", || world.messages(dm).into_iter().find(|message| message.id == card_id));
+    assert!(card.attachments.is_empty(), "a site player is not an attachment: {:?}", card.attachments);
+    assert_eq!(card.previews.len(), 1);
+    let preview = &card.previews[0];
+    assert!(preview.opens_in_browser);
+    assert_eq!(preview.duration, 84);
+    assert_eq!(preview.site, "YouTube");
+    assert!(preview.url.contains("youtube.com"));
+    assert!(preview.image.is_some(), "the poster is the card's picture");
+
+    let moving = format!("{}/media/external/span.mp4", world.api);
+    let poster = format!("{}/media/external/span-still.png", world.api);
+    let clip_id = world.incoming(
+        dm,
+        None,
+        "",
+        json!({
+            "embeds": [{
+                "type": "video",
+                "url": "https://cdn.discordapp.com/attachments/1/clip.mp4",
+                "title": "Clip",
+                "thumbnail": {"proxy_url": poster, "width": 498, "height": 280},
+                "video": {"url": moving, "proxy_url": moving, "width": 498, "height": 280, "duration_secs": 12.4}
+            }]
+        }),
+    );
+    let clip = wait("the proxied video", || world.messages(dm).into_iter().find(|message| message.id == clip_id));
+    assert!(clip.previews.is_empty(), "{:?}", clip.previews);
+    let video = clip.attachments.iter().find(|attachment| attachment.file.kind == MediaKind::Video).expect("proxied video");
+    assert_eq!((video.mime.as_str(), video.duration), ("video/mp4", 12));
+    assert!(video.file.path.is_none());
+    let id = video.file.id.clone();
+
+    settled(&world);
+    assert!(world.discord.requests_to("GET", "/media/external/span.mp4").is_empty());
+    let window = |world: &World| match world.ask(Request::Fetch {
+        account: world.account(),
+        ids: vec![id.clone()],
+        size: None,
+        retry: false,
+        span: Some((0, 65_536)),
+    }) {
+        Response::Media { files } => files,
+        other => panic!("{other:?}"),
+    };
+    let first = window(&world);
+    assert!(first.iter().all(|file| file.path.is_none() && file.failed.is_none()), "a window is not the file: {first:?}");
+    let seen = wait("the byte window to be read and not stored", || {
+        let files = window(&world);
+        assert!(files.iter().all(|file| file.path.is_none() && file.failed.is_none()), "a window is not the file: {files:?}");
+        let seen = world.discord.requests_to("GET", "/media/external/span.mp4");
+        let windows = seen.iter().filter(|seen| seen.headers.get("range").is_some_and(|range| range.starts_with("bytes="))).count();
+        (windows >= 2).then_some(seen)
+    });
+    assert_eq!(seen[0].headers.get("range").map(String::as_str), Some("bytes=0-65535"));
 }

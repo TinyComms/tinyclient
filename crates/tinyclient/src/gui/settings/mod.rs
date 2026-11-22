@@ -420,6 +420,9 @@ pub struct SettingsWindow {
     pub(super) tg_sessions_requested: std::collections::HashSet<protocol::AccountKey>,
     pub(super) tg_session_confirm: Option<(protocol::AccountKey, String)>,
     pub(super) tg_session_error: Option<String>,
+    /// Loaded Discord Privacy & Safety settings (`GetNetworkPrivacy`), keyed by account.
+    pub(super) discord_privacy: HashMap<protocol::AccountKey, protocol::NetworkPrivacy>,
+    pub(super) discord_privacy_requested: std::collections::HashSet<protocol::AccountKey>,
     /// Drawn as the phone's page: a list of sections, then one section at a time.
     pub(super) phone: bool,
     /// On a phone: the list of sections is on show, not `section`.
@@ -581,6 +584,8 @@ impl SettingsWindow {
             tg_sessions_requested: std::collections::HashSet::new(),
             tg_session_confirm: None,
             tg_session_error: None,
+            discord_privacy: HashMap::new(),
+            discord_privacy_requested: std::collections::HashSet::new(),
             phone,
             listing: phone,
             shown: phone,
