@@ -746,6 +746,21 @@ pub struct Capabilities {
     /// This account supports reordering Spaces and creating/renaming/colouring Space folders (`MoveSpace`, `SetFolder`, Discord).
     #[serde(default, skip_serializing_if = "is_false")]
     pub manage_space_folders: bool,
+    /// This account supports muting a conversation for a chosen duration (`SetMute` with `until`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub timed_mute: bool,
+    /// This account supports reading/updating account-wide notification defaults and exceptions (Telegram).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub notify_defaults: bool,
+    /// This account supports browsing Saved Messages grouped by source chat and reaction tags (Telegram).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub saved_subdialogs: bool,
+    /// This account supports listing active signed-in devices/sessions and ending another session (Telegram).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub active_sessions: bool,
+    /// This account supports jumping to unread mentions and reactions per conversation (Telegram).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unread_jumps: bool,
 }
 
 /// One recent mention fetched from the network (`Request::Mentions`).
@@ -769,21 +784,6 @@ pub struct MentionHit {
     pub mentions_everyone: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub mentions_role: bool,
-    /// This account supports muting a conversation for a chosen duration (`SetMute` with `until`).
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub timed_mute: bool,
-    /// This account supports reading/updating account-wide notification defaults and exceptions (Telegram).
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub notify_defaults: bool,
-    /// This account supports browsing Saved Messages grouped by source chat and reaction tags (Telegram).
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub saved_subdialogs: bool,
-    /// This account supports listing active signed-in devices/sessions and ending another session (Telegram).
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub active_sessions: bool,
-    /// This account supports jumping to unread mentions and reactions per conversation (Telegram).
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub unread_jumps: bool,
 }
 
 /// Scope of an account-wide notification default (Telegram `InputNotifyUsers` / `Chats` / `Broadcasts`).

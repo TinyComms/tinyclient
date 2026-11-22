@@ -2269,7 +2269,7 @@ impl Discord {
 /// A new folder id, a snowflake from now, distinct from the folders already stored.
 fn fresh_folder_id(folders: &[proto::GuildFolder]) -> i64 {
     let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|elapsed| elapsed.as_millis() as u64).unwrap_or(0);
-    let snowflake = millis.saturating_sub(1_420_070_400_000).saturating_shl(22);
+    let snowflake = millis.saturating_sub(1_420_070_400_000) << 22;
     let mut id = i64::try_from(snowflake).unwrap_or(1).max(1);
     for _ in 0..64 {
         if !folders.iter().any(|folder| folder.id == Some(id)) {
