@@ -1740,6 +1740,9 @@ pub struct Capabilities {
     /// Maximum members in a group chat this account can create (`Request::StartGroup`). 0: unsupported.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub groups: u32,
+    /// This Tiny account can ring and join a call in a group conversation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub group_calls: bool,
     /// This account supports marking messages as Important or Urgent (`Outgoing::importance`, Teams).
     #[serde(default, skip_serializing_if = "is_false")]
     pub importance: bool,

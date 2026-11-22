@@ -1102,6 +1102,7 @@ impl Shell {
             .as_deref()
             .unwrap_or(call.conversation.network.label());
         let alone = self.call_left_alone(call);
+        let ringing = call.ringing.iter().filter(|ring| ring.state == "ringing").count();
         let words = match (&call.state, alone.as_deref()) {
             (CallState::RingingOut, _) => "Ringing…".to_owned(),
             (CallState::Connecting, _) => "Connecting…".to_owned(),
@@ -1109,6 +1110,14 @@ impl Shell {
             // Alone in a direct call: said, and left to me. tinyclient does not hang up for me.
             (_, Some(peer)) if subject.kind == ConversationKind::Direct => {
                 format!("{} left", peer.split_whitespace().next().unwrap_or(peer))
+            }
+            (CallState::Joined, _)
+                if subject.kind == ConversationKind::Group && call.participants.is_empty() && ringing > 0 =>
+            {
+                format!("Ringing {ringing}…")
+            }
+            (CallState::Joined, _) if subject.kind == ConversationKind::Group && call.participants.is_empty() => {
+                "Waiting for others".to_owned()
             }
             _ => place.to_owned(),
         };
@@ -1357,6 +1366,9 @@ impl Shell {
     fn call_incoming(&self, call: &Call, subject: &Subject, from: &str, cx: &mut Context<Self>) -> Div {
         let words = match subject.kind {
             ConversationKind::Direct => "Incoming call".to_owned(),
+            ConversationKind::Group if subject.occupied > 0 => {
+                format!("{from} is calling · {} in the call", subject.occupied)
+            }
             _ => format!("{from} is calling"),
         };
         let decline = worded(
@@ -1532,11 +1544,13 @@ mod tests {
             share_view: None,
             picture_source: None,
             video_allowed: true,
+        ringing: Vec::new(),
+        moved_from: None,
         }
     }
 
     fn mara() -> Subject {
-        Subject { title: "Mara Okafor".into(), kind: ConversationKind::Direct, avatar: None, space: None }
+        Subject { title: "Mara Okafor".into(), kind: ConversationKind::Direct, avatar: None, space: None, occupied: 0 }
     }
 
     fn said(reason: CallFailure, detail: &str) -> Failure {
@@ -1609,7 +1623,7 @@ mod tests {
     }
 
     fn lounge() -> Subject {
-        Subject { title: "Lounge".into(), kind: ConversationKind::Voice, avatar: None, space: Some("Night Shift".into()) }
+        Subject { title: "Lounge".into(), kind: ConversationKind::Voice, avatar: None, space: Some("Night Shift".into()), occupied: 0 }
     }
 
     #[test]

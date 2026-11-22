@@ -1,6 +1,6 @@
 {
   "id": "tiny-groups",
-  "title": "A Tiny group conversation is listed beside the directs, survives a failed groups call, is found again by the same people, and goes when left",
+  "title": "A Tiny group is listed beside the directs, keeps a missed call, survives a failed groups call, is found again by the same people, and goes when left",
   "platforms": ["windows", "linux", "macos"],
   "not_applicable": {
     "android": "The phone proof build does not run desktop chatd against a localhost groups list. The same adapter code lists, finds and leaves the group this desktop run checks.",

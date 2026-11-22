@@ -8,7 +8,7 @@ use crate::store::Store;
 use protocol::{AccountKey, Change, Key, Network};
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -2389,4 +2389,234 @@ fn a_single_video_slot_keeps_the_watch_locally() {
     assert!(!watch_local(true, 5));
     assert!(!watch_wire(true, 5, false), "multi-video without mids is not ready");
     assert!(!watch_local(false, 1), "a watch before the call is up is not kept locally");
+}
+
+const GROUP: &str = "77777777-7777-7777-7777-777777777777";
+const CALL: &str = "88888888-8888-8888-8888-888888888888";
+
+fn group_started(participants: Value, rings: Value) -> Value {
+    json!({
+        "type": "call.group.started",
+        "group_id": GROUP,
+        "call_id": CALL,
+        "started_by": BEA,
+        "started_at": "2024-01-02T03:04:05Z",
+        "participants": participants,
+        "rings": rings,
+    })
+}
+
+fn group_call(running: &Running) -> Option<protocol::Call> {
+    running.hub.calls.describe().0.filter(|call| call.conversation == running.key(GROUP))
+}
+
+/// A group call is `call.group.start`, then `call.join` of the group, and leaving sends
+/// `call.leave` for that call only. The other person stays.
+#[test]
+fn a_group_call_starts_joins_and_leaves_without_ending() {
+    let fake = fake(&[], |_, mut conn| {
+        conn.send(ready(1, &[ME, BEA], json!([])));
+        let start = conn.next(Duration::from_secs(5)).expect("call.group.start");
+        assert_eq!(start["type"], "call.group.start");
+        assert_eq!(start["group_id"], GROUP);
+        assert!(start.get("from_direct").is_none(), "a group start is not a moved direct: {start}");
+        conn.send(json!({"type": "ok", "ref": start["ref"]}));
+        conn.send(group_started(json!([]), json!([{"user_id": BEA, "state": "ringing"}])));
+        let join = conn.next(Duration::from_secs(5)).expect("call.join");
+        assert_eq!(join["type"], "call.join");
+        assert_eq!(join["group_id"], GROUP);
+        assert!(join.get("room_id").is_none(), "a group join names the group, not a room: {join}");
+        assert!(join.get("sdp").is_none(), "a server without audio takes a seat: {join}");
+        conn.send(json!({"type": "ok", "ref": join["ref"], "call_id": CALL}));
+        conn.send(json!({"type": "call.group.joined", "group_id": GROUP, "call_id": CALL, "user_id": BEA}));
+        let leave = conn.next(Duration::from_secs(5)).expect("call.leave");
+        assert_eq!(leave["type"], "call.leave");
+        assert_eq!(leave["group_id"], GROUP);
+        assert_eq!(leave["call_id"], CALL);
+        conn.send(json!({"type": "ok", "ref": leave["ref"]}));
+        conn.idle(Duration::from_millis(300));
+    });
+    let running = run(&fake.base, QUICK);
+    until("connected", || running.link().0 == Link::Connected);
+    assert_eq!(
+        running.ask(|reply| Ask::GroupStart { group_id: GROUP.into(), from_direct: None, reply }),
+        Ok(())
+    );
+    until("both seated", || {
+        let names = running.in_room(GROUP);
+        names.iter().any(|name| name == "Ada") && names.iter().any(|name| name == "Bea")
+    });
+    running.live.ask(Ask::GroupLeave { group_id: GROUP.into() });
+    until("only Bea remains", || {
+        let names = running.in_room(GROUP);
+        names == ["Bea"]
+    });
+}
+
+/// `call.group.ended` clears the people and a ring. It does not leave a phantom room.
+#[test]
+fn a_group_call_ending_clears_the_people_and_the_ring() {
+    let go = Arc::new(AtomicBool::new(false));
+    let flag = go.clone();
+    let fake = fake(&[], move |_, mut conn| {
+        conn.send(ready(1, &[ME, BEA], json!([])));
+        conn.send(group_started(
+            json!([{"user_id": BEA}]),
+            json!([{"user_id": ME, "state": "ringing"}]),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !flag.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        conn.send(json!({"type": "call.group.ended", "group_id": GROUP, "call_id": CALL, "outcome": "ended"}));
+        let extra = conn.next(Duration::from_millis(400));
+        assert!(extra.is_none(), "an ended call is not joined: {extra:?}");
+        conn.idle(Duration::from_millis(200));
+    });
+    let running = run(&fake.base, QUICK);
+    until("connected", || running.link().0 == Link::Connected);
+    until("Bea is listed and we are ringing", || {
+        running.in_room(GROUP) == ["Bea"]
+            && group_call(&running).is_some_and(|call| matches!(call.state, protocol::CallState::RingingIn { .. }))
+    });
+    go.store(true, Ordering::SeqCst);
+    until("the call is gone", || running.in_room(GROUP).is_empty() && group_call(&running).is_none());
+    assert!(running.in_room(&format!("g:{CALL}")).is_empty());
+}
+
+/// A `group_calls` value that is not a list does not fail `ready`, and a voice room still lists.
+#[test]
+fn a_bad_group_calls_list_still_connects_and_a_room_still_lists() {
+    let fake = fake(&[], |_, mut conn| {
+        let mut frame = ready(1, &[ME, BEA], json!([{"room_id": ROOM, "participants": [{"user_id": BEA}]}]));
+        frame["group_calls"] = json!("nope");
+        conn.send(frame);
+        conn.idle(Duration::from_millis(400));
+    });
+    let running = run(&fake.base, QUICK);
+    until("connected", || running.link().0 == Link::Connected);
+    until("the room lists Bea", || running.in_room(ROOM) == ["Bea"]);
+}
+
+/// A media `call.joined` for `g:{call}` is not a voice room.
+#[test]
+fn a_group_media_room_is_not_a_voice_channel() {
+    let media = format!("g:{CALL}");
+    let fake = fake(&[], {
+        let media = media.clone();
+        move |_, mut conn| {
+            conn.send(ready(1, &[ME, BEA], json!([])));
+            conn.send(json!({"type": "call.joined", "room_id": media, "user_id": BEA}));
+            conn.send(json!({"type": "call.joined", "room_id": ROOM, "user_id": BEA}));
+            conn.idle(Duration::from_millis(300));
+        }
+    });
+    let running = run(&fake.base, QUICK);
+    until("the real room lists Bea", || running.link().0 == Link::Connected && running.in_room(ROOM) == ["Bea"]);
+    assert!(running.in_room(&format!("g:{CALL}")).is_empty());
+}
+
+/// A group ring while a call is already showing waits beside it, and another device answering
+/// clears that ring without joining.
+#[test]
+fn a_group_ring_beside_a_call_clears_when_another_device_answers() {
+    let step = Arc::new(AtomicU8::new(0));
+    let seen = step.clone();
+    let fake = fake(&[], move |_, mut conn| {
+        conn.send(ready(1, &[ME, BEA], json!([])));
+        let wait = |at: u8| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while seen.load(Ordering::SeqCst) < at && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        wait(1);
+        conn.send(json!({
+            "type": "call.group.ring",
+            "group_id": GROUP,
+            "call_id": CALL,
+            "user_id": ME,
+            "state": "ringing",
+            "by": BEA,
+        }));
+        wait(2);
+        conn.send(json!({
+            "type": "call.group.ring",
+            "group_id": GROUP,
+            "call_id": CALL,
+            "user_id": ME,
+            "state": "answered",
+            "by": BEA,
+        }));
+        let extra = conn.next(Duration::from_millis(400));
+        assert!(extra.is_none(), "answering elsewhere does not join: {extra:?}");
+        conn.idle(Duration::from_millis(200));
+    });
+    let running = run(&fake.base, QUICK);
+    until("connected", || running.link().0 == Link::Connected);
+    running.hub.calls.place(&running.hub, running.key(ROOM)).expect("a shown ring");
+    step.store(1, Ordering::SeqCst);
+    until("the group ring waits", || {
+        running.hub.calls.aside().is_some_and(|ring| {
+            ring.conversation == running.key(GROUP) && matches!(ring.state, protocol::CallState::RingingIn { .. })
+        })
+    });
+    let shown = running.hub.calls.describe().0.expect("the room ring stays");
+    assert_eq!(shown.conversation, running.key(ROOM));
+    assert!(matches!(shown.state, protocol::CallState::RingingOut));
+    step.store(2, Ordering::SeqCst);
+    until("the aside is gone", || running.hub.calls.aside().is_none());
+    let shown = running.hub.calls.describe().0.expect("the room ring stays");
+    assert_eq!(shown.conversation, running.key(ROOM));
+    assert!(running.in_room(GROUP).is_empty());
+}
+
+/// A listed ring rings us. Leaving while only ringing declines, and does not end the call.
+#[test]
+fn a_listed_group_ring_is_declined_without_ending_the_call() {
+    let fake = fake(&[], |_, mut conn| {
+        let mut frame = ready(1, &[ME, BEA], json!([]));
+        frame["group_calls"] = json!([{
+            "group_id": GROUP,
+            "call_id": CALL,
+            "started_by": BEA,
+            "participants": [{"user_id": BEA}],
+            "rings": [{"user_id": ME, "state": "ringing"}],
+        }]);
+        conn.send(frame);
+        let decline = conn.next(Duration::from_secs(5)).expect("call.group.decline");
+        assert_eq!(decline["type"], "call.group.decline");
+        assert_eq!(decline["group_id"], GROUP);
+        assert_eq!(decline["call_id"], CALL);
+        conn.send(json!({"type": "ok", "ref": decline["ref"]}));
+        let extra = conn.next(Duration::from_millis(400));
+        assert!(extra.is_none(), "a decline does not leave or join: {extra:?}");
+        conn.idle(Duration::from_millis(200));
+    });
+    let running = run(&fake.base, QUICK);
+    until("ringing", || {
+        running.link().0 == Link::Connected
+            && group_call(&running).is_some_and(|call| matches!(call.state, protocol::CallState::RingingIn { .. }))
+            && running.in_room(GROUP) == ["Bea"]
+    });
+    running.live.ask(Ask::GroupLeave { group_id: GROUP.into() });
+    until("the ring stopped", || group_call(&running).is_none());
+    assert_eq!(running.in_room(GROUP), ["Bea"]);
+}
+
+/// A server whose audio is down refuses to start a group call, and sends nothing.
+#[test]
+fn a_group_start_is_refused_when_audio_is_down() {
+    let fake = fake_with("down", &[], |_, mut conn| {
+        conn.send(ready(1, &[ME], json!([])));
+        let extra = conn.next(Duration::from_millis(500));
+        assert!(extra.is_none(), "audio down never starts: {extra:?}");
+        conn.idle(Duration::from_millis(200));
+    });
+    let running = run(&fake.base, QUICK);
+    until("connected", || running.link().0 == Link::Connected);
+    assert_eq!(
+        running.ask(|reply| Ask::GroupStart { group_id: GROUP.into(), from_direct: None, reply }),
+        Err(AUDIO_DOWN.to_owned())
+    );
 }

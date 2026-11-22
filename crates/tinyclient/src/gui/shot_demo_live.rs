@@ -116,6 +116,8 @@ fn bare(conversation: Key, state: CallState, participants: Vec<Participant>) -> 
         share_view: None,
         picture_source: None,
         video_allowed: true,
+        ringing: Vec::new(),
+        moved_from: None,
     }
 }
 

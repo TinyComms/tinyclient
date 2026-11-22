@@ -2016,6 +2016,9 @@ impl Shell {
     pub(super) fn join_pill(&self, conversation: &Conversation, cx: &mut Context<Self>) -> Stateful<Div> {
         let key = conversation.key.clone();
         let title = conversation.title.clone();
+        let group_call = conversation.kind == ConversationKind::Group;
+        let hover_group = if group_call { "group-call" } else { "voice" };
+        let icon = if group_call { "icons/phone.svg" } else { "icons/volume-2.svg" };
         div()
             .id(row_id("join", &key))
             .flex_none()
@@ -2042,13 +2045,13 @@ impl Shell {
                 if super::phone::active() {
                     pill.h(px(30.)).px(px(12.)).rounded(px(15.)).text_size(px(13.))
                 } else {
-                    pill.invisible().group_hover("voice", |style| style.visible())
+                    pill.invisible().group_hover(hover_group, |style| style.visible())
                 }
             })
             // The press belongs to the pill: the row's open must not fire with it.
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, _, cx| this.call_start(key.clone(), cx)))
-            .child(glyph("icons/volume-2.svg", 12., theme::text()))
+            .child(glyph(icon, 12., theme::text()))
             .child("Join")
     }
 
@@ -2096,7 +2099,11 @@ impl Shell {
                 call.conversation == c.key
                     && !matches!(call.state, protocol::CallState::Failed { .. })
             });
-        let join = joins_from_list(c) && !ours;
+        let voice_join = joins_from_list(c) && !ours;
+        let group_join = c.kind == ConversationKind::Group && c.call == CallSupport::Native && inside.is_some() && !ours;
+        let show_join = voice_join || group_join;
+        let hover_group = if c.kind == ConversationKind::Group { "group-call" } else { "voice" };
+        let count_icon = if c.kind == ConversationKind::Group { "icons/phone.svg" } else { "icons/volume-2.svg" };
         let content = div()
             // 16 a level less the gap after it (none at the top), as the tree's other rows.
             .children((depth > 0).then(|| div().flex_none().w(px(16. * f32::from(depth) - 8.))))
@@ -2114,12 +2121,12 @@ impl Shell {
             .children(status.map(|emoji| div().flex_none().type_small().child(emoji)))
             .children(chat::name_mark(c).filter(|_| c.kind.is_direct()))
             .child(div().flex_1())
-            .children(join.then(|| self.join_pill(c, cx)))
+            .children(show_join.then(|| self.join_pill(c, cx)))
             .children(draft)
-            .children(count.map(|(count, soft)| div().flex_none().flex().items_center().gap(px(2.)).child(glyph("icons/volume-2.svg", 12., theme::text_faint())).child(div().type_micro().text_color(if soft { theme::text_soft() } else { theme::text_faint() }).child(count))))
+            .children(count.map(|(count, soft)| div().flex_none().flex().items_center().gap(px(2.)).child(glyph(count_icon, 12., theme::text_faint())).child(div().type_micro().text_color(if soft { theme::text_soft() } else { theme::text_faint() }).child(count))))
             .children(live.map(|line| div().flex_none().type_micro().text_color(theme::text_faint()).child(line)))
             .children(row_badge(c))
-            .when(join, |row| row.group("voice"));
+            .when(show_join, |row| row.group(hover_group));
         list_row(row_id("tree", &c.key), theme::row_height(theme::ROW_ONE), selected, focused, content)
             .map(|row| {
                 if super::phone::active() {
@@ -2136,7 +2143,7 @@ impl Shell {
                         move |this, _, cx| {
                             if voice && ours {
                                 this.call_phone_restore(cx);
-                            } else if join {
+                            } else if voice_join {
                                 this.call_start(picked.key.clone(), cx);
                             } else {
                                 this.pick_row(&picked, cx);
@@ -2157,7 +2164,7 @@ impl Shell {
                         if !crate::gui::conversation::press_opens_row(crate::gui::conversation::modifier_held(event.modifiers)) {
                             return;
                         }
-                        if join && event.click_count == 2 {
+                        if voice_join && event.click_count == 2 {
                             this.call_start(picked.key.clone(), cx);
                         } else {
                             this.pick_row(&picked, cx);

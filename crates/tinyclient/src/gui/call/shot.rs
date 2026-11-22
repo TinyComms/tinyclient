@@ -317,6 +317,8 @@ pub(super) fn call(snapshot: &Snapshot) -> Option<Call> {
         share_view: sharing.then(screen_picture).flatten(),
         picture_source: None,
         video_allowed: true,
+        ringing: Vec::new(),
+        moved_from: None,
     })
 }
 
@@ -330,7 +332,7 @@ fn screen_picture() -> Option<protocol::CallPicture> {
 }
 
 fn mara() -> Subject {
-    Subject { title: "Mara Okafor".to_owned(), kind: ConversationKind::Direct, avatar: None, space: None }
+    Subject { title: "Mara Okafor".to_owned(), kind: ConversationKind::Direct, avatar: None, space: None, occupied: 0 }
 }
 
 /// Who the made-up call is with, or the voice channel of the channel shots. `None` with a
@@ -344,7 +346,7 @@ pub(super) fn subject(snapshot: &Snapshot) -> Option<Subject> {
     }
     if channel(&named()?) {
         let space = Some("tinyclient-dev".to_owned());
-        return Some(Subject { title: "Lounge".to_owned(), kind: ConversationKind::Voice, avatar: None, space });
+        return Some(Subject { title: "Lounge".to_owned(), kind: ConversationKind::Voice, avatar: None, space, occupied: 0 });
     }
     snapshot.open.is_none().then(mara)
 }
@@ -465,6 +467,8 @@ fn bare(conversation: Key, state: CallState, participants: Vec<Participant>, joi
         share_view: None,
         picture_source: None,
         video_allowed: true,
+        ringing: Vec::new(),
+        moved_from: None,
     }
 }
 
@@ -499,11 +503,11 @@ fn tiny_key(id: &str) -> Key {
 }
 
 fn lounge() -> Subject {
-    Subject { title: "Lounge".to_owned(), kind: ConversationKind::Voice, avatar: None, space: Some("Premier".to_owned()) }
+    Subject { title: "Lounge".to_owned(), kind: ConversationKind::Voice, avatar: None, space: Some("Premier".to_owned()), occupied: 0 }
 }
 
 fn direct(title: &str) -> Subject {
-    Subject { title: title.to_owned(), kind: ConversationKind::Direct, avatar: None, space: None }
+    Subject { title: title.to_owned(), kind: ConversationKind::Direct, avatar: None, space: None, occupied: 0 }
 }
 
 /// The four in Lounge: two cameras on, one of them speaking, one person muted.
@@ -588,7 +592,7 @@ pub(super) fn phone_shot() -> Option<PhoneShot> {
                 .map(|(id, name, speaking, muted, deafened)| Participant { speaking: *speaking, muted: *muted, deafened: *deafened, ..seat(id, name) })
                 .collect();
             let call = bare(key("campfire"), CallState::Joined, seats, now() - 1_953);
-            let subject = Subject { title: "Campfire".to_owned(), kind: ConversationKind::Voice, avatar: None, space: Some("Moss & Lichen".to_owned()) };
+            let subject = Subject { title: "Campfire".to_owned(), kind: ConversationKind::Voice, avatar: None, space: Some("Moss & Lichen".to_owned()), occupied: 0 };
             shot(call, subject, screen)
         }
         "phone_share" | "phone_people" => {

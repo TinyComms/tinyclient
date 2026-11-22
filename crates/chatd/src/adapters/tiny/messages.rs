@@ -3495,6 +3495,7 @@ struct CapInput {
     blocks: bool,
     presence_status: bool,
     groups: bool,
+    group_calls: bool,
 }
 
 fn capabilities_from(input: CapInput) -> Capabilities {
@@ -3522,6 +3523,7 @@ fn capabilities_from(input: CapInput) -> Capabilities {
         presence_status: input.presence_status,
         // No count of the client's own: the server says when a group is too large for it.
         groups: if input.groups { u32::MAX } else { 0 },
+        group_calls: input.group_calls,
         profile_avatar: true,
         ..Capabilities::default()
     }
@@ -3548,6 +3550,7 @@ fn account_caps(saved: &Saved) -> Capabilities {
         blocks: server_caps.has(protocol::TINY_FEATURE_BLOCKS),
         presence_status: server_caps.has(protocol::TINY_FEATURE_PRESENCE_STATUS),
         groups: server_caps.has(TINY_FEATURE_GROUPS),
+        group_calls: server_caps.has(protocol::TINY_FEATURE_GROUP_CALLS),
     })
 }
 
@@ -3569,6 +3572,7 @@ pub(crate) fn capability_ceiling() -> Capabilities {
         blocks: true,
         presence_status: true,
         groups: true,
+        group_calls: true,
     })
 }
 
@@ -3580,9 +3584,9 @@ pub(crate) fn room_call() -> CallSupport {
     CallSupport::Native
 }
 
-/// A group conversation has no call button. Directs and rooms do.
+/// A group conversation can hold a call. One server still hides the button until it lists `group_calls`.
 pub(crate) fn group_offer() -> protocol::CallOffer {
-    protocol::CallOffer::Missing
+    protocol::CallOffer::Native
 }
 
 /// The caps `GET /v1/server` reports. An older server, or one that does not answer, keeps the original 8 MiB and 25 MiB.
@@ -4304,8 +4308,19 @@ fn groups_on(saved: &Saved) -> bool {
     capabilities.has(TINY_FEATURE_GROUPS)
 }
 
-fn is_group(ctx: &Context, conversation_id: &str) -> bool {
+pub(crate) fn is_group(ctx: &Context, conversation_id: &str) -> bool {
     ctx.known(conversation_id).ok().flatten().is_some_and(|row| row.kind == ConversationKind::Group)
+}
+
+/// Member ids kept for this group, in join order. Empty when this account has not listed it.
+pub(crate) fn group_member_ids(saved: &Saved, id: &str) -> Vec<String> {
+    kept_group(saved, id).map(|group| group.members.into_iter().map(|member| member.user_id).collect()).unwrap_or_default()
+}
+
+fn groups_callable(saved: &Saved) -> bool {
+    let known = super::manage::known(saved);
+    let capabilities = if known.checked { known.capabilities } else { super::manage::capabilities_of(saved) };
+    capabilities.has(protocol::TINY_FEATURE_GROUP_CALLS)
 }
 
 /// The caller's groups, read one element at a time: a group that does not decode is skipped and
@@ -4378,7 +4393,7 @@ fn group_row(saved: &Saved, group: &WireGroup, position: i32, e2ee: bool, histor
     row.group = Some("directs".to_owned());
     row.position = position;
     row.topic = people_count(group.members.len());
-    row.call = CallSupport::None;
+    row.call = direct_call(groups_callable(saved));
     row.encryption = encryption_of(saved, &group.id, e2ee, history);
     // Every member may add people and rename. Nobody removes anyone else.
     row.rights.add_members = true;
@@ -5315,9 +5330,14 @@ pub(super) fn prove_tiny_groups() -> Result<(), String> {
     let known = |id: &str| ctx.known(id).map_err(|err| err.to_string());
     refresh(&ctx, &saved);
     match known("group-1")? {
-        Some(row) if row.kind == ConversationKind::Group && row.title == "Bea, Cy" && row.group_title == "Direct messages" => {}
-        Some(row) => return Err(format!("the group was listed as {:?} {:?} under {:?}", row.kind, row.title, row.group_title)),
+        Some(row) if row.kind == ConversationKind::Group && row.title == "Bea, Cy" && row.group_title == "Direct messages" && row.call == CallSupport::Native => {}
+        Some(row) => return Err(format!("the group was listed as {:?} {:?} under {:?} call {:?}", row.kind, row.title, row.group_title, row.call)),
         None => return Err("the listed group is not a row".to_owned()),
+    }
+    match ctx.stored_message("group-1", "call-1").map_err(|err| err.to_string())? {
+        Some(message) if message.text == "Missed call from Bea · 40 sec" => {}
+        Some(message) => return Err(format!("the missed call read {:?}", message.text)),
+        None => return Err("the group's missed call is not a line".to_owned()),
     }
     let kept = Message::plain("g-kept", "Bea", "kept", 1_700_000_000, false);
     ctx.hub.store().ingest(&ctx.key("group-1"), &kept, false).map_err(|err| err.to_string())?;
@@ -5348,9 +5368,14 @@ fn answer_tiny_groups(listener: std::net::TcpListener) {
     let (lists, starts) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let _ = listener.set_nonblocking(true);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    let group = |id: &str| {
+    let group = |id: &str, call: bool| {
+        let last = if call {
+            r#","last_call":{"id":"call-1","call_id":"call-1","started_by":"22222222-2222-2222-2222-222222222222","outcome":"ended","started_at":"2024-01-02T03:04:05Z","ended_at":"2024-01-02T03:04:45Z","joined":["22222222-2222-2222-2222-222222222222"],"mine":"missed"}"#
+        } else {
+            ""
+        };
         format!(
-            r#"{{"id":"{id}","name":"","created_by":"22222222-2222-2222-2222-222222222222","created_at":"2024-01-02T03:04:05Z","members":[{{"user_id":"22222222-2222-2222-2222-222222222222","display_name":"Bea"}},{{"user_id":"11111111-1111-1111-1111-111111111111","display_name":"Ada"}},{{"user_id":"33333333-3333-3333-3333-333333333333","display_name":"Cy"}}]}}"#
+            r#"{{"id":"{id}","name":"","created_by":"22222222-2222-2222-2222-222222222222","created_at":"2024-01-02T03:04:05Z","members":[{{"user_id":"22222222-2222-2222-2222-222222222222","display_name":"Bea"}},{{"user_id":"11111111-1111-1111-1111-111111111111","display_name":"Ada"}},{{"user_id":"33333333-3333-3333-3333-333333333333","display_name":"Cy"}}]{last}}}"#
         )
     };
     while std::time::Instant::now() < deadline {
@@ -5361,15 +5386,15 @@ fn answer_tiny_groups(listener: std::net::TcpListener) {
                 let read = std::io::Read::read(&mut stream, &mut got).unwrap_or(0);
                 let request = String::from_utf8_lossy(&got[..read]);
                 let (status, payload) = if request.contains("GET /v1/capabilities") {
-                    ("200 OK", r#"{"features":["groups"]}"#.to_owned())
+                    ("200 OK", r#"{"features":["groups","group_calls"]}"#.to_owned())
                 } else if request.contains("GET /v1/groups ") {
                     if lists.fetch_add(1, Ordering::Relaxed) == 0 {
-                        ("200 OK", format!(r#"{{"groups":[{}]}}"#, group("group-1")))
+                        ("200 OK", format!(r#"{{"groups":[{}]}}"#, group("group-1", true)))
                     } else {
                         ("500 Internal Server Error", "{}".to_owned())
                     }
                 } else if request.contains("POST /v1/groups ") {
-                    (if starts.fetch_add(1, Ordering::Relaxed) == 0 { "201 Created" } else { "200 OK" }, group("group-2"))
+                    (if starts.fetch_add(1, Ordering::Relaxed) == 0 { "201 Created" } else { "200 OK" }, group("group-2", false))
                 } else if request.contains("DELETE /v1/groups/group-2/members/me") {
                     ("204 No Content", String::new())
                 } else if request.contains("GET /v1/channels") {

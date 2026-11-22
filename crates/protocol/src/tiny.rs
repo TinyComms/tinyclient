@@ -428,6 +428,8 @@ pub const TINY_FEATURE_E2EE_CALLS: &str = "e2ee_calls";
 pub const TINY_FEATURE_DIRECT_CALLS: &str = "direct_calls";
 /// Group conversations: three or more people a member picked (`/v1/groups`). An older server has none.
 pub const TINY_FEATURE_GROUPS: &str = "groups";
+/// A group conversation can ring and hold a call (`call.group.*`). An older server has none.
+pub const TINY_FEATURE_GROUP_CALLS: &str = "group_calls";
 /// Under a group member whose app is too old to see groups (`Person::status` in its member list).
 pub const TINY_NOT_UPDATED: &str = "Hasn't updated Tiny yet";
 /// Text, direct messages and files can be end-to-end encrypted: MLS groups per conversation.

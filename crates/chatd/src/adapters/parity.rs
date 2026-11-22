@@ -198,11 +198,8 @@ fn show(mark: Mark, label: &str, network: Network) -> String {
     }
 }
 
-fn gap(label: &str, network: Network) -> Option<u32> {
-    match (label, network) {
-        ("Group audio", Network::Tiny) => Some(291),
-        _ => None,
-    }
+fn gap(_label: &str, _network: Network) -> Option<u32> {
+    None
 }
 
 fn table(rows: &[(String, Vec<String>)]) -> String {
@@ -255,8 +252,9 @@ mod tests {
     #[test]
     fn native_cells_are_not_issue_links() {
         let text = markdown();
-        assert!(!text.contains("N ([#"));
-        assert!(text.contains("[#291](https://github.com/TinyComms/tinyclient/issues/291)"));
+        assert!(!text.contains("([#"));
+        let row = text.lines().find(|line| line.starts_with("| Group audio |")).expect("group audio row");
+        assert_eq!(cells(row)[7], "N");
     }
 
     fn cells(row: &str) -> Vec<&str> {

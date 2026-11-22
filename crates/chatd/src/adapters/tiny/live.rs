@@ -211,6 +211,33 @@ pub enum Ask {
         clear_at: Option<i64>,
         reply: Reply<()>,
     },
+    /// Start a group call. `from_direct` is the 1:1 being moved, when this call grew out of one.
+    GroupStart {
+        group_id: String,
+        from_direct: Option<(String, String)>,
+        reply: Reply<()>,
+    },
+    /// Join a group call that is already up.
+    GroupJoin {
+        group_id: String,
+        reply: Reply<()>,
+    },
+    /// Leave a group call, or decline one that is only ringing here. The call stays up for everyone else.
+    GroupLeave {
+        group_id: String,
+    },
+    /// Ring people into the group call. `None` rings the members who are not already in it.
+    GroupRing {
+        group_id: String,
+        people: Option<Vec<String>>,
+        reply: Reply<()>,
+    },
+    /// Stop ringing people in the group call.
+    GroupUnring {
+        group_id: String,
+        people: Option<Vec<String>>,
+        reply: Reply<()>,
+    },
 }
 
 impl Ask {
@@ -224,9 +251,14 @@ impl Ask {
             | Ask::Moderate { reply, .. }
             | Ask::Move { reply, .. }
             | Ask::SetPresence { reply, .. }
-            | Ask::Watch { reply, .. } => Some(reply),
+            | Ask::Watch { reply, .. }
+            | Ask::GroupStart { reply, .. }
+            | Ask::GroupJoin { reply, .. }
+            | Ask::GroupRing { reply, .. }
+            | Ask::GroupUnring { reply, .. } => Some(reply),
             Ask::Look
             | Ask::Hangup { .. }
+            | Ask::GroupLeave { .. }
             | Ask::State { .. }
             | Ask::Type { .. }
             | Ask::Priority { .. }
@@ -305,7 +337,7 @@ impl Live {
             // A hang-up while down needs nothing sent now: the seat is not taken again without
             // the call (`rejoin`), and one the server kept is left on `ready` (`seat_kept`).
             ask if !inner.connected => ask.refuse(OFFLINE),
-            ask @ Ask::Join { .. } if inner.media == "down" => ask.refuse(AUDIO_DOWN),
+            ask @ (Ask::Join { .. } | Ask::GroupStart { .. } | Ask::GroupJoin { .. }) if inner.media == "down" => ask.refuse(AUDIO_DOWN),
             ask if inner.queued.len() >= QUEUED => ask.refuse(BUSY),
             ask => {
                 inner.queued.push_back(ask);
@@ -443,6 +475,12 @@ struct Seat {
     leave_direct: Option<(String, String)>,
     /// `call.accepted` was ours: join once this frame has been read.
     join_direct: bool,
+    /// Group calls this socket knows, keyed by the group conversation.
+    groups: HashMap<String, GroupCall>,
+    /// A `call.group.start` we sent and have not heard `call.group.started` for.
+    starting: Option<String>,
+    /// Join this group once the frame that said it started has been read.
+    join_group: Option<String>,
     /// Mute and deafen still to tell, once the direct call has a media session.
     say_state: bool,
     /// A `call.join` for a drop is in flight. Another drop waits for it.
@@ -596,6 +634,9 @@ pub(super) fn keep_live(ctx: &Context, saved: &Saved, live: &Live, timing: &Timi
         leave_direct: None,
         join_direct: false,
         say_state: false,
+        groups: HashMap::new(),
+        starting: None,
+        join_group: None,
     };
     let mut pause = timing.first;
     while !ctx.stopped() {
@@ -783,6 +824,12 @@ enum Asked {
     Watch { sources: Vec<protocol::WatchSource>, epoch: u64 },
     /// `call.cancel`, `call.decline`, or `call.leave` of a direct. A room seat is left alone.
     Direct,
+    /// `call.group.start`. The id is the group. A failure does not clear a room seat.
+    GroupStart(String),
+    /// `call.group.ring` or `call.group.unring`. A failure does not clear a room seat.
+    Group,
+    /// `call.leave` or `call.group.decline` for a group.
+    GroupLeave(String),
 }
 
 fn connect(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &Timing) -> End {
@@ -801,7 +848,7 @@ fn connect(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, timing: &
     for pending in pending {
         if let Some(reply) = pending.reply {
             // A join with audio that never got its answer has a mediad waiting for nothing.
-            if let Asked::Join(room, true, _) = &pending.asked {
+            if let Asked::Join(room, true, _) | Asked::GroupStart(room) = &pending.asked {
                 ctx.call_over(room);
             }
             let _ = reply.send(Err(Refusal::Refused(LOST.to_owned())));
@@ -894,6 +941,12 @@ fn serve(
                         if let Err(err) =
                             join_direct(ctx, saved, live, seat, wire, pending, refs, timing)
                         {
+                            return End::Dropped(err.to_string());
+                        }
+                    }
+                    if let Some(group_id) = seat.join_group.take() {
+                        refs += 1;
+                        if let Err(err) = join_group_now(ctx, saved, live, seat, wire, pending, refs, &group_id, timing) {
                             return End::Dropped(err.to_string());
                         }
                     }
@@ -1097,6 +1150,45 @@ fn serve(
                             reply: Some(reply),
                         });
                         wire.send(json!({"type": "call.kick", "ref": reference, "room_id": room_id, "user_id": user_id}).to_string())
+                    }
+                    Ask::GroupStart { group_id, from_direct, reply } => {
+                        seat.starting = Some(group_id.clone());
+                        ask_group_start(wire, pending, refs, group_id, from_direct, reply, timing)
+                    }
+                    Ask::GroupJoin { group_id, reply } => {
+                        ensure_group(seat, &group_id, "", "");
+                        if let Some(group) = seat.groups.get_mut(&group_id) {
+                            group.joining = true;
+                        }
+                        if live.seats_only() {
+                            ask_group_join(wire, pending, refs, group_id, None, Some(reply), timing)
+                        } else {
+                            match offer_group(ctx, saved, seat, &group_id) {
+                                Ok(sdp) => {
+                                    let sent = ask_group_join(wire, pending, refs, group_id.clone(), Some(sdp), Some(reply), timing);
+                                    ctx.tiny_room(&group_id, DIRECT_CALL_KBPS, false);
+                                    ctx.tiny_video_allowed(&group_id, true);
+                                    sent
+                                }
+                                Err(words) => {
+                                    if let Some(group) = seat.groups.get_mut(&group_id) {
+                                        group.joining = false;
+                                    }
+                                    let _ = reply.send(Err(Refusal::Refused(words.clone())));
+                                    ctx.call_over(&group_id);
+                                    Ok(())
+                                }
+                            }
+                        }
+                    }
+                    Ask::GroupLeave { group_id } => send_group_leave(ctx, wire, pending, refs, seat, &group_id, timing),
+                    Ask::GroupRing { group_id, people, reply } => {
+                        let people = expand_ring(saved, seat, &group_id, people);
+                        ask_group_people(wire, pending, refs, seat, group_id, people, true, reply, timing)
+                    }
+                    Ask::GroupUnring { group_id, people, reply } => {
+                        let people = expand_ring(saved, seat, &group_id, people);
+                        ask_group_people(wire, pending, refs, seat, group_id, people, false, reply, timing)
                     }
                     Ask::Look => Ok(()),
                     Ask::Resume => {
@@ -1490,11 +1582,7 @@ fn apply_room(ctx: &Context, saved: &Saved, seat: &mut Seat, room: &str) {
 fn rejoin(seat: &Seat) -> Option<String> {
     let room = seat.wanted.clone()?;
     // A direct call's shell id is not a room. Joining it again is `join_direct`, not `call.join` of a room.
-    if seat
-        .direct
-        .as_ref()
-        .is_some_and(|direct| direct.direct_id == room)
-    {
+    if seat.direct.as_ref().is_some_and(|direct| direct.direct_id == room) || seat.groups.contains_key(&room) {
         return None;
     }
     let seated = seat
@@ -1518,6 +1606,12 @@ fn rejoin_with(
     room: String,
     timing: &Timing,
 ) -> io::Result<()> {
+    if seat.groups.contains_key(&room) {
+        if let Some(group) = seat.groups.get_mut(&room) {
+            group.joining = false;
+        }
+        return join_group_now(ctx, saved, live, seat, wire, pending, refs, &room, timing);
+    }
     if seat
         .direct
         .as_ref()
@@ -1589,6 +1683,19 @@ fn seat_kept(
         }
         if call_is_down(ctx, &room) {
             resume_media(ctx, seat, pending);
+        }
+        return Ok(());
+    }
+    if seat.groups.contains_key(&room) {
+        if !ctx.in_call(&room) {
+            return send_group_leave(ctx, wire, pending, refs, seat, &room, timing);
+        }
+        let seated = seat.groups.get(&room).is_some_and(|group| group.seated);
+        if !seated {
+            if let Some(group) = seat.groups.get_mut(&room) {
+                group.joining = false;
+            }
+            return join_group_now(ctx, saved, live, seat, wire, pending, refs, &room, timing);
         }
         return Ok(());
     }
@@ -1690,6 +1797,10 @@ struct ReadyFrame {
     /// The direct call this person is seated in. Kept out of `calls`.
     #[serde(default)]
     direct_call: Option<DirectReady>,
+    /// Group calls this person can see. Read row by row: one bad entry leaves the others, and a
+    /// value that is not a list leaves the socket's own record alone.
+    #[serde(default)]
+    group_calls: Value,
 }
 
 #[derive(Deserialize)]
@@ -1759,6 +1870,14 @@ fn heard_frame(
     frame: &Value,
 ) -> Option<End> {
     let kind = text(frame, "type").unwrap_or("");
+    if kind.starts_with("call.group.") {
+        hear_group(ctx, seat, kind, frame);
+        return None;
+    }
+    if text(frame, "room_id").is_some_and(|room| room.starts_with("g:")) {
+        hear_group_media(ctx, seat, kind, frame);
+        return None;
+    }
     if let Some(ring) = text(frame, "room_id").and_then(|room| room.strip_prefix("d:")) {
         if seat.direct.as_ref().is_none_or(|direct| direct.ring_id != ring
             || text(frame, "direct_id").is_some_and(|id| id != direct.direct_id)) {
@@ -1798,10 +1917,14 @@ fn heard_frame(
         "call.left" => {
             if let (Some(room), Some(user)) = (text(frame, "room_id"), text(frame, "user_id")) {
                 if let Some(direct_id) = direct_key(seat, room, frame) {
+                    let reason = text(frame, "reason").unwrap_or("");
                     if user == seat.me {
-                        left(ctx, seat, &direct_id, text(frame, "reason").unwrap_or(""));
+                        left(ctx, seat, &direct_id, reason);
                     }
-                    direct_unseated(ctx, seat, &direct_id, user);
+                    // A move into a group call must keep this seat until `call.group.started` retargets it.
+                    if !(user == seat.me && reason == "moved") {
+                        direct_unseated(ctx, seat, &direct_id, user);
+                    }
                 } else {
                     // `left` first, while this is still our seat: a media blip, or a resume already
                     // underway, can keep it. `unseated` then drops us from the room.
@@ -1996,6 +2119,7 @@ fn ready_heard(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, heard
     }
     // Before `calls` is taken off the frame. A ring here does not start mediad.
     restore_direct(ctx, seat, &heard);
+    restore_groups(ctx, seat, &heard.group_calls);
     let before: Vec<String> = seat.calls.keys().cloned().collect();
     let calls: Vec<CallFrame> = super::rows(heard.calls, "calls").unwrap_or_default();
     seat.calls = calls
@@ -2017,7 +2141,7 @@ fn ready_heard(ctx: &Context, saved: &Saved, live: &Live, seat: &mut Seat, heard
             });
             (call.room_id, people.collect::<Vec<_>>())
         })
-        .filter(|(room, people)| !people.is_empty() && !room.starts_with("d:"))
+        .filter(|(room, people)| !people.is_empty() && !room.starts_with("d:") && !room.starts_with("g:"))
         .collect();
     super::manage::remember(saved, |known| known.seats.clear());
     // A room `ready` no longer lists is told as empty, or as ours alone while our call is up in
@@ -2453,16 +2577,17 @@ fn people_of<'a>(seat: &'a Seat, room: &str) -> &'a [Sitting] {
     {
         return direct.people.as_slice();
     }
+    if let Some(group) = seat.groups.get(room) {
+        return group.people.as_slice();
+    }
     seat.calls.get(room).map(Vec::as_slice).unwrap_or(&[])
 }
 
 /// A direct call is not a voice channel. The page must not gain a join pill for its id.
 fn showed(ctx: &Context, seat: &Seat, room: &str) {
-    if seat
-        .direct
-        .as_ref()
-        .is_some_and(|direct| direct.direct_id == room)
-    {
+    if seat.groups.contains_key(room) {
+        publish_group(ctx, seat, room);
+    } else if seat.direct.as_ref().is_some_and(|direct| direct.direct_id == room) {
         tell_direct(ctx, seat, room);
     } else {
         tell(ctx, seat, room);
@@ -3317,13 +3442,11 @@ fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &
     let answer = if ok {
         match &pending.asked {
             Asked::Join(room, media, _) => {
-                let direct = seat
-                    .direct
-                    .as_ref()
-                    .is_some_and(|direct| direct.direct_id == *room);
+                let direct = seat.direct.as_ref().is_some_and(|direct| direct.direct_id == *room);
+                let group = seat.groups.contains_key(room.as_str());
                 seat.wanted = Some(room.clone());
-                // `last` is the room a move carries the call from. A direct message is not one.
-                if !direct {
+                // `last` is the room a move carries the call from. A direct or a group is not one.
+                if !direct && !group {
                     seat.last = Some(room.clone());
                 }
                 // With audio the answer is `call.answer`, and it goes to mediad first.
@@ -3331,7 +3454,11 @@ fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &
                     seat.call_id = text(frame, "call_id").map(str::to_owned);
                     ctx.tiny_answer(room, sdp.to_owned());
                 }
-                if direct && (seat.muted || seat.deafened) {
+                if group {
+                    note_group_join(seat, room, frame);
+                    publish_group(ctx, seat, room);
+                }
+                if (direct || group) && (seat.muted || seat.deafened) {
                     seat.say_state = true;
                 }
             }
@@ -3345,7 +3472,13 @@ fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &
             | Asked::Moderate
             | Asked::Ring(_, _)
             | Asked::Accept(_, _)
-            | Asked::Direct => {}
+            | Asked::Direct
+            | Asked::GroupStart(_)
+            | Asked::Group => {}
+            Asked::GroupLeave(group) => {
+                let group = group.clone();
+                group_unseat_me(ctx, seat, &group);
+            }
             Asked::Watch { sources, epoch } => {
                 // A newer list may already be the one mediad is on. This ack must not rewind it.
                 keep_watch(ctx, seat, sources, *epoch);
@@ -3364,6 +3497,37 @@ fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &
         Ok(())
     } else {
         let code = text(frame, "code").unwrap_or("");
+        if let Asked::GroupStart(group) = &pending.asked {
+            if seat.starting.as_deref() == Some(group) {
+                seat.starting = None;
+            }
+            let said = group_words(code);
+            if let Some(reply) = pending.reply {
+                let _ = reply.send(Err(Refusal::Refused(said.to_owned())));
+            }
+            return;
+        }
+        if let Asked::Group = &pending.asked {
+            let said = group_words(code);
+            if let Some(reply) = pending.reply {
+                let _ = reply.send(Err(Refusal::Refused(said.to_owned())));
+            }
+            return;
+        }
+        if let Asked::GroupLeave(_) = &pending.asked {
+            return;
+        }
+        if let Asked::Join(room, _, _) = &pending.asked {
+            if seat.groups.contains_key(room.as_str()) {
+                let said = group_words(code).to_owned();
+                let room = room.clone();
+                group_join_refused(ctx, seat, &room);
+                if let Some(reply) = pending.reply {
+                    let _ = reply.send(Err(Refusal::Refused(said)));
+                }
+                return;
+            }
+        }
         let said = words(matches!(pending.asked, Asked::Kick | Asked::Moderate), code);
         if let Asked::Join(room, true, _) = &pending.asked {
             // A join with audio the server refused: its mediad goes. A rejoin that fails is
@@ -3421,7 +3585,9 @@ fn answered(ctx: &Context, seat: &mut Seat, pending: &mut Vec<Pending>, frame: &
         }
         // A rejoin nobody asked for that fails is not tried again. A refused renegotiation
         // leaves the seat. A refused watch keeps the last list the server accepted.
-        if pending.reply.is_none() && !matches!(pending.asked, Asked::Offer | Asked::Direct | Asked::Watch { .. }) {
+        if pending.reply.is_none()
+            && !matches!(pending.asked, Asked::Offer | Asked::Direct | Asked::Watch { .. } | Asked::Group | Asked::GroupStart(_) | Asked::GroupLeave(_))
+        {
             seat.wanted = None;
         }
         Err(Refusal::Refused(said.to_owned()))
@@ -3616,6 +3782,8 @@ mod join_order {
         assert!(join < room, "room settings ran before call.join");
     }
 }
+
+include!("group_call.rs");
 
 #[cfg(test)]
 mod presence_tests {

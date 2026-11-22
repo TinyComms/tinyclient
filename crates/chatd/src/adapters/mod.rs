@@ -3385,6 +3385,16 @@ impl Context {
         self.hub.calls.set_participants(&self.hub, &self.key(conversation_id), participants);
     }
 
+    /// People rung into this call who have not joined.
+    pub fn set_ringing(&self, conversation_id: &str, ringing: Vec<protocol::CallRing>) {
+        self.hub.calls.set_ringing(&self.hub, &self.key(conversation_id), ringing);
+    }
+
+    /// The direct conversation a group call is moving out of.
+    pub fn set_moved_from(&self, conversation_id: &str, moved_from: Option<protocol::Key>) {
+        self.hub.calls.set_moved_from(&self.hub, &self.key(conversation_id), moved_from);
+    }
+
     /// Server-side moderation on our own voice state (server mute, server deafen, suppressed).
     pub fn self_moderation(&self, conversation_id: &str, server_muted: bool, server_deafened: bool, suppressed: bool) {
         self.hub.calls.set_self_moderation(&self.hub, &self.key(conversation_id), server_muted, server_deafened, suppressed);

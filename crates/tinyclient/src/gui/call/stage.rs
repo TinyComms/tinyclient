@@ -646,6 +646,7 @@ mod tests {
             kind: ConversationKind::Direct,
             avatar: None,
             space: None,
+            occupied: 0,
         };
         let joined = sample_call(
             CallState::Joined,

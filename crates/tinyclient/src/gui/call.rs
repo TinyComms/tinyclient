@@ -586,6 +586,8 @@ pub(super) struct Subject {
     pub avatar: Option<MediaFile>,
     /// The Space it is in, by name.
     pub space: Option<String>,
+    /// How many people are in the call already, when the row says so. 0 when it does not.
+    pub occupied: u32,
 }
 
 impl Subject {
@@ -604,12 +606,13 @@ impl Subject {
                 });
                 found.map(|space| space.name.clone())
             });
-            return Subject { title: row.title, kind: row.kind, avatar: row.avatar, space };
+            let occupied = row.occupants.as_ref().map(|inside| inside.total).unwrap_or(0);
+            return Subject { title: row.title, kind: row.kind, avatar: row.avatar, space, occupied };
         }
         // A Tiny room is no conversation: its name is on the server's page.
         if key.network == Network::Tiny {
             if let Some((room, server)) = shell.tiny_room(key) {
-                return Subject { title: room, kind: ConversationKind::Voice, avatar: None, space: Some(server) };
+                return Subject { title: room, kind: ConversationKind::Voice, avatar: None, space: Some(server), occupied: 0 };
             }
         }
         // Not on the first page of the Inbox and not open: say who, from the call itself.
@@ -622,7 +625,7 @@ impl Subject {
             0 | 1 => ConversationKind::Direct,
             _ => ConversationKind::Group,
         };
-        Subject { title, kind, avatar: None, space: None }
+        Subject { title, kind, avatar: None, space: None, occupied: 0 }
     }
 }
 
@@ -662,6 +665,8 @@ fn bare_call(conversation: Key, state: CallState, muted: bool, deafened: bool) -
         share_view: None,
         picture_source: None,
         video_allowed: true,
+        ringing: Vec::new(),
+        moved_from: None,
     }
 }
 
@@ -1446,6 +1451,7 @@ impl Shell {
         let account = call.conversation.account();
         let mut people: Vec<&protocol::Participant> = call.participants.iter().collect();
         people.sort_by_key(|who| (who.ringing, who.name.to_lowercase()));
+        let seated: Vec<&str> = people.iter().map(|who| who.id.as_str()).collect();
         let joined_count = call_people_count(call);
         let noun = if joined_count == 1 { "PERSON" } else { "PEOPLE" };
         let own = super::components::Avatar::named("You", 22.).build();
@@ -1640,7 +1646,68 @@ impl Shell {
                     .into_any_element(),
             );
         }
-        let can_ring_group = call.conversation.network == Network::Discord && subject.kind == ConversationKind::Group;
+        for ring in &call.ringing {
+            if seated.iter().any(|id| *id == ring.id) {
+                continue;
+            }
+            let ringing = ring.state == "ringing";
+            let person = ring.id.clone();
+            let label = match ring.state.as_str() {
+                "declined" => "Declined",
+                "missed" => "Missed",
+                "busy" => "Busy",
+                "unreachable" => "Can't reach them",
+                _ => "Ringing…",
+            };
+            let action = if ringing { "Stop" } else { "Ring again" };
+            rows.push(
+                div()
+                    .id(SharedString::from(format!("call-ring-row-{}", ring.id)))
+                    .w_full()
+                    .h(px(32.))
+                    .flex_none()
+                    .pl(px(12.))
+                    .pr(px(10.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .text_size(px(13.))
+                    .text_color(theme::text_faint())
+                    .child(div().flex_1().min_w_0().truncate().child(ring.name.clone()))
+                    .child(div().flex_none().type_micro().text_color(theme::text_faint()).child(label))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("call-ring-act-{}", ring.id)))
+                            .flex_none()
+                            .px(px(6.))
+                            .h(px(20.))
+                            .rounded(px(6.))
+                            .bg(theme::hover())
+                            .hover(|s| s.bg(theme::danger_soft()).text_color(theme::danger()))
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .type_micro()
+                            .text_color(theme::text_soft())
+                            .tooltip(tip(action, None))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                let request = if ringing {
+                                    Request::CallStopRinging { people: Some(vec![person.clone()]) }
+                                } else {
+                                    Request::CallRing { people: Some(vec![person.clone()]) }
+                                };
+                                this.call_ask(request, cx);
+                            }))
+                            .child(action),
+                    )
+                    .into_any_element(),
+            );
+        }
+        let can_ring_group = subject.kind == ConversationKind::Group
+            && (call.conversation.network == Network::Discord
+                || (call.conversation.network == Network::Tiny
+                    && matches!(call.state, CallState::Joined | CallState::Connecting | CallState::Reconnecting)));
         let can_add_people = call.conversation.network == Network::Discord
             && subject.kind.is_direct()
             && (call.participants.len() + 1) < 10;
