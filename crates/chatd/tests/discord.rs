@@ -5098,6 +5098,9 @@ fn per_server_avatar_and_server_profile() {
     }
 
     // 2. Guild message sender uses mavatar:, while a DM message keeps the global avatar:.
+    // A server channel keeps a live message once its history is stored. Until then a
+    // MESSAGE_CREATE only moves unread state, so open the channel before the push.
+    wait("channel 4101 history", || (world.messages("4101").len() == 3).then_some(()));
     let guild_msg_id = world.incoming(
         "4101",
         Some("4000"),
@@ -5371,20 +5374,19 @@ fn edit_own_profile_avatar_banner_and_server_nickname() {
     }
 
     // 5. SpaceInfo reports can_change_nickname; set and clear server nickname on guild 4000.
-    // Give @everyone CHANGE_NICKNAME (1 << 26 = 67108864) in guild 4000 via ROLE_UPDATE or use a Nitro+perm world.
+    // Ready's @everyone (36769344) cannot change its own name.
+    // CHANGE_NICKNAME is 1 << 26, so the role update sets 36769344 | 67108864.
     world.discord.push(
         "GUILD_ROLE_UPDATE",
         json!({
             "guild_id": "4000",
-            "role": {"id": "4000", "name": "@everyone", "permissions": "1071765638721"}
+            "role": {"id": "4000", "name": "@everyone", "permissions": "103878208"}
         }),
     );
-    sleep(Duration::from_millis(200));
-    let space_info = match world.ask(Request::SpaceInfo { space: world.key("4000") }) {
-        Response::SpaceInfo { info } => info,
-        other => panic!("expected SpaceInfo, got {other:?}"),
-    };
-    assert!(space_info.can_change_nickname);
+    wait("nickname permission on the server", || match world.ask(Request::SpaceInfo { space: world.key("4000") }) {
+        Response::SpaceInfo { info } if info.can_change_nickname => Some(info),
+        _ => None,
+    });
 
     world.discord.script("/guilds/4000/members/@me", 200, json!({"nick": "CrabCaptain"}));
     assert_eq!(
@@ -5457,7 +5459,13 @@ fn recent_mentions_fetch_filter_and_dismiss() {
     assert!(can.mentions_history);
 
     // 2. Fetch mentions: includes normal channel 4101, filters out message request 3005 and NSFW channel 4199.
-    let before_msgs = world.messages("4101").len();
+    // Asking for messages starts a history fetch. Settle that page first, so the count
+    // afterwards only moves if a mention itself was stored.
+    let before = wait("channel 4101 history", || {
+        let messages = world.messages("4101");
+        (messages.len() == 3).then_some(messages)
+    });
+    let before_ids: Vec<String> = before.iter().map(|message| message.id.clone()).collect();
     world.discord.script(
         "/users/@me/mentions",
         200,
@@ -5508,7 +5516,9 @@ fn recent_mentions_fetch_filter_and_dismiss() {
     assert_eq!(reqs.len(), 1);
     assert!(reqs[0].path.contains("limit=25") && reqs[0].path.contains("roles=true") && reqs[0].path.contains("everyone=true"));
     // Mentions must NEVER be written into channel message history.
-    assert_eq!(world.messages("4101").len(), before_msgs);
+    let after = world.messages("4101");
+    assert_eq!(after.len(), before_ids.len());
+    assert!(after.iter().all(|message| before_ids.iter().any(|id| id == &message.id)));
 
     // 3. Paging + filters: everyone=false, roles=false, before, guild_id.
     world.discord.script("/users/@me/mentions", 200, json!([]));
