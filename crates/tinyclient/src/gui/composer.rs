@@ -833,6 +833,10 @@ impl Composer {
         self.drafts.get(key).cloned()
     }
 
+    fn aimed_at(&self, key: &Key) -> bool {
+        self.target.as_ref().is_some_and(|target| target.key == *key)
+    }
+
     /// Writes the field to chatd when this composer is aimed at `key`, and
     /// drops the quiet timer so a later drop cannot cancel the save.
     fn flush_aimed(&mut self, key: &Key, cx: &mut Context<Self>) {
@@ -4133,23 +4137,48 @@ impl Shell {
         div().flex_none().child(composer)
     }
 
-    /// A composer for a conversation window. It opens on the draft the main
-    /// composer holds now, including keystrokes the quiet timer has not saved.
-    /// It owns that draft only while the main window is aimed somewhere else;
-    /// the caller decides that before asking.
-    pub(in crate::gui) fn window_composer(&mut self, open: &Conversation, thread: bool, cx: &mut Context<Self>) -> Entity<Composer> {
+    /// A composer for a conversation window. It opens on the live draft,
+    /// including keystrokes the quiet timer has not saved. `thread` is how it
+    /// posts. `from_side` reads the right-pane thread slot; otherwise the draft
+    /// comes from the main conversation composer. The caller has already
+    /// decided that this window owns the draft.
+    pub(in crate::gui) fn window_composer(
+        &mut self,
+        open: &Conversation,
+        thread: bool,
+        from_side: bool,
+        cx: &mut Context<Self>,
+    ) -> Entity<Composer> {
         let (shell, hub) = (cx.weak_entity(), self.people_state.hub());
         let composer = cx.new(|cx| Composer::new(shell, hub, thread, cx));
-        self.give_live_draft(&composer, &open.key, thread, cx);
+        self.give_live_draft(&composer, &open.key, from_side, cx);
         self.reaim_window_composer(&composer, open, thread, cx);
         self.composer_state.extra.push(composer.clone());
         composer
     }
 
-    /// Copies the draft the main composer holds for `key` onto a window composer
-    /// before that window aims, so the row's older text does not win.
-    fn give_live_draft(&mut self, composer: &Entity<Composer>, key: &Key, thread: bool, cx: &mut Context<Self>) {
-        let Some(source) = self.composer_made(thread) else {
+    /// The main field is on `key`, the side field is, and the main dock
+    /// remembers a draft for it without showing that field.
+    pub(in crate::gui) fn draft_slot_flags(&self, key: &Key, cx: &App) -> (bool, bool, bool) {
+        let look = |slot_thread: bool| {
+            let Some(composer) = self.composer_made(slot_thread) else {
+                return (false, false);
+            };
+            let composer = composer.read(cx);
+            let aimed = composer.aimed_at(key);
+            let remembers = !aimed && composer.held_draft(key, cx).is_some();
+            (aimed, remembers)
+        };
+        let (main_aimed, main_remembers) = look(false);
+        let (side_aimed, _) = look(true);
+        (main_aimed, side_aimed, main_remembers)
+    }
+
+    /// Copies the draft held for `key` onto a window composer before that
+    /// window aims, so the row's older text does not win. `from_side` is the
+    /// right-pane slot; the main conversation composer is the other one.
+    fn give_live_draft(&mut self, composer: &Entity<Composer>, key: &Key, from_side: bool, cx: &mut Context<Self>) {
+        let Some(source) = self.composer_made(from_side) else {
             return;
         };
         if source.entity_id() == composer.entity_id() {
@@ -4167,20 +4196,30 @@ impl Shell {
         slot.get().cloned()
     }
 
-    /// Saves the window composer's draft, gives it to the main composer, and
-    /// drops the window composer. The quiet timer is cancelled by the save.
-    pub(in crate::gui) fn release_window_composer(&mut self, composer: Option<Entity<Composer>>, cx: &mut Context<Self>) {
+    /// Saves the window composer's draft, gives it to the composer that should
+    /// show it, and drops the window composer. The quiet timer is cancelled by
+    /// the save. `to_side` is the right-pane thread slot. The main conversation
+    /// composer is the other one, including when the conversation is a thread
+    /// the main pane opened.
+    pub(in crate::gui) fn release_window_composer(
+        &mut self,
+        composer: Option<Entity<Composer>>,
+        to_side: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(composer) = composer else {
             return;
         };
-        let thread = composer.read(cx).thread;
-        if self.composer_made(thread).as_ref().map(Entity::entity_id) == Some(composer.entity_id()) {
+        // The dock's own composer is not a window composer.
+        let dock = self.composer_made(false).as_ref().map(Entity::entity_id) == Some(composer.entity_id())
+            || self.composer_made(true).as_ref().map(Entity::entity_id) == Some(composer.entity_id());
+        if dock {
             self.drop_composers(&[composer]);
             return;
         }
         let released = composer.update(cx, |composer, cx| composer.release_draft(cx));
         if let Some((key, draft)) = released {
-            let dest = self.composer_in(thread, cx);
+            let dest = self.composer_in(to_side, cx);
             if dest.entity_id() != composer.entity_id() {
                 dest.update(cx, |dest, cx| dest.accept_draft(key, draft, cx));
             }

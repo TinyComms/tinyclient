@@ -71,6 +71,44 @@ pub(in crate::gui) fn composer_for_popout(main_key: Option<&Key>, popout_key: &K
     main_key != Some(popout_key)
 }
 
+/// Who is showing a pop-out's draft. `Main` is the open conversation's field.
+/// `Side` is the right-pane thread. `Window` is the pop-out itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PopoutDraft {
+    Main,
+    Side,
+    Window,
+}
+
+/// A normal window yields only to the open conversation. A thread popped out
+/// of the side pane also yields to that side thread, but the open conversation
+/// wins when that thread is what the main pane shows. The main field is a
+/// different composer from the side-thread slot.
+fn popout_draft_home(open: Option<&Key>, side_thread: Option<&Key>, key: &Key, pane_is_thread: bool) -> PopoutDraft {
+    if open == Some(key) {
+        PopoutDraft::Main
+    } else if pane_is_thread && side_thread == Some(key) {
+        PopoutDraft::Side
+    } else {
+        PopoutDraft::Window
+    }
+}
+
+/// Which slot a thread window copies from when it takes the draft back.
+/// The main field wins when it is still on this conversation: that is the
+/// text the user just had, and a side composer can still be sitting on an
+/// older copy. Otherwise a side composer that is still on the thread. A
+/// remembered main draft is the fallback when neither field is on it.
+fn thread_draft_from_side(main_aimed: bool, side_aimed: bool, main_remembers: bool) -> bool {
+    if main_aimed {
+        false
+    } else if side_aimed {
+        true
+    } else {
+        !main_remembers
+    }
+}
+
 /// Restores `saved` when it is finite and at least half on a display. Otherwise the
 /// bottom-right of the primary display, nudged so a second window is not on top of the first.
 pub(in crate::gui) fn window_frame(saved: Option<Frame>, displays: &[Frame], slot: usize) -> Frame {
@@ -273,20 +311,21 @@ impl Render for ConversationWindow {
             return div().into_any_element();
         };
         let thread_key = self.thread.as_ref().and_then(|pane| pane.read(cx).key().cloned());
-        let (title, service, main_has_draft, thread_has_draft) = {
+        let (title, service, thread_has_draft) = {
             let shell = shell.read(cx);
             let row = shell.conversation_row(&self.key);
             let title = row.as_ref().map(|row| row.title.clone()).unwrap_or_else(|| self.title.clone());
             let service = row.as_ref().is_some_and(|row| row.special == Special::Service);
-            let main_has_draft = !composer_for_popout(shell.open.as_ref(), &self.key);
             let main_thread = shell.main_thread_key(cx);
             let thread_has_draft = thread_key.as_ref().is_some_and(|key| !composer_for_popout(main_thread.as_ref(), key));
-            (title, service, main_has_draft, thread_has_draft)
+            (title, service, thread_has_draft)
         };
+        // The field stays until sync has handed the draft off. Hiding it while
+        // it is still here would claim the main window holds text it does not.
         let draft = if service {
             let network = self.key.network.label();
             Some(self.note(&format!("Only {network} posts here.")))
-        } else if main_has_draft || self.composer.is_none() {
+        } else if self.composer.is_none() {
             Some(self.note("The draft stays in the main window."))
         } else {
             None
@@ -358,7 +397,7 @@ impl Render for ConversationWindow {
                     )
                     .child(div().flex_1().min_h_0().child(self.pane.clone()))
                     .children(draft)
-                    .children(self.composer.clone().filter(|_| !service && !main_has_draft)),
+                    .children(self.composer.clone().filter(|_| !service)),
             )
             .children(thread)
             .into_any_element()
@@ -539,24 +578,28 @@ impl Shell {
         let Some(handle) = self.conversation_state.windows.handle(key) else {
             return;
         };
-        // A window opened on a thread follows the main thread, not the open conversation.
-        let as_thread = self
+        // A thread popped out of the side pane is this window's conversation.
+        // It yields to the open conversation, whose composer is the main field,
+        // and to the right-pane thread when the main pane is somewhere else.
+        // A normal window yields only to the open conversation.
+        let pane_is_thread = self
             .conversation_state
             .windows
             .open
             .iter()
             .find(|live| live.key == *key)
             .is_some_and(|live| live.pane.read(cx).is_thread());
-        let aimed = if as_thread { self.main_thread_key(cx) } else { self.open.clone() };
+        let home = popout_draft_home(self.open.as_ref(), self.main_thread_key(cx).as_ref(), key, pane_is_thread);
         let row = self.conversation_row(key);
         // No list row: a thread window still types. A conversation window does not.
-        let allowed = row.as_ref().map(|row| row.special != Special::Service).unwrap_or(as_thread);
-        let want = allowed && composer_for_popout(aimed.as_ref(), key);
+        let allowed = row.as_ref().map(|row| row.special != Special::Service).unwrap_or(pane_is_thread);
+        let want = allowed && home == PopoutDraft::Window;
         let has = self.conversation_state.windows.open.iter().any(|live| live.key == *key && live.composer.is_some());
-        let open_row = row.clone().or_else(|| as_thread.then(|| bare_thread(key)));
+        let open_row = row.clone().or_else(|| pane_is_thread.then(|| bare_thread(key)));
         if want && !has {
             if let Some(row) = open_row.clone() {
-                let composer = self.window_composer(&row, as_thread, cx);
+                let from_side = self.draft_from_side(key, pane_is_thread, cx);
+                let composer = self.window_composer(&row, pane_is_thread, from_side, cx);
                 if let Some(live) = self.conversation_state.windows.open.iter_mut().find(|live| live.key == *key) {
                     live.composer = Some(composer.clone());
                 }
@@ -581,7 +624,7 @@ impl Shell {
                     .find(|live| live.key == *key)
                     .and_then(|live| live.composer.clone())
                 {
-                    self.reaim_window_composer(&composer, &row, as_thread, cx);
+                    self.reaim_window_composer(&composer, &row, pane_is_thread, cx);
                 }
             }
         }
@@ -610,7 +653,7 @@ impl Shell {
         let has = self.conversation_state.windows.open.iter().any(|live| live.key == *window_key && live.thread_composer.is_some());
         if want && !has {
             let bare = self.thread_row(window_key, thread_key);
-            let composer = self.window_composer(&bare, true, cx);
+            let composer = self.window_composer(&bare, true, true, cx);
             if let Some(live) = self.conversation_state.windows.open.iter_mut().find(|live| live.key == *window_key) {
                 live.thread_composer = Some(composer.clone());
             }
@@ -686,14 +729,14 @@ impl Shell {
             return None;
         }
         let as_thread = thread.is_some();
-        let aimed = if as_thread { self.main_thread_key(cx) } else { self.open.clone() };
+        let home = popout_draft_home(self.open.as_ref(), self.main_thread_key(cx).as_ref(), &key, as_thread);
         let pending_at = self.conversation_state.windows.pending.iter().position(|(pending, _)| pending == &key);
         let restore_pending = pending_at.map(|index| self.conversation_state.windows.pending.remove(index).1);
         let saved = saved.or(restore_pending);
         let frame = window_frame(saved, &screens(cx), self.conversation_state.windows.open.len());
         let title = row.as_ref().map(|row| row.title.clone()).unwrap_or_else(|| "Thread".to_owned());
         let shell = cx.weak_entity();
-        let owns = row.as_ref().map(|row| row.special != Special::Service).unwrap_or(true) && composer_for_popout(aimed.as_ref(), &key);
+        let owns = row.as_ref().map(|row| row.special != Special::Service).unwrap_or(true) && home == PopoutDraft::Window;
         let pane = if let Some(thread) = thread {
             let parent = self.conversation_row(&thread.parent);
             let can = self.snapshot.as_ref().and_then(|snapshot| snapshot.account(&key.account())).map(|status| status.can).unwrap_or_default();
@@ -718,12 +761,13 @@ impl Shell {
                 pane
             })
         };
+        let from_side = self.draft_from_side(&key, as_thread, cx);
         let composer = if owns {
             if let Some(row) = row.as_ref() {
-                Some(self.window_composer(row, as_thread, cx))
+                Some(self.window_composer(row, as_thread, from_side, cx))
             } else {
                 let bare = Conversation::new(key.clone(), ConversationKind::Thread, title.clone());
-                Some(self.window_composer(&bare, true, cx))
+                Some(self.window_composer(&bare, true, from_side, cx))
             }
         } else {
             None
@@ -752,7 +796,9 @@ impl Shell {
         if let Some(frame) = prepared.restore_pending {
             self.conversation_state.windows.pending.push((prepared.key, frame));
         }
-        self.drop_one_composer(prepared.composer, cx);
+        // The window never opened, so the draft goes back to the slot it was copied from.
+        let to_side = self.draft_from_side(&prepared.key, prepared.pane.read(cx).is_thread(), cx);
+        self.drop_one_composer(prepared.composer, to_side, cx);
         cx.notify();
     }
 
@@ -760,12 +806,13 @@ impl Shell {
         let Some(live) = self.conversation_state.windows.take(key) else {
             return;
         };
-        let mut composers = Vec::new();
-        composers.extend(live.composer);
-        composers.extend(live.thread_composer);
-        for composer in composers {
-            self.drop_one_composer(Some(composer), cx);
-        }
+        let pane_is_thread = live.pane.read(cx).is_thread();
+        // Closing while the main pane shows this thread hands the field there.
+        // Anything else a thread window held still parks on the side slot.
+        let to_side = pane_is_thread
+            && popout_draft_home(self.open.as_ref(), self.main_thread_key(cx).as_ref(), key, true) != PopoutDraft::Main;
+        self.release_window_composer(live.composer, to_side, cx);
+        self.release_window_composer(live.thread_composer, true, cx);
         self.sync_watch(cx);
         self.save_prefs(cx);
         cx.notify();
@@ -841,7 +888,7 @@ impl Shell {
             .iter_mut()
             .find(|live| live.key == *window_key)
             .and_then(|live| live.thread_composer.take());
-        self.drop_one_composer(previous, cx);
+        self.drop_one_composer(previous, true, cx);
         if let Some(live) = self.conversation_state.windows.open.iter_mut().find(|live| live.key == *window_key) {
             live.thread = Some(pane.clone());
             live.thread_composer = None;
@@ -863,21 +910,48 @@ impl Shell {
         live.thread = None;
         let composer = live.thread_composer.take();
         drop(live);
-        self.drop_one_composer(composer, cx);
+        self.drop_one_composer(composer, true, cx);
         cx.notify();
     }
 
-    fn drop_window_composer(&mut self, key: &Key, thread: bool, cx: &mut Context<Self>) {
+    fn drop_window_composer(&mut self, key: &Key, nested: bool, cx: &mut Context<Self>) {
+        // A thread inside a conversation window always returns to the side slot.
+        // The window's own composer returns there only when the right pane is
+        // the one taking a popped-out thread. The open conversation's field is
+        // the main composer, even when that conversation is the thread.
+        let to_side = if nested { true } else { self.primary_returns_to_side(key, cx) };
         let Some(live) = self.conversation_state.windows.open.iter_mut().find(|live| live.key == *key) else {
             return;
         };
-        let composer = if thread { live.thread_composer.take() } else { live.composer.take() };
+        let composer = if nested { live.thread_composer.take() } else { live.composer.take() };
         drop(live);
-        self.drop_one_composer(composer, cx);
+        self.drop_one_composer(composer, to_side, cx);
     }
 
-    fn drop_one_composer(&mut self, composer: Option<Entity<Composer>>, cx: &mut Context<Self>) {
-        self.release_window_composer(composer, cx);
+    /// The right-pane slot, when this popped-out thread is not the open conversation.
+    fn primary_returns_to_side(&self, key: &Key, cx: &App) -> bool {
+        let pane_is_thread = self
+            .conversation_state
+            .windows
+            .open
+            .iter()
+            .find(|live| live.key == *key)
+            .is_some_and(|live| live.pane.read(cx).is_thread());
+        pane_is_thread && popout_draft_home(self.open.as_ref(), self.main_thread_key(cx).as_ref(), key, true) != PopoutDraft::Main
+    }
+
+    /// A thread window copies the side slot when that field is the one still
+    /// holding the thread. A normal window always copies the main composer.
+    fn draft_from_side(&self, key: &Key, pane_is_thread: bool, cx: &App) -> bool {
+        if !pane_is_thread {
+            return false;
+        }
+        let (main_aimed, side_aimed, main_remembers) = self.draft_slot_flags(key, cx);
+        thread_draft_from_side(main_aimed, side_aimed, main_remembers)
+    }
+
+    fn drop_one_composer(&mut self, composer: Option<Entity<Composer>>, to_side: bool, cx: &mut Context<Self>) {
+        self.release_window_composer(composer, to_side, cx);
     }
 }
 
@@ -942,6 +1016,28 @@ mod tests {
         assert!(!composer_for_popout(Some(&main), &main));
         assert!(composer_for_popout(Some(&main), &other));
         assert!(composer_for_popout(None, &other));
+    }
+
+    #[test]
+    fn a_popped_out_thread_gives_its_draft_to_the_open_conversation() {
+        let thread = key("thread");
+        let parent = key("parent");
+        let other = key("other");
+        assert_eq!(popout_draft_home(Some(&thread), None, &thread, true), PopoutDraft::Main);
+        assert_eq!(popout_draft_home(Some(&thread), Some(&thread), &thread, true), PopoutDraft::Main);
+        assert_eq!(popout_draft_home(Some(&parent), Some(&thread), &thread, true), PopoutDraft::Side);
+        assert_eq!(popout_draft_home(Some(&parent), None, &thread, true), PopoutDraft::Window);
+        assert_eq!(popout_draft_home(Some(&other), Some(&other), &thread, true), PopoutDraft::Window);
+        assert_eq!(popout_draft_home(Some(&parent), Some(&parent), &parent, false), PopoutDraft::Main);
+        assert_eq!(popout_draft_home(Some(&other), Some(&parent), &parent, false), PopoutDraft::Window);
+    }
+
+    #[test]
+    fn a_thread_window_takes_the_draft_back_from_the_main_field() {
+        assert!(!thread_draft_from_side(true, true, false), "the main field is what was just on screen");
+        assert!(thread_draft_from_side(false, true, true), "the right pane still has the thread");
+        assert!(!thread_draft_from_side(false, false, true));
+        assert!(thread_draft_from_side(false, false, false));
     }
 
     #[test]
