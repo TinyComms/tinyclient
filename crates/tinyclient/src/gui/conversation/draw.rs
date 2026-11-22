@@ -61,6 +61,42 @@ fn translation_attribution(translation: &protocol::Translation) -> String {
     }
 }
 
+fn message_label(message: &Message, hidden: bool) -> String {
+    let sender = if message.outgoing { "You" } else if message.sender.name.is_empty() {
+        "Unknown sender"
+    } else { &message.sender.name };
+    let mut parts = vec![sender.to_owned(), short_clock(message.sent)];
+    if message.deleted {
+        parts.push("Message deleted".into());
+    } else if hidden {
+        parts.push("Message hidden".into());
+    } else {
+        if message.spans.iter().any(|span| matches!(span.style, protocol::Style::Spoiler)) {
+            parts.push("Message contains a spoiler".into());
+        } else if !message.text.trim().is_empty() {
+            parts.push(message.text.clone());
+        }
+        parts.extend(message.attachments.iter().map(|file| {
+            if file.spoiler || file.view_once { "Hidden attachment".into() }
+            else if !file.alt.is_empty() { format!("Attachment: {}", file.alt) }
+            else if !file.name.is_empty() { format!("Attachment: {}", file.name) }
+            else { "Attachment".into() }
+        }));
+        parts.extend(message.reactions.iter().map(|reaction| format!("{} {}", reaction.count, reaction.emoji)));
+    }
+    parts.join(", ")
+}
+
+#[test]
+fn a_hidden_message_label_does_not_include_its_contents() {
+    let message = Message::plain("m1", "Nadia", "Private words", 0, false);
+    assert!(message_label(&message, false).contains("Private words"));
+    let hidden = message_label(&message, true);
+    assert!(hidden.starts_with("Nadia, "));
+    assert!(hidden.ends_with("Message hidden"));
+    assert!(!hidden.contains("Private words"));
+}
+
 fn poll_percentage(count: u32, total: u32) -> u32 {
     if total == 0 {
         return 0;
@@ -1361,8 +1397,33 @@ impl Pane {
             .children(self.ephemeral_note(message, cx));
 
         let menu = message.clone();
+        let keyboard_menu = message.clone();
+        let can = self.can(message);
         let inner = div()
             .id(name_id("m", &message.id))
+            .role(gpui::Role::ListItem)
+            .aria_label(message_label(message, blocked_hidden || sensitive_hidden))
+            .tab_index(0)
+            .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
+            .when(can.act || can.unsent, |row| {
+                let pane = cx.weak_entity();
+                let message = message.clone();
+                row.aria_description("Press Enter to open message actions")
+                    .on_a11y_action(gpui::AccessibleAction::Click, move |_, window, cx| {
+                        let _ = pane.update(cx, |this, cx| {
+                            this.open_menu(message.clone(), this.list.viewport_bounds().center(), window, cx);
+                        });
+                    })
+            })
+            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                if event.is_keyboard() {
+                    let can = this.can(&keyboard_menu);
+                    if can.act || can.unsent {
+                        this.open_menu(keyboard_menu.clone(), event.position(), window, cx);
+                        cx.stop_propagation();
+                    }
+                }
+            }))
             .group("row")
             .relative()
             .px(px(metrics.inset))

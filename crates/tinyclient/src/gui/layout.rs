@@ -273,6 +273,8 @@ impl Shell {
         let width = f32::from(window.viewport_size().width);
         plan(width, state.sidebar_width, state.sidebar_hidden, None).sidebar.is_none().then(|| {
             icon_button("panel", "icons/panel-left.svg", state.floating)
+                .aria_label("Show sidebar")
+                .aria_expanded(state.floating)
                 .size(px(24.))
                 .tooltip(tip("Show sidebar", Some("⌘\\")))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -289,6 +291,9 @@ impl Shell {
                 if back { ("travel-back", "icons/arrow-left.svg", "Back", "⌘[") } else { ("travel-forward", "icons/arrow-right.svg", "Forward", "⌘]") };
             let can = self.can_travel(back);
             icon_button(id, icon, false)
+                .aria_label(words)
+                .aria_disabled(!can)
+                .tab_stop(can)
                 .size(px(24.))
                 .when(!can, |button| button.opacity(0.4).cursor_default())
                 .tooltip(tip(words, Some(keys)))
@@ -2037,6 +2042,25 @@ fn items_id(account: &str) -> usize {
     account.bytes().fold(0usize, |hash, byte| hash.wrapping_mul(31).wrapping_add(byte as usize))
 }
 
+fn call_status(state: Option<&CallState>) -> &'static str {
+    match state {
+        None => "No active call",
+        Some(CallState::RingingIn { .. }) => "Incoming call",
+        Some(CallState::RingingOut) => "Calling",
+        Some(CallState::Connecting) => "Connecting call",
+        Some(CallState::Joined) => "Call connected",
+        Some(CallState::Reconnecting) => "Reconnecting call",
+        Some(CallState::Failed { .. }) => "Call failed",
+    }
+}
+
+#[test]
+fn a_reconnecting_call_changes_the_announced_status() {
+    assert_eq!(call_status(Some(&CallState::Joined)), "Call connected");
+    assert_eq!(call_status(Some(&CallState::Reconnecting)), "Reconnecting call");
+    assert_eq!(call_status(None), "No active call");
+}
+
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // `TINYCLIENT_FRAMES=1` counts the window's frames, to see that an idle one draws none.
@@ -2134,6 +2158,10 @@ impl Render for Shell {
                 &placeholder
             }
         };
+        let root = root.child(super::components::live_status(
+            "call-state-status",
+            call_status(self.call_shown(snapshot).as_ref().map(|call| &call.state)),
+        ));
         // While the keychain is still being read, accounts arrive one network at a time: the
         // first-launch screen waits until it is done.
         let settled = !self.service.keychain.reading && self.shown().empty_state().is_none();

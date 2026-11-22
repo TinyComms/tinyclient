@@ -244,18 +244,17 @@ impl Shell {
         cx.stop_propagation();
     }
 
-    /// `tab` and `shift-tab`: the keys move between the sidebar's list and the composer. The
-    /// region that has them shows it on its row or its field, never around a pane.
-    // The messages and the right pane are the conversation view's; they take the keys by click.
+    /// Follow the rendered tab order, including the rail and toolbar controls.
     fn focus_region(&mut self, forward: bool, window: &mut gpui::Window, cx: &mut Context<Self>) {
-        let _ = forward;
-        if self.in_lists(window) && self.open.is_some() {
-            self.composer_focus(window, cx);
-            return;
+        if forward {
+            window.focus_next(cx);
+        } else {
+            window.focus_prev(cx);
         }
-        window.focus(&self.sidebar_state.focus, cx);
-        self.cursor_to_open();
-        cx.notify();
+        if self.sidebar_state.focus.is_focused(window) {
+            self.cursor_to_open();
+            cx.notify();
+        }
     }
 
     /// The window's keys, on its root so they work wherever focus is. A text field's own keys
@@ -299,23 +298,39 @@ impl Shell {
             .on_action(cx.listener(|this, _: &PreviousRow, _, cx| this.walk(false, cx)))
             .on_action(cx.listener(|this, _: &NextUnread, _, cx| this.walk_unread(true, cx)))
             .on_action(cx.listener(|this, _: &PreviousUnread, _, cx| this.walk_unread(false, cx)))
-            .on_action(cx.listener(|this, _: &ListDown, _, cx| {
+            .on_action(cx.listener(|this, _: &ListDown, window, cx| {
+                if !this.in_lists(window) {
+                    cx.propagate();
+                    return;
+                }
                 if !this.first_run_key("down", cx) {
                     this.move_cursor(true, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &ListUp, _, cx| {
+            .on_action(cx.listener(|this, _: &ListUp, window, cx| {
+                if !this.in_lists(window) {
+                    cx.propagate();
+                    return;
+                }
                 if !this.first_run_key("up", cx) {
                     this.move_cursor(false, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &ListOpen, window, cx| {
+                if !this.in_lists(window) {
+                    cx.propagate();
+                    return;
+                }
                 if !this.first_run_key("enter", cx) {
                     this.open_cursor(window, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &ListFold, _, cx| this.fold_cursor(false, cx)))
-            .on_action(cx.listener(|this, _: &ListUnfold, _, cx| this.fold_cursor(true, cx)))
+            .on_action(cx.listener(|this, _: &ListFold, window, cx| {
+                if this.in_lists(window) { this.fold_cursor(false, cx); } else { cx.propagate(); }
+            }))
+            .on_action(cx.listener(|this, _: &ListUnfold, window, cx| {
+                if this.in_lists(window) { this.fold_cursor(true, cx); } else { cx.propagate(); }
+            }))
             .on_action(cx.listener(|this, _: &NewMessage, window, cx| this.open_switcher("@", window, cx)))
             .on_action(cx.listener(|this, _: &AddAccount, _, cx| this.open_menu(layout::Menu::Add, cx)))
             .on_action(cx.listener(|this, _: &BiggerText, window, cx| this.step_text(Some(1), window, cx)))

@@ -55,6 +55,10 @@ impl Shell {
             let conversation = open.key.clone();
             div()
                 .id("phone-encryption")
+                .role(gpui::Role::Button)
+                .aria_label(format!("Encryption: {}", phone_words(open.encryption)))
+                .tab_index(0)
+                .focus_visible(|style| style.shadow(theme::focus_ring_inset()))
                 .flex_1()
                 .min_w_0()
                 .flex()
@@ -74,8 +78,10 @@ impl Shell {
         let action = |id: &'static str, icon: &'static str| {
             icon_button(id, icon, false).size(px(tokens::TOUCH)).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         };
-        let members = (!direct).then(|| action("phone-members", "icons/users.svg").on_click(cx.listener(|this, _, _, cx| this.toggle_member_list(cx))));
+        let members = (!direct).then(|| action("phone-members", "icons/users.svg").aria_label("Members")
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_member_list(cx))));
         let details = action("phone-details", if direct { "icons/user.svg" } else { "icons/info.svg" })
+            .aria_label(if direct { "Profile details" } else { "Conversation details" })
             .on_click(cx.listener(|this, _, _, cx| this.toggle_details(cx)));
         let strip = div()
             .flex_none()
@@ -89,6 +95,7 @@ impl Shell {
             .border_color(theme::hairline())
             .child(
                 icon_button("phone-back", "icons/chevron-left.svg", false)
+                    .aria_label("Back to conversations")
                     .size(px(tokens::TOUCH))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -109,7 +116,8 @@ impl Shell {
                             .items_center()
                             .gap(px(6.))
                             .children(mixed.then(|| div().flex_none().child(network_icon(open.key.network, 14.))))
-                            .child(div().min_w_0().truncate().phone_title().child(open.title.clone())),
+                            .child(div().id("phone-conversation-title").role(gpui::Role::Heading).aria_label(open.title.clone())
+                                .min_w_0().truncate().phone_title().child(open.title.clone())),
                     )
                     // One line under the title: where it is, then whether it is encrypted.
                     .when(subtitle.is_some() || encryption.is_some(), |column| {

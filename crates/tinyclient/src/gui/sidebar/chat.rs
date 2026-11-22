@@ -428,7 +428,18 @@ impl Shell {
                     ),
             );
         let (picked, menu_row) = (c.clone(), c.clone());
-        let row = list_row(row_id(id, &c.key), theme::row_height(theme::ROW_TWO), selected, focused, content);
+        let accessible = c.clone();
+        let row = list_row(row_id(id, &c.key), theme::row_height(theme::ROW_TWO), selected, focused, content)
+            .role(gpui::Role::ListItem)
+            .aria_label(conversation_label(c))
+            .aria_selected(selected)
+            .when(focused, |row| row.aria_active_descendant())
+            .on_a11y_action(gpui::AccessibleAction::Click, {
+                let shell = cx.weak_entity();
+                move |_, _, cx| {
+                    let _ = shell.update(cx, |this, cx| this.pick_row(&accessible, cx));
+                }
+            });
         let row = if crate::gui::phone::active() {
             let token = crate::gui::phone::token(&[id, picked.key.network.label(), &picked.key.account, &picked.key.id]);
             self.tap(row, token, Some(picked.clone()), move |this, _, cx| this.pick_row(&picked, cx), cx)
@@ -472,6 +483,30 @@ impl Shell {
             .children(trailing);
         list_row(id, theme::row_height(theme::ROW_ONE), false, focused, content)
     }
+}
+
+fn conversation_label(conversation: &Conversation) -> String {
+    let mut label = conversation.title.clone();
+    match conversation.unread {
+        0 => {}
+        1 => label.push_str(", 1 unread message"),
+        count => label.push_str(&format!(", {count} unread messages")),
+    }
+    if conversation.muted {
+        label.push_str(", muted");
+    }
+    label
+}
+
+#[test]
+fn a_muted_conversation_still_announces_its_unread_count() {
+    let key = Key { network: Network::Telegram, account: "me".into(), id: "c".into() };
+    let mut room = Conversation::new(key, ConversationKind::Group, "Fernhill");
+    room.muted = true;
+    room.unread = 2;
+    assert_eq!(conversation_label(&room), "Fernhill, 2 unread messages, muted");
+    room.unread = 1;
+    assert_eq!(conversation_label(&room), "Fernhill, 1 unread message, muted");
 }
 
 /// The lab's telegram-mute-bell driver (`03` §4): a muted Telegram row draws the bell-off beside
