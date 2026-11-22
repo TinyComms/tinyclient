@@ -3112,7 +3112,8 @@ fn activity_feed_pages_filters_marks_read_and_handles_live_push() {
     let account = key(GENERAL).account();
     assert!(world.account(HOME).can.activity_feed);
 
-    // 1. First page returns mentions and reactions with a cursor to page 2.
+    // 1. The first page is the whole stream: mentions, a reaction, a reply, a missed
+    // call, and an invite, with a cursor to the next page.
     let (items, cursor) = match world.ask(Request::ActivityFeed {
         account: account.clone(),
         kind: None,
@@ -3122,13 +3123,16 @@ fn activity_feed_pages_filters_marks_read_and_handles_live_push() {
         Response::ActivityFeed { items, cursor } => (items, cursor),
         other => panic!("unexpected: {other:?}"),
     };
-    assert_eq!(items.len(), 3);
+    assert_eq!(items.len(), 6);
     assert_eq!(items[0].kind, protocol::ActivityItemKind::Mention);
     assert_eq!(items[0].conversation, key("19:grp1@thread.v2"));
     assert_eq!(items[0].message_id, "1759600000000");
     assert_eq!(items[0].actor, "Ben Okafor");
     assert!(items[0].unread);
     assert_eq!(items[2].kind, protocol::ActivityItemKind::Reaction);
+    assert_eq!(items[3].kind, protocol::ActivityItemKind::ThreadReply);
+    assert_eq!(items[4].kind, protocol::ActivityItemKind::MissedCall);
+    assert_eq!(items[5].kind, protocol::ActivityItemKind::Invite);
     assert_eq!(cursor.as_deref(), Some("actpage2"));
 
     // 2. Second page via cursor returns missed call and thread reply (pointing at the reply chain).
