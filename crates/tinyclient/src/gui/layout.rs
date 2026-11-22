@@ -551,6 +551,14 @@ impl Shell {
             })
             // Beside the conversation nothing leads the strip, so the close does.
             .when(!replaces, |row| row.child(close))
+            .when(pane.kind == RightKind::Thread && !super::phone::active() && self.thread_is_open(), |row| {
+                row.child(
+                    icon_button("open-thread-window", "icons/picture-in-picture-2.svg", false)
+                        .tooltip(tip("Open in New Window", None))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|this, _, _, cx| this.pop_out_open_thread(cx))),
+                )
+            })
             .child(title);
         let strip = drags_window(div())
             .relative()
@@ -1106,6 +1114,7 @@ impl Shell {
                 }
                 // A phone has no Return key to name.
                 let keys = if super::phone::active() { None } else { Some("↵") };
+                let window_key = unpinned.key.clone();
                 items.push(
                     menu_item("open", Some(NO_GLYPH), "Open", keys)
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -1114,6 +1123,16 @@ impl Shell {
                         }))
                         .into_any_element(),
                 );
+                if !super::phone::active() {
+                    items.push(
+                        menu_item("open-window", Some("icons/picture-in-picture-2.svg"), "Open in New Window", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.pop_out_conversation(window_key.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
                 if conversation.kind.is_direct() {
                     let row = (**conversation).clone();
                     items.push(menu_separator().into_any_element());

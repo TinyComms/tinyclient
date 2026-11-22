@@ -480,6 +480,8 @@ impl Shell {
             if let Some(snapshot) = &mut self.snapshot {
                 snapshot.open = None;
             }
+            // The open conversation may already be a window with no composer.
+            self.sync_popout_composers(cx);
         }
         if self.sidebar_state.mode == mode {
             let state = &mut self.sidebar_state;
@@ -584,6 +586,7 @@ impl Shell {
                 if let Some(snapshot) = &mut self.snapshot {
                     snapshot.open = None;
                 }
+                self.sync_popout_composers(cx);
             }
             self.tiny_pick_channel(there.tiny_channel, cx);
         }
@@ -1423,7 +1426,7 @@ impl Shell {
                     (count, false) => Some(super::components::badge_count_unread(count)),
                 };
                 self.action_row(("unreads", ix), Some("icons/inbox.svg"), "Unreads".into(), *count > 0, trailing, focused)
-                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, cx| this.activate(ix, cx), cx))
+                    .map(|row| self.tap(row, super::phone::token(&["tree", &ix.to_string()]), None, move |this, _, cx| this.activate(ix, cx), cx))
             }
             Row::Threads { count, mention, .. } => {
                 let trailing = match (*count, *mention) {
@@ -1656,6 +1659,14 @@ impl Shell {
                     MouseButton::Left,
                     // A voice row joins on a double-click; a single click only opens its chat.
                     cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                        if crate::gui::conversation::modifier_click(event.click_count, event.modifiers) {
+                            this.pop_out_conversation(picked.key.clone(), cx);
+                            return;
+                        }
+                        // The first press of that double-click must not open the row.
+                        if !crate::gui::conversation::press_opens_row(crate::gui::conversation::modifier_held(event.modifiers)) {
+                            return;
+                        }
                         if join && event.click_count == 2 {
                             this.call_start(picked.key.clone(), cx);
                         } else {

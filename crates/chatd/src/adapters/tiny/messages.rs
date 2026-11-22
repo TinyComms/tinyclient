@@ -215,9 +215,7 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         row.group = Some("directs".to_owned());
         row.peer = Some(direct.peer.user_id.clone());
         row.position = DIRECTS_AT + index as i32;
-        if callable {
-            row.call = CallSupport::Native;
-        }
+        row.call = direct_call(callable);
         row.can_pin = has_pins;
         row.rights.pin = has_pins;
         if blocked_ids.contains(&direct.peer.user_id) {
@@ -263,7 +261,7 @@ pub(crate) fn publish(ctx: &Context, saved: &Saved, names: &HashMap<String, Stri
         row.space = Some(SPACE.to_owned());
         row.group = Some("rooms".to_owned());
         row.position = ROOMS_AT + index as i32;
-        row.call = CallSupport::Native;
+        row.call = room_call();
         rows.push(row);
     }
     rows.extend(surviving_rooms);
@@ -843,7 +841,7 @@ fn direct_upsert(ctx: &Context, saved: &Saved, names: &HashMap<String, String>, 
     row.group = Some("directs".to_owned());
     row.peer = Some(direct.peer.user_id.clone());
     row.position = DIRECTS_AT;
-    row.call = if directs_callable(saved) { CallSupport::Native } else { CallSupport::None };
+    row.call = direct_call(directs_callable(saved));
     // A replayed creation predates any later upgrade. It can add encryption, never remove it.
     let kept = if paired { ctx.known(&direct.id).ok().flatten().map(|row| row.encryption) } else { None };
     let sealed = direct.e2ee || kept.is_some_and(|encryption| encryption.is_sealed());
@@ -2938,7 +2936,7 @@ fn start_direct_intent(ctx: &Context, saved: &Saved, person_id: &str, call: bool
                 row.group = Some("directs".to_owned());
                 row.peer = Some(person_id.to_owned());
                 row.position = DIRECTS_AT;
-                row.call = if directs_callable(saved) { CallSupport::Native } else { CallSupport::None };
+                row.call = direct_call(directs_callable(saved));
                 row.encryption = encryption_of(saved, id, encrypted, false);
                 let _ = ctx.conversation(&row);
                 let _ = ctx.counts(id, 0, 0, None, 1);
@@ -3406,42 +3404,105 @@ struct UploadLimits {
     archives: bool,
 }
 
+struct CapInput {
+    max_file_bytes: u64,
+    direct_calls: bool,
+    file_scan: bool,
+    allow_archives: bool,
+    abuse_reports: bool,
+    mention_spans: bool,
+    custom_emoji: bool,
+    stickers: bool,
+    suppress_embeds: bool,
+    threads: bool,
+    pins: bool,
+    search: bool,
+    blocks: bool,
+    presence_status: bool,
+}
+
+fn capabilities_from(input: CapInput) -> Capabilities {
+    Capabilities {
+        max_file_bytes: input.max_file_bytes,
+        max_files: protocol::ATTACHMENTS_LIMIT as u32,
+        direct_calls: input.direct_calls,
+        file_scan: input.file_scan,
+        allow_archives: input.allow_archives,
+        abuse_reports: input.abuse_reports,
+        voice_notes: input.max_file_bytes > 0,
+        mention_spans: input.mention_spans,
+        custom_emoji: if input.custom_emoji { protocol::EmojiScope::Space } else { protocol::EmojiScope::None },
+        stickers: input.stickers,
+        suppress_embeds: input.suppress_embeds,
+        threads: input.threads,
+        reply: true,
+        edit: true,
+        delete: true,
+        pins: input.pins,
+        search: input.search,
+        blocks: input.blocks,
+        reactions: true,
+        gif_file: true,
+        presence_status: input.presence_status,
+        profile_avatar: true,
+        ..Capabilities::default()
+    }
+}
+
 /// What this account may send. `file_scan` is absent on an older server, which keeps today's upload.
 fn account_caps(saved: &Saved) -> Capabilities {
     let limits = upload_limits(saved);
     let server_caps = super::manage::capabilities_of(saved);
     let scans = server_caps.has(protocol::TINY_FEATURE_FILE_SCAN);
-    let max_file_bytes = limits.image.max(limits.file);
-    let presence_status = server_caps.has(protocol::TINY_FEATURE_PRESENCE_STATUS);
-    Capabilities {
-        max_file_bytes,
-        max_files: protocol::ATTACHMENTS_LIMIT as u32,
+    capabilities_from(CapInput {
+        max_file_bytes: limits.image.max(limits.file),
         direct_calls: directs_callable(saved),
         file_scan: scans,
         allow_archives: scans && limits.archives,
         abuse_reports: server_caps.has(protocol::TINY_FEATURE_ABUSE_REPORTS),
-        voice_notes: max_file_bytes > 0,
         mention_spans: server_caps.has(protocol::TINY_FEATURE_MENTIONS),
-        custom_emoji: if server_caps.has(protocol::TINY_FEATURE_CUSTOM_EMOJI) {
-            protocol::EmojiScope::Space
-        } else {
-            protocol::EmojiScope::None
-        },
+        custom_emoji: server_caps.has(protocol::TINY_FEATURE_CUSTOM_EMOJI),
         stickers: server_caps.has(protocol::TINY_FEATURE_STICKERS),
         suppress_embeds: server_caps.has(protocol::TINY_FEATURE_LINK_PREVIEWS),
         threads: server_caps.has(protocol::TINY_FEATURE_THREADS),
-        reply: true,
-        edit: true,
-        delete: true,
         pins: server_caps.has(protocol::TINY_FEATURE_PINS),
         search: server_caps.has(protocol::TINY_FEATURE_MESSAGE_SEARCH),
         blocks: server_caps.has(protocol::TINY_FEATURE_BLOCKS),
-        reactions: true,
-        gif_file: true,
-        presence_status,
-        profile_avatar: true,
-        ..Capabilities::default()
-    }
+        presence_status: server_caps.has(protocol::TINY_FEATURE_PRESENCE_STATUS),
+    })
+}
+
+/// Every client-honored flag on, at the default upload caps. Not one server's answer.
+pub(crate) fn capability_ceiling() -> Capabilities {
+    capabilities_from(CapInput {
+        max_file_bytes: protocol::TINY_FILE_MAX_DEFAULT.max(protocol::TINY_IMAGE_MAX_DEFAULT) as u64,
+        direct_calls: true,
+        file_scan: true,
+        allow_archives: true,
+        abuse_reports: true,
+        mention_spans: true,
+        custom_emoji: true,
+        stickers: true,
+        suppress_embeds: true,
+        threads: true,
+        pins: true,
+        search: true,
+        blocks: true,
+        presence_status: true,
+    })
+}
+
+pub(crate) fn direct_call(callable: bool) -> CallSupport {
+    if callable { CallSupport::Native } else { CallSupport::None }
+}
+
+pub(crate) fn room_call() -> CallSupport {
+    CallSupport::Native
+}
+
+/// A group conversation has no call button. Directs and rooms do.
+pub(crate) fn group_offer() -> protocol::CallOffer {
+    protocol::CallOffer::Missing
 }
 
 /// The caps `GET /v1/server` reports. An older server, or one that does not answer, keeps the original 8 MiB and 25 MiB.

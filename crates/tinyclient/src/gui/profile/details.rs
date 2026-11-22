@@ -571,7 +571,7 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                 let id = id.clone();
                 actions = actions.child(button(("details-meeting-rsvp", slot), ButtonKind::Ghost, label).on_click(cx.listener(move |pane, _, _, cx| {
                     pane.note_meeting_response(response);
-                    crate::gui::people::ask_later(cx, Request::MeetingRsvp { account, id, response, propose }, |_, _| {});
+                    crate::gui::people::ask_later(cx, Request::MeetingRsvp { account: account.clone(), id: id.clone(), response, propose }, |_, _| {});
                 })));
             }
         }

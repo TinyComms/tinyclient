@@ -683,7 +683,9 @@ mod tests {
     #[test]
     fn stage_of_room_draws_a_room_i_am_not_in() {
         let account = AccountKey { network: Network::Tiny, account: "srv".into() };
-        let mut community = TinyCommunity::default();
+        // TinyCommunity has no Default: read an empty one the way the wire gives it.
+        let mut community: TinyCommunity =
+            serde_json::from_value(serde_json::json!({"role": "", "members": [], "invites": [], "audit": []})).unwrap();
         community.me = "me".into();
         community.members = vec![
             TinyMember { user_id: "ada".into(), display_name: "Ada".into(), ..TinyMember::default() },

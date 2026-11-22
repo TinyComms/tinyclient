@@ -19,6 +19,7 @@ mod rich;
 mod rows;
 #[cfg(feature = "gui-shot")]
 mod shot;
+mod popout;
 mod side;
 mod text;
 mod tokens;
@@ -29,6 +30,7 @@ mod wiki;
 use protocol::highlight;
 
 pub(in crate::gui) use player::glyph as player_glyph;
+pub(in crate::gui) use popout::{modifier_click, modifier_held, press_opens_row};
 
 
 use super::components::empty_state;
@@ -64,6 +66,8 @@ pub struct State {
     listening: OnceCell<Subscription>,
     following: OnceCell<Subscription>,
     side: side::Side,
+    /// Conversations the user opened in their own windows.
+    pub(in crate::gui) windows: popout::Windows,
 }
 
 /// How often the network is told how far the user has read, at most.
@@ -160,6 +164,8 @@ struct Open {
     topic: String,
     /// True when this conversation is with a bot/app (enables Home / Messages / About tabs on Slack).
     bot: bool,
+    /// True when the conversation is end-to-end encrypted (`Encryption::is_sealed()`).
+    encrypted: bool,
     #[cfg_attr(not(feature = "gui-shot"), allow(dead_code))]
     started: Instant,
 }
@@ -257,20 +263,6 @@ pub(super) struct OpenSelect {
     pub selected: Option<String>,
     pub confirm: Option<protocol::ConfirmDialog>,
     pub at: Point<Pixels>,
-}
-
-/// Infers a short BCP-47 primary language tag from the process locale, defaulting to `"en"`.
-fn system_translate_lang() -> String {
-    for var in ["LC_ALL", "LC_MESSAGES", "LANG"] {
-        if let Ok(raw) = std::env::var(var) {
-            let head = raw.split(['.', '@']).next().unwrap_or("").replace('_', "-");
-            let primary = head.split('-').next().unwrap_or("");
-            if protocol::settings::valid_language_tag(primary) {
-                return primary.to_ascii_lowercase();
-            }
-        }
-    }
-    "en".to_owned()
 }
 
 /// The one rule for telling the network how far the user has read: a real window that is
@@ -448,6 +440,11 @@ pub struct Pane {
     unread_jumps_for: Option<Key>,
     unread_mention_ids: Vec<String>,
     unread_reaction_ids: Vec<String>,
+    /// On-demand inline translations for messages in the open conversation, keyed by `message_id`.
+    /// Never written to stored message history; cleared when switching conversations.
+    translations: HashMap<String, protocol::Translation>,
+    /// Messages currently waiting for an inline translation response.
+    translating: HashSet<String>,
     /// After an older page: the message that was on screen and how far below the top of the
     /// viewport it was, to put it back there once the rows above it can be measured.
     hold: Option<(String, f32)>,
@@ -474,11 +471,6 @@ pub struct Pane {
     scrub_bounds: Rc<RefCell<HashMap<String, Bounds<Pixels>>>>,
     /// A file the user pressed play on before it was on disk: file, message, attachment, from.
     play_after: Option<(String, String, usize, Option<u32>)>,
-    /// Ephemeral in-memory message translations: `message_id -> (translated_text, detected_lang)`.
-    /// Cleared on conversation switch and never persisted to disk.
-    translations: HashMap<String, (String, String)>,
-    /// Message ids with an in-flight `Request::Translate`.
-    translating: HashSet<String>,
     /// Clip attachment file ids whose full transcript panel is expanded.
     transcript_open: HashSet<String>,
     /// Lazily parsed WebVTT lines keyed by VTT `MediaFile::id`.
@@ -576,6 +568,8 @@ impl Pane {
             open_select: None,
             fetched_reactors: HashMap::new(),
             reactors_loading: None,
+            translations: HashMap::new(),
+            translating: HashSet::new(),
             hold: None,
             land: false,
             places: crate::gui::pane::Memory::default(),
@@ -587,8 +581,6 @@ impl Pane {
             scrub: None,
             scrub_bounds: Rc::default(),
             play_after: None,
-            translations: HashMap::new(),
-            translating: HashSet::new(),
             transcript_open: HashSet::new(),
             transcripts: HashMap::new(),
             captions_on: HashSet::new(),
@@ -629,52 +621,6 @@ impl Pane {
             self.revealed_contacts.insert(key);
         }
         cx.notify();
-    }
-
-    /// Toggles on-demand in-place translation for one message. If already translated, restores
-    /// the original immediately; otherwise asks chatd without modifying the stored message.
-    pub(super) fn toggle_translate(&mut self, message: &Message, cx: &mut Context<Self>) {
-        if self.translations.remove(&message.id).is_some() {
-            cx.notify();
-            return;
-        }
-        if SCREENSHOTS || self.translating.contains(&message.id) {
-            return;
-        }
-        let Some(conversation) = self.open.as_ref().map(|open| open.key.clone()) else {
-            return;
-        };
-        let message_id = message.id.clone();
-        let pref = super::app::prefs::values().translate_lang();
-        let to = if pref != "auto" { pref } else { system_translate_lang() };
-        self.translating.insert(message_id.clone());
-        cx.notify();
-        cx.spawn(async move |pane, cx| {
-            let ask_id = message_id.clone();
-            let answer = cx
-                .background_executor()
-                .spawn(async move {
-                    ask(&Request::Translate { conversation, message_id: ask_id, to })
-                })
-                .await;
-            let _ = pane.update(cx, |this, cx| {
-                this.translating.remove(&message_id);
-                match answer {
-                    Ok(Response::Translated { text, detected_language }) => {
-                        this.translations.insert(message_id, (text, detected_language));
-                    }
-                    Ok(Response::Error { detail, .. }) => {
-                        let shell = this.shell.clone();
-                        cx.defer(move |cx| {
-                            let _ = shell.update(cx, |shell, cx| shell.toast(None, detail, cx));
-                        });
-                    }
-                    _ => {}
-                }
-                cx.notify();
-            });
-        })
-        .detach();
     }
 
     pub(super) fn load_transcript_file(&mut self, vtt_id: &str, path: &str) {
@@ -769,6 +715,7 @@ impl Pane {
         cx: &mut Context<Self>,
     ) {
         let receipt = conversation.receipt();
+        let encrypted = conversation.encryption.is_sealed();
         if let Some(open) = self.open.as_mut().filter(|open| open.key == conversation.key) {
             if open.title != conversation.title
                 || open.picture != picture
@@ -780,6 +727,7 @@ impl Pane {
                 || open.call != conversation.call
                 || open.topic != conversation.topic
                 || open.bot != conversation.bot
+                || open.encrypted != encrypted
             {
                 open.title.clone_from(&conversation.title);
                 open.picture = picture;
@@ -791,6 +739,7 @@ impl Pane {
                 open.call = conversation.call;
                 open.topic.clone_from(&conversation.topic);
                 open.bot = conversation.bot;
+                open.encrypted = encrypted;
                 cx.notify();
             }
             return;
@@ -812,6 +761,7 @@ impl Pane {
             open.call = conversation.call;
             open.topic.clone_from(&conversation.topic);
             open.bot = conversation.bot;
+            open.encrypted = encrypted;
         }
     }
 
@@ -845,6 +795,8 @@ impl Pane {
         self.revisions = None;
         self.fetched_reactors.clear();
         self.reactors_loading = None;
+        self.translations.clear();
+        self.translating.clear();
         // Where the one being left was, for coming back to it.
         if let Some((left, place)) = self.key().cloned().zip(self.place()) {
             self.places.put(left, place);
@@ -868,6 +820,7 @@ impl Pane {
             call: protocol::CallSupport::None,
             topic: String::new(),
             bot: false,
+            encrypted: false,
             started: Instant::now(),
         });
         self.app_tab = AppTab::Messages;
@@ -906,8 +859,6 @@ impl Pane {
         self.code_colors.clear();
         self.multi_select.clear();
         self.code_coloring.clear();
-        self.translations.clear();
-        self.translating.clear();
         self.copied = None;
         self.hovered = None;
         self.selection = None;
@@ -2932,11 +2883,18 @@ impl Shell {
         thread.into_iter().chain(main).any(|pane| pane.update(cx, |pane, cx| pane.phone_back(cx)))
     }
 
+    /// The main pane, its thread, and any conversation window. Not the phone's back stack.
+    fn message_panes(&self) -> Vec<Entity<Pane>> {
+        let state = &self.conversation_state;
+        let mut panes: Vec<_> = state.pane.get().cloned().into_iter().chain(state.thread.borrow().clone()).collect();
+        panes.extend(state.windows.panes());
+        panes
+    }
+
     /// Draws the panes again: a player in them moved on. Only marks them, so it is safe from
     /// inside a pane's own handler, where the pane cannot be updated.
     pub(super) fn conversation_redraw(&mut self, cx: &mut Context<Self>) {
-        let state = &self.conversation_state;
-        let panes: Vec<gpui::EntityId> = state.pane.get().into_iter().chain(state.thread.borrow().as_ref()).map(Entity::entity_id).collect();
+        let panes: Vec<gpui::EntityId> = self.message_panes().iter().map(Entity::entity_id).collect();
         let app: &mut gpui::App = cx;
         for pane in panes {
             app.notify(pane);
@@ -2946,8 +2904,7 @@ impl Shell {
 
     /// Offered every change chatd reports, after `Shell` has applied its own part.
     pub(super) fn conversation_changed(&mut self, change: &Change, cx: &mut Context<Self>) {
-        let state = &self.conversation_state;
-        for pane in state.pane.get().into_iter().chain(state.thread.borrow().as_ref()) {
+        for pane in self.message_panes() {
             pane.update(cx, |pane, cx| pane.changed(change, cx));
         }
     }
@@ -2955,8 +2912,7 @@ impl Shell {
     /// chatd no longer knows what changed: everything held is read again.
     #[allow(dead_code)]
     pub(super) fn conversation_reset(&mut self, cx: &mut Context<Self>) {
-        let state = &self.conversation_state;
-        for pane in state.pane.get().into_iter().chain(state.thread.borrow().as_ref()) {
+        for pane in self.message_panes() {
             pane.update(cx, |pane, cx| pane.refresh(cx));
         }
     }

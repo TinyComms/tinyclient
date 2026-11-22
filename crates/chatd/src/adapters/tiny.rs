@@ -18,6 +18,8 @@ pub(crate) mod live;
 pub(crate) mod manage;
 mod browser;
 mod messages;
+
+pub(crate) use messages::{capability_ceiling, direct_call, group_offer, room_call};
 pub(crate) mod preview;
 mod sealing;
 pub mod signin;

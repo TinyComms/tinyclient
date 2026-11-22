@@ -5621,15 +5621,15 @@ fn translate_message_returns_ephemeral_translation_without_mutating_store() {
     assert_eq!(orig.text, "¡Buenos días equipo!");
 
     // 3. Translate into English on demand.
-    let Response::Translated { text, detected_language } = world.ask(Request::Translate {
+    let Response::Translated { translation, .. } = world.ask(Request::Translate {
         conversation: ana.clone(),
         message_id: "1760000850001".to_owned(),
         to: "en".to_owned(),
     }) else {
         panic!("expected Response::Translated");
     };
-    assert_eq!(text, "Good morning team!");
-    assert_eq!(detected_language, "es");
+    assert_eq!(translation.text, "Good morning team!");
+    assert_eq!(translation.source_lang.as_deref(), Some("es"));
 
     // 4. Stored message in SQLite is completely unchanged (ephemeral translation).
     let after = world.message(&ana, "1760000850001").unwrap();
@@ -5652,14 +5652,14 @@ fn translate_message_returns_ephemeral_translation_without_mutating_store() {
         }),
         Response::Error { .. }
     ));
-    let Response::Translated { text: fr_text, .. } = world.ask(Request::Translate {
+    let Response::Translated { translation: fr, .. } = world.ask(Request::Translate {
         conversation: ana.clone(),
         message_id: "1760000850001".to_owned(),
         to: String::new(),
     }) else {
         panic!("expected Response::Translated with stored target language");
     };
-    assert!(fr_text.starts_with("Bonjour"), "{fr_text}");
+    assert!(fr.text.starts_with("Bonjour"), "{}", fr.text);
 }
 
 #[test]

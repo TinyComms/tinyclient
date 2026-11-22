@@ -13,7 +13,7 @@
 //! is said in words and the voice call stays. A phone captures and codes through its `platform`
 //! (`phone`). All of it is slow, and none of it runs on the call's tick: `video` holds the threads.
 
-use protocol::{PictureKind, ShareQuality};
+use protocol::{CameraQuality, CameraSettings, PictureKind, ShareQuality};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -83,15 +83,218 @@ pub use phone::*;
 /// A phone's share is fitted inside this, and so is a desktop's at `Low`. Even, and inside
 /// level 3.1, which is what a phone's hardware codec is sure to take.
 pub const SHARE_MAX: (u32, u32) = (1280, 720);
-/// The camera's high layer.
+/// The camera's HD top layer when a hardware encoder is available or HD is chosen.
+pub const CAMERA_HD: (u32, u32) = (1280, 720);
+/// The camera's standard high layer.
 pub const CAMERA_HIGH: (u32, u32) = (640, 360);
 /// The camera's low layer.
 pub const CAMERA_LOW: (u32, u32) = (320, 180);
 
 /// A phone's share, and a desktop's at `Low`.
 pub const SHARE_BPS: u32 = 1_500_000;
+pub const CAMERA_HD_BPS: u32 = 1_500_000;
+pub const CAMERA_HD_FPS: u32 = 30;
 pub const CAMERA_HIGH_BPS: u32 = 500_000;
+pub const CAMERA_DATA_SAVER_BPS: u32 = 350_000;
 pub const CAMERA_LOW_BPS: u32 = 150_000;
+
+/// Resolved camera top-layer target: maximum size, frame rate, and bitrate ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CameraProfile {
+    pub max: (u32, u32),
+    pub fps: u32,
+    pub bps: u32,
+}
+
+impl CameraProfile {
+    pub const fn resolve(quality: CameraQuality, hardware_encoder: bool) -> CameraProfile {
+        match quality {
+            CameraQuality::Hd => CameraProfile { max: CAMERA_HD, fps: CAMERA_HD_FPS, bps: CAMERA_HD_BPS },
+            CameraQuality::Auto if hardware_encoder => CameraProfile { max: CAMERA_HD, fps: CAMERA_HD_FPS, bps: CAMERA_HD_BPS },
+            CameraQuality::Auto | CameraQuality::Standard => CameraProfile { max: CAMERA_HIGH, fps: 15, bps: CAMERA_HIGH_BPS },
+            CameraQuality::DataSaver => CameraProfile { max: CAMERA_HIGH, fps: 15, bps: CAMERA_DATA_SAVER_BPS },
+        }
+    }
+}
+
+/// Whether this machine has a hardware H.264 encoder available for HD camera encoding.
+pub fn has_hardware_encoder() -> bool {
+    #[cfg(all(windows, not(any(target_os = "android", target_os = "ios"))))]
+    {
+        crate::mf_encoder::available().is_ok()
+    }
+    #[cfg(not(all(windows, not(any(target_os = "android", target_os = "ios")))))]
+    {
+        false
+    }
+}
+
+static CAMERA_QUALITY_STATE: AtomicU8 = AtomicU8::new(0);
+static CAMERA_MIRROR_STATE: AtomicBool = AtomicBool::new(true);
+static CAMERA_BLUR_STATE: AtomicBool = AtomicBool::new(false);
+
+pub fn choose_camera_settings(settings: CameraSettings) {
+    let code = match settings.quality {
+        CameraQuality::Auto => 0,
+        CameraQuality::Hd => 1,
+        CameraQuality::Standard => 2,
+        CameraQuality::DataSaver => 3,
+    };
+    CAMERA_QUALITY_STATE.store(code, Ordering::Relaxed);
+    CAMERA_MIRROR_STATE.store(settings.mirror, Ordering::Relaxed);
+    CAMERA_BLUR_STATE.store(settings.blur, Ordering::Relaxed);
+}
+
+pub fn camera_settings() -> CameraSettings {
+    let quality = match CAMERA_QUALITY_STATE.load(Ordering::Relaxed) {
+        1 => CameraQuality::Hd,
+        2 => CameraQuality::Standard,
+        3 => CameraQuality::DataSaver,
+        _ => CameraQuality::Auto,
+    };
+    CameraSettings {
+        quality,
+        mirror: CAMERA_MIRROR_STATE.load(Ordering::Relaxed),
+        blur: CAMERA_BLUR_STATE.load(Ordering::Relaxed),
+    }
+}
+
+pub fn camera_profile() -> CameraProfile {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        CameraProfile::resolve(CameraQuality::Standard, false)
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        CameraProfile::resolve(camera_settings().quality, has_hardware_encoder())
+    }
+}
+
+pub fn camera_fps() -> u32 {
+    camera_profile().fps.max(1)
+}
+
+pub fn camera_high_bps() -> u32 {
+    camera_profile().bps
+}
+
+pub fn camera_mirror() -> bool {
+    CAMERA_MIRROR_STATE.load(Ordering::Relaxed)
+}
+
+pub fn camera_blur() -> bool {
+    CAMERA_BLUR_STATE.load(Ordering::Relaxed)
+}
+
+/// Flip an RGB8 image horizontally in-place. Used only for the local camera self-view so peers
+/// always receive the unmirrored camera frame.
+pub fn mirror_rgb_horizontal(rgb: &mut [u8], width: u32, height: u32) {
+    let w = width as usize;
+    let h = height as usize;
+    let stride = w.saturating_mul(3);
+    if w < 2 || h == 0 || rgb.len() < stride.saturating_mul(h) {
+        return;
+    }
+    for y in 0..h {
+        let row = &mut rgb[y * stride..(y + 1) * stride];
+        for x in 0..(w / 2) {
+            let left = x * 3;
+            let right = (w - 1 - x) * 3;
+            for c in 0..3 {
+                row.swap(left + c, right + c);
+            }
+        }
+    }
+}
+
+/// Lightweight on-device portrait background blur applied in-place before camera encoding.
+/// Softens pixels outside a centered portrait ellipse using a downscaled separable box blur,
+/// with zero downloaded models and minimal CPU overhead.
+pub fn apply_background_blur(frame: &mut Rgba) {
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    let total = w.saturating_mul(h).saturating_mul(4);
+    if w < 4 || h < 4 || frame.pixels.len() < total {
+        return;
+    }
+    let bw = (w / 4).max(2);
+    let bh = (h / 4).max(2);
+    let mut small = vec![0u8; bw * bh * 3];
+    for by in 0..bh {
+        let sy = by * h / bh;
+        for bx in 0..bw {
+            let sx = bx * w / bw;
+            let src = (sy * w + sx) * 4;
+            let dst = (by * bw + bx) * 3;
+            small[dst] = frame.pixels[src];
+            small[dst + 1] = frame.pixels[src + 1];
+            small[dst + 2] = frame.pixels[src + 2];
+        }
+    }
+    let radius: isize = 2;
+    let mut horiz = vec![0u8; bw * bh * 3];
+    for by in 0..bh {
+        for bx in 0..bw {
+            let mut acc = [0u32; 3];
+            let mut count = 0u32;
+            for dx in -radius..=radius {
+                let nx = (bx as isize + dx).clamp(0, bw as isize - 1) as usize;
+                let idx = (by * bw + nx) * 3;
+                acc[0] += u32::from(small[idx]);
+                acc[1] += u32::from(small[idx + 1]);
+                acc[2] += u32::from(small[idx + 2]);
+                count += 1;
+            }
+            let dst = (by * bw + bx) * 3;
+            horiz[dst] = (acc[0] / count) as u8;
+            horiz[dst + 1] = (acc[1] / count) as u8;
+            horiz[dst + 2] = (acc[2] / count) as u8;
+        }
+    }
+    let mut blurred = vec![0u8; bw * bh * 3];
+    for by in 0..bh {
+        for bx in 0..bw {
+            let mut acc = [0u32; 3];
+            let mut count = 0u32;
+            for dy in -radius..=radius {
+                let ny = (by as isize + dy).clamp(0, bh as isize - 1) as usize;
+                let idx = (ny * bw + bx) * 3;
+                acc[0] += u32::from(horiz[idx]);
+                acc[1] += u32::from(horiz[idx + 1]);
+                acc[2] += u32::from(horiz[idx + 2]);
+                count += 1;
+            }
+            let dst = (by * bw + bx) * 3;
+            blurred[dst] = (acc[0] / count) as u8;
+            blurred[dst + 1] = (acc[1] / count) as u8;
+            blurred[dst + 2] = (acc[2] / count) as u8;
+        }
+    }
+    let wf = w as f32;
+    let hf = h as f32;
+    for y in 0..h {
+        let dy = (y as f32 / hf - 0.55) / 0.44;
+        let dy2 = dy * dy;
+        let by = (y * bh / h).min(bh - 1);
+        for x in 0..w {
+            let dx = (x as f32 / wf - 0.5) / 0.30;
+            let d2 = dx * dx + dy2;
+            if d2 <= 0.72 {
+                continue;
+            }
+            let t = ((d2 - 0.72) / (1.35 - 0.72)).clamp(0.0, 1.0);
+            let alpha = t * t * (3.0 - 2.0 * t);
+            let bx = (x * bw / w).min(bw - 1);
+            let b = (by * bw + bx) * 3;
+            let p = (y * w + x) * 4;
+            for c in 0..3 {
+                let orig = f32::from(frame.pixels[p + c]);
+                let soft = f32::from(blurred[b + c]);
+                frame.pixels[p + c] = (orig + (soft - orig) * alpha).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+}
 
 /// What a camera's encoder is opened at. `video` halves it when encoding falls behind.
 pub(crate) const FULL_FPS: f32 = 15.;
@@ -567,5 +770,53 @@ mod tests {
         // A shell that says nothing is an older one, and leaves it shown.
         choose_cursor(None);
         assert!(cursor_shown());
+    }
+
+    #[test]
+    fn camera_profile_uses_hd_on_hardware_auto_and_respects_data_saver() {
+        assert_eq!(CameraProfile::resolve(CameraQuality::Auto, true), CameraProfile { max: (1280, 720), fps: 30, bps: 1_500_000 });
+        assert_eq!(CameraProfile::resolve(CameraQuality::Auto, false), CameraProfile { max: (640, 360), fps: 15, bps: 500_000 });
+        assert_eq!(CameraProfile::resolve(CameraQuality::Hd, false), CameraProfile { max: (1280, 720), fps: 30, bps: 1_500_000 });
+        assert_eq!(CameraProfile::resolve(CameraQuality::Standard, true), CameraProfile { max: (640, 360), fps: 15, bps: 500_000 });
+        assert_eq!(CameraProfile::resolve(CameraQuality::DataSaver, true), CameraProfile { max: (640, 360), fps: 15, bps: 350_000 });
+    }
+
+    #[test]
+    fn mirror_rgb_horizontal_flips_rows_without_touching_vertical_order() {
+        // 3x2 RGB: top row R, G, B; bottom row C, M, Y.
+        let mut rgb = vec![
+            255, 0, 0,   0, 255, 0,   0, 0, 255,
+            0, 255, 255, 255, 0, 255, 255, 255, 0,
+        ];
+        mirror_rgb_horizontal(&mut rgb, 3, 2);
+        assert_eq!(rgb, vec![
+            0, 0, 255,   0, 255, 0,   255, 0, 0,
+            255, 255, 0, 255, 0, 255, 0, 255, 255,
+        ]);
+    }
+
+    #[test]
+    fn background_blur_softens_corners_while_keeping_portrait_center_sharp() {
+        let (w, h) = (32u32, 32u32);
+        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        // Checkerboard everywhere so blur averages high-contrast pixels toward mid-gray.
+        for y in 0..h {
+            for x in 0..w {
+                let v = if (x + y) % 2 == 0 { 255 } else { 0 };
+                let p = ((y * w + x) * 4) as usize;
+                pixels[p] = v;
+                pixels[p + 1] = v;
+                pixels[p + 2] = v;
+                pixels[p + 3] = 255;
+            }
+        }
+        let center_idx = ((17 * w + 16) * 4) as usize;
+        let center_before = pixels[center_idx];
+        let mut frame = Rgba { width: w, height: h, pixels, bgra: false };
+        apply_background_blur(&mut frame);
+        assert_eq!(frame.pixels[center_idx], center_before, "portrait center remains sharp");
+        // Top-left corner had alternating 0/255; blur moves it off the extreme.
+        let corner = frame.pixels[0];
+        assert!(corner > 0 && corner < 255, "corner pixel should be softened, got {corner}");
     }
 }

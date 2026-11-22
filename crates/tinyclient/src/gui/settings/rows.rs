@@ -77,6 +77,14 @@ pub const ROWS: &[Row] = &[
     row("M5", Messages, "", "Play GIFs and animated stickers", &["Automatically", "On hover", "Never"], &["gif", "animated", "autoplay", "sticker", "motion", "animation"]),
     row("M6", Messages, "", "Check spelling", &[], &["spell", "spelling", "spellcheck", "dictionary", "underline"]),
     row("M7", Messages, "", "Show a preview for links I send", &[], &["link", "links", "preview", "previews", "card", "embed", "url", "tiny"]),
+    row(
+        "M8",
+        Messages,
+        "",
+        "Translate messages to",
+        &["System default", "English", "Spanish", "French", "German", "Italian", "Portuguese", "Russian", "Japanese", "Korean", "Chinese", "Arabic", "Hindi"],
+        &["translate", "translation", "locale"],
+    ),
     row("LK", Privacy, "Lock", "Lock tinyclient", &["Off", "After 1 minute", "After 5 minutes", "After 1 hour"], &["touch id", "windows hello", "fingerprint", "face", "passcode", "pin", "biometric", "lock"]),
     row("LS", Privacy, "Lock", "When the screen locks", &[], &["screen lock", "away"]),
     row("LP", Privacy, "Lock", "Passphrase", &[], &["passphrase", "password", "linux"]),
@@ -93,10 +101,14 @@ pub const ROWS: &[Row] = &[
     row("PS3", Privacy, "Streamer mode", "Turn on automatically when OBS or Streamlabs is running", &[], &["streamer", "obs", "streamlabs", "broadcast", "detect", "automatic"]),
     row("V1", Audio, "Microphone", "Microphone", &[], &["input", "mic", "device", "headset"]),
     row("V22", Audio, "Camera", "Camera", &[], &["webcam", "video", "device", "preview"]),
+    row("V23", Audio, "Camera", "Camera quality", &["Auto", "HD (720p)", "Standard (360p)", "Data saver"], &["camera", "video", "hd", "720p", "360p", "quality", "fps", "bandwidth", "data saver"]),
+    row("V24", Audio, "Camera", "Mirror my video", &[], &["camera", "mirror", "flip", "self view", "video"]),
+    row("V25", Audio, "Camera", "Background blur", &[], &["camera", "blur", "background", "privacy", "video"]),
     row("V2", Audio, "Speaker", "Speaker", &[], &["output", "headphones", "device", "speakers"]),
     row("V5", Audio, "Speaker", "Call volume", &[], &["volume", "loud", "quiet", "voices"]),
     row("V4", Audio, "Joining", "Join calls with my microphone muted", &[], &["mute", "muted", "join"]),
-    row("V23", Audio, "Screen sharing", "Open a screen share when I'm looking at the call", &[], &["screen", "share", "sharing", "watch", "auto", "stream"]),
+    row("V26", Audio, "Joining", "Pop out video when switching apps", &[], &["popout", "pop out", "pip", "picture in picture", "always on top", "share", "call"]),
+    row("V27", Audio, "Screen sharing", "Open a screen share when I'm looking at the call", &[], &["screen", "share", "sharing", "watch", "auto", "stream"]),
     row("V8", Voice, "", "Microphone opens by", &["Voice activation", "Push to talk"], &["ptt", "push to talk", "voice activity", "vad", "open mic"]),
     row("V3", Voice, "", "Input level", &[], &["test", "meter", "mic", "level"]),
     row("V6", Voice, "", "Sensitivity", &[], &["gate", "threshold", "noise", "voice activity", "vad"]),
@@ -244,7 +256,8 @@ pub fn kept_by_chatd(id: &str) -> bool {
     matches!(
         id,
         "N1" | "N2" | "ND" | "NG" | "NM" | "NT" | "NR" | "NF" | "NK" | "N4" | "NL" | "N5" | "N6" | "N7" | "N8" | "N9" | "N10" | "N11" | "N13" | "S2" | "S3" | "S4" | "SV" | "S13" | "S14"
-            | "G2" | "GN1" | "GN2" | "S1" | "S7" | "S8" | "S9" | "S10" | "P1" | "P2" | "P4" | "PE" | "PS1" | "PS2" | "PS3" | "V1" | "V2" | "V3" | "V4" | "V5" | "V6" | "V22" | "V23" | "V8" | "V10" | "V11" | "V12" | "V13" | "V14" | "V15" | "V16" | "V17" | "V19" | "V20" | "V21" | "D1" | "D2" | "D3"
+            | "M8"
+            | "G2" | "GN1" | "GN2" | "S1" | "S7" | "S8" | "S9" | "S10" | "P1" | "P2" | "P4" | "PE" | "PS1" | "PS2" | "PS3" | "V1" | "V2" | "V3" | "V4" | "V5" | "V6" | "V22" | "V23" | "V24" | "V25" | "V27" | "V8" | "V10" | "V11" | "V12" | "V13" | "V14" | "V15" | "V16" | "V17" | "V19" | "V20" | "V21" | "D1" | "D2" | "D3"
     )
 }
 
@@ -311,6 +324,7 @@ pub const SHORTCUTS: &[Shortcut] = &[
     key("Calls", "Accept a call", "⇧⌘A"),
     key("Calls", "Decline a call", "⇧⌘R"),
     key("Calls", "Go to the call", "⇧⌘J"),
+    key("Calls", "Pop out call video", "⇧⌘O"),
 ];
 
 /// Hiding an application is macOS's: GPUI ignores it on Linux and panics at Hide Others on

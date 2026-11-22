@@ -7,7 +7,7 @@ use crate::store::Store;
 use protocol::settings;
 use protocol::{
     clip, read_frame_bytes, support_dir, write_frame, CatalogKind, ConversationInfo, MediaFile, MediaKind, Outgoing, SharedKind, SpaceInfo, AccountKey, AccountStatus, CallSupport, Capabilities,
-    Change, ChatListener, ChatStream, Conversation, ConversationKind, ErrorCode, InboxCounts, Key,
+    Change, ChatListener, ChatStream, Conversation, ConversationKind, Encryption, ErrorCode, InboxCounts, Key,
     Link, Media, MediaRequest, Message, MessageKind, Network, NetworkStatus, Page, Person, Presence,
     Profile, Reaction, RelateAction, Relation, Request, Response, SendState, Sender, Watching,
     MUTUAL_SPACES, PAGE_LIMIT, SEARCH_MIN_CHARS, WATCH_LIMIT,
@@ -213,6 +213,12 @@ fn error(code: ErrorCode, detail: impl ToString) -> Response {
         code,
         detail: detail.to_string(),
     }
+}
+
+/// Hard privacy guard: end-to-end encrypted conversations (all Signal chats and any sealed
+/// Tiny/E2EE room) must never send plaintext to a network translation service.
+pub(crate) fn is_e2ee_for_translation(conversation: &Key, encryption: Encryption) -> bool {
+    conversation.network == Network::Signal || encryption.is_sealed()
 }
 
 fn internal(err: rusqlite::Error) -> Response {
@@ -606,7 +612,10 @@ impl Chat {
             | settings::NOISE_SUPPRESSION
             | settings::AUTO_GAIN
             | settings::INPUT_VOLUME
-            | settings::VOICE_QUALITY => self.hub.calls.retune(&self.hub),
+            | settings::VOICE_QUALITY
+            | settings::CAMERA_QUALITY
+            | settings::CAMERA_MIRROR
+            | settings::CAMERA_BLUR => self.hub.calls.retune(&self.hub),
             settings::INPUT | settings::OUTPUT | settings::CAMERA => self.hub.calls.redevice(&self.hub),
             // `set_setting` has already moved chatd's own ceiling.
             settings::LOG_LEVEL => self.hub.calls.relevel(),
@@ -3029,32 +3038,39 @@ impl Chat {
                 }
             }
             Request::Translate { conversation, message_id, to } => {
-                if !self.shows(&conversation.account()) {
-                    return error(ErrorCode::NotFound, "signed out");
+                let encryption = self
+                    .hub
+                    .store()
+                    .conversation(&conversation)
+                    .ok()
+                    .flatten()
+                    .map(|row| row.encryption)
+                    .unwrap_or(Encryption::Unknown);
+                if is_e2ee_for_translation(&conversation, encryption) {
+                    return error(
+                        ErrorCode::Refused,
+                        "End-to-end encrypted messages are not sent to a translation service.",
+                    );
                 }
-                let requested = to.trim();
-                let target = if !requested.is_empty() && requested != "auto" {
-                    if !protocol::settings::valid_language_tag(requested) {
-                        return error(ErrorCode::Refused, "Unsupported target language.");
-                    }
-                    requested.to_owned()
-                } else {
+                let target = if to.trim().is_empty()
+                    || to.eq_ignore_ascii_case("auto")
+                    || to.eq_ignore_ascii_case("system")
+                {
+                    // `translate_lang` has no settings row; when someone set it, it still wins.
                     let stored = self.hub.settings().translate_lang();
-                    if stored != "auto" { stored } else { "en".to_owned() }
+                    if stored != "auto" { stored } else { self.hub.settings().translate_target() }
+                } else {
+                    protocol::normalize_language_tag(&to)
                 };
                 match self.ask(&conversation.account(), |reply| Command::Translate {
                     conversation_id: conversation.id.clone(),
-                    message_id,
+                    message_id: message_id.clone(),
                     to: target,
                     reply,
                 }) {
-                    Ok(mut translated) => {
-                        protocol::clip(&mut translated.text, 40_000);
-                        protocol::clip(&mut translated.detected_language, 32);
-                        Response::Translated {
-                            text: translated.text,
-                            detected_language: translated.detected_language,
-                        }
+                    Ok(mut translation) => {
+                        protocol::clip(&mut translation.text, 40_000);
+                        Response::Translated { conversation, message_id, translation }
                     }
                     Err(refused) => *refused,
                 }
@@ -6263,5 +6279,117 @@ mod tests {
 
         let commands = seen.lock().unwrap().clone();
         assert_eq!(commands, vec![("ch-1".to_owned(), "m-1".to_owned())]);
+    }
+
+    #[test]
+    fn translate_never_dispatches_for_e2ee_and_forwards_for_telegram() {
+        use super::*;
+        let store = Store::open(std::path::Path::new(":memory:")).expect("memory store");
+        let chat = Chat::new(store);
+        let hub = chat.hub.clone();
+
+        let signal_acct = AccountKey { network: Network::Signal, account: "+15550001".into() };
+        let tiny_acct = AccountKey { network: Network::Tiny, account: "me".into() };
+        let tg_acct = AccountKey { network: Network::Telegram, account: "42".into() };
+
+        let (sig_adapter, sig_ctx, sig_inbox) = crate::adapters::local(signal_acct.clone(), hub.clone());
+        let (tiny_adapter, tiny_ctx, tiny_inbox) = crate::adapters::local(tiny_acct.clone(), hub.clone());
+        let (tg_adapter, tg_ctx, tg_inbox) = crate::adapters::local(tg_acct.clone(), hub.clone());
+        {
+            let mut adapters = lock(&chat.adapters);
+            adapters.insert(signal_acct.clone(), sig_adapter);
+            adapters.insert(tiny_acct.clone(), tiny_adapter);
+            adapters.insert(tg_acct.clone(), tg_adapter);
+        }
+
+        let sig_row = ConversationRow::new("c-sig", ConversationKind::Direct, "Ada");
+        sig_ctx.conversation(&sig_row).unwrap();
+
+        let mut e2ee_row = ConversationRow::new("dm-e2ee", ConversationKind::Direct, "Bea");
+        e2ee_row.space = Some("server".into());
+        tiny_ctx.conversation(&e2ee_row).unwrap();
+        tiny_ctx.mark_encryption("dm-e2ee", Encryption::EndToEnd).unwrap();
+
+        let mut upgrade_row = ConversationRow::new("dm-up", ConversationKind::Direct, "Cy");
+        upgrade_row.space = Some("server".into());
+        tiny_ctx.conversation(&upgrade_row).unwrap();
+        tiny_ctx.mark_encryption("dm-up", Encryption::EndToEndAfterPlain).unwrap();
+
+        let tg_row = ConversationRow::new("u7", ConversationKind::Direct, "Dora");
+        tg_ctx.conversation(&tg_row).unwrap();
+
+        let dispatched = Arc::new(Mutex::new(Vec::<(Network, String, String, String)>::new()));
+        let spawn_worker = |network: Network, inbox: std::sync::mpsc::Receiver<Command>, log: Arc<Mutex<Vec<(Network, String, String, String)>>>| {
+            std::thread::spawn(move || {
+                for cmd in inbox {
+                    match cmd {
+                        Command::Translate { conversation_id, message_id, to, reply } => {
+                            log.lock().unwrap().push((network, conversation_id, message_id, to.clone()));
+                            let _ = reply.send(Ok(protocol::Translation {
+                                text: format!("[{to}] Hola"),
+                                source_lang: Some("es".into()),
+                                target_lang: to,
+                            }));
+                        }
+                        Command::Stop => break,
+                        _ => {}
+                    }
+                }
+            })
+        };
+        let w1 = spawn_worker(Network::Signal, sig_inbox, dispatched.clone());
+        let w2 = spawn_worker(Network::Tiny, tiny_inbox, dispatched.clone());
+        let w3 = spawn_worker(Network::Telegram, tg_inbox, dispatched.clone());
+
+        // Signal must be refused locally without dispatching Command::Translate.
+        let sig_resp = chat.handle(Request::Translate {
+            conversation: Key::new(&signal_acct, "c-sig"),
+            message_id: "1".into(),
+            to: "en".into(),
+        });
+        assert!(matches!(sig_resp, Response::Error { code: ErrorCode::Refused, .. }), "{sig_resp:?}");
+
+        // Tiny E2EE (both EndToEnd and EndToEndAfterPlain) must be refused locally.
+        for id in ["dm-e2ee", "dm-up"] {
+            let resp = chat.handle(Request::Translate {
+                conversation: Key::new(&tiny_acct, id),
+                message_id: "2".into(),
+                to: "en".into(),
+            });
+            assert!(matches!(resp, Response::Error { code: ErrorCode::Refused, .. }), "{id}: {resp:?}");
+        }
+
+        // Plain Telegram dispatches Command::Translate and returns Response::Translated.
+        let tg_key = Key::new(&tg_acct, "u7");
+        let tg_resp = chat.handle(Request::Translate {
+            conversation: tg_key.clone(),
+            message_id: "99".into(),
+            to: "fr-FR".into(),
+        });
+        assert_eq!(
+            tg_resp,
+            Response::Translated {
+                conversation: tg_key,
+                message_id: "99".into(),
+                translation: protocol::Translation {
+                    text: "[fr] Hola".into(),
+                    source_lang: Some("es".into()),
+                    target_lang: "fr".into(),
+                },
+            }
+        );
+
+        {
+            let mut adapters = lock(&chat.adapters);
+            adapters.remove(&signal_acct);
+            adapters.remove(&tiny_acct);
+            adapters.remove(&tg_acct);
+        }
+        drop((sig_ctx, tiny_ctx, tg_ctx));
+        let _ = (w1.join(), w2.join(), w3.join());
+
+        // Only Telegram ever received a Command::Translate.
+        let log = dispatched.lock().unwrap().clone();
+        assert_eq!(log, vec![(Network::Telegram, "u7".to_owned(), "99".to_owned(), "fr".to_owned())]);
     }
 }

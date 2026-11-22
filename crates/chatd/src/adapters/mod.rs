@@ -16,6 +16,7 @@
 //! message edited, deleted or reacted to only by the command the shell's request became.
 
 mod discord;
+pub mod parity;
 
 /// `TINYCLIENT_PROVE=discord-nitro-length`. Nitro's 4,000-character limit, shared by every send path.
 pub fn prove_discord_nitro_length() -> Result<(), String> {
@@ -278,13 +279,6 @@ pub struct BrowsedPage {
 pub struct ReactorsPage {
     pub reactors: Vec<protocol::Reactor>,
     pub more: bool,
-}
-
-/// Ephemeral result of `Command::Translate`.
-#[derive(Debug, Clone, Default)]
-pub struct Translation {
-    pub text: String,
-    pub detected_language: String,
 }
 
 /// A picture on the call the user is in. Discord is the network that acts on it.
@@ -802,6 +796,14 @@ pub enum Command {
         unfave: bool,
         reply: Reply<()>,
     },
+    /// Translate one message on demand into `to` (normalized ISO 639-1 language tag).
+    /// Never called for end-to-end encrypted conversations.
+    Translate {
+        conversation_id: String,
+        message_id: String,
+        to: String,
+        reply: Reply<protocol::Translation>,
+    },
     /// What was shared in a conversation, from the network's own search, because the user
     /// clicked "Search all". `before` continues below an item already listed.
     SearchShared {
@@ -969,13 +971,6 @@ pub enum Command {
         response: protocol::MeetingResponse,
         propose: Option<i64>,
         reply: Reply<()>,
-    },
-    /// On-demand translation of one message into BCP-47 tag `to`. Ephemeral: never stored.
-    Translate {
-        conversation_id: String,
-        message_id: String,
-        to: String,
-        reply: Reply<Translation>,
     },
     /// mediad is up: join or ring on the network, then report through [`Context::voice`].
     CallJoin(String),

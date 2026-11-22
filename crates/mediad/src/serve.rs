@@ -129,6 +129,10 @@ impl Call {
                 self.controls.set_camera_preview(on);
                 return MediaResponse::Done;
             }
+            MediaRequest::CameraSettings(settings) => {
+                picture::choose_camera_settings(settings);
+                return MediaResponse::Done;
+            }
             MediaRequest::ShareWatch { source } => {
                 match &source {
                     Some(user_id) => tracing::info!(user_id = %user_id, "watch on"),

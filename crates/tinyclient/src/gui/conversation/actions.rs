@@ -160,7 +160,7 @@ pub struct Can {
     pub unsent: bool,
     /// May report this message to the server's moderators (Tiny `abuse_reports`, other people's messages).
     pub report: bool,
-    /// May translate this message on demand (`Capabilities::translate` and non-empty text).
+    /// May translate this message inline on demand (`Capabilities::translate`, non-E2EE, non-empty text).
     pub translate: bool,
 }
 
@@ -325,7 +325,7 @@ pub fn can_with_network_topic(
         remind: act && caps.save_messages,
         unsent,
         report: act && network == Network::Tiny && !message.outgoing && caps.abuse_reports,
-        translate: act && caps.translate && !message.text.trim().is_empty(),
+        translate: act && caps.translate && network != Network::Signal && !message.text.trim().is_empty(),
     }
 }
 
@@ -390,7 +390,7 @@ enum MenuAct {
     Remind,
     /// Report another person's message on a Tiny server.
     Report,
-    /// Translate message text in place, or restore the original (`Capabilities::translate`).
+    /// Translate this message inline, or hide its translation.
     Translate,
     /// A sent message: ask, unless the click held Shift.
     Delete,
@@ -615,7 +615,7 @@ impl Pane {
                 if open.can_pin {
                     rights.pin = true;
                 }
-                can_with_network_topic(
+                let mut allowed = can_with_network_topic(
                     message,
                     open.key.network,
                     &open.can,
@@ -624,7 +624,11 @@ impl Pane {
                     self.is_thread(),
                     &open.topic,
                     now,
-                )
+                );
+                if open.encrypted {
+                    allowed.translate = false;
+                }
+                allowed
             }
             None => can_with_network(
                 message,
@@ -1341,7 +1345,6 @@ impl Pane {
                 });
             }
             MenuAct::Copy => self.copy_text(&message, cx),
-            MenuAct::Translate => self.toggle_translate(&message, cx),
             MenuAct::Drop => self.delete(&message, true, window, cx),
             MenuAct::Quick(_) => {
                 if let Some(emoji) = emoji {
@@ -1419,8 +1422,57 @@ impl Pane {
                     });
                 }
             }
+            MenuAct::Translate => self.translate_message(&message, cx),
             MenuAct::Delete => self.delete(&message, at_once, window, cx),
         }
+    }
+
+    /// Translates one message inline on demand, or clears its translation when already shown.
+    /// Never runs on end-to-end encrypted conversations (Signal or sealed Tiny rooms).
+    pub(super) fn translate_message(&mut self, message: &Message, cx: &mut Context<Self>) {
+        if self.translations.remove(&message.id).is_some() {
+            self.translating.remove(&message.id);
+            cx.notify();
+            return;
+        }
+        if self.translating.contains(&message.id) {
+            return;
+        }
+        let Some(open) = self.open.as_ref() else {
+            return;
+        };
+        if open.encrypted || open.key.network == Network::Signal || !open.can.translate || message.text.trim().is_empty() {
+            return;
+        }
+        let conversation = open.key.clone();
+        let message_id = message.id.clone();
+        let to = crate::gui::app::prefs::values().translate_target();
+        self.translating.insert(message_id.clone());
+        cx.notify();
+        let request = Request::Translate {
+            conversation: conversation.clone(),
+            message_id: message_id.clone(),
+            to,
+        };
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.key() != Some(&conversation) {
+                    return;
+                }
+                this.translating.remove(&message_id);
+                match answer {
+                    Ok(Response::Translated { translation, .. }) => {
+                        this.translations.insert(message_id, translation);
+                    }
+                    Ok(Response::Error { detail, .. }) => this.say(detail, cx),
+                    Err(err) => this.say(crate::client::trouble_words("translate", &err), cx),
+                    _ => {}
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// A file attachment already on disk, as `(path, name)`, for Save as….
@@ -1574,6 +1626,14 @@ impl Pane {
             }
             if !message.text.is_empty() {
                 rows.push(row("sheet-copy", "icons/copy.svg", "Copy text".into(), false).on_click(then(|this, message, _, cx| this.copy_text(message, cx))).into_any_element());
+            }
+            if can.translate {
+                let label = if self.translations.contains_key(&message.id) { "Show original" } else { "Translate" };
+                rows.push(
+                    row("sheet-translate", "icons/arrow-right-left.svg", label.into(), false)
+                        .on_click(then(|this, message, _, cx| this.translate_message(message, cx)))
+                        .into_any_element(),
+                );
             }
             if let Some(link) = self.link_of(message, cx) {
                 let open = link.clone();
@@ -1860,13 +1920,9 @@ impl Pane {
                         .on_click(go(MenuAct::Copy)));
             }
             if can.translate {
-                let label = if self.translations.contains_key(&message.id) {
-                    "Show original"
-                } else {
-                    "Translate"
-                };
+                let label = if self.translations.contains_key(&message.id) { "Show original" } else { "Translate" };
                 items = items.child(
-                    menu_item("translate", None, label, None)
+                    menu_item("translate", Some("icons/arrow-right-left.svg"), label, None)
                         .when(lit(MenuAct::Translate), |row| row.bg(theme::selected()))
                         .on_click(go(MenuAct::Translate)),
                 );
@@ -3144,6 +3200,24 @@ mod tests {
         assert!(menu_acts(translatable, false, 0, false, true, false, false, false, false).contains(&MenuAct::Translate));
         let empty = Message::plain("3", "Mara", "   ", 3, false);
         assert!(!can(&empty, &t_caps, rights, channel, false, 10).translate);
+    }
+
+    #[test]
+    fn translate_is_offered_for_telegram_and_never_for_signal() {
+        let said = Message::plain("1", "Mara", "hola", 1, false);
+        let mut caps = telegram_caps();
+        caps.translate = true;
+        let rights = ConversationRights::default();
+        let offered = can_with_network(&said, Network::Telegram, &caps, rights, ConversationKind::Direct, false, 10);
+        assert!(offered.translate);
+        let acts = menu_acts(offered, false, 0, true, true, false, false, false, false);
+        let copy = acts.iter().position(|act| *act == MenuAct::Copy).unwrap();
+        assert_eq!(acts.get(copy + 1), Some(&MenuAct::Translate));
+        let signal = can_with_network(&said, Network::Signal, &caps, rights, ConversationKind::Direct, false, 10);
+        assert!(!signal.translate);
+        assert!(!menu_acts(signal, false, 0, true, true, false, false, false, false).contains(&MenuAct::Translate));
+        let blank = Message::plain("2", "Mara", "  ", 1, false);
+        assert!(!can_with_network(&blank, Network::Telegram, &caps, rights, ConversationKind::Direct, false, 10).translate);
     }
 
     #[test]

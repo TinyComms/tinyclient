@@ -8,7 +8,7 @@ use super::stage::{self, sending, sending_now, CallPeople, Focus, People, Seat, 
 use super::{watching, Menu, Subject};
 use crate::gui::chrome::{self, End};
 use crate::gui::components::{
-    button_with_icon, glyph, icon_button, tip, Avatar, ButtonKind,
+    button, button_with_icon, glyph, icon_button, tip, Avatar, ButtonKind,
 };
 use crate::gui::layout::{drags_window, TOP_BAR};
 use crate::gui::state::{Shell, Snapshot};
@@ -358,15 +358,17 @@ impl Shell {
             },
             cx,
         );
-        div()
-            .id("call-view-pane")
-            .size_full()
-            .flex()
-            .flex_col()
-            .child(bar)
-            .children(banner)
-            .child(stage_el)
-            .child(controls)
+        div().size_full().child(
+            div()
+                .id("call-view-pane")
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(bar)
+                .children(banner)
+                .child(stage_el)
+                .child(controls),
+        )
     }
 
     /// Over the stage while my call here is not simply up: connecting or reconnecting with how
@@ -1147,7 +1149,7 @@ impl Shell {
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
-                        this.call_strip(stage::Strip { hidden: !strip.hidden, ..strip }, window, cx);
+                        this.call_set_strip(stage::Strip { hidden: !strip.hidden, ..strip }, window, cx);
                     })),
                 )
                 .when(!strip.hidden, |tools| {
@@ -1159,10 +1161,21 @@ impl Shell {
                         )
                         .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
-                            this.call_strip(stage::Strip { over: !strip.over, ..strip }, window, cx);
+                            this.call_set_strip(stage::Strip { over: !strip.over, ..strip }, window, cx);
                         })),
                     )
                 })
+                .child(
+                    stream_button(
+                        "tiny-stream-popout",
+                        "icons/picture-in-picture-2.svg",
+                        if self.call_popout_open() { "Bring back from pop-out" } else { "Pop out" },
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.call_toggle_popout(cx);
+                    })),
+                )
                 .child(stream_button("tiny-stream-full", "icons/maximize.svg", "Full screen").on_click(
                     cx.listener(|this, _, window: &mut Window, cx| {
                         cx.stop_propagation();
@@ -1179,6 +1192,38 @@ impl Shell {
                 }),
             ));
         }
+        // The pop-out window has the frame: the stage never draws the same picture twice.
+        let body: AnyElement = if self.call_popout_open() {
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(10.))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .type_ui()
+                        .text_color(theme::text_soft())
+                        .child(glyph("icons/picture-in-picture-2.svg", 16., theme::accent()))
+                        .child("Playing in a separate window"),
+                )
+                .child(
+                    button("tiny-stream-bring-back", ButtonKind::Secondary, "Bring back")
+                        .h(px(30.))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.call_close_popout(cx);
+                        })),
+                )
+                .into_any_element()
+        } else {
+            self.call_stream_body(people, stream, call, Size::Big, cx).into_any_element()
+        };
         div()
             .id(if full { "tiny-stream-whole" } else { "tiny-stream-focused" })
             .relative()
@@ -1194,7 +1239,7 @@ impl Shell {
                     .tooltip(tip("Click to see everyone again (Esc)", None))
                     .on_click(cx.listener(move |this, _, window, cx| this.call_open_stream(&user_id, mine, window, cx)))
             })
-            .child(self.call_stream_body(people, stream, call, Size::Big, cx))
+            .child(body)
             .child(caption(
                 if mine { format!("Your {what}") } else { format!("{name}'s {what}") },
                 false,
@@ -1783,6 +1828,12 @@ impl Shell {
                 }
             }))
         });
+        let popout_open = self.call_popout_open();
+        let popout = pictures.then(|| {
+            bar_button("tiny-bar-popout", "icons/picture-in-picture-2.svg", if popout_open { BarLook::On } else { BarLook::Rest })
+                .tooltip(tip(if popout_open { "Bring video back" } else { "Pop out video" }, Some("⇧⌘O")))
+                .on_click(cx.listener(|this, _, _, cx| this.call_toggle_popout(cx)))
+        });
         let refused = self
             .call_refused()
             .map(str::to_owned)
@@ -1860,6 +1911,7 @@ impl Shell {
                     .child(deafen)
                     .children(share)
                     .children(camera)
+                    .children(popout)
                     .child(devices)
                     .children(health)
                     .child(leave),
@@ -1952,7 +2004,7 @@ impl Shell {
     }
 
     /// The people under the focused stream, over it, or gone.
-    pub(in crate::gui) fn call_strip(&mut self, strip: stage::Strip, window: &mut Window, cx: &mut Context<Self>) {
+    pub(in crate::gui) fn call_set_strip(&mut self, strip: stage::Strip, window: &mut Window, cx: &mut Context<Self>) {
         self.call_keep_keys(window, cx);
         self.call_state.strip = strip;
         cx.notify();

@@ -1140,6 +1140,23 @@ pub fn answer(request: &Request) -> std::io::Result<Response> {
         },
         Request::Catalog { .. } => Response::Catalog { items: Vec::new(), cursor: None },
         Request::SaveGif { .. } | Request::StickerSet { .. } | Request::FaveSticker { .. } => Response::Ok,
+        Request::Translate { conversation, message_id, to } => {
+            let target_lang = protocol::normalize_language_tag(to);
+            let original = messages_of(conversation)
+                .iter()
+                .find(|m| m.id == *message_id)
+                .map(|m| m.text.as_str())
+                .unwrap_or("");
+            Response::Translated {
+                conversation: conversation.clone(),
+                message_id: message_id.clone(),
+                translation: protocol::Translation {
+                    text: format!("[{target_lang}] {original}"),
+                    source_lang: Some("auto".to_owned()),
+                    target_lang,
+                },
+            }
+        }
         Request::Watch(watching) => {
             let people = watching
                 .people

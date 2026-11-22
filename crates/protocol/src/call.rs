@@ -71,6 +71,59 @@ pub enum ShareQuality {
     Low,
 }
 
+/// How much of the camera a call spends: its top resolution, frame rate, and bitrate ceiling.
+/// `Auto` picks HD (1280×720 at 30 fps) when a hardware encoder is available and 640×360 at 15 fps
+/// on software; `DataSaver` caps at 640×360 at 15 fps / 350 kb/s.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CameraQuality {
+    #[default]
+    Auto,
+    Hd,
+    Standard,
+    DataSaver,
+}
+
+impl CameraQuality {
+    pub fn parse(word: &str) -> Option<Self> {
+        match word {
+            "auto" => Some(Self::Auto),
+            "hd" => Some(Self::Hd),
+            "standard" => Some(Self::Standard),
+            "data_saver" => Some(Self::DataSaver),
+            _ => None,
+        }
+    }
+
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Hd => "hd",
+            Self::Standard => "standard",
+            Self::DataSaver => "data_saver",
+        }
+    }
+}
+
+/// Camera capture, quality, and self-view preferences applied in mediad (`MediaRequest::CameraSettings`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CameraSettings {
+    #[serde(default)]
+    pub quality: CameraQuality,
+    /// Mirror the local self-view horizontally. Never alters what remote peers receive.
+    #[serde(default = "crate::yes")]
+    pub mirror: bool,
+    /// Lightweight on-device background blur before encoding.
+    #[serde(default)]
+    pub blur: bool,
+}
+
+impl Default for CameraSettings {
+    fn default() -> Self {
+        Self { quality: CameraQuality::Auto, mirror: true, blur: false }
+    }
+}
+
 /// The picture on screen: a JPEG written by mediad, and removed once the next one is written.
 /// The window reads it into an image of its own (`gui/tiny/feed.rs`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -596,6 +649,8 @@ pub enum MediaRequest {
     /// Local camera preview before turning the camera on: captures for `SelfView` without sending
     /// video to peers.
     CameraPreview { on: bool },
+    /// Camera quality, self-view mirroring, and on-device background blur (V23–V25).
+    CameraSettings(CameraSettings),
     /// Who the one video slot carries now. `None` when the server sends `video: null`.
     TinyPicture { picture: Option<TinyPicture> },
     /// Who each active video receive slot carries now, from `call.slots.videos`.
@@ -1208,5 +1263,22 @@ mod tests {
         assert_eq!(refused.name(), "WatchRefused");
         let wire = serde_json::to_string(&refused).unwrap();
         assert_eq!(serde_json::from_str::<MediaResponse>(&wire).unwrap(), refused);
+    }
+
+    #[test]
+    fn camera_settings_round_trip_and_default_mirror_on_blur_off() {
+        let minimal: CameraSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(minimal, CameraSettings { quality: CameraQuality::Auto, mirror: true, blur: false });
+        let req = MediaRequest::CameraSettings(CameraSettings {
+            quality: CameraQuality::Hd,
+            mirror: false,
+            blur: true,
+        });
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains(r#""camera_settings""#) && json.contains(r#""hd""#), "{json}");
+        assert_eq!(serde_json::from_str::<MediaRequest>(&json).unwrap(), req);
+        for q in [CameraQuality::Auto, CameraQuality::Hd, CameraQuality::Standard, CameraQuality::DataSaver] {
+            assert_eq!(CameraQuality::parse(q.word()), Some(q));
+        }
     }
 }

@@ -1,6 +1,6 @@
 //! The composer: the draft, sending it, editing and replying, the typing row above it, and what
 //! replaces it when nothing can be sent. One `Composer` per place a message is written: the
-//! conversation, and the thread pane.
+//! conversation, the thread pane, and a conversation window when that window owns the draft.
 //!
 //! The card holds only what the account can do (`controls`): attach, the field, GIF, emoji and
 //! send. Files come in by ⌘U, by pasting a screenshot or Finder files, or by a drop anywhere on
@@ -128,6 +128,8 @@ type Rec = protocol::Recording;
 pub struct State {
     main: OnceCell<Entity<Composer>>,
     thread: OnceCell<Entity<Composer>>,
+    /// Composers of conversation windows. The main window keeps `main` and `thread`.
+    extra: Vec<Entity<Composer>>,
     hold: Hold,
     flight: Flight,
     /// The one timer of the hold: it exists only while a message waits, and ends at the
@@ -348,6 +350,14 @@ impl Draft {
     }
 }
 
+/// What the field shows when a composer is aimed here. A draft handed over
+/// from the composer that just owned the conversation wins, including an
+/// empty one. What this composer remembered when it left is next. The row
+/// is only the fallback.
+fn draft_on_open(handed: Option<Draft>, remembered: Option<Draft>, stored: &str) -> Draft {
+    handed.or(remembered).unwrap_or_else(|| Draft { text: stored.to_owned(), ..Draft::default() })
+}
+
 /// The parked text is still the message that went. A follow-up typed before the
 /// answer arrived is a different draft and stays.
 fn parked_text_is_the_send(parked: &str, sent_field: &str) -> bool {
@@ -522,6 +532,9 @@ pub struct Composer {
     thread: bool,
     target: Option<Target>,
     drafts: HashMap<Key, Draft>,
+    /// A draft handed over by the composer that owned this conversation. The
+    /// next aim at that key shows it, ahead of what this composer remembered.
+    incoming: Option<(Key, Draft)>,
     draft_order: VecDeque<Key>,
     /// The draft chatd holds for this conversation, as far as this window knows.
     saved: String,
@@ -763,6 +776,7 @@ impl Composer {
             thread,
             target: None,
             drafts: HashMap::new(),
+            incoming: None,
             draft_order: VecDeque::new(),
             saved: String::new(),
             offered: String::new(),
@@ -852,7 +866,10 @@ impl Composer {
         let renamed = self.target.as_ref().map(|old| &old.title) != Some(&target.title);
         if moved {
             self.leave(cx);
-            let draft = self.drafts.get(&target.key).cloned().unwrap_or_else(|| Draft { text: stored.to_owned(), ..Draft::default() });
+            // Typing in the composer that just owned this conversation wins.
+            // What this one parked when it left is the fallback, then the row.
+            let handed = self.take_incoming(&target.key);
+            let draft = draft_on_open(handed, self.drafts.get(&target.key).cloned(), stored);
             self.saved = draft_text(&draft.text);
             self.set_field(&draft, cx);
             let note = draft.note.clone();
@@ -988,6 +1005,85 @@ impl Composer {
         let draft = Draft { text: draft_text(self.input.read(cx).text()), subject: self.subject.read(cx).text().trim().to_owned(), tokens: self.tokens.clone(), files,
             note: self.caption.clone(), reply: self.reply.take(), };
         self.remember(old, draft);
+    }
+
+    /// The draft this composer holds for `key`. The field, when it is aimed
+    /// there, including keystrokes the quiet timer has not saved yet.
+    fn held_draft(&self, key: &Key, cx: &App) -> Option<Draft> {
+        if self.target.as_ref().is_some_and(|target| target.key == *key) {
+            if let Some(editing) = &self.editing {
+                return Some(editing.stash.clone());
+            }
+            return Some(Draft {
+                text: draft_text(self.input.read(cx).text()),
+                subject: self.subject.read(cx).text().trim().to_owned(),
+                tokens: self.tokens.clone(),
+                files: self.tray.clone(),
+                note: self.caption.clone(),
+                reply: self.reply.clone(),
+            });
+        }
+        self.drafts.get(key).cloned()
+    }
+
+    fn aimed_at(&self, key: &Key) -> bool {
+        self.target.as_ref().is_some_and(|target| target.key == *key)
+    }
+
+    /// Writes the field to chatd when this composer is aimed at `key`, and
+    /// drops the quiet timer so a later drop cannot cancel the save.
+    fn flush_aimed(&mut self, key: &Key, cx: &mut Context<Self>) {
+        if self.editing.is_some() || self.target.as_ref().is_none_or(|target| target.key != *key) {
+            return;
+        }
+        self.save_draft(cx);
+        self.draft_timer = None;
+    }
+
+    fn take_incoming(&mut self, key: &Key) -> Option<Draft> {
+        match self.incoming.take() {
+            Some((incoming, draft)) if incoming == *key => Some(draft),
+            other => {
+                self.incoming = other;
+                None
+            }
+        }
+    }
+
+    /// Parks `draft` as what the next aim shows. A draft this composer
+    /// remembered when it left loses.
+    fn offer_draft(&mut self, key: Key, draft: Draft) {
+        self.remember(key.clone(), draft.clone());
+        self.incoming = Some((key, draft));
+    }
+
+    /// The composer that owns `key` now shows `draft`, in the field when it
+    /// is already aimed there.
+    fn accept_draft(&mut self, key: Key, draft: Draft, cx: &mut Context<Self>) {
+        let showing = self.editing.is_none() && self.target.as_ref().is_some_and(|target| target.key == key);
+        if !showing {
+            self.offer_draft(key, draft);
+            return;
+        }
+        self.remember(key, draft.clone());
+        self.incoming = None;
+        self.saved = draft_text(&draft.text);
+        self.offered = self.saved.clone();
+        self.set_field(&draft, cx);
+        self.tray = draft.files;
+        self.reply = draft.reply;
+        self.caption = draft.note;
+        self.touched = true;
+        self.draft_timer = None;
+        cx.notify();
+    }
+
+    /// Saves the field and returns the draft, files and reply included, so
+    /// another composer can show it after this one is dropped.
+    fn release_draft(&mut self, cx: &mut Context<Self>) -> Option<(Key, Draft)> {
+        let key = self.target.as_ref().map(|target| target.key.clone())?;
+        self.leave(cx);
+        self.drafts.get(&key).cloned().map(|draft| (key, draft))
     }
 
     fn remember(&mut self, key: Key, draft: Draft) {
@@ -4414,9 +4510,14 @@ impl Render for Composer {
 }
 
 impl Shell {
+    /// The main composer, the thread's, and each conversation window's.
+    fn composers(&self) -> Vec<Entity<Composer>> {
+        let state = &self.composer_state;
+        state.main.get().cloned().into_iter().chain(state.thread.get().cloned()).chain(state.extra.iter().cloned()).collect()
+    }
+
     pub(super) fn composer_playback_redraw(&self, cx: &mut Context<Self>) {
-        let ids: Vec<_> = [self.composer_state.main.get(), self.composer_state.thread.get()]
-            .into_iter().flatten().map(Entity::entity_id).collect();
+        let ids: Vec<_> = self.composers().iter().map(Entity::entity_id).collect();
         let app: &mut gpui::App = cx;
         for id in ids {
             app.notify(id);
@@ -4444,10 +4545,8 @@ impl Shell {
             .unwrap_or_default()
     }
 
-    /// The composer dock of the open conversation.
-    pub(super) fn composer(&self, open: &Conversation, link: Link, cx: &mut Context<Self>) -> Div {
-        self.people_state.attach(cx);
-        self.people_state.hub().watch_conversation(Some(&open.key), cx);
+    /// Where a conversation's composer writes. A screenshot run can lock the link and the kind.
+    fn target_of(&self, open: &Conversation, link: Link) -> Target {
         #[cfg(feature = "gui-shot")]
         let (link, kind) = super::people::shot::locked(link, open.kind);
         #[cfg(feature = "gui-shot")]
@@ -4466,7 +4565,7 @@ impl Shell {
                 (person.relation == protocol::Relation::Blocked).then_some(person)
             })
             .flatten();
-        let target = Target {
+        Target {
             key: open.key.clone(),
             title: open.title.clone(),
             kind,
@@ -4480,7 +4579,15 @@ impl Shell {
             special: open.special,
             can,
             send_as: self.send_as_of(&open.key),
-        };
+        }
+    }
+
+    /// The composer dock of the open conversation.
+    pub(super) fn composer(&self, open: &Conversation, link: Link, cx: &mut Context<Self>) -> Div {
+        self.people_state.attach(cx);
+        // The focused conversation window is the one Watch names. This dock must not replace it.
+        self.people_state.hub().watch_conversation(self.watched_conversation_key().as_ref(), cx);
+        let target = self.target_of(open, link);
         let composer = self.composer_in(false, cx);
         composer.update(cx, |composer, cx| composer.aim(target, &open.draft, cx));
         #[cfg(feature = "gui-shot")]
@@ -4517,6 +4624,125 @@ impl Shell {
         // A thread's row is not handed over, so its draft is the one this window remembers.
         composer.update(cx, |composer, cx| composer.aim(target, "", cx));
         div().flex_none().child(composer)
+    }
+
+    /// A composer for a conversation window. It opens on the live draft,
+    /// including keystrokes the quiet timer has not saved. `thread` is how it
+    /// posts. `from_side` reads the right-pane thread slot; otherwise the draft
+    /// comes from the main conversation composer. The caller has already
+    /// decided that this window owns the draft.
+    pub(in crate::gui) fn window_composer(
+        &mut self,
+        open: &Conversation,
+        thread: bool,
+        from_side: bool,
+        cx: &mut Context<Self>,
+    ) -> Entity<Composer> {
+        let (shell, hub) = (cx.weak_entity(), self.people_state.hub());
+        let composer = cx.new(|cx| Composer::new(shell, hub, thread, cx));
+        self.give_live_draft(&composer, &open.key, from_side, cx);
+        self.reaim_window_composer(&composer, open, thread, cx);
+        self.composer_state.extra.push(composer.clone());
+        composer
+    }
+
+    /// The main field is on `key`, the side field is, and the main dock
+    /// remembers a draft for it without showing that field.
+    pub(in crate::gui) fn draft_slot_flags(&self, key: &Key, cx: &App) -> (bool, bool, bool) {
+        let look = |slot_thread: bool| {
+            let Some(composer) = self.composer_made(slot_thread) else {
+                return (false, false);
+            };
+            let composer = composer.read(cx);
+            let aimed = composer.aimed_at(key);
+            let remembers = !aimed && composer.held_draft(key, cx).is_some();
+            (aimed, remembers)
+        };
+        let (main_aimed, main_remembers) = look(false);
+        let (side_aimed, _) = look(true);
+        (main_aimed, side_aimed, main_remembers)
+    }
+
+    /// Copies the draft held for `key` onto a window composer before that
+    /// window aims, so the row's older text does not win. `from_side` is the
+    /// right-pane slot; the main conversation composer is the other one.
+    fn give_live_draft(&mut self, composer: &Entity<Composer>, key: &Key, from_side: bool, cx: &mut Context<Self>) {
+        let Some(source) = self.composer_made(from_side) else {
+            return;
+        };
+        if source.entity_id() == composer.entity_id() {
+            return;
+        }
+        source.update(cx, |source, cx| source.flush_aimed(key, cx));
+        let Some(draft) = source.read(cx).held_draft(key, cx) else {
+            return;
+        };
+        composer.update(cx, |composer, _| composer.offer_draft(key.clone(), draft));
+    }
+
+    fn composer_made(&self, thread: bool) -> Option<Entity<Composer>> {
+        let slot = if thread { &self.composer_state.thread } else { &self.composer_state.main };
+        slot.get().cloned()
+    }
+
+    /// Saves the window composer's draft, gives it to the composer that should
+    /// show it, and drops the window composer. The quiet timer is cancelled by
+    /// the save. `to_side` is the right-pane thread slot. The main conversation
+    /// composer is the other one, including when the conversation is a thread
+    /// the main pane opened.
+    pub(in crate::gui) fn release_window_composer(
+        &mut self,
+        composer: Option<Entity<Composer>>,
+        to_side: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(composer) = composer else {
+            return;
+        };
+        // The dock's own composer is not a window composer.
+        let dock = self.composer_made(false).as_ref().map(Entity::entity_id) == Some(composer.entity_id())
+            || self.composer_made(true).as_ref().map(Entity::entity_id) == Some(composer.entity_id());
+        if dock {
+            self.drop_composers(&[composer]);
+            return;
+        }
+        let released = composer.update(cx, |composer, cx| composer.release_draft(cx));
+        if let Some((key, draft)) = released {
+            let dest = self.composer_in(to_side, cx);
+            if dest.entity_id() != composer.entity_id() {
+                dest.update(cx, |dest, cx| dest.accept_draft(key, draft, cx));
+            }
+        }
+        self.drop_composers(&[composer]);
+    }
+
+    pub(in crate::gui) fn reaim_window_composer(&mut self, composer: &Entity<Composer>, open: &Conversation, thread: bool, cx: &mut Context<Self>) {
+        let link = self.snapshot.as_ref().map(|snapshot| snapshot.account_link(&open.key)).unwrap_or(Link::SignedOut);
+        let target = if thread {
+            Target {
+                key: open.key.clone(),
+                title: open.title.clone(),
+                kind: ConversationKind::Thread,
+                link,
+                space: None,
+                read_only: open.read_only,
+                read_only_reason: open.read_only_reason.clone(),
+                joined: true,
+                peer: None,
+                blocked_peer: None,
+                special: protocol::Special::None,
+                can: self.can_of(&open.key),
+                send_as: self.send_as_of(&open.key),
+            }
+        } else {
+            self.target_of(open, link)
+        };
+        let draft = if thread { "" } else { open.draft.as_str() };
+        composer.update(cx, |composer, cx| composer.aim(target, draft, cx));
+    }
+
+    pub(in crate::gui) fn drop_composers(&mut self, gone: &[Entity<Composer>]) {
+        self.composer_state.extra.retain(|composer| !gone.iter().any(|drop| drop == composer));
     }
 
     // Hooks for the conversation and the window.
@@ -4616,8 +4842,14 @@ impl Shell {
     /// lost. Once this update is over: a hold can fail in the middle of that composer's own.
     fn hold_returns(&mut self, cx: &mut Context<Self>) {
         for held in self.composer_state.hold.take_failed() {
-            let slot = if held.typed.thread { &self.composer_state.thread } else { &self.composer_state.main };
-            if let Some(composer) = slot.get().cloned() {
+            let key = held.conversation.clone();
+            let thread = held.typed.thread;
+            let found = self.composers().into_iter().find(|composer| {
+                let composer = composer.read(cx);
+                composer.thread == thread && composer.target.as_ref().is_some_and(|target| target.key == key)
+            });
+            let slot = if thread { self.composer_state.thread.get().cloned() } else { self.composer_state.main.get().cloned() };
+            if let Some(composer) = found.or(slot) {
                 cx.defer(move |cx| composer.update(cx, |composer, cx| composer.held_back(held, cx)));
             }
         }
@@ -4711,7 +4943,7 @@ impl Shell {
     /// A Tiny file send reached a verdict. The composer that is holding it applies that; otherwise
     /// the verdict waits for the pending-row answer, which can arrive after the upload.
     fn finish_tiny_file(&mut self, client_id: String, outcome: Result<(), String>, cx: &mut Context<Self>) {
-        let composers: Vec<_> = [self.composer_state.main.get().cloned(), self.composer_state.thread.get().cloned()].into_iter().flatten().collect();
+        let composers = self.composers();
         let mut consumed = false;
         for composer in composers {
             let (id, outcome) = (client_id.clone(), outcome.clone());
@@ -4725,14 +4957,13 @@ impl Shell {
 
     /// Client ids of Tiny file scans still open in this conversation.
     fn scans_open_in(&self, key: &Key, cx: &mut Context<Self>) -> Vec<String> {
-        [self.composer_state.main.get(), self.composer_state.thread.get()].into_iter().flatten().flat_map(|composer| composer.read(cx).held_scan_ids(key)).collect()
+        self.composers().iter().flat_map(|composer| composer.read(cx).held_scan_ids(key)).collect()
     }
 
     /// Tiny file client ids whose send ack has not opened a hold yet.
     fn awaiting_tiny_files(&self, key: &Key, cx: &mut Context<Self>) -> Vec<String> {
-        [self.composer_state.main.get(), self.composer_state.thread.get()]
-            .into_iter()
-            .flatten()
+        self.composers()
+            .iter()
             .filter_map(|composer| composer.read(cx).pending_file.as_ref().filter(|(held, _)| held == key).map(|(_, id)| id.clone()))
             .collect()
     }
@@ -4773,7 +5004,7 @@ impl Shell {
                     shell.composer_state.ticking = false;
                     return false;
                 }
-                for composer in [shell.composer_state.main.get(), shell.composer_state.thread.get()].into_iter().flatten() {
+                for composer in shell.composers() {
                     composer.update(cx, |_, cx| cx.notify());
                 }
                 cx.notify();
@@ -4802,7 +5033,7 @@ impl Shell {
                 return;
             }
             Change::Media { file, .. } => {
-                for composer in [self.composer_state.main.get(), self.composer_state.thread.get()].into_iter().flatten() {
+                for composer in self.composers() {
                     let (composer, file) = (composer.clone(), file.clone());
                     // Its own update may be running: it hears of the file once that is over.
                     cx.defer(move |cx| composer.update(cx, |composer, cx| composer.media_landed(&file, cx)));
@@ -4811,7 +5042,7 @@ impl Shell {
             }
             Change::Recording { recording } => {
                 self.composer_state.recording = recording.clone();
-                for composer in [self.composer_state.main.get(), self.composer_state.thread.get()].into_iter().flatten() {
+                for composer in self.composers() {
                     let (composer, recording) = (composer.clone(), recording.clone());
                     cx.defer(move |cx| composer.update(cx, |composer, cx| composer.recording_changed(&recording, cx)));
                 }
@@ -5074,6 +5305,20 @@ mod tests {
         let (head_no_date, note_default) = ooo_banner_text("Ana Ruiz", "Out of office", None);
         assert_eq!(head_no_date, "Ana Ruiz is out of office");
         assert_eq!(note_default, None);
+    }
+
+    #[test]
+    fn a_handed_draft_wins_over_what_this_composer_remembered() {
+        let handed = Draft { text: "typed in the window".into(), reply: reply("m9"), ..Draft::default() };
+        let remembered = Draft { text: "typed before it left".into(), reply: reply("m1"), ..Draft::default() };
+        let won = draft_on_open(Some(handed), Some(remembered.clone()), "stored on the row");
+        assert_eq!(won.text, "typed in the window");
+        assert_eq!(won.reply.as_ref().map(|reply| reply.id.as_str()), Some("m9"));
+        // Clearing the window is a draft too: the old memory does not come back.
+        let cleared = draft_on_open(Some(Draft::default()), Some(remembered.clone()), "stored on the row");
+        assert!(cleared.text.is_empty());
+        assert_eq!(draft_on_open(None, Some(remembered), "stored on the row").text, "typed before it left");
+        assert_eq!(draft_on_open(None, None, "stored on the row").text, "stored on the row");
     }
 
     #[test]

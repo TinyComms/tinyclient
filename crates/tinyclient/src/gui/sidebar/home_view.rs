@@ -195,6 +195,7 @@ impl Shell {
             home.loaded = true;
             home.loaded_once = true;
             this.rebuild_home(cx);
+            this.restore_conversation_windows(cx);
         });
     }
 

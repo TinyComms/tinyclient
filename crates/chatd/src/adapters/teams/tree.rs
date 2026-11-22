@@ -351,7 +351,7 @@ impl Teams {
                     let mut row = ConversationRow {
                         space: Some(id.to_owned()),
                         position: position as i32,
-                        call: CallSupport::Handoff,
+                        call: super::channel_call(),
                         private,
                         shared,
                         mark,
@@ -574,7 +574,7 @@ impl Teams {
         let mut row = ConversationRow {
             avatar: avatar.map(|file| file.id),
             peer: partner.filter(|_| !bot).map(str::to_owned),
-            call: if bot || notes { CallSupport::None } else { CallSupport::Handoff },
+            call: super::chat_call(bot, notes),
             bot,
             special: if notes { Special::Saved } else { Special::None },
             can_pin: !notes,

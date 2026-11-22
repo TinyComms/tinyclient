@@ -2156,7 +2156,7 @@ pub(super) fn invoke_card_action(
 
     /// Translates one stored message on demand through Teams' middle-tier translation service.
     /// Ephemeral: never overwrites the stored original message.
-    pub(super) fn translate(&self, conversation: &str, message_id: &str, to: &str) -> Result<crate::adapters::Translation, Fault> {
+    pub(super) fn translate(&self, conversation: &str, message_id: &str, to: &str) -> Result<protocol::Translation, Fault> {
         if self.state().translation_disabled {
             return Err(Fault::Refused {
                 status: 403,
@@ -2185,8 +2185,11 @@ pub(super) fn invoke_card_action(
             "messageId": message_id,
         });
         let answer = self.call("POST", &url, super::Auth::Both(Audience::Spaces), Body::Json(&body), false)?;
-        parse_translation_response(&answer.body).ok_or_else(|| {
-            Fault::Net("Teams returned no translated text.".to_owned())
+        let read = parse_translation_response(&answer.body).ok_or_else(|| Fault::Net("Teams returned no translated text.".to_owned()))?;
+        Ok(protocol::Translation {
+            text: read.text,
+            source_lang: Some(read.detected_language).filter(|lang| !lang.is_empty()),
+            target_lang: to.to_owned(),
         })
     }
 
@@ -2467,8 +2470,14 @@ fn tab_name_from(content: &str) -> Option<String> {
     None
 }
 
+/// What Teams' translate call answered.
+struct Translated {
+    text: String,
+    detected_language: String,
+}
+
 /// Reads a translated message body and optional detected language from Teams' translate response.
-fn parse_translation_response(body: &Value) -> Option<crate::adapters::Translation> {
+fn parse_translation_response(body: &Value) -> Option<Translated> {
     let direct_text = [&body["translatedText"], &body["translation"], &body["text"]]
         .into_iter()
         .filter_map(Value::as_str)
@@ -2487,7 +2496,7 @@ fn parse_translation_response(body: &Value) -> Option<crate::adapters::Translati
         .find(|s| !s.is_empty())
         .unwrap_or("")
         .to_owned();
-        return Some(crate::adapters::Translation { text: text.to_owned(), detected_language: detected });
+        return Some(Translated { text: text.to_owned(), detected_language: detected });
     }
     let first = body.as_array()?.first()?;
     let text = first["translations"].as_array()?.first()?["text"].as_str()?.trim();
@@ -2499,7 +2508,7 @@ fn parse_translation_response(body: &Value) -> Option<crate::adapters::Translati
         .unwrap_or("")
         .trim()
         .to_owned();
-    Some(crate::adapters::Translation { text: text.to_owned(), detected_language: detected })
+    Some(Translated { text: text.to_owned(), detected_language: detected })
 }
 
 #[cfg(test)]

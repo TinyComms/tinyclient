@@ -405,24 +405,26 @@ impl Shell {
                 this.call_menu_set(None, cx);
                 this.call_ask(Request::Media(MediaRequest::Camera { on: true }), cx);
             }));
-        div()
-            .id("call-camera-preview-menu")
-            .flex()
-            .flex_col()
-            .gap(px(8.))
-            .child(
-                div()
-                    .w_full()
-                    .h(px(150.))
-                    .rounded(px(8.))
-                    .bg(gpui::rgb(0x0b0b0d))
-                    .border_1()
-                    .border_color(theme::hairline())
-                    .overflow_hidden()
-                    .child(preview),
-            )
-            .when(!call.cameras.is_empty(), |box_div| box_div.child(list))
-            .child(go)
+        div().child(
+            div()
+                .id("call-camera-preview-menu")
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .w_full()
+                        .h(px(150.))
+                        .rounded(px(8.))
+                        .bg(gpui::rgb(0x0b0b0d))
+                        .border_1()
+                        .border_color(theme::hairline())
+                        .overflow_hidden()
+                        .child(preview),
+                )
+                .when(!call.cameras.is_empty(), |box_div| box_div.child(list))
+                .child(go),
+        )
     }
 
     /// Twelve segments and what they measure. The microphone's stays live while muted so it can

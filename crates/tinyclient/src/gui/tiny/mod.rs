@@ -725,6 +725,7 @@ impl Shell {
         if let (Some(account), Some(open)) = (self.tiny_state.account.as_ref(), self.open.as_ref()) {
             if open.network == Network::Tiny && open.account == account.account && had_channel(&open.id) && channel_gone(&open.id) {
                 self.open = None;
+                self.sync_popout_composers(cx);
             }
         }
         let state = &mut self.tiny_state;
@@ -1707,6 +1708,7 @@ impl Shell {
         };
         if self.open.as_ref().is_some_and(|key| key.network == Network::Tiny && key.account == account.account && key.id == channel_id) {
             self.open = None;
+            self.sync_popout_composers(cx);
         }
         self.act(Request::TinyChannelDelete { account, channel_id }, cx);
     }

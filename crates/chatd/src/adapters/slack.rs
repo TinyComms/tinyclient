@@ -1240,7 +1240,7 @@ impl Slack {
             team
         };
         self.ctx.describe(name, me)?;
-        self.ctx.capabilities(capabilities());
+        self.ctx.capabilities(capability_ceiling());
         self.space(name)?;
         let cookie = self.cookie();
         let headers = [
@@ -3547,7 +3547,7 @@ pub(crate) fn prove_profile_fields() -> Result<(), String> {
 /// through `CatalogKind::Gifs` (`gifs.trending` / `gifs.search`) and posted as unfurled GIF URLs;
 /// a GIF pasted as a link or sent as a file also plays. Voice clips are enabled through
 /// `voice_notes: true` and uploaded with Slack's clip `subtype` (`slack_audio` / `slack_video`).
-fn capabilities() -> protocol::Capabilities {
+pub(crate) fn capability_ceiling() -> protocol::Capabilities {
     protocol::Capabilities {
         max_file_bytes: send::LARGEST,
         max_files: send::FILES as u32,
@@ -3627,6 +3627,11 @@ fn parse_duration_minutes(text: &str) -> Option<i64> {
         }
     }
     None
+}
+
+/// Every Slack conversation can hold a huddle, which the official app carries.
+pub(crate) fn call_support() -> protocol::CallSupport {
+    protocol::CallSupport::Handoff
 }
 
 /// A store error on the way out of a command, as a fault. Slack had already said yes.

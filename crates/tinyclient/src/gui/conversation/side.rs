@@ -345,7 +345,7 @@ fn pane_open(open: &protocol::Conversation) -> pane::Open {
 /// The key a thread is read and posted under: its own id, on its conversation's account.
 /// Slack's is `{channel}:{root}` and Teams' is `{channel};messageid={root}`, even before the
 /// first reply. Discord's does not exist until the thread channel is created.
-fn thread_key(conversation: &Key, kind: ConversationKind, root: &Message) -> Option<Key> {
+pub(super) fn thread_key(conversation: &Key, kind: ConversationKind, root: &Message) -> Option<Key> {
     let caps = Capabilities {
         threads: matches!(conversation.network, Network::Slack | Network::Teams | Network::Discord | Network::Tiny),
         direct_threads: conversation.network == Network::Slack,
@@ -465,6 +465,8 @@ impl Shell {
                 }
             }
         }
+        // Opening or closing the main thread moves that thread's draft.
+        self.sync_popout_composers(cx);
     }
 
     /// Another view changed the slot: the ✕, `cmd-.`, a member row's profile, the members
@@ -490,6 +492,7 @@ impl Shell {
             self.dismiss_search(cx);
             return;
         }
+        let mut thread_closed = false;
         let side = &mut self.conversation_state.side;
         match slot {
             // In a narrow window the pane stood in for the conversation, and "‹ #channel" or ✕
@@ -510,6 +513,7 @@ impl Shell {
                 side.search = None;
                 side.search_input = None;
                 self.conversation_state.thread.borrow_mut().take();
+                thread_closed = true;
             }
             Some(RightKind::Info) => {
                 if let Some(shown) = shown {
@@ -532,7 +536,11 @@ impl Shell {
                 pane::keep_thread(&side.stack, &Stack::default(), &mut side.threads);
                 side.stack = Stack::default();
                 side.installed = None;
+                thread_closed = true;
             }
+        }
+        if thread_closed {
+            self.sync_popout_composers(cx);
         }
     }
 

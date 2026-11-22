@@ -13,7 +13,7 @@
 //! a keyframe, and a stalled tick holds the encoder back rather than losing a frame.
 
 use crate::picture::{
-    self, share_quality, Ask, Encoded, Incoming, Outgoing, Painted, Tag, CAMERA_HIGH_BPS, CAMERA_LOW_BPS,
+    self, camera_fps, camera_high_bps, share_quality, Ask, Encoded, Incoming, Outgoing, Painted, Tag, CAMERA_LOW_BPS,
 };
 use crate::session::Controls;
 use crate::{out, rt};
@@ -120,7 +120,7 @@ impl Default for Rates {
     fn default() -> Self {
         Rates {
             share: share_quality().bps,
-            high: CAMERA_HIGH_BPS,
+            high: camera_high_bps(),
             low: CAMERA_LOW_BPS,
         }
     }
@@ -165,7 +165,7 @@ pub fn allocate(estimate: u64, share: bool, camera: bool, was: Rates) -> Rates {
         0
     };
     let share = take(share, share_quality().bps, SHARE_FLOOR, was.share);
-    let high = take(camera, CAMERA_HIGH_BPS, HIGH_FLOOR, was.high);
+    let high = take(camera, camera_high_bps(), HIGH_FLOOR, was.high);
     Rates { share, high, low }
 }
 
@@ -263,7 +263,7 @@ impl Uplink {
 pub fn desired(share: bool, camera: bool) -> u64 {
     let share = if share { u64::from(share_quality().bps) } else { 0 };
     let camera = if camera {
-        u64::from(CAMERA_HIGH_BPS + CAMERA_LOW_BPS)
+        u64::from(camera_high_bps() + CAMERA_LOW_BPS)
     } else {
         0
     };
@@ -340,10 +340,12 @@ impl Schedule {
     /// The rate for what `wants` now: the share's own, a camera's, or for both the share's
     /// held to twice a camera's, which is as fast as a webcam gives frames.
     fn rate(&mut self, wants: &Wants) {
+        let cam = camera_fps();
         let full = match (wants.share, wants.camera) {
             (true, false) => picture::share_fps(),
-            (true, true) => picture::share_fps().min(FPS * 2),
-            _ => FPS,
+            (true, true) => picture::share_fps().min((cam * 2).min(picture::SHARE_FPS_MOST)),
+            (false, true) => cam,
+            (false, false) => FPS,
         };
         if full != self.full {
             self.full = full;

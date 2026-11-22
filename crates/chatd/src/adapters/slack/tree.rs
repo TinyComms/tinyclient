@@ -3,7 +3,7 @@
 use super::{emoji, fnv, seconds, thread_id, thread_of, Fault, Slack};
 use crate::adapters::{BrowsedPage, Command, Failure};
 use crate::store::{ConversationRow, SpaceRow};
-use protocol::{BrowsedChannel, CallSupport, Conversation, ConversationKind, Group, GroupKind, MediaFile, MediaKind, Relation};
+use protocol::{BrowsedChannel, Conversation, ConversationKind, Group, GroupKind, MediaFile, MediaKind, Relation};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -161,7 +161,7 @@ impl Slack {
         ConversationRow {
             space: Some(space_id.to_owned()),
             position: LAST,
-            call: CallSupport::Handoff,
+            call: super::call_support(),
             ..ConversationRow::new(id, kind, title)
         }
     }
@@ -542,7 +542,7 @@ impl Slack {
     }
 
     fn disable_sidebar_sections(&self) {
-        let mut caps = super::capabilities();
+        let mut caps = super::capability_ceiling();
         caps.sidebar_sections = false;
         self.ctx.capabilities(caps);
     }

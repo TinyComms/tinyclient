@@ -51,13 +51,20 @@ pub const OUTPUT: &str = "output";
 /// V22. The camera, stored as V1 and V2 store theirs: absent is the first camera the system
 /// lists, else one by name, then a tab and the system's id for it.
 pub const CAMERA: &str = "camera";
+/// V23. Camera resolution/rate tier: `auto`, `hd`, `standard`, or `data_saver`.
+pub const CAMERA_QUALITY: &str = "camera_quality";
+pub const CAMERA_QUALITY_CHOICES: [&str; 4] = ["auto", "hd", "standard", "data_saver"];
+/// V24. Mirror the local camera self-view horizontally (never what peers see). Defaults on.
+pub const CAMERA_MIRROR: &str = "camera_mirror";
+/// V25. Apply lightweight on-device background blur before encoding camera video. Defaults off.
+pub const CAMERA_BLUR: &str = "camera_blur";
 /// The stored value of "System default" in V1 and V2.
 pub const SYSTEM_DEFAULT: &str = "@system";
 /// V4. Every join and every Accept starts muted.
 pub const JOIN_MUTED: &str = "join_muted";
 /// V19: "You're muted" shows when the microphone hears speech while I am muted in a call.
 pub const MUTED_TALK: &str = "muted_talk";
-/// V23: automatically open a newly started screen share when the user is looking at the call.
+/// V27: automatically open a newly started screen share when the user is looking at the call.
 pub const AUTO_WATCH_SHARE: &str = "auto_watch_share";
 /// Only join Tiny calls that are end-to-end encrypted. A call whose server turns encryption off
 /// always stops sending and playing (mediad `Blocked`); off, the person may choose to carry on
@@ -124,6 +131,11 @@ pub const RECEIPTS: &str = "receipts";
 pub const PRESENCE_ACTIVITY: &str = "presence_activity";
 /// P4. Days messages are kept on this Mac: 7, 30 or 90.
 pub const KEEP_DAYS: &str = "keep_days";
+/// M8. Target language for inline message translation (`"auto"` follows system locale).
+pub const TRANSLATE_TO: &str = "translate_to";
+pub const TRANSLATE_TO_CHOICES: [&str; 13] = [
+    "auto", "en", "es", "fr", "de", "it", "pt", "ru", "ja", "ko", "zh", "ar", "hi",
+];
 /// Client-side link preview cards (e.g. Google Messages). On for known contacts by default.
 pub const LINK_PREVIEWS: &str = "link_previews";
 /// Client-side link preview cards for numbers not in contacts. Off by default to avoid
@@ -288,6 +300,9 @@ fn kind(key: &str) -> Option<Kind> {
         ECHO_CANCELLATION | AUTO_GAIN => Kind::Switch(true),
         NOISE_SUPPRESSION => Kind::Word(&NOISE_CHOICES, "enhanced"),
         VOICE_QUALITY => Kind::Word(&QUALITY_CHOICES, "standard"),
+        CAMERA_QUALITY => Kind::Word(&CAMERA_QUALITY_CHOICES, "auto"),
+        CAMERA_MIRROR => Kind::Switch(true),
+        CAMERA_BLUR => Kind::Switch(false),
         JOIN_MUTED | PUSH_TO_TALK | REQUIRE_CALL_E2EE | LINK_PREVIEWS_UNKNOWN | STREAMER_HIDE_WINDOW | STREAMER_DETECT_OBS => Kind::Switch(false),
         STREAMER_MODE => Kind::Word(&STREAMER_MODE_CHOICES, "while_sharing"),
         MUTED_TALK | AUTO_WATCH_SHARE => Kind::Switch(true),
@@ -300,6 +315,7 @@ fn kind(key: &str) -> Option<Kind> {
         PTT_KEY | PRIORITY_KEY | MUTE_KEY | DEAFEN_KEY => Kind::Hotkey,
         _ if gain_user(key).is_some() => Kind::Gain,
         KEEP_DAYS => Kind::Choice(&KEEP_DAYS_CHOICES, 90),
+        TRANSLATE_TO => Kind::Word(&TRANSLATE_TO_CHOICES, "auto"),
         CACHE_MB => Kind::Choice(&CACHE_MB_CHOICES, 500),
         // Per account; the default is the network's (`typing_default`).
         TYPING | RECEIPTS | PRESENCE_ACTIVITY => Kind::Switch(true),
@@ -699,6 +715,37 @@ impl Values {
     /// Preferred target language for on-demand message translation (`auto` or a BCP-47 tag).
     pub fn translate_lang(&self) -> String {
         self.stored(GLOBAL, TRANSLATE_LANG).unwrap_or("auto").to_owned()
+    }
+
+    /// V23: Auto, HD (720p30), Standard (360p15), or Data saver.
+    pub fn camera_quality(&self) -> crate::CameraQuality {
+        crate::CameraQuality::parse(self.word(GLOBAL, CAMERA_QUALITY)).unwrap_or_default()
+    }
+
+    /// V23–V25: camera quality, self-view mirror, and on-device background blur.
+    pub fn camera_settings(&self) -> crate::CameraSettings {
+        crate::CameraSettings {
+            quality: self.camera_quality(),
+            mirror: self.on(CAMERA_MIRROR),
+            blur: self.on(CAMERA_BLUR),
+        }
+    }
+
+    /// M8: target ISO-639-1 language code for message translation (`"auto"` resolves system locale).
+    pub fn translate_target(&self) -> String {
+        let word = self.word(GLOBAL, TRANSLATE_TO);
+        if word != "auto" && !word.is_empty() {
+            return crate::normalize_language_tag(word);
+        }
+        for var in ["LC_ALL", "LC_MESSAGES", "LANG"] {
+            if let Ok(val) = std::env::var(var) {
+                let norm = crate::normalize_language_tag(&val);
+                if !val.trim().is_empty() && !val.eq_ignore_ascii_case("C") && !val.to_ascii_uppercase().starts_with("POSIX") {
+                    return norm;
+                }
+            }
+        }
+        "en".to_owned()
     }
 
     /// How the microphone opens, as the user chose. A room that requires push-to-talk asks
@@ -1356,5 +1403,47 @@ mod tests {
         assert!(values.streamer_active(false, false));
         values.set(GLOBAL, STREAMER_MODE, Some("off".into()));
         assert!(!values.streamer_active(true, true));
+    }
+
+    #[test]
+    fn camera_quality_mirror_and_blur_settings_validate_and_resolve() {
+        let mut values = Values::default();
+        assert_eq!(values.camera_settings(), crate::CameraSettings {
+            quality: crate::CameraQuality::Auto,
+            mirror: true,
+            blur: false,
+        });
+        for q in CAMERA_QUALITY_CHOICES {
+            assert!(valid(GLOBAL, CAMERA_QUALITY, q), "{q}");
+        }
+        assert!(!valid(GLOBAL, CAMERA_QUALITY, "4k"));
+        assert!(valid(GLOBAL, CAMERA_MIRROR, "off") && valid(GLOBAL, CAMERA_MIRROR, "on"));
+        assert!(valid(GLOBAL, CAMERA_BLUR, "on") && valid(GLOBAL, CAMERA_BLUR, "off"));
+        assert!(valid(GLOBAL, CAMERA, "FaceTime HD\tcam-0"));
+
+        values.set(GLOBAL, CAMERA_QUALITY, Some("hd".into()));
+        values.set(GLOBAL, CAMERA_MIRROR, Some("off".into()));
+        values.set(GLOBAL, CAMERA_BLUR, Some("on".into()));
+        assert_eq!(values.camera_settings(), crate::CameraSettings {
+            quality: crate::CameraQuality::Hd,
+            mirror: false,
+            blur: true,
+        });
+    }
+
+    #[test]
+    fn translate_target_setting_validates_and_resolves() {
+        let mut values = Values::default();
+        for code in TRANSLATE_TO_CHOICES {
+            assert!(valid(GLOBAL, TRANSLATE_TO, code), "{code}");
+        }
+        assert!(!valid(GLOBAL, TRANSLATE_TO, "klingon"));
+        assert!(!valid(&account_scope(&account(Network::Telegram)), TRANSLATE_TO, "es"));
+        assert!(!values.translate_target().is_empty());
+
+        values.set(GLOBAL, TRANSLATE_TO, Some("ja".into()));
+        assert_eq!(values.translate_target(), "ja");
+        values.set(GLOBAL, TRANSLATE_TO, Some("fr".into()));
+        assert_eq!(values.translate_target(), "fr");
     }
 }

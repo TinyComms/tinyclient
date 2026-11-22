@@ -142,7 +142,7 @@ pub(super) fn sending(call: &Call, content: Content) -> bool {
 /// The call can carry pictures: a Tiny room, or a Discord voice call. Elsewhere camera and
 /// share are absent, not greyed.
 fn pictures_network(call: &Call) -> bool {
-    matches!(call.conversation.network, Network::Tiny | Network::Discord)
+    protocol::call_pictures(call.conversation.network)
 }
 
 /// One round control: its look, and the colors that go with it.

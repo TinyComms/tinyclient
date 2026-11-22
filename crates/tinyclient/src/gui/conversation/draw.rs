@@ -1003,6 +1003,61 @@ impl Pane {
                 ),
                 None => sent.children(said).children(attached),
             };
+            if self.translating.contains(&message.id) {
+                sent = sent.child(
+                    div()
+                        .mt(px(4.))
+                        .pl(px(10.))
+                        .border_l_2()
+                        .border_color(tokens::border_strong())
+                        .type_small()
+                        .italic()
+                        .text_color(theme::text_faint())
+                        .child("Translating…"),
+                );
+            } else if let Some(translated) = self.translations.get(&message.id).cloned() {
+                let clear_id = message.id.clone();
+                let attribution = match translated.source_lang.as_deref() {
+                    Some(src) if !src.is_empty() && !src.eq_ignore_ascii_case("auto") => {
+                        format!("Translated from {}", protocol::language_name(src))
+                    }
+                    _ => format!("Translated to {}", protocol::language_name(&translated.target_lang)),
+                };
+                sent = sent.child(
+                    div()
+                        .mt(px(4.))
+                        .pl(px(10.))
+                        .border_l_2()
+                        .border_color(theme::accent())
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(div().type_body().text_color(theme::text()).child(translated.text))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .type_micro()
+                                .text_color(theme::text_faint())
+                                .child(attribution)
+                                .child("·")
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("translation-clear-{}", message.id)))
+                                        .cursor_pointer()
+                                        .text_color(theme::text_soft())
+                                        .hover(|style| style.underline())
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.translations.remove(&clear_id);
+                                            cx.notify();
+                                        }))
+                                        .child("Show original"),
+                                ),
+                        ),
+                );
+            }
             sent = sent
                 .children(message.ephemeral.then(|| {
                     div()
@@ -1423,16 +1478,10 @@ impl Pane {
         if message.text.trim().is_empty() {
             return message.edited.then(|| self.edited_mark(message, cx)).into_iter().collect();
         }
-        let translated = self.translations.get(&message.id).cloned();
-        if translated.is_none() {
-            if let Some(emoji) = rich::jumbo(&message.text, &message.spans) {
-                return vec![self.jumbo(&emoji, window, cx)];
-            }
+        if let Some(emoji) = rich::jumbo(&message.text, &message.spans) {
+            return vec![self.jumbo(&emoji, window, cx)];
         }
-        let mut blocks = match &translated {
-            Some((text, _)) => rich::blocks(text, &[]),
-            None => rich::blocks(&message.text, &message.spans),
-        };
+        let mut blocks = rich::blocks(&message.text, &message.spans);
         let mut edited_alone = message.edited;
         if let (true, Some(Block::Text(last))) = (message.edited, blocks.last_mut()) {
             last.mark_edited();
@@ -1492,28 +1541,6 @@ impl Pane {
         }
         if edited_alone {
             out.push(self.edited_mark(message, cx));
-        }
-        if let Some((_, detected)) = translated {
-            let caption = if detected.is_empty() {
-                "Translated · Show original".to_owned()
-            } else {
-                format!("Translated from {detected} · Show original")
-            };
-            let msg = message.clone();
-            out.push(
-                div()
-                    .id(name_id("translated", &message.id))
-                    .mt(px(2.))
-                    .type_micro()
-                    .text_color(theme::text_faint())
-                    .cursor_pointer()
-                    .hover(|style| style.text_color(theme::text_soft()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.toggle_translate(&msg, cx);
-                    }))
-                    .child(caption)
-                    .into_any_element(),
-            );
         }
         if let Some(expires_at) = message.expires_at {
             if let Some(label) = expiry_label(expires_at, crate::view::now()) {

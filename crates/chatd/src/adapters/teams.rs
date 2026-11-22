@@ -161,6 +161,63 @@ pub fn prove_share_links() -> Result<(), String> {
     links::prove_share_links()
 }
 
+/// What a Teams account may send. Files stay off: the old OneDrive path made an
+/// organization-wide link.
+pub(crate) fn capability_ceiling() -> protocol::Capabilities {
+    protocol::Capabilities {
+        max_file_bytes: 250 * 1024 * 1024,
+        max_files: protocol::ATTACHMENTS_LIMIT as u32,
+        reply: true,
+        edit: true,
+        delete: true,
+        threads: true,
+        pins: true,
+        save_messages: true,
+        activity_feed: true,
+        search: true,
+        search_global: true,
+        groups: 250,
+        blocks: true,
+        browse_channels: true,
+        join_space_by_invite: true,
+        leave_space: true,
+        pin_chats: 15,
+        close_direct: true,
+        clear_history: true,
+        suppress_embeds: true,
+        schedule: true,
+        voice_notes: true,
+        gifs: true,
+        stickers: true,
+        translate: true,
+        forward: true,
+        reactions: true,
+        mention_format: protocol::MentionFormat::Teams,
+        mention_spans: true,
+        importance: true,
+        channel_subject: true,
+        out_of_office: true,
+        polls: Some(protocol::PollCapabilities {
+            max_options: 10,
+            max_duration_secs: 0,
+            multiple: true,
+            anonymous: true,
+        }),
+        read_by: true,
+        ..protocol::Capabilities::default()
+    }
+}
+
+/// A team channel's call opens in Teams.
+pub(crate) fn channel_call() -> protocol::CallSupport {
+    protocol::CallSupport::Handoff
+}
+
+/// A chat opens in Teams, except a bot and the user's own Notes.
+pub(crate) fn chat_call(bot: bool, notes: bool) -> protocol::CallSupport {
+    if bot || notes { protocol::CallSupport::None } else { protocol::CallSupport::Handoff }
+}
+
 use super::net::{address, browser};
 use super::{keep_connected, serve_commands, Command, Context, Download, Failure, Refusal, Signed};
 use base64::Engine;
@@ -1033,46 +1090,10 @@ impl Teams {
         // Other files use the member-scoped upload: recipients are resolved before the
         // session is created, and the drive item is deleted if the invite fails.
         self.ctx.capabilities(protocol::Capabilities {
-            max_file_bytes: 250 * 1024 * 1024,
-            max_files: protocol::ATTACHMENTS_LIMIT as u32,
-            reply: true,
-            edit: true,
-            delete: true,
-            threads: true,
-            pins: true,
-            save_messages: true,
-            activity_feed: true,
-            search: true,
-            search_global: true,
-            groups: 250,
-            blocks: true,
-            browse_channels: true,
-            join_space_by_invite: true,
-            leave_space: true,
-            pin_chats: 15,
-            close_direct: true,
-            clear_history: true,
-            suppress_embeds: true,
-            schedule: true,
-            voice_notes: true,
             gifs: !giphy_disabled && self.cloud == TeamsCloud::Worldwide,
             stickers: !stickers_disabled,
             translate: !translation_disabled,
-            forward: true,
-            reactions: true,
-            mention_format: protocol::MentionFormat::Teams,
-            mention_spans: true,
-            importance: true,
-            channel_subject: true,
-            out_of_office: true,
-            polls: Some(protocol::PollCapabilities {
-                max_options: 10,
-                max_duration_secs: 0,
-                multiple: true,
-                anonymous: true,
-            }),
-            read_by: true,
-            ..protocol::Capabilities::default()
+            ..capability_ceiling()
         });
         {
             let mut state = self.state();
