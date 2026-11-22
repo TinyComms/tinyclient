@@ -382,7 +382,7 @@ impl Upload {
         self.check()?;
         let name = self.files[at].name.clone();
         let network = self.account.network;
-        if !uploads_to(network, &target.url) {
+        if !uploads_to_account(&self.account, &target.url) {
             return Err(format!("{name} could not be sent: {} does not take files at that address.", network.label()));
         }
         let unreadable = |err: std::io::Error| format!("{name} could not be read: {}.", plain(&err));
@@ -703,7 +703,16 @@ mod windows_places {
 
 /// Whether the network takes uploads at this address. Never plain HTTP, except a test's own
 /// server in a scratch directory, and a Tiny server on this machine.
+#[cfg_attr(not(test), allow(dead_code))]
 fn uploads_to(network: Network, url: &str) -> bool {
+    uploads_to_for(None, network, url)
+}
+
+fn uploads_to_account(account: &AccountKey, url: &str) -> bool {
+    uploads_to_for(Some(account), account.network, url)
+}
+
+fn uploads_to_for(account: Option<&AccountKey>, network: Network, url: &str) -> bool {
     let Some((secure, host)) = super::fetch::host_of(url) else {
         return false;
     };
@@ -726,8 +735,12 @@ fn uploads_to(network: Network, url: &str) -> bool {
         Network::Discord => &["discord.com", "discordapp.com", "discord-attachments-uploads-prd.storage.googleapis.com"],
         // `files.getUploadURLExternal` answers an address on files.slack.com.
         Network::Slack => &["slack.com"],
-        // OneDrive and SharePoint for files; the Teams media service for pasted images.
-        Network::Teams => &["graph.microsoft.com", "sharepoint.com", "asm.skype.com", "teams.microsoft.com"],
+        // Per-cloud Teams allow-list: OneDrive/SharePoint and AMS media store for this account's cloud.
+        Network::Teams => account
+            .map(crate::adapters::teams::cloud_for)
+            .unwrap_or_default()
+            .endpoints()
+            .upload_hosts,
         // MTProto, through `parts`: nothing goes over HTTP.
         Network::Telegram => &[],
         // Encrypted before it leaves, by the adapter: nothing goes through this helper.
@@ -854,6 +867,21 @@ mod tests {
         assert!(!uploads_to(Network::Telegram, "https://core.telegram.org/x"));
         assert!(uploads_to(Network::Tiny, "https://chat.example/v1/media"));
         assert!(!uploads_to(Network::Tiny, "https://chat.example@evil.example/v1/media"));
+        assert!(!uploads_to(Network::Teams, "https://agency.sharepoint.us/personal/x/_api/upload"));
+        assert!(!uploads_to(Network::Teams, "https://cn.sharepoint.cn/personal/x/_api/upload"));
+
+        let gcc = AccountKey { network: Network::Teams, account: "upload-gcc-1".into() };
+        let cn = AccountKey { network: Network::Teams, account: "upload-cn-1".into() };
+        crate::adapters::teams::cloud::register(&gcc, crate::adapters::teams::TeamsCloud::GccHigh);
+        crate::adapters::teams::cloud::register(&cn, crate::adapters::teams::TeamsCloud::China);
+        assert!(uploads_to_account(&gcc, "https://agency.sharepoint.us/personal/x/_api/upload"));
+        assert!(uploads_to_account(&gcc, "https://graph.microsoft.us/v1.0/me/drive"));
+        assert!(!uploads_to_account(&gcc, "https://contoso-my.sharepoint.com/personal/x/_api/upload"));
+        assert!(!uploads_to_account(&gcc, "https://graph.microsoft.com/v1.0/me/drive"));
+        assert!(uploads_to_account(&cn, "https://cn.sharepoint.cn/personal/x/_api/upload"));
+        assert!(!uploads_to_account(&cn, "https://agency.sharepoint.us/personal/x/_api/upload"));
+        crate::adapters::teams::cloud::unregister(&gcc);
+        crate::adapters::teams::cloud::unregister(&cn);
     }
 
     #[test]

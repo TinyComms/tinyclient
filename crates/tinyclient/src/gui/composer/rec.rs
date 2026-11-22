@@ -6,10 +6,10 @@
 use protocol::{Capabilities, Key, OutgoingFile, RecordRequest, RecordState, Recording, VoiceNote};
 use super::{super::playing, Tone};
 
-/// Where the composer has a mic: the account takes files and names one a voice note with. A
-/// recording is a file send, so a network without files has no voice notes either.
+/// Where the composer has a mic: any account that supports voice notes, including networks like
+/// Teams that upload voice notes to a dedicated media store even when general file uploads are off.
 pub(in crate::gui) fn available(can: &Capabilities) -> bool {
-    can.voice_notes && can.max_file_bytes > 0
+    can.voice_notes
 }
 
 /// What a press on the mic is: the first on a conversation records, the next stops. A press
@@ -346,5 +346,13 @@ mod tests {
         // Two files are not one voice note (`Outgoing::voice` names the last of `files`).
         let two = vec![file("voice-1.opus"), file("trail.jpg")];
         assert!(sent_as(&Some(kept("voice-1.opus")), &two).is_none());
+    }
+
+    #[test]
+    fn voice_notes_available_even_when_general_file_uploads_are_disabled() {
+        let teams = Capabilities { voice_notes: true, max_file_bytes: 0, ..Capabilities::default() };
+        assert!(available(&teams));
+        let disabled = Capabilities { voice_notes: false, max_file_bytes: 10_000, ..Capabilities::default() };
+        assert!(!available(&disabled));
     }
 }

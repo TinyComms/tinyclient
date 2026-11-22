@@ -39,8 +39,11 @@ channels, app DMs (GitHub, Linear, Google Calendar, Cloudflare), a few people. T
 ## 3. A workspace's sidebar, top to bottom
 
 1. **Header** (R2) with ⋯: Mark all read, Show (all / unreads only), Open in Slack.
-2. **Threads**: a fixed row with a count of followed threads that have new replies, and an accent
-   pill when one of them mentions me. See §4. This is the only built-in destination kept.
+2. **Unreads** and **Threads**: fixed rows at the top of the workspace sidebar. **Unreads** opens a
+   grouped scrolling list of unread messages across the workspace's unread channels and DMs,
+   fetched on open (never at connect) via paced, capped `conversations.history` calls (`oldest = last_read`),
+   upgrading coarse `has_unreads` flags to real unread counts with per-group and all mark-read.
+   **Threads** shows followed threads with new replies and an accent pill when one mentions me (§4).
 3. **The user's own sections, in Slack's order**, holding channels, DMs and apps exactly where the
    user filed them. Starred is a section like any other. Collapse is remembered (N5).
 4. **Channels** (Slack's default section): whatever no custom section claims.
@@ -53,8 +56,9 @@ channels, app DMs (GitHub, Linear, Google Calendar, Cloudflare), a few people. T
 Rules:
 - **R5. Sort within a section:** channels A to Z by name without the `#`, DMs and apps by recency.
   Slack's per-section sort override is honored if `channelSections` carries it [U], otherwise this default.
-- **R6. Built-in groups.** Cut: Unreads view (the "unreads only" filter and the Inbox Unread chip
-  cover it), Mentions & reactions (Inbox Mentions chip; reactions to me are cut), Activity tabs.
+- **R6. Built-in groups.** Kept: **Unreads** (paced, capped on-open fetch of unread channels and DMs,
+  built generically across networks; cut lifted in #606) and **Threads** (§4). Cut: Mentions & reactions
+  (Inbox Mentions chip; reactions to me are cut), Activity tabs.
   Hand off with one ⋯ menu line "Open in Slack": Later/saved, Drafts & sent, Huddles list,
   Canvases, Directories. Directories become People search (§5).
 - **R7. Show unreads only.** Honor Slack's sidebar pref and per-section overrides (all, unreads only,
@@ -140,7 +144,7 @@ the networks differ, not one menu with greyed rows.
   pill (F11) becomes an icon button when no huddle is running.
 - Scheduled messages and Slack drafts: not shown (stories: no scheduled sends). A local draft
   marks the row with a pencil.
-- App home tabs are cut. An app DM opens its Messages tab, and an "Open app in Slack" line replaces Home.
+- App home tabs are shown (#551). Opening an app DM's Home tab loads its published view; About lists the app's commands and links.
 
 ## 10. Cost of each decision (under `07`)
 
@@ -172,7 +176,7 @@ the networks differ, not one menu with greyed rows.
 | S12 | P1 | I pause notifications or set my status from Slack's menu. | `dnd.setSnooze` / `users.profile.set` are sent once; the menu shows "Paused until 3:40 PM". |
 | S13 | P2 | Slack Connect channels show the other org; a live huddle shows on its row. | `is_ext_shared` → Connect glyph; huddle start event → glyph within 1 s. |
 | S14 | P2 | Docked channel details show topic, member count and shared orgs. | Details pane fields equal `conversations.info`. |
-| cut | — | Unreads view, Activity tabs, reactions-to-me, Later, Drafts & sent, Huddles list, Canvases, app home tabs, prefix grouping, all-workspaces-expanded home. | Each is an "Open in Slack" line where a user would look for it. |
+| cut | — | Activity tabs, reactions-to-me, Later, Drafts & sent, Huddles list, Canvases, prefix grouping, all-workspaces-expanded home. | Unreads (#606) and app home tabs (#551) are in the app. Each remaining item is an "Open in Slack" line where a user would look for it. |
 
 ## Open questions for the owner
 

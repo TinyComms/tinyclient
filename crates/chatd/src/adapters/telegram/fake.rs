@@ -3778,6 +3778,23 @@ impl World {
             }
             return Some(answer(true));
         }
+        if let Some(request) = asked::<f::messages::TranslateText>(body) {
+            let who = request
+                .peer
+                .as_ref()
+                .map(|p| input_who(p).text())
+                .unwrap_or_default();
+            let first_id = request.id.as_ref().and_then(|ids| ids.first().copied()).unwrap_or(0);
+            self.log(&format!("TranslateText {who} {first_id} to={}", request.to_lang));
+            let translated = tl::types::TextWithEntities {
+                text: format!("[{}] translated #{first_id}", request.to_lang),
+                entities: Vec::new(),
+            };
+            let result = tl::types::messages::TranslateResult {
+                result: vec![tl::enums::TextWithEntities::Entities(translated)],
+            };
+            return Some(answer(tl::enums::messages::TranslatedText::TranslateResult(result)));
+        }
         if let Some(request) = asked::<f::contacts::ResolveUsername>(body) {
             self.log(&format!("ResolveUsername {}", request.username));
             if request.username == OFF_PAGE_HANDLE {

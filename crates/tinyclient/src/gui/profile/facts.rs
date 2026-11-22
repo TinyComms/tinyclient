@@ -403,6 +403,21 @@ pub fn mask(phone: &str) -> String {
         .collect()
 }
 
+/// `t•••@•••.com`: keeps the first character of the local part and the top-level suffix,
+/// masking the rest so an email address stays unreadable on stream.
+pub fn mask_email(email: &str) -> String {
+    let trimmed = email.trim();
+    let Some((local, domain)) = trimmed.split_once('@') else {
+        return "••••••".to_owned();
+    };
+    let head = local.chars().next().map(|ch| ch.to_string()).unwrap_or_default();
+    let domain_masked = match domain.rsplit_once('.') {
+        Some((_, tld)) if !tld.is_empty() && tld.len() <= 8 => format!("•••.{tld}"),
+        _ => "••••••".to_owned(),
+    };
+    format!("{head}•••@{domain_masked}")
+}
+
 /// The Contact section's lines. Never on Discord, which shares neither.
 pub fn contacts(person: &Person, profile: &Profile) -> Vec<Contact> {
     if person.key.network == Network::Discord || person.bot {
@@ -413,6 +428,20 @@ pub fn contacts(person: &Person, profile: &Profile) -> Vec<Contact> {
 
 /// What a contact line reads: masked phones until Show.
 pub fn contact_words(contact: &Contact, shown: bool) -> String {
+    contact_words_for(contact, shown, false)
+}
+
+/// What a contact line reads, respecting Streamer mode (where phones and emails stay masked
+/// even if Show was previously clicked).
+pub fn contact_words_for(contact: &Contact, shown: bool, streamer: bool) -> String {
+    if streamer {
+        return match contact.kind {
+            ContactKind::Email => mask_email(&contact.value),
+            ContactKind::Phone => mask(&contact.value),
+            ContactKind::Other if contact.masked => mask(&contact.value),
+            ContactKind::Other => contact.value.clone(),
+        };
+    }
     let masked = contact.kind == ContactKind::Phone || contact.masked;
     if masked && !shown {
         mask(&contact.value)
@@ -786,10 +815,56 @@ pub fn conversation_link(conversation: &Conversation, info: Option<&Conversation
 pub fn space_link(space: &protocol::Key) -> Option<String> {
     match space.network {
         Network::Discord => Some(format!("https://discord.com/channels/{}", space.id)),
-        Network::Slack => Some(format!("slack://open?team={}", space.id)),
+        Network::Slack => Some(format!("https://app.slack.com/client/{}", space.id)),
         Network::Telegram | Network::Teams | Network::Signal | Network::Messages | Network::Tiny => None,
     }
 }
+
+/// Validates a Slack workspace subdomain or base URL and builds an exact HTTPS workspace settings URL.
+/// Only allows `https://` with valid ASCII hostname labels (never arbitrary hosts or non-HTTP schemes).
+pub fn slack_workspace_url(domain_or_url: &str, team_id: &str, path: &str) -> String {
+    let clean_path = path.trim_start_matches('/');
+    let trimmed = domain_or_url.trim().trim_end_matches('/');
+    if trimmed.starts_with("https://") {
+        if let Some(dest) = protocol::link::Destination::parse(trimmed) {
+            if dest.host.ends_with(".slack.com") || dest.host == "slack.com" {
+                return if clean_path.is_empty() {
+                    trimmed.to_owned()
+                } else {
+                    format!("{trimmed}/{clean_path}")
+                };
+            }
+        }
+    }
+    if !trimmed.is_empty()
+        && trimmed.len() <= 63
+        && trimmed.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !trimmed.starts_with('-')
+        && !trimmed.ends_with('-')
+    {
+        return if clean_path.is_empty() {
+            format!("https://{trimmed}.slack.com")
+        } else {
+            format!("https://{trimmed}.slack.com/{clean_path}")
+        };
+    }
+    if clean_path.is_empty() {
+        format!("https://app.slack.com/client/{team_id}")
+    } else {
+        format!("https://app.slack.com/client/{team_id}/{clean_path}")
+    }
+}
+
+/// Exact Slack workspace settings browser links (label, relative path on the workspace host).
+pub const SLACK_WORKSPACE_LINKS: &[(&str, &str)] = &[
+    ("Invite people", "admin/invites"),
+    ("Members", "admin"),
+    ("Workspace settings", "admin/settings"),
+    ("Manage apps", "apps/manage"),
+    ("Customize emoji", "customize/emoji"),
+    ("Analytics", "admin/stats"),
+    ("Billing", "admin/billing"),
+];
 
 /// What the one confirm asks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -806,6 +881,7 @@ pub fn confirm_words(act: Act, name: &str, network: Network) -> (String, String,
             format!("Block {name} on {net}?"),
             match network {
                 Network::Discord => "They won't be able to message you, and their messages in shared servers are hidden. You can unblock them from their profile or Blocked.".to_owned(),
+                Network::Teams => "They won't be able to message or call you on Teams. You can unblock them from their profile or Blocked.".to_owned(),
                 Network::Tiny => "They won't be able to message or call you, and their messages in channels are hidden. You can unblock them from their profile or Blocked.".to_owned(),
                 _ => format!("They won't be able to message or call you on {net}. You can unblock them in {net}."),
             },
@@ -939,8 +1015,22 @@ pub fn conversation_tag(conversation: &Conversation, info: Option<&ConversationI
     if let Some(external) = info.map(|info| info.external.trim()).filter(|external| !external.is_empty()) {
         return Some(match conversation.key.network {
             Network::Slack => format!("External · {external}"),
+            Network::Teams if !external.eq_ignore_ascii_case("Shared channel") => {
+                if external.eq_ignore_ascii_case("External") {
+                    "External".to_owned()
+                } else {
+                    format!("External · {external}")
+                }
+            }
             _ => "Shared".to_owned(),
         });
+    }
+    if conversation.key.network == Network::Teams {
+        match conversation.mark {
+            Some(protocol::Mark::External) => return Some("External".to_owned()),
+            Some(protocol::Mark::Guest) => return Some("Guest".to_owned()),
+            _ => {}
+        }
     }
     // Signal marks every chat private because the chat is encrypted. That is not a private channel.
     if conversation.private && conversation.key.network != Network::Signal {
@@ -1267,6 +1357,8 @@ mod tests {
             link: "https://t.me/riverbend_news".into(),
             disappearing: None,
             bookmarks: Vec::new(),
+            tabs: Vec::new(),
+            meeting: None,
         };
         let channel = info.conversation.clone();
         assert_eq!(conversation_line(&channel, Some(&info)), "@riverbend_news · Channel · 12,408 subscribers");
@@ -1304,6 +1396,14 @@ mod tests {
         assert_eq!(notify_control(&row(Network::Tiny, ConversationKind::Direct)), NotifyControl::LocalSwitch);
         info.external = "Northwind".into();
         assert_eq!(conversation_tag(&slack, Some(&info)).as_deref(), Some("External · Northwind"));
+        let teams_dm = row(Network::Teams, ConversationKind::Direct);
+        assert_eq!(conversation_tag(&teams_dm, Some(&info)).as_deref(), Some("External · Northwind"));
+        info.external = "Shared channel".into();
+        assert_eq!(conversation_tag(&teams_dm, Some(&info)).as_deref(), Some("Shared"));
+        info.external.clear();
+        let mut teams_marked = row(Network::Teams, ConversationKind::Direct);
+        teams_marked.mark = Some(protocol::Mark::External);
+        assert_eq!(conversation_tag(&teams_marked, None).as_deref(), Some("External"));
         info.creator = "Dev Patel".into();
         assert!(created_line(&info).is_empty() || created_line(&info) == "Created by Dev Patel");
         assert_eq!(thousands(1_204), "1,204");
@@ -1404,5 +1504,33 @@ mod tests {
         p.relation = Relation::None;
         p.bot = true;
         assert!(!person_menu(&p, &with_blocks, false, false).contains(&Item::Block));
+    }
+
+    #[test]
+    fn slack_workspace_url_validates_domains_and_rejects_non_slack_hosts() {
+        assert_eq!(slack_workspace_url("acme", "T01ALPHA", "admin/invites"), "https://acme.slack.com/admin/invites");
+        assert_eq!(slack_workspace_url("https://acme.slack.com/", "T01ALPHA", "/customize/emoji"), "https://acme.slack.com/customize/emoji");
+        assert_eq!(slack_workspace_url("", "T01ALPHA", "apps/manage"), "https://app.slack.com/client/T01ALPHA/apps/manage");
+        assert_eq!(slack_workspace_url("https://evil.example.com", "T01ALPHA", "admin"), "https://app.slack.com/client/T01ALPHA/admin");
+        assert_eq!(slack_workspace_url("javascript:alert(1)", "T01ALPHA", "admin"), "https://app.slack.com/client/T01ALPHA/admin");
+        assert_eq!(slack_workspace_url("-bad-", "T01ALPHA", "admin"), "https://app.slack.com/client/T01ALPHA/admin");
+    }
+
+    #[test]
+    fn streamer_mode_keeps_phones_and_emails_masked_even_when_shown() {
+        let phone = Contact { kind: ContactKind::Phone, value: "+44 7700 900142".into(), masked: true };
+        let email = Contact { kind: ContactKind::Email, value: "alice@example.org".into(), masked: false };
+        let other = Contact { kind: ContactKind::Other, value: "https://example.org".into(), masked: false };
+
+        assert_eq!(contact_words(&phone, true), "+44 7700 900142");
+        assert_eq!(contact_words(&email, false), "alice@example.org");
+
+        // In Streamer mode, phone & email stay masked regardless of `shown`.
+        let masked_phone = contact_words_for(&phone, true, true);
+        assert!(masked_phone.contains('•') && masked_phone.ends_with("42"), "{masked_phone}");
+        assert_eq!(contact_words_for(&email, true, true), "a•••@•••.org");
+        assert_eq!(contact_words_for(&email, false, true), "a•••@•••.org");
+        assert_eq!(contact_words_for(&other, false, true), "https://example.org");
+        assert_eq!(mask_email("not-an-email"), "••••••");
     }
 }

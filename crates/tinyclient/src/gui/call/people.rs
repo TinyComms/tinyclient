@@ -2,7 +2,7 @@
 //! under a voice channel in the tree. A speaking ring is a border that is on or off; nothing
 //! here animates.
 
-use super::{in_call, Subject};
+use super::in_call;
 use crate::gui::components::{glyph, Avatar};
 use crate::gui::theme;
 use gpui::{div, prelude::*, px, AnyElement, Div, FontWeight, Hsla};
@@ -11,8 +11,6 @@ use protocol::{Call, Content, Direction, Key, Participant};
 
 /// Rows drawn under a voice channel before "+ N more".
 const OCCUPANTS: usize = 12;
-/// Rows of the participant list on screen before it scrolls.
-const LISTED: usize = 10;
 
 /// An avatar in its speaking-ring slot: a 2 px gap and a 2 px border around it, always laid out
 /// and transparent when off, so a ring switching on moves nothing.
@@ -131,7 +129,6 @@ struct Sizes {
 }
 
 const IN_TREE: Sizes = Sizes { height: 28., indent: 38., right: 16., avatar: 20., text: 12.5 };
-const IN_LIST: Sizes = Sizes { height: 32., indent: 12., right: 10., avatar: 22., text: 13. };
 
 /// Me first, then everyone by name. It never reorders on speech.
 fn roster(call: &Call) -> Vec<&Participant> {
@@ -236,36 +233,4 @@ pub(in crate::gui) fn occupants(call: Option<&Call>, channel: &Key, me: Option<&
         );
     }
     all.into_iter().map(IntoElement::into_any_element).collect()
-}
-
-/// What the participant list holds: "LOUNGE · 21 PEOPLE", then a row each. Ten rows show and
-/// the rest scroll; it is a plain column, not a virtual list.
-pub(super) fn list(call: &Call, subject: &Subject) -> Div {
-    let all = rows(call, None, &IN_LIST);
-    let count = all.len();
-    let noun = if count == 1 { "PERSON" } else { "PEOPLE" };
-    div()
-        .flex()
-        .flex_col()
-        .child(
-            div()
-                .h(px(26.))
-                .flex_none()
-                .px(px(12.))
-                .flex()
-                .items_center()
-                .text_size(px(11.))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme::text_faint())
-                .child(format!("{} · {count} {noun}", subject.title.to_uppercase())),
-        )
-        .child(
-            div()
-                .id("call-people-rows")
-                .max_h(px(IN_LIST.height * LISTED as f32))
-                .overflow_y_scroll()
-                .flex()
-                .flex_col()
-                .children(all),
-        )
 }

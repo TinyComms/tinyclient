@@ -8,7 +8,7 @@ use super::presence::Ring;
 use super::{existing_direct, in_call, only_draws, person_avatar, shown_presence, Hub, Scene};
 use crate::gui::components::{
     button, button_with_icon, fade_in, menu, menu_item, menu_item_danger, menu_separator, modal_body,
-    modal_buttons, network_icon, scrim, search_field, Avatar, ButtonKind, Shape as Plate,
+    modal_buttons, network_icon, scrim, search_field, sensitive_cover, Avatar, ButtonKind, Shape as Plate,
 };
 use crate::gui::input::{InputEvent, TextInput};
 use crate::gui::state::Shell;
@@ -145,6 +145,8 @@ pub struct Floating {
     /// One-line input for setting a friend's private nickname (`Float::FriendNickname`).
     nick_input: Option<Entity<TextInput>>,
     nick_error: Option<String>,
+    /// The open card's bio was revealed in Streamer mode. A new card hides it again.
+    bio_revealed: bool,
 }
 
 impl Floating {
@@ -162,6 +164,7 @@ impl Floating {
             direct: None,
             nick_input: None,
             nick_error: None,
+            bio_revealed: false,
         }
     }
 
@@ -186,6 +189,7 @@ impl Floating {
         if let Float::Card(person) | Float::Menu(person) = &float {
             self.learn_place(person.clone(), matches!(float, Float::Card(_)), cx);
         }
+        self.bio_revealed = false;
         self.open = Some((float, anchor));
         self.opened += 1;
         cx.notify();
@@ -241,6 +245,7 @@ impl Floating {
     /// Swaps what floats for something else in the same place.
     fn turn_to(&mut self, float: Float, cx: &mut Context<Self>) {
         let anchor = self.open.as_ref().map(|(_, anchor)| *anchor).unwrap_or_default();
+        self.bio_revealed = false;
         self.open = Some((float, anchor));
         self.opened += 1;
         cx.notify();
@@ -352,7 +357,18 @@ impl Floating {
                 }
                 Some(CardBody::About(bio)) => {
                     any = true;
-                    body = body.child(div().type_ui().line_clamp(2).child(bio));
+                    let hide = crate::gui::streamer::is_active()
+                        && crate::gui::streamer::contains_sensitive(&bio)
+                        && !self.bio_revealed;
+                    body = if hide {
+                        body.child(sensitive_cover("card-reveal-bio", cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.bio_revealed = true;
+                            cx.notify();
+                        })))
+                    } else {
+                        body.child(div().type_ui().line_clamp(2).child(bio))
+                    };
                 }
                 None => {}
             }

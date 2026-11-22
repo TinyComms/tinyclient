@@ -538,7 +538,40 @@ impl Shell {
             )
             .when(me, |row| row.child(div().flex_none().type_micro().text_color(theme::text_faint()).child("You")))
             .child(div().flex_none().flex().items_center().gap(px(4.)).children(glyphs.into_iter().map(|(icon, color, words)| {
-                div().id(SharedString::from(format!("tiny-seat-glyph-{}-{icon}", seat.user_id))).tooltip(tip(words, None)).child(glyph(icon, 14., color))
+                let id = SharedString::from(format!("tiny-seat-glyph-{}-{icon}", seat.user_id));
+                if icon == "icons/monitor-up.svg" && !me {
+                    let watch_id = seat.user_id.clone();
+                    let open_room = room_id.to_owned();
+                    let room_name = page
+                        .community
+                        .rooms
+                        .iter()
+                        .find(|r| r.id == room_id)
+                        .map(|r| r.name.clone())
+                        .unwrap_or_default();
+                    let joined_call = call.clone().filter(|c| c.state == protocol::CallState::Joined);
+                    div()
+                        .id(id)
+                        .px(px(2.))
+                        .py(px(1.))
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::accent_soft()))
+                        .tooltip(tip(format!("Watch {name}'s screen"), None))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            if let Some(call) = joined_call.as_ref() {
+                                this.call_watch_stream(call, watch_id.clone(), &room_name, cx);
+                            } else {
+                                this.tiny_pick_channel(Some(open_room.clone()), cx);
+                            }
+                        }))
+                        .child(glyph(icon, 14., color))
+                        .into_any_element()
+                } else {
+                    div().id(id).tooltip(tip(words, None)).child(glyph(icon, 14., color)).into_any_element()
+                }
             })));
         let menu_id = seat.user_id.clone();
         let open_id = seat.user_id.clone();

@@ -10,7 +10,7 @@
 use crate::dave::Dave;
 use crate::h264::{self, Assembler};
 use crate::media::FromMedia;
-use crate::picture::CAMERA_HIGH_BPS;
+use crate::picture::camera_high_bps;
 use crate::rtp::{self, Cipher, VideoSender, H264, RTX};
 use crate::session::Controls;
 use crate::video::{Rates, Received, Video, Wants, Word};
@@ -127,6 +127,7 @@ impl Drive {
             Wants {
                 share: true,
                 camera: false,
+                preview_camera: false,
                 keep_camera: false,
                 rates: Rates { share: crate::picture::share_quality().bps, high: 0, low: 0 },
             }
@@ -134,8 +135,9 @@ impl Drive {
             Wants {
                 share: false,
                 camera: true,
+                preview_camera: false,
                 keep_camera: true,
-                rates: Rates { share: 0, high: CAMERA_HIGH_BPS, low: 0 },
+                rates: Rates { share: 0, high: camera_high_bps(), low: 0 },
             }
         }
     }

@@ -490,6 +490,36 @@ fn a_sealed_picture_keeps_its_nal_header_and_opens() {
     assert_eq!(bea.open_video(ADA, &frame), None, "a clear picture is dropped in an end-to-end call");
 }
 
+/// Multi-stream video: one sender's camera and screen share are sealed by one encryptor, so they
+/// share one nonce counter. After the first picture of theirs has opened, the rest open in any
+/// arrival order (DAVE keeps the nonces it skipped), none opens twice, and a frame arriving after
+/// a mid changes owner fails to open under the new owner's identity.
+#[test]
+fn interleaved_camera_and_share_from_one_sender_both_open_and_wrong_owner_is_dropped() {
+    let (_, mut ada, mut bea, _) = three();
+    let cam_a = [0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x1f, 0, 0, 0, 1, 0x65, 0x11, 0x22, 0x33, 0x44, 0x55];
+    let share_a = [0, 0, 0, 1, 0x67, 0x42, 0xe0, 0x28, 0, 0, 0, 1, 0x65, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+    let cam_b = [0, 0, 0, 1, 0x41, 0x9a, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+    let share_b = [0, 0, 0, 1, 0x41, 0x9a, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+
+    let s_cam_a = ada.seal_video(&cam_a).expect("seal cam_a");
+    let s_share_a = ada.seal_video(&share_a).expect("seal share_a");
+    let s_cam_b = ada.seal_video(&cam_b).expect("seal cam_b");
+    let s_share_b = ada.seal_video(&share_b).expect("seal share_b");
+
+    // Arrive out of order across the two concurrent streams from Ada.
+    assert_eq!(bea.open_video(ADA, &s_cam_a).as_deref(), Some(&cam_a[..]));
+    assert_eq!(bea.open_video(ADA, &s_share_b).as_deref(), Some(&share_b[..]));
+    assert_eq!(bea.open_video(ADA, &s_cam_b).as_deref(), Some(&cam_b[..]));
+    assert_eq!(bea.open_video(ADA, &s_share_a).as_deref(), Some(&share_a[..]));
+    // Replay protection is whole: what opened once does not open again.
+    assert_eq!(bea.open_video(ADA, &s_cam_b), None);
+    assert_eq!(bea.open_video(ADA, &s_share_a), None);
+
+    // Slot changes owner to Cy: a stale frame sealed by Ada is rejected under Cy's identity.
+    assert_eq!(bea.open_video(CY, &s_share_a), None);
+}
+
 #[test]
 fn what_is_told_is_told_once() {
     let mut e2ee = app(ADA);

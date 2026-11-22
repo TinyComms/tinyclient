@@ -1,219 +1,32 @@
 //! One voice channel in the pane: its topic, how full it is, push-to-talk and bitrate in the top
-//! bar, then the stage, one tile per person in the call, ringed while they speak and labelled
-//! with what is true of them ("Server muted"), and beside each one sharing their screen or camera
-//! a stream tile, "Watch stream" until it is watched (`stage`). Click a person to focus them,
-//! drawn large; hover them for their volume, right-click them for the person menu. Click a stream
-//! to watch it filling the stage, the people in a strip under it, over it or hidden, and full
-//! screen; click it again, or Escape, for the grid. My own share is a tile too, from what my call
-//! sends, with Stop. Over the stage, while my call here is connecting, reconnecting or has
-//! failed, a banner says so with the time and what to do. Under the stage, Join, or while I am in
-//! it the call's own controls — mute, deafen, share, camera, and Leave — with "You're muted" and
-//! push-to-talk above them. A channel nobody is in says so, with Join and which devices it will
-//! use.
+//! bar, then the shared call stage (`gui/call/view.rs`), wrapped with room-only states (empty room
+//! with Join, full room, join-blocked, preset mute/deafen, server-held mute).
 
-use super::stage::{self, Focus, Sending, Stream};
-use super::{join_blocked, model, Float, Page};
-use crate::gui::call::health::{self, Grade};
-use crate::gui::components::{button, button_disabled, button_with_icon, glyph, tip, Avatar, ButtonKind};
+use super::{join_blocked, model, Page};
+use crate::gui::call::stage::{Stage, self};
+use crate::gui::call::view::ViewBar;
+use crate::gui::components::{button, button_disabled, button_with_icon, glyph, ButtonKind};
 use crate::gui::state::Shell;
 use crate::gui::theme::{self, Type};
-use gpui::{div, img, prelude::*, px, AnyElement, Context, Div, MouseButton, MouseDownEvent, ObjectFit, RenderImage, SharedString, Stateful, Window};
-use protocol::{Call, CallState, Content, Direction, MediaRequest, Request, TinyRoom, TinySeat};
-use std::sync::Arc;
+use gpui::{div, prelude::*, px, AnyElement, Context, Div};
+use protocol::{Call, CallState, TinyRoom};
 
-const TILE_W: f32 = 196.;
-const TILE_H: f32 = 148.;
-/// A focused tile: the one person drawn large.
-const FOCUS_W: f32 = 420.;
-const FOCUS_H: f32 = 300.;
-/// A tile in the strip under a focused stream.
-const STRIP_W: f32 = 150.;
-const STRIP_H: f32 = 96.;
-
-/// How large a tile is drawn.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Size {
-    Grid,
-    Big,
-    Strip,
-}
-
-impl Size {
-    /// A person's tile: width, height and avatar.
-    fn person(self) -> (f32, f32, f32) {
-        match self {
-            Size::Grid => (TILE_W, TILE_H, 64.),
-            Size::Big => (FOCUS_W, FOCUS_H, 112.),
-            Size::Strip => (STRIP_W, STRIP_H, 36.),
-        }
-    }
-
-    /// A stream's tile: as tall as a person's, 16:9.
-    fn stream(self) -> (f32, f32) {
-        let (_, h, _) = self.person();
-        (h * 16. / 9., h)
-    }
-}
-/// Said under the call while echo cancellation is switched off in Settings → Voice.
-const HEADPHONES: &str = "Echo cancellation is off: wear headphones, or others hear themselves.";
-
-/// A chip of words: `Push to talk`, `96 kb/s`.
-pub(super) fn chip(words: impl Into<SharedString>, color: gpui::Rgba, fill: gpui::Rgba) -> Div {
-    div().flex_none().h(px(20.)).px(px(6.)).rounded(px(theme::R_CHIP)).bg(fill).flex().items_center().type_micro().text_color(color).child(words.into())
-}
-
-/// How the round button of the call bar looks.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Look {
-    Rest,
-    /// My mic or audio is off.
-    Off,
-    /// The server holds it off: shown, not pressable.
-    Held,
-    /// Share or camera is on.
-    On,
-}
-
-/// The round button of the call bar.
-fn bar_button(id: &'static str, icon: &'static str, look: Look) -> Stateful<Div> {
-    let (fill, color) = match look {
-        Look::Rest => (theme::selected(), theme::text()),
-        Look::Off | Look::Held => (theme::danger_soft(), theme::danger()),
-        Look::On => (theme::accent_soft(), theme::accent()),
-    };
-    div()
-        .id(id)
-        .relative()
-        .size(px(44.))
-        .rounded_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(fill)
-        .map(|button| match look {
-            Look::Held => button.opacity(0.55),
-            _ => button
-                .cursor_pointer()
-                .tab_index(0)
-                .hover(|style| style.bg(theme::pressed()))
-                .focus_visible(|style| style.shadow(theme::focus_ring())),
-        })
-        .child(glyph(icon, 20., color))
-}
-
-/// What the person whose seat this is can be heard as, in my call: my own seat with what my
-/// call says right now (it knows before the server echoes it), anyone else's with mediad's
-/// speaking edge when it is quicker than the server's.
-pub(super) fn as_heard(seat: &TinySeat, me: bool, call: Option<&Call>) -> TinySeat {
-    let mut seat = seat.clone();
-    let Some(call) = call.filter(|call| call.state == CallState::Joined) else {
-        return seat;
-    };
-    if me {
-        seat.muted = call.muted || call.deafened;
-        seat.deafened = call.deafened;
-        seat.speaking = call.speaking;
-    } else if call.participants.iter().any(|who| who.id == seat.user_id && who.speaking) {
-        seat.speaking = true;
-    }
-    seat
-}
-
-/// The room with my seat added, when my call is up in it and the room does not list me yet (the
-/// call joins before the server says who is seated). `None` when it lists me already. Without
-/// it the stage had no tile to draw and was a blank, scrolling area.
-fn with_me(room: &TinyRoom, me: &str) -> Option<TinyRoom> {
-    if room.participants.iter().any(|seat| seat.user_id == me) {
-        return None;
-    }
-    let mut room = room.clone();
-    room.participants.push(TinySeat { user_id: me.to_owned(), ..TinySeat::default() });
-    Some(room)
-}
-
-/// Push to talk, as the pill over the call bar says it: the key to hold, or that it is held.
-#[derive(Debug, PartialEq, Eq)]
-enum Talk {
-    /// Not push to talk: no pill.
-    Open,
-    Waiting(Option<String>),
-    Talking,
-    Priority,
-}
-
-fn talk(push: bool, held: Option<bool>, key: Option<String>) -> Talk {
-    match (push, held) {
-        (_, Some(true)) => Talk::Priority,
-        (true, Some(false)) => Talk::Talking,
-        (true, None) => Talk::Waiting(key),
-        (false, _) => Talk::Open,
-    }
-}
-
-/// Our own encode of this picture is on.
-fn sending(call: &Call, content: Content) -> bool {
-    call.video.iter().any(|stream| stream.direction == Direction::Encode && stream.content == content)
-}
-
-/// A decode of this person was asked for, or their picture is on screen.
-pub(super) fn watching(call: &Call, user_id: &str) -> bool {
-    crate::gui::call::watching(call, user_id)
-}
-
-/// What my call sends, when it is up.
-fn sending_now(call: Option<&Call>) -> Option<Sending> {
-    call.filter(|call| call.state == CallState::Joined).map(|call| Sending { share: sending(call, Content::Share), camera: sending(call, Content::Camera) })
-}
-
-/// A round button over a stream: its own click, never the stream's.
-fn stream_button(id: &'static str, icon: &'static str, words: &'static str) -> Stateful<Div> {
-    div()
-        .id(id)
-        .flex_none()
-        .size(px(32.))
-        .rounded_full()
-        .bg(theme::overlay())
-        .border_1()
-        .border_color(theme::overlay_edge())
-        .flex()
-        .items_center()
-        .justify_center()
-        .cursor_pointer()
-        .tab_index(0)
-        .hover(|style| style.bg(theme::selected()))
-        .focus_visible(|style| style.shadow(theme::focus_ring()))
-        .tooltip(tip(words, None))
-        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .child(glyph(icon, 15., theme::text()))
-}
-
-/// The red LIVE mark and whose stream it is, at a stream's foot.
-fn caption(words: String, small: bool) -> Div {
-    div()
-        .absolute()
-        .bottom(px(if small { 6. } else { 10. }))
-        .left(px(if small { 6. } else { 10. }))
-        .max_w(px(if small { 140. } else { 360. }))
-        .flex()
-        .items_center()
-        .gap(px(6.))
-        .child(chip("LIVE", theme::on_accent(), theme::danger_fill()).font_weight(theme::SEMIBOLD))
-        .when(!small, |row| {
-            row.child(div().min_w_0().truncate().h(px(20.)).px(px(6.)).rounded(px(theme::R_CHIP)).bg(theme::overlay()).flex().items_center().type_micro().text_color(theme::text()).child(words))
-        })
-}
+pub(in crate::gui) use crate::gui::call::stage::{as_heard, with_me};
+pub(in crate::gui) use crate::gui::call::view::chip;
 
 impl Shell {
     /// What the top bar says of a channel after its name.
     pub(super) fn tiny_channel_facts(&self, page: &Page, room: &TinyRoom) -> Div {
-        let seated_here = self.tiny_call_here(room).is_some_and(|call| matches!(call.state, CallState::Joined | CallState::Reconnecting));
+        let seated_here = self
+            .tiny_call_here(room)
+            .is_some_and(|call| matches!(call.state, CallState::Joined | CallState::Reconnecting));
         let seated = seated_here.then(|| with_me(room, page.me)).flatten();
         let shown = seated.as_ref().unwrap_or(room);
         let mut facts = div().flex().items_center().gap(px(6.)).min_w_0();
         if !shown.topic.trim().is_empty() {
-            facts = facts.child(div().flex_none().w(px(1.)).h(px(16.)).bg(theme::hairline())).child(
-                div().min_w_0().truncate().type_ui().text_color(theme::text_soft()).child(shown.topic.clone()),
-            );
+            facts = facts
+                .child(div().flex_none().w(px(1.)).h(px(16.)).bg(theme::hairline()))
+                .child(div().min_w_0().truncate().type_ui().text_color(theme::text_soft()).child(shown.topic.clone()));
         }
         facts = facts.child(chip(
             model::channel_occupancy(shown),
@@ -243,705 +56,28 @@ impl Shell {
     pub(super) fn tiny_channel(&self, page: &Page, room: &TinyRoom, cx: &mut Context<Self>) -> AnyElement {
         let mine = page.mine == Some(room.id.as_str());
         let call = self.tiny_call_here(room);
-        let banner = call.as_ref().and_then(|call| self.tiny_call_banner(room, call, cx));
+        let banner = call.as_ref().and_then(|call| self.call_view_banner(&room.name, call, cx));
         let up = call.as_ref().is_some_and(|call| !matches!(call.state, CallState::Failed { .. }));
-        // Under a call that is up here the stage is never "nobody is here", nor a grid of no
-        // tiles: my seat is drawn from the call while the server's word of it catches up.
         let seated_here = call.as_ref().is_some_and(|call| matches!(call.state, CallState::Joined | CallState::Reconnecting));
-        let seated = seated_here.then(|| with_me(room, page.me)).flatten();
         let stage: AnyElement = if room.participants.is_empty() && !seated_here {
             self.tiny_empty_stage(page, room, cx)
         } else {
-            self.tiny_stage(page, seated.as_ref().unwrap_or(room), call.as_ref(), cx)
+            let model = Stage::of_room(page, room, call.as_ref());
+            self.call_stage(&model, page, call.as_ref(), true, cx)
         };
-        let bar = if room.participants.is_empty() && !mine && !up { None } else { Some(self.tiny_call_bar(page, room, mine || up, call.as_ref(), cx)) };
-        div().size_full().flex().flex_col().children(banner).child(stage).children(bar).into_any_element()
-    }
-
-    /// Over the stage while my call here is not simply up: connecting or reconnecting with how
-    /// long it has been, or what ended it, with Rejoin.
-    fn tiny_call_banner(&self, room: &TinyRoom, call: &Call, cx: &mut Context<Self>) -> Option<Div> {
-        let (icon, color, fill, title, line): (&'static str, gpui::Rgba, gpui::Rgba, String, Option<String>) = match &call.state {
-            CallState::Connecting => ("icons/refresh-cw.svg", theme::accent_text(), theme::accent_wash(), format!("Connecting to {}…", room.name), None),
-            CallState::Reconnecting => (
-                "icons/wifi-off.svg",
-                theme::warning(),
-                theme::warning_soft(),
-                "Connection lost. Reconnecting…".to_owned(),
-                Some("Your seat is kept while the call finds its way back.".to_owned()),
-            ),
-            CallState::Failed { .. } => {
-                let (title, line, _) = self.call_failure(call)?;
-                ("icons/triangle-alert.svg", theme::danger(), theme::danger_soft(), title, Some(line))
-            }
-            _ => return None,
-        };
-        let failed = matches!(call.state, CallState::Failed { .. });
-        let again = self.call_failure(call).filter(|(_, _, again)| *again).is_some();
-        let key = call.conversation.clone();
-        let action: Option<AnyElement> = if failed {
-            again.then(|| {
-                button_with_icon("tiny-banner-rejoin", ButtonKind::Primary, "icons/rotate-ccw.svg", "Rejoin")
-                    .h(px(30.))
-                    .on_click(cx.listener(move |this, _, _, cx| this.call_start(key.clone(), cx)))
-                    .into_any_element()
-            })
+        let bar = if room.participants.is_empty() && !mine && !up {
+            None
         } else {
-            let word = if call.state == CallState::Connecting { "Cancel" } else { "Leave" };
-            Some(
-                button_with_icon("tiny-banner-leave", ButtonKind::Danger, "icons/phone-off.svg", word)
-                    .h(px(30.))
-                    .tooltip(tip(word, Some("⌘⇧H")))
-                    .on_click(cx.listener(|this, _, _, cx| this.call_leave(cx)))
-                    .into_any_element(),
-            )
-        };
-        let dismiss = failed.then(|| {
-            div()
-                .id("tiny-banner-dismiss")
-                .flex_none()
-                .size(px(28.))
-                .rounded(px(theme::R_CONTROL))
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .tab_index(0)
-                .hover(|style| style.bg(theme::hover()))
-                .focus_visible(|style| style.shadow(theme::focus_ring()))
-                .tooltip(tip("Dismiss", Some("⌘⇧H")))
-                .on_click(cx.listener(|this, _, _, cx| this.call_leave(cx)))
-                .child(glyph("icons/x.svg", 14., theme::text_soft()))
-        });
-        let clock = self.call_stage_clock(call, cx);
-        Some(
-            div().flex_none().px(px(24.)).pt(px(16.)).flex().justify_center().child(
-                div()
-                    .id("tiny-call-banner")
-                    .w_full()
-                    .max_w(px(640.))
-                    .min_h(px(52.))
-                    .px(px(14.))
-                    .py(px(10.))
-                    .rounded(px(theme::R_FLOAT))
-                    .bg(fill)
-                    .border_1()
-                    .border_color(theme::hairline())
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(12.))
-                    .child(div().flex_none().size(px(30.)).rounded_full().bg(theme::hover()).flex().items_center().justify_center().child(glyph(icon, 15., color)))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(160.))
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(8.))
-                                    .child(
-                                        div()
-                                            .min_w(px(120.))
-                                            .flex_1()
-                                            .whitespace_normal()
-                                            .line_clamp(2)
-                                            .type_ui()
-                                            .font_weight(theme::SEMIBOLD)
-                                            .text_color(theme::text())
-                                            .child(title),
-                                    )
-                                    .children(clock.map(|clock| div().flex_none().type_small().text_color(color).child(clock))),
-                            )
-                            .children(line.map(|line| div().whitespace_normal().type_small().text_color(theme::text_soft()).child(line))),
-                    )
-                    .children(action)
-                    .children(dismiss),
-            ),
-        )
-    }
-
-    /// The tiles: wrapping and centred, each stream beside its owner; or one person large over
-    /// a row of the rest; or one stream filling the stage.
-    fn tiny_stage(&self, page: &Page, room: &TinyRoom, call: Option<&Call>, cx: &mut Context<Self>) -> AnyElement {
-        let streams = stage::streams(room, page.me, sending_now(call));
-        let focus = stage::still(self.tiny_state.focus.as_ref(), room, &streams);
-        let base = div().id("tiny-stage").flex_1().min_h_0();
-        match focus {
-            None => {
-                let (grid_seats, roster_seats) = stage::partition_stage(&room.participants, &streams, page.me, stage::STAGE_GRID_CAP);
-                let grid_tiles = self.tiny_tiles_for(page, &grid_seats, &streams, call, None, Size::Grid, cx);
-                let mut content = base.overflow_y_scroll().p(px(24.)).flex().flex_col().items_center().gap(px(20.)).child(
-                    div().w_full().flex().flex_wrap().content_center().items_center().justify_center().gap(px(12.)).children(grid_tiles),
-                );
-                if !roster_seats.is_empty() {
-                    let mut roster = div()
-                        .w_full()
-                        .max_w(px(680.))
-                        .p(px(12.))
-                        .rounded(px(theme::R_CARD))
-                        .bg(theme::raised())
-                        .border_1()
-                        .border_color(theme::hairline())
-                        .flex()
-                        .flex_col()
-                        .gap(px(4.))
-                        .child(
-                            div()
-                                .px(px(6.))
-                                .pb(px(4.))
-                                .type_micro()
-                                .text_color(theme::text_faint())
-                                .child(format!("ALSO IN CALL · {}", roster_seats.len())),
-                        );
-                    for seat in roster_seats {
-                        let name = model::name_by_id(page.community, &seat.user_id);
-                        let avatar = Avatar::new(&page.key(&seat.user_id), &name, 20.).image_at(page.picture(&seat.user_id)).build();
-                        let glyphs = super::column::seat_glyphs(seat);
-                        let menu_id = seat.user_id.clone();
-                        roster = roster.child(
-                            div()
-                                .id(SharedString::from(format!("tiny-roster-{}", seat.user_id)))
-                                .h(px(28.))
-                                .px(px(6.))
-                                .rounded(px(theme::R_CONTROL))
-                                .flex()
-                                .items_center()
-                                .gap(px(8.))
-                                .hover(|s| s.bg(theme::hover()))
-                                .on_mouse_down(
-                                    MouseButton::Right,
-                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                        this.tiny_open_float(Float::Person { user_id: menu_id.clone(), at: event.position }, cx);
-                                    }),
-                                )
-                                .child(avatar)
-                                .child(div().flex_1().min_w_0().truncate().type_ui().text_color(theme::text_soft()).child(name))
-                                .child(div().flex_none().flex().items_center().gap(px(4.)).children(glyphs.into_iter().map(|(icon, color, _)| glyph(icon, 14., color)))),
-                        );
-                    }
-                    content = content.child(roster);
-                }
-                crate::gui::components::scroll::scroll_page("tiny-stage-grid-scroll-frame", content).into_any_element()
-            }
-            Some(Focus::Person(focus)) => {
-                let big = room.participants.iter().find(|seat| seat.user_id == *focus).map(|seat| self.tiny_tile(page, seat, call, Size::Big, cx));
-                let rest = self.tiny_tiles(page, room, &streams, call, Some(&Focus::Person(focus.clone())), Size::Grid, cx);
-                crate::gui::components::scroll::scroll_page("tiny-stage-person-scroll-frame", base.overflow_y_scroll()
-                    .p(px(24.))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(16.))
-                    .children(big)
-                    .child(div().flex().flex_wrap().justify_center().gap(px(12.)).children(rest)))
-                    .into_any_element()
-            }
-            Some(Focus::Stream(user_id)) => {
-                let Some(stream) = streams.iter().find(|stream| stream.user_id == *user_id) else {
-                    return base.into_any_element();
-                };
-                let strip = self.tiny_state.strip;
-                let view = self.tiny_stream_view(page, stream, call, false, cx);
-                let row = div()
-                    .id("tiny-strip")
-                    .max_w_full()
-                    .overflow_x_scroll()
-                    .flex()
-                    .gap(px(8.))
-                    .children(self.tiny_tiles(page, room, &streams, call, Some(&Focus::Stream(user_id.clone())), Size::Strip, cx));
-                let base = base.p(px(16.)).flex().flex_col().gap(px(12.));
-                if strip.hidden {
-                    base.child(view).into_any_element()
-                } else if strip.over {
-                    base.child(
-                        div()
-                            .relative()
-                            .flex_1()
-                            .min_h_0()
-                            .flex()
-                            .child(view)
-                            .child(div().absolute().bottom(px(12.)).left_0().right_0().px(px(12.)).flex().justify_center().child(row.p(px(6.)).rounded(px(16.)).bg(theme::overlay()))),
-                    )
-                    .into_any_element()
-                } else {
-                    base.child(view).child(div().flex_none().flex().justify_center().child(row)).into_any_element()
-                }
-            }
-        }
-    }
-
-    /// Everyone's tile, each followed by their stream's, leaving out the one focused.
-    #[allow(clippy::too_many_arguments)]
-    fn tiny_tiles(&self, page: &Page, room: &TinyRoom, streams: &[Stream], call: Option<&Call>, except: Option<&Focus>, size: Size, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let seats: Vec<&TinySeat> = room.participants.iter().collect();
-        self.tiny_tiles_for(page, &seats, streams, call, except, size, cx)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn tiny_tiles_for(&self, page: &Page, seats: &[&TinySeat], streams: &[Stream], call: Option<&Call>, except: Option<&Focus>, size: Size, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let shown = |focus: Focus| except != Some(&focus);
-        let mut tiles = Vec::new();
-        for seat in seats {
-            if shown(Focus::Person(seat.user_id.clone())) {
-                tiles.push(self.tiny_tile(page, seat, call, size, cx));
-            }
-            if let Some(stream) = streams.iter().find(|stream| stream.user_id == seat.user_id).filter(|stream| shown(Focus::Stream(stream.user_id.clone()))) {
-                tiles.push(self.tiny_stream_tile(page, stream, call, size, cx));
-            }
-        }
-        // My stream before the room lists my seat.
-        for stream in streams.iter().filter(|stream| !seats.iter().any(|seat| seat.user_id == stream.user_id)) {
-            if shown(Focus::Stream(stream.user_id.clone())) {
-                tiles.push(self.tiny_stream_tile(page, stream, call, size, cx));
-            }
-        }
-        tiles
-    }
-
-    /// The frame on screen, when it is this person's.
-    fn tiny_frame(&self, call: Option<&Call>, user_id: &str) -> Option<Arc<RenderImage>> {
-        self.call_frame(call, user_id)
-    }
-
-    /// My own camera, or with `share` my own screen, as it is sent, while it is on.
-    fn tiny_self_frame(&self, call: Option<&Call>, share: bool) -> Option<Arc<RenderImage>> {
-        self.call_self_frame(call, share)
-    }
-
-    /// What a stream shows: its picture; mine, the same small live view of it that I send, with
-    /// Stop over it (until the first one lands, words with Stop); anyone else's, "Watch stream"
-    /// until its first picture arrives.
-    fn tiny_stream_body(&self, page: &Page, stream: &Stream, call: Option<&Call>, size: Size, cx: &mut Context<Self>) -> AnyElement {
-        if let Some(frame) = self.tiny_frame(call, &stream.user_id) {
-            return img(frame).size_full().object_fit(ObjectFit::Contain).into_any_element();
-        }
-        let small = size == Size::Strip;
-        let large = size == Size::Big;
-        let body = div().size_full().relative().flex().flex_col().items_center().justify_center().gap(px(if small { 4. } else { 10. })).p(px(8.));
-        if stream.mine {
-            // My camera or my screen as everyone sees it, with Stop over it.
-            if let Some(frame) = self.tiny_self_frame(call, stream.share) {
-                let stop = if stream.share {
-                    button_with_icon("tiny-stream-stop", ButtonKind::Danger, "icons/monitor-off.svg", "Stop sharing").on_click(cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.tiny_stop_share(cx);
-                    }))
-                } else {
-                    button_with_icon("tiny-stream-camera-off", ButtonKind::Danger, "icons/video-off.svg", "Turn camera off").on_click(cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.call_ask(Request::Media(MediaRequest::Camera { on: false }), cx);
-                    }))
-                };
-                return div()
-                    .size_full()
-                    .relative()
-                    .child(img(frame).size_full().object_fit(ObjectFit::Contain))
-                    .when(!small, |tile| {
-                        // A grid tile's caption sits at the bottom, so Stop goes along the top.
-                        let row = div().absolute().left_0().right_0().flex().justify_center();
-                        let row = if size == Size::Grid { row.top(px(8.)) } else { row.bottom(px(10.)) };
-                        // On a picture that can be any colour, so it sits on the overlay as the strip's does.
-                        tile.child(row.child(div().p(px(2.)).rounded(px(10.)).bg(theme::overlay()).child(stop.h(px(28.)).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()))))
-                    })
-                    .into_any_element();
-            }
-        }
-        if stream.mine {
-            let words = if stream.share { "You're sharing your screen" } else { "Your camera is on" };
-            let stop = if stream.share {
-                button_with_icon("tiny-stream-stop", ButtonKind::Danger, "icons/monitor-off.svg", "Stop sharing").on_click(cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.tiny_stop_share(cx);
-                }))
-            } else {
-                button_with_icon("tiny-stream-camera-off", ButtonKind::Danger, "icons/video-off.svg", "Turn camera off").on_click(cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.call_ask(Request::Media(MediaRequest::Camera { on: false }), cx);
-                }))
-            };
-            let line = match &self.tiny_state.shared {
-                Some(screen) if stream.share => format!("Everyone in the call can watch {}. A live view of it shows here as soon as the first picture is sent.", screen.name),
-                _ => "Everyone in the call can watch it.".to_owned(),
-            };
-            return body
-                // A grid tile has room for the words and Stop, not the icon as well.
-                .when(small || large, |body| body.child(glyph(if stream.share { "icons/monitor-up.svg" } else { "icons/video.svg" }, if small { 18. } else { 36. }, theme::accent_text())))
-                .when(!small, |body| body.child(div().text_center().whitespace_normal().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::text()).child(words)))
-                .when(large, |body| body.child(div().max_w(px(420.)).text_center().whitespace_normal().type_small().text_color(theme::text_soft()).child(line)))
-                .when(!small, |body| body.child(stop.h(px(28.)).on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())))
-                .into_any_element();
-        }
-        let name = model::name_by_id(page.community, &stream.user_id);
-        if !stream.watchable {
-            return body
-                .when(!small, |body| body.child(Avatar::new(&page.key(&stream.user_id), &name, if large { 72. } else { 40. }).image_at(page.picture(&stream.user_id)).build()))
-                .child(div().type_small().text_color(theme::text_soft()).child("Camera on"))
-                .into_any_element();
-        }
-        let asked = call.is_some_and(|call| watching(call, &stream.user_id));
-        let since = self
-            .call_state
-            .watch_asked
-            .as_ref()
-            .filter(|(id, _)| *id == stream.user_id)
-            .map(|(_, at)| at.elapsed())
-            .unwrap_or_default();
-        let trouble = asked
-            .then(|| call.and_then(|c| stage::watch_trouble(c, &stream.user_id, |id| model::name_by_id(page.community, id), since)))
-            .flatten();
-        if let Some(trouble) = trouble {
-            let words = match &trouble {
-                stage::Trouble::OtherSource { name: who, kind } => {
-                    let what = if *kind == protocol::PictureKind::Share { "screen" } else { "camera" };
-                    format!("The room is showing {who}'s {what} right now.")
-                }
-                stage::Trouble::Deafened => "Undeafen to watch.".to_owned(),
-                stage::Trouble::Slow => format!("Waiting for {name}'s picture… Your connection may be too slow for video."),
-                stage::Trouble::Failed => format!("Couldn't get {name}'s picture."),
-            };
-            let retry_id = stream.user_id.clone();
-            let retry = matches!(trouble, stage::Trouble::Slow | stage::Trouble::Failed).then(|| {
-                div()
-                    .id(SharedString::from(format!("tiny-stream-retry-{}", stream.user_id)))
-                    .h(px(if small { 22. } else { 28. }))
-                    .px(px(if small { 8. } else { 12. }))
-                    .rounded_full()
-                    .bg(theme::accent())
-                    .text_color(theme::on_accent())
-                    .flex()
-                    .items_center()
-                    .cursor_pointer()
-                    .type_micro()
-                    .font_weight(theme::SEMIBOLD)
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.call_retry_watch(retry_id.clone(), cx);
-                    }))
-                    .child("Try again")
-            });
-            return body
-                .when(!small, |body| body.child(Avatar::new(&page.key(&stream.user_id), &name, if large { 72. } else { 40. }).image_at(page.picture(&stream.user_id)).build()))
-                .child(div().max_w(px(260.)).text_center().whitespace_normal().type_small().text_color(theme::text_soft()).child(words))
-                .children(retry)
-                .into_any_element();
-        }
-        let pill = div()
-            .h(px(if small { 22. } else { 30. }))
-            .px(px(if small { 8. } else { 14. }))
-            .rounded_full()
-            .bg(if asked { theme::overlay() } else { theme::accent() })
-            .flex()
-            .items_center()
-            .gap(px(6.))
-            .when(!asked && !small, |pill| pill.child(glyph("icons/play.svg", 12., theme::on_accent())))
-            .child(
-                div()
-                    .map(|words| if small { words.type_micro() } else { words.type_small() })
-                    .font_weight(theme::SEMIBOLD)
-                    .text_color(if asked { theme::text_soft() } else { theme::on_accent() })
-                    .child(if asked { "Connecting…" } else { "Watch stream" }),
-            );
-        body.when(!small, |body| body.child(Avatar::new(&page.key(&stream.user_id), &name, if large { 72. } else { 40. }).image_at(page.picture(&stream.user_id)).build()))
-            .child(pill)
-            .into_any_element()
-    }
-
-    /// A stream in the grid or the strip: click it to watch it filling the stage.
-    fn tiny_stream_tile(&self, page: &Page, stream: &Stream, call: Option<&Call>, size: Size, cx: &mut Context<Self>) -> AnyElement {
-        let (w, h) = size.stream();
-        let small = size == Size::Strip;
-        let name = model::name_by_id(page.community, &stream.user_id);
-        let what = if stream.share { "screen" } else { "camera" };
-        let live = self.tiny_frame(call, &stream.user_id).is_some();
-        let user_id = stream.user_id.clone();
-        let mine = stream.mine;
-        div()
-            .id(SharedString::from(format!("tiny-stream-{}", stream.user_id)))
-            .relative()
-            .flex_none()
-            .w(px(w))
-            .h(px(h))
-            .rounded(px(theme::R_CARD + 4.))
-            .bg(gpui::rgb(0x0b0b0d))
-            .border_2()
-            .border_color(if live { theme::border_strong() } else { theme::hairline() })
-            .overflow_hidden()
-            .cursor_pointer()
-            .tab_index(0)
-            .focus_visible(|style| style.shadow(theme::focus_ring()))
-            .tooltip(tip(if mine || live { "Click to focus".to_owned() } else { format!("Watch {name}'s {what}") }, None))
-            .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_stream(&user_id, mine, window, cx)))
-            .child(self.tiny_stream_body(page, stream, call, size, cx))
-            .child(caption(if mine { format!("Your {what}") } else { format!("{name}'s {what}") }, small))
-            .into_any_element()
-    }
-
-    /// The focused stream, filling the stage (or, `full`, the window): its picture, whose it is,
-    /// and the buttons for the people, where they go, full screen, and stopping. A click on it
-    /// is the grid again.
-    fn tiny_stream_view(&self, page: &Page, stream: &Stream, call: Option<&Call>, full: bool, cx: &mut Context<Self>) -> Stateful<Div> {
-        let strip = self.tiny_state.strip;
-        let name = model::name_by_id(page.community, &stream.user_id);
-        let what = if stream.share { "screen" } else { "camera" };
-        let user_id = stream.user_id.clone();
-        let mine = stream.mine;
-        let mut tools = div().absolute().top(px(10.)).right(px(10.)).flex().gap(px(6.));
-        if full {
-            tools = tools.child(stream_button("tiny-stream-unfull", "icons/minimize.svg", "Exit full screen (Esc)").on_click(cx.listener(|this, _, window, cx| {
-                cx.stop_propagation();
-                this.tiny_unfull(window, cx);
-            })));
-        } else {
-            tools = tools
-                .child(stream_button("tiny-stream-people", "icons/users.svg", if strip.hidden { "Show participants" } else { "Hide participants" }).on_click(cx.listener(
-                    move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.tiny_strip(stage::Strip { hidden: !strip.hidden, ..strip }, window, cx);
-                    },
-                )))
-                .when(!strip.hidden, |tools| {
-                    tools.child(
-                        stream_button("tiny-stream-over", "icons/panel-bottom.svg", if strip.over { "Participants under the stream" } else { "Participants over the stream" })
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                this.tiny_strip(stage::Strip { over: !strip.over, ..strip }, window, cx);
-                            })),
-                    )
-                })
-                .child(stream_button("tiny-stream-full", "icons/maximize.svg", "Full screen").on_click(cx.listener(|this, _, window: &mut Window, cx| {
-                    cx.stop_propagation();
-                    this.tiny_full(window, cx);
-                })));
-        }
-        if !mine {
-            tools = tools.child(stream_button("tiny-stream-unwatch", "icons/x.svg", "Stop watching").on_click(cx.listener(|this, _, window, cx| {
-                cx.stop_propagation();
-                this.tiny_unfull(window, cx);
-                this.tiny_stop_watching(window, cx);
-            })));
-        }
-        div()
-            .id(if full { "tiny-stream-whole" } else { "tiny-stream-focused" })
-            .relative()
-            .flex_1()
-            .min_h_0()
-            .w_full()
-            .when(full, |view| view.size_full())
-            .when(!full, |view| view.rounded(px(12.)).border_1().border_color(theme::hairline()))
-            .bg(gpui::rgb(0x000000))
-            .overflow_hidden()
-            .when(!full, |view| {
-                view.cursor_pointer()
-                    .tooltip(tip("Click to see everyone again (Esc)", None))
-                    .on_click(cx.listener(move |this, _, window, cx| this.tiny_open_stream(&user_id, mine, window, cx)))
-            })
-            .child(self.tiny_stream_body(page, stream, call, Size::Big, cx))
-            .child(caption(if mine { format!("Your {what}") } else { format!("{name}'s {what}") }, false))
-            .child(tools)
-    }
-
-    /// Over the whole window while the focused stream has it.
-    pub(super) fn tiny_full_stage(&self, page: &Page, cx: &mut Context<Self>) -> Option<AnyElement> {
-        self.tiny_state.full?;
-        let room = page.community.rooms.iter().find(|room| Some(&room.id) == self.tiny_state.channel.as_ref())?;
-        let call = self.tiny_call_here(room);
-        let streams = stage::streams(room, page.me, sending_now(call.as_ref()));
-        let stream = match stage::still(self.tiny_state.focus.as_ref(), room, &streams) {
-            Some(Focus::Stream(user_id)) => streams.iter().find(|stream| stream.user_id == *user_id),
-            _ => None,
-        };
-        let inside: AnyElement = match stream {
-            Some(stream) => self.tiny_stream_view(page, stream, call.as_ref(), true, cx).into_any_element(),
-            // The stream ended while it had the window.
-            None => div()
-                .size_full()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap(px(12.))
-                .child(div().type_title().text_color(theme::text()).child("The stream ended"))
-                .child(button_with_icon("tiny-stream-ended", ButtonKind::Secondary, "icons/minimize.svg", "Exit full screen").h(px(32.)).on_click(cx.listener(|this, _, window, cx| {
-                    this.tiny_unfull(window, cx);
-                })))
-                .into_any_element(),
-        };
-        Some(div().id("tiny-full").absolute().top_0().left_0().size_full().bg(gpui::rgb(0x000000)).occlude().flex().child(inside).into_any_element())
-    }
-
-    fn tiny_tile(&self, page: &Page, seat: &TinySeat, call: Option<&Call>, size: Size, cx: &mut Context<Self>) -> AnyElement {
-        let big = size == Size::Big;
-        let small = size == Size::Strip;
-        let me = seat.user_id == page.me;
-        let seat = as_heard(seat, me, call);
-        let seat = &seat;
-        let name = model::name_by_id(page.community, &seat.user_id);
-        let speaking = seat.speaking && !seat.server_muted && !seat.suppressed;
-        let color = page.community.member(&seat.user_id).and_then(|member| model::color_of(page.community, member)).map(gpui::rgb).unwrap_or(theme::text());
-        let states = model::seat_states(seat);
-        let mut glyphs = super::column::seat_glyphs(seat);
-        let (percent, local_mute) = self.call_gain(page.account, &seat.user_id);
-        if local_mute && !me {
-            glyphs.push(("icons/volume-x.svg", theme::warning(), "Muted for you"));
-        } else if percent != 100 && !me {
-            glyphs.push(("icons/volume-2.svg", theme::text_soft(), "Volume adjusted"));
-        }
-        let focused = self.tiny_state.focus.as_ref() == Some(&Focus::Person(seat.user_id.clone()));
-        let group: SharedString = format!("tiny-tile-{}", seat.user_id).into();
-        let (w, h, avatar) = size.person();
-        let user_id = seat.user_id.clone();
-        let focus_id = seat.user_id.clone();
-        let menu_id = seat.user_id.clone();
-        // My own link, in my own tile: what everyone else hears me through.
-        let link = (me && !small && call.is_some_and(|call| call.state == CallState::Joined)).then(|| self.tiny_health()).flatten().map(|health| {
-            let grade = health.grade();
-            let words = match health.rtt_ms {
-                Some(ms) if grade != Grade::Unknown => format!("{} · {ms} ms", grade.words()),
-                _ => grade.words().to_owned(),
-            };
-            div()
-                .id("tiny-tile-link")
-                .absolute()
-                .top(px(10.))
-                .left(px(10.))
-                .p(px(3.))
-                .rounded(px(theme::R_CHIP))
-                .cursor_pointer()
-                .hover(|style| style.bg(theme::hover()))
-                .tooltip(tip(format!("{words}. Call health"), None))
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.tiny_toggle_health(cx);
-                }))
-                .child(health::bars(grade, 11.))
-        });
-        let hover_button = |id: String, icon: &'static str, words: &'static str| {
-            div()
-                .id(SharedString::from(id))
-                .size(px(28.))
-                .rounded_full()
-                .bg(theme::overlay())
-                .border_1()
-                .border_color(theme::overlay_edge())
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .hover(|style| style.bg(theme::selected()))
-                .tooltip(tip(words, None))
-                .child(glyph(icon, 14., theme::text()))
-        };
-        let actions = div()
-            .absolute()
-            .bottom(px(8.))
-            .right(px(8.))
-            .flex()
-            .gap(px(4.))
-            .opacity(if focused { 1. } else { 0. })
-            .group_hover(group.clone(), |style| style.opacity(1.))
-            .when(!me, |row| {
-                row.child(
-                    hover_button(format!("tiny-tile-volume-{menu_id}"), if local_mute { "icons/volume-x.svg" } else { "icons/volume-2.svg" }, "Volume and more")
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.tiny_open_float(Float::Person { user_id: menu_id.clone(), at: event.position }, cx);
-                            }),
-                        ),
-                )
-            })
-            .child(hover_button(format!("tiny-tile-pin-{}", seat.user_id), if focused { "icons/x.svg" } else { "icons/pin.svg" }, if focused { "Stop focusing" } else { "Focus" }));
-        let state_row = div()
-            .h(px(20.))
-            .flex()
-            .items_center()
-            .gap(px(4.))
-            .children(states.first().map(|words| {
-                let danger = words.starts_with("Server") || words.starts_with("Can't");
-                let priority = *words == "Priority speaker";
-                let (fg, bg) = if danger {
-                    (theme::danger(), theme::danger_soft())
-                } else if priority {
-                    (theme::accent_text(), theme::accent_soft())
-                } else {
-                    (theme::text_soft(), theme::hover())
-                };
-                chip(*words, fg, bg)
-            }))
-            .when(local_mute && !me, |row| row.child(chip("Muted for you", theme::warning(), theme::warning_soft())))
-            .when(percent != 100 && !local_mute && !me, |row| row.child(chip(format!("{percent} %"), theme::text_soft(), theme::hover())));
-        let ring = if speaking && seat.priority {
-            theme::accent_text()
-        } else if speaking {
-            theme::positive()
-        } else if focused {
-            theme::border_strong()
-        } else {
-            theme::hairline()
+            Some(self.tiny_call_bar(page, room, mine || up, call.as_ref(), cx))
         };
         div()
-            .id(SharedString::from(format!("tiny-tile-{}", seat.user_id)))
-            .group(group)
-            .relative()
-            .flex_none()
-            .w(px(w))
-            .h(px(h))
-            .rounded(px(theme::R_CARD + 4.))
-            .bg(theme::raised())
-            .border_2()
-            .border_color(ring)
-            .when(speaking, |tile| tile.shadow(vec![gpui::BoxShadow {
-                color: gpui::Rgba { alpha: 0.25, ..if seat.priority { theme::accent_text() } else { theme::positive() } }.into(),
-                offset: gpui::point(px(0.), px(0.)),
-                blur_radius: px(12.),
-                spread_radius: px(0.),
-                inset: false,
-            }]))
+            .size_full()
             .flex()
             .flex_col()
-            .items_center()
-            .justify_center()
-            .gap(px(if small { 4. } else { 8. }))
-            .cursor_pointer()
-            .tab_index(0)
-            .focus_visible(|style| style.shadow(theme::focus_ring()))
-            .tooltip(tip(if focused { "Click to stop focusing" } else { "Click to focus. Right-click for more" }, None))
-            .on_click(cx.listener(move |this, _, window, cx| this.tiny_toggle_focus(&focus_id, window, cx)))
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |this, event: &MouseDownEvent, _, cx| this.tiny_open_float(Float::Person { user_id: user_id.clone(), at: event.position }, cx)),
-            )
-            .child(Avatar::new(&page.key(&seat.user_id), &name, avatar).image_at(page.picture(&seat.user_id)).build())
-            .child(
-                div()
-                    .max_w(px(w - 24.))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .child(div().min_w_0().truncate().map(|name| if big { name.type_title() } else if small { name.type_small() } else { name.type_ui() }).font_weight(theme::SEMIBOLD).text_color(color).child(name))
-                    .when(me && !small, |row| row.child(chip("You", theme::text_soft(), theme::hover()))),
-            )
-            .when(!small, |tile| tile.child(state_row))
-            .children(link)
-            .child(div().absolute().top(px(8.)).right(px(8.)).flex().gap(px(4.)).children(glyphs.into_iter().map(|(icon, color, _)| glyph(icon, 14., color))))
-            .when(!small, |tile| tile.child(actions))
+            .children(banner)
+            .child(stage)
+            .children(bar)
             .into_any_element()
-    }
-
-    /// A click on a tile: that person large, or everyone alike again.
-    fn tiny_toggle_focus(&mut self, user_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.tiny_keep_keys(window, cx);
-        self.tiny_state.focus = stage::toggle(self.tiny_state.focus.as_ref(), Focus::Person(user_id.to_owned()));
-        cx.notify();
     }
 
     fn tiny_empty_stage(&self, page: &Page, room: &TinyRoom, cx: &mut Context<Self>) -> AnyElement {
@@ -970,11 +106,33 @@ impl Shell {
             .justify_center()
             .gap(px(12.))
             .px(px(24.))
-            .child(div().size(px(56.)).rounded_full().bg(theme::raised()).flex().items_center().justify_center().child(glyph("icons/volume-2.svg", 24., theme::text_faint())))
+            .child(
+                div()
+                    .size(px(56.))
+                    .rounded_full()
+                    .bg(theme::raised())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(glyph("icons/volume-2.svg", 24., theme::text_faint())),
+            )
             .child(div().type_title().text_color(theme::text()).child(format!("Nobody is in {} yet", room.name)))
-            .child(div().max_w(px(380.)).text_center().whitespace_normal().type_ui().text_color(theme::text_soft()).child(blocked.map(str::to_owned).unwrap_or(devices)))
+            .child(
+                div()
+                    .max_w(px(380.))
+                    .text_center()
+                    .whitespace_normal()
+                    .type_ui()
+                    .text_color(theme::text_soft())
+                    .child(blocked.map(str::to_owned).unwrap_or(devices)),
+            )
             .child(join)
-            .children(self.tiny_state.call_error.clone().map(|detail| div().max_w(px(380.)).text_center().whitespace_normal().type_small().text_color(theme::danger()).child(detail)))
+            .children(
+                self.tiny_state
+                    .call_error
+                    .clone()
+                    .map(|detail| div().max_w(px(380.)).text_center().whitespace_normal().type_small().text_color(theme::danger()).child(detail)),
+            )
             .into_any_element()
     }
 
@@ -984,104 +142,27 @@ impl Shell {
             return "This server has no audio turned on, so joining only takes a seat.".to_owned();
         }
         match self.snapshot.as_ref().and_then(|snapshot| snapshot.call.as_ref()).filter(|call| !call.input.is_empty()) {
-            Some(call) => format!("You'll join with {} and hear through {}.", call.input, if call.output.is_empty() { "your speaker" } else { &call.output }),
+            Some(call) => format!(
+                "You'll join with {} and hear through {}.",
+                call.input,
+                if call.output.is_empty() { "your speaker" } else { &call.output }
+            ),
             None => "You'll join with your default microphone and speaker. Change them in Settings › Audio & video.".to_owned(),
         }
     }
 
-    /// Over the call bar: "You're muted" when I seem to be talking into a muted microphone,
-    /// a moderator's mute, and the push-to-talk key, lit while it is held.
-    fn tiny_call_pills(&self, room: &TinyRoom, call: Option<&Call>, held_by_server: Option<&'static str>, cx: &mut Context<Self>) -> Option<Div> {
-        let call = call.filter(|call| call.state == CallState::Joined)?;
-        let pill = |id: &'static str, icon: &'static str, words: String, color: gpui::Rgba, fill: gpui::Rgba| {
-            div()
-                .id(id)
-                .min_h(px(30.))
-                .max_w_full()
-                .px(px(12.))
-                .py(px(4.))
-                .rounded(px(15.))
-                .bg(fill)
-                .border_1()
-                .border_color(theme::hairline())
-                .flex()
-                .items_center()
-                .gap(px(7.))
-                .type_small()
-                .font_weight(theme::MEDIUM)
-                .text_color(color)
-                .child(div().flex_none().child(glyph(icon, 14., color)))
-                .child(div().min_w(px(80.)).whitespace_normal().line_clamp(3).child(words))
-        };
-        let muted = match held_by_server {
-            Some(words) => Some(pill("tiny-pill-held", "icons/mic-off.svg", words.to_owned(), theme::danger(), theme::danger_soft()).into_any_element()),
-            None if self.call_muted_talking(call) => Some(
-                pill(
-                    "tiny-pill-muted",
-                    "icons/mic-off.svg",
-                    if crate::gui::phone::active() {
-                        "You're muted · tap to talk".to_owned()
-                    } else {
-                        format!("You're muted · {} to talk", crate::gui::shortcuts::label("⌘⇧M"))
-                    },
-                    theme::on_accent(),
-                    theme::danger_fill(),
-                )
-                .cursor_pointer()
-                .tab_index(0)
-                .focus_visible(|style| style.shadow(theme::focus_ring()))
-                .tooltip(tip("Unmute", Some("⌘⇧M")))
-                .on_click(cx.listener(|this, _, _, cx| this.tiny_toggle_mute(cx)))
-                .into_any_element(),
-            ),
-            None => None,
-        };
-        let values = crate::gui::app::prefs::values();
-        let push = values.on(protocol::settings::PUSH_TO_TALK) || room.ptt_only;
-        let key = values.hotkey(protocol::settings::PTT_KEY).map(|binding| binding.label());
-        let held = crate::gui::hotkeys::talk_held();
-        #[cfg(feature = "gui-shot")]
-        let (push, held, key) = match crate::gui::call::shot_ptt() {
-            Some(down) => (true, down.then_some(false), Some("F".to_owned())),
-            None => (push, held, key),
-        };
-        let ptt = match talk(push, held, key) {
-            Talk::Open => None,
-            Talk::Waiting(Some(key)) => Some(pill("tiny-pill-ptt", "icons/radio.svg", format!("Push to talk · hold {key}"), theme::text_soft(), theme::overlay())),
-            Talk::Waiting(None) => Some(
-                pill("tiny-pill-ptt", "icons/radio.svg", "Push to talk · pick a key in Settings › Voice".to_owned(), theme::warning(), theme::overlay())
-                    .cursor_pointer()
-                    .on_click(|_, _, cx| crate::gui::settings::open(crate::gui::settings::Section::Voice, cx)),
-            ),
-            Talk::Talking => Some(pill("tiny-pill-ptt", "icons/radio.svg", "Talking".to_owned(), theme::on_accent(), theme::positive())),
-            Talk::Priority => Some(pill("tiny-pill-ptt", "icons/megaphone.svg", "Priority speaking".to_owned(), theme::on_accent(), theme::accent())),
-        };
-        // The most serious thing Call health has to say, when it is serious.
-        let trouble = self.tiny_health().and_then(|health| health.hints().into_iter().next()).filter(|hint| hint.level == health::Level::Bad).map(|hint| {
-            pill("tiny-pill-health", "icons/triangle-alert.svg", hint.words, theme::warning(), theme::overlay())
-                .max_w(px(520.))
-                .cursor_pointer()
-                .tab_index(0)
-                .focus_visible(|style| style.shadow(theme::focus_ring()))
-                .tooltip(tip("Call health", None))
-                .on_click(cx.listener(|this, _, _, cx| this.tiny_toggle_health(cx)))
-        });
-        if muted.is_none() && ptt.is_none() && trouble.is_none() {
-            return None;
-        }
-        Some(div().w_full().flex().flex_wrap().justify_center().items_center().gap(px(8.)).children(muted).children(ptt).children(trouble))
-    }
-
-    /// Under the stage: Join for a channel I am not in, else mute, deafen, devices, call
-    /// health and Leave.
+    /// Under the stage: Join for a channel I am not in, else the shared call control bar with
+    /// room moderation states and presets.
     fn tiny_call_bar(&self, page: &Page, room: &TinyRoom, mine: bool, call: Option<&Call>, cx: &mut Context<Self>) -> Div {
-        let bar = div().w_full().flex_none().pb(px(20.)).pt(px(8.)).flex().flex_col().items_center().gap(px(8.));
         if !mine {
+            let bar = div().w_full().flex_none().pb(px(20.)).pt(px(8.)).flex().flex_col().items_center().gap(px(8.));
             let blocked = join_blocked(page.live, &page.community.media);
             let join: AnyElement = if !page.community.allowed("community.calls.join") {
                 div().type_ui().text_color(theme::text_soft()).child("You can't join calls on this server.").into_any_element()
             } else if model::full(room) {
-                button_disabled(format!("{} is full · {} of {}", room.name, room.participants.len(), room.user_limit)).h(px(36.)).into_any_element()
+                button_disabled(format!("{} is full · {} of {}", room.name, room.participants.len(), room.user_limit))
+                    .h(px(36.))
+                    .into_any_element()
             } else if self.tiny_state.call_busy {
                 button("tiny-cancel", ButtonKind::Danger, "Cancel")
                     .h(px(36.))
@@ -1098,15 +179,17 @@ impl Shell {
                     .on_click(cx.listener(move |this, _, _, cx| this.tiny_join(room_id.clone(), cx)))
                     .into_any_element()
             };
-            let under = if model::full(room) { "Someone has to leave before you can join.".to_owned() } else { blocked.map(str::to_owned).unwrap_or_else(|| self.tiny_device_hint(page)) };
+            let under = if model::full(room) {
+                "Someone has to leave before you can join.".to_owned()
+            } else {
+                blocked.map(str::to_owned).unwrap_or_else(|| self.tiny_device_hint(page))
+            };
             return bar
                 .child(join)
                 .child(div().type_small().text_color(theme::text_faint()).child(under))
                 .children(self.tiny_state.call_error.clone().map(|detail| div().type_small().text_color(theme::danger()).child(detail)));
         }
-        let (muted, deafened) = self.tiny_quiet();
         let my_seat = room.participants.iter().find(|seat| seat.user_id == page.me);
-        // What the server holds over my microphone, which no button of mine undoes.
         let held = my_seat.and_then(|seat| {
             if seat.server_muted {
                 Some("A moderator muted you here")
@@ -1117,120 +200,29 @@ impl Shell {
             }
         });
         let held_ears = my_seat.is_some_and(|seat| seat.server_deafened);
-        let connecting = call.is_some_and(|call| matches!(call.state, CallState::Connecting | CallState::RingingOut));
-        let speaking = call.is_some_and(|call| call.state == CallState::Joined && call.speaking) && !muted && held.is_none();
-        let leave_word = if connecting { "Cancel" } else { "Leave" };
-        let leave = div()
-            .id("tiny-leave")
-            .h(px(44.))
-            .px(px(20.))
-            .rounded_full()
-            .bg(theme::danger_fill())
-            .hover(|style| style.bg(theme::danger()))
-            .flex()
-            .items_center()
-            .gap(px(8.))
-            .cursor_pointer()
-            .tab_index(0)
-            .focus_visible(|style| style.shadow(theme::focus_ring_gap(theme::overlay())))
-            .tooltip(tip(if connecting { "Cancel joining" } else { "Leave the call" }, Some("⌘⇧H")))
-            .on_click(cx.listener(|this, _, _, cx| this.tiny_leave(cx)))
-            .child(glyph("icons/phone-off.svg", 18., theme::on_accent()))
-            .child(div().type_ui().font_weight(theme::SEMIBOLD).text_color(theme::on_accent()).child(leave_word))
-            .into_any_element();
-        let mute = match held {
-            Some(words) => bar_button("tiny-bar-mute", "icons/mic-off.svg", Look::Held).tooltip(tip(words, None)),
-            None => bar_button("tiny-bar-mute", if muted { "icons/mic-off.svg" } else { "icons/mic.svg" }, if muted { Look::Off } else { Look::Rest })
-                .tooltip(tip(if muted { "Unmute" } else { "Mute" }, Some("⌘⇧M")))
-                .on_click(cx.listener(|this, _, _, cx| this.tiny_toggle_mute(cx))),
-        }
-        // While I am heard: a ring on the button, the same green as a speaking tile's.
-        .when(speaking, |mute| mute.child(div().absolute().top_0().left_0().size_full().rounded_full().border_2().border_color(theme::positive())));
-        let deafen = if held_ears {
-            bar_button("tiny-bar-deafen", "icons/headphone-off.svg", Look::Held).tooltip(tip("A moderator deafened you here", None))
-        } else {
-            bar_button("tiny-bar-deafen", if deafened { "icons/headphone-off.svg" } else { "icons/headphones.svg" }, if deafened { Look::Off } else { Look::Rest })
-                .tooltip(tip(if deafened { "Undeafen" } else { "Deafen" }, Some("⌘⇧D")))
-                .on_click(cx.listener(|this, _, _, cx| this.tiny_toggle_deafen(cx)))
-        };
-        let joined = call.is_some_and(|call| call.state == CallState::Joined);
-        let pictures = joined && room.video_enabled;
-        let share_on = call.is_some_and(|call| sending(call, Content::Share));
-        let camera_on = call.is_some_and(|call| sending(call, Content::Camera));
-        let share = pictures.then(|| {
-            bar_button("tiny-bar-share", "icons/monitor-up.svg", if share_on { Look::On } else { Look::Rest })
-                .tooltip(tip(if share_on { "Stop sharing" } else { "Share your screen" }, None))
-                .on_click(cx.listener(move |this, _, window, cx| if share_on { this.tiny_stop_share(cx) } else { this.tiny_share(window, cx) }))
-        });
-        let camera = pictures.then(|| {
-            bar_button("tiny-bar-camera", "icons/video.svg", if camera_on { Look::On } else { Look::Rest })
-                .tooltip(tip(if camera_on { "Turn camera off" } else { "Turn camera on" }, None))
-                .on_click(cx.listener(move |this, _, _, cx| this.call_ask(Request::Media(MediaRequest::Camera { on: !camera_on }), cx)))
-        });
-        let refused = self.call_refused().map(str::to_owned).or_else(|| call.and_then(|call| call.device_notice.clone()));
-        let health = call.filter(|call| call.state == CallState::Joined).and_then(|_| self.tiny_health()).map(|health| {
-            let grade = health.grade();
-            let words = match health.rtt_ms {
-                Some(ms) if grade != Grade::Unknown => format!("Call health: {} · {ms} ms", grade.words().to_lowercase()),
-                _ => "Call health".to_owned(),
-            };
-            div()
-                .id("tiny-bar-health")
-                .size(px(44.))
-                .rounded_full()
-                .bg(theme::selected())
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .tab_index(0)
-                .hover(|style| style.bg(theme::pressed()))
-                .focus_visible(|style| style.shadow(theme::focus_ring()))
-                .child(health::bars(grade, 16.))
-                .tooltip(tip(words, None))
-                .on_click(cx.listener(|this, _, _, cx| this.tiny_toggle_health(cx)))
-        });
         let no_sound = !page.audio && !page.community.media.is_empty();
-        bar.children(self.tiny_call_pills(room, call, held, cx))
-            .child(
-                div()
-                    .max_w_full()
-                    .p(px(6.))
-                    .rounded(px(24.))
-                    .bg(theme::overlay())
-                    .border_1()
-                    .border_color(theme::overlay_edge())
-                    .shadow(theme::shadow_popover())
-                    .flex()
-                    .flex_wrap()
-                    .justify_center()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(mute)
-                    .child(deafen)
-                    .children(share)
-                    .children(camera)
-                    .child(
-                        bar_button("tiny-bar-devices", "icons/settings.svg", Look::Rest)
-                            .tooltip(tip("Microphone and speaker", None))
-                            .on_click(|_, _, cx| crate::gui::settings::open(crate::gui::settings::Section::Audio, cx)),
-                    )
-                    .children(health)
-                    .child(leave),
-            )
-            .when(no_sound, |bar| bar.child(div().type_small().text_color(theme::text_faint()).child("This server has no audio turned on, so you have a seat and no sound.")))
-            // mediad cancels echo unless it was switched off (V10); only then does the call say to
-            // wear headphones.
-            .when(page.audio && !crate::gui::app::prefs::values().processing().echo_cancellation, |bar| bar.child(div().type_small().text_color(theme::text_faint()).child(HEADPHONES)))
-            .children(refused.map(|detail| div().max_w(px(520.)).whitespace_normal().type_small().text_color(theme::warning()).child(detail)))
-            .children(self.tiny_state.call_error.clone().map(|detail| div().type_small().text_color(theme::danger()).child(detail)))
+        self.call_view_bar(
+            call,
+            &ViewBar {
+                held,
+                held_ears,
+                ptt_only: room.ptt_only,
+                video_allowed: room.video_enabled,
+                room_context: true,
+                no_sound,
+                audio_up: page.audio,
+            },
+            cx,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use protocol::{Key, Network, Participant};
+    use crate::gui::call::view::{talk, Talk};
+    use crate::gui::call::watching;
+    use protocol::{Content, Direction, Key, Network, Participant, TinySeat};
 
     fn joined(muted: bool, deafened: bool, speaking: bool) -> Call {
         Call {
@@ -1251,6 +243,8 @@ mod tests {
             level: None,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            cameras: Vec::new(),
+            camera_id: String::new(),
             output_level: None,
             input_id: String::new(),
             output_id: String::new(),
@@ -1258,9 +252,12 @@ mod tests {
             device_stuck: false,
             security: None,
             picture: None,
+            pictures: Vec::new(),
+            watch_refused: Vec::new(),
             self_view: None,
             share_view: None,
             picture_source: None,
+            video_allowed: true,
         }
     }
 
@@ -1309,10 +306,10 @@ mod tests {
     #[test]
     fn sending_is_our_encode_and_watching_is_that_person() {
         let mut call = joined(false, false, false);
-        assert!(!sending(&call, Content::Share));
+        assert!(!stage::sending(&call, Content::Share));
         call.video.push(protocol::VideoStream { direction: Direction::Encode, content: Content::Camera, source: String::new() });
-        assert!(sending(&call, Content::Camera));
-        assert!(!sending(&call, Content::Share));
+        assert!(stage::sending(&call, Content::Camera));
+        assert!(!stage::sending(&call, Content::Share));
         assert!(!watching(&call, "ada"));
         call.video.push(protocol::VideoStream { direction: Direction::Decode, content: Content::Share, source: "ada".into() });
         assert!(watching(&call, "ada"));

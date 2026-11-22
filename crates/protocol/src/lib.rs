@@ -33,6 +33,7 @@ pub mod quarantine;
 mod react;
 pub mod settings;
 mod signin;
+pub mod streamer;
 pub mod telegram_call_emoji;
 mod tiny;
 pub mod web_sign_in;
@@ -303,6 +304,12 @@ pub struct Group {
     /// drawn, except the open one and starred ones.
     #[serde(default, skip_serializing_if = "is_false")]
     pub unread_only: bool,
+    /// Optional section icon / emoji (e.g. Slack custom sidebar section emoji).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub emoji: String,
+    /// Optional per-section sort order (e.g. `"alphabetical"`, `"recent"`, `"priority"`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub sort: String,
 }
 
 impl Group {
@@ -316,6 +323,8 @@ impl Group {
             count: 0,
             muted: false,
             unread_only: false,
+            emoji: String::new(),
+            sort: String::new(),
         }
     }
 }
@@ -352,6 +361,43 @@ pub enum CallSupport {
     Handoff,
     /// The other person's privacy settings restrict calls from this account.
     Restricted,
+}
+
+/// Camera and screen share run in this client on a Tiny or Discord call.
+pub fn call_pictures(network: Network) -> bool {
+    matches!(network, Network::Tiny | Network::Discord)
+}
+
+/// How a conversation kind is called, as the adapter that builds its row decides.
+/// Not sent on the wire. [`CallOffer::Absent`] means that network has no such conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallOffer {
+    Native,
+    Handoff,
+    /// The network has this kind of conversation and this client does not call it.
+    Missing,
+    /// The network has no such conversation.
+    Absent,
+}
+
+impl CallOffer {
+    pub fn support(self) -> CallSupport {
+        match self {
+            CallOffer::Native => CallSupport::Native,
+            CallOffer::Handoff => CallSupport::Handoff,
+            CallOffer::Missing | CallOffer::Absent => CallSupport::None,
+        }
+    }
+}
+
+impl From<CallSupport> for CallOffer {
+    fn from(support: CallSupport) -> Self {
+        match support {
+            CallSupport::Native => CallOffer::Native,
+            CallSupport::Handoff => CallOffer::Handoff,
+            CallSupport::None | CallSupport::Restricted => CallOffer::Missing,
+        }
+    }
 }
 
 /// Someone in a voice channel, as its row in the tree shows them.
@@ -1522,6 +1568,8 @@ pub enum Request {
     MembersAdd {
         conversation: Key,
         people: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        share_history: Option<HistoryShare>,
     },
     /// Removes one person (by person id) from a group or channel.
     MembersRemove {
@@ -1598,6 +1646,20 @@ pub enum Request {
     /// pane opens and kept five minutes.
     ConversationInfo {
         conversation: Key,
+    },
+    /// Today's meetings for one account, soonest first. Teams reads its calendar; Join is a
+    /// link until a call can be placed here.
+    Meetings {
+        account: AccountKey,
+    },
+    /// Accept, decline, or tentatively accept one meeting. `propose` is a new start, Unix
+    /// seconds, sent with a tentative answer.
+    MeetingRsvp {
+        account: AccountKey,
+        id: String,
+        response: MeetingResponse,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        propose: Option<i64>,
     },
     /// A Space's own info, opened from its name.
     SpaceInfo {
@@ -2062,6 +2124,18 @@ pub enum Request {
         unfave: bool,
     },
 
+    /// Translates one message on demand into `to` (a BCP-47 / ISO 639-1 tag such as `"en"`,
+    /// or `"system"` to use the local system locale).
+    ///
+    /// Never dispatched for end-to-end encrypted conversations (Signal or Tiny E2EE): chatd
+    /// refuses those locally without contacting any network service.
+    Translate {
+        conversation: Key,
+        message_id: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        to: String,
+    },
+
     /// Asks for these files to be on disk. Answers with what is known now; each file that lands
     /// later is a `Media` change. Ask only for what is on screen.
     Fetch {
@@ -2087,6 +2161,10 @@ pub enum Request {
         /// over it and not on another display.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         at: Option<(i32, i32)>,
+        /// A Slack workspace or org to continue (SSO or two-factor). The helper opens that
+        /// workspace's address, and only that account's token is replaced.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume: Option<String>,
     },
     /// Reads again the sessions the keychain refused (`Keychain::denied`): the user's "Try
     /// again". Answers `Status` at once; the read goes on behind it.
@@ -2730,6 +2808,125 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         values: Vec<String>,
     },
+    /// Invite someone by email to a workspace (Slack `users.admin.invite`). Answers `Response::Ok`.
+    InviteMember {
+        account: AccountKey,
+        email: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        channels: Vec<String>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        real_name: String,
+    },
+    /// Upload a custom emoji to a workspace (Slack `emoji.add`). Answers `Response::Ok`.
+    AddCustomEmoji {
+        account: AccountKey,
+        name: String,
+        path: String,
+    },
+    /// List active workspace user groups (Slack `usergroups.list`). Answers `Response::UserGroups`.
+    UserGroups {
+        account: AccountKey,
+    },
+    /// Create a workspace user group (Slack `usergroups.create`). Answers `Response::UserGroup`.
+    UserGroupCreate {
+        account: AccountKey,
+        name: String,
+        handle: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        description: String,
+    },
+    /// Update a workspace user group's name, handle, or description (Slack `usergroups.update`).
+    /// Answers `Response::UserGroup`.
+    UserGroupUpdate {
+        account: AccountKey,
+        group_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handle: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+    },
+    /// Replace a workspace user group's members (Slack `usergroups.users.update`).
+    /// Answers `Response::UserGroup`.
+    UserGroupMembers {
+        account: AccountKey,
+        group_id: String,
+        users: Vec<String>,
+    },
+    /// Fetch a Slack app's About profile and (when `include_home` is true) its published Home tab.
+    /// Fetched on open only; never at connect. Answers `Response::AppView`.
+    AppView {
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "is_false")]
+        include_home: bool,
+    },
+    /// Search files on a network (`search.files` on Slack). Answers `Response::AccountFiles`.
+    SearchFiles {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation: Option<Key>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<Key>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account: Option<AccountKey>,
+        query: String,
+        #[serde(default, skip_serializing_if = "SearchSort::is_newest")]
+        sort: SearchSort,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+    },
+    /// Create a custom sidebar section in a Space (Slack `users.channelSections.create`).
+    /// Answers `Response::Section`.
+    SectionCreate {
+        space: Key,
+        name: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        emoji: String,
+    },
+    /// Rename or update a custom sidebar section (Slack `users.channelSections.update`).
+    SectionRename {
+        space: Key,
+        section_id: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        emoji: Option<String>,
+    },
+    /// Delete a custom sidebar section (Slack `users.channelSections.delete`).
+    SectionDelete {
+        space: Key,
+        section_id: String,
+    },
+    /// Reorder sidebar sections (Slack `users.channelSections.order`).
+    SectionReorder {
+        space: Key,
+        section_ids: Vec<String>,
+    },
+    /// Move a conversation between sidebar sections (Slack `users.channelSections.channels.bulkUpdate`).
+    SectionMoveChannel {
+        space: Key,
+        conversation: Key,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_section: Option<String>,
+        to_section: String,
+    },
+    /// List available slash commands for an account (built-ins + cached `commands.list`).
+    /// Answers `Response::SlashCommands`.
+    SlashCommands {
+        account: AccountKey,
+    },
+    /// Reads unread messages grouped by conversation across a network or workspace (All Unreads, #606).
+    /// On Slack this runs paced, capped `conversations.history` calls (`oldest = last_read`) ONLY
+    /// when opened (never at connect), upgrading coarse unread flags to real counts.
+    /// Answers `Response::AllUnreads`.
+    AllUnreads {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        network: Option<Network>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        space: Option<Key>,
+        /// Maximum unread conversations to include (server-clamped; 0 uses default 15).
+        #[serde(default)]
+        limit: u32,
+    },
     /// Who has read a given message in a chat (`Capabilities::read_by`).
     ReadBy {
         conversation: Key,
@@ -2834,6 +3031,9 @@ pub enum Change {
     Searched { account: AccountKey, query: String },
     /// Ephemeral. Everyone typing in the conversation now; empty when they stopped.
     Typing { conversation: Key, typists: Vec<Typist> },
+    /// Ephemeral. A message visible only to the current user (e.g. Slack ephemeral reply).
+    /// Never stored in persistent channel history.
+    Ephemeral { conversation: Key, message: Box<Message> },
     /// A network's folders, or their counts: ask `Folders`.
     Folders { account: AccountKey },
     /// Ephemeral. Presence, status and what they are doing, all of it.
@@ -2916,6 +3116,7 @@ impl Change {
         matches!(
             self,
             Change::Typing { .. }
+                | Change::Ephemeral { .. }
                 | Change::Presence { .. }
                 | Change::Call { .. }
                 | Change::Occupants { .. }
@@ -2927,6 +3128,65 @@ impl Change {
                 | Change::Meter { .. }
                 | Change::Open { .. }
         )
+    }
+}
+
+/// An on-demand translation of one message (`Request::Translate` / `Response::Translated`).
+/// Never written into stored message history; kept in UI state only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Translation {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_lang: Option<String>,
+    pub target_lang: String,
+}
+
+/// Normalizes a locale or BCP-47 tag (such as `"en_US.UTF-8"`, `"zh-Hans"`, `"FR"`) into a
+/// lowercase primary ISO 639-1 / 639-3 subtag suitable for translation APIs.
+/// Falls back to `"en"` when empty or malformed.
+pub fn normalize_language_tag(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") || trimmed.eq_ignore_ascii_case("system") {
+        return "en".to_owned();
+    }
+    let primary = trimmed
+        .split(['.', '@', '-', '_'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    if (2..=5).contains(&primary.len()) && primary.bytes().all(|b| b.is_ascii_alphabetic()) {
+        primary.to_ascii_lowercase()
+    } else {
+        "en".to_owned()
+    }
+}
+
+/// Human-readable display name for a language tag (e.g. `"es"` -> `"Spanish"`).
+pub fn language_name(tag: &str) -> String {
+    let norm = tag.trim().to_ascii_lowercase();
+    let primary = norm.split(['-', '_', '.']).next().unwrap_or("");
+    match primary {
+        "" | "auto" => "detected language".to_owned(),
+        "en" => "English".to_owned(),
+        "es" => "Spanish".to_owned(),
+        "fr" => "French".to_owned(),
+        "de" => "German".to_owned(),
+        "it" => "Italian".to_owned(),
+        "pt" => "Portuguese".to_owned(),
+        "ru" => "Russian".to_owned(),
+        "ja" => "Japanese".to_owned(),
+        "ko" => "Korean".to_owned(),
+        "zh" => "Chinese".to_owned(),
+        "ar" => "Arabic".to_owned(),
+        "hi" => "Hindi".to_owned(),
+        "nl" => "Dutch".to_owned(),
+        "pl" => "Polish".to_owned(),
+        "tr" => "Turkish".to_owned(),
+        "uk" => "Ukrainian".to_owned(),
+        "sv" => "Swedish".to_owned(),
+        "vi" => "Vietnamese".to_owned(),
+        "id" => "Indonesian".to_owned(),
+        other => other.to_ascii_uppercase(),
     }
 }
 
@@ -3133,6 +3393,10 @@ pub enum Response {
     ConversationInfo {
         info: Box<ConversationInfo>,
     },
+    /// Answers `Meetings`.
+    Meetings {
+        events: Vec<MeetingEvent>,
+    },
     SpaceInfo {
         info: Box<SpaceInfo>,
     },
@@ -3169,6 +3433,12 @@ pub enum Response {
         reactors: Vec<Reactor>,
         #[serde(default, skip_serializing_if = "is_false")]
         more: bool,
+    },
+    /// Answers `Translate`: translated message text kept transiently beside the original.
+    Translated {
+        conversation: Key,
+        message_id: String,
+        translation: Translation,
     },
     Catalog {
         items: Vec<CatalogItem>,
@@ -3329,6 +3599,30 @@ pub enum Response {
     /// One updated/rescheduled message (`Request::RescheduleMessage`).
     ScheduledMessage {
         message: ScheduledMessage,
+    },
+    /// Active workspace user groups (`Request::UserGroups`).
+    UserGroups {
+        groups: Vec<UserGroup>,
+    },
+    /// One created or updated workspace user group.
+    UserGroup {
+        group: UserGroup,
+    },
+    /// A Slack app's About profile and optional Home tab (`Request::AppView`).
+    AppView {
+        view: Box<AppView>,
+    },
+    /// A newly created custom sidebar section (`Request::SectionCreate`).
+    Section {
+        group: Group,
+    },
+    /// Built-in and workspace slash commands (`Request::SlashCommands`).
+    SlashCommands {
+        commands: Vec<SlashCommand>,
+    },
+    /// Unread messages grouped by conversation (`Request::AllUnreads`, #606).
+    AllUnreads {
+        groups: Vec<UnreadGroup>,
     },
     /// Members who have read a given message (`Request::ReadBy`).
     ReadBy {
@@ -3677,7 +3971,7 @@ mod tests {
         let request: Request = serde_json::from_str(r#"{"op":"fetch","account":{"network":"slack","account":"T1"},"ids":["a"]}"#).unwrap();
         assert!(matches!(request, Request::Fetch { size: None, retry: false, .. }));
         let request: Request = serde_json::from_str(r#"{"op":"sign_in","network":"slack"}"#).unwrap();
-        assert!(matches!(request, Request::SignIn { at: None, .. }));
+        assert!(matches!(request, Request::SignIn { at: None, resume: None, .. }));
         let thread: ThreadSummary = serde_json::from_str(r#"{"id":"t","replies":2,"last":5}"#).unwrap();
         assert_eq!((thread.participants.len(), thread.unread), (0, 0));
         let call = r#"{"conversation":{"network":"discord","account":"1","id":"c"},"state":"joined",
@@ -3805,7 +4099,7 @@ mod tests {
     #[test]
     fn conversation_management_requests_and_rights_round_trip() {
         let key = Key::new(&AccountKey { network: Network::Slack, account: "w1".into() }, "C1");
-        let add = Request::MembersAdd { conversation: key.clone(), people: vec!["U1".into(), "U2".into()] };
+        let add = Request::MembersAdd { conversation: key.clone(), people: vec!["U1".into(), "U2".into()], share_history: None };
         assert_eq!(serde_json::from_str::<Request>(&serde_json::to_string(&add).unwrap()).unwrap(), add);
 
         let remove = Request::MembersRemove { conversation: key.clone(), person: "U2".into() };
@@ -3918,5 +4212,39 @@ mod sock_path_tests {
         let old: Capabilities = serde_json::from_str("{}").unwrap();
         assert!(!old.follow_threads);
         assert!(!old.dnd_snooze);
+        assert!(!old.translate);
+    }
+
+    #[test]
+    fn translate_request_response_and_language_helpers_round_trip() {
+        let conv = Key::new(&AccountKey { network: Network::Telegram, account: "42".into() }, "u7");
+        let req = Request::Translate {
+            conversation: conv.clone(),
+            message_id: "105".into(),
+            to: "en".into(),
+        };
+        let encoded = serde_json::to_string(&req).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&encoded).unwrap(), req);
+
+        let translation = Translation {
+            text: "Hello world".into(),
+            source_lang: Some("es".into()),
+            target_lang: "en".into(),
+        };
+        let resp = Response::Translated {
+            conversation: conv,
+            message_id: "105".into(),
+            translation: translation.clone(),
+        };
+        assert_eq!(serde_json::from_str::<Response>(&serde_json::to_string(&resp).unwrap()).unwrap(), resp);
+
+        assert_eq!(normalize_language_tag("en_US.UTF-8"), "en");
+        assert_eq!(normalize_language_tag("pt-BR"), "pt");
+        assert_eq!(normalize_language_tag("JA"), "ja");
+        assert_eq!(normalize_language_tag(""), "en");
+        assert_eq!(normalize_language_tag("123"), "en");
+        assert_eq!(language_name("es"), "Spanish");
+        assert_eq!(language_name("zh-Hans"), "Chinese");
+        assert_eq!(language_name("auto"), "detected language");
     }
 }

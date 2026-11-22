@@ -15,7 +15,7 @@ use gpui::{div, prelude::*, px, AnyElement, Context, MouseButton, MouseMoveEvent
 impl Shell {
     pub(in crate::gui) fn tiny_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let state = &self.tiny_state;
-        if state.float.is_none() && state.modal.is_none() && state.settings.is_none() && state.card.is_none() && !state.setup.prompt && state.full.is_none() {
+        if state.float.is_none() && state.modal.is_none() && state.settings.is_none() && state.card.is_none() && !state.setup.prompt {
             return None;
         }
         // Sharing and abuse reports work even while another chat is selected and
@@ -32,8 +32,6 @@ impl Shell {
         }
         let page = self.tiny_page_facts()?;
         let mut layer = div().absolute().top_0().left_0().size_full();
-        // A stream with the whole window, under any menu or modal.
-        layer = layer.children(self.tiny_full_stage(&page, cx));
         if state.settings.is_some() {
             layer = layer.child(self.tiny_settings_overlay(&page, window, cx));
         }

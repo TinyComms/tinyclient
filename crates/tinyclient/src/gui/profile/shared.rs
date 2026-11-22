@@ -47,6 +47,7 @@ fn none_words(network: Network, tab: Tab) -> &'static str {
         Tab::Kind(SharedKind::Links) => "No links in this chat",
         Tab::Pinned if network == Network::Messages => "No starred messages in this chat",
         Tab::Pinned => "Nothing pinned in this chat",
+        Tab::Later if network == Network::Teams => "No saved messages",
         Tab::Later => "Nothing saved for later",
     }
 }
@@ -102,12 +103,10 @@ pub fn tabs(network: Network) -> Vec<Tab> {
 
 pub fn tabs_for(network: Network, has_pins: bool) -> Vec<Tab> {
     let mut tabs = vec![Tab::Kind(SharedKind::Media), Tab::Kind(SharedKind::Files), Tab::Kind(SharedKind::Links)];
-    if !matches!(network, Network::Teams | Network::Tiny)
-        || (network == Network::Tiny && has_pins)
-    {
+    if network != Network::Tiny || has_pins {
         tabs.push(Tab::Pinned);
     }
-    if network == Network::Slack {
+    if matches!(network, Network::Slack | Network::Teams) {
         tabs.push(Tab::Later);
     }
     tabs
@@ -327,6 +326,7 @@ pub fn draw(shared: &Shared, network: Network, has_pins: bool, hub: &Hub, width:
                 Tab::Kind(SharedKind::Links) => "Links",
                 Tab::Pinned if network == Network::Messages => "Starred",
                 Tab::Pinned => "Pinned",
+                Tab::Later if network == Network::Teams => "Saved",
                 Tab::Later => "Later",
             };
             let count = shared.total_of(tab);
@@ -558,7 +558,10 @@ mod tests {
         assert_eq!(tab_count(&whole), Some(37));
         let none = Page { complete: true, total: Some(0), read: true, ..Page::default() };
         assert_eq!(source(Network::Telegram, links, &none).line, "No links in this chat");
-        assert_eq!(tabs(Network::Teams).len(), 3);
+        assert_eq!(tabs(Network::Teams).len(), 5);
+        assert!(tabs(Network::Teams).contains(&Tab::Pinned));
+        assert_eq!(tabs(Network::Teams).last(), Some(&Tab::Later));
+        assert_eq!(source(Network::Teams, Tab::Later, &none).line, "No saved messages");
         assert_eq!(tabs(Network::Messages).len(), 4);
         assert_eq!(tabs(Network::Messages).last(), Some(&Tab::Pinned));
         assert_eq!(source(Network::Messages, Tab::Pinned, &none).line, "No starred messages in this chat");

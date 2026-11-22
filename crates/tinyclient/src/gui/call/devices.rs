@@ -17,13 +17,13 @@
 use super::{in_call, Menu};
 use crate::client::ask;
 use crate::gui::app::prefs;
-use crate::gui::components::{menu_item, menu_separator};
+use crate::gui::components::{button_with_icon, glyph, menu_item, menu_separator, ButtonKind};
 use crate::gui::settings;
 use crate::gui::state::Shell;
-use crate::gui::theme;
-use gpui::{div, prelude::*, px, AnyElement, Context, Div, FontWeight, SharedString};
-use protocol::settings::{DeviceChoice, GLOBAL, INPUT, OUTPUT};
-use protocol::{AudioDevice, Call, MediaRequest, Request};
+use crate::gui::theme::{self, Type};
+use gpui::{div, img, prelude::*, px, AnyElement, Context, Div, FontWeight, ObjectFit, SharedString};
+use protocol::settings::{DeviceChoice, CAMERA, GLOBAL, INPUT, OUTPUT};
+use protocol::{AudioDevice, Call, CameraSource, MediaRequest, Request};
 use std::time::{Duration, Instant};
 
 /// Segments of a level meter.
@@ -41,6 +41,7 @@ fn lit(level: Option<u8>) -> u8 {
 pub(super) enum Side {
     Input,
     Output,
+    Camera,
 }
 
 /// One row of a side of the menu.
@@ -96,6 +97,65 @@ pub(super) fn rows(choice: &DeviceChoice, listed: &[AudioDevice], in_use: &str) 
     rows
 }
 
+/// Whether `choice` picks `camera` among `listed`.
+fn camera_matches(choice: &DeviceChoice, camera: &CameraSource) -> bool {
+    match choice {
+        DeviceChoice::Device { id: Some(id), .. } => camera.id == *id,
+        DeviceChoice::Device { name, id: None } => camera.name == *name,
+        DeviceChoice::Auto | DeviceChoice::System => false,
+    }
+}
+
+/// Camera radio rows for the device menu and camera preview popover: empty when `listed` is empty
+/// (no CAMERA section drawn); otherwise "System default" first, then each listed camera, then a
+/// disconnected chosen camera if it is missing from `listed`.
+pub(super) fn camera_rows(choice: &DeviceChoice, listed: &[CameraSource], in_use: &str) -> Vec<Row> {
+    if listed.is_empty() {
+        return Vec::new();
+    }
+    let default_selected = matches!(choice, DeviceChoice::Auto | DeviceChoice::System);
+    let mut out = vec![Row {
+        choice: DeviceChoice::Auto,
+        label: "System default".to_owned(),
+        detail: listed.first().map(|cam| cam.name.clone()),
+        chosen: default_selected,
+        is_virtual: false,
+    }];
+    let mut matched = false;
+    for camera in listed {
+        let chosen = camera_matches(choice, camera);
+        if chosen {
+            matched = true;
+        }
+        let standing_in = !chosen && !in_use.is_empty() && camera.id == in_use && !default_selected;
+        out.push(Row {
+            choice: DeviceChoice::device(&camera.name, &camera.id),
+            label: camera.name.clone(),
+            detail: standing_in.then(|| "in use for now".to_owned()),
+            chosen,
+            is_virtual: false,
+        });
+    }
+    if let DeviceChoice::Device { name, .. } = choice {
+        if !matched {
+            out.push(Row {
+                choice: choice.clone(),
+                label: name.clone(),
+                detail: Some("not connected".to_owned()),
+                chosen: true,
+                is_virtual: false,
+            });
+        }
+    }
+    out
+}
+
+/// True when clicking Camera (while off) should open the live-preview popover before sending:
+/// on first use in the session, or whenever more than one camera is available.
+pub(super) fn should_preview_camera(cameras: &[CameraSource], used_before: bool) -> bool {
+    !used_before || cameras.len() > 1
+}
+
 impl Shell {
     /// The popover that is open. Under `--shot`, the one the hook names.
     pub(super) fn call_menu(&self) -> Option<Menu> {
@@ -116,6 +176,14 @@ impl Shell {
             .detach();
     }
 
+    fn call_camera_preview_media(&self, on: bool, cx: &mut Context<Self>) {
+        cx.background_executor()
+            .spawn(async move {
+                let _ = ask(&Request::Media(MediaRequest::CameraPreview { on }));
+            })
+            .detach();
+    }
+
     /// Closes whatever popover is open, however it came to close.
     pub(super) fn call_menu_set(&mut self, menu: Option<Menu>, cx: &mut Context<Self>) {
         if self.call_state.sliding.is_some() && menu.is_none() {
@@ -125,11 +193,18 @@ impl Shell {
         if before == menu {
             return;
         }
-        if before == Some(Menu::Devices) {
+        let metered = |m: &Option<Menu>| matches!(m, Some(Menu::Devices | Menu::CameraPreview));
+        if metered(&before) && !metered(&menu) {
             self.call_meter(false, cx);
         }
-        if menu == Some(Menu::Devices) {
+        if !metered(&before) && metered(&menu) {
             self.call_meter(true, cx);
+        }
+        if before == Some(Menu::CameraPreview) && menu != Some(Menu::CameraPreview) {
+            self.call_camera_preview_media(false, cx);
+        }
+        if before != Some(Menu::CameraPreview) && menu == Some(Menu::CameraPreview) {
+            self.call_camera_preview_media(true, cx);
         }
         if before == Some(Menu::Security) && menu != Some(Menu::Security) {
             self.call_state.security_more = false;
@@ -161,10 +236,14 @@ impl Shell {
         }
     }
 
-    /// Stores the choice (V1, V2) as Settings would: chatd gives it to the call at once and
+    /// Stores the choice (V1, V2, V22) as Settings would: chatd gives it to the call at once and
     /// keeps it for every call after.
     pub(super) fn call_pick(&mut self, side: Side, choice: DeviceChoice, cx: &mut Context<Self>) {
-        let key = if side == Side::Input { INPUT } else { OUTPUT };
+        let key = match side {
+            Side::Input => INPUT,
+            Side::Output => OUTPUT,
+            Side::Camera => CAMERA,
+        };
         let value = choice.value();
         let mut values = prefs::values();
         values.set(GLOBAL, key, value.clone());
@@ -174,8 +253,27 @@ impl Shell {
         cx.notify();
     }
 
+    /// Handles clicking the Camera button in the dock or call view bar.
+    pub(super) fn call_camera_clicked(&mut self, call: &Call, camera_on: bool, cx: &mut Context<Self>) {
+        if camera_on {
+            self.call_menu_set(None, cx);
+            self.call_ask(Request::Media(MediaRequest::Camera { on: false }), cx);
+            return;
+        }
+        if should_preview_camera(&call.cameras, self.call_state.camera_used) {
+            self.call_menu_toggle(Menu::CameraPreview, cx);
+        } else {
+            self.call_state.camera_used = true;
+            self.call_ask(Request::Media(MediaRequest::Camera { on: true }), cx);
+        }
+    }
+
     fn call_device_row(&self, side: Side, ix: usize, row: Row, cx: &mut Context<Self>) -> impl IntoElement {
-        let group = if side == Side::Input { "call-input" } else { "call-output" };
+        let group = match side {
+            Side::Input => "call-input",
+            Side::Output => "call-output",
+            Side::Camera => "call-camera",
+        };
         let radio = div().flex_none().size(px(14.)).rounded(px(7.)).flex().items_center().justify_center();
         let radio = if row.chosen {
             radio
@@ -222,6 +320,7 @@ impl Shell {
         let (title, listed, in_use, key) = match side {
             Side::Input => ("MICROPHONE", &call.inputs, &call.input_id, INPUT),
             Side::Output => ("SPEAKER", &call.outputs, &call.output_id, OUTPUT),
+            Side::Camera => unreachable!("camera section uses call_camera_section"),
         };
         let choice = prefs::values().device_choice(key);
         let heading = |words: &'static str| {
@@ -248,6 +347,86 @@ impl Shell {
         section
     }
 
+    /// The CAMERA section under SPEAKER when the system lists at least one camera.
+    fn call_camera_section(&self, call: &Call, cx: &mut Context<Self>) -> Option<Div> {
+        let choice = prefs::values().device_choice(CAMERA);
+        let items = camera_rows(&choice, &call.cameras, &call.camera_id);
+        if items.is_empty() {
+            return None;
+        }
+        let heading = div()
+            .h(px(22.))
+            .flex_none()
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .text_size(px(11.))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme::text_faint())
+            .child("CAMERA");
+        let mut section = div().flex().flex_col().child(heading);
+        for (ix, row) in items.into_iter().enumerate() {
+            section = section.child(self.call_device_row(Side::Camera, ix, row, cx));
+        }
+        Some(section)
+    }
+
+    /// Small popover above the Camera button: live preview of the chosen camera, camera list, and
+    /// "Turn on camera".
+    pub(super) fn call_camera_preview_menu(&self, call: &Call, cx: &mut Context<Self>) -> Div {
+        let preview = match self.call_self_frame(Some(call), false) {
+            Some(frame) => img(frame)
+                .size_full()
+                .object_fit(ObjectFit::Contain)
+                .into_any_element(),
+            None => div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(6.))
+                .child(glyph("icons/video.svg", 22., theme::text_faint()))
+                .child(div().type_small().text_color(theme::text_soft()).child("Starting camera preview…"))
+                .into_any_element(),
+        };
+        let choice = prefs::values().device_choice(CAMERA);
+        let items = camera_rows(&choice, &call.cameras, &call.camera_id);
+        let mut list = div().flex().flex_col();
+        for (ix, row) in items.into_iter().enumerate() {
+            list = list.child(self.call_device_row(Side::Camera, ix, row, cx));
+        }
+        let go = button_with_icon("call-camera-preview-on", ButtonKind::Primary, "icons/video.svg", "Turn on camera")
+            .h(px(32.))
+            .w_full()
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.call_state.camera_used = true;
+                this.call_menu_set(None, cx);
+                this.call_ask(Request::Media(MediaRequest::Camera { on: true }), cx);
+            }));
+        div().child(
+            div()
+                .id("call-camera-preview-menu")
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .w_full()
+                        .h(px(150.))
+                        .rounded(px(8.))
+                        .bg(gpui::rgb(0x0b0b0d))
+                        .border_1()
+                        .border_color(theme::hairline())
+                        .overflow_hidden()
+                        .child(preview),
+                )
+                .when(!call.cameras.is_empty(), |box_div| box_div.child(list))
+                .child(go),
+        )
+    }
+
     /// Twelve segments and what they measure. The microphone's stays live while muted so it can
     /// be tried, and says that nobody hears it. Before the call is up nothing is open, and the
     /// meters say so by staying dark.
@@ -265,6 +444,7 @@ impl Shell {
                 let words = if in_call(call) { "What you hear" } else { "Speaker level, once the call connects" };
                 (call.output_level, words)
             }
+            Side::Camera => unreachable!("camera has no audio meter"),
         };
         let lit = lit(level);
         let gate = prefs::values().number(protocol::settings::SENSITIVITY) as u8;
@@ -363,6 +543,13 @@ impl Shell {
             .child(div().flex_none().my(px(4.)).mx(px(8.)).h(px(1.)).bg(theme::hairline()))
             .child(self.call_device_section(Side::Output, call, cx))
             .child(self.call_level(call, Side::Output))
+            .children(self.call_camera_section(call, cx).map(|section| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(div().flex_none().my(px(4.)).mx(px(8.)).h(px(1.)).bg(theme::hairline()))
+                    .child(section)
+            }))
             .children(peer_volume)
             .child(menu_separator().mx(px(8.)))
             .child(test)
@@ -434,5 +621,48 @@ mod tests {
         let rows = rows(&legacy, &listed(), "hs55");
         assert!(rows.iter().any(|row| row.label == HEADSET && row.chosen));
         assert_eq!(rows.len(), 5, "no 'not connected' row for a device that is there");
+    }
+
+    #[test]
+    fn camera_rows_are_empty_without_cameras_and_list_system_default_first_when_present() {
+        assert!(camera_rows(&DeviceChoice::Auto, &[], "").is_empty());
+        let cams = vec![
+            CameraSource { id: "cam-a".into(), name: "Built-in Camera".into(), thumbnail: String::new() },
+            CameraSource { id: "cam-b".into(), name: "Desk USB Camera".into(), thumbnail: String::new() },
+        ];
+        let default_rows = camera_rows(&DeviceChoice::Auto, &cams, "cam-a");
+        assert_eq!(
+            labels(&default_rows),
+            [
+                ("System default", Some("Built-in Camera"), true),
+                ("Built-in Camera", None, false),
+                ("Desk USB Camera", None, false),
+            ]
+        );
+        let picked = DeviceChoice::device("Desk USB Camera", "cam-b");
+        let picked_rows = camera_rows(&picked, &cams, "cam-b");
+        assert_eq!(
+            picked_rows.iter().filter(|row| row.chosen).map(|row| row.label.as_str()).collect::<Vec<_>>(),
+            ["Desk USB Camera"]
+        );
+        // Unplugged camera stays marked as not connected while the stand-in says so.
+        let unplugged = camera_rows(&picked, &cams[..1], "cam-a");
+        assert_eq!(
+            unplugged.last().map(|r| (r.label.as_str(), r.detail.as_deref(), r.chosen)),
+            Some(("Desk USB Camera", Some("not connected"), true))
+        );
+        assert_eq!(unplugged[1].detail.as_deref(), Some("in use for now"));
+    }
+
+    #[test]
+    fn camera_preview_opens_on_first_use_or_multiple_cameras_and_skips_with_one_used_camera() {
+        let one = vec![CameraSource { id: "cam-a".into(), name: "Built-in".into(), thumbnail: String::new() }];
+        let two = vec![
+            one[0].clone(),
+            CameraSource { id: "cam-b".into(), name: "External".into(), thumbnail: String::new() },
+        ];
+        assert!(should_preview_camera(&one, false), "first use previews before sending");
+        assert!(!should_preview_camera(&one, true), "single camera after first use turns on at once");
+        assert!(should_preview_camera(&two, true), "multiple cameras always offer the picker and preview");
     }
 }

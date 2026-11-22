@@ -174,6 +174,7 @@ impl Dirty {
             | Change::People { .. }
             | Change::Media { .. }
             | Change::Typing { .. }
+            | Change::Ephemeral { .. }
             | Change::Presence { .. }
             | Change::Members { .. }
             | Change::Occupants { .. }
@@ -282,6 +283,7 @@ impl Shell {
                 this.active = window.is_window_active();
                 super::lock::note_active(this.active);
                 this.focus_changed(this.active, cx);
+                this.call_auto_popout_on_blur(this.active, cx);
                 cx.notify();
             }),
             // A move draws nothing, so render never sees it: the frame is noted here.
@@ -343,7 +345,10 @@ impl Shell {
         shell.sidebar_state.pins = prefs.pins;
         shell.sidebar_state.remember_telegram_folder(prefs.telegram_folder.clone());
         shell.tiny_state.set_members_open(prefs.tiny_members);
+        shell.call_state.popout_frame = prefs.call_popout_frame;
         app::prefs::set_me(prefs.me.clone());
+        // Before the first snapshot, so a conversation window is not forgotten on the first write.
+        shell.conversation_state.windows.set_pending(prefs.conversation_windows);
         shell.saved_prefs.replace(app::prefs::write(&shell.current_prefs()));
         if crate::update::announce().is_some() {
             shell.layout_state.update_alert = true;
@@ -495,6 +500,7 @@ impl Shell {
             if let Some(snapshot) = &mut self.snapshot {
                 snapshot.open = None;
             }
+            self.sync_popout_composers(cx);
         }
 
         let (inbox_changed, home_changed) = self.sidebar_state.without_signed_out(&keep);
@@ -797,6 +803,7 @@ impl Shell {
             tree.conversations = conversations.into_iter().map(Rc::new).collect();
             tree.loaded = true;
             this.rebuild_rows(cx);
+            this.restore_conversation_windows(cx);
         });
     }
 
@@ -857,6 +864,7 @@ impl Shell {
             if spaced && before.as_ref() != Some(&after) {
                 this.load_spaces_soon(cx);
             }
+            this.refresh_conversation_window(&key, cx);
         });
     }
 
@@ -903,6 +911,7 @@ impl Shell {
             self.load_row(key.clone(), cx);
         }
         self.open = Some(key);
+        self.call_state.view = None;
         self.refused = None;
         // A floating sidebar closes on pick.
         self.layout_state.floating = false;
@@ -910,6 +919,7 @@ impl Shell {
         if let Some((conversation, peer)) = catch_up {
             self.catch_up_if_blocked(conversation, peer, cx);
         }
+        self.sync_popout_composers(cx);
     }
 
     /// Opening a DM with someone we blocked clears the badge even when their history will not
@@ -1031,6 +1041,15 @@ impl Shell {
 
     /// Opens the network's sign-in window. chatd answers when the user has finished with it.
     pub(super) fn sign_in(&mut self, network: Network, cx: &mut Context<Self>) {
+        self.begin_sign_in(network, None, cx);
+    }
+
+    /// Continues Slack SSO or two-factor for one workspace. The others stay connected.
+    pub(super) fn continue_slack(&mut self, account: String, cx: &mut Context<Self>) {
+        self.begin_sign_in(Network::Slack, Some(account), cx);
+    }
+
+    fn begin_sign_in(&mut self, network: Network, resume: Option<String>, cx: &mut Context<Self>) {
         if super::signin::open(network, cx) { return; }
         if self.signing_in.is_some() {
             return;
@@ -1038,7 +1057,7 @@ impl Shell {
         self.signing_in = Some(network);
         self.sign_in_failed = None;
         cx.notify();
-        let request = Request::SignIn { at: self.window_at.get(), network };
+        let request = Request::SignIn { at: self.window_at.get(), network, resume };
         self.off_thread(cx, move || ask(&request), move |this, answer, cx| {
             this.signing_in = None;
             this.sign_in_failed = match answer {
@@ -1064,6 +1083,7 @@ impl Shell {
             if let Some(snapshot) = &mut self.snapshot {
                 snapshot.open = None;
             }
+            self.sync_popout_composers(cx);
         }
         let request = Request::SignOut { account, erase };
         self.off_thread(cx, move || ask(&request), |this, _, cx| {

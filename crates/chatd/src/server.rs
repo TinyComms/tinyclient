@@ -7,7 +7,7 @@ use crate::store::Store;
 use protocol::settings;
 use protocol::{
     clip, read_frame_bytes, support_dir, write_frame, CatalogKind, ConversationInfo, MediaFile, MediaKind, Outgoing, SharedKind, SpaceInfo, AccountKey, AccountStatus, CallSupport, Capabilities,
-    Change, ChatListener, ChatStream, Conversation, ConversationKind, ErrorCode, InboxCounts, Key,
+    Change, ChatListener, ChatStream, Conversation, ConversationKind, Encryption, ErrorCode, InboxCounts, Key,
     Link, Media, MediaRequest, Message, MessageKind, Network, NetworkStatus, Page, Person, Presence,
     Profile, Reaction, RelateAction, Relation, Request, Response, SendState, Sender, Watching,
     MUTUAL_SPACES, PAGE_LIMIT, SEARCH_MIN_CHARS, WATCH_LIMIT,
@@ -129,6 +129,53 @@ fn search_fate(fresh_sent: Option<&str>, waiting: Option<&str>, query: &str) -> 
     }
 }
 
+/// One everywhere page: local offset `o`, and the account cursors `a` that produced this window.
+/// A missing cursor or a bare number means every account, each asked with no cursor.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EverywhereWindow {
+    o: usize,
+    a: Vec<EverywhereAccount>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EverywhereAccount {
+    n: Network,
+    id: String,
+    c: Option<String>,
+}
+
+fn decode_everywhere(cursor: Option<&str>) -> (usize, Option<Vec<(AccountKey, Option<String>)>>) {
+    let Some(cursor) = cursor else {
+        return (0, None);
+    };
+    if let Some(rest) = cursor.strip_prefix("e1:") {
+        if let Ok(parsed) = serde_json::from_str::<EverywhereWindow>(rest) {
+            let accounts = parsed
+                .a
+                .into_iter()
+                .map(|row| (AccountKey { network: row.n, account: row.id }, row.c))
+                .collect();
+            return (parsed.o, Some(accounts));
+        }
+    }
+    (cursor.parse().unwrap_or(0), None)
+}
+
+fn encode_everywhere(offset: usize, accounts: &[(AccountKey, Option<String>)]) -> Option<String> {
+    let body = EverywhereWindow {
+        o: offset,
+        a: accounts
+            .iter()
+            .map(|(key, cursor)| EverywhereAccount {
+                n: key.network,
+                id: key.account.clone(),
+                c: cursor.clone(),
+            })
+            .collect(),
+    };
+    serde_json::to_string(&body).ok().map(|json| format!("e1:{json}"))
+}
+
 pub struct Chat {
     pub(crate) hub: Arc<Hub>,
     adapters: Adapters,
@@ -166,6 +213,12 @@ fn error(code: ErrorCode, detail: impl ToString) -> Response {
         code,
         detail: detail.to_string(),
     }
+}
+
+/// Hard privacy guard: end-to-end encrypted conversations (all Signal chats and any sealed
+/// Tiny/E2EE room) must never send plaintext to a network translation service.
+pub(crate) fn is_e2ee_for_translation(conversation: &Key, encryption: Encryption) -> bool {
+    conversation.network == Network::Signal || encryption.is_sealed()
 }
 
 fn internal(err: rusqlite::Error) -> Response {
@@ -439,7 +492,18 @@ impl Chat {
 
     /// Starts an adapter for every account in a network's session.
     fn connect(&self, network: Network, session: &str) -> Result<(), String> {
+        self.start_accounts(network, session, None)
+    }
+
+    /// Starts adapters from a session. `only` starts that account and leaves every other
+    /// adapter of the network running.
+    fn start_accounts(&self, network: Network, session: &str, only: Option<&str>) -> Result<(), String> {
+        let mut started = false;
         for signed in adapters::accounts(network, session)? {
+            if only.is_some_and(|id| signed.account != id) {
+                continue;
+            }
+            started = true;
             let account = AccountKey {
                 network,
                 account: signed.account,
@@ -457,6 +521,9 @@ impl Chat {
             for command in ready {
                 self.command(&account, command);
             }
+        }
+        if only.is_some() && !started {
+            return Err("that workspace is not in the session".to_owned());
         }
         Ok(())
     }
@@ -545,8 +612,11 @@ impl Chat {
             | settings::NOISE_SUPPRESSION
             | settings::AUTO_GAIN
             | settings::INPUT_VOLUME
-            | settings::VOICE_QUALITY => self.hub.calls.retune(&self.hub),
-            settings::INPUT | settings::OUTPUT => self.hub.calls.redevice(&self.hub),
+            | settings::VOICE_QUALITY
+            | settings::CAMERA_QUALITY
+            | settings::CAMERA_MIRROR
+            | settings::CAMERA_BLUR => self.hub.calls.retune(&self.hub),
+            settings::INPUT | settings::OUTPUT | settings::CAMERA => self.hub.calls.redevice(&self.hub),
             // `set_setting` has already moved chatd's own ceiling.
             settings::LOG_LEVEL => self.hub.calls.relevel(),
             _ => {}
@@ -1372,6 +1442,17 @@ impl Chat {
         if with.files.is_empty() {
             return Ok(());
         }
+        // A voice send is one clip. A document sent that way is refused before the upload, and
+        // before the voice-note size exception below. Slack refuses its own, in its own words,
+        // on the message (`slack/send.rs`).
+        if with.voice.is_some() && with.files.len() == 1 && account.network != Network::Slack {
+            let named = file_name(&with.files[0]);
+            let mime = crate::blobs::upload::mime_of(&named);
+            if !(mime.starts_with("audio/") || mime.starts_with("video/")) {
+                return refuse(format!("{named} is not an audio or video clip."));
+            }
+        }
+        let voice_only = with.voice.is_some() && with.files.len() == 1 && can.voice_notes;
         let max_file_bytes = self
             .hub
             .store()
@@ -1379,6 +1460,11 @@ impl Chat {
             .ok()
             .flatten()
             .map_or(can.max_file_bytes, |row| can.max_file_bytes.max(row.max_file_bytes));
+        let max_file_bytes = if voice_only && max_file_bytes == 0 {
+            25 * 1024 * 1024
+        } else {
+            max_file_bytes
+        };
         if max_file_bytes == 0 {
             return refuse(format!("Files can't be sent to {name} from tinyclient yet."));
         }
@@ -1949,6 +2035,45 @@ impl Chat {
         Response::Profile { profile: Box::new(profile) }
     }
 
+    /// Today's meetings, soonest first. A calendar failure is the adapter's to soften.
+    fn meetings(&self, account: AccountKey) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        match self.ask(&account, |reply| Command::Meetings { reply }) {
+            Ok(mut events) => {
+                for event in &mut events {
+                    clip_meeting(event);
+                }
+                events.retain(|event| event.start > 0 && !event.title.is_empty());
+                events.sort_by_key(|event| event.start);
+                events.truncate(protocol::MEETINGS_LIMIT);
+                Response::Meetings { events }
+            }
+            Err(refused) => *refused,
+        }
+    }
+
+    /// Accept, decline, or tentatively accept one meeting. Forgets cached conversation info so
+    /// the next Details open reads the new answer.
+    fn meeting_rsvp(&self, account: AccountKey, id: String, response: protocol::MeetingResponse, propose: Option<i64>) -> Response {
+        if let Err(refused) = self.online(&account) {
+            return *refused;
+        }
+        let mut id = id;
+        clip(&mut id, 256);
+        if id.is_empty() {
+            return error(ErrorCode::NotFound, "no such meeting");
+        }
+        match self.ask(&account, |reply| Command::MeetingRsvp { id, response, propose, reply }) {
+            Ok(()) => {
+                self.hub.infos.forget_where(|key| key.account() == account);
+                Response::Ok
+            }
+            Err(refused) => *refused,
+        }
+    }
+
     /// A conversation's info: its row, and what the network says beyond it, kept five minutes.
     fn conversation_info(&self, conversation: Key) -> Response {
         let row = match self.hub.store().conversation(&conversation) {
@@ -1978,11 +2103,34 @@ impl Chat {
             external: about.external,
             link: about.link,
             bookmarks: about.bookmarks,
+            tabs: about.tabs,
+            meeting: about.meeting,
         };
         clip(&mut info.description, 4_000);
         clip(&mut info.creator, 100);
         clip(&mut info.external, 100);
         clip(&mut info.link, 300);
+        info.tabs.truncate(protocol::TABS_LIMIT);
+        for tab in &mut info.tabs {
+            clip(&mut tab.id, 128);
+            clip(&mut tab.name, 120);
+            clip(&mut tab.app, 80);
+            clip(&mut tab.kind, 32);
+            clip(&mut tab.web_url, 1_024);
+            clip(&mut tab.content_url, 1_024);
+            if !tab.web_url.starts_with("https://") && !tab.web_url.starts_with("http://") {
+                tab.web_url.clear();
+            }
+            if !tab.content_url.starts_with("https://") && !tab.content_url.starts_with("http://") {
+                tab.content_url.clear();
+            }
+        }
+        if let Some(meeting) = info.meeting.as_mut() {
+            clip_meeting(meeting);
+            if meeting.start <= 0 {
+                info.meeting = None;
+            }
+        }
         self.hub.infos.keep(conversation, info.clone());
         Response::ConversationInfo { info: Box::new(info) }
     }
@@ -2003,6 +2151,11 @@ impl Chat {
             Ok(about) => about,
             Err(refused) => return *refused,
         };
+        let mut link = about.link.trim().to_owned();
+        if !link.starts_with("https://") || protocol::link::Destination::parse(&link).is_none() {
+            link.clear();
+        }
+        clip(&mut link, 2_000);
         let mut info = SpaceInfo {
             space: known,
             description: about.description,
@@ -2012,9 +2165,14 @@ impl Chat {
             roles: about.roles,
             notify: about.notify,
             tags: about.tags,
+            link,
+            domain: about.domain,
+            url: about.url,
         };
         clip(&mut info.description, 4_000);
         clip(&mut info.nickname, 100);
+        clip(&mut info.domain, 128);
+        clip(&mut info.url, 512);
         info.roles.truncate(protocol::PROFILE_ROLES);
         info.roles.iter_mut().for_each(|role| clip(role, 100));
         info.tags.truncate(200);
@@ -2396,7 +2554,7 @@ impl Chat {
     }
 
     /// Shows the network's sign-in and waits for the user to finish it.
-    fn sign_in(&self, network: Network, at: Option<(i32, i32)>) -> Response {
+    fn sign_in(&self, network: Network, at: Option<(i32, i32)>, resume: Option<String>) -> Response {
         if !adapters::supported(network) {
             return error(
                 ErrorCode::Unsupported,
@@ -2420,12 +2578,15 @@ impl Chat {
         if !session::enabled() && std::env::var_os("TINYCLIENT_LOGIN").is_none() && web.is_none() {
             return error(ErrorCode::SignIn, "sign-in is off while TINYCLIENT_DIR is set");
         }
+        if let Some(account) = resume {
+            return self.resume_sign_in(network, at, &account);
+        }
         let session = match web {
-            Some(web) => match login::web::sign_in(&*web, &network.label().to_lowercase()) {
+            Some(web) => match login::web::sign_in(&*web, &network.label().to_lowercase(), None) {
                 Ok(session) => session,
                 Err(code) => return sign_in_ended(network, Some(code)),
             },
-            None => match self.sign_in_helper(network, at) {
+            None => match self.sign_in_helper(network, at, None) {
                 Ok(session) => session,
                 Err(answer) => return *answer,
             },
@@ -2442,12 +2603,73 @@ impl Chat {
         }
     }
 
+    /// Continues Slack SSO or two-factor for one workspace. The helper opens that workspace's
+    /// address. Only that account's token is saved, and only that adapter is restarted.
+    fn resume_sign_in(&self, network: Network, at: Option<(i32, i32)>, account: &str) -> Response {
+        if network != Network::Slack {
+            return error(ErrorCode::Unsupported, "Only a Slack workspace can be continued this way.");
+        }
+        let stored = match session::read(Network::Slack) {
+            session::Stored::Found(session) => session,
+            session::Stored::Absent => return error(ErrorCode::SignIn, "That workspace is not signed in."),
+            session::Stored::Unreadable(why) => {
+                return error(ErrorCode::Internal, format!("The session could not be read from {}: {why}", session::STORE));
+            }
+        };
+        match adapters::slack::accounts(&stored) {
+            Ok(found) if found.iter().any(|signed| signed.account == account) => {}
+            Ok(_) => return error(ErrorCode::SignIn, "That workspace is not signed in."),
+            Err(why) => return error(ErrorCode::SignIn, why),
+        }
+        let Some(url) = adapters::slack::workspace_url(&stored, account) else {
+            return error(ErrorCode::SignIn, "That workspace has no address to continue at.");
+        };
+        let fresh = match protocol::web_sign_in::provider() {
+            Some(web) => match login::web::sign_in(&*web, "slack", Some(&url)) {
+                Ok(session) => session,
+                Err(code) => return self.resume_ended(account, sign_in_ended(network, Some(code))),
+            },
+            None => match self.sign_in_helper(network, at, Some(&url)) {
+                Ok(session) => session,
+                Err(answer) => return self.resume_ended(account, *answer),
+            },
+        };
+        let Some(merged) = adapters::slack::resumed(&stored, &fresh, account) else {
+            return error(ErrorCode::SignIn, "That workspace did not come back signed in.");
+        };
+        let key = AccountKey { network: Network::Slack, account: account.to_owned() };
+        let started = session::save(Network::Slack, &merged).and_then(|()| {
+            lock(&self.adapters).remove(&key);
+            self.hub.set_required(&key, "");
+            self.start_accounts(Network::Slack, &merged, Some(account))
+        });
+        match started {
+            Ok(()) => self.status(),
+            Err(why) => error(ErrorCode::SignIn, why),
+        }
+    }
+
+    /// A continue that the page refused because this browser is not allowed is said on the
+    /// account row. Closing the window leaves the demand where it was.
+    fn resume_ended(&self, account: &str, ended: Response) -> Response {
+        if matches!(ended, Response::Error { code: ErrorCode::SignInBlocked, .. }) {
+            let key = AccountKey { network: Network::Slack, account: account.to_owned() };
+            self.hub.set_required(&key, adapters::slack::BROWSER_BLOCKED);
+            return self.status();
+        }
+        ended
+    }
+
     /// The desktop's sign-in: the helper window (`tinyclient-login`), and the session it prints.
-    fn sign_in_helper(&self, network: Network, at: Option<(i32, i32)>) -> Result<String, Refused> {
+    /// `start` opens that Slack address instead of the usual sign-in page.
+    fn sign_in_helper(&self, network: Network, at: Option<(i32, i32)>, start: Option<&str>) -> Result<String, Refused> {
         let helper = login_path().and_then(|path| {
             let mut helper = std::process::Command::new(path);
             protocol::log_policy::share_session(&mut helper);
             protocol::launch::no_console(&mut helper).arg(network.label().to_lowercase());
+            if let Some(start) = start {
+                helper.args(["--start", start]);
+            }
             if let Some((x, y)) = at {
                 helper.args(["--at", &format!("{x},{y}")]);
             }
@@ -2816,6 +3038,44 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
+            Request::Translate { conversation, message_id, to } => {
+                let encryption = self
+                    .hub
+                    .store()
+                    .conversation(&conversation)
+                    .ok()
+                    .flatten()
+                    .map(|row| row.encryption)
+                    .unwrap_or(Encryption::Unknown);
+                if is_e2ee_for_translation(&conversation, encryption) {
+                    return error(
+                        ErrorCode::Refused,
+                        "End-to-end encrypted messages are not sent to a translation service.",
+                    );
+                }
+                let target = if to.trim().is_empty()
+                    || to.eq_ignore_ascii_case("auto")
+                    || to.eq_ignore_ascii_case("system")
+                {
+                    // `translate_lang` has no settings row; when someone set it, it still wins.
+                    let stored = self.hub.settings().translate_lang();
+                    if stored != "auto" { stored } else { self.hub.settings().translate_target() }
+                } else {
+                    protocol::normalize_language_tag(&to)
+                };
+                match self.ask(&conversation.account(), |reply| Command::Translate {
+                    conversation_id: conversation.id.clone(),
+                    message_id: message_id.clone(),
+                    to: target,
+                    reply,
+                }) {
+                    Ok(mut translation) => {
+                        protocol::clip(&mut translation.text, 40_000);
+                        Response::Translated { conversation, message_id, translation }
+                    }
+                    Err(refused) => *refused,
+                }
+            }
             Request::ReadSessions => {
                 let denied = self.hub.keychain().denied;
                 if let Some(chat) = self.this.get().and_then(Weak::upgrade) {
@@ -2882,7 +3142,7 @@ impl Chat {
                         at: std::time::Instant::now(),
                         reply,
                     }) {
-                        Ok(hits) => Response::MessageHits { hits, cursor: None, not_searched: Vec::new() },
+                        Ok(page) => Response::MessageHits { hits: page.hits, cursor: page.cursor, not_searched: Vec::new() },
                         Err(refused) => *refused,
                     }
                 } else {
@@ -2890,7 +3150,7 @@ impl Chat {
                     // connected account whose adapter supports account-wide search, merge by time,
                     // and honestly list connected networks that were not asked.
                     const PAGE: usize = 25;
-                    let offset: usize = cursor.as_deref().and_then(|c| c.parse().ok()).unwrap_or(0);
+                    let (offset, window) = decode_everywhere(cursor.as_deref());
                     let accounts: Vec<AccountKey> = match self.hub.store().accounts() {
                         Ok(rows) => rows
                             .into_iter()
@@ -2904,21 +3164,42 @@ impl Chat {
                     let mut merged: Vec<protocol::MessageHit> = Vec::new();
                     let mut not_searched: Vec<Network> = Vec::new();
                     let mut asked_networks: Vec<Network> = Vec::new();
-                    for acct in accounts {
-                        let can = self.hub.capabilities(&acct);
-                        if self.hub.link(&acct) == Link::Connected && can.search_global {
-                            if let Ok(hits) = self.ask(&acct, |reply| Command::Search {
-                                query: query.clone(),
-                                scope: SearchScope::Account,
-                                filters: filters.clone(),
-                                cursor: None,
-                                at: std::time::Instant::now(),
-                                reply,
-                            }) {
+                    // Cursors sent on this ask. A later local slice repeats them instead of
+                    // dropping the rest of the page Slack already returned.
+                    let mut sent: Vec<(AccountKey, Option<String>)> = Vec::new();
+                    let mut next_remote: Vec<(AccountKey, Option<String>)> = Vec::new();
+                    for acct in &accounts {
+                        let can = self.hub.capabilities(acct);
+                        let connected = self.hub.link(acct) == Link::Connected && can.search_global;
+                        let planned = match &window {
+                            None => Some(None),
+                            Some(list) => list.iter().find(|(key, _)| key == acct).map(|(_, cursor)| cursor.clone()),
+                        };
+                        if connected {
+                            if let Some(cur) = planned {
+                                if let Ok(page) = self.ask(acct, |reply| Command::Search {
+                                    query: query.clone(),
+                                    scope: SearchScope::Account,
+                                    filters: filters.clone(),
+                                    cursor: cur.clone(),
+                                    at: std::time::Instant::now(),
+                                    reply,
+                                }) {
+                                    if !asked_networks.contains(&acct.network) {
+                                        asked_networks.push(acct.network);
+                                    }
+                                    sent.push((acct.clone(), cur));
+                                    if page.cursor.is_some() {
+                                        next_remote.push((acct.clone(), page.cursor));
+                                    }
+                                    merged.extend(page.hits);
+                                    continue;
+                                }
+                            } else {
+                                // This account already finished. It stays searched, and is not asked again.
                                 if !asked_networks.contains(&acct.network) {
                                     asked_networks.push(acct.network);
                                 }
-                                merged.extend(hits);
                                 continue;
                             }
                         }
@@ -2930,7 +3211,15 @@ impl Chat {
                     merged.sort_by(|a, b| b.sent.cmp(&a.sent).then_with(|| b.message_id.cmp(&a.message_id)));
                     let mut seen = std::collections::HashSet::new();
                     merged.retain(|hit| seen.insert((hit.conversation.clone(), hit.message_id.clone())));
-                    let next_cursor = (offset + PAGE < merged.len()).then(|| (offset + PAGE).to_string());
+                    let shown = merged.len().saturating_sub(offset).min(PAGE);
+                    let more_in_window = offset + shown < merged.len();
+                    let next_cursor = if shown > 0 && more_in_window {
+                        encode_everywhere(offset + shown, &sent)
+                    } else if shown > 0 && !next_remote.is_empty() {
+                        encode_everywhere(0, &next_remote)
+                    } else {
+                        None
+                    };
                     let page: Vec<protocol::MessageHit> = merged.into_iter().skip(offset).take(PAGE).collect();
                     Response::MessageHits { hits: page, cursor: next_cursor, not_searched }
                 }
@@ -3149,11 +3438,11 @@ impl Chat {
                     Err(refused) => *refused,
                 }
             }
-            Request::MembersAdd { conversation, people } => {
+            Request::MembersAdd { conversation, people, share_history } => {
                 if people.is_empty() {
                     return error(ErrorCode::Refused, "Pick at least one person to add.");
                 }
-                let res = self.act(&conversation, |conversation_id, reply| Command::MembersAdd { conversation_id, people, reply });
+                let res = self.act(&conversation, |conversation_id, reply| Command::MembersAdd { conversation_id, people, share_history, reply });
                 if res == Response::Ok {
                     self.hub.infos.forget(&conversation);
                 }
@@ -3595,7 +3884,7 @@ impl Chat {
                 }
             }
 
-            Request::SignIn { network, at } => self.sign_in(network, at),
+            Request::SignIn { network, at, resume } => self.sign_in(network, at, resume),
             Request::SignInBegin { network } => self.sign_in_step(network, None),
             Request::SignInAnswer { network, input } => self.sign_in_step(network, Some(input)),
             Request::SignInCancel { network } => {
@@ -3878,6 +4167,25 @@ impl Chat {
                 Response::Ok
             }
             Request::Media(request) => {
+                // Tiny `call.watch` reaches mediad from the live socket, and only when that
+                // list is still the newest one accepted. Applying the sources here, after
+                // `ask` returns, lets an older connection thread rewind mediad. A single
+                // video slot never sends `call.watch`; the socket keeps that list locally
+                // and answers ok. ShareWatch is Discord's picture subscription.
+                if let MediaRequest::Watch { sources } = &request {
+                    if let (Some(call), true) = self.hub.calls.describe() {
+                        if call.conversation.network == Network::Tiny {
+                            let sources = sources.clone();
+                            let account = call.conversation.account();
+                            return match self.ask(&account, |reply| {
+                                Command::Tiny(adapters::tiny::live::Ask::Watch { sources, reply })
+                            }) {
+                                Ok(()) => self.status(),
+                                Err(refused) => *refused,
+                            };
+                        }
+                    }
+                }
                 let picture = match &request {
                     MediaRequest::Camera { on } => Some(Picture::Camera(*on)),
                     MediaRequest::ShareSend { on, .. } => Some(Picture::Share(*on)),
@@ -3894,8 +4202,8 @@ impl Chat {
                 };
                 // A refusal never tells Discord we are sending. Other networks ignore the command.
                 if asked.is_ok() {
-                    if let Some(picture) = picture {
-                        if let (Some(call), true) = self.hub.calls.describe() {
+                    if let (Some(call), true) = self.hub.calls.describe() {
+                        if let Some(picture) = picture {
                             if call.conversation.network == Network::Discord {
                                 self.command(&call.conversation.account(), Command::CallPicture(picture));
                             }
@@ -4129,6 +4437,235 @@ impl Chat {
                 values,
                 reply,
             }),
+            Request::InviteMember { account, email, channels, real_name } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::InviteMember { email, channels, real_name, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::AddCustomEmoji { account, name, path } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::AddCustomEmoji { name, path, reply }) {
+                    Ok(()) => {
+                        self.hub.catalogs.forget_where(|(acct, kind, ..)| acct == &account && *kind == CatalogKind::Emoji);
+                        Response::Ok
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::UserGroups { account } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::UserGroups { reply }) {
+                    Ok(groups) => Response::UserGroups { groups },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::UserGroupCreate { account, name, handle, description } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::UserGroupCreate { name, handle, description, reply }) {
+                    Ok(group) => Response::UserGroup { group },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::UserGroupUpdate { account, group_id, name, handle, description } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::UserGroupUpdate { group_id, name, handle, description, reply }) {
+                    Ok(group) => Response::UserGroup { group },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::UserGroupMembers { account, group_id, users } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::UserGroupMembers { group_id, users, reply }) {
+                    Ok(group) => Response::UserGroup { group },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::AppView { conversation, include_home } => {
+                let account = conversation.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let conversation_id = conversation.id;
+                match self.ask(&account, |reply| Command::AppView { conversation_id, include_home, reply }) {
+                    Ok(view) => Response::AppView { view: Box::new(view) },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SearchFiles { conversation, space, account, query, sort, cursor } => {
+                let query = query.trim().to_owned();
+                if query.is_empty() {
+                    return Response::AccountFiles { items: Vec::new(), cursor: None, more: false };
+                }
+                let (target_account, scope) = match (&conversation, &space, &account) {
+                    (Some(key), ..) => (key.account(), SearchScope::Conversation(key.id.clone())),
+                    (None, Some(key), _) => (key.account(), SearchScope::Space(key.id.clone())),
+                    (None, None, Some(acct)) => (acct.clone(), SearchScope::Account),
+                    (None, None, None) => {
+                        return Response::AccountFiles { items: Vec::new(), cursor: None, more: false };
+                    }
+                };
+                if let Err(refused) = self.online(&target_account) {
+                    return *refused;
+                }
+                match self.ask(&target_account, |reply| Command::SearchFiles { query, scope, sort, cursor, reply }) {
+                    Ok(mut page) => {
+                        for item in &mut page.items {
+                            clip(&mut item.title, 256);
+                            clip(&mut item.url, 2_000);
+                        }
+                        Response::AccountFiles { items: page.items, cursor: page.cursor, more: page.more }
+                    }
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SectionCreate { space, name, emoji } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id;
+                match self.ask(&account, |reply| Command::SectionCreate { space_id, name, emoji, reply }) {
+                    Ok(group) => Response::Section { group },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SectionRename { space, section_id, name, emoji } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id;
+                match self.ask(&account, |reply| Command::SectionRename { space_id, section_id, name, emoji, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SectionDelete { space, section_id } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id;
+                match self.ask(&account, |reply| Command::SectionDelete { space_id, section_id, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SectionReorder { space, section_ids } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id;
+                match self.ask(&account, |reply| Command::SectionReorder { space_id, section_ids, reply }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SectionMoveChannel { space, conversation, from_section, to_section } => {
+                let account = space.account();
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                let space_id = space.id;
+                let conversation_id = conversation.id;
+                match self.ask(&account, |reply| Command::SectionMoveChannel {
+                    space_id,
+                    conversation_id,
+                    from_section,
+                    to_section,
+                    reply,
+                }) {
+                    Ok(()) => Response::Ok,
+                    Err(refused) => *refused,
+                }
+            }
+            Request::SlashCommands { account } => {
+                if let Err(refused) = self.online(&account) {
+                    return *refused;
+                }
+                match self.ask(&account, |reply| Command::SlashCommands { reply }) {
+                    Ok(commands) => Response::SlashCommands { commands },
+                    Err(refused) => *refused,
+                }
+            }
+            Request::AllUnreads { network, space, limit } => {
+                let cap = if limit == 0 { 15 } else { limit.clamp(1, 30) };
+                let mut groups: Vec<protocol::UnreadGroup> = Vec::new();
+                let mut fetched_accounts: std::collections::HashSet<AccountKey> = std::collections::HashSet::new();
+                // Ask connected Slack accounts live (paced and capped inside the Slack adapter).
+                let live_slack_accounts: Vec<AccountKey> = if let Some(sp) = &space {
+                    let acct = sp.account();
+                    if sp.network == Network::Slack && self.shows(&acct) && self.hub.link(&acct) == Link::Connected {
+                        vec![acct]
+                    } else {
+                        Vec::new()
+                    }
+                } else if network.is_none() || network == Some(Network::Slack) {
+                    self.hub
+                        .store()
+                        .accounts()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|a| a.key)
+                        .filter(|k| k.network == Network::Slack && self.shows(k) && self.hub.link(k) == Link::Connected)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                for acct in live_slack_accounts {
+                    if let Ok(live_groups) = self.ask(&acct, |reply| Command::AllUnreads { limit: cap, reply }) {
+                        fetched_accounts.insert(acct);
+                        groups.extend(live_groups);
+                    }
+                }
+                // Fill any remaining networks (or offline Slack accounts) from the local SQLite store.
+                let now = crate::hub::now();
+                let cached = match self.hub.store().unread_conversations(network, space.as_ref(), None, cap) {
+                    Ok(rows) => rows,
+                    Err(err) => return internal(err),
+                };
+                for conv in cached {
+                    let acct = conv.key.account();
+                    if !self.shows(&acct) || fetched_accounts.contains(&acct) {
+                        continue;
+                    }
+                    let messages = self
+                        .hub
+                        .store()
+                        .unread_messages(&conv.key, conv.last_read.as_deref().unwrap_or(""), 50, now)
+                        .unwrap_or_default();
+                    let total_unread = conv.unread.max(messages.len() as u32);
+                    groups.push(protocol::UnreadGroup {
+                        conversation: conv,
+                        messages,
+                        total_unread,
+                    });
+                }
+                groups.sort_by(|a, b| {
+                    let a_m = a.conversation.mentions > 0;
+                    let b_m = b.conversation.mentions > 0;
+                    let a_ts = a.messages.last().map_or(a.conversation.updated, |m| m.sent);
+                    let b_ts = b.messages.last().map_or(b.conversation.updated, |m| m.sent);
+                    b_m.cmp(&a_m).then_with(|| b_ts.cmp(&a_ts))
+                });
+                groups.truncate(cap as usize);
+                Response::AllUnreads { groups }
+            }
             Request::PressButton { conversation, message_id, data } => {
                 let account = conversation.account();
                 let conversation_id = conversation.id;
@@ -4207,6 +4744,8 @@ impl Chat {
                     reply,
                 })
             }
+            Request::Meetings { account } => self.meetings(account),
+            Request::MeetingRsvp { account, id, response, propose } => self.meeting_rsvp(account, id, response, propose),
             Request::PlaySound { sound } => {
                 let known = sound != "none" && settings::sound_word(&sound) && match sound.strip_prefix("custom:") {
                     Some(id) => self.hub.settings().custom_sound(id).is_some(),
@@ -4235,6 +4774,28 @@ impl Chat {
 
 /// Tiny keeps every server in the one item. A second sign-in is folded in before anything is
 /// saved, so it does not replace the server already there. Other networks still replace.
+/// Keeps a meeting row inside the sizes the shell draws, and drops a join target that is not
+/// `https://` or `http://`.
+fn clip_meeting(event: &mut protocol::MeetingEvent) {
+    clip(&mut event.id, 256);
+    clip(&mut event.title, 200);
+    clip(&mut event.organizer, 120);
+    clip(&mut event.join_url, 1_024);
+    clip(&mut event.conversation, 256);
+    if event.start < 0 {
+        event.start = 0;
+    }
+    if event.end < event.start {
+        event.end = event.start;
+    }
+    if !event.join_url.starts_with("https://") && !event.join_url.starts_with("http://") {
+        event.join_url.clear();
+    }
+    if event.title.is_empty() {
+        event.title = "Meeting".to_owned();
+    }
+}
+
 fn merged(network: Network, session: &str) -> Result<String, String> {
     if network != Network::Tiny || !session::enabled() {
         return Ok(session.to_owned());
@@ -5627,7 +6188,7 @@ mod tests {
 
         // Empty people list and empty title are refused cleanly.
         assert!(matches!(
-            chat.handle(Request::MembersAdd { conversation: conv.clone(), people: vec![] }),
+            chat.handle(Request::MembersAdd { conversation: conv.clone(), people: vec![], share_history: None }),
             Response::Error { code: ErrorCode::Refused, .. }
         ));
         assert!(matches!(
@@ -5641,7 +6202,7 @@ mod tests {
         ));
 
         // Add, remove, rename + topic, and picture succeed.
-        assert_eq!(chat.handle(Request::MembersAdd { conversation: conv.clone(), people: vec!["U2".into()] }), Response::Ok);
+        assert_eq!(chat.handle(Request::MembersAdd { conversation: conv.clone(), people: vec!["U2".into()], share_history: None }), Response::Ok);
         assert_eq!(*members.lock().unwrap(), vec!["U1".to_owned(), "U2".to_owned()]);
         assert_eq!(chat.handle(Request::MembersRemove { conversation: conv.clone(), person: "U2".into() }), Response::Ok);
         assert_eq!(*members.lock().unwrap(), vec!["U1".to_owned()]);
@@ -5719,5 +6280,117 @@ mod tests {
 
         let commands = seen.lock().unwrap().clone();
         assert_eq!(commands, vec![("ch-1".to_owned(), "m-1".to_owned())]);
+    }
+
+    #[test]
+    fn translate_never_dispatches_for_e2ee_and_forwards_for_telegram() {
+        use super::*;
+        let store = Store::open(std::path::Path::new(":memory:")).expect("memory store");
+        let chat = Chat::new(store);
+        let hub = chat.hub.clone();
+
+        let signal_acct = AccountKey { network: Network::Signal, account: "+15550001".into() };
+        let tiny_acct = AccountKey { network: Network::Tiny, account: "me".into() };
+        let tg_acct = AccountKey { network: Network::Telegram, account: "42".into() };
+
+        let (sig_adapter, sig_ctx, sig_inbox) = crate::adapters::local(signal_acct.clone(), hub.clone());
+        let (tiny_adapter, tiny_ctx, tiny_inbox) = crate::adapters::local(tiny_acct.clone(), hub.clone());
+        let (tg_adapter, tg_ctx, tg_inbox) = crate::adapters::local(tg_acct.clone(), hub.clone());
+        {
+            let mut adapters = lock(&chat.adapters);
+            adapters.insert(signal_acct.clone(), sig_adapter);
+            adapters.insert(tiny_acct.clone(), tiny_adapter);
+            adapters.insert(tg_acct.clone(), tg_adapter);
+        }
+
+        let sig_row = ConversationRow::new("c-sig", ConversationKind::Direct, "Ada");
+        sig_ctx.conversation(&sig_row).unwrap();
+
+        let mut e2ee_row = ConversationRow::new("dm-e2ee", ConversationKind::Direct, "Bea");
+        e2ee_row.space = Some("server".into());
+        tiny_ctx.conversation(&e2ee_row).unwrap();
+        tiny_ctx.mark_encryption("dm-e2ee", Encryption::EndToEnd).unwrap();
+
+        let mut upgrade_row = ConversationRow::new("dm-up", ConversationKind::Direct, "Cy");
+        upgrade_row.space = Some("server".into());
+        tiny_ctx.conversation(&upgrade_row).unwrap();
+        tiny_ctx.mark_encryption("dm-up", Encryption::EndToEndAfterPlain).unwrap();
+
+        let tg_row = ConversationRow::new("u7", ConversationKind::Direct, "Dora");
+        tg_ctx.conversation(&tg_row).unwrap();
+
+        let dispatched = Arc::new(Mutex::new(Vec::<(Network, String, String, String)>::new()));
+        let spawn_worker = |network: Network, inbox: std::sync::mpsc::Receiver<Command>, log: Arc<Mutex<Vec<(Network, String, String, String)>>>| {
+            std::thread::spawn(move || {
+                for cmd in inbox {
+                    match cmd {
+                        Command::Translate { conversation_id, message_id, to, reply } => {
+                            log.lock().unwrap().push((network, conversation_id, message_id, to.clone()));
+                            let _ = reply.send(Ok(protocol::Translation {
+                                text: format!("[{to}] Hola"),
+                                source_lang: Some("es".into()),
+                                target_lang: to,
+                            }));
+                        }
+                        Command::Stop => break,
+                        _ => {}
+                    }
+                }
+            })
+        };
+        let w1 = spawn_worker(Network::Signal, sig_inbox, dispatched.clone());
+        let w2 = spawn_worker(Network::Tiny, tiny_inbox, dispatched.clone());
+        let w3 = spawn_worker(Network::Telegram, tg_inbox, dispatched.clone());
+
+        // Signal must be refused locally without dispatching Command::Translate.
+        let sig_resp = chat.handle(Request::Translate {
+            conversation: Key::new(&signal_acct, "c-sig"),
+            message_id: "1".into(),
+            to: "en".into(),
+        });
+        assert!(matches!(sig_resp, Response::Error { code: ErrorCode::Refused, .. }), "{sig_resp:?}");
+
+        // Tiny E2EE (both EndToEnd and EndToEndAfterPlain) must be refused locally.
+        for id in ["dm-e2ee", "dm-up"] {
+            let resp = chat.handle(Request::Translate {
+                conversation: Key::new(&tiny_acct, id),
+                message_id: "2".into(),
+                to: "en".into(),
+            });
+            assert!(matches!(resp, Response::Error { code: ErrorCode::Refused, .. }), "{id}: {resp:?}");
+        }
+
+        // Plain Telegram dispatches Command::Translate and returns Response::Translated.
+        let tg_key = Key::new(&tg_acct, "u7");
+        let tg_resp = chat.handle(Request::Translate {
+            conversation: tg_key.clone(),
+            message_id: "99".into(),
+            to: "fr-FR".into(),
+        });
+        assert_eq!(
+            tg_resp,
+            Response::Translated {
+                conversation: tg_key,
+                message_id: "99".into(),
+                translation: protocol::Translation {
+                    text: "[fr] Hola".into(),
+                    source_lang: Some("es".into()),
+                    target_lang: "fr".into(),
+                },
+            }
+        );
+
+        {
+            let mut adapters = lock(&chat.adapters);
+            adapters.remove(&signal_acct);
+            adapters.remove(&tiny_acct);
+            adapters.remove(&tg_acct);
+        }
+        drop((sig_ctx, tiny_ctx, tg_ctx));
+        let _ = (w1.join(), w2.join(), w3.join());
+
+        // Only Telegram ever received a Command::Translate.
+        let log = dispatched.lock().unwrap().clone();
+        assert_eq!(log, vec![(Network::Telegram, "u7".to_owned(), "99".to_owned(), "fr".to_owned())]);
     }
 }

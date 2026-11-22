@@ -32,8 +32,9 @@ mod card;
 mod hub;
 mod info;
 pub(in crate::gui) use info::profile::facts::{
-    mask,
+    mask, mask_email,
     can_archive, can_clear_history, can_close_direct, can_edit_folders, can_pin_on_network, network_pin_label,
+    slack_workspace_url, SLACK_WORKSPACE_LINKS,
 };
 mod list;
 mod members;

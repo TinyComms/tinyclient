@@ -2,7 +2,7 @@
 //! headers, and the bytes going from the socket to a file through one fixed buffer.
 
 use crate::adapters::{Command, Download, Refusal};
-use protocol::{MediaFile, MediaKind, Network};
+use protocol::{AccountKey, MediaFile, MediaKind, Network};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::mpsc::{channel, Sender};
@@ -36,8 +36,17 @@ pub(super) fn under(host: &str, name: &str) -> bool {
     host == name || host.strip_suffix(name).is_some_and(|rest| rest.ends_with('.'))
 }
 
+/// A Slack workspace file (`/files-pri/`, `/files-tmb/`), not a public avatar or emoji.
+fn slack_workspace_file(url: &str) -> bool {
+    url.contains("/files-pri/") || url.contains("/files-tmb/")
+}
+
 impl Hosts {
     pub(super) fn trust(&self, network: Network, url: &str) -> Option<Trust> {
+        self.trust_for(None, network, url)
+    }
+
+    pub(super) fn trust_for(&self, account: Option<&AccountKey>, network: Network, url: &str) -> Option<Trust> {
         let (secure, host) = host_of(url)?;
         // Files on a Tiny server are fetched with that server's bearer. This is before the
         // local-host shortcut, so a test server on 127.0.0.1 still asks Download. The adapter
@@ -46,6 +55,11 @@ impl Hosts {
             return Some(Trust::Session);
         }
         if let Some((_, trust)) = self.local.iter().find(|(local, _)| *local == host) {
+            // A workspace file on the test server needs the session, the same as files.slack.com.
+            // Avatars and emoji on that server stay open.
+            if network == Network::Slack && *trust == Trust::Open && slack_workspace_file(url) {
+                return Some(Trust::Session);
+            }
             return Some(*trust);
         }
         if !secure {
@@ -58,11 +72,15 @@ impl Hosts {
             // Avatars, emoji, unfurled images, and GIF picker thumbnails (GIPHY/Tenor) are public;
             // workspace files need the session's token.
             Network::Slack => (&["slack-edge.com", "slack-imgs.com", "slack-files.com", "giphy.com", "media.tenor.com"], &["files.slack.com"]),
-            // Pictures in messages and people's pictures, each behind the session's own token;
-            // GIFs from Teams' Giphy button, public, on Giphy's host. A shared file is fetched
-            // from Graph with the session. Graph redirects to a pre-authenticated SharePoint
-            // address, which is followed without that bearer.
-            Network::Teams => (&["giphy.com", "sharepoint.com"], &["asm.skype.com", "asyncgw.teams.microsoft.com", "teams.microsoft.com", "graph.microsoft.com"]),
+            // Scoped strictly to this Teams account's cloud (Worldwide, GCC High, DoD, China),
+            // never expanded globally.
+            Network::Teams => {
+                let ep = account
+                    .map(crate::adapters::teams::cloud_for)
+                    .unwrap_or_default()
+                    .endpoints();
+                (ep.fetch_open, ep.fetch_session)
+            }
             Network::Telegram => (&[], &[]),
             // Attachments are encrypted end to end: the adapter fetches and opens them itself.
             Network::Signal => (&[], &[]),
@@ -166,6 +184,7 @@ fn ask(adapter: Option<&Sender<Command>>, id: &str, url: &str) -> Result<Downloa
 
 /// What one download needs to know.
 pub struct Want<'a> {
+    pub account: Option<&'a AccountKey>,
     pub network: Network,
     pub file: &'a MediaFile,
     /// The address the adapter registered.
@@ -231,7 +250,7 @@ fn get(hosts: &Hosts, agent: &ureq::Agent, want: &Want, from: &Download, buffer:
     let mut url = from.url.clone();
     let mut hops = 0;
     let mut response = loop {
-        let Some(trust) = hosts.trust(want.network, &url) else {
+        let Some(trust) = hosts.trust_for(want.account, want.network, &url) else {
             // The host alone, for the log: it is how a wrong guess about a network gets found.
             let host = url.split("://").nth(1).and_then(|rest| rest.split(['/', '?', '#']).next()).unwrap_or("?");
             tracing::warn!("chatd: {}: a file was at or moved to {host}, which is not on the list", want.network.label());
@@ -419,7 +438,7 @@ fn fetch(hosts: &Hosts, agent: &ureq::Agent, want: &Want, buffer: &mut [u8]) -> 
         headers: Vec::new(),
         sealed: None,
     };
-    match hosts.trust(want.network, want.url) {
+    match hosts.trust_for(want.account, want.network, want.url) {
         None => Err(format!("{} does not serve files from that address.", want.network.label())),
         // Only the adapter holds the session, so it says how.
         Some(Trust::Session) => {
@@ -535,6 +554,7 @@ mod tests {
         let part = std::env::temp_dir().join(format!("tinyclient-fetch-{}-{next}.part", std::process::id()));
         let file = MediaFile::new("F1", MediaKind::Image);
         let want = Want {
+            account: None,
             network,
             file: &file,
             url,
@@ -619,6 +639,7 @@ mod tests {
         let url = address("a", "1");
         let waiting = vec![("F2".to_owned(), address("b", "1")), ("F3".to_owned(), address("c", "7fffffff")), ("F1".to_owned(), url.clone())];
         let want = Want {
+            account: None,
             network: Network::Discord,
             file: &file,
             url: &url,
@@ -663,10 +684,42 @@ mod tests {
         // A test's own server, and nothing else on plain HTTP.
         assert_eq!(trust(Discord, "http://127.0.0.1:4000/a.png"), Some(Trust::Open));
         assert_eq!(trust(Discord, "http://localhost:4000/a.png"), None);
+        // A clip transcript on the test server is a workspace file, so it asks Download.
+        // A public avatar on that same server does not.
+        assert_eq!(trust(Slack, "http://127.0.0.1:4000/files-pri/T1-F1/a.vtt"), Some(Trust::Session));
+        assert_eq!(trust(Slack, "http://127.0.0.1:4000/files-tmb/T1-F1/a_480.png"), Some(Trust::Session));
+        assert_eq!(trust(Slack, "http://127.0.0.1:4000/img/avatars/a.png"), Some(Trust::Open));
+        assert_eq!(trust(Discord, "http://127.0.0.1:4000/files-pri/T1-F1/a.vtt"), Some(Trust::Open));
         // A Tiny file asks Download even on a local test server. A user part is not a host.
         assert_eq!(trust(Network::Tiny, "https://chat.example/v1/media/a"), Some(Trust::Session));
         assert_eq!(trust(Network::Tiny, "http://127.0.0.1:9/v1/media/a"), Some(Trust::Session));
         assert_eq!(trust(Network::Tiny, "https://chat.example@evil.example/v1/media/a"), None);
+    }
+
+    #[test]
+    fn teams_media_allowlist_is_scoped_per_cloud_never_globally() {
+        let hosts = Hosts { local: Vec::new() };
+        let gcc = AccountKey { network: Network::Teams, account: "fetch-gcc-1".into() };
+        let ww = AccountKey { network: Network::Teams, account: "fetch-ww-1".into() };
+        crate::adapters::teams::cloud::register(&gcc, crate::adapters::teams::TeamsCloud::GccHigh);
+        crate::adapters::teams::cloud::register(&ww, crate::adapters::teams::TeamsCloud::Worldwide);
+
+        // GCC High allows GCC High session & SharePoint hosts and blocks Worldwide hosts.
+        assert_eq!(hosts.trust_for(Some(&gcc), Network::Teams, "https://gov.teams.microsoft.us/api/mt/pic"), Some(Trust::Session));
+        assert_eq!(hosts.trust_for(Some(&gcc), Network::Teams, "https://usgov.asyncgw.gov.teams.microsoft.us/v1/objects/1/views/imgo"), Some(Trust::Session));
+        assert_eq!(hosts.trust_for(Some(&gcc), Network::Teams, "https://usgov-api.asm.skype.us/v1/objects/1/views/imgo"), None);
+        assert_eq!(hosts.trust_for(Some(&gcc), Network::Teams, "https://agency.sharepoint.us/file"), Some(Trust::Open));
+        assert_eq!(hosts.trust_for(Some(&gcc), Network::Teams, "https://teams.microsoft.com/api/mt/pic"), None);
+        assert_eq!(hosts.trust_for(Some(&gcc), Network::Teams, "https://contoso.sharepoint.com/file"), None);
+
+        // Worldwide remains strictly worldwide (no global expansion to .us or .cn).
+        assert_eq!(hosts.trust_for(Some(&ww), Network::Teams, "https://teams.microsoft.com/api/mt/pic"), Some(Trust::Session));
+        assert_eq!(hosts.trust_for(Some(&ww), Network::Teams, "https://gov.teams.microsoft.us/api/mt/pic"), None);
+        assert_eq!(hosts.trust_for(Some(&ww), Network::Teams, "https://teams.microsoft.cn/api/mt/pic"), None);
+        assert_eq!(hosts.trust_for(Some(&ww), Network::Teams, "https://teams.microsoftonline.cn/api/mt/pic"), None);
+
+        crate::adapters::teams::cloud::unregister(&gcc);
+        crate::adapters::teams::cloud::unregister(&ww);
     }
 
     #[test]

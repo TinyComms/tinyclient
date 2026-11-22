@@ -4,9 +4,13 @@
 //! user opened or clicked something, or (previews) because the rows are on screen, paced.
 
 use super::{emoji, fnv, seconds, thread_id, thread_of, Fault, Slack};
-use crate::adapters::{AccountFilesPage, ActivityPage, CatalogPage, ConversationAbout, Failure, SharedPage};
+use crate::adapters::{AccountFilesPage, ActivityPage, CatalogPage, ConversationAbout, Failure, SharedPage, SpaceAbout};
 use crate::store::Filing;
-use protocol::{ActivityItem, ActivityItemKind, Bookmark, BookmarkKind, CatalogItem, ConversationKind, MediaFile, MediaKind, Message, Notify, SharedItem, SharedKind};
+use protocol::{
+    ActivityItem, ActivityItemKind, AppHome, AppLink, AppProfile, AppSlashCommand, AppView,
+    Bookmark, BookmarkKind, CatalogItem, ConversationKind, MediaFile, MediaKind, Message, Notify,
+    SharedItem, SharedKind, SlashCommand, UnreadGroup, UserGroup,
+};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -28,6 +32,65 @@ const CONNECTED_TEAMS: usize = 4;
 /// A direct message with someone at another company starts as an invitation Slack sends.
 pub(super) const EXTERNAL_EMAIL: &str =
     "A direct message with someone at another company starts as an invitation. Send it in Slack: Home, Directories, External. If Directories is not there, open External connections.";
+
+/// Workspace role from `users.info`, in the same order `space_info` shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WorkspaceRole {
+    PrimaryOwner,
+    Owner,
+    Admin,
+    SingleGuest,
+    MultiGuest,
+    Member,
+}
+
+impl WorkspaceRole {
+    fn from_user(user: &Value) -> Self {
+        if user["is_primary_owner"] == true {
+            Self::PrimaryOwner
+        } else if user["is_owner"] == true {
+            Self::Owner
+        } else if user["is_admin"] == true {
+            Self::Admin
+        } else if user["is_ultra_restricted"] == true {
+            Self::SingleGuest
+        } else if user["is_restricted"] == true {
+            Self::MultiGuest
+        } else {
+            Self::Member
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::PrimaryOwner => "Primary owner",
+            Self::Owner => "Owner",
+            Self::Admin => "Workspace admin",
+            Self::SingleGuest => "Single-channel guest",
+            Self::MultiGuest => "Multi-channel guest",
+            Self::Member => "Member",
+        }
+    }
+
+    fn is_workspace_admin(self) -> bool {
+        matches!(self, Self::PrimaryOwner | Self::Owner | Self::Admin)
+    }
+}
+
+/// PNG, GIF, JPEG, or WEBP, from the file bytes.
+fn image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
 
 fn channel_of(conversation: &str) -> &str {
     thread_of(conversation).map_or(conversation, |(channel, _)| channel)
@@ -378,14 +441,14 @@ impl Slack {
             let permalink = file["permalink"]
                 .as_str()
                 .map(str::trim)
-                .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+                .filter(|u| u.starts_with("https://"))
                 .unwrap_or("")
                 .to_owned();
             if kind == SharedKind::Files && self.is_external(file) {
                 let url = file["url_private"]
                     .as_str()
                     .map(str::trim)
-                    .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+                    .filter(|u| u.starts_with("https://"))
                     .unwrap_or(&permalink)
                     .to_owned();
                 if !url.is_empty() {
@@ -484,14 +547,14 @@ impl Slack {
             let permalink = file["permalink"]
                 .as_str()
                 .map(str::trim)
-                .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+                .filter(|u| u.starts_with("https://"))
                 .unwrap_or("")
                 .to_owned();
             if self.is_external(file) {
                 let url = file["url_private"]
                     .as_str()
                     .map(str::trim)
-                    .filter(|u| u.starts_with("https://") || u.starts_with("http://"))
+                    .filter(|u| u.starts_with("https://"))
                     .unwrap_or(&permalink)
                     .to_owned();
                 items.push(SharedItem {
@@ -758,8 +821,10 @@ impl Slack {
             if self.ctx.pause(wait) {
                 return;
             }
-            self.state().previewed = Some(Instant::now());
+            // The gap runs from one answer to the next request. A stamp taken before the
+            // call lets a slow answer and a fast follow-up arrive less than a second apart.
             self.report(self.newest_of(&id));
+            self.state().previewed = Some(Instant::now());
         }
     }
 
@@ -790,6 +855,7 @@ impl Slack {
             ActivityItemKind::Mention => Some("at_mention,broadcast,keyword,usergroup_mention"),
             ActivityItemKind::ThreadReply => Some("thread_v2,thread"),
             ActivityItemKind::Reaction => Some("reaction"),
+            ActivityItemKind::MissedCall => None,
             ActivityItemKind::App => Some("app_mention,bot_dm,workflow"),
             ActivityItemKind::Invite => Some("channel_invite"),
             ActivityItemKind::Other => None,
@@ -1010,4 +1076,647 @@ impl Slack {
         self.api("bookmarks.remove", &[("channel_id", channel), ("bookmark_id", bookmark_id)])?;
         Ok(())
     }
+
+    /// Cached `users.info` role, fetched once for this connection.
+    fn workspace_role(&self) -> Result<WorkspaceRole, Fault> {
+        if let Some(role) = self.state().role {
+            return Ok(role);
+        }
+        let Some(me) = self.me.get().filter(|id| !id.is_empty()) else {
+            return Err(Fault::Slack("no_permission".to_owned()));
+        };
+        let resp = self.api("users.info", &[("user", me.as_str())])?;
+        let role = WorkspaceRole::from_user(&resp["user"]);
+        self.state().role = Some(role);
+        Ok(role)
+    }
+
+    /// Owner or workspace admin. Guests and members are refused here, with no write call.
+    fn require_workspace_admin(&self) -> Result<(), Fault> {
+        if self.workspace_role()?.is_workspace_admin() {
+            Ok(())
+        } else {
+            Err(Fault::Slack("no_permission".to_owned()))
+        }
+    }
+
+    /// Workspace info for `Request::SpaceInfo`: calls `team.info` for name/domain/email_domain
+    /// and reads our own user record for workspace role (`Primary owner`, `Owner`, `Workspace admin`,
+    /// `Guest`, or `Member`).
+    pub(super) fn space_info(&self, _space_id: &str) -> Result<SpaceAbout, Fault> {
+        let info = self.api("team.info", &[])?;
+        let team = &info["team"];
+        let domain = team["domain"]
+            .as_str()
+            .filter(|d| !d.is_empty())
+            .map(str::to_owned)
+            .or_else(|| self.ctx.note("team:domain"))
+            .unwrap_or_default();
+        if !domain.is_empty() {
+            self.ctx.set_note("team:domain", &domain);
+        }
+        let url = if !domain.is_empty() && domain.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            format!("https://{domain}.slack.com")
+        } else {
+            team["url"]
+                .as_str()
+                .map(str::trim)
+                .filter(|u| u.starts_with("https://"))
+                .map(|u| u.trim_end_matches('/').to_owned())
+                .unwrap_or_default()
+        };
+        let email_domain = team["email_domain"].as_str().unwrap_or("").trim();
+        let description = if email_domain.is_empty() {
+            String::new()
+        } else {
+            format!("Email domain: {email_domain}")
+        };
+        let mut nickname = String::new();
+        let mut roles = Vec::new();
+        if let Some(me) = self.me.get().filter(|id| !id.is_empty()) {
+            if let Ok(resp) = self.api("users.info", &[("user", me.as_str())]) {
+                let u = &resp["user"];
+                nickname = u["profile"]["display_name"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| u["profile"]["real_name"].as_str().filter(|s| !s.is_empty()))
+                    .or_else(|| u["name"].as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let role = WorkspaceRole::from_user(u);
+                self.state().role = Some(role);
+                roles.push(role.label().to_owned());
+            }
+        }
+        Ok(SpaceAbout {
+            description,
+            members: None,
+            online: None,
+            nickname,
+            roles,
+            notify: Notify::All,
+            domain,
+            url,
+            ..SpaceAbout::default()
+        })
+    }
+
+    /// Invites someone by email to this workspace (`users.admin.invite`, private web-client call).
+    pub(super) fn invite_member(&self, email: &str, channels: &[String], real_name: &str) -> Result<(), Fault> {
+        let email = email.trim();
+        if email.is_empty() || !email.contains('@') {
+            return Err(Fault::Slack("invalid_email".to_owned()));
+        }
+        self.require_workspace_admin()?;
+        let channels_csv: String = channels
+            .iter()
+            .map(|c| c.trim())
+            .filter(|c| !c.is_empty())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut params = vec![("email", email), ("resend", "true")];
+        if !channels_csv.is_empty() {
+            params.push(("channels", channels_csv.as_str()));
+        }
+        let real_name = real_name.trim();
+        if !real_name.is_empty() {
+            params.push(("real_name", real_name));
+        }
+        self.api("users.admin.invite", &params)?;
+        Ok(())
+    }
+
+    /// Uploads a custom emoji (`emoji.add`, multipart upload). Validates the local path through
+    /// `crate::blobs::upload::allowed` and rejects non-image or oversized (> 1 MiB) files.
+    pub(super) fn add_custom_emoji(&self, name: &str, path: &str) -> Result<(), Fault> {
+        let clean = name.trim().trim_matches(':').to_ascii_lowercase();
+        if clean.is_empty()
+            || clean.len() > 100
+            || !clean
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+        {
+            return Err(Fault::Slack("error_name_bad_characters".to_owned()));
+        }
+        let (real, _) = crate::blobs::upload::allowed(path.trim()).map_err(|why| Fault::Net(format!("emoji: {why}")))?;
+        let ext = real
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        if !matches!(ext.as_str(), "png" | "gif" | "jpg" | "jpeg" | "webp") {
+            return Err(Fault::Slack("error_invalid_image".to_owned()));
+        }
+        let meta = std::fs::metadata(&real).map_err(|err| Fault::Net(format!("emoji: {err}")))?;
+        const MAX_EMOJI_BYTES: u64 = 1024 * 1024;
+        if meta.len() == 0 || meta.len() > MAX_EMOJI_BYTES {
+            return Err(Fault::Slack("error_too_big".to_owned()));
+        }
+        let bytes = std::fs::read(&real).map_err(|err| Fault::Net(format!("emoji: {err}")))?;
+        let mime = image_mime(&bytes).ok_or_else(|| Fault::Slack("error_invalid_image".to_owned()))?;
+        self.require_workspace_admin()?;
+        let filename = real
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("emoji.png");
+        self.api_multipart(
+            "emoji.add",
+            &[("mode", "data"), ("name", clean.as_str())],
+            "image",
+            filename,
+            mime,
+            &bytes,
+        )?;
+        // Force next emoji catalog fetch to pick up the new custom emoji.
+        self.ctx.set_note("emoji", "0");
+        Ok(())
+    }
+
+    fn map_user_group(raw: &Value) -> Option<UserGroup> {
+        let id = raw["id"].as_str().filter(|s| !s.is_empty())?.to_owned();
+        let disabled = raw["date_delete"].as_i64().unwrap_or(0) > 0
+            || raw["deleted_by"].as_str().is_some_and(|by| !by.is_empty());
+        if disabled {
+            return None;
+        }
+        let name = raw["name"].as_str().unwrap_or("").to_owned();
+        let handle = raw["handle"].as_str().unwrap_or("").to_owned();
+        let description = raw["description"].as_str().unwrap_or("").to_owned();
+        let members: Vec<String> = raw["users"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|u| u.as_str().filter(|s| !s.is_empty()).map(str::to_owned))
+            .collect();
+        let member_count = raw["user_count"]
+            .as_u64()
+            .map(|n| n as u32)
+            .unwrap_or(members.len() as u32);
+        Some(UserGroup { id, name, handle, description, members, member_count })
+    }
+
+    /// Lists active workspace user groups (`usergroups.list` with `include_users=true`).
+    pub(super) fn user_groups(&self) -> Result<Vec<UserGroup>, Fault> {
+        let listed = self.api("usergroups.list", &[("include_users", "true"), ("include_count", "true")])?;
+        let me = self.me.get().map_or("", String::as_str);
+        let mut out = Vec::new();
+        let mut mine = std::collections::HashSet::new();
+        for raw in listed["usergroups"].as_array().into_iter().flatten() {
+            let Some(group) = Self::map_user_group(raw) else {
+                continue;
+            };
+            if !group.handle.is_empty() {
+                self.ctx.set_note(&format!("g:{}", group.id), &group.handle);
+            }
+            if !me.is_empty() && group.members.iter().any(|u| u == me) {
+                mine.insert(group.id.clone());
+            }
+            out.push(group);
+        }
+        self.state().my_groups = mine;
+        Ok(out)
+    }
+
+    /// Creates a user group (`usergroups.create`).
+    pub(super) fn user_group_create(&self, name: &str, handle: &str, description: &str) -> Result<UserGroup, Fault> {
+        let name = name.trim();
+        let handle = handle.trim().trim_start_matches('@');
+        if name.is_empty() || handle.is_empty() {
+            return Err(Fault::Slack("invalid_arguments".to_owned()));
+        }
+        self.require_workspace_admin()?;
+        let mut params = vec![("name", name), ("handle", handle)];
+        let description = description.trim();
+        if !description.is_empty() {
+            params.push(("description", description));
+        }
+        let resp = self.api("usergroups.create", &params)?;
+        let group = Self::map_user_group(&resp["usergroup"])
+            .ok_or_else(|| Fault::Slack("invalid_arguments".to_owned()))?;
+        if !group.handle.is_empty() {
+            self.ctx.set_note(&format!("g:{}", group.id), &group.handle);
+        }
+        Ok(group)
+    }
+
+    /// Updates a user group's name, handle, or description (`usergroups.update`).
+    pub(super) fn user_group_update(
+        &self,
+        group_id: &str,
+        name: Option<&str>,
+        handle: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<UserGroup, Fault> {
+        let group_id = group_id.trim();
+        if group_id.is_empty() {
+            return Err(Fault::Slack("no_such_subteam".to_owned()));
+        }
+        self.require_workspace_admin()?;
+        let mut params = vec![("usergroup", group_id)];
+        if let Some(n) = name.map(str::trim).filter(|s| !s.is_empty()) {
+            params.push(("name", n));
+        }
+        if let Some(h) = handle.map(|s| s.trim().trim_start_matches('@')).filter(|s| !s.is_empty()) {
+            params.push(("handle", h));
+        }
+        if let Some(d) = description {
+            params.push(("description", d.trim()));
+        }
+        let resp = self.api("usergroups.update", &params)?;
+        let group = Self::map_user_group(&resp["usergroup"])
+            .ok_or_else(|| Fault::Slack("no_such_subteam".to_owned()))?;
+        if !group.handle.is_empty() {
+            self.ctx.set_note(&format!("g:{}", group.id), &group.handle);
+        }
+        Ok(group)
+    }
+
+    /// Replaces the members of a user group (`usergroups.users.update`).
+    pub(super) fn user_group_members(&self, group_id: &str, users: &[String]) -> Result<UserGroup, Fault> {
+        let group_id = group_id.trim();
+        if group_id.is_empty() {
+            return Err(Fault::Slack("no_such_subteam".to_owned()));
+        }
+        self.require_workspace_admin()?;
+        let csv: String = users
+            .iter()
+            .map(|u| u.trim())
+            .filter(|u| !u.is_empty())
+            .collect::<Vec<_>>()
+            .join(",");
+        let resp = self.api("usergroups.users.update", &[("usergroup", group_id), ("users", csv.as_str())])?;
+        let group = Self::map_user_group(&resp["usergroup"])
+            .ok_or_else(|| Fault::Slack("no_such_subteam".to_owned()))?;
+        if let Some(me) = self.me.get().filter(|id| !id.is_empty()) {
+            let mut state = self.state();
+            if group.members.iter().any(|u| u == me) {
+                state.my_groups.insert(group.id.clone());
+            } else {
+                state.my_groups.remove(&group.id);
+            }
+        }
+        Ok(group)
+    }
+
+    /// Fetches a Slack app's About metadata and (optionally) its published Home tab.
+    /// Called only when the user opens an app's Home or About tab — never at connect.
+    ///
+    /// Unverified against a real workspace: `apps.profile.get` and `views.get` (`type=home`)
+    /// are web-client calls; falls back to `bots.info` for About details and `apps.home.get`
+    /// for Home blocks when unavailable.
+    pub(super) fn app_view(&self, conversation_id: &str, include_home: bool) -> Result<AppView, Fault> {
+        let channel = channel_of(conversation_id);
+        let stored = self.ctx.known(channel).map_err(|err| Fault::Net(err.to_string()))?;
+        let peer_id = stored
+            .as_ref()
+            .and_then(|row| row.peer.clone())
+            .filter(|id| !id.is_empty());
+        let mut name = stored.as_ref().map(|r| r.title.clone()).unwrap_or_default();
+        let (mut app_id, mut bot_id) = peer_id
+            .as_deref()
+            .and_then(|uid| self.ctx.note(&format!("app:{uid}")))
+            .map(|raw| {
+                let mut parts = raw.splitn(2, '|');
+                (
+                    parts.next().unwrap_or("").to_owned(),
+                    parts.next().unwrap_or("").to_owned(),
+                )
+            })
+            .unwrap_or_default();
+
+        if app_id.is_empty() && bot_id.is_empty() {
+            if let Some(uid) = peer_id.as_deref() {
+                if let Ok(info) = self.api("users.info", &[("user", uid)]) {
+                    let u = &info["user"];
+                    let prof = &u["profile"];
+                    app_id = prof["api_app_id"].as_str().unwrap_or("").to_owned();
+                    bot_id = prof["bot_id"]
+                        .as_str()
+                        .or_else(|| u["bot_id"].as_str())
+                        .unwrap_or("")
+                        .to_owned();
+                    if name.is_empty() {
+                        name = prof["real_name"]
+                            .as_str()
+                            .or_else(|| u["real_name"].as_str())
+                            .or_else(|| u["name"].as_str())
+                            .unwrap_or("")
+                            .to_owned();
+                    }
+                    if !app_id.is_empty() || !bot_id.is_empty() {
+                        self.ctx.set_note(&format!("app:{uid}"), &format!("{app_id}|{bot_id}"));
+                    }
+                }
+            }
+        }
+
+        let mut description = String::new();
+        let mut commands = Vec::new();
+        let mut links = Vec::new();
+        let mut installed_by = String::new();
+        let mut home_enabled = false;
+
+        let valid_url = |s: &str| -> Option<String> {
+            let trimmed = s.trim();
+            trimmed.starts_with("https://").then(|| trimmed.to_owned())
+        };
+
+        // 1. Try `apps.profile.get` when we know `app_id` (or `bot_id`).
+        let profile_resp = if !app_id.is_empty() {
+            self.api("apps.profile.get", &[("app", app_id.as_str())]).ok()
+        } else if !bot_id.is_empty() {
+            self.api("apps.profile.get", &[("bot", bot_id.as_str())]).ok()
+        } else {
+            None
+        };
+        if let Some(resp) = &profile_resp {
+            let app = if resp["app"].is_object() { &resp["app"] } else { resp };
+            if app_id.is_empty() {
+                if let Some(id) = app["id"].as_str().or_else(|| app["app_id"].as_str()).filter(|s| !s.is_empty()) {
+                    app_id = id.to_owned();
+                }
+            }
+            if let Some(n) = app["name"].as_str().filter(|s| !s.is_empty()) {
+                name = n.to_owned();
+            }
+            description = app["long_description"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| app["short_description"].as_str().filter(|s| !s.is_empty()))
+                .or_else(|| app["description"].as_str().filter(|s| !s.is_empty()))
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            home_enabled = app["app_home_enabled"] == true
+                || app["is_app_home_enabled"] == true
+                || app["home_tab_enabled"] == true;
+            if let Some(installer) = app["installed_by"].as_str().filter(|s| !s.is_empty()) {
+                installed_by = if installer.starts_with('U') || installer.starts_with('W') {
+                    self.user(installer).name
+                } else {
+                    installer.to_owned()
+                };
+            }
+            for cmd in app["slash_commands"]
+                .as_array()
+                .or_else(|| app["commands"].as_array())
+                .into_iter()
+                .flatten()
+                .take(32)
+            {
+                let Some(command) = cmd["command"].as_str().filter(|s| !s.is_empty()) else {
+                    continue;
+                };
+                commands.push(AppSlashCommand {
+                    command: command.to_owned(),
+                    description: cmd["description"].as_str().unwrap_or("").trim().to_owned(),
+                    usage: cmd["usage_hint"]
+                        .as_str()
+                        .or_else(|| cmd["usage"].as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_owned(),
+                });
+            }
+            for (field, label) in [
+                ("app_homepage_url", "Homepage"),
+                ("help_url", "Support"),
+                ("privacy_policy_url", "Privacy policy"),
+            ] {
+                if let Some(url) = app[field].as_str().and_then(valid_url) {
+                    links.push(AppLink { label: label.to_owned(), url });
+                }
+            }
+            for raw_link in app["links"].as_array().into_iter().flatten().take(12) {
+                if let Some(url) = raw_link["url"].as_str().and_then(valid_url) {
+                    let label = raw_link["label"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("Link")
+                        .to_owned();
+                    links.push(AppLink { label, url });
+                }
+            }
+        } else if !bot_id.is_empty() {
+            // Fallback to documented `bots.info`.
+            if let Ok(resp) = self.api("bots.info", &[("bot", bot_id.as_str())]) {
+                let bot = &resp["bot"];
+                if let Some(n) = bot["name"].as_str().filter(|s| !s.is_empty()) {
+                    name = n.to_owned();
+                }
+                if app_id.is_empty() {
+                    if let Some(id) = bot["app_id"].as_str().filter(|s| !s.is_empty()) {
+                        app_id = id.to_owned();
+                    }
+                }
+            }
+        }
+
+        let team = &self.ctx.account.account;
+        let domain = self.ctx.note("team:domain").unwrap_or_default();
+        let directory_url = if !domain.is_empty() && domain.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            format!("https://{domain}.slack.com/apps")
+        } else {
+            format!("https://app.slack.com/apps/{team}")
+        };
+        let open_url = format!("https://app.slack.com/client/{team}/{channel}");
+
+        // 2. Fetch published Home tab blocks when requested.
+        let home = if include_home {
+            let view_resp = if !app_id.is_empty() {
+                self.api("views.get", &[("type", "home"), ("app_id", app_id.as_str())])
+                    .or_else(|_| self.api("apps.home.get", &[("app_id", app_id.as_str())]))
+                    .ok()
+            } else if !bot_id.is_empty() {
+                self.api("views.get", &[("type", "home"), ("bot_id", bot_id.as_str())]).ok()
+            } else {
+                None
+            };
+            match view_resp {
+                Some(resp) => {
+                    let view = if resp["view"].is_object() { &resp["view"] } else { &resp };
+                    let view_id = view["id"].as_str().unwrap_or("").to_owned();
+                    let blocks = view["blocks"].as_array().map_or(&[][..], Vec::as_slice);
+                    if !blocks.is_empty() {
+                        home_enabled = true;
+                        let (text, spans, cards, controls) = self.parse_app_home_blocks(blocks);
+                        Some(AppHome {
+                            app_id: app_id.clone(),
+                            view_id,
+                            text,
+                            spans,
+                            cards,
+                            controls,
+                            empty_reason: String::new(),
+                        })
+                    } else {
+                        Some(AppHome {
+                            app_id: app_id.clone(),
+                            view_id,
+                            empty_reason: "This app has not published a Home view.".to_owned(),
+                            ..AppHome::default()
+                        })
+                    }
+                }
+                None => Some(AppHome {
+                    app_id: app_id.clone(),
+                    empty_reason: "This app's Home tab isn't available here. Open it in Slack to interact with it.".to_owned(),
+                    ..AppHome::default()
+                }),
+            }
+        } else {
+            None
+        };
+
+        Ok(AppView {
+            profile: AppProfile {
+                app_id,
+                bot_id,
+                name,
+                description,
+                commands,
+                links,
+                installed_by,
+                open_url,
+                directory_url,
+                home_enabled,
+            },
+            home,
+        })
+    }
+
+    /// Built-in Slack slash commands plus workspace app commands from `commands.list` (cached 24 h
+    /// in store notes, same policy as `emoji.list`).
+    pub(super) fn slash_commands(&self) -> Result<Vec<SlashCommand>, Fault> {
+        let mut out = builtin_slash_commands();
+        let now = crate::hub::now();
+        let cached_at = self.ctx.note("commands:at").and_then(|s| s.parse::<i64>().ok());
+        let workspace: Vec<SlashCommand> = if cached_at.is_some_and(|at| now.saturating_sub(at) < 86_400) {
+            self.ctx
+                .note("commands:json")
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .unwrap_or_default()
+        } else {
+            self.ctx.set_note("commands:at", &now.to_string());
+            let mut fetched = Vec::new();
+            if let Ok(resp) = self.api("commands.list", &[]) {
+                for raw in resp["commands"].as_array().into_iter().flatten().take(200) {
+                    let Some(cmd) = raw["command"]
+                        .as_str()
+                        .or_else(|| raw["name"].as_str())
+                        .filter(|s| !s.is_empty())
+                    else {
+                        continue;
+                    };
+                    let command = if cmd.starts_with('/') { cmd.to_owned() } else { format!("/{cmd}") };
+                    if out.iter().any(|b| b.command.eq_ignore_ascii_case(&command)) {
+                        continue;
+                    }
+                    fetched.push(SlashCommand {
+                        command,
+                        description: raw["description"]
+                            .as_str()
+                            .or_else(|| raw["desc"].as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_owned(),
+                        usage: raw["usage"]
+                            .as_str()
+                            .or_else(|| raw["usage_hint"].as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_owned(),
+                        builtin: false,
+                    });
+                }
+            }
+            if let Ok(json) = serde_json::to_string(&fetched) {
+                self.ctx.set_note("commands:json", &json);
+            }
+            fetched
+        };
+        out.extend(workspace);
+        Ok(out)
+    }
+
+    /// Fetches unread messages for the newest unread conversations (All Unreads, #606).
+    ///
+    /// Runs ONLY when the user opens All Unreads (never at connect), is capped to at most 15
+    /// conversations per call, and paces every `conversations.history` request through `self.api`
+    /// (`self.pace`, half the documented tier rate). Upgrades coarse `has_unreads` counts to the
+    /// exact unread message count.
+    pub(super) fn all_unreads(&self, limit: u32) -> Result<Vec<UnreadGroup>, Fault> {
+        const MAX_CHANNELS: u32 = 15;
+        let cap = if limit == 0 { MAX_CHANNELS } else { limit.clamp(1, MAX_CHANNELS) };
+        let unread = self.ctx.unread_conversations(cap).map_err(|err| Fault::Net(err.to_string()))?;
+        let mut groups = Vec::with_capacity(unread.len());
+        for mut conv in unread {
+            let last_read = conv.last_read.as_deref().filter(|s| !s.is_empty());
+            let mut params = vec![("channel", conv.key.id.as_str()), ("limit", "50")];
+            if let Some(oldest) = last_read {
+                params.push(("oldest", oldest));
+            }
+            let history = match self.api("conversations.history", &params) {
+                Ok(history) => history,
+                Err(fault @ (Fault::Auth(_) | Fault::Limited(_))) => return Err(fault),
+                Err(_) => continue,
+            };
+            let entries = history["messages"].as_array().map_or(&[][..], Vec::as_slice);
+            self.authors(entries);
+            let mut messages: Vec<Message> = entries
+                .iter()
+                .filter_map(|entry| self.message(&conv.key.id, entry))
+                .filter(|msg| last_read.is_none_or(|lr| msg.id.as_str() > lr))
+                .collect();
+            messages.sort_by(|a, b| a.id.cmp(&b.id));
+            if !messages.is_empty() {
+                let _ = self.ctx.history(&conv.key.id, &messages);
+            }
+            let real_unread = if !messages.is_empty() {
+                messages.len() as u32
+            } else {
+                conv.unread
+            };
+            let latest_sent = messages.last().map_or(conv.updated, |m| m.sent.max(conv.updated));
+            if real_unread != conv.unread {
+                let _ = self.ctx.counts(&conv.key.id, real_unread, conv.mentions, last_read, latest_sent);
+                conv.unread = real_unread;
+                conv.updated = latest_sent;
+            }
+            groups.push(UnreadGroup {
+                conversation: conv,
+                messages,
+                total_unread: real_unread,
+            });
+        }
+        Ok(groups)
+    }
+}
+
+pub(super) fn builtin_slash_commands() -> Vec<SlashCommand> {
+    [
+        ("/me", "Display action text", "[text]"),
+        ("/shrug", "Append ¯\\_(ツ)_/¯ to your message", "[text]"),
+        ("/topic", "Set the channel topic", "[text]"),
+        ("/invite", "Invite someone to this channel", "@user"),
+        ("/kick", "Remove someone from this channel", "@user"),
+        ("/remove", "Remove someone from this channel", "@user"),
+        ("/leave", "Leave this channel", ""),
+        ("/join", "Join a channel", "#channel"),
+        ("/archive", "Archive this channel", ""),
+        ("/mute", "Mute this channel", ""),
+        ("/status", "Set your status", "[:emoji:] [text]"),
+        ("/dnd", "Pause notifications", "[minutes | off]"),
+        ("/away", "Set yourself away", ""),
+        ("/active", "Set yourself active", ""),
+        ("/remind", "Set a reminder", "[text] [in N minutes]"),
+    ]
+    .into_iter()
+    .map(|(command, description, usage)| SlashCommand {
+        command: command.to_owned(),
+        description: description.to_owned(),
+        usage: usage.to_owned(),
+        builtin: true,
+    })
+    .collect()
 }

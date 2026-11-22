@@ -745,7 +745,7 @@ impl Discord {
             names.push(name);
         }
         let mut row = ConversationRow::new(&channel.id, kind, names.join(", "));
-        row.call = CallSupport::Native;
+        row.call = super::private_call(false);
         // Unverified against a real account: the flags are the community's names. A request
         // and one Discord judged spam both wait behind Message Requests.
         if channel.is_message_request || channel.is_spam {
@@ -761,7 +761,7 @@ impl Discord {
                     // Discord's own account: no replies, no call.
                     row.special = Special::Service;
                     row.read_only = true;
-                    row.call = CallSupport::None;
+                    row.call = super::private_call(true);
                 }
                 state.directs.insert(peer.id.clone(), channel.id.clone());
             }
@@ -849,12 +849,18 @@ impl Discord {
     /// smaller one is used until a real session says otherwise), and a server's boosts, which
     /// raise it there, are not counted.
     pub(super) fn capabilities(&self, premium: u8) {
+        self.ctx.capabilities(Self::account_capabilities(premium));
+        self.state.lock().unwrap().premium = premium;
+    }
+
+    /// The plan's limits. Nitro (`premium` 2) is the ceiling the capability table prints.
+    pub(super) fn account_capabilities(premium: u8) -> protocol::Capabilities {
         let (max_file_bytes, emoji) = match premium {
             2 => (500 << 20, protocol::EmojiScope::All),
             1 | 3 => (50 << 20, protocol::EmojiScope::All),
             _ => (10 << 20, protocol::EmojiScope::Space),
         };
-        self.ctx.capabilities(protocol::Capabilities {
+        protocol::Capabilities {
             max_file_bytes,
             max_files: 10,
             caption_limit: 0,
@@ -899,8 +905,7 @@ impl Discord {
             join_space_by_invite: true,
             leave_space: true,
             ..Default::default()
-        });
-        self.state.lock().unwrap().premium = premium;
+        }
     }
 
     /// The user's own order of servers: folders flattened, then anything they do not mention on

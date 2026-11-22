@@ -5,7 +5,7 @@
 //! Every field here is optional on the wire and every list has a cap, as in the rest of the
 //! contract.
 
-use crate::{is_false, is_zero, Conversation, Key, MediaFile, Network, Space};
+use crate::{is_false, is_zero, Conversation, Key, MediaFile, Message, Network, Space};
 use serde::{Deserialize, Serialize};
 
 /// Most folders an account lists. Telegram allows 30 with Premium; Discord's server folders are
@@ -28,6 +28,10 @@ pub const CATALOG_LIMIT: usize = 200;
 pub const PINNED_LIMIT: usize = 50;
 /// Most people each section of `Around` lists.
 pub const AROUND_LIMIT: usize = 100;
+/// Most channel or chat tabs listed in [`ConversationInfo::tabs`].
+pub const TABS_LIMIT: usize = 32;
+/// Most meetings one `Meetings` answer carries. Today's list, soonest first.
+pub const MEETINGS_LIMIT: usize = 32;
 
 fn is_true(value: &bool) -> bool {
     *value
@@ -339,6 +343,77 @@ pub struct ConversationInfo {
     /// Channel bookmarks (links, canvases, folders; Slack `bookmarks.list`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bookmarks: Vec<Bookmark>,
+    /// Pinned channel/chat tabs and apps (Teams: Files, Notes, Planner, websites, apps).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tabs: Vec<ConversationTab>,
+    /// The meeting this chat is for, when Teams gave a start time. Join is a link until calls
+    /// exist here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meeting: Option<MeetingEvent>,
+}
+
+/// One tab or pinned app on a channel or chat (`ConversationInfo::tabs`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationTab {
+    pub id: String,
+    pub name: String,
+    /// App display name when distinct from `name` (e.g. "Planner", "OneNote", "Website").
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub app: String,
+    /// Normalized kind: `"files"`, `"notes"`, `"planner"`, `"website"`, or `"app"`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
+    /// Direct web URL (`https://` or `http://`) to open the tab externally, or Teams deep link.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub web_url: String,
+    /// Underlying content URL when provided by the tab configuration.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub content_url: String,
+}
+
+/// How I answered a calendar event.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingResponse {
+    #[default]
+    None,
+    Accepted,
+    Tentative,
+    Declined,
+    Organizer,
+}
+
+impl MeetingResponse {
+    /// The word Details and Upcoming show beside the time.
+    pub fn label(self) -> &'static str {
+        match self {
+            MeetingResponse::None => "",
+            MeetingResponse::Accepted => "Accepted",
+            MeetingResponse::Tentative => "Tentative",
+            MeetingResponse::Declined => "Declined",
+            MeetingResponse::Organizer => "Organizer",
+        }
+    }
+}
+
+/// One calendar event: today's meetings, and the meeting a chat is for.
+///
+/// `start` and `end` are Unix seconds. `join_url` is `https://` or `http://` only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeetingEvent {
+    pub id: String,
+    pub title: String,
+    pub start: i64,
+    pub end: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub organizer: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub join_url: String,
+    #[serde(default)]
+    pub response: MeetingResponse,
+    /// Teams thread id when the meeting has a chat (`19:meeting_…`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub conversation: String,
 }
 
 /// Kind of a channel bookmark.
@@ -384,6 +459,120 @@ pub struct SpaceInfo {
     /// Mentionable team tags in this Space (Teams).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<TeamTag>,
+    /// Optional `https://` hand-off link to open or manage this Space in the network's app.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub link: String,
+    /// Workspace subdomain (e.g. `acme` for `acme.slack.com`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub domain: String,
+    /// Canonical HTTPS workspace URL (e.g. `https://acme.slack.com`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+}
+
+/// One workspace user group (e.g. Slack `@oncall`, `@design`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserGroup {
+    pub id: String,
+    pub name: String,
+    pub handle: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub member_count: u32,
+}
+
+/// One slash command exposed by a Slack app (shown in its About tab).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppSlashCommand {
+    pub command: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub usage: String,
+}
+
+/// One validated external link on a Slack app's About tab.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppLink {
+    pub label: String,
+    pub url: String,
+}
+
+/// A Slack app's About metadata, fetched on demand when its conversation opens.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppProfile {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub app_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bot_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands: Vec<AppSlashCommand>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<AppLink>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub installed_by: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub open_url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub directory_url: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub home_enabled: bool,
+}
+
+/// A Slack app's published Home tab (Block Kit view), fetched on demand.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppHome {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub app_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub view_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spans: Vec<crate::Span>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cards: Vec<crate::Card>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub controls: Vec<crate::MessageControl>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub empty_reason: String,
+}
+
+/// Combined About + optional Home view for a Slack app conversation (`Request::AppView`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppView {
+    pub profile: AppProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<AppHome>,
+}
+
+/// One slash command available in a workspace (`Request::SlashCommands`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlashCommand {
+    pub command: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub usage: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub builtin: bool,
+}
+
+/// One conversation's unread messages in the All Unreads view (`Request::AllUnreads`, #606).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnreadGroup {
+    pub conversation: Conversation,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub messages: Vec<Message>,
+    /// Exact unread count known after fetching messages past `last_read`.
+    #[serde(default)]
+    pub total_unread: u32,
 }
 
 /// Which of a custom emoji set this account may send.
@@ -738,9 +927,16 @@ pub struct Capabilities {
     /// This account supports following and unfollowing threads (`Request::FollowThread`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub follow_threads: bool,
+    /// This account supports on-demand in-place message translation (`Request::Translate`, Teams).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub translate: bool,
     /// This account supports reading and setting out-of-office / automatic replies (`Request::GetOutOfOffice`, `Request::SetOutOfOffice`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub out_of_office: bool,
+    /// This account supports creating, renaming, deleting, reordering, and moving channels
+    /// between custom sidebar sections (Slack paid plans).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sidebar_sections: bool,
     /// This account supports muting a conversation for a chosen duration (`SetMute` with `until`).
     #[serde(default, skip_serializing_if = "is_false")]
     pub timed_mute: bool,
@@ -914,8 +1110,10 @@ pub enum ActivityItemKind {
     Mention,
     ThreadReply,
     Reaction,
+    MissedCall,
     App,
     Invite,
+    #[serde(other)]
     Other,
 }
 
@@ -993,6 +1191,16 @@ pub fn format_disappearing(seconds: u32) -> String {
     }
 }
 
+/// How much prior chat history a newly added member receives (Teams group chats).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum HistoryShare {
+    #[default]
+    None,
+    Days { days: u32 },
+    All,
+}
+
 /// Content-type filter for network message search (`SearchFilters::has`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1000,6 +1208,21 @@ pub enum SearchHas {
     Files,
     Links,
     Images,
+}
+
+/// Sort order for network search (`SearchFilters::sort`, `Request::SearchFiles`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchSort {
+    #[default]
+    Newest,
+    Relevance,
+}
+
+impl SearchSort {
+    pub fn is_newest(&self) -> bool {
+        *self == SearchSort::Newest
+    }
 }
 
 /// Optional filters on `Request::SearchNetwork`.
@@ -1015,6 +1238,8 @@ pub struct SearchFilters {
     pub after: Option<i64>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub mentions_me: bool,
+    #[serde(default, skip_serializing_if = "SearchSort::is_newest")]
+    pub sort: SearchSort,
 }
 
 impl SearchFilters {
@@ -1411,5 +1636,67 @@ mod tests {
         };
         let back_opt: SendAs = serde_json::from_str(&serde_json::to_string(&opt).unwrap()).unwrap();
         assert_eq!(back_opt, opt);
+    }
+
+    #[test]
+    fn activity_item_kind_missed_call_round_trips() {
+        let wire = serde_json::to_string(&ActivityItemKind::MissedCall).unwrap();
+        assert_eq!(wire, "\"missed_call\"");
+        let back: ActivityItemKind = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, ActivityItemKind::MissedCall);
+        let unknown: ActivityItemKind = serde_json::from_str("\"future_activity_kind\"").unwrap();
+        assert_eq!(unknown, ActivityItemKind::Other);
+    }
+
+    #[test]
+    fn history_share_round_trips_and_stays_backward_compatible() {
+        for mode in [HistoryShare::None, HistoryShare::Days { days: 7 }, HistoryShare::All] {
+            let wire = serde_json::to_string(&mode).unwrap();
+            let back: HistoryShare = serde_json::from_str(&wire).unwrap();
+            assert_eq!(back, mode);
+        }
+        let legacy = json_members_add_without_share();
+        let req: Request = serde_json::from_str(&legacy).unwrap();
+        assert!(matches!(req, Request::MembersAdd { share_history: None, .. }));
+    }
+
+    fn json_members_add_without_share() -> String {
+        r#"{"op":"members_add","conversation":{"network":"teams","account":"t1","id":"19:g@thread.v2"},"people":["8:orgid:a"]}"#.to_owned()
+    }
+
+    #[test]
+    fn space_info_link_round_trips_and_defaults_empty() {
+        let space = Space {
+            key: Key { network: Network::Teams, account: "t1".into(), id: "19:g@thread.tacv2".into() },
+            name: "Platform".into(),
+            icon: None,
+            position: 0,
+            attention: 0,
+            unread: false,
+            folder: None,
+            muted: false,
+            hide_muted: false,
+            can_create_channels: true,
+        };
+        let info = SpaceInfo {
+            space,
+            description: "Core".into(),
+            members: Some(4),
+            online: None,
+            nickname: String::new(),
+            roles: vec!["Owner".into()],
+            notify: Notify::All,
+            tags: Vec::new(),
+            domain: String::new(),
+            url: String::new(),
+            link: "https://teams.microsoft.com/l/team/19%3Ag/conversations?groupId=g1&tenantId=t1".into(),
+        };
+        let wire = serde_json::to_string(&info).unwrap();
+        let back: SpaceInfo = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, info);
+
+        let without_link = wire.replace(&format!(r#","link":"{}""#, info.link), "");
+        let legacy: SpaceInfo = serde_json::from_str(&without_link).unwrap();
+        assert!(legacy.link.is_empty());
     }
 }

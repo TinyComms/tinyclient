@@ -67,6 +67,20 @@ mod secret;
 mod send;
 pub mod signin;
 mod sync;
+
+pub(crate) fn capability_ceiling() -> protocol::Capabilities {
+    sync::capability_ceiling()
+}
+
+/// A normal person's call before the full profile arrives: open it in Telegram.
+pub(crate) fn direct_call_ceiling() -> protocol::CallSupport {
+    sync::user_call(false, false, None).support
+}
+
+/// Groups and channels do not place a call here.
+pub(crate) fn other_call() -> protocol::CallSupport {
+    sync::other_call()
+}
 mod wire;
 
 use super::{keep_connected, serve_commands, Command, Context, Failure, Refusal, Signed};
@@ -739,6 +753,7 @@ fn offline(ctx: &Context, command: Command) {
         Command::EndSession { reply, .. } => drop(reply.send(Err(down()))),
         Command::UnreadItems { reply, .. } => drop(reply.send(Err(down()))),
         Command::MarkUnreadItemsRead { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Translate { reply, .. } => drop(reply.send(Err(down()))),
         Command::SendWith { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
         Command::StartDirect { reply, .. } | Command::Handoff { reply, .. } => drop(reply.send(Err(down()))),
         Command::OpenForum { reply, .. } => drop(reply.send(Err(down()))),
@@ -888,7 +903,7 @@ fn serve(account: &Arc<Account>, command: Command) {
                 super::SearchScope::Account => info::search_global(account, &query, cursor.as_deref()).map_err(refused),
                 super::SearchScope::Space(_) => Err(Refusal::Unsupported),
             };
-            let _ = reply.send(result);
+            let _ = reply.send(result.map(|hits| super::SearchPage { hits, cursor: None }));
         }
         Command::SearchShared { conversation_id, kind, before, limit, reply } => {
             let _ = reply.send(info::shared(account, &conversation_id, kind, before.as_deref(), limit).map_err(refused));
@@ -955,6 +970,9 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::MarkUnreadItemsRead { conversation_id, kind, message_ids, reply } => {
             let _ = reply.send(info::mark_unread_items_read(account, &conversation_id, kind, &message_ids).map_err(refused));
+        }
+        Command::Translate { conversation_id, message_id, to, reply } => {
+            let _ = reply.send(translate_message(account, &conversation_id, &message_id, &to).map_err(refused));
         }
         Command::Handoff { conversation_id, reply } => {
             let link = Who::parse(&conversation_id).map(|(who, _)| {
@@ -1047,6 +1065,40 @@ fn mark_dialog_unread(account: &Account, conversation: &str, unread: bool) {
         tracing::warn!("chatd: Telegram: unread mark: {fault}");
     }
     filing::facts_changed(account, who, |facts| facts.read = !unread);
+}
+
+/// `messages.translateText`: native Telegram server-side translation for one message.
+fn translate_message(account: &Account, conversation: &str, message_id: &str, to: &str) -> Result<protocol::Translation, Fault> {
+    let invalid = || Fault::Rpc { code: 400, name: "PEER_ID_INVALID".to_owned(), value: None };
+    let (who, topic) = Who::parse(conversation).ok_or_else(invalid)?;
+    let (who, _) = sync::comment_target(account, conversation)?.map(|(group, echo)| (group, Some(echo))).unwrap_or((who, topic));
+    let peer = account.input(who)?;
+    let id = message_id
+        .parse::<i32>()
+        .map_err(|_| Fault::Rpc { code: 400, name: "MESSAGE_ID_INVALID".to_owned(), value: None })?;
+    let target_lang = protocol::normalize_language_tag(to);
+    let request = tl::functions::messages::TranslateText {
+        peer: Some(peer),
+        id: Some(vec![id]),
+        text: None,
+        to_lang: target_lang.clone(),
+        tone: None,
+    };
+    let tl::enums::messages::TranslatedText::TranslateResult(answer) = account.ask(&request)?;
+    let text = answer
+        .result
+        .into_iter()
+        .next()
+        .map(|tl::enums::TextWithEntities::Entities(t)| t.text)
+        .unwrap_or_default();
+    if text.is_empty() {
+        return Err(Fault::Net("Telegram returned an empty translation".to_owned()));
+    }
+    Ok(protocol::Translation {
+        text,
+        source_lang: None,
+        target_lang,
+    })
 }
 
 /// The nonce Telegram dedupes a send by, from the shell's client id.

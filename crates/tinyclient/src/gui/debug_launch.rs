@@ -189,10 +189,10 @@ impl Shell {
                     return;
                 };
                 say!("tinyclient: debug launch: asking to watch {}", seat.user_id);
-                let source = Some(seat.user_id.clone());
+                let user_id = seat.user_id.clone();
                 *stage = Stage::Watching(Some(Instant::now()));
                 drop(pending);
-                self.call_ask(Request::Media(MediaRequest::ShareWatch { source }), cx);
+                self.call_watch_user(user_id, cx);
             }
         }
     }

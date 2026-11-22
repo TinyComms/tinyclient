@@ -9,7 +9,7 @@ use crate::gui::people::info::{InfoPane, ManageKind};
 use crate::gui::people::presence::{self, Ring, Shape};
 use crate::gui::theme::{self, Type};
 use gpui::{div, prelude::*, px, Context, Div, MouseButton, Window};
-use protocol::{CallSupport, Conversation, ConversationKind, Key, Network, Notify, Presence, Request};
+use protocol::{CallSupport, Conversation, ConversationKind, Key, MeetingResponse, Network, Notify, Presence, Request};
 
 /// S6: this conversation's own notification sound, kept here only (the network never sees it),
 /// over its account's and the global one. Picking one plays it.
@@ -197,6 +197,13 @@ fn head_picture(pane: &InfoPane, row: &Conversation, cx: &mut Context<InfoPane>)
     }
 }
 
+fn open_https_link(pane: &InfoPane, url: &str, window: &mut Window, cx: &mut Context<InfoPane>) {
+    pane.shell_do(cx, |shell, cx| {
+        let conv = shell.pane(cx);
+        conv.update(cx, |conv, cx| conv.open_external_link(url, window, cx));
+    });
+}
+
 /// A conversation's Details.
 pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &mut Context<InfoPane>) -> Div {
     let network = row.key.network;
@@ -321,8 +328,17 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
         }
         top = top.child(manage_bar);
     }
-    if let Some((mkey, _, input)) = pane.managing() {
+    if let Some((mkey, mkind, input)) = pane.managing() {
         if mkey == &row.key {
+            let show_history = *mkind == ManageKind::AddMembers
+                && row.key.network == Network::Teams
+                && row.kind == ConversationKind::Group;
+            let history_label = match pane.share_history() {
+                protocol::HistoryShare::None => "History: None",
+                protocol::HistoryShare::Days { days: 7 } => "History: 7 days",
+                protocol::HistoryShare::Days { .. } => "History: Recent",
+                protocol::HistoryShare::All => "History: All",
+            };
             top = top.child(
                 div()
                     .mt(px(8.))
@@ -333,6 +349,17 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                     .flex_col()
                     .gap(px(6.))
                     .child(input.clone())
+                    .when(show_history, |box_| {
+                        box_.child(
+                            div().flex().items_center().justify_between().child(
+                                button("manage-history", ButtonKind::Secondary, history_label)
+                                    .h(px(24.))
+                                    .px(px(8.))
+                                    .type_small()
+                                    .on_click(cx.listener(|pane, _, _, cx| pane.cycle_share_history(cx))),
+                            ),
+                        )
+                    })
                     .child(
                         div()
                             .flex()
@@ -490,6 +517,7 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                 format!("{} {}", bm.emoji, bm.title)
             };
             let url = bm.link.clone();
+            let valid_url = url.starts_with("https://") || url.starts_with("http://");
             let chip = div()
                 .id(("details-bookmark", ix))
                 .px(px(8.))
@@ -498,7 +526,7 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                 .bg(theme::raised())
                 .type_small()
                 .text_color(theme::text())
-                .when(!url.is_empty(), |d| {
+                .when(valid_url, |d| {
                     d.cursor_pointer()
                         .hover(|s| s.bg(theme::hover()))
                         .on_click(move |_, _, cx| cx.open_url(&url))
@@ -515,6 +543,99 @@ pub fn conversation(pane: &InfoPane, row: &Conversation, window: &Window, cx: &m
                 .gap(px(8.))
                 .child(div().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child("Bookmarks"))
                 .child(chips),
+        );
+    }
+    if let Some(meeting) = info.and_then(|info| info.meeting.clone()) {
+        let line = crate::gui::time::meeting_display(&meeting, crate::view::now());
+        let can_join = meeting.join_url.starts_with("https://");
+        let join = meeting.join_url.clone();
+        let show_rsvp = meeting.response != MeetingResponse::Organizer && !meeting.id.is_empty();
+        let mut actions = div().flex().flex_wrap().gap(px(6.));
+        if can_join {
+            actions = actions.child(button("details-meeting-join", ButtonKind::Secondary, "Join").on_click(cx.listener(move |pane, _, window, cx| {
+                open_https_link(pane, &join, window, cx);
+            })));
+        }
+        if show_rsvp {
+            let account = row.key.account();
+            let id = meeting.id.clone();
+            let propose_at = meeting.start + 15 * 60;
+            let choices = [
+                ("Accept", MeetingResponse::Accepted, None),
+                ("Tentative", MeetingResponse::Tentative, None),
+                ("Decline", MeetingResponse::Declined, None),
+                ("Propose 15 min later", MeetingResponse::Tentative, Some(propose_at)),
+            ];
+            for (slot, (label, response, propose)) in choices.into_iter().enumerate() {
+                let account = account.clone();
+                let id = id.clone();
+                actions = actions.child(button(("details-meeting-rsvp", slot), ButtonKind::Ghost, label).on_click(cx.listener(move |pane, _, _, cx| {
+                    pane.note_meeting_response(response);
+                    crate::gui::people::ask_later(cx, Request::MeetingRsvp { account: account.clone(), id: id.clone(), response, propose }, |_, _| {});
+                })));
+            }
+        }
+        body = body.child(draw::rule().mt(px(16.))).child(
+            div()
+                .px(px(theme::PANE_PAD))
+                .pt(px(12.))
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(div().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child("Meeting"))
+                .child(div().type_small().text_color(theme::text_soft()).child(line))
+                .child(actions),
+        );
+    }
+    if let Some(tabs) = info.map(|i| i.tabs.as_slice()).filter(|t| !t.is_empty()) {
+        let fallback_link = link.clone().unwrap_or_default();
+        let mut rows = div().flex().flex_col().gap(px(2.));
+        for (ix, tab) in tabs.iter().enumerate() {
+            let open_url = [&tab.web_url, &tab.content_url, &fallback_link]
+                .into_iter()
+                .find(|u| u.starts_with("https://"))
+                .cloned();
+            let icon = match tab.kind.as_str() {
+                "files" => "icons/folder-plus.svg",
+                "planner" => "icons/check.svg",
+                "website" => "icons/link.svg",
+                _ => "icons/external-link.svg",
+            };
+            let show_app = !tab.app.is_empty() && !tab.app.eq_ignore_ascii_case(&tab.name);
+            let mut row = div()
+                .id(("details-tab", ix))
+                .h(px(theme::ROW_ONE))
+                .mx(px(-8.))
+                .px(px(8.))
+                .rounded(px(theme::R_CONTROL))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .type_ui()
+                .child(glyph(icon, 15., theme::text_soft()))
+                .child(div().flex_1().min_w_0().truncate().text_color(theme::text()).child(tab.name.clone()));
+            if show_app {
+                row = row.child(div().flex_none().type_micro().text_color(theme::text_faint()).child(tab.app.clone()));
+            }
+            if let Some(url) = open_url {
+                row = row
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::hover()))
+                    .child(glyph("icons/external-link.svg", 13., theme::text_faint()))
+                    .on_click(cx.listener(move |pane, _, window, cx| open_https_link(pane, &url, window, cx)));
+            }
+            rows = rows.child(row);
+        }
+        body = body.child(draw::rule().mt(px(16.))).child(
+            div()
+                .px(px(theme::PANE_PAD))
+                .pt(px(12.))
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(div().type_ui().font_weight(theme::MEDIUM).text_color(theme::text()).child("Tabs"))
+                .child(div().type_micro().text_color(theme::text_faint()).child("Tabs open in your browser or Teams."))
+                .child(rows),
         );
     }
     if !waiting || late {
@@ -655,6 +776,9 @@ pub fn space(pane: &InfoPane, key: &Key, cx: &mut Context<InfoPane>) -> Div {
             _ => None,
         },
         (Network::Teams, Some(info)) => info.members.map(|members| div().child(format!("Team · {} members", facts::thousands(members)))),
+        (Network::Slack, Some(info)) if !info.domain.is_empty() => {
+            Some(div().child(format!("{}.slack.com", info.domain)))
+        }
         _ => None,
     };
     let top = div()
@@ -767,11 +891,60 @@ pub fn space(pane: &InfoPane, key: &Key, cx: &mut Context<InfoPane>) -> Div {
     } else if waiting && late {
         body = body.child(draw::rule().mt(px(16.))).child(div().px(px(theme::PANE_PAD)).pt(px(16.)).child(draw::skeleton()));
     }
-    let link = facts::space_link(key);
-    body.child(
-        div()
+    let link = match (key.network, info.as_ref()) {
+        (Network::Slack, Some(info)) if !info.url.is_empty() => Some(info.url.clone()),
+        _ => info
+            .as_ref()
+            .map(|i| i.link.as_str())
+            .filter(|u| u.starts_with("https://") && protocol::link::Destination::parse(u).is_some())
+            .map(str::to_owned)
+            .or_else(|| facts::space_link(key)),
+    };
+    let domain_or_url = info
+        .as_ref()
+        .map(|i| if !i.url.is_empty() { i.url.as_str() } else { i.domain.as_str() })
+        .unwrap_or("");
+    let slack_links = (key.network == Network::Slack).then(|| {
+        let mut group = div()
             .px(px(theme::PANE_PAD))
-            .pt(px(16.))
-            .children(link.map(|url| draw::open_in("space-open", key.network).on_click(move |_, _, cx| cx.open_url(&url)))),
+            .pt(px(12.))
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .child(draw::label("Workspace settings · Opens in your browser", true));
+        for (ix, &(label, rel)) in facts::SLACK_WORKSPACE_LINKS.iter().enumerate() {
+            let url = facts::slack_workspace_url(domain_or_url, &key.id, rel);
+            let shell = pane.shell_weak();
+            group = group.child(
+                button_with_icon(("space-slack-link", ix), ButtonKind::Secondary, "icons/external-link.svg", label)
+                    .tooltip(tip(format!("{label} · Opens in your browser"), None))
+                    .on_click(move |_, window, cx| {
+                        let url = url.clone();
+                        let _ = shell.update(cx, |shell, cx| shell.open_external_link(&url, window, cx));
+                    }),
+            );
+        }
+        group
+    });
+    let shell = pane.shell_weak();
+    let label = if key.network == Network::Teams {
+        "Manage in Teams".to_owned()
+    } else {
+        format!("Open in {}", key.network.label())
+    };
+    let network = key.network;
+    body.children(slack_links).child(
+        div().px(px(theme::PANE_PAD)).pt(px(16.)).children(link.map(move |url| {
+            let shell = shell.clone();
+            draw::open_in_labeled("space-open", network, label.clone()).on_click(move |_, window, cx| {
+                if network == Network::Slack {
+                    let _ = shell.update(cx, |shell, cx| shell.open_external_link(&url, window, cx));
+                } else if url.starts_with("https://") {
+                    let _ = shell.update(cx, |shell, cx| shell.open_external_url(&url, window, cx));
+                } else {
+                    cx.open_url(&url);
+                }
+            })
+        })),
     )
 }

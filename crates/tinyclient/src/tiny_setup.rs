@@ -561,7 +561,7 @@ mod tests {
             channels: Vec::new(),
             online: Vec::new(),
             media: String::new(),
-            capabilities: TinyCapabilities { version: String::new(), features: features.iter().map(|feature| (*feature).to_owned()).collect() },
+            capabilities: TinyCapabilities { version: String::new(), features: features.iter().map(|feature| (*feature).to_owned()).collect(), multi_video: None },
             access: Some(TinyAccess { owner, permissions: protocol::TINY_ALL, ..TinyAccess::default() }),
             me: String::new(),
             server: None,

@@ -15,7 +15,7 @@ use super::tokens::{self, Metrics, MEASURE};
 use super::when;
 use super::{edited_tip, Pane, PaneEvent, Selection, Then};
 use crate::gui::anim::{self, Play};
-use crate::gui::components::{button, glyph, tip, Avatar, ButtonKind, Shape};
+use crate::gui::components::{button, glyph, sensitive_cover, tip, Avatar, ButtonKind, Shape};
 use crate::gui::phone::tokens as tokens_phone;
 use crate::gui::theme::{self, Type};
 use crate::gui::time;
@@ -907,6 +907,11 @@ impl Pane {
                         .person(&key)
                         .is_some_and(|p| p.relation == protocol::Relation::Blocked)
                 });
+        let sensitive_hidden = !message.deleted
+            && !blocked_hidden
+            && crate::gui::streamer::is_active()
+            && !self.revealed_sensitive.contains(&message.id)
+            && crate::gui::streamer::contains_sensitive(&message.text);
         let mut sent = div().flex().flex_col();
         if message.deleted {
             // What it said is gone; the row stays for the thread that hangs off it.
@@ -938,6 +943,15 @@ impl Pane {
                             .child("Show"),
                     ),
             );
+        } else if sensitive_hidden {
+            let reveal_id = message.id.clone();
+            sent = sent.child(sensitive_cover(
+                SharedString::from(format!("reveal-sensitive-{}", message.id)),
+                cx.listener(move |this, _, _, cx| {
+                    this.revealed_sensitive.insert(reveal_id.clone());
+                    cx.notify();
+                }),
+            ));
         } else {
             let said = match &message.kind {
                 MessageKind::Unsupported { link } => vec![self.unsupported(message, link, cx).into_any_element()],
@@ -947,15 +961,30 @@ impl Pane {
             sent = match &message.forwarded {
                 // When the forwarder wrote a note of their own, render it above the quoted original.
                 Some(from) if !from.text.is_empty() && !message.text.is_empty() && from.text != message.text => {
+                    let forward_key = format!("forward:{}", message.id);
+                    let hide_from = crate::gui::streamer::is_active()
+                        && crate::gui::streamer::contains_sensitive(&from.text)
+                        && !self.revealed_sensitive.contains(&forward_key);
                     let mut quoted = div().pl(px(12.)).min_w_0().flex_1().flex().flex_col();
                     if !from.author.is_empty() {
                         quoted = quoted.child(
                             div().type_small().font_weight(theme::MEDIUM).text_color(theme::text_soft()).child(from.author.clone()),
                         );
                     }
-                    quoted = quoted
-                        .child(div().type_body().text_color(theme::text()).child(from.text.clone()))
-                        .children(attached);
+                    quoted = if hide_from {
+                        let key = forward_key;
+                        quoted.child(sensitive_cover(
+                            SharedString::from(format!("reveal-forward-{}", message.id)),
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.revealed_sensitive.insert(key.clone());
+                                cx.notify();
+                            }),
+                        ))
+                    } else {
+                        quoted.child(div().type_body().text_color(theme::text()).child(from.text.clone()))
+                    };
+                    quoted = quoted.children(attached);
                     sent.children(said)
                         .child(div().mt(px(4.)).child(forwarded_line(from)))
                         .child(
@@ -974,7 +1003,81 @@ impl Pane {
                 ),
                 None => sent.children(said).children(attached),
             };
+            if self.translating.contains(&message.id) {
+                sent = sent.child(
+                    div()
+                        .mt(px(4.))
+                        .pl(px(10.))
+                        .border_l_2()
+                        .border_color(tokens::border_strong())
+                        .type_small()
+                        .italic()
+                        .text_color(theme::text_faint())
+                        .child("Translating…"),
+                );
+            } else if let Some(translated) = self.translations.get(&message.id).cloned() {
+                let clear_id = message.id.clone();
+                let attribution = match translated.source_lang.as_deref() {
+                    Some(src) if !src.is_empty() && !src.eq_ignore_ascii_case("auto") => {
+                        format!("Translated from {}", protocol::language_name(src))
+                    }
+                    _ => format!("Translated to {}", protocol::language_name(&translated.target_lang)),
+                };
+                sent = sent.child(
+                    div()
+                        .mt(px(4.))
+                        .pl(px(10.))
+                        .border_l_2()
+                        .border_color(theme::accent())
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .child(div().type_body().text_color(theme::text()).child(translated.text))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .type_micro()
+                                .text_color(theme::text_faint())
+                                .child(attribution)
+                                .child("·")
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("translation-clear-{}", message.id)))
+                                        .cursor_pointer()
+                                        .text_color(theme::text_soft())
+                                        .hover(|style| style.underline())
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.translations.remove(&clear_id);
+                                            cx.notify();
+                                        }))
+                                        .child("Show original"),
+                                ),
+                        ),
+                );
+            }
             sent = sent
+                .children(message.ephemeral.then(|| {
+                    div()
+                        .pb(px(3.))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(
+                            div()
+                                .px(px(6.))
+                                .py(px(1.))
+                                .rounded(px(theme::R_CONTROL))
+                                .bg(tokens::card())
+                                .border_1()
+                                .border_color(theme::hairline())
+                                .type_micro()
+                                .text_color(theme::text_faint())
+                                .child("Only visible to you"),
+                        )
+                }))
                 .children(message.announcement.then(|| {
                     div()
                         .pb(px(3.))
@@ -1068,7 +1171,7 @@ impl Pane {
             .flex_col()
             .children(head.then(|| self.header(message, in_header, cx)))
             .child(sent)
-            .children(self.otp_chip(message, cx))
+            .children((!sensitive_hidden).then(|| self.otp_chip(message, cx)).flatten())
             .children(self.views_line(message))
             .children(self.reactions(message, window, cx))
             .children(self.thread_line(message, window, cx))
@@ -1107,7 +1210,7 @@ impl Pane {
                     .bg(theme::accent_soft())
                     .with_animation(name_id("flash", &message.id), Animation::new(FLASH), |tint, done| tint.opacity(1. - done))
             }))
-            .children(message.reply_to.as_ref().map(|reply| self.reply_line(reply, window, cx)))
+            .children(message.reply_to.as_ref().map(|reply| self.reply_line(reply, &message.id, window, cx)))
             .child(
                 div()
                     .flex()
@@ -2069,7 +2172,12 @@ impl Pane {
                 let attachment = &message.attachments[*only];
                 let (wide, tall) = natural(attachment);
                 let single = media::single(wide, tall, width);
-                out.push(self.tile(message, *only, single.width, single.height, single.fit, None, window, cx));
+                let tile = self.tile(message, *only, single.width, single.height, single.fit, None, window, cx);
+                if let Some(panel) = self.transcript_box(message, *only, None, cx) {
+                    out.push(div().flex().flex_col().child(tile).child(panel).into_any_element());
+                } else {
+                    out.push(tile);
+                }
             }
             many => {
                 let (tiles, height) = media::grid(many.len(), width);
@@ -3061,9 +3169,10 @@ impl Pane {
     fn contact_card(&self, message: &Rc<Message>, contact: &protocol::SharedContact, idx: usize, cx: &mut Context<Self>) -> AnyElement {
         let title = if contact.name.trim().is_empty() { "Shared contact" } else { contact.name.trim() };
         let mut rows: Vec<AnyElement> = Vec::new();
+        let streamer = crate::gui::streamer::is_active();
         for (p_idx, phone) in contact.phones.iter().enumerate() {
             let reveal_key = format!("{}:{idx}:{p_idx}", message.id);
-            let revealed = self.revealed_contacts.contains(&reveal_key);
+            let revealed = !streamer && self.revealed_contacts.contains(&reveal_key);
             let shown = if revealed { phone.clone() } else { crate::gui::people::mask(phone) };
             let copy_val = phone.clone();
             let toggle_key = reveal_key.clone();
@@ -3076,49 +3185,55 @@ impl Pane {
                     .child(
                         div()
                             .id(name_id(&format!("contact-phone-{}-{idx}-{p_idx}", message.id), ""))
-                            .cursor_pointer()
+                            .when(!streamer, |row| row.cursor_pointer().hover(|s| s.text_color(theme::text())))
                             .type_ui()
                             .text_color(theme::text_soft())
-                            .hover(|s| s.text_color(theme::text()))
-                            .on_click(cx.listener(move |this, _, _, cx| this.toggle_contact_reveal(toggle_key.clone(), cx)))
-                            .child(if revealed { shown } else { format!("{shown} · Show") }),
+                            .when(!streamer, |row| {
+                                row.on_click(cx.listener(move |this, _, _, cx| this.toggle_contact_reveal(toggle_key.clone(), cx)))
+                            })
+                            .child(if streamer || revealed { shown } else { format!("{shown} · Show") }),
                     )
-                    .child(
-                        div()
-                            .id(name_id(&format!("contact-phone-copy-{}-{idx}-{p_idx}", message.id), ""))
-                            .cursor_pointer()
-                            .type_micro()
-                            .text_color(theme::accent())
-                            .hover(|s| s.underline())
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_val.clone()));
-                            }))
-                            .child("Copy"),
-                    )
+                    .when(!streamer, |row| {
+                        row.child(
+                            div()
+                                .id(name_id(&format!("contact-phone-copy-{}-{idx}-{p_idx}", message.id), ""))
+                                .cursor_pointer()
+                                .type_micro()
+                                .text_color(theme::accent())
+                                .hover(|s| s.underline())
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_val.clone()));
+                                }))
+                                .child("Copy"),
+                        )
+                    })
                     .into_any_element(),
             );
         }
         for (e_idx, email) in contact.emails.iter().enumerate() {
             let copy_val = email.clone();
+            let shown_email = if streamer { crate::gui::people::mask_email(email) } else { email.clone() };
             rows.push(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
                     .gap(px(8.))
-                    .child(div().type_ui().text_color(theme::text_soft()).child(email.clone()))
-                    .child(
-                        div()
-                            .id(name_id(&format!("contact-email-copy-{}-{idx}-{e_idx}", message.id), ""))
-                            .cursor_pointer()
-                            .type_micro()
-                            .text_color(theme::accent())
-                            .hover(|s| s.underline())
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_val.clone()));
-                            }))
-                            .child("Copy"),
-                    )
+                    .child(div().type_ui().text_color(theme::text_soft()).child(shown_email))
+                    .when(!streamer, |row| {
+                        row.child(
+                            div()
+                                .id(name_id(&format!("contact-email-copy-{}-{idx}-{e_idx}", message.id), ""))
+                                .cursor_pointer()
+                                .type_micro()
+                                .text_color(theme::accent())
+                                .hover(|s| s.underline())
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_val.clone()));
+                                }))
+                                .child("Copy"),
+                        )
+                    })
                     .into_any_element(),
             );
         }
@@ -3588,7 +3703,7 @@ impl Pane {
         Some(row.child(add).into_any_element())
     }
 
-    fn reply_line(&mut self, reply: &protocol::ReplyTo, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn reply_line(&mut self, reply: &protocol::ReplyTo, message_id: &str, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let metrics = self.metrics;
         let target = reply.id.clone();
         let gone = reply.deleted || (!reply.story && reply.sender.is_empty() && reply.snippet.is_empty());
@@ -3607,6 +3722,11 @@ impl Pane {
             (false, true, false) => "Attachment".to_owned(),
             (false, false, _) => reply.snippet.replace('\n', " "),
         };
+        let reply_key = format!("reply:{}", reply.id);
+        let hide_reply = !gone
+            && crate::gui::streamer::is_active()
+            && crate::gui::streamer::contains_sensitive(&reply.snippet)
+            && !self.revealed_sensitive.contains(&reply_key);
         let face = (!gone).then(|| {
             let (_, file) = reply.person.as_ref().map(|person| self.who(person, cx)).unwrap_or_default();
             let plate = match &reply.person {
@@ -3634,7 +3754,8 @@ impl Pane {
         let reach = metrics.avatar / 2. + metrics.gap - 4.;
         div()
             .id("reply")
-            .h(px(20.))
+            .when(!hide_reply, |line| line.h(px(20.)))
+            .when(hide_reply, |line| line.min_h(px(20.)))
             .mb(px(2.))
             .flex()
             .items_center()
@@ -3665,9 +3786,22 @@ impl Pane {
                 div().flex_none().font_weight(theme::SEMIBOLD).text_color(theme::text_soft()).child(label)
             }))
             .children(thumb)
-            .children((!snippet.is_empty()).then(|| {
-                div().min_w_0().truncate().when(gone, |snippet| snippet.italic()).child(snippet)
-            }))
+            .children(if hide_reply {
+                let key = reply_key;
+                Some(
+                    sensitive_cover(
+                        SharedString::from(format!("reveal-reply-{message_id}-{}", reply.id)),
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.revealed_sensitive.insert(key.clone());
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
+                )
+            } else {
+                (!snippet.is_empty()).then(|| div().min_w_0().truncate().when(gone, |snippet| snippet.italic()).child(snippet).into_any_element())
+            })
     }
 
     /// A channel post's footer: how many people saw it, as Telegram's apps say it. Telegram

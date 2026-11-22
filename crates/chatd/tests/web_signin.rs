@@ -54,7 +54,7 @@ fn a_registered_web_page_signs_in_without_the_helper_and_the_session_goes_to_be_
 
     let core = chatd::start_in_process(dir.clone()).expect("the core starts");
     let mut stream = ChatStream::connect(&chat_sock_path_in(&dir)).expect("the socket answers");
-    write_frame(&mut stream, &Request::SignIn { network: Network::Discord, at: None }).unwrap();
+    write_frame(&mut stream, &Request::SignIn { network: Network::Discord, at: None, resume: None }).unwrap();
     match read_frame::<Response>(&mut stream).unwrap() {
         // The session was made from the page and handed on to be kept; a scratch directory
         // keeps nothing and says so. Any other ending means the page did not sign in.
@@ -70,7 +70,7 @@ fn a_registered_web_page_signs_in_without_the_helper_and_the_session_goes_to_be_
 
     // The user closing the page is the helper's "closed", in the same words.
     *phone.close_next.lock().unwrap() = true;
-    write_frame(&mut stream, &Request::SignIn { network: Network::Discord, at: None }).unwrap();
+    write_frame(&mut stream, &Request::SignIn { network: Network::Discord, at: None, resume: None }).unwrap();
     match read_frame::<Response>(&mut stream).unwrap() {
         Response::Error { code: ErrorCode::SignIn, detail } => assert_eq!(detail, "The sign-in window was closed."),
         other => panic!("{other:?}"),

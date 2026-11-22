@@ -2,8 +2,8 @@
 
 use crate::teams;
 use crate::{
-    blocked, finish, hands_off, load_failed_message, route, session, web_client, Route, Site, BLOCKED, CLOSED,
-    LOAD_FAILED, NO_TOKEN, NO_TOKEN_AFTER, PAGE, SIZE,
+    blocked, finish, hands_off, load_failed_message, route, session, slack_cookie_domain, slack_page, web_client, Route, Site,
+    BLOCKED, CLOSED, LOAD_FAILED, NO_TOKEN, NO_TOKEN_AFTER, PAGE, SIZE, SLACK,
 };
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -49,7 +49,7 @@ fn platform_data_root() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-pub fn run(site: Site, at: Option<(f64, f64)>, network: &str) {
+pub fn run(site: Site, at: Option<(f64, f64)>, network: &str, start: Option<&str>) {
     // On Wayland, WebKitGTK turns on NVIDIA's explicit sync without the sync point it promises, and
     // the compositor drops the window as it opens: "Error 71 (Protocol error)", WebKit bug 280210.
     // Only NVIDIA's driver reads this.
@@ -86,7 +86,7 @@ pub fn run(site: Site, at: Option<(f64, f64)>, network: &str) {
 
     let nav_state = state.clone();
     let builder = WebViewBuilder::new_with_web_context(&mut web_context)
-        .with_url(site.start)
+        .with_url(start.unwrap_or(site.start))
         .with_user_agent(&agent)
         .with_navigation_handler({
             let nav_state = nav_state.clone();
@@ -179,9 +179,10 @@ fn tick(web: &WebView, site: Site, agent: &str, state: &Arc<Mutex<State>>) {
         let mut guard = state.lock().unwrap();
         if let Some(probed) = guard.pending_session.take() {
             if let Ok(cookies) = web.cookies() {
+                // The `d` cookie counts only for slack.com or a subdomain.
                 let cookie = cookies
                     .iter()
-                    .find(|cookie| cookie.name() == wanted)
+                    .find(|cookie| cookie.name() == wanted && cookie.domain().is_some_and(slack_cookie_domain))
                     .map(|cookie| cookie.value().to_string());
                 if cookie.is_some() {
                     finish(session(probed, cookie, agent));
@@ -243,6 +244,11 @@ fn tick(web: &WebView, site: Site, agent: &str, state: &Arc<Mutex<State>>) {
     let wanted = site.cookie;
     let agent = agent.to_owned();
     let state_probe = state.clone();
+    // localConfig_v2 is only on slack.com. An identity-provider page is shown, not read.
+    let probe_here = site.probe != SLACK.probe || web.url().ok().as_deref().is_some_and(slack_page);
+    if !probe_here {
+        return;
+    }
     let _ = web.evaluate_script_with_callback(probe, move |value| {
         if std::env::var_os("TINYCLIENT_LOGIN_DEBUG").is_some() {
             // Never print the JavaScript result: it may contain credentials.

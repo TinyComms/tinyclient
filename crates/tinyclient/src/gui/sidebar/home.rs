@@ -4,7 +4,7 @@
 //! Meetings and teams. Slack's home is its workspace's tree (`tree.rs`). Rows are 48 and 28
 //! mixed, so the list is a GPUI `list` whose heights are known from each item's kind.
 
-use protocol::{Badge, Conversation, Folder, Key, Network, Space, Special};
+use protocol::{Badge, Conversation, Folder, Key, MeetingEvent, Network, Space, Special};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -22,6 +22,8 @@ pub const MEETING_QUIET: i64 = 14 * 86_400;
 /// A list the home drills into, replacing itself until `‹`.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Drill {
+    /// All unread conversations and their unread messages in one list (#606).
+    Unreads(Option<Key>),
     /// A Slack workspace's followed threads.
     Threads(Key),
     /// A Slack workspace's active drafts.
@@ -49,6 +51,8 @@ pub enum Act {
     CallsMore,
     Meetings,
     MoreChats,
+    /// Mark every unread conversation in the All Unreads view as read (#606).
+    MarkAllUnreadsRead,
     /// Show or hide a team's opted-out channels. The id is the team's.
     Hidden(String),
 }
@@ -99,12 +103,20 @@ pub enum Item {
     Folder { id: String, name: String, color: Option<u32>, open: bool, lit: bool, mention: bool },
     /// A team's channel under its row.
     Channel(Rc<Conversation>),
+    /// One of today's meetings, soonest first under Upcoming.
+    Meeting(MeetingEvent),
+    /// A conversation header inside the All Unreads view (#606), with its per-group Mark as read action.
+    UnreadGroupHeader(Rc<protocol::UnreadGroup>),
+    /// One unread message row inside the All Unreads view (#606).
+    UnreadMessage { conversation: Key, title: String, message: Rc<protocol::Message> },
 }
 
 impl Item {
     pub fn height(&self) -> f32 {
         match self {
             Item::Header { first: true, .. } => 24.,
+            Item::UnreadGroupHeader(_) => 32.,
+            Item::UnreadMessage { .. } => 44.,
             Item::Chat(_) | Item::Voice(_) | Item::Call(_) => 48.,
             _ => 28.,
         }
@@ -120,7 +132,10 @@ impl Item {
     pub fn anchor(&self) -> Option<String> {
         match self {
             Item::Chat(c) | Item::Voice(c) | Item::Channel(c) => Some(format!("c/{}", c.key.id)),
+            Item::UnreadGroupHeader(g) => Some(format!("ug/{}", g.conversation.key.id)),
+            Item::UnreadMessage { conversation, message, .. } => Some(format!("um/{}/{}", conversation.id, message.id)),
             Item::Call(c) => Some(format!("call/{}", c.latest.message_id)),
+            Item::Meeting(event) => Some(format!("m/{}", event.id)),
             Item::Folder { id, .. } => Some(format!("f/{id}")),
             Item::Header { label, .. } => Some(format!("h/{label}")),
             _ => None,
@@ -146,6 +161,8 @@ pub struct Home {
     pub archive_total: u32,
     /// The rows of the list drilled into.
     pub drilled: Vec<Rc<Conversation>>,
+    /// Unread groups loaded for `Drill::Unreads` (#606).
+    pub unreads: Vec<Rc<protocol::UnreadGroup>>,
     /// Recent calls loaded for `Drill::Calls`, newest first.
     pub calls: Vec<protocol::CallLogEntry>,
     pub calls_missed: bool,
@@ -165,6 +182,9 @@ pub struct Home {
     pub opened: HashSet<String>,
     /// Teams whose hidden channels are listed, by team id.
     pub hidden_shown: HashSet<String>,
+    /// Today's meetings for `upcoming_account`, soonest first.
+    pub upcoming: Vec<MeetingEvent>,
+    pub upcoming_account: String,
 }
 
 impl Home {
@@ -178,6 +198,7 @@ impl Home {
         outgoing.epoch += 1;
         outgoing.loaded = outgoing.loaded_once;
         outgoing.drilled.clear();
+        outgoing.unreads.clear();
         if let Some(previous) = outgoing.network {
             saved.insert(previous, outgoing);
         }
@@ -359,6 +380,21 @@ pub fn signal(home: &Home) -> Vec<Item> {
 /// teams, collapsed, each showing the channels that need me (rule 3) or all when opened.
 pub fn teams(home: &Home, spaces: &[Space], channels: &dyn Fn(&Key) -> Vec<Rc<Conversation>>, open: Option<&Key>, now: i64) -> Vec<Item> {
     let mut out = Vec::new();
+    let mut upcoming: Vec<&MeetingEvent> = home.upcoming.iter().filter(|event| event.start > 0 && crate::gui::time::same_day(event.start, now)).collect();
+    upcoming.sort_by_key(|event| event.start);
+    if !upcoming.is_empty() {
+        header(&mut out, "Upcoming");
+        out.extend(upcoming.into_iter().cloned().map(Item::Meeting));
+    }
+    if home.requests > 0 {
+        out.push(Item::Action {
+            act: Act::Requests,
+            icon: "icons/mail.svg",
+            words: "Message requests".into(),
+            after: home.requests.to_string(),
+            dot: None,
+        });
+    }
     let pinned_chats: Vec<&Rc<Conversation>> = home.chats.iter().filter(|c| c.starred || c.pin.is_some()).collect();
     let mut pinned_channels: Vec<Rc<Conversation>> = spaces
         .iter()
@@ -457,6 +493,9 @@ mod tests {
                 Item::Space { index, child, .. } => format!("{}{}", if child.is_some() { "." } else { "" }, spaces[*index].name),
                 Item::Folder { name, open, lit, .. } => format!("{}{name}{}", if *open { "v" } else { ">" }, if *lit { "*" } else { "" }),
                 Item::Call(c) => format!("call:{}", c.latest.name),
+                Item::Meeting(event) => format!("meet:{}", event.title),
+                Item::UnreadGroupHeader(group) => format!("[{}]", group.conversation.title),
+                Item::UnreadMessage { title, message, .. } => format!("{title}:{}", message.id),
             })
             .collect()
     }
@@ -621,6 +660,45 @@ mod tests {
         let home = Home { chats: vec![Rc::new(notes), Rc::new(ana)], ..Home::for_network(Network::Teams) };
         let got = shape(&teams(&home, &[], &|_: &Key| Vec::new(), None, 100), &[]);
         assert_eq!(got, ["[Chats]", "ana", "notes"]);
+    }
+
+    fn local_noon() -> i64 {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|since| since.as_secs() as i64).unwrap_or(0);
+        let clock = crate::gui::time::local(now);
+        now - clock.hour as i64 * 3600 - clock.minute as i64 * 60 - now.rem_euclid(60) + 12 * 3600
+    }
+
+    #[test]
+    fn teams_lists_todays_meetings_soonest_first() {
+        let noon = local_noon();
+        let event = |id: &str, title: &str, start: i64| MeetingEvent {
+            id: id.into(),
+            title: title.into(),
+            start,
+            end: start + 1800,
+            ..MeetingEvent::default()
+        };
+        let home = Home {
+            upcoming: vec![
+                event("later", "Design review", noon + 3 * 3600),
+                event("soon", "Standup", noon + 3600),
+                event("old", "Yesterday sync", noon - 20 * 3600),
+            ],
+            ..Home::for_network(Network::Teams)
+        };
+        let got = shape(&teams(&home, &[], &|_: &Key| Vec::new(), None, noon), &[]);
+        assert_eq!(got, ["[Upcoming]", "meet:Standup", "meet:Design review"]);
+    }
+
+    #[test]
+    fn teams_shows_message_requests_row_when_pending() {
+        let home = Home {
+            requests: 2,
+            chats: vec![chat("ana", 0)],
+            ..Home::for_network(Network::Teams)
+        };
+        let got = shape(&teams(&home, &[], &|_: &Key| Vec::new(), None, 100), &[]);
+        assert_eq!(got, ["<Message requests>", "[Chats]", "ana"]);
     }
 
     #[test]

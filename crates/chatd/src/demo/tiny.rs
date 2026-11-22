@@ -581,6 +581,7 @@ pub fn seed(s: &mut Seeder) -> Fallible<Who> {
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
+            multi_video: None,
         },
         access: Some(TinyAccess { owner: false, roles: vec![ADMIN.into()], permissions: TINY_ALL, rank: 3 }),
         me: ME.to_owned(),

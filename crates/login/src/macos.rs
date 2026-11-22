@@ -1,8 +1,8 @@
 //! macOS sign-in window (AppKit + WKWebView).
 
 use crate::{
-    blocked, finish, hands_off, load_failed, origin, route, session, web_client, Route, Site, BLOCKED, CLOSED,
-    LOAD_FAILED, NO_TOKEN, NO_TOKEN_AFTER, PAGE, SIZE,
+    blocked, finish, hands_off, load_failed, origin, route, session, slack_cookie_domain, slack_page, web_client, Route, Site,
+    BLOCKED, CLOSED, LOAD_FAILED, NO_TOKEN, NO_TOKEN_AFTER, PAGE, SIZE, SLACK,
 };
 use block2::RcBlock;
 use objc2::rc::Retained;
@@ -116,7 +116,7 @@ impl WebDelegate {
     }
 }
 
-pub fn run(site: Site, at: Option<(f64, f64)>) {
+pub fn run(site: Site, at: Option<(f64, f64)>, start: Option<&str>) {
     let mtm = MainThreadMarker::new().expect("main thread");
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
@@ -175,7 +175,7 @@ pub fn run(site: Site, at: Option<(f64, f64)>) {
         let url = NSURL::URLWithString(&NSString::from_str(url)).expect("a valid url");
         web.loadRequest(&NSURLRequest::requestWithURL(&url));
     };
-    load(&web, site.start);
+    load(&web, start.unwrap_or(site.start));
     window.setContentView(Some(&web));
     window.makeKeyAndOrderFront(None);
     #[allow(deprecated)]
@@ -237,9 +237,10 @@ pub fn run(site: Site, at: Option<(f64, f64)>) {
             let agent = agent.clone();
             let found = RcBlock::new(move |all: NonNull<NSArray<NSHTTPCookie>>| {
                 let all = unsafe { all.as_ref() };
+                // The `d` cookie counts only for slack.com or a subdomain.
                 let cookie = all
                     .iter()
-                    .find(|cookie| cookie.name().to_string() == wanted)
+                    .find(|cookie| cookie.name().to_string() == wanted && slack_cookie_domain(&cookie.domain().to_string()))
                     .map(|cookie| cookie.value().to_string());
                 if cookie.is_some() {
                     finish(session(probed.clone(), cookie, &agent));
@@ -247,7 +248,10 @@ pub fn run(site: Site, at: Option<(f64, f64)>) {
             });
             unsafe { cookies.getAllCookies(&found) };
         });
-        unsafe { web.evaluateJavaScript_completionHandler(&probe, Some(&probed)) };
+        // localConfig_v2 is only on slack.com. An identity-provider page is shown, not read.
+        if site.probe != SLACK.probe || slack_page(&at) {
+            unsafe { web.evaluateJavaScript_completionHandler(&probe, Some(&probed)) };
+        }
     });
     let _timer = unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(1., true, &tick) };
     app.run();

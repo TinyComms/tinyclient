@@ -13,7 +13,7 @@ use crate::discord_video::{self, Remote};
 use crate::gateway::{self, closed, Closed, Incoming, Socket};
 use crate::media::{self, FromMedia, MICROPHONE_DENIED};
 use crate::permission::{microphone, Microphone};
-use crate::picture::{CAMERA_HIGH, CAMERA_HIGH_BPS};
+use crate::picture::CameraProfile;
 use crate::rtp::{self, Cipher, Sender};
 use crate::out;
 use protocol::{AudioProcessing, CallFailure, CallStats, Cue, InputMode, MediaResponse, TinyPicture, TinySlot, Tuning, VoiceJoin, VoiceQuality};
@@ -87,6 +87,7 @@ pub struct Controls {
     /// The camera and the share the user asked for, and whether the one picture is watched.
     share: AtomicBool,
     camera: AtomicBool,
+    camera_preview: AtomicBool,
     watch: AtomicBool,
     /// Stops a Go Live leg without hanging up the voice call. The voice loop does not read these.
     share_leg_stop: AtomicBool,
@@ -95,8 +96,10 @@ pub struct Controls {
     speaker: Mutex<Option<String>>,
     /// An answer to the renegotiation offer, or an empty SDP when the server refused it.
     picture_answer: Mutex<Option<String>>,
-    /// Who the one video slot carries. `None` inside means the server sent no picture.
-    picture_slot: Mutex<Option<Option<TinyPicture>>>,
+    /// Who each active video receive slot carries now (`call.slots.videos` or single `video`).
+    picture_slots: Mutex<Option<Vec<TinyPicture>>>,
+    /// Multi-stream watch list accepted by the decode budget.
+    watch_sources: Mutex<Vec<protocol::WatchSource>>,
     /// A Tiny server call's end-to-end encryption (`e2ee`), shared by chatd's requests and the
     /// call's loop.
     pub(crate) tiny_e2ee: Mutex<crate::e2ee::E2ee>,
@@ -170,6 +173,14 @@ impl Controls {
         self.camera.load(Ordering::Relaxed)
     }
 
+    pub fn set_camera_preview(&self, on: bool) {
+        self.camera_preview.store(on, Ordering::Relaxed);
+    }
+
+    pub fn camera_preview(&self) -> bool {
+        self.camera_preview.load(Ordering::Relaxed)
+    }
+
     pub fn set_watch(&self, on: bool) {
         self.watch.store(on, Ordering::Relaxed);
     }
@@ -215,14 +226,26 @@ impl Controls {
         self.picture_answer.lock().unwrap().take()
     }
 
-    /// Who the video slot carries now. The outer `Some` means the server said; the inner is
-    /// `None` when it sent `video: null`.
+    /// Who the single legacy video slot carries now.
     pub fn set_picture(&self, picture: Option<TinyPicture>) {
-        *self.picture_slot.lock().unwrap() = Some(picture);
+        self.set_pictures(picture.into_iter().collect());
     }
 
-    pub(crate) fn take_picture(&self) -> Option<Option<TinyPicture>> {
-        self.picture_slot.lock().unwrap().take()
+    /// Who each active video receive slot carries now, from `call.slots.videos`.
+    pub fn set_pictures(&self, pictures: Vec<TinyPicture>) {
+        *self.picture_slots.lock().unwrap() = Some(pictures);
+    }
+
+    pub(crate) fn take_pictures(&self) -> Option<Vec<TinyPicture>> {
+        self.picture_slots.lock().unwrap().take()
+    }
+
+    pub fn set_watch_sources(&self, sources: Vec<protocol::WatchSource>) {
+        *self.watch_sources.lock().unwrap() = sources;
+    }
+
+    pub(crate) fn watch_sources(&self) -> Vec<protocol::WatchSource> {
+        self.watch_sources.lock().unwrap().clone()
     }
 
     /// The devices chosen so far, for a call that opens them now. Any choice waiting for the
@@ -246,7 +269,7 @@ impl Controls {
         let tuning = self.tuning();
         let wanted = match cue {
             Cue::Test => true,
-            Cue::Joined | Cue::Left => tuning.joins && !self.deafened.load(Ordering::Relaxed),
+            Cue::Joined | Cue::Left | Cue::ShareStarted => tuning.joins && !self.deafened.load(Ordering::Relaxed),
             // Our own room changed: as a join, but heard while deafened, since it is ours.
             Cue::Moved => tuning.joins,
             Cue::Muted | Cue::Unmuted | Cue::Deafened | Cue::Undeafened => tuning.mine,
@@ -978,7 +1001,7 @@ impl Call {
         if self.told == Some(quality) {
             return Ok(());
         }
-        socket.send(gateway::VIDEO, video_announcement(true, self.ssrc, self.assigned, true, quality)).map_err(dropped)?;
+        socket.send(gateway::VIDEO, video_announcement(true, self.ssrc, self.assigned, true, quality, crate::picture::camera_profile())).map_err(dropped)?;
         self.told = Some(quality);
         Ok(())
     }
@@ -987,20 +1010,21 @@ impl Call {
     /// negotiated type is `video` on both legs; identify is what said `screen`.
     fn video_body(&self, active: bool) -> Value {
         let screen = self.join.stream && !self.join.watch;
-        video_announcement(active, self.ssrc, self.assigned, screen, crate::picture::share_quality())
+        video_announcement(active, self.ssrc, self.assigned, screen, crate::picture::share_quality(), crate::picture::camera_profile())
     }
 }
 
-/// Opcode 12 for one leg. A screen names the share that was picked. A camera stays one layer.
+/// Opcode 12 for one leg. A screen names the share that was picked; a camera uses the resolved
+/// [`CameraProfile`] (720p30 HD when hardware or HD is selected, 360p15 otherwise).
 /// Off, or never assigned, is a video SSRC of 0 and no streams.
-fn video_announcement(active: bool, audio_ssrc: u32, assigned: Option<(u32, u32)>, screen: bool, quality: crate::picture::Quality) -> Value {
+fn video_announcement(active: bool, audio_ssrc: u32, assigned: Option<(u32, u32)>, screen: bool, quality: crate::picture::Quality, camera: CameraProfile) -> Value {
     let Some((ssrc, rtx)) = assigned.filter(|_| active) else {
         return json!({ "audio_ssrc": audio_ssrc, "video_ssrc": 0, "rtx_ssrc": 0, "streams": [] });
     };
     let (width, height, fps, bitrate) = if screen {
         (quality.max.0, quality.max.1, quality.fps, quality.bps)
     } else {
-        (CAMERA_HIGH.0, CAMERA_HIGH.1, 15, CAMERA_HIGH_BPS)
+        (camera.max.0, camera.max.1, camera.fps, camera.bps)
     };
     json!({
         "audio_ssrc": audio_ssrc,
@@ -1021,10 +1045,12 @@ fn video_announcement(active: bool, audio_ssrc: u32, assigned: Option<(u32, u32)
 }
 
 /// The lab's discord-share-quality driver. Opcode 12 names the share that was picked, and a
-/// camera stays one layer. A build from before the fix ignores the variable and stays up.
+/// camera announces its resolved profile. A build from before the fix ignores the variable and stays up.
 pub fn prove_discord_share_quality() -> Result<(), String> {
+    let std_cam = CameraProfile::resolve(protocol::CameraQuality::Standard, false);
+    let hd_cam = CameraProfile::resolve(protocol::CameraQuality::Hd, true);
     let size = |quality: protocol::ShareQuality| {
-        let body = video_announcement(true, 1, Some((7, 8)), true, crate::picture::Quality::of(quality));
+        let body = video_announcement(true, 1, Some((7, 8)), true, crate::picture::Quality::of(quality), std_cam);
         (
             body["streams"][0]["max_resolution"]["width"].as_u64().unwrap_or(0),
             body["streams"][0]["max_resolution"]["height"].as_u64().unwrap_or(0),
@@ -1041,9 +1067,13 @@ pub fn prove_discord_share_quality() -> Result<(), String> {
     if size(protocol::ShareQuality::Best) != (2560, 1440, 60, 8_000_000) {
         return Err("best is 1440p at 60".into());
     }
-    let camera = video_announcement(true, 1, Some((7, 8)), false, crate::picture::Quality::of(protocol::ShareQuality::Best));
+    let camera = video_announcement(true, 1, Some((7, 8)), false, crate::picture::Quality::of(protocol::ShareQuality::Best), std_cam);
     if camera["streams"][0]["max_resolution"]["width"] != 640 || camera["streams"][0]["max_framerate"] != 15 {
-        return Err("a camera stays 640 by 360 at 15".into());
+        return Err("standard camera is 640 by 360 at 15".into());
+    }
+    let camera_hd = video_announcement(true, 1, Some((7, 8)), false, crate::picture::Quality::of(protocol::ShareQuality::Best), hd_cam);
+    if camera_hd["streams"][0]["max_resolution"]["width"] != 1280 || camera_hd["streams"][0]["max_framerate"] != 30 {
+        return Err("hd camera is 1280 by 720 at 30".into());
     }
     Ok(())
 }
@@ -1306,7 +1336,9 @@ mod tests {
 
     #[test]
     fn a_share_is_announced_at_the_quality_that_was_picked() {
-        let announced = |quality: protocol::ShareQuality| video_announcement(true, 1111, Some((7, 8)), true, crate::picture::Quality::of(quality));
+        let std_cam = CameraProfile::resolve(protocol::CameraQuality::Standard, false);
+        let hd_cam = CameraProfile::resolve(protocol::CameraQuality::Hd, true);
+        let announced = |quality: protocol::ShareQuality| video_announcement(true, 1111, Some((7, 8)), true, crate::picture::Quality::of(quality), std_cam);
         let size = |body: &Value| {
             (
                 body["streams"][0]["max_resolution"]["width"].as_u64().unwrap(),
@@ -1318,9 +1350,11 @@ mod tests {
         assert_eq!(size(&announced(protocol::ShareQuality::Low)), (1280, 720, 15, 1_500_000));
         assert_eq!(size(&announced(protocol::ShareQuality::Balanced)), (1920, 1080, 30, 4_000_000));
         assert_eq!(size(&announced(protocol::ShareQuality::Best)), (2560, 1440, 60, 8_000_000));
-        let camera = video_announcement(true, 1111, Some((7, 8)), false, crate::picture::Quality::of(protocol::ShareQuality::Best));
-        assert_eq!(size(&camera), (640, 360, 15, 500_000), "a camera stays one layer");
-        let off = video_announcement(false, 1111, Some((7, 8)), true, crate::picture::Quality::of(protocol::ShareQuality::Best));
+        let camera = video_announcement(true, 1111, Some((7, 8)), false, crate::picture::Quality::of(protocol::ShareQuality::Best), std_cam);
+        assert_eq!(size(&camera), (640, 360, 15, 500_000), "standard camera is 360p at 15");
+        let camera_hd = video_announcement(true, 1111, Some((7, 8)), false, crate::picture::Quality::of(protocol::ShareQuality::Best), hd_cam);
+        assert_eq!(size(&camera_hd), (1280, 720, 30, 1_500_000), "hd camera announces 720p at 30");
+        let off = video_announcement(false, 1111, Some((7, 8)), true, crate::picture::Quality::of(protocol::ShareQuality::Best), std_cam);
         assert_eq!(off["video_ssrc"], 0);
         assert!(off["streams"].as_array().unwrap().is_empty());
     }
