@@ -1648,8 +1648,10 @@ pub(super) fn classify_activity(raw_type: &str, activity: &Value) -> (ActivityIt
     }
     if lower.contains("reaction") || matches!(lower.as_str(), "like" | "heart" | "laugh" | "surprised" | "sad" | "angry") {
         let key = [
+            activity["reactionKey"].as_str(),
             activity["reactionType"].as_str(),
             activity["activitySubType"].as_str(),
+            activity["activitySubtype"].as_str(),
             activity["emoji"].as_str(),
             (!lower.contains("reaction")).then_some(raw_type),
         ]

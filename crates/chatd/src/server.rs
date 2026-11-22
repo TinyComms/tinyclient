@@ -1443,8 +1443,9 @@ impl Chat {
             return Ok(());
         }
         // A voice send is one clip. A document sent that way is refused before the upload, and
-        // before the voice-note size exception below.
-        if with.voice.is_some() && with.files.len() == 1 {
+        // before the voice-note size exception below. Slack refuses its own, in its own words,
+        // on the message (`slack/send.rs`).
+        if with.voice.is_some() && with.files.len() == 1 && account.network != Network::Slack {
             let named = file_name(&with.files[0]);
             let mime = crate::blobs::upload::mime_of(&named);
             if !(mime.starts_with("audio/") || mime.starts_with("video/")) {

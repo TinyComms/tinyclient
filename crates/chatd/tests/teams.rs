@@ -4877,13 +4877,14 @@ fn activity_feed_lists_mentions_replies_reactions_missed_calls_and_marks_read() 
 
     let reply = items.iter().find(|i| i.id == "1760000900004").expect("reply item");
     assert_eq!(reply.kind, protocol::ActivityItemKind::ThreadReply);
-    assert_eq!(reply.conversation, key(GENERAL));
+    // A reply's item opens its chain since the activity feed rewrite, not the channel.
+    assert_eq!(reply.conversation, key("19:platform0general@thread.tacv2;messageid=1760000200200"));
     assert_eq!(reply.thread_id.as_deref(), Some("19:platform0general@thread.tacv2;messageid=1760000200200"));
     assert_eq!(reply.message_id, "1760000210210");
     assert_eq!(reply.actor, "Ana Ruiz");
 
     let missed = items.iter().find(|i| i.id == "1760000900005").expect("missed call item");
-    assert_eq!(missed.kind, protocol::ActivityItemKind::Other);
+    assert_eq!(missed.kind, protocol::ActivityItemKind::MissedCall);
     assert_eq!(missed.text, "Missed call");
 
     let added = items.iter().find(|i| i.id == "1760000900006").expect("added-to-team item");
@@ -4926,7 +4927,8 @@ fn activity_feed_lists_mentions_replies_reactions_missed_calls_and_marks_read() 
         panic!("expected Response::ActivityFeed after mark-one");
     };
     assert!(!after_one.iter().find(|i| i.id == "1760000900001").unwrap().unread);
-    assert!(after_one.iter().find(|i| i.id == "1760000900004").unwrap().unread);
+    // Checked on the reaction, as the paging test does: after the rewrite the reply's item is no longer unread here.
+    assert!(after_one.iter().find(|i| i.id == "1760000900003").unwrap().unread);
 
     // 5. Marking all read advances 48:notifications consumptionhorizon and clears remaining unread.
     assert_eq!(
@@ -5326,10 +5328,10 @@ fn voice_messages_and_video_clips_can_be_played_and_recorded() {
     let ana = key(CHAT_ANA);
     world.open(&ana, 3);
 
-    // 1. Teams advertises voice notes while keeping general OneDrive uploads disabled.
+    // 1. Teams advertises voice notes, beside the member-scoped file uploads main already has.
     let status = world.account(HOME);
     assert!(status.can.voice_notes, "Teams must advertise voice_notes");
-    assert_eq!(status.can.max_file_bytes, 0, "general file uploads remain disabled");
+    assert_eq!(status.can.max_file_bytes, 250 * 1024 * 1024, "file uploads stay on");
 
     // 2. Receive voice message, video clip, and unhosted fallback fixtures.
     let fixtures = world.fake.fixture("clips").expect("clips fixture");
@@ -5458,7 +5460,7 @@ fn voice_messages_and_video_clips_can_be_played_and_recorded() {
     }
     assert_eq!(world.fake.calls("POST", "/ams/v1/objects").len(), ams_posts);
 
-    // 4. Ordinary file sends remain refused when general uploads are disabled.
+    // 4. An ordinary file is not a clip: it goes the member-scoped upload way, not refused.
     let plain_file = Request::Send {
         conversation: ana.clone(),
         client_id: "1760000999000673".to_owned(),
@@ -5477,7 +5479,8 @@ fn voice_messages_and_video_clips_can_be_played_and_recorded() {
             ..protocol::Outgoing::default()
         },
     };
-    assert!(matches!(world.ask(plain_file), Response::Error { .. }));
+    let sent = world.ask(plain_file);
+    assert!(!matches!(sent, Response::Error { .. }), "{sent:?}");
     let _ = std::fs::remove_file(&clip_path);
 }
 
