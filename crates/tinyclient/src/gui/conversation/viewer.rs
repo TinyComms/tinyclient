@@ -781,6 +781,7 @@ impl Pane {
         if full.width > 0 && full.height > 0 {
             facts.push(format!("{} × {}", full.width, full.height));
         }
+        facts.push(attachment.alt.clone());
         facts.retain(|fact| !fact.is_empty());
 
         let bar = if phone {

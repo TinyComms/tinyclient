@@ -1306,6 +1306,33 @@ fn plain(text: &tl::enums::TextWithEntities) -> &str {
     &text.text
 }
 
+/// Keep the shared poll state for callers while the quiz card preserves Telegram's hand-off.
+fn shared_poll(poll: &tl::types::Poll, results: &tl::types::PollResults) -> protocol::Poll {
+    let hidden = results.min || (poll.hide_results_until_close && !poll.closed);
+    let mut shared = protocol::Poll::open(plain(&poll.question), std::iter::empty::<String>(), poll.multiple_choice);
+    shared.closed = poll.closed;
+    shared.closes_at = poll.close_date.map(i64::from);
+    shared.anonymous = !poll.public_voters;
+    shared.total = if hidden { None } else { results.total_voters.and_then(|total| u32::try_from(total).ok()) };
+    let results = results.results.as_deref().unwrap_or_default();
+    let answers = poll.answers.iter().filter_map(|answer| match answer {
+        tl::enums::PollAnswer::Answer(answer) => Some(answer),
+        _ => None,
+    });
+    for (index, answer) in answers.take(protocol::POLL_OPTIONS).enumerate() {
+        let result = results.iter().find_map(|result| match result {
+            tl::enums::PollAnswerVoters::Voters(result) if result.option == answer.option => Some(result),
+            _ => None,
+        });
+        if result.is_some_and(|result| result.chosen) {
+            shared.mine.push(index as u32);
+        }
+        let count = if hidden { 0 } else { result.and_then(|result| result.voters).and_then(|count| u32::try_from(count).ok()).unwrap_or(0) };
+        shared.choices.push(protocol::PollChoice { text: plain(&answer.text).to_owned(), count, ..Default::default() });
+    }
+    shared
+}
+
 /// View-once is Telegram's `ttl_seconds` of `0x7FFFFFFF`. Anything shorter is a timer.
 fn locked_media(kind: &str, ttl: Option<i32>) -> String {
     if ttl == Some(i32::MAX) {
@@ -3017,6 +3044,7 @@ pub fn map(dir: &Directory, raw: &tl::enums::Message) -> Option<Mapped> {
                         let tl::enums::Poll::Poll(poll) = &media.poll;
                         let tl::enums::PollResults::Results(results) = &media.results;
                         message.card = Some(Box::new(poll_card(poll, results)));
+                        message.poll = Some(Box::new(shared_poll(poll, results)));
                     }
                 }
             }
@@ -5275,6 +5303,8 @@ mod tests {
             other => panic!("a poll stays a hand-off, got {other:?}"),
         }
         let card = mapped.message.card.as_ref().expect("a poll is a card");
+        let poll = mapped.message.poll.as_deref().expect("shared poll");
+        assert_eq!((poll.question.as_str(), poll.mine.as_slice(), poll.choices[0].count), ("Saturday or Sunday?", &[0][..], 3));
         assert_eq!(card.title, "Saturday or Sunday?");
         assert_eq!(card.footer, "Open in Telegram");
         assert_eq!(card.text, "4 votes");

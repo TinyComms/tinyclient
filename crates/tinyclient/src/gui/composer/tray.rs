@@ -8,7 +8,8 @@ use super::Composer;
 use crate::gui::components::{glyph, menu, menu_item, tip};
 use crate::gui::theme::{self, Type};
 use crate::gui::anim::{self, Play};
-use gpui::{anchored, deferred, Anchor, div, point, prelude::*, px, rgba, AnyElement, Context, Div, MouseButton, ObjectFit, Rgba, Window};
+use crate::gui::input::{InputEvent, InputKey, TextInput};
+use gpui::{anchored, deferred, Anchor, div, point, prelude::*, px, rgba, AnyElement, Context, Div, Focusable, MouseButton, ObjectFit, Rgba, Window};
 
 const THUMB: f32 = 64.;
 const CONTROL: f32 = 20.;
@@ -90,6 +91,9 @@ fn tags(chip: &Staged) -> Vec<&'static str> {
     if chip.sends_jpeg() {
         tags.push("JPEG");
     }
+    if !chip.alt.trim().is_empty() {
+        tags.push("ALT");
+    }
     tags
 }
 
@@ -126,7 +130,7 @@ impl Composer {
             };
             row = row.child(element);
         }
-        Some(div().child(crate::gui::components::scroll::scroll_content("tray-scroll-frame", row.pb(px(16.)))))
+        Some(div().child(crate::gui::components::scroll::scroll_content("tray-scroll-frame", row.pb(px(16.)))).children(self.alt_row(window, cx)))
     }
 
     fn chip_controls(&self, chip: &Staged, options: Options, cx: &mut Context<Self>) -> Div {
@@ -298,6 +302,12 @@ impl Composer {
                 this.toggle_chip(id, |chip| chip.spoiler = !chip.spoiler, cx);
             })));
         }
+        if options.alt_text {
+            let described = !chip.alt.trim().is_empty();
+            items = items.child(slot(menu_item(("opt-alt", id), check(described), "Add description", None), described).on_click(cx.listener(move |this, _, window, cx| {
+                this.begin_alt(id, window, cx);
+            })));
+        }
         if options.as_file {
             items = items.child(slot(menu_item(("opt-file", id), check(chip.as_file), "Send as file", None), chip.as_file).on_click(cx.listener(move |this, _, _, cx| {
                 this.toggle_chip(id, |chip| chip.as_file = !chip.as_file, cx);
@@ -314,6 +324,71 @@ impl Composer {
         }));
         let layer = deferred(anchored().anchor(Anchor::BottomLeft).offset(point(px(0.), px(-6.))).snap_to_window_with_margin(px(8.)).child(items)).priority(2);
         Some(div().absolute().top_0().left_0().child(layer).into_any_element())
+    }
+
+    /// The description field under the chips, while one picture is being described.
+    fn alt_row(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<Div> {
+        let (id, field) = self.alt_for.clone()?;
+        if !self.tray.iter().any(|chip| chip.id == id) {
+            return None;
+        }
+        let focused = field.focus_handle(cx).is_focused(window);
+        Some(
+            div()
+                .px(px(8.))
+                .pb(px(8.))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(crate::gui::components::field(focused).child(div().flex_1().min_w_0().child(field))),
+        )
+    }
+
+    /// Opens the description field for one chip. Return keeps it, Escape puts back what it was.
+    fn begin_alt(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        self.chip_menu = None;
+        let previous = self.tray.iter().find(|chip| chip.id == id).map(|chip| chip.alt.clone()).unwrap_or_default();
+        let field = cx.new(|cx| TextInput::new("Describe this picture", cx));
+        field.update(cx, |field, cx| field.set_text(&previous, cx));
+        cx.subscribe(&field, |this, _, event: &InputEvent, cx| {
+            let finish = matches!(event, InputEvent::Submit);
+            if finish || matches!(event, InputEvent::Changed) {
+                this.keep_alt(finish, cx);
+            }
+            if finish {
+                this.alt_for = None;
+                this.focus_next = true;
+                cx.notify();
+            }
+        })
+        .detach();
+        cx.subscribe(&field, move |this, _, event: &InputKey, cx| {
+            if *event == InputKey::Escape {
+                if let Some(chip) = this.tray.iter_mut().find(|chip| chip.id == id) {
+                    chip.alt = previous.clone();
+                }
+                this.alt_for = None;
+                this.focus_next = true;
+                cx.notify();
+            }
+        })
+        .detach();
+        window.focus(&field.focus_handle(cx), cx);
+        self.alt_for = Some((id, field));
+        cx.notify();
+    }
+
+    /// Copies the field onto the chip. `finish` trims it; while typing only the length is cut,
+    /// so a space between words stays until Return.
+    fn keep_alt(&mut self, finish: bool, cx: &mut Context<Self>) {
+        let Some((id, field)) = self.alt_for.clone() else { return };
+        let typed = field.read(cx).text().to_owned();
+        let limited: String = typed.chars().take(protocol::ALT_LIMIT).collect();
+        if limited != typed {
+            field.update(cx, |field, cx| field.set_text(&limited, cx));
+        }
+        if let Some(chip) = self.tray.iter_mut().find(|chip| chip.id == id) {
+            chip.alt = if finish { protocol::clip_alt(&limited) } else { limited };
+        }
+        cx.notify();
     }
 }
 

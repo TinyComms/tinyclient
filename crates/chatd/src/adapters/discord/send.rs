@@ -135,6 +135,17 @@ pub(super) fn upload_limit(premium: u8, tier: u8) -> u64 {
 }
 
 impl Discord {
+    pub(super) fn poll_send_rules(&self, channel: &str) -> Result<protocol::SendRules, Refusal> {
+        let row = self.ctx.known(channel).ok().flatten().ok_or_else(|| Refusal::Refused("This conversation is gone.".into()))?;
+        Ok(protocol::SendRules { send_polls: self.can_send_poll(channel, self.guild_of(&row).as_deref(), row.parent.as_deref()), ..Default::default() })
+    }
+
+    fn can_send_poll(&self, channel: &str, guild: Option<&str>, parent: Option<&str>) -> bool {
+        let Some(guild) = guild else { return true };
+        let permissions = self.channel_permission_bits(guild, channel)
+            .or_else(|| parent.and_then(|parent| self.channel_permission_bits(guild, parent)));
+        permissions.is_none_or(|bits| bits & model::SEND_POLLS != 0)
+    }
     /// Whether this account has Discord's `SEND_VOICE_MESSAGES` permission in `channel`.
     /// Direct and group messages always allow voice messages; for a server channel (or thread
     /// under one), check the kept channel's computed permissions.
@@ -217,6 +228,14 @@ impl Discord {
         let conversation = self.ctx.known(channel).map_err(|err| err.to_string())?;
         let conversation = conversation.ok_or_else(|| "This conversation is gone.".to_owned())?;
         let guild = self.guild_of(&conversation);
+        let poll = if let Some(draft) = &with.poll {
+            if !self.can_send_poll(channel, guild.as_deref(), conversation.parent.as_deref()) {
+                return Err("You don't have permission to send polls in this channel.".into());
+            }
+            Some(super::polls::create_body(draft)?)
+        } else {
+            None
+        };
         let tier = guild
             .as_deref()
             .and_then(|guild| self.state.lock().unwrap().guilds.get(guild).map(|info| info.premium_tier))
@@ -239,7 +258,11 @@ impl Discord {
         }
 
         let nitro = matches!(premium, 1..=3);
-        let mut content = if with.voice.is_some() { String::new() } else { text.to_owned() };
+        let mut content = if with.voice.is_some() || with.poll.as_ref().is_some_and(|draft| text == format!("Poll: {}", draft.question)) {
+            String::new()
+        } else {
+            text.to_owned()
+        };
         if with.voice.is_none() && !nitro {
             content = rewrite_locked_emoji(&content, &self.sendable_emoji(guild.as_deref()));
         }
@@ -280,6 +303,9 @@ impl Discord {
             "flags": flags,
             "mobile_network_type": "unknown",
         });
+        if let Some(poll) = poll {
+            body["poll"] = poll;
+        }
         if !attachments.is_empty() {
             body["attachments"] = json!(attachments);
         }
@@ -347,6 +373,10 @@ impl Discord {
                 return Err(why);
             }
             let mut entry = json!({"id": at.to_string(), "filename": name, "uploaded_filename": slot.upload_filename});
+            // A description goes on the message only, and only when there is one.
+            if let Some(alt) = up.files().get(at).map(|file| file.alt.as_str()).filter(|alt| !alt.is_empty()) {
+                entry["description"] = json!(alt);
+            }
             if let Some(voice) = voice {
                 entry["duration_secs"] = json!(f64::from(voice.duration) / 1000.0);
                 entry["waveform"] = json!(encode_waveform(&voice.waveform));

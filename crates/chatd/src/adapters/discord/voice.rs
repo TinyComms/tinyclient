@@ -2,7 +2,7 @@
 //! voice session Discord gives out, and reports who is in which voice channel, who is in the
 //! call, who is ringing, and when the other side picked up.
 
-use super::super::{Failure, Picture};
+use super::super::{Failure, Picture, Refusal};
 use super::model::{self, VoiceState};
 use super::rest::Refused;
 use super::Discord;
@@ -14,8 +14,107 @@ use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+mod settings;
+
 /// Voice states remembered across every server. A person in a voice channel is one entry.
 const HEARD: usize = 2_000;
+
+#[derive(Deserialize)]
+pub(super) struct ChannelStatus {
+    id: String,
+    status: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct ChannelStatuses {
+    guild_id: String,
+    channels: Vec<ChannelStatus>,
+}
+
+impl Discord {
+    pub(super) fn voice_channel_status(&self, update: ChannelStatus) {
+        let status = update.status.map(|text| {
+            let text: String = text.lines().next().unwrap_or_default().chars().take(500).collect();
+            let files: Vec<_> = text.split_inclusive('>').filter_map(|fragment| {
+                let start = fragment.rfind('<')?;
+                let (_, id, animated) = protocol::discord_emoji_token(&fragment[start..])?;
+                Some(model::emoji(id, animated))
+            }).collect();
+            let _ = self.ctx.media(&files);
+            text
+        });
+        self.ctx.voice_status(&update.id, status);
+    }
+
+    pub(super) fn voice_channel_statuses(&self, update: ChannelStatuses) {
+        let current: HashSet<_> = update.channels.iter().map(|status| status.id.as_str()).collect();
+        for key in self.ctx.voice_status_channels(&update.guild_id) {
+            if !current.contains(key.id.as_str()) {
+                self.ctx.voice_status(&key.id, None);
+            }
+        }
+        for status in update.channels {
+            self.voice_channel_status(status);
+        }
+    }
+
+    pub(super) fn set_voice_status(&self, channel: &str, status: Option<String>) -> Result<(), Refusal> {
+        let row = self.ctx.known(channel).ok().flatten().filter(|row| row.kind == ConversationKind::Voice)
+            .ok_or_else(|| Refusal::Refused("This voice channel is no longer available.".into()))?;
+        let joined = {
+            let state = self.state.lock().unwrap();
+            state.voice.states.get(&state.me).is_some_and(|heard| heard.channel == channel)
+        };
+        if !row.rights.set_voice_status || (!joined && !row.rights.rename) {
+            return Err(Refusal::Refused("You cannot set this voice channel's status.".into()));
+        }
+        let status = status.map(|text| text.trim().chars().take(500).collect::<String>()).filter(|text| !text.is_empty());
+        self.call("PUT", &format!("/channels/{channel}/voice-status"), Some(json!({"status": status})))
+            .map(|_| ()).map_err(super::refusal)
+    }
+
+    /// The current channel and guild are checked against the latest gateway state.
+    fn voice_target(&self, channel: &str, person: &str) -> Result<String, Refusal> {
+        let state = self.state.lock().unwrap();
+        state.voice.states.get(person).filter(|heard| heard.channel == channel && person != state.me)
+            .and_then(|heard| heard.guild.clone())
+            .ok_or_else(|| Refusal::Refused("That participant is no longer in this server voice channel.".into()))
+    }
+
+    pub(super) fn moderate_voice(&self, channel: &str, person: &str, mute: Option<bool>, deaf: Option<bool>) -> Result<(), Refusal> {
+        let guild = self.voice_target(channel, person)?;
+        let mut body = serde_json::Map::new();
+        if let Some(mute) = mute {
+            self.require_channel_perm(&guild, channel, model::MUTE_MEMBERS, "server mute this participant")?;
+            body.insert("mute".into(), json!(mute));
+        }
+        if let Some(deaf) = deaf {
+            self.require_channel_perm(&guild, channel, model::DEAFEN_MEMBERS, "server deafen this participant")?;
+            body.insert("deaf".into(), json!(deaf));
+        }
+        if body.is_empty() {
+            return Ok(());
+        }
+        self.call("PATCH", &format!("/guilds/{guild}/members/{person}"), Some(Value::Object(body)))
+            .map(|_| ()).map_err(super::refusal)
+    }
+
+    pub(super) fn move_in_voice(&self, channel: &str, person: &str, to: Option<&str>) -> Result<(), Refusal> {
+        let guild = self.voice_target(channel, person)?;
+        self.require_channel_perm(&guild, channel, model::MOVE_MEMBERS, "move or disconnect this participant")?;
+        if let Some(to) = to {
+            let valid = self.ctx.known(to).ok().flatten().is_some_and(|row| {
+                row.kind == ConversationKind::Voice && row.space.as_deref() == Some(guild.as_str())
+                    && self.channel_permission_bits(&guild, to).is_some_and(|bits| bits & model::CONNECT != 0)
+            });
+            if !valid {
+                return Err(Refusal::Refused("Choose a voice channel you can join on this server.".into()));
+            }
+        }
+        self.call("PATCH", &format!("/guilds/{guild}/members/{person}"), Some(json!({"channel_id": to})))
+            .map(|_| ()).map_err(super::refusal)
+    }
+}
 /// How long Discord has to hand out a voice session.
 const PATIENCE: Duration = Duration::from_secs(15);
 /// How long our own voice state has to show up in a direct call before the other side is rung.
@@ -251,6 +350,8 @@ pub struct Voice {
     call: Option<Joining>,
     /// Direct conversations with a call going on.
     calls: HashSet<String>,
+    call_regions: HashMap<String, String>,
+    regions: Option<(Instant, Vec<protocol::DiscordVoiceRegion>)>,
     /// Direct conversations whose call is ringing us.
     ringing: HashSet<String>,
     /// User ids currently being rung per direct/group call, from `CALL_CREATE` / `CALL_UPDATE`.
@@ -300,6 +401,7 @@ pub struct ServerUpdate {
 #[derive(Deserialize)]
 pub struct CallEvent {
     channel_id: String,
+    region: Option<String>,
     #[serde(default)]
     ringing: Vec<String>,
     #[serde(default)]
@@ -494,6 +596,7 @@ impl Discord {
             .filter(|channel| self.ctx.known(channel).ok().flatten().is_some_and(|row| row.call == CallSupport::Handoff))
             .collect();
         let mut changed = BTreeSet::new();
+        let emptied;
         let mut media_files: Vec<(MediaFile, String)> = Vec::new();
         {
             let mut state = self.state.lock().unwrap();
@@ -540,6 +643,11 @@ impl Discord {
                 changed.insert(channel.clone());
                 state.voice.states.insert(voice.user_id.clone(), heard);
             }
+            emptied = changed.iter().filter(|channel| !state.voice.states.values().any(|heard| &heard.channel == *channel))
+                .cloned().collect::<Vec<_>>();
+        }
+        for channel in emptied {
+            self.ctx.voice_status(&channel, None);
         }
         if !media_files.is_empty() {
             let _ = self.ctx.media(&media_files);
@@ -1072,6 +1180,11 @@ impl Discord {
         {
             let mut state = self.state.lock().unwrap();
             state.voice.calls.insert(event.channel_id.clone());
+            if let Some(region) = event.region.as_ref().filter(|region| !region.is_empty() && region.len() <= 64) {
+                if state.voice.call_regions.contains_key(&event.channel_id) || state.voice.call_regions.len() < HEARD {
+                    state.voice.call_regions.insert(event.channel_id.clone(), region.clone());
+                }
+            }
             if event.ringing.is_empty() {
                 state.voice.ringing_out.remove(&event.channel_id);
             } else {
@@ -1146,6 +1259,7 @@ impl Discord {
         {
             let mut state = self.state.lock().unwrap();
             state.voice.calls.remove(&event.channel_id);
+            state.voice.call_regions.remove(&event.channel_id);
             state.voice.ringing.remove(&event.channel_id);
             state.voice.ringing_out.remove(&event.channel_id);
             state.voice.states.retain(|_, heard| heard.channel != event.channel_id);

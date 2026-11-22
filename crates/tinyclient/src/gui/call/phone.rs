@@ -484,6 +484,10 @@ impl Shell {
     fn call_phone_header(&self, call: &Call, subject: &Subject, hero: bool, cx: &mut Context<Self>) -> Div {
         let network = call.conversation.network;
         let place = subject.space.clone().unwrap_or_else(|| network.label().to_owned());
+        let voice_status = self.snapshot.as_ref().and_then(|snapshot| snapshot.open.as_ref())
+            .filter(|row| row.key == call.conversation).cloned()
+            .or_else(|| self.sidebar_state.find(&self.trees, &call.conversation))
+            .as_ref().and_then(crate::gui::sidebar::discord_voice_status);
         // A hero says the state under the name, with a ring's count: the header keeps to where.
         let (state, color) = match call.state {
             _ if self.call_muted_talking(call) => (Some("You're muted"), theme::danger()),
@@ -544,7 +548,11 @@ impl Shell {
             .phone_preview()
             .text_color(color)
             .child(div().flex_none().child(network_icon(network, 13.)))
-            .child(div().min_w_0().truncate().text_color(theme::text_soft()).child(place))
+            .child(if let Some(status) = voice_status {
+                self.voice_status_line(&call.conversation, &status, cx)
+            } else {
+                div().min_w_0().truncate().text_color(theme::text_soft()).child(place)
+            })
             .children(state.map(|words| div().flex_none().flex().gap(px(5.)).child(dot()).child(words)))
             .children(clock.map(|clock| div().flex_none().flex().gap(px(5.)).child(dot()).child(clock)))
             .children(signal)

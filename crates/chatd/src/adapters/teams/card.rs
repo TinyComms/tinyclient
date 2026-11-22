@@ -272,7 +272,7 @@ fn try_parse_poll(entry: &Value, content: &Value, message_id: &str) -> Option<(P
                 .map(str::to_owned)
                 .unwrap_or_else(|| ix.to_string());
             let count = ch["voteCount"].as_u64().or_else(|| ch["count"].as_u64()).unwrap_or(0) as u32;
-            choices.push(PollChoice { text: title, count, voters: Vec::new() });
+            choices.push(PollChoice { text: title, count, ..PollChoice::default() });
             option_values.push(value);
         }
     }
@@ -300,7 +300,7 @@ fn try_parse_poll(entry: &Value, content: &Value, message_id: &str) -> Option<(P
                         existing.count = existing.count.max(count);
                     } else if choice_set.is_none() && !left.is_empty() {
                         option_values.push(choices.len().to_string());
-                        choices.push(PollChoice { text: left, count, voters: Vec::new() });
+                        choices.push(PollChoice { text: left, count, ..PollChoice::default() });
                     }
                 }
             }

@@ -13,7 +13,7 @@ use serde_json::{json, Map, Value};
 
 /// Validates and maps a channel name (trimmed, 1..=100 chars).
 /// A store or session failure while applying a change we just made, as the request's refusal.
-fn failed(err: super::super::Failure) -> Refusal {
+pub(super) fn failed(err: super::super::Failure) -> Refusal {
     match err {
         super::super::Failure::SignedOut(why) | super::super::Failure::Dropped(why) => Refusal::Refused(why),
     }

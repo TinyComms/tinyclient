@@ -155,6 +155,7 @@ struct Reading {
 struct Live {
     typing: HashMap<Key, Vec<Typist>>,
     occupants: HashMap<Key, Occupants>,
+    voice_status: HashMap<Key, (String, String)>,
     presence: HashMap<Key, Shown>,
     watching: Arc<Watching>,
     asked: Instant,
@@ -237,6 +238,7 @@ impl Hub {
             live: Mutex::new(Live {
                 typing: HashMap::new(),
                 occupants: HashMap::new(),
+                voice_status: HashMap::new(),
                 presence: HashMap::new(),
                 watching: Arc::default(),
                 asked: Instant::now(),
@@ -802,6 +804,39 @@ impl Hub {
         lock(&self.live).occupants.get(conversation).cloned()
     }
 
+    pub fn set_voice_status(&self, conversation: Key, status: Option<String>) {
+        let guild = self.store().conversation(&conversation).ok().flatten()
+            .filter(|row| row.kind == protocol::ConversationKind::Voice)
+            .and_then(|row| row.space);
+        {
+            let mut live = lock(&self.live);
+            if let Some((guild, status)) = guild.zip(status.filter(|status| !status.is_empty())) {
+                if let Some((_, previous)) = live.voice_status.get_mut(&conversation) {
+                    if previous == &status {
+                        return;
+                    }
+                    *previous = status;
+                } else if live.voice_status.len() < OCCUPIED {
+                    live.voice_status.insert(conversation.clone(), (guild, status));
+                } else {
+                    return;
+                }
+            } else if live.voice_status.remove(&conversation).is_none() {
+                return;
+            }
+        }
+        self.changed(Change::Conversation { conversation });
+    }
+
+    pub fn voice_status(&self, conversation: &Key) -> Option<String> {
+        lock(&self.live).voice_status.get(conversation).map(|(_, status)| status.clone())
+    }
+
+    pub fn voice_status_channels(&self, account: &AccountKey, guild: &str) -> Vec<Key> {
+        lock(&self.live).voice_status.iter().filter(|(key, (space, _))| key.account() == *account && space == guild)
+            .map(|(key, _)| key.clone()).collect()
+    }
+
     /// Records when this account may send again in a slowmode conversation (Unix seconds).
     /// Never stored; announced via `Change::Conversation`.
     pub fn set_slowmode_until(&self, conversation: Key, until: i64) {
@@ -875,15 +910,20 @@ impl Hub {
     }
 
     fn drop_live(&self, account: &AccountKey, keep: Option<&Key>) {
-        let emptied: Vec<Key> = {
+        let (emptied, statuses): (Vec<Key>, Vec<Key>) = {
             let mut live = lock(&self.live);
             live.presence.retain(|person, _| person.account() != *account || Some(person) == keep);
             live.typing.retain(|conversation, _| conversation.account() != *account);
             live.slowmode.retain(|conversation, _| conversation.account() != *account);
             let emptied = live.occupants.keys().filter(|conversation| conversation.account() == *account).cloned().collect();
             live.occupants.retain(|conversation, _| conversation.account() != *account);
-            emptied
+            let statuses = live.voice_status.keys().filter(|key| key.account() == *account).cloned().collect();
+            live.voice_status.retain(|key, _| key.account() != *account);
+            (emptied, statuses)
         };
+        for conversation in statuses {
+            self.changed(Change::Conversation { conversation });
+        }
         for conversation in emptied {
             self.changed(Change::Occupants { conversation, occupants: Occupants::default() });
         }

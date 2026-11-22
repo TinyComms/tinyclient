@@ -1824,6 +1824,19 @@ pub enum Command {
         propose: Option<i64>,
         reply: Reply<()>,
     },
+    SetVoiceChannelStatus { conversation_id: String, status: Option<String>, reply: Reply<()> },
+    PollVoters { conversation_id: String, message_id: String, choice: u32, after: Option<String>, reply: Reply<ReactorsPage> },
+    DiscordVoiceSettings { conversation_id: String, reply: Reply<protocol::DiscordVoiceSettings> },
+    EditDiscordVoiceChannel { conversation_id: String, edit: protocol::DiscordChannelVoice, reply: Reply<()> },
+    SetDiscordCallRegion { conversation_id: String, region: String, reply: Reply<()> },
+    CallModerate {
+        conversation_id: String,
+        person_id: String,
+        server_muted: Option<bool>,
+        server_deafened: Option<bool>,
+        reply: Reply<()>,
+    },
+    CallMove { conversation_id: String, person_id: String, to: Option<String>, reply: Reply<()> },
     /// mediad is up: join or ring on the network, then report through [`Context::voice`].
     CallJoin(String),
     /// Leave, cancel or decline on the network. Also sent when the call failed here (mediad
@@ -2016,12 +2029,18 @@ impl Command {
             | Command::UpdateChatSettings { reply, .. }
             | Command::SetDefaultSendAs { reply, .. }
             | Command::EditChannel { reply, .. }
+            | Command::SetVoiceChannelStatus { reply, .. }
+            | Command::EditDiscordVoiceChannel { reply, .. }
+            | Command::SetDiscordCallRegion { reply, .. }
+            | Command::CallModerate { reply, .. }
+            | Command::CallMove { reply, .. }
             | Command::MoveChannels { reply, .. }
             | Command::DeleteChannel { reply, .. }
             | Command::SetOverwrite { reply, .. }
             | Command::DeleteOverwrite { reply, .. }
             | Command::SyncChannelPermissions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ChannelPermissions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::DiscordVoiceSettings { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::AuditLog { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::AutomodRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SaveAutomodRule { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
@@ -2203,6 +2222,7 @@ impl Command {
             | Command::SetDefaultReaction { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendRules { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::Reactors { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
+            Command::PollVoters { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::ClearReactions { reply, .. } => drop(reply.send(Err(Refusal::Unsupported))),
             Command::SendWith { conversation_id, client_id, .. } => {
                 let why = format!("Sending files and options is not built for {} yet.", ctx.account.network.label());
@@ -2514,6 +2534,14 @@ impl Context {
     /// is not announced: the row is told alone.
     pub fn occupants(&self, conversation_id: &str, people: Vec<Occupant>, total: u32) {
         self.hub.set_occupants(self.key(conversation_id), Occupants { people, total });
+    }
+
+    pub fn voice_status(&self, conversation_id: &str, status: Option<String>) {
+        self.hub.set_voice_status(self.key(conversation_id), status);
+    }
+
+    pub fn voice_status_channels(&self, guild_id: &str) -> Vec<Key> {
+        self.hub.voice_status_channels(&self.account, guild_id)
     }
 
     /// Records when this account may send again in a slowmode conversation (Unix seconds).
@@ -3172,6 +3200,11 @@ impl Context {
     /// A Tiny server's people, roles, invites or rooms changed: the shell reads them again.
     pub fn community_changed(&self) {
         self.hub.changed(Change::Tiny { account: self.account.clone() });
+    }
+
+    /// Something was pinned or unpinned in a conversation.
+    pub fn pins_changed(&self, conversation_id: &str) {
+        self.hub.changed(Change::Pins { conversation: self.key(conversation_id) });
     }
 
     /// Rows of a conversation's member list were added, removed or moved.

@@ -764,6 +764,7 @@ fn a_file_is_sent_with_its_attachment_and_the_phones_copy_does_not_replace_it() 
         reply_to: None,
         with: protocol::Outgoing {
             files: vec![protocol::OutgoingFile {
+                alt: String::new(),
                 path: path.to_string_lossy().into_owned(),
                 name: "card.png".into(),
                 spoiler: false,
@@ -1228,7 +1229,7 @@ fn a_group_poll_shows_its_counts_and_a_vote_reaches_the_wire() {
         reply_to: None,
         with: Outgoing {
             poll: Some(PollDraft { question: "Dinner?".into(), options: vec!["Thai".into(), "Pizza".into()], multiple: false, ..PollDraft::default() }),
-            files: vec![OutgoingFile { path: "missing.txt".into(), name: String::new(), spoiler: false, as_file: false, original: false, view_once: false, media: None }],
+            files: vec![OutgoingFile { alt: String::new(), path: "missing.txt".into(), name: String::new(), spoiler: false, as_file: false, original: false, view_once: false, media: None }],
             ..Outgoing::default()
         },
     };
@@ -3097,6 +3098,7 @@ fn voice_messages_download_populate_waveform_send_viewed_receipt_and_can_be_sent
         reply_to: None,
         with: Outgoing {
             files: vec![OutgoingFile {
+                alt: String::new(),
                 path: recorded_path.to_string_lossy().into_owned(),
                 name: "voice-message.ogg".into(),
                 spoiler: false,

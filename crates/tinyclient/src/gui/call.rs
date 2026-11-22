@@ -1527,6 +1527,13 @@ impl Shell {
                     this.open_profile(profile_key.clone(), event.position(), cx);
                 })),
             );
+        if account.network == Network::Discord {
+            if let Some(call) = self.call_now().filter(|call| call.conversation.account() == account) {
+                if let (Some(row), Some(participant)) = (self.discord_voice_row(&call.conversation), call.participants.iter().find(|p| p.id == user_id)) {
+                    items = items.children(self.discord_voice_actions(&row, &person_key, participant.server_muted, participant.server_deafened, cx));
+                }
+            }
+        }
         if account.network == Network::Tiny {
             if let Some(page) = self.tiny_page_facts().filter(|page| page.account == &account) {
                 let facts = super::tiny::model::person_menu(page.community, user_id);

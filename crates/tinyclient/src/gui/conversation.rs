@@ -351,6 +351,16 @@ impl EventEmitter<PaneEvent> for Pane {}
 /// Where each row drawn in a frame is.
 type Seen = Rc<RefCell<Vec<(usize, Bounds<Pixels>)>>>;
 
+#[derive(Default)]
+struct PollVoterList {
+    message_id: String,
+    choice: u32,
+    voters: Vec<protocol::Reactor>,
+    loading: bool,
+    more: bool,
+    error: Option<String>,
+}
+
 /// The messages of one conversation, or of one thread.
 pub struct Pane {
     metrics: Metrics,
@@ -410,6 +420,9 @@ pub struct Pane {
     shown: HashSet<String>,
     /// Polls where the user toggled "Show results" before voting, by message id.
     poll_results: HashSet<String>,
+    poll_voting: HashSet<String>,
+    poll_voters: Option<PollVoterList>,
+    poll_voters_task: Option<gpui::Task<()>>,
     /// Shared-contact phone numbers revealed by clicking them, keyed by "{msg_id}:{phone}".
     revealed_contacts: HashSet<String>,
     /// Long code blocks opened, by message and block.
@@ -636,6 +649,9 @@ impl Pane {
             revealed: HashSet::new(),
             shown: HashSet::new(),
             poll_results: HashSet::new(),
+            poll_voting: HashSet::new(),
+            poll_voters: None,
+            poll_voters_task: None,
             revealed_contacts: HashSet::new(),
             expanded: HashSet::new(),
             revealed_blocked: HashSet::new(),
@@ -742,6 +758,53 @@ impl Pane {
             self.poll_results.insert(message_id);
         }
         cx.notify();
+    }
+
+    pub(super) fn toggle_poll_voters(&mut self, message_id: String, choice: u32, cx: &mut Context<Self>) {
+        self.poll_voters_task = None;
+        if self.poll_voters.as_ref().is_some_and(|list| list.message_id == message_id && list.choice == choice) {
+            self.poll_voters = None;
+            cx.notify();
+            return;
+        }
+        self.poll_voters = Some(PollVoterList { message_id, choice, ..PollVoterList::default() });
+        self.load_poll_voters(cx);
+    }
+
+    pub(super) fn load_poll_voters(&mut self, cx: &mut Context<Self>) {
+        let Some(conversation) = self.open.as_ref().map(|open| open.key.clone()) else { return };
+        let Some(list) = self.poll_voters.as_mut().filter(|list| !list.loading) else { return };
+        let message_id = list.message_id.clone();
+        let choice = list.choice;
+        let after = list.voters.last().map(|voter| voter.key.id.clone());
+        let request = Request::PollVoters { conversation: conversation.clone(), message_id: message_id.clone(), choice, after };
+        list.loading = true;
+        list.error = None;
+        cx.notify();
+        self.poll_voters_task = Some(cx.spawn(async move |pane, cx| {
+            let result = cx.background_executor().spawn(async move { ask(&request) }).await;
+            let _ = pane.update(cx, |this, cx| {
+                if this.open.as_ref().is_none_or(|open| open.key != conversation) {
+                    return;
+                }
+                let Some(list) = this.poll_voters.as_mut().filter(|list| list.message_id == message_id && list.choice == choice) else { return };
+                list.loading = false;
+                match result {
+                    Ok(Response::PollVoters { voters, more }) => {
+                        let before = list.voters.len();
+                        for voter in voters {
+                            if !list.voters.iter().any(|known| known.key == voter.key) {
+                                list.voters.push(voter);
+                            }
+                        }
+                        list.more = more && list.voters.len() > before && list.voters.len() < 250;
+                    }
+                    Ok(Response::Error { detail, .. }) => list.error = Some(detail),
+                    _ => list.error = Some("Could not read the voters.".to_owned()),
+                }
+                cx.notify();
+            });
+        }));
     }
 
     pub(super) fn toggle_contact_reveal(&mut self, key: String, cx: &mut Context<Self>) {
@@ -886,12 +949,24 @@ impl Pane {
         let Some(conversation) = self.open.as_ref().map(|open| open.key.clone()) else {
             return;
         };
+        if !self.poll_voting.insert(message_id.clone()) {
+            return;
+        }
+        self.poll_voters = None;
+        self.poll_voters_task = None;
+        let pending = message_id.clone();
+        let target = conversation.clone();
+        cx.notify();
         cx.spawn(async move |pane, cx| {
             let answer = cx
                 .background_executor()
                 .spawn(async move { ask(&Request::Poll { conversation, message_id, votes }) })
                 .await;
             let _ = pane.update(cx, |this, cx| {
+                if this.open.as_ref().is_none_or(|open| open.key != target) {
+                    return;
+                }
+                this.poll_voting.remove(&pending);
                 if let Ok(Response::Error { detail, .. }) = answer {
                     let shell = this.shell.clone();
                     cx.defer(move |cx| {
@@ -1029,6 +1104,10 @@ impl Pane {
         self.translations.clear();
         self.fetched_reactors.clear();
         self.reactors_loading = None;
+        self.poll_results.clear();
+        self.poll_voting.clear();
+        self.poll_voters = None;
+        self.poll_voters_task = None;
         self.translations.clear();
         self.translating.clear();
         // Where the one being left was, for coming back to it.
@@ -2067,7 +2146,10 @@ impl Pane {
             .iter()
             .filter(|(_, bounds)| on_screen(bounds))
             .filter_map(|(ix, _)| self.items.get(*ix).and_then(Item::message))
-            .any(|message| message.spans.iter().any(|span| matches!(span.style, protocol::Style::Time { form: 'R', .. })));
+            .any(|message| {
+                message.spans.iter().any(|span| matches!(span.style, protocol::Style::Time { form: 'R', .. }))
+                    || message.poll.as_ref().is_some_and(|poll| !poll.closed && poll.closes_at.is_some_and(|expiry| expiry > crate::view::now()))
+            });
         self.sync_relative_timer(has_relative_time, cx);
         self.resolve_visible_invites(&seen, viewport, cx);
         let newest = seen

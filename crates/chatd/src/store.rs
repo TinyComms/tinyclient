@@ -925,6 +925,9 @@ fn preview_of(message: &Message) -> String {
     if !message.text.is_empty() {
         return without_spoilers(&message.text, &message.spans).chars().take(120).collect();
     }
+    if let Some(poll) = &message.poll {
+        return format!("Poll: {}", poll.question).chars().take(120).collect();
+    }
     let Some(first) = message.attachments.first() else {
         if let Some(contact) = message.contacts.first() {
             let label = if contact.name.trim().is_empty() {

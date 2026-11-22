@@ -212,12 +212,8 @@ fn angle(rich: &mut Rich, text: &str, names: &dyn Names, guild: Option<&str>) ->
         if let Some(guild) = guild.filter(|g| digits(g)) {
             rich.span(start, Style::Link { url: format!("https://discord.com/channels/{guild}/{suffix}") });
         }
-    } else if let Some(emoji) = inner.strip_prefix("a:").or_else(|| inner.strip_prefix(':')) {
-        let (name, id) = emoji.split_once(':')?;
-        if !digits(id) || name.is_empty() {
-            return None;
-        }
-        let (file, url) = model::emoji(id, inner.starts_with("a:"));
+    } else if let Some((name, id, animated)) = protocol::discord_emoji_token(&text[..=end]) {
+        let (file, url) = model::emoji(id, animated);
         rich.text.push_str(&format!(":{name}:"));
         rich.span(start, Style::Emoji { file: file.clone() });
         rich.files.push((file, url));
@@ -596,11 +592,14 @@ fn attachment(rich: &mut Rich, attached: &Attached, blur_explicit: bool) -> Atta
         }
         thumb
     });
+    // A title the sender gave the file is the name shown; a blank one is no title.
+    let name = attached.title.as_deref().map(str::trim).filter(|title| !title.is_empty()).unwrap_or(&attached.filename);
     Attachment {
+        alt: protocol::clip_alt(attached.description.as_deref().unwrap_or("")),
         spoiler: attached.spoiler() || (blur_explicit && attached.is_explicit()),
         sticker: false,
         waveform: waveform(attached.waveform.as_deref()),
-        name: attached.filename.clone(),
+        name: name.to_owned(),
         file,
         thumb,
         preview: None,
@@ -636,6 +635,7 @@ fn sticker(rich: &mut Rich, sticker: &model::Sticker) -> Attachment {
     }
     rich.files.push((file.clone(), url));
     Attachment {
+        alt: String::new(),
         spoiler: false,
         sticker: true,
         waveform: Vec::new(),
@@ -736,21 +736,52 @@ fn whole_seconds(value: f64) -> u32 {
     value.round().clamp(0.0, u32::MAX as f64) as u32
 }
 
-/// What a bot or webhook composed, as the one framed card a message can carry. Its text is
-/// plain: the markup goes, the words stay.
-fn card(embed: &Embed, names: &dyn Names) -> Card {
+/// A small picture of an embed (an author's or footer's icon), from Discord's proxy only.
+fn embed_icon(rich: &mut Rich, id: String, proxy: Option<&str>) -> Option<MediaFile> {
+    let proxy = proxy.filter(|proxy| !proxy.is_empty())?;
+    let file = MediaFile { width: 40, height: 40, ..MediaFile::new(id, MediaKind::Image) };
+    rich.files.push((file.clone(), resized(proxy, 40, 40, false)));
+    Some(file)
+}
+
+/// What a bot or webhook composed, as a framed card. Its description keeps its styles and
+/// links; a title, a field and a footer are plain: the markup goes, the words stay. Pictures
+/// come from Discord's proxy or not at all.
+fn card(rich: &mut Rich, message: &str, index: usize, embed: &Embed, names: &dyn Names, blur_explicit: bool) -> Card {
     let plain = |text: &str| {
         let mut rich = Rich::default();
         markdown(&mut rich, text, names);
         rich.text
     };
-    let author = embed.author.as_ref().map_or("", |author| author.name.as_str());
-    let title = embed.title.as_deref().filter(|title| !title.is_empty()).unwrap_or(author);
+    let mut said = Rich::default();
+    markdown(&mut said, embed.description.as_deref().unwrap_or(""), names);
+    // A custom emoji in the description is fetched like one in a message.
+    rich.files.merge(std::mem::take(&mut said.files));
+    let link = |url: Option<&String>| url.filter(|url| is_safe_http_url(url)).cloned().unwrap_or_default();
+    let author = embed.author.as_ref();
+    let author_name = author.map_or("", |author| author.name.as_str());
+    // With no title, the author's name is the title, as before; it is not said twice.
+    let title = embed.title.as_deref().filter(|title| !title.is_empty());
+    let shown = !blur_explicit || !embed.is_explicit();
+    let thumbnail = embed.thumbnail.as_ref().filter(|_| shown);
     Card {
-        title: plain(title),
-        text: plain(embed.description.as_deref().unwrap_or("")),
+        author: title.map_or_else(String::new, |_| plain(author_name)),
+        author_link: link(author.and_then(|author| author.url.as_ref())),
+        author_icon: author.and_then(|author| embed_icon(rich, format!("embed:{message}:{index}:author"), author.proxy_icon_url.as_deref())),
+        title: plain(title.unwrap_or(author_name)),
+        title_link: link(embed.url.as_ref()),
+        text: said.text,
+        text_spans: said.spans,
         fields: embed.fields.iter().map(|field| (plain(&field.name), plain(&field.value))).collect(),
+        // Nothing to say when every field shares its row: that is what a card does anyway.
+        inline: match embed.fields.iter().all(|field| field.inline) {
+            true => Vec::new(),
+            false => embed.fields.iter().map(|field| field.inline).collect(),
+        },
         footer: embed.footer.as_ref().map_or_else(String::new, |footer| footer.text.clone()),
+        footer_icon: embed.footer.as_ref().and_then(|footer| embed_icon(rich, format!("embed:{message}:{index}:footer"), footer.proxy_icon_url.as_deref())),
+        time: embed.timestamp.as_deref().and_then(model::iso_seconds),
+        thumbnail: thumbnail.and_then(|picture| embed_still(rich, format!("embed:{message}:{index}:thumb"), picture)),
         color: embed.color,
         sponsored: false,
         ..Card::default()
@@ -895,7 +926,11 @@ fn system_line(posted: &Posted, kind: u8, who: &str, content: &str, mentioned: &
                 None => format!("{who} made a purchase."),
             }
         }
-        46 => "A poll has closed.".to_owned(),
+        46 => {
+            let winner = posted.embeds.as_deref().unwrap_or_default().iter().find(|embed| embed.kind.as_deref() == Some("poll_result"))
+                .and_then(|embed| embed_field(embed, "victor_answer_text").or_else(|| embed_field(embed, "victor_answer_emoji_name")));
+            winner.map_or_else(|| "A poll has closed.".to_owned(), |winner| format!("A poll has closed. {winner} won."))
+        }
         67 => format!("{who} accepted your friend request."),
         _ => {
             tracing::debug!(message_type = kind, "chatd: Discord: unsupported system message type");
@@ -1197,12 +1232,13 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         }
         attachments.extend(part.sticker_items.iter().map(|item| sticker(&mut rich, item)));
         // The alert's embed is the system line. A preview would glue those fields back on.
-        if kind != 24 {
+        if kind != 24 && kind != 46 {
             embeds.extend(part.embeds.as_deref().unwrap_or(&[]).iter().cloned());
         }
         composed |= part.author.as_ref().is_some_and(|author| author.bot) || part.webhook_id.is_some();
     }
-    let (card, previews, moving_pictures) = cards(&mut rich, &posted.id, &embeds, place.names, composed, place.blur_explicit);
+    let (mut composed_cards, previews, moving_pictures) = cards(&mut rich, &posted.id, &embeds, place.names, composed, place.blur_explicit);
+    let card = (!composed_cards.is_empty()).then(|| Box::new(composed_cards.remove(0)));
     attachments.extend(moving_pictures);
     if flags & model::FLAG_IS_VOICE_MESSAGE != 0 {
         for attachment in &mut attachments {
@@ -1232,12 +1268,19 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         forwarded_from = posted.message_reference.as_ref().map(|origin| Box::new(referenced(origin, place)));
     }
 
-    if let Some(poll) = &posted.poll {
-        let question = poll.question.as_ref().and_then(|question| question.text.as_deref()).unwrap_or("");
-        rich.text = format!("Poll: {question}");
-        rich.spans.clear();
-        message_kind = MessageKind::Unsupported { link: link.clone() };
-    } else if message_kind == MessageKind::Normal
+    let poll = posted.poll.as_ref().and_then(|raw| {
+        let (poll, files) = super::polls::convert(raw, None);
+        rich.files.files.extend(files);
+        poll.map(Box::new)
+    });
+    if poll.is_none() {
+        if let Some(question) = posted.poll.as_ref().and_then(|poll| poll.question.as_ref()).and_then(|question| question.text.as_deref()) {
+            rich.text = format!("Poll: {question}");
+            rich.spans.clear();
+            message_kind = MessageKind::Unsupported { link: link.clone() };
+        }
+    }
+    if poll.is_none() && message_kind == MessageKind::Normal
         && rich.text.is_empty()
         && attachments.is_empty()
         && previews.is_empty()
@@ -1346,7 +1389,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         sent_subsec_millis: 0,
         seal: protocol::Seal::Plain,
         card,
-        cards: Vec::new(),
+        cards: composed_cards,
         deleted: false,
         moderated: false,
         forwarded: forwarded_from,
@@ -1370,7 +1413,7 @@ pub fn message(posted: &Posted, place: &Place) -> (Message, Files) {
         reactions,
         reply_to,
         thread,
-        poll: None,
+        poll,
         views: None,
         edited: posted.edited_timestamp.is_some(),
         edited_at: posted.edited_timestamp.as_deref().and_then(model::iso_seconds),
@@ -1474,9 +1517,10 @@ fn remembered_flags(message: &Message) -> u64 {
     flags
 }
 
-/// The first embed a bot or webhook composed (`by_bot`, type `rich`) is the message's card;
-/// every other one is a link's preview: a person's link that Discord unfurled is `rich` too.
-/// A composed embed's picture rides along as a preview with nothing but the picture.
+/// Every embed a bot or webhook composed (`by_bot`, type `rich`) is a card, in Discord's
+/// order; every other one is a link's preview: a person's link that Discord unfurled is `rich`
+/// too. A composed embed's picture rides along as a preview with nothing but the picture, and
+/// an embed that repeats an earlier one's address is only another picture of it (a gallery).
 fn cards(
     rich: &mut Rich,
     message: &str,
@@ -1484,20 +1528,25 @@ fn cards(
     names: &dyn Names,
     by_bot: bool,
     blur_explicit: bool,
-) -> (Option<Box<Card>>, Vec<Preview>, Vec<Attachment>) {
-    let mut composed = None;
+) -> (Vec<Card>, Vec<Preview>, Vec<Attachment>) {
+    let mut composed = Vec::new();
     let mut previews = Vec::new();
     let mut moving_pictures = Vec::new();
+    let mut carded: Vec<&str> = Vec::new();
     for (index, embed) in embeds.iter().enumerate() {
         if let Some(attachment) = moving(rich, message, index, embed, blur_explicit) {
             moving_pictures.push(attachment);
             continue;
         }
-        if !by_bot || composed.is_some() || embed.kind.as_deref() != Some("rich") {
+        if !by_bot || embed.kind.as_deref() != Some("rich") {
             previews.push(preview(rich, message, index, embed, blur_explicit));
             continue;
         }
-        composed = Some(Box::new(card(embed, names)));
+        let address = embed.url.as_deref().filter(|url| !url.is_empty());
+        if !address.is_some_and(|url| carded.contains(&url)) {
+            composed.push(card(rich, message, index, embed, names, blur_explicit));
+            carded.extend(address);
+        }
         if embed.image.is_some() {
             let picture = Embed {
                 title: None,
@@ -1521,6 +1570,17 @@ fn cards(
 /// Applies the fields a partial `MESSAGE_UPDATE` carries to the message as stored.
 pub fn patch(stored: &mut Message, update: &Posted, place: &Place) -> Files {
     let mut rich = Rich::default();
+    if let Some(raw) = &update.poll {
+        let (poll, files) = super::polls::convert(raw, stored.poll.as_deref());
+        if let Some(poll) = poll {
+            stored.poll = Some(Box::new(poll));
+            stored.kind = MessageKind::Normal;
+            if update.content.is_none() && stored.text.starts_with("Poll: ") {
+                stored.text.clear();
+            }
+            rich.files.files.extend(files);
+        }
+    }
     if let Some(content) = &update.content {
         if stored.kind == MessageKind::Normal {
             markdown_in(&mut rich, content, place.names, place.guild);
@@ -1541,8 +1601,9 @@ pub fn patch(stored: &mut Message, update: &Posted, place: &Place) -> Files {
         stored.attachments.extend(stickers);
     }
     if let Some(embeds) = &update.embeds {
-        let (card, previews, moving_pictures) = cards(&mut rich, &stored.id, embeds, place.names, stored.sender.bot, place.blur_explicit);
-        stored.card = card;
+        let (mut composed, previews, moving_pictures) = cards(&mut rich, &stored.id, embeds, place.names, stored.sender.bot, place.blur_explicit);
+        stored.card = (!composed.is_empty()).then(|| Box::new(composed.remove(0)));
+        stored.cards = composed;
         stored.previews = previews;
         stored.attachments.retain(|kept| !kept.file.id.starts_with("embed:"));
         stored.attachments.extend(moving_pictures);
@@ -1695,6 +1756,7 @@ fn component_media_attachment(
     };
     rich.files.push((file.clone(), fetch_url.to_owned()));
     Some(Attachment {
+        alt: String::new(),
         name,
         file,
         thumb: None,
@@ -2711,6 +2773,7 @@ mod tests {
             channel_id: "c1".into(),
             author: Some(model::User { id: "2001".into(), username: "bea".into(), ..Default::default() }),
             attachments: Some(vec![Attached {
+                title: None, description: None,
                 id: "9001".into(),
                 filename: "pic.png".into(),
                 size: 1024,
