@@ -937,44 +937,6 @@ impl Shell {
         self.set_discord_folder(edit.key, Some(name), None, cx);
     }
 
-    /// Marks every server in the folder that still has news. One toast for the whole folder.
-    pub(super) fn mark_folder_read(&mut self, folder: Key, cx: &mut Context<Self>) {
-        let spaces: Vec<Key> = self
-            .spaces
-            .iter()
-            .filter(|space| {
-                space.key.account() == folder.account()
-                    && space.folder.as_deref() == Some(folder.id.as_str())
-                    && (space.attention > 0 || space.unread)
-            })
-            .map(|space| space.key.clone())
-            .collect();
-        if spaces.is_empty() {
-            self.toast(Some(("icons/check.svg", theme::text_soft())), "Marked as read", cx);
-            return;
-        }
-        cx.spawn(async move |this, cx| {
-            let mut failure: Option<String> = None;
-            for space in spaces {
-                let request = Request::MarkAllRead { network: Some(space.network), space: Some(space) };
-                let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
-                if let Some(words) = refused(&answer) {
-                    failure = Some(words);
-                    break;
-                }
-            }
-            let _ = this.update(cx, |this, cx| {
-                match failure {
-                    None => this.toast(Some(("icons/check.svg", theme::text_soft())), "Marked as read", cx),
-                    Some(words) => this.toast(Some(("icons/circle-alert.svg", theme::danger())), words, cx),
-                }
-                let pages = this.sidebar_state.inbox.stale();
-                this.load_inbox(pages, cx);
-            });
-        })
-        .detach();
-    }
-
     /// Removes a direct or group conversation from this Inbox. The network keeps the messages.
     pub(super) fn forget_conversation(&mut self, conversation: Conversation, cx: &mut Context<Self>) {
         let title = conversation.title.clone();

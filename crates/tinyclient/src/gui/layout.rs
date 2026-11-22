@@ -751,10 +751,6 @@ impl Shell {
                 let items = menu().w(px(200.)).children(self.menu_items(open, snapshot, cx));
                 placed("menu-space-at", Place::Below(menu_anchor), Layer::Menu, window, fade_in("menu-space", 120, items))
             }
-            Menu::Folder(_, position) => {
-                let items = menu().w(px(200.)).children(self.menu_items(open, snapshot, cx));
-                placed("menu-folder-at", Place::Pointer(*position), Layer::Menu, window, fade_in("menu-folder", 120, items))
-            }
             Menu::Row(_, position) => {
                 let items = menu().w(px(220.)).children(self.menu_items(open, snapshot, cx));
                 placed("menu-row-at", Place::Pointer(*position), Layer::Menu, window, fade_in("menu-row", 120, items))
@@ -906,17 +902,6 @@ impl Shell {
                             .into_any_element(),
                     );
                 }
-            }
-            Menu::Folder(folder, _) => {
-                let read = folder.clone();
-                items.push(
-                    menu_item("folder-read", Some("icons/check.svg"), "Mark as read", None)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.close_menu(cx);
-                            this.mark_folder_read(read.clone(), cx);
-                        }))
-                        .into_any_element(),
-                );
             }
             Menu::Row(conversation, _) => {
                 let (key, starred) = (conversation.key.clone(), conversation.starred);
@@ -1251,19 +1236,6 @@ impl Shell {
                             ),
                     );
                 column().child(head).child(menu_separator()).children(self.phone_row_items(conversation, cx)).into_any_element()
-            }
-            Menu::Folder(folder, _) => {
-                let name = self
-                    .sidebar_state
-                    .home
-                    .folders
-                    .iter()
-                    .find(|known| &known.key == folder)
-                    .map(|known| known.name.clone())
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or_else(|| "Folder".to_owned());
-                let head = div().flex().items_center().px(px(8.)).h(px(44.)).child(div().phone_title().child(name));
-                column().child(head).children(self.menu_items(open, snapshot, cx)).into_any_element()
             }
         };
         Some(super::phone::sheet("phone-menu", tall, body, close))
