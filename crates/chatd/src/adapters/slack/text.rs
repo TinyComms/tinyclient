@@ -377,7 +377,14 @@ impl<'a> Rich<'a> {
             let found = match bytes[at] {
                 b'<' => line[at..].find('>').map(|close| (at + close + 1, 0u8)),
                 b'`' => line[at + 1..].find('`').filter(|len| *len > 0).map(|len| (at + len + 2, b'`')),
-                mark @ (b'*' | b'_' | b'~') => closer(line, at, mark).map(|close| (close + 1, mark)),
+                mark @ (b'*' | b'_' | b'~') => {
+                    // A backslash keeps the mark, as in the shrug `¯\_(ツ)_/¯`.
+                    if line[..at].ends_with('\\') {
+                        None
+                    } else {
+                        closer(line, at, mark).map(|close| (close + 1, mark))
+                    }
+                }
                 b':' => emoji_end(line, at).map(|close| (close + 1, b':')),
                 _ => None,
             };
@@ -451,6 +458,7 @@ fn closer(line: &str, open: usize, mark: u8) -> Option<usize> {
     let bytes = line.as_bytes();
     (open + 2..bytes.len()).find(|at| {
         bytes[*at] == mark
+            && !line[..*at].ends_with('\\')
             && !line[..*at].ends_with(char::is_whitespace)
             && !line[at + 1..].chars().next().is_some_and(word_like)
     })
@@ -926,6 +934,15 @@ mod tests {
     fn ranges(rich: &Rich) -> Vec<(String, Style)> {
         let cut = |span: &Span| rich.text[span.start as usize..span.end as usize].to_owned();
         rich.spans.iter().map(|span| (cut(span), span.style.clone())).collect()
+    }
+
+    #[test]
+    fn a_backslash_keeps_the_following_mark() {
+        let mut rich = Rich::new(&Book);
+        rich.mrkdwn("hello ¯\\_(ツ)_/¯");
+        rich.finish();
+        assert_eq!(rich.text, "hello ¯\\_(ツ)_/¯");
+        assert!(rich.spans.iter().all(|span| !matches!(span.style, Style::Italic)));
     }
 
     #[test]
