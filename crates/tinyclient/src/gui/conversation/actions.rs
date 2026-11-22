@@ -968,7 +968,7 @@ impl Pane {
         };
         // Guard: paid Star reactions must never fire through the ordinary React path.
         if conversation.network == Network::Telegram && protocol::bare_emoji(emoji) == "⭐" {
-            self.say("Paid Star reactions must be confirmed before spending Stars.", cx);
+            self.say("Paid Star reactions must be confirmed before spending Stars.".to_owned(), cx);
             return;
         }
         if on {
@@ -1005,7 +1005,7 @@ impl Pane {
         });
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let answer = ask(Request::StarsBalance { account }).await;
+            let answer = cx.background_executor().spawn(async move { ask(&Request::StarsBalance { account }) }).await;
             let _ = this.update(cx, |this, cx| {
                 if let Some(dialog) = &mut this.paid_react {
                     dialog.loading_balance = false;
@@ -1036,7 +1036,7 @@ impl Pane {
         };
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let answer = ask(request).await;
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
             let _ = this.update(cx, |this, cx| {
                 this.paid_react = None;
                 match answer {
@@ -1065,10 +1065,10 @@ impl Pane {
         self.paid_react = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let answer = ask(request).await;
+            let answer = cx.background_executor().spawn(async move { ask(&request) }).await;
             let _ = this.update(cx, |this, cx| {
                 match answer {
-                    Ok(Response::Ok) => this.say(label, cx),
+                    Ok(Response::Ok) => this.say(label.to_owned(), cx),
                     Ok(Response::Error { detail, .. }) => this.say(format!("Couldn't update Star privacy: {detail}"), cx),
                     Ok(_) => {}
                     Err(err) => this.say(format!("Couldn't update Star privacy: {}", crate::client::trouble_words("send", &err)), cx),
