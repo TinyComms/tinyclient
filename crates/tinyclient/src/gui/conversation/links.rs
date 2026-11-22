@@ -14,19 +14,19 @@ use gpui::{anchored, deferred, div, point, prelude::*, px, AnyElement, App, Clip
 use protocol::link::{Destination, Risk};
 
 /// The question on screen: the link, and whether "Don't ask again" is ticked.
-pub(super) struct LinkAsk {
+pub(in crate::gui) struct LinkAsk {
     pub dest: Destination,
     pub remember: bool,
 }
 
 impl LinkAsk {
     /// What the browser is given, with the tracking strip applied if the person turned it on.
-    fn target(&self) -> String {
+    pub(in crate::gui) fn target(&self) -> String {
         self.dest.target(prefs::choices().strip_tracking)
     }
 
     /// A domain this device may stop asking about. Never one that looks like a lookalike.
-    fn can_remember(&self) -> bool {
+    pub(in crate::gui) fn can_remember(&self) -> bool {
         self.dest.risk != Risk::Lookalike && !self.dest.has_userinfo
     }
 }
@@ -99,7 +99,7 @@ fn https_telegram_web(url: &str) -> Option<String> {
 
 /// A `mailto:` link, which other networks put on an address. It opens the mail app as it is:
 /// no question, no tracking strip.
-pub(super) fn is_mailto(url: &str) -> bool {
+pub(in crate::gui) fn is_mailto(url: &str) -> bool {
     url.get(..7).is_some_and(|scheme| scheme.eq_ignore_ascii_case("mailto:"))
         && url.len() <= 2048
         && !url.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"')
@@ -122,7 +122,7 @@ pub(super) fn telegram_app_link(url: &str) -> bool {
 }
 
 /// Whether a link to `dest` opens without a question, given what the person chose.
-pub(super) fn opens_at_once(dest: &Destination, confirm: bool, trusted: bool) -> bool {
+pub(in crate::gui) fn opens_at_once(dest: &Destination, confirm: bool, trusted: bool) -> bool {
     // A lookalike or a "user@" address is always asked about: that is what the question is for.
     let suspicious = dest.risk == Risk::Lookalike || dest.has_userinfo;
     !suspicious && (!confirm || trusted)
@@ -157,7 +157,7 @@ pub(in crate::gui) fn open_external_link(url: &str, cx: &mut App) {
 
 impl Pane {
     /// Opens a link externally (in the system browser), asking for confirmation per preferences.
-    pub(super) fn open_external_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(in crate::gui) fn open_external_link(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
         // An e-mail address Telegram or Slack made a link of: the mail app's, not a site.
         if is_mailto(url) {
             cx.open_url(url);

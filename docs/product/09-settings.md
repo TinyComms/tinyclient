@@ -16,7 +16,7 @@ The tables under "Information architecture" are the control design. A row marked
 | Appearance | A2, A3, A4 | Text size, density, list previews. No theme control. The app is dark. |
 | Messages | M1–M6 | Send key, where a conversation opens, typing line, emoticons, GIF and sticker autoplay, spelling. |
 | Privacy | P1–P4, PE | Typing and read receipts per account, image loading, keep-for 7 / 30 / 90 days. Telegram typing and receipts are fixed on. Signal has a local switch that stops tinyclient only; the phone still decides. Messages says the phone. |
-| Audio & video | V1, V2, V4, V5 | Microphone, speaker, join muted, call volume. |
+| Audio & video | V1, V22, V2, V4, V5 | Microphone, camera, speaker, join muted, call volume. |
 | Voice | V3, V6, V8, V10–V19, S7–S10 | Input level, sensitivity, voice activation or push-to-talk, echo cancellation, noise suppression, automatic gain, key recorders, release delay, call cues and their volume. |
 | Storage | D1–D3 | Usage, cap (default 500 MB), clear. Sign-ins, drafts, and settings stay. |
 | Shortcuts | read-only | Menu shortcuts. Voice keys are recorders in Voice, not this list. |
@@ -34,7 +34,6 @@ chatd keeps the notification, sound, privacy, voice, and storage values. The she
 | S5, S6 pickers | chatd will honor an account or conversation sound if one is stored. No row was found that writes them. |
 | S13 custom files, S14 ring-back | Both are in: sounds of your own in every picker, and a ring back while you call. |
 | P5 screen-share hide, P7 Signal relay | In `NOT_YET` or absent. |
-| V7 camera device | "tinyclient has no camera yet." A Tiny call can still toggle the camera from the call dock. That is `06-calls.md`. |
 | V9 per-person volume | `CallGain` on a Tiny participant row, not a Settings row. |
 | Proxy, accent, font, language, sync | `NOT_YET`. |
 
@@ -238,6 +237,7 @@ no control.
 | # | Setting | Type | Default | Scope | Home | What it changes | Rel |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | V1 | Microphone | Menu: "System default (name)" then devices | System default | G | d | chatd sends it to mediad right after `Join`. Shown by name; a missing device falls back to the default and the menu says "(not connected)". Audio & video is where the default device lives. | in |
+| V22 | Camera | Menu: "System default" then cameras | System default | G | d | Camera device chosen for calls (`mediad --devices`). | in |
 | V2 | Speaker | Menu, as V1 | System default | G | d | As V1, for output. Also where S12 plays | in |
 | V4 | Join calls with my microphone muted | Switch | Off | G | d | On: every join and every Accept starts muted, and the dock shows it | in |
 | V5 | Call volume | Slider 0 to 100 % | 100 % | G | d | Gain on everyone's voice in mediad's mix. | in |
@@ -253,7 +253,6 @@ no control.
 | V8 | Voice activation or push to talk | Switch and key recorder | | G | d | In the window. | in |
 | V10–V19 | Processing, keys, release delay | Switches, menus and recorders | V10/V12 on; V11 Enhanced | G | d | Echo cancellation, noise suppression (Off, Standard or High WebRTC, or Enhanced voice isolation, the default), automatic gain, key recorders (V13 and V15–V17), and release delay. | in |
 | S7–S10 | Call cues and their volume | Switches and a slider | Cues on | G | d | Join, leave, mute, deafen, connection, and their volume. Cue semantics during a call are `06-calls.md`. | in |
-| V7 | Camera device | | | G | d | Not in the window. Search: "tinyclient has no camera yet." A Tiny call dock can toggle the camera. That toggle is `06-calls.md`. | not in 0.2.35 |
 | V9 | Per-person volume | | | C | | `CallGain` on a Tiny participant row, not a Settings row. | not in 0.2.35 |
 
 "Call settings…" opens Audio & video. A device picked in the call dock lasts for that call and resets when the call ends. How a call uses the microphone, the echo canceller, and the camera toggle is `06-calls.md`.
@@ -577,7 +576,6 @@ Still absent, matching `NOT_YET` and the "Not in the window" table above. M5, V8
 | S14 Ring-back tone, longer looping ring | Ring back is built; an optional looping ringtone is not. |
 | P5 Hide from screen sharing | `NOT_YET`. |
 | P7 Signal always relay | `NOT_YET`. |
-| V7 Camera device | "tinyclient has no camera yet." The call-dock camera toggle is `06-calls.md`. |
 | Proxy, accent, font, language, sync | `NOT_YET`. A proxy, if it is ever offered, is Telegram only. It is not a setting. |
 
 V9 is `CallGain` on a Tiny participant row, not a later Settings row.

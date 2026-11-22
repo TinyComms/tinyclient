@@ -2,9 +2,9 @@
 //! middle tier (with Microsoft Graph fallback), remembering which tags belong to the signed-in
 //! user for `mentions_me`, and starting a group chat with a tag's members.
 
-use super::{escaped, id_of, Auth, Body, Fault, Teams, GRAPH, SPACES};
+use super::{escaped, Audience, Auth, Body, Fault, Teams};
 use protocol::{Key, ProfilePerson, TeamTag};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 /// Parses tags from either Teams middle-tier (`/beta/teams/{id}/tags`) or Microsoft Graph
 /// (`/v1.0/teams/{groupId}/tags?$expand=members`) JSON payloads.
@@ -110,14 +110,14 @@ impl Teams {
     pub(super) fn space_tags(&self, space: &str) -> Result<Vec<TeamTag>, Fault> {
         let place = self.place()?;
         let mt_url = format!("{}/beta/teams/{}/tags", place.middle, escaped(space));
-        let raw = match self.call("GET", &mt_url, Auth::Both(SPACES), Body::None, true) {
+        let raw = match self.call("GET", &mt_url, Auth::Both(Audience::Spaces), Body::None, true) {
             Ok(answer) => answer.body,
             Err(_) => {
                 let Some(group_id) = self.ctx.note(&format!("group:{space}")).filter(|s| !s.is_empty()) else {
                     return Ok(Vec::new());
                 };
                 let graph_url = format!("{}/v1.0/teams/{}/tags?$expand=members", self.graph, escaped(&group_id));
-                match self.call("GET", &graph_url, Auth::Bearer(GRAPH), Body::None, true) {
+                match self.call("GET", &graph_url, Auth::Bearer(Audience::Graph), Body::None, true) {
                     Ok(answer) => answer.body,
                     Err(_) => return Ok(Vec::new()),
                 }
@@ -179,60 +179,13 @@ impl Teams {
         self.ctx.set_note("my_tags", &serde_json::to_string(&persisted_mine).unwrap_or_default());
         Ok(tags)
     }
-
-    /// Creates a new Teams group chat with `people` (e.g. from a team tag's members) and an
-    /// optional `title` (`topic`).
-    pub(super) fn start_group(&self, people: &[String], title: Option<&str>) -> Result<String, Fault> {
-        let me = self.me();
-        let mut unique: Vec<String> = Vec::new();
-        if !me.is_empty() {
-            unique.push(me.clone());
-        }
-        for person in people {
-            if !person.is_empty() && !unique.iter().any(|existing| existing == person) {
-                unique.push(person.clone());
-            }
-        }
-        if unique.len() < 2 {
-            return Err(Fault::Refused {
-                status: 400,
-                message: "Choose at least one other person to start a chat.".to_owned(),
-            });
-        }
-        if unique.len() == 2 {
-            if let Some(other) = unique.iter().find(|id| **id != me) {
-                if title.map(str::trim).unwrap_or("").is_empty() {
-                    return self.start_direct(other);
-                }
-            }
-        }
-        let members: Vec<Value> = unique.iter().map(|id| json!({"id": id, "role": "Admin"})).collect();
-        let mut properties = json!({"threadType": "chat"});
-        if let Some(topic) = title.map(str::trim).filter(|t| !t.is_empty()) {
-            properties["topic"] = Value::String(topic.to_owned());
-        }
-        let wanted = json!({"members": members, "properties": properties});
-        let created = self.chat("POST", "/v1/threads", Body::Json(&wanted), false)?;
-        let named = created.location.rsplit('/').next().unwrap_or("").split('?').next().unwrap_or("");
-        let id = match named {
-            "" => id_of(&created.body["id"]),
-            named => named.replace("%3A", ":").replace("%3a", ":").replace("%40", "@"),
-        };
-        if !id.starts_with("19:") {
-            return Err(Fault::Net("Teams created the group chat but did not name it".to_owned()));
-        }
-        self.lookup(&unique);
-        if !self.known(&id)? {
-            return Err(Fault::Net("Teams does not describe the group chat it created".to_owned()));
-        }
-        Ok(id)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use protocol::Network;
+    use serde_json::json;
 
     fn key(id: &str) -> Key {
         Key {

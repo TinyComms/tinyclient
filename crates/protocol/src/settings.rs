@@ -51,12 +51,21 @@ pub const OUTPUT: &str = "output";
 /// V22. The camera, stored as V1 and V2 store theirs: absent is the first camera the system
 /// lists, else one by name, then a tab and the system's id for it.
 pub const CAMERA: &str = "camera";
+/// V23. Camera resolution/rate tier: `auto`, `hd`, `standard`, or `data_saver`.
+pub const CAMERA_QUALITY: &str = "camera_quality";
+pub const CAMERA_QUALITY_CHOICES: [&str; 4] = ["auto", "hd", "standard", "data_saver"];
+/// V24. Mirror the local camera self-view horizontally (never what peers see). Defaults on.
+pub const CAMERA_MIRROR: &str = "camera_mirror";
+/// V25. Apply lightweight on-device background blur before encoding camera video. Defaults off.
+pub const CAMERA_BLUR: &str = "camera_blur";
 /// The stored value of "System default" in V1 and V2.
 pub const SYSTEM_DEFAULT: &str = "@system";
 /// V4. Every join and every Accept starts muted.
 pub const JOIN_MUTED: &str = "join_muted";
 /// V19: "You're muted" shows when the microphone hears speech while I am muted in a call.
 pub const MUTED_TALK: &str = "muted_talk";
+/// V27: automatically open a newly started screen share when the user is looking at the call.
+pub const AUTO_WATCH_SHARE: &str = "auto_watch_share";
 /// Only join Tiny calls that are end-to-end encrypted. A call whose server turns encryption off
 /// always stops sending and playing (mediad `Blocked`); off, the person may choose to carry on
 /// unencrypted, on, they may not, and a server that cannot encrypt is not joined. Off by default:
@@ -64,6 +73,13 @@ pub const MUTED_TALK: &str = "muted_talk";
 /// ([`crate::incognito_host`]) or an `e2ee_required` room acts as on whatever this says. See
 /// `SECURITY.md`.
 pub const REQUIRE_CALL_E2EE: &str = "require_call_e2ee";
+/// PS1. Streamer mode: `off`, `on`, or `while_sharing` (default).
+pub const STREAMER_MODE: &str = "streamer_mode";
+pub const STREAMER_MODE_CHOICES: [&str; 3] = ["off", "on", "while_sharing"];
+/// PS2. Exclude tinyclient's own window from capture by other applications while Streamer mode is active.
+pub const STREAMER_HIDE_WINDOW: &str = "streamer_hide_window";
+/// PS3. Automatically activate Streamer mode while OBS Studio or Streamlabs Desktop is running.
+pub const STREAMER_DETECT_OBS: &str = "streamer_detect_obs";
 /// V5. Everyone's voice, 0 to 100.
 pub const VOICE_VOLUME: &str = "voice_volume";
 /// V6. The level, 0 to 100, from which our microphone counts as speech, and in voice
@@ -120,6 +136,11 @@ pub const RECEIPTS: &str = "receipts";
 pub const PRESENCE_ACTIVITY: &str = "presence_activity";
 /// P4. Days messages are kept on this Mac: 7, 30 or 90.
 pub const KEEP_DAYS: &str = "keep_days";
+/// M8. Target language for inline message translation (`"auto"` follows system locale).
+pub const TRANSLATE_TO: &str = "translate_to";
+pub const TRANSLATE_TO_CHOICES: [&str; 13] = [
+    "auto", "en", "es", "fr", "de", "it", "pt", "ru", "ja", "ko", "zh", "ar", "hi",
+];
 /// Client-side link preview cards (e.g. Google Messages). On for known contacts by default.
 pub const LINK_PREVIEWS: &str = "link_previews";
 /// Client-side link preview cards for numbers not in contacts. Off by default to avoid
@@ -127,6 +148,8 @@ pub const LINK_PREVIEWS: &str = "link_previews";
 pub const LINK_PREVIEWS_UNKNOWN: &str = "link_previews_unknown";
 /// D2. The image and file cache's cap in MB: 250, 500, 1000 or 2000.
 pub const CACHE_MB: &str = "cache_mb";
+/// Preferred target language for on-demand message translation (`auto` or a short BCP-47 tag like `en`, `es`, `zh-Hans`).
+pub const TRANSLATE_LANG: &str = "translate_lang";
 /// The schema of these rows, for migrations. Not a setting anyone changes.
 pub const VERSION: &str = "version";
 
@@ -248,6 +271,8 @@ enum Kind {
     Port,
     /// An optional proxy username.
     User,
+    /// Preferred translation language (`auto` or a short BCP-47 tag).
+    Language,
 }
 
 fn kind(key: &str) -> Option<Kind> {
@@ -280,17 +305,22 @@ fn kind(key: &str) -> Option<Kind> {
         ECHO_CANCELLATION | AUTO_GAIN => Kind::Switch(true),
         NOISE_SUPPRESSION => Kind::Word(&NOISE_CHOICES, "enhanced"),
         VOICE_QUALITY => Kind::Word(&QUALITY_CHOICES, "standard"),
-        JOIN_MUTED | PUSH_TO_TALK | REQUIRE_CALL_E2EE | LINK_PREVIEWS_UNKNOWN => Kind::Switch(false),
-        MUTED_TALK => Kind::Switch(true),
+        CAMERA_QUALITY => Kind::Word(&CAMERA_QUALITY_CHOICES, "auto"),
+        CAMERA_MIRROR => Kind::Switch(true),
+        CAMERA_BLUR => Kind::Switch(false),
+        JOIN_MUTED | PUSH_TO_TALK | REQUIRE_CALL_E2EE | LINK_PREVIEWS_UNKNOWN | STREAMER_HIDE_WINDOW | STREAMER_DETECT_OBS => Kind::Switch(false),
+        STREAMER_MODE => Kind::Word(&STREAMER_MODE_CHOICES, "while_sharing"),
+        MUTED_TALK | AUTO_WATCH_SHARE => Kind::Switch(true),
         PTT_RELEASE_MS => Kind::Choice(&PTT_RELEASE_CHOICES, 200),
         CUE_VOLUME => Kind::Percent(50),
         VOICE_VOLUME => Kind::Percent(100),
         INPUT_VOLUME => Kind::Percent(100),
         SENSITIVITY => Kind::Percent(25),
-        INPUT | OUTPUT => Kind::Device,
+        INPUT | OUTPUT | CAMERA => Kind::Device,
         PTT_KEY | PRIORITY_KEY | MUTE_KEY | DEAFEN_KEY => Kind::Hotkey,
         _ if gain_user(key).is_some() => Kind::Gain,
         KEEP_DAYS => Kind::Choice(&KEEP_DAYS_CHOICES, 90),
+        TRANSLATE_TO => Kind::Word(&TRANSLATE_TO_CHOICES, "auto"),
         CACHE_MB => Kind::Choice(&CACHE_MB_CHOICES, 500),
         // Per account; the default is the network's (`typing_default`).
         TYPING | RECEIPTS | PRESENCE_ACTIVITY => Kind::Switch(true),
@@ -302,6 +332,7 @@ fn kind(key: &str) -> Option<Kind> {
         LOG_LEVEL => Kind::Word(&LOG_LEVEL_CHOICES, "info"),
         LOG_RING | LOG_EXPORT => Kind::Switch(true),
         CUSTOM_SOUND => Kind::CustomSound,
+        TRANSLATE_LANG => Kind::Language,
         _ => return None,
     })
 }
@@ -382,8 +413,27 @@ pub fn valid(scope: &str, key: &str, value: &str) -> bool {
         Some(Kind::Host) => !value.is_empty() && value.len() <= 253 && !value.chars().any(|c| c.is_control() || c.is_whitespace() || c == '/' || c == '@'),
         Some(Kind::Port) => value.parse::<u16>().is_ok_and(|p| p > 0),
         Some(Kind::User) => value.len() <= 128 && !value.chars().any(|c| c.is_control() || c == '@' || c == ':'),
+        Some(Kind::Language) => valid_language_tag(value),
         None => false,
     }
+}
+
+/// Validates `auto` or a short BCP-47 language tag (e.g. `en`, `es`, `pt-BR`, `zh-Hans`).
+pub fn valid_language_tag(value: &str) -> bool {
+    if value == "auto" {
+        return true;
+    }
+    if !(2..=15).contains(&value.len()) {
+        return false;
+    }
+    let mut parts = value.split('-');
+    let Some(primary) = parts.next() else {
+        return false;
+    };
+    if !(2..=3).contains(&primary.len()) || !primary.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return false;
+    }
+    parts.all(|sub| (2..=4).contains(&sub.len()) && sub.bytes().all(|b| b.is_ascii_alphanumeric()))
 }
 
 /// What `notify_about` may be in a scope: the global one has no `off`, which is N1's.
@@ -576,6 +626,16 @@ impl Values {
         Values(settings.into_iter().map(|s| ((s.scope, s.key), s.value)).collect())
     }
 
+    /// Whether Streamer mode is active given whether the user is sharing a screen
+    /// and whether a supported broadcast app (OBS / Streamlabs) is running.
+    pub fn streamer_active(&self, sharing: bool, obs_running: bool) -> bool {
+        match self.word(GLOBAL, STREAMER_MODE) {
+            "on" => true,
+            "while_sharing" => sharing || (self.on(STREAMER_DETECT_OBS) && obs_running),
+            _ => false,
+        }
+    }
+
     /// The stored value, if one is.
     pub fn stored(&self, scope: &str, key: &str) -> Option<&str> {
         self.0.get(&(scope.to_owned(), key.to_owned())).map(String::as_str).filter(|value| valid(scope, key, value))
@@ -663,6 +723,42 @@ impl Values {
     /// How clearly to encode on a Tiny call, within the room's bitrate.
     pub fn voice_quality(&self) -> crate::VoiceQuality {
         crate::VoiceQuality::parse(self.word(GLOBAL, VOICE_QUALITY)).unwrap_or_default()
+    }
+
+    /// Preferred target language for on-demand message translation (`auto` or a BCP-47 tag).
+    pub fn translate_lang(&self) -> String {
+        self.stored(GLOBAL, TRANSLATE_LANG).unwrap_or("auto").to_owned()
+    }
+
+    /// V23: Auto, HD (720p30), Standard (360p15), or Data saver.
+    pub fn camera_quality(&self) -> crate::CameraQuality {
+        crate::CameraQuality::parse(self.word(GLOBAL, CAMERA_QUALITY)).unwrap_or_default()
+    }
+
+    /// V23–V25: camera quality, self-view mirror, and on-device background blur.
+    pub fn camera_settings(&self) -> crate::CameraSettings {
+        crate::CameraSettings {
+            quality: self.camera_quality(),
+            mirror: self.on(CAMERA_MIRROR),
+            blur: self.on(CAMERA_BLUR),
+        }
+    }
+
+    /// M8: target ISO-639-1 language code for message translation (`"auto"` resolves system locale).
+    pub fn translate_target(&self) -> String {
+        let word = self.word(GLOBAL, TRANSLATE_TO);
+        if word != "auto" && !word.is_empty() {
+            return crate::normalize_language_tag(word);
+        }
+        for var in ["LC_ALL", "LC_MESSAGES", "LANG"] {
+            if let Ok(val) = std::env::var(var) {
+                let norm = crate::normalize_language_tag(&val);
+                if !val.trim().is_empty() && !val.eq_ignore_ascii_case("C") && !val.to_ascii_uppercase().starts_with("POSIX") {
+                    return norm;
+                }
+            }
+        }
+        "en".to_owned()
     }
 
     /// How the microphone opens, as the user chose. A room that requires push-to-talk asks
@@ -1265,5 +1361,102 @@ mod tests {
         assert!(telegram_relay_only(false, true));
         assert!(telegram_relay_only(true, true));
         assert!(!telegram_relay_only(true, false));
+    }
+
+    #[test]
+    fn translate_lang_validates_auto_and_bcp47_tags() {
+        assert!(valid(GLOBAL, TRANSLATE_LANG, "auto"));
+        assert!(valid(GLOBAL, TRANSLATE_LANG, "en"));
+        assert!(valid(GLOBAL, TRANSLATE_LANG, "pt-BR"));
+        assert!(valid(GLOBAL, TRANSLATE_LANG, "zh-Hans"));
+        assert!(!valid(GLOBAL, TRANSLATE_LANG, ""));
+        assert!(!valid(GLOBAL, TRANSLATE_LANG, "1"));
+        assert!(!valid(GLOBAL, TRANSLATE_LANG, "en US"));
+        assert!(!valid(&account_scope(&account(Network::Teams)), TRANSLATE_LANG, "en"));
+        let mut values = Values::default();
+        assert_eq!(values.translate_lang(), "auto");
+        values.set(GLOBAL, TRANSLATE_LANG, Some("es".into()));
+        assert_eq!(values.translate_lang(), "es");
+    }
+
+    #[test]
+    fn auto_watch_share_defaults_on_and_is_global() {
+        assert!(Values::default().on(AUTO_WATCH_SHARE));
+        assert!(valid(GLOBAL, AUTO_WATCH_SHARE, "on"));
+        assert!(valid(GLOBAL, AUTO_WATCH_SHARE, "off"));
+        assert!(!valid(&account_scope(&account(Network::Tiny)), AUTO_WATCH_SHARE, "off"));
+    }
+
+    #[test]
+    fn streamer_mode_defaults_and_activation_rules() {
+        let mut values = Values::default();
+        assert_eq!(values.word(GLOBAL, STREAMER_MODE), "while_sharing");
+        assert!(!values.on(STREAMER_HIDE_WINDOW));
+        assert!(!values.on(STREAMER_DETECT_OBS));
+        for word in STREAMER_MODE_CHOICES {
+            assert!(valid(GLOBAL, STREAMER_MODE, word), "{word}");
+        }
+        assert!(!valid(GLOBAL, STREAMER_MODE, "always"));
+        assert!(valid(GLOBAL, STREAMER_HIDE_WINDOW, "on"));
+        assert!(valid(GLOBAL, STREAMER_DETECT_OBS, "on"));
+        assert!(!valid(&account_scope(&account(Network::Tiny)), STREAMER_MODE, "on"));
+
+        // Default "while_sharing": active only while sharing (unless OBS detection is enabled).
+        assert!(!values.streamer_active(false, false));
+        assert!(values.streamer_active(true, false));
+        assert!(!values.streamer_active(false, true));
+
+        // Enabling OBS detection activates "while_sharing" when OBS is running.
+        values.set(GLOBAL, STREAMER_DETECT_OBS, Some("on".into()));
+        assert!(values.streamer_active(false, true));
+        assert!(!values.streamer_active(false, false));
+
+        // Explicit "on" is always active; explicit "off" is never active even while sharing or OBS running.
+        values.set(GLOBAL, STREAMER_MODE, Some("on".into()));
+        assert!(values.streamer_active(false, false));
+        values.set(GLOBAL, STREAMER_MODE, Some("off".into()));
+        assert!(!values.streamer_active(true, true));
+    }
+
+    #[test]
+    fn camera_quality_mirror_and_blur_settings_validate_and_resolve() {
+        let mut values = Values::default();
+        assert_eq!(values.camera_settings(), crate::CameraSettings {
+            quality: crate::CameraQuality::Auto,
+            mirror: true,
+            blur: false,
+        });
+        for q in CAMERA_QUALITY_CHOICES {
+            assert!(valid(GLOBAL, CAMERA_QUALITY, q), "{q}");
+        }
+        assert!(!valid(GLOBAL, CAMERA_QUALITY, "4k"));
+        assert!(valid(GLOBAL, CAMERA_MIRROR, "off") && valid(GLOBAL, CAMERA_MIRROR, "on"));
+        assert!(valid(GLOBAL, CAMERA_BLUR, "on") && valid(GLOBAL, CAMERA_BLUR, "off"));
+        assert!(valid(GLOBAL, CAMERA, "FaceTime HD\tcam-0"));
+
+        values.set(GLOBAL, CAMERA_QUALITY, Some("hd".into()));
+        values.set(GLOBAL, CAMERA_MIRROR, Some("off".into()));
+        values.set(GLOBAL, CAMERA_BLUR, Some("on".into()));
+        assert_eq!(values.camera_settings(), crate::CameraSettings {
+            quality: crate::CameraQuality::Hd,
+            mirror: false,
+            blur: true,
+        });
+    }
+
+    #[test]
+    fn translate_target_setting_validates_and_resolves() {
+        let mut values = Values::default();
+        for code in TRANSLATE_TO_CHOICES {
+            assert!(valid(GLOBAL, TRANSLATE_TO, code), "{code}");
+        }
+        assert!(!valid(GLOBAL, TRANSLATE_TO, "klingon"));
+        assert!(!valid(&account_scope(&account(Network::Telegram)), TRANSLATE_TO, "es"));
+        assert!(!values.translate_target().is_empty());
+
+        values.set(GLOBAL, TRANSLATE_TO, Some("ja".into()));
+        assert_eq!(values.translate_target(), "ja");
+        values.set(GLOBAL, TRANSLATE_TO, Some("fr".into()));
+        assert_eq!(values.translate_target(), "fr");
     }
 }

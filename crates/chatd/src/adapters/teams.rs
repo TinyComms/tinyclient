@@ -96,8 +96,12 @@
 //! `https://go.trouter.teams.microsoft.com`. The session comes from `TINYCLIENT_SESSION_TEAMS`.
 
 mod card;
+pub(crate) mod cloud;
 mod emoji;
 mod html;
+
+pub(crate) use cloud::{cloud_for, TeamsCloud};
+use cloud::Audience;
 
 /// The lab's teams-markdown driver. A build without this returns to the server and stays up.
 pub fn prove_teams_markdown() -> Result<(), String> {
@@ -140,7 +144,9 @@ pub fn prove_team_info() -> Result<(), String> {
     people::prove_team_roster()
 }
 mod people;
+mod picker;
 mod push;
+mod search;
 mod send;
 mod tags;
 mod tree;
@@ -153,6 +159,63 @@ pub fn prove_chain_paging() -> Result<(), String> {
 /// The lab's teams-copy-link driver. A build without this returns to the server and stays up.
 pub fn prove_share_links() -> Result<(), String> {
     links::prove_share_links()
+}
+
+/// What a Teams account may send. Files stay off: the old OneDrive path made an
+/// organization-wide link.
+pub(crate) fn capability_ceiling() -> protocol::Capabilities {
+    protocol::Capabilities {
+        max_file_bytes: 250 * 1024 * 1024,
+        max_files: protocol::ATTACHMENTS_LIMIT as u32,
+        reply: true,
+        edit: true,
+        delete: true,
+        threads: true,
+        pins: true,
+        save_messages: true,
+        activity_feed: true,
+        search: true,
+        search_global: true,
+        groups: 250,
+        blocks: true,
+        browse_channels: true,
+        join_space_by_invite: true,
+        leave_space: true,
+        pin_chats: 15,
+        close_direct: true,
+        clear_history: true,
+        suppress_embeds: true,
+        schedule: true,
+        voice_notes: true,
+        gifs: true,
+        stickers: true,
+        translate: true,
+        forward: true,
+        reactions: true,
+        mention_format: protocol::MentionFormat::Teams,
+        mention_spans: true,
+        importance: true,
+        channel_subject: true,
+        out_of_office: true,
+        polls: Some(protocol::PollCapabilities {
+            max_options: 10,
+            max_duration_secs: 0,
+            multiple: true,
+            anonymous: true,
+        }),
+        read_by: true,
+        ..protocol::Capabilities::default()
+    }
+}
+
+/// A team channel's call opens in Teams.
+pub(crate) fn channel_call() -> protocol::CallSupport {
+    protocol::CallSupport::Handoff
+}
+
+/// A chat opens in Teams, except a bot and the user's own Notes.
+pub(crate) fn chat_call(bot: bool, notes: bool) -> protocol::CallSupport {
+    if bot || notes { protocol::CallSupport::None } else { protocol::CallSupport::Handoff }
 }
 
 use super::net::{address, browser};
@@ -170,17 +233,17 @@ use std::time::{Duration, Instant};
 
 /// Teams' own desktop client, the one registration third-party clients sign in as.
 const CLIENT: &str = "1fec8e78-bce4-4aaf-ab1b-5451cc387264";
-const LOGIN: &str = "https://login.microsoftonline.com";
-const TEAMS: &str = "https://teams.microsoft.com";
-/// Token audiences.
-const SPACES: &str = "https://api.spaces.skype.com";
-const AGGREGATOR: &str = "https://chatsvcagg.teams.microsoft.com";
-const PRESENCE: &str = "https://presence.teams.microsoft.com";
-/// The second audience: Microsoft Graph, for the user's OneDrive (files in chats). Unverified
-/// that Teams' client id may mint it.
-const GRAPH: &str = "https://graph.microsoft.com";
-/// Hosts a service address handed out by Teams may be on. A token goes nowhere else.
-const OURS: &[&str] = &["teams.microsoft.com", "skype.com", "teams.cloud.microsoft", "teams.office.com", "graph.microsoft.com"];
+const TEAMS: &str = cloud::WORLDWIDE.teams;
+/// Microsoft Graph default (worldwide), kept for `prove_shared_file`.
+const GRAPH: &str = cloud::WORLDWIDE.graph;
+/// Microsoft Search (Substrate) audience for server-side Teams search.
+const SUBSTRATE: &str = "https://substrate.office.com";
+/// Hosts a Microsoft Search (Substrate) token may be sent to.
+const SUBSTRATE_HOSTS: &[&str] = &[
+    "substrate.office.com",
+    "teams.microsoft.com",
+    "teams.cloud.microsoft",
+];
 
 /// Messages per page of history, and per opening of a reply chain.
 const PAGE: u32 = 50;
@@ -221,6 +284,9 @@ struct Session {
     /// The user's own name, as Teams shows it beside what they send.
     #[serde(default)]
     user: String,
+    /// Microsoft 365 cloud (`worldwide`, `gcc_high`, `dod`, `china`).
+    #[serde(default)]
+    cloud: String,
 }
 
 /// Why a call failed. Deliberately not `Display`: it becomes a [`Failure`] or words for the
@@ -260,7 +326,12 @@ fn reason(fault: Fault) -> String {
         Fault::Auth(why) => why,
         Fault::Net(_) => "Teams could not be reached.".to_owned(),
         Fault::Refused { status: 403, message } => {
-            if message.contains("moderator") || message.contains("Only channel") {
+            if message.contains("moderator")
+                || message.contains("Only channel")
+                || message.contains("Only team")
+                || message.contains("organization's policy")
+                || message.contains("last owner")
+            {
                 message
             } else {
                 "Teams does not let you do that here.".to_owned()
@@ -291,6 +362,7 @@ struct Place {
     middle: String,
     presence: String,
     urlp: Option<String>,
+    search: Option<String>,
     ams: Option<String>,
 }
 
@@ -308,7 +380,7 @@ impl Token {
 #[derive(Default)]
 struct State {
     refresh: String,
-    access: HashMap<&'static str, Token>,
+    access: HashMap<Audience, Token>,
     skype: Option<Token>,
     place: Option<Arc<Place>>,
     /// Our own id, `8:orgid:…`.
@@ -341,6 +413,10 @@ struct State {
     file_props: HashMap<(String, String), Vec<Value>>,
     /// Chat ids pinned in Teams, in Teams' own order.
     pinned_chats: Vec<String>,
+    /// Pinned messages per conversation/thread id.
+    pinned_messages: HashMap<String, Vec<info::PinnedEntry>>,
+    /// Saved (bookmarked) message ids for this account.
+    saved_ids: HashSet<String>,
     /// Channel ids pinned in Teams, in Teams' own order.
     pinned_channels: Vec<String>,
     /// Per-conversation notification level as reported by Teams.
@@ -354,10 +430,32 @@ struct State {
     /// Team tags per Space id, and tag ids the signed-in user belongs to.
     tags: HashMap<String, Vec<protocol::TeamTag>>,
     my_tags: HashSet<String>,
+    /// Newest activity item timestamp (ms) marked read across the `48:notifications` stream.
+    activity_read_horizon: i64,
+    /// Individual activity item ids marked read locally / on Teams.
+    activity_read_ids: HashSet<String>,
+    /// Mapping from activity item id -> `(thread_id, source_message_id)` for syncing read state.
+    activity_targets: HashMap<String, (String, String)>,
+    /// Newest activity item id seen from `48:notifications`.
+    activity_newest_ms: i64,
+    /// When the last server-side search ran, for separate pacing.
+    search_at: Option<Instant>,
+    /// Blocked user MRIs on Teams.
+    blocked: HashSet<String>,
+    /// Last listed teams (Spaces), kept so leaving one updates the Spaces list cleanly.
+    spaces: Vec<crate::store::SpaceRow>,
     /// Activity feed item ids marked read locally this session.
     activity_read: HashSet<String>,
     /// Per-thread member consumption horizons (thread_id -> member_id -> arrival_ms), excluding me.
     member_horizons: HashMap<String, HashMap<String, i64>>,
+    /// Tenant policy flags learned from `authz` settings.
+    giphy_disabled: bool,
+    stickers_disabled: bool,
+    translation_disabled: bool,
+    /// Dimensions and alt titles remembered for GIFs and stickers from the picker catalog.
+    catalog_meta: HashMap<String, (u32, u32, String)>,
+    /// Meeting chats and calendar events remembered this run, by id.
+    meetings: HashMap<String, protocol::MeetingEvent>,
 }
 
 /// What a call presents.
@@ -365,13 +463,13 @@ struct State {
 enum Auth {
     /// The chat service's own header.
     Skype,
-    Bearer(&'static str),
+    /// AMS media store header (`Authorization: skype_token ...`).
+    Ams,
+    Bearer(Audience),
     /// A bearer token and the skype token beside it, as the middle tier takes them.
-    Both(&'static str),
+    Both(Audience),
     /// The skype token as trouter takes it.
     Push,
-    /// The skype token as the AMS media store takes it (`Authorization: skype_token ...`).
-    Ams,
 }
 
 enum Body<'a> {
@@ -392,11 +490,15 @@ struct Teams {
     ctx: Context,
     agent: ureq::Agent,
     session: Session,
+    /// Sovereign/commercial cloud table for this tenant.
+    cloud: TeamsCloud,
     /// Where Microsoft's sign-in service is, and Teams' own front door.
     login: String,
     api: String,
     /// Microsoft Graph, for OneDrive.
     graph: String,
+    /// Trouter push entry host.
+    trouter: String,
     /// A test moved the front door: the addresses it hands out are its own.
     moved: Option<String>,
     state: Mutex<State>,
@@ -422,10 +524,14 @@ pub fn accounts(session: &str) -> Result<Vec<Signed>, String> {
             continue;
         }
         let name = Some(text(&tenant["name"])).filter(|name| !name.is_empty()).unwrap_or_else(|| "Teams".to_owned());
+        let cloud = Some(text(&tenant["cloud"]))
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| text(&parsed["cloud"]));
         let session = json!({
             "tenant": id, "name": name, "refresh_token": refresh,
             "client_id": text(&parsed["client_id"]), "user_agent": text(&parsed["user_agent"]),
             "oid": text(&parsed["oid"]), "user": text(&parsed["name"]),
+            "cloud": cloud,
         });
         found.push(Signed {
             account: id,
@@ -466,7 +572,10 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
     if session.client_id.is_empty() {
         session.client_id = CLIENT.to_owned();
     }
-    let api = address("TINYCLIENT_TEAMS_API", TEAMS).trim_end_matches('/').to_owned();
+    let cloud = TeamsCloud::parse(&session.cloud);
+    let ep = cloud.endpoints();
+    cloud::register(&ctx.account, cloud);
+    let api = address("TINYCLIENT_TEAMS_API", ep.teams).trim_end_matches('/').to_owned();
     let agent = crate::adapters::net::apply_proxy(ureq::Agent::config_builder())
         .tls_config(crate::tls::config())
         .timeout_global(Some(Duration::from_secs(30)))
@@ -483,9 +592,11 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
     let teams = Arc::new(Teams {
         ctx,
         agent,
-        login: address("TINYCLIENT_TEAMS_LOGIN", LOGIN).trim_end_matches('/').to_owned(),
-        moved: (api != TEAMS).then(|| api.clone()),
-        graph: address("TINYCLIENT_TEAMS_GRAPH", GRAPH).trim_end_matches('/').to_owned(),
+        cloud,
+        login: address("TINYCLIENT_TEAMS_LOGIN", ep.login).trim_end_matches('/').to_owned(),
+        moved: (api != ep.teams).then(|| api.clone()),
+        graph: address("TINYCLIENT_TEAMS_GRAPH", ep.graph).trim_end_matches('/').to_owned(),
+        trouter: address("TINYCLIENT_TEAMS_TROUTER", ep.trouter).trim_end_matches('/').to_owned(),
         api,
         session,
         state: Mutex::new(state),
@@ -659,16 +770,24 @@ impl Teams {
         }
     }
 
-    /// True for an address Teams' own services are at.
+    /// True for an address Teams' own services are at, strictly scoped to this session's cloud.
     fn ours(&self, url: &str) -> bool {
+        let ep = self.cloud.endpoints();
         self.moved.as_ref().is_some_and(|base| url.starts_with(base.as_str()))
-            || (self.graph != GRAPH && url.starts_with(self.graph.as_str()))
-            || https_host(url).is_some_and(|host| OURS.iter().any(|domain| within(host, domain)))
+            || (self.graph != ep.graph && url.starts_with(self.graph.as_str()))
+            || https_host(url).is_some_and(|host| ep.ours.iter().any(|domain| within(host, domain)))
     }
 
-    /// True for an address a picture in a message may be fetched from: the media store.
+    /// True for an address a Microsoft Search (Substrate) bearer token may be sent to.
+    fn substrate_host(&self, url: &str) -> bool {
+        self.moved.as_ref().is_some_and(|base| url.starts_with(base.as_str()))
+            || https_host(url).is_some_and(|host| SUBSTRATE_HOSTS.iter().any(|domain| within(host, domain)))
+    }
+
+    /// True for an address a picture in a message may be fetched from: this cloud's media store.
     fn pictures(&self, url: &str) -> bool {
-        let media = |host: &str| within(host, "asm.skype.com") || within(host, "asyncgw.teams.microsoft.com");
+        let ep = self.cloud.endpoints();
+        let media = |host: &str| ep.media_hosts.iter().any(|domain| within(host, domain));
         self.moved.as_ref().is_some_and(|base| url.starts_with(base.as_str())) || https_host(url).is_some_and(media)
     }
 
@@ -686,14 +805,15 @@ impl Teams {
 
     /// An access token for one audience, minted from the refresh token when the one held is
     /// missing or near its end. Microsoft answers with the next refresh token, which is saved.
-    fn token(&self, scope: &'static str) -> Result<String, Fault> {
+    fn token(&self, scope: Audience) -> Result<String, Fault> {
         let _one = self.minting.lock().unwrap();
-        if let Some(token) = self.state().access.get(scope).filter(|token| token.fresh()) {
+        if let Some(token) = self.state().access.get(&scope).filter(|token| token.fresh()) {
             return Ok(token.value.clone());
         }
         let refresh = self.state().refresh.clone();
         let url = format!("{}/{}/oauth2/v2.0/token", self.login, escaped(&self.session.tenant));
-        let scopes = format!("{scope}/.default openid profile offline_access");
+        let audience = self.cloud.endpoints().audience(scope);
+        let scopes = format!("{audience}/.default openid profile offline_access");
         let form = [
             ("client_id", self.session.client_id.as_str()),
             ("grant_type", "refresh_token"),
@@ -735,10 +855,10 @@ impl Teams {
     fn forget(&self, auth: Auth) {
         let mut state = self.state();
         match auth {
-            Auth::Skype | Auth::Push | Auth::Ams => state.skype = None,
-            Auth::Bearer(scope) => drop(state.access.remove(scope)),
+            Auth::Skype | Auth::Ams | Auth::Push => state.skype = None,
+            Auth::Bearer(scope) => drop(state.access.remove(&scope)),
             Auth::Both(scope) => {
-                state.access.remove(scope);
+                state.access.remove(&scope);
                 state.skype = None;
             }
         }
@@ -762,7 +882,7 @@ impl Teams {
         let url = format!("{}/api/authsvc/v1.0/authz", self.api);
         let mut refused = None;
         for _ in 0..2 {
-            let bearer = self.token(SPACES)?;
+            let bearer = self.token(Audience::Spaces)?;
             self.pace();
             let sent = self
                 .agent
@@ -774,7 +894,7 @@ impl Teams {
             let status = response.status().as_u16();
             let body: Value = response.body_mut().read_json().unwrap_or(Value::Null);
             if status == 401 {
-                self.forget(Auth::Bearer(SPACES));
+                self.forget(Auth::Bearer(Audience::Spaces));
                 refused = Some(Fault::Auth("Teams no longer accepts this sign-in. Sign in again.".to_owned()));
                 continue;
             }
@@ -796,9 +916,13 @@ impl Teams {
             let place = Arc::new(Place {
                 chat,
                 middle,
-                presence: named("unifiedPresence").unwrap_or_else(|| PRESENCE.to_owned()),
+                presence: named("unifiedPresence").unwrap_or_else(|| self.cloud.endpoints().presence.to_owned()),
                 urlp: named("urlp"),
-                ams: named("ams"),
+                search: gtms["search"]
+                    .as_str()
+                    .map(|url| url.trim_end_matches('/').to_owned())
+                    .filter(|url| self.substrate_host(url)),
+                ams: named("ams").or_else(|| named("amsV2")),
             });
             let life = body["tokens"]["expiresIn"].as_u64().unwrap_or(3600).clamp(60, 86_400);
             let me = claim(token, "skypeid").map(|id| format!("8:{id}")).or_else(|| {
@@ -812,6 +936,20 @@ impl Teams {
             state.place = Some(place.clone());
             if let Some(me) = me {
                 state.me = me;
+            }
+            let disabled = |keys: &[&str]| {
+                [&body["regionSettings"], &body["tenantSettings"], &body["featureSettings"]]
+                    .into_iter()
+                    .any(|bag| keys.iter().any(|k| bag[*k] == Value::Bool(false)))
+            };
+            if disabled(&["isGiphyEnabled", "allowGiphy", "giphyEnabled"]) {
+                state.giphy_disabled = true;
+            }
+            if disabled(&["isStickersEnabled", "allowStickers", "stickersEnabled"]) {
+                state.stickers_disabled = true;
+            }
+            if disabled(&["isMessageTranslationEnabled", "allowMessageTranslation", "messageTranslationEnabled"]) {
+                state.translation_disabled = true;
             }
             return Ok((token.to_owned(), place));
         }
@@ -827,8 +965,8 @@ impl Teams {
     fn headers(&self, auth: Auth) -> Result<Vec<(&'static str, String)>, Fault> {
         Ok(match auth {
             Auth::Skype => vec![("Authentication", format!("skypetoken={}", self.skype()?.0))],
-            Auth::Push => vec![("X-Skypetoken", self.skype()?.0)],
             Auth::Ams => vec![("Authorization", format!("skype_token {}", self.skype()?.0))],
+            Auth::Push => vec![("X-Skypetoken", self.skype()?.0)],
             Auth::Bearer(scope) => vec![("Authorization", format!("Bearer {}", self.token(scope)?))],
             Auth::Both(scope) => {
                 vec![("Authorization", format!("Bearer {}", self.token(scope)?)), ("X-Skypetoken", self.skype()?.0)]
@@ -837,13 +975,15 @@ impl Teams {
     }
 
     fn send(&self, method: &str, url: &str, headers: &[(&'static str, String)], body: &Body) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+        let origin = self.cloud.endpoints().teams;
+        let referer = format!("{origin}/");
         macro_rules! dressed {
             ($request:expr) => {{
                 let mut request = $request
                     .header("Accept", "application/json")
                     .header("BehaviorOverride", "redirectAs404")
-                    .header("Origin", TEAMS)
-                    .header("Referer", "https://teams.microsoft.com/");
+                    .header("Origin", origin)
+                    .header("Referer", referer.as_str());
                 for (name, value) in headers {
                     request = request.header(*name, value.as_str());
                 }
@@ -870,7 +1010,11 @@ impl Teams {
         if let Some(why) = self.state().expired.clone() {
             return Err(Fault::Auth(why));
         }
-        if !self.ours(url) {
+        let allowed = match auth {
+            Auth::Bearer(scope) | Auth::Both(scope) if scope == Audience::Substrate => self.substrate_host(url),
+            _ => self.ours(url),
+        };
+        if !allowed {
             return Err(Fault::Net(format!("{} is not a Teams address", bare(url))));
         }
         let (mut renewed, mut limited, mut wait) = (false, false, 0);
@@ -938,39 +1082,18 @@ impl Teams {
         self.ctx.describe(&self.session.name, &self.me())?;
         let mut push = self.open()?;
         self.ctx.link(Link::Connected);
+        let (giphy_disabled, stickers_disabled, translation_disabled) = {
+            let state = self.state();
+            (state.giphy_disabled, state.stickers_disabled, state.translation_disabled)
+        };
         // Pasted images go inline through Teams' AMS media store, scoped to the conversation.
         // Other files use the member-scoped upload: recipients are resolved before the
         // session is created, and the drive item is deleted if the invite fails.
         self.ctx.capabilities(protocol::Capabilities {
-            max_file_bytes: 250 * 1024 * 1024,
-            max_files: protocol::ATTACHMENTS_LIMIT as u32,
-            reply: true,
-            edit: true,
-            delete: true,
-            threads: true,
-            pins: false,
-            pin_chats: 15,
-            groups: 250,
-            close_direct: true,
-            clear_history: true,
-            suppress_embeds: true,
-            schedule: true,
-            forward: true,
-            reactions: true,
-            mention_format: protocol::MentionFormat::Teams,
-            mention_spans: true,
-            importance: true,
-            channel_subject: true,
-            out_of_office: true,
-            polls: Some(protocol::PollCapabilities {
-                max_options: 10,
-                max_duration_secs: 0,
-                multiple: true,
-                anonymous: true,
-            }),
-            activity_feed: true,
-            read_by: true,
-            ..protocol::Capabilities::default()
+            gifs: !giphy_disabled && self.cloud == TeamsCloud::Worldwide,
+            stickers: !stickers_disabled,
+            translate: !translation_disabled,
+            ..capability_ceiling()
         });
         {
             let mut state = self.state();
@@ -1039,6 +1162,23 @@ impl Teams {
             Command::StartGroup { people, title, reply } => {
                 let _ = reply.send(self.start_group(&people, title.as_deref()).map_err(refuse));
             }
+            Command::MembersAdd { conversation_id, people, share_history, reply } => {
+                let _ = reply.send(self.members_add(&conversation_id, &people, share_history).map_err(refuse));
+            }
+            Command::MembersRemove { conversation_id, person, reply } => {
+                let _ = reply.send(self.members_remove(&conversation_id, &person).map_err(refuse));
+            }
+            Command::ConversationUpdate { conversation_id, title, topic, description, reply } => {
+                let _ = reply.send(
+                    self.update_conversation(
+                        &conversation_id,
+                        title.as_deref(),
+                        topic.as_deref(),
+                        description.as_deref(),
+                    )
+                    .map_err(refuse),
+                );
+            }
             Command::Profile { person_id, reply } => {
                 let _ = reply.send(self.profile(&person_id).map_err(refuse));
             }
@@ -1051,12 +1191,6 @@ impl Teams {
             Command::SpaceTags { space_id, reply } => {
                 let _ = reply.send(self.space_tags(&space_id).map_err(refuse));
             }
-            Command::ActivityFeed { kind, cursor, limit, reply } => {
-                let _ = reply.send(self.fetch_activity_feed(kind, cursor.as_deref(), limit).map_err(refuse));
-            }
-            Command::ActivityMarkRead { item_id, reply } => {
-                let _ = reply.send(self.mark_activity_read(item_id.as_deref()).map_err(refuse));
-            }
             Command::ReadBy { conversation_id, message_id, reply } => {
                 let _ = reply.send(self.read_by(&conversation_id, &message_id).map_err(refuse));
             }
@@ -1066,8 +1200,57 @@ impl Teams {
             Command::Leave { conversation_id, reply } => {
                 let _ = reply.send(self.leave(&conversation_id).map_err(refuse));
             }
+            Command::LeaveSpace { space_id, reply } => {
+                let _ = reply.send(self.leave_team(&space_id).map_err(refuse));
+            }
+            Command::BrowseChannels { space_id, query, cursor, limit, reply } => {
+                let _ = reply.send(self.browse_channels(&space_id, &query, cursor.as_deref(), limit).map_err(refuse));
+            }
+            Command::PreviewChannel { conversation_id, reply } => {
+                let _ = reply.send(self.preview_channel(&conversation_id).map_err(refuse));
+            }
+            Command::Join { conversation_id, reply } => {
+                let _ = reply.send(self.join_channel_or_team(&conversation_id).map_err(refuse));
+            }
+            Command::CreateChannel { space_id, name, kind: _, private, group: _, reply, .. } => {
+                let _ = reply.send(self.create_channel(&space_id, &name, private).map_err(refuse));
+            }
+            Command::InvitePreview { code, reply } => {
+                let _ = reply.send(self.invite_preview(&code).map_err(refuse));
+            }
+            Command::InviteJoin { code, reply } => {
+                let _ = reply.send(self.invite_join(&code).map(|(space, conversation)| (space, conversation, false)).map_err(refuse));
+            }
             Command::File { conversation_id, pinned, archived, folder_add: _, folder_remove: _, reply } => {
                 let _ = reply.send(self.file_conversation(&conversation_id, pinned, archived).map_err(refuse));
+            }
+            Command::Pinned { conversation_id, reply } => {
+                let _ = reply.send(self.pinned_messages(&conversation_id).map_err(refuse));
+            }
+            Command::Pin { conversation_id, message_id, pinned, notify: _, me_only: _, reply } => {
+                let _ = reply.send(self.pin_message(&conversation_id, &message_id, pinned).map_err(refuse));
+            }
+            Command::StarMessage { conversation_id, message_id, starred, reply } => {
+                let _ = reply.send(self.save_message(&conversation_id, &message_id, starred).map_err(refuse));
+            }
+            Command::StarredMessages { conversation_id, limit, reply } => {
+                let _ = reply.send(self.saved_messages(conversation_id.as_deref(), limit).map_err(refuse));
+            }
+            Command::ActivityFeed { kind, cursor, limit, reply } => {
+                let _ = reply.send(self.activity_feed_page(kind, cursor.as_deref(), limit).map_err(refuse));
+            }
+            Command::ActivityMarkRead { item_id, reply } => {
+                let _ = reply.send(self.activity_mark_read(item_id.as_deref()).map_err(refuse));
+            }
+            Command::Search { query, scope, filters, cursor, at, reply } => {
+                let found = self.search_messages(&query, &scope, &filters, cursor.as_deref(), at);
+                let _ = reply.send(found.map(|hits| super::SearchPage { hits, cursor: None, total: None }).map_err(refuse));
+            }
+            Command::Relate { person_id, action, reply } => {
+                let _ = reply.send(self.relate(&person_id, action).map_err(refuse));
+            }
+            Command::AnswerMessageRequest { conversation_id, accept, reply } => {
+                let _ = reply.send(self.answer_external_request(&conversation_id, accept).map_err(refuse));
             }
             Command::CloseDirect { conversation_id, reply } => {
                 let _ = reply.send(self.hide_chat(&conversation_id).map_err(refuse));
@@ -1100,12 +1283,27 @@ impl Teams {
             Command::Handoff { conversation_id, reply } => {
                 let _ = reply.send(Ok(self.call_link(&conversation_id)));
             }
+            Command::Catalog { kind, query, cursor, reply, .. }
+                if matches!(kind, protocol::CatalogKind::Gifs | protocol::CatalogKind::Stickers) =>
+            {
+                let _ = reply.send(self.catalog(kind, &query, cursor.as_deref()).map_err(refuse));
+            }
+            Command::Translate { conversation_id, message_id, to, reply } => {
+                let _ = reply.send(self.translate(&conversation_id, &message_id, &to).map_err(refuse));
+            }
+            Command::Meetings { reply } => {
+                let _ = reply.send(self.meetings().map_err(refuse));
+            }
+            Command::MeetingRsvp { id, response, propose, reply } => {
+                let _ = reply.send(self.meeting_rsvp(&id, response, propose).map_err(refuse));
+            }
             // Remove the trouter push registration at Microsoft before forgetting the local token.
             // Entra v2.0 public clients have no single-refresh-token revocation endpoint, and
             // Graph's `/me/revokeSignInSessions` ends every Microsoft session across all devices,
             // so session revocation stays on `https://myaccount.microsoft.com/`.
             Command::SignOut(reply) => {
                 self.unregister_push();
+                cloud::unregister(&self.ctx.account);
                 let _ = reply.send(Ok(()));
             }
             command => command.unsupported(&self.ctx),
@@ -1118,16 +1316,17 @@ impl Teams {
     fn download(&self, url: String) -> Result<Download, Fault> {
         let mut headers = vec![("User-Agent".to_owned(), self.session.user_agent.clone())];
         if let Some(shared) = self.shared_download(&url) {
-            headers.push(("Authorization".to_owned(), format!("Bearer {}", self.token(GRAPH)?)));
+            headers.push(("Authorization".to_owned(), format!("Bearer {}", self.token(Audience::Graph)?)));
             headers.push(("Prefer".to_owned(), "redeemSharingLinkIfNecessary".to_owned()));
             return Ok(Download { url: shared, headers, sealed: None });
         }
         if self.pictures(&url) {
             headers.push(("Authorization".to_owned(), format!("skype_token {}", self.skype()?.0)));
         } else if self.ours(&url) {
-            let cookie = format!("authtoken=Bearer={}&Origin={TEAMS}", self.token(SPACES)?);
+            let origin = self.cloud.endpoints().teams;
+            let cookie = format!("authtoken=Bearer={}&Origin={origin}", self.token(Audience::Spaces)?);
             headers.push(("Cookie".to_owned(), cookie));
-            headers.push(("Referer".to_owned(), "https://teams.microsoft.com/".to_owned()));
+            headers.push(("Referer".to_owned(), format!("{origin}/")));
         }
         Ok(Download { url, headers, sealed: None })
     }
@@ -1138,10 +1337,15 @@ impl Teams {
     fn shared_download(&self, url: &str) -> Option<String> {
         let path = url.split(['?', '#']).next().unwrap_or(url);
         if path.contains("/v1.0/shares/") && path.ends_with("/driveItem/content") {
-            return Some(url.to_owned());
+            return self.ours(url).then(|| url.to_owned());
         }
         let host = https_host(url)?;
-        within(host, "sharepoint.com").then(|| graph_content(&self.graph, url))
+        self.cloud
+            .endpoints()
+            .sharepoint
+            .iter()
+            .any(|domain| within(host, domain))
+            .then(|| graph_content(&self.graph, url))
     }
 
     /// Tells the conversation the user is typing, at most once per [`TYPING_EVERY`].
@@ -1176,6 +1380,7 @@ impl Teams {
         if let Some((channel, root)) = chain_of(conversation) {
             self.clear_chain_unread(channel, root)?;
         }
+        self.mark_activity_for_conversation(thread, message);
         Ok(())
     }
 
@@ -1277,5 +1482,76 @@ mod tests {
         assert_eq!(ended("invalid_grant", ""), "Microsoft ended this sign-in (invalid_grant). Sign in again.");
         assert_eq!(reason(Fault::Limited(7)), "Teams is rate limiting you. Try again in 7 s.");
         assert_eq!(reason(Fault::Refused { status: 403, message: "x".into() }), "Teams does not let you do that here.");
+    }
+
+    #[test]
+    fn gcc_high_session_builds_only_gcc_high_addresses_and_refuses_worldwide_hosts() {
+        let gov_session = json!({
+            "client_id": CLIENT, "user_agent": "Safari/1", "oid": "gov-oid", "name": "Sam Gov",
+            "cloud": "gcc_high",
+            "tenants": [{"id": "gov-tenant-1", "name": "Agency", "refresh_token": "rt-gov"}],
+        })
+        .to_string();
+        let found = accounts(&gov_session).unwrap();
+        assert_eq!(found.len(), 1);
+        let per_tenant: Session = serde_json::from_str(&found[0].session).unwrap();
+        assert_eq!(TeamsCloud::parse(&per_tenant.cloud), TeamsCloud::GccHigh);
+
+        let ep = TeamsCloud::GccHigh.endpoints();
+        assert_eq!(ep.login, "https://login.microsoftonline.us");
+        assert_eq!(ep.teams, "https://gov.teams.microsoft.us");
+        assert_eq!(ep.spaces, "https://gov.teams.microsoft.us");
+        assert_eq!(ep.aggregator, "https://chatsvcagg.gov.teams.microsoft.us");
+        assert_eq!(ep.presence, "https://presence.gov.teams.microsoft.us");
+        assert_eq!(ep.graph, "https://graph.microsoft.us");
+        assert_eq!(ep.trouter, "https://go.trouter.gov.teams.microsoft.us");
+
+        let dir = std::env::temp_dir().join(format!("tiny-teams-gcchigh-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let store = crate::store::Store::open(&dir.join("chat.sqlite")).unwrap();
+        let hub = Arc::new(crate::hub::Hub::new(store));
+        let acct = protocol::AccountKey { network: protocol::Network::Teams, account: "gov-tenant-1".into() };
+        let (_adapter, ctx, _rx) = super::super::local(acct, hub);
+        let teams = Teams {
+            ctx,
+            agent: ureq::Agent::config_builder().build().into(),
+            cloud: TeamsCloud::GccHigh,
+            login: ep.login.to_owned(),
+            api: ep.teams.to_owned(),
+            graph: ep.graph.to_owned(),
+            trouter: ep.trouter.to_owned(),
+            moved: None,
+            session: per_tenant,
+            state: Mutex::new(State { refresh: "rt-gov".to_owned(), ..State::default() }),
+            minting: Mutex::new(()),
+            settling: Mutex::new(()),
+            asked: Mutex::new(Instant::now()),
+        };
+
+        // GCC High accepts only GCC High hosts and refuses worldwide, DoD, and China hosts.
+        assert!(teams.ours("https://gov.teams.microsoft.us/api/authsvc/v1.0/authz"));
+        assert!(teams.ours("https://usgov.ng.msg.gov.teams.microsoft.us/v1/users/ME"));
+        assert!(teams.ours("https://graph.microsoft.us/v1.0/me"));
+        assert!(!teams.ours("https://teams.microsoft.com/api/authsvc/v1.0/authz"));
+        assert!(!teams.ours("https://emea.ng.msg.teams.microsoft.com/v1/users/ME"));
+        assert!(!teams.ours("https://graph.microsoft.com/v1.0/me"));
+        assert!(!teams.ours("https://dod.teams.microsoft.us/api/authsvc/v1.0/authz"));
+        assert!(!teams.ours("https://teams.microsoft.cn/api/authsvc/v1.0/authz"));
+        assert!(!teams.ours("https://teams.microsoftonline.cn/api/authsvc/v1.0/authz"));
+        assert!(!teams.ours("https://api.fl.spaces.skype.us/"));
+        assert!(!teams.ours("https://usgov-api.asm.skype.us/v1/objects/1"));
+
+        // Media store and SharePoint links stay strictly inside GCC High.
+        assert!(teams.pictures("https://usgov.asyncgw.gov.teams.microsoft.us/v1/objects/1/views/imgo"));
+        assert!(!teams.pictures("https://usgov-api.asm.skype.us/v1/objects/1/views/imgo"));
+        assert!(!teams.pictures("https://eu-api.asm.skype.com/v1/objects/1/views/imgo"));
+        assert!(teams.shared_download("https://agency.sharepoint.us/:x:/s/Ops/Abc").is_some_and(|u| u.starts_with("https://graph.microsoft.us/v1.0/shares/u!")));
+        assert!(teams.shared_download("https://contoso.sharepoint.com/:x:/s/Ops/Abc").is_none());
+
+        // `call` refuses before touching the network or minting a token for a worldwide URL.
+        let refused = teams.call("GET", "https://teams.microsoft.com/api/csa/api/v1/teams/users/me", Auth::Bearer(Audience::Aggregator), Body::None, false);
+        assert!(matches!(refused, Err(Fault::Net(msg)) if msg.contains("is not a Teams address")));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

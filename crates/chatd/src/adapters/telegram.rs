@@ -70,6 +70,20 @@ mod secret;
 mod send;
 pub mod signin;
 mod sync;
+
+pub(crate) fn capability_ceiling() -> protocol::Capabilities {
+    sync::capability_ceiling()
+}
+
+/// A normal person's call before the full profile arrives: open it in Telegram.
+pub(crate) fn direct_call_ceiling() -> protocol::CallSupport {
+    sync::user_call(false, false, None).support
+}
+
+/// Groups and channels do not place a call here.
+pub(crate) fn other_call() -> protocol::CallSupport {
+    sync::other_call()
+}
 mod wire;
 
 use super::{keep_connected, serve_commands, Command, Context, Failure, Refusal, Signed};
@@ -785,6 +799,7 @@ fn offline(ctx: &Context, command: Command) {
         Command::MarkUnreadItemsRead { reply, .. } => drop(reply.send(Err(down()))),
         Command::Transcribe { reply, .. } => drop(reply.send(Err(down()))),
         Command::RateTranscript { reply, .. } => drop(reply.send(Err(down()))),
+        Command::Translate { reply, .. } => drop(reply.send(Err(down()))),
         Command::SendWith { conversation_id, client_id, .. } => ctx.sent(&conversation_id, &client_id, Err("Telegram is offline.".to_owned())),
         Command::StartDirect { reply, .. }
         | Command::StartGroup { reply, .. }
@@ -952,7 +967,7 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::Members { conversation_id, offset, limit, reply } => {
             let _ = reply.send(members::list(account, &conversation_id, offset, limit).map_err(refused));
         }
-        Command::MembersAdd { conversation_id, people, reply } => {
+        Command::MembersAdd { conversation_id, people, reply, .. } => {
             let _ = reply.send(members::add_members(account, &conversation_id, &people).map_err(refused));
         }
         Command::StartGroup { people, title, reply } => {
@@ -1264,6 +1279,9 @@ fn serve(account: &Arc<Account>, command: Command) {
         }
         Command::RateTranscript { conversation_id, message_id, transcription_id, good, reply } => {
             let _ = reply.send(info::rate_transcript(account, &conversation_id, &message_id, transcription_id, good).map_err(refused));
+        }
+        Command::Translate { conversation_id, message_id, to, reply } => {
+            let _ = reply.send(translate::one(account, &conversation_id, &message_id, &to).map_err(refused));
         }
         Command::Handoff { conversation_id, reply } => {
             let link = Who::parse(&conversation_id).map(|(who, _)| {

@@ -367,6 +367,8 @@ fn notes(cue: Cue) -> (&'static [(f64, f64, f64)], bool) {
         Cue::Moved => (&[(0., 0.07, A5), (0.07, 0.07, E5), (0.14, 0.07, A5)], false),
         // Down to the lowest note any cue has, held longest: out, and not coming back by itself.
         Cue::Disconnected => (&[(0., 0.1, E4), (0.1, 0.2, A3)], false),
+        // Soft rising two-note chime: someone started sharing their screen.
+        Cue::ShareStarted => (&[(0., 0.08, E5), (0.08, 0.1, A5)], false),
     }
 }
 
@@ -580,6 +582,7 @@ mod tests {
             (Cue::Back, 0.25),
             (Cue::Moved, 0.21),
             (Cue::Disconnected, 0.3),
+            (Cue::ShareStarted, 0.18),
             (Cue::Test, 0.18),
         ];
         for (cue, length) in lengths {

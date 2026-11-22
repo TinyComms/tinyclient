@@ -5709,6 +5709,7 @@ fn create_group_channel_and_add_members_with_missing_invitees() {
         world.ask(Request::MembersAdd {
             conversation: key("g8001"),
             people: vec!["u7002".into()],
+            share_history: None,
         }),
         Response::Ok
     );
@@ -5718,6 +5719,7 @@ fn create_group_channel_and_add_members_with_missing_invitees() {
         world.ask(Request::MembersAdd {
             conversation: pub_chan.key.clone(),
             people: vec!["u7002".into()],
+            share_history: None,
         }),
         Response::Ok
     );
@@ -5731,6 +5733,7 @@ fn create_group_channel_and_add_members_with_missing_invitees() {
     let privacy = world.ask(Request::MembersAdd {
         conversation: pub_chan.key.clone(),
         people: vec!["u7005".into()],
+        share_history: None,
     });
     assert!(
         matches!(privacy, Response::Error { code: ErrorCode::Refused, ref detail } if detail.contains("invite link")),

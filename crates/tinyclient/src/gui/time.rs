@@ -332,6 +332,46 @@ pub fn duration(seconds: u64) -> String {
     }
 }
 
+/// `Today 14:00–14:30`. `end_clock` empty means the end is the start.
+pub fn meeting_words(day: &str, start_clock: &str, end_clock: &str) -> String {
+    if end_clock.is_empty() {
+        format!("{day} {start_clock}")
+    } else {
+        format!("{day} {start_clock}–{end_clock}")
+    }
+}
+
+/// [`meeting_words`] plus the RSVP word, when there is one.
+pub fn meeting_line(day: &str, start_clock: &str, end_clock: &str, response_label: &str) -> String {
+    let words = meeting_words(day, start_clock, end_clock);
+    if response_label.is_empty() { words } else { format!("{words} · {response_label}") }
+}
+
+/// True from fifteen minutes before the start until it starts, and only while it has not ended.
+pub fn meeting_starts_soon(now: i64, start: i64, end: i64) -> bool {
+    end > now && start > now && start - now <= 15 * 60
+}
+
+/// True from the start until the end.
+pub fn meeting_live(now: i64, start: i64, end: i64) -> bool {
+    now >= start && now < end
+}
+
+/// The line Upcoming, the header, and Details show. `Now` and `Starting soon` lead when they apply.
+pub fn meeting_display(event: &protocol::MeetingEvent, now: i64) -> String {
+    let day = if same_day(event.start, now) { "Today" } else { "Later" };
+    let start = clock(event.start);
+    let end = if event.end > event.start { clock(event.end) } else { String::new() };
+    let line = meeting_line(day, &start, &end, event.response.label());
+    if meeting_live(now, event.start, event.end) {
+        format!("Now · {line}")
+    } else if meeting_starts_soon(now, event.start, event.end) {
+        format!("Starting soon · {line}")
+    } else {
+        line
+    }
+}
+
 /// Seconds from `now` to the next local midnight: when day labels roll over.
 #[allow(dead_code)]
 pub fn until_midnight(now: i64) -> u64 {
@@ -417,6 +457,23 @@ mod tests {
         assert_eq!(style(), UK);
         set_style(US);
         assert_eq!(style(), US);
+    }
+
+    #[test]
+    fn a_meeting_line_says_the_day_then_the_clocks_and_soon_is_fifteen_minutes() {
+        assert_eq!(meeting_words("Today", "14:00", "14:30"), "Today 14:00–14:30");
+        assert_eq!(meeting_line("Today", "14:00", "14:30", "Accepted"), "Today 14:00–14:30 · Accepted");
+        assert_eq!(meeting_line("Later", "09:00", "09:30", ""), "Later 09:00–09:30");
+        assert_eq!(meeting_words("Today", "14:00", ""), "Today 14:00");
+        let start = 1_700_000_000;
+        assert!(meeting_starts_soon(start - 15 * 60, start, start + 1800));
+        assert!(meeting_starts_soon(start - 60, start, start + 1800));
+        assert!(!meeting_starts_soon(start - 15 * 60 - 1, start, start + 1800));
+        assert!(!meeting_starts_soon(start, start, start + 1800));
+        assert!(meeting_live(start, start, start + 1800));
+        assert!(meeting_live(start + 1799, start, start + 1800));
+        assert!(!meeting_live(start + 1800, start, start + 1800));
+        assert!(!meeting_starts_soon(start + 10, start, start + 1800));
     }
 
     #[test]

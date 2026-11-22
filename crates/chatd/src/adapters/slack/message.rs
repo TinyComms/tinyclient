@@ -6,8 +6,8 @@ use super::{fnv, seconds, thread_id, Slack};
 use protocol::{
     Attachment, Card, ConfirmDialog, ControlKind, ControlOption, ControlStyle, Forwarded,
     MediaFile, MediaKind, Message, MessageControl, MessageKind, Preview, Reaction, Sender, Span,
-    Style, ThreadSummary, CARD_FIELDS, CONTROL_OPTIONS_LIMIT, MESSAGE_CONTROLS_LIMIT, THREAD_FACES,
-    WAVEFORM_LIMIT,
+    Style, ThreadSummary, Transcript, CARD_FIELDS, CONTROL_OPTIONS_LIMIT, MESSAGE_CONTROLS_LIMIT,
+    THREAD_FACES, WAVEFORM_LIMIT,
 };
 use serde_json::{json, Value};
 
@@ -1286,21 +1286,74 @@ impl Slack {
         }
     }
 
+    /// Extracts optional clip transcript preview/status and registers the lazy WebVTT caption track
+    /// (`{id}:vtt`) when Slack serves it. Never fetches the VTT eagerly.
+    fn clip_transcript(&self, id: &str, file: &Value, media: &mut Registered) -> Option<Transcript> {
+        let tr = &file["transcription"];
+        let status = tr["status"].as_str().unwrap_or("").trim().to_owned();
+        let preview = tr["preview"]["content"]
+            .as_str()
+            .or_else(|| tr["preview"].as_str())
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        let vtt_file = file["vtt"]
+            .as_str()
+            .filter(|u| !u.is_empty() && self.hosted(u))
+            .map(|u| {
+                let vtt = MediaFile::new(format!("{id}:vtt"), MediaKind::File);
+                media.push((vtt.clone(), u.to_owned()));
+                vtt
+            });
+        let transcript = Transcript {
+            preview,
+            status,
+            file: vtt_file,
+            lines: Vec::new(),
+        };
+        (!transcript.is_empty()).then_some(transcript)
+    }
+
     /// An upload as an attachment: the file itself and the picture a row shows inline. Both
     /// addresses need the session to fetch (see `Command::Download`).
     ///
     /// The picture a row shows is registered at the size a row normally draws, and every other
     /// size Slack made of it as a variant, so a 2x screen is given one large enough.
+    /// For video clips, Slack's smaller transcoded `mp4` copy is preferred over the original
+    /// `url_private` when hosted by Slack.
     pub(super) fn file(&self, file: &Value, media: &mut Registered, variants: &mut Sizes) -> Option<Attachment> {
         let id = file["id"].as_str()?;
-        let url = file["url_private"].as_str().filter(|url| self.hosted(url))?;
-        let mime = file["mimetype"].as_str().unwrap_or("");
-        let kind = match mime.split_once('/') {
+        let subtype = file["subtype"].as_str().unwrap_or("");
+        let raw_mime = file["mimetype"].as_str().unwrap_or("");
+        let kind = match raw_mime.split_once('/') {
             Some(("image", "gif")) => MediaKind::Gif,
             Some(("image", _)) => MediaKind::Image,
             Some(("video", _)) => MediaKind::Video,
             Some(("audio", _)) => MediaKind::Audio,
-            _ => MediaKind::File,
+            _ => match subtype {
+                "slack_audio" => MediaKind::Audio,
+                "slack_video" => MediaKind::Video,
+                _ => MediaKind::File,
+            },
+        };
+        let mime = if !raw_mime.is_empty() {
+            raw_mime
+        } else {
+            match subtype {
+                "slack_audio" => "audio/ogg",
+                "slack_video" => "video/mp4",
+                _ => "",
+            }
+        };
+        // Prefer Slack's smaller transcoded MP4 copy over the raw upload for video clips,
+        // falling back to `url_private` (and `hls` if neither is present).
+        let url = if kind == MediaKind::Video {
+            [&file["mp4"], &file["url_private"], &file["hls"]]
+                .into_iter()
+                .filter_map(Value::as_str)
+                .find(|u| !u.is_empty() && self.hosted(u))?
+        } else {
+            file["url_private"].as_str().filter(|url| self.hosted(url))?
         };
         let whole = MediaFile {
             width: pixels(&file["original_w"]),
@@ -1369,6 +1422,9 @@ impl Slack {
         let samples: Vec<u64> = file["audio_wave_samples"].as_array().into_iter().flatten().filter_map(Value::as_u64).collect();
         let every = samples.len().div_ceil(WAVEFORM_LIMIT).max(1);
         let waveform = samples.iter().step_by(every).map(|sample| ((*sample).min(100) * 255 / 100) as u8).collect();
+        let duration_ms = file["duration_ms"].as_u64().unwrap_or(0);
+        let duration = if duration_ms > 0 { (duration_ms / 1000).max(1) as u32 } else { 0 };
+        let transcript = self.clip_transcript(id, file, media);
         Some(Attachment {
             // Slack has neither spoilers nor stickers.
             spoiler: false,
@@ -1379,11 +1435,12 @@ impl Slack {
             thumb,
             preview: None,
             mime: mime.to_owned(),
-            duration: (file["duration_ms"].as_u64().unwrap_or(0) / 1000) as u32,
+            duration,
             round: false,
             view_once: false,
             sticker_set: String::new(),
             transcription: None,
+            transcript,
         })
     }
 
@@ -1815,13 +1872,32 @@ impl Slack {
         }
     }
 
+    /// Parses a Slack App Home tab's Block Kit `blocks` array into rich text, spans, and
+    /// interactive controls, reusing the same Block Kit parser as messages.
+    pub(super) fn parse_app_home_blocks(
+        &self,
+        blocks: &[Value],
+    ) -> (String, Vec<Span>, Vec<Card>, Vec<MessageControl>) {
+        let mut rich = Rich::new(self);
+        rich.blocks(blocks);
+        rich.finish();
+        let mut controls = Vec::new();
+        collect_block_controls(blocks, &mut controls);
+        controls.truncate(MESSAGE_CONTROLS_LIMIT);
+        (rich.text, rich.spans, Vec::new(), controls)
+    }
+
     /// A message event, or one entry of a page of history. `None` only for what Slack itself
     /// hides. Registers every file the message refers to.
     pub(super) fn message(&self, channel: &str, event: &Value) -> Option<Message> {
         let ts = event["ts"].as_str()?;
         let subtype = event["subtype"].as_str();
+        let ephemeral = event["is_ephemeral"] == true
+            || subtype == Some("ephemeral")
+            || event["message_type"].as_str() == Some("ephemeral")
+            || event["ephemeral_type"].is_string();
         let handled_apart = matches!(subtype, Some("message_changed" | "message_deleted" | "message_replied"));
-        if handled_apart || event["hidden"] == true {
+        if handled_apart || (event["hidden"] == true && !ephemeral) {
             return None;
         }
         let thread = event["thread_ts"].as_str();
@@ -2017,6 +2093,7 @@ impl Slack {
         message.card = framed;
         message.cards = extra_cards;
         message.controls = controls;
+        message.ephemeral = ephemeral;
         message.forwarded = forwarded;
         message.edited = event["edited"].is_object();
         message.edited_at = event["edited"]["ts"].as_str().map(seconds).filter(|at| *at > 0);

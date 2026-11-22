@@ -312,22 +312,21 @@ impl Shell {
 
     /// Once the first answer is in: the conversation and sidebar mode of the last launch.
     fn restore_place(&mut self, cx: &mut Context<Self>) {
-        let Some((open, mode)) = self.restore.take() else {
-            return;
-        };
-        // A restored chat would cover the server page. Tiny opens on its own window.
-        let tiny = matches!(&mode, super::sidebar::Mode::Network(protocol::Network::Tiny));
-        if tiny || mode != self.sidebar_state.mode {
-            self.go(mode, cx);
-        }
-        if tiny {
-            return;
-        }
-        if let Some((key, title)) = open {
-            if self.open.is_none() {
-                self.open_now(key, &title, cx);
+        if let Some((open, mode)) = self.restore.take() {
+            // A restored chat would cover the server page. Tiny opens on its own window.
+            let tiny = matches!(&mode, super::sidebar::Mode::Network(protocol::Network::Tiny));
+            if tiny || mode != self.sidebar_state.mode {
+                self.go(mode, cx);
+            }
+            if !tiny {
+                if let Some((key, title)) = open {
+                    if self.open.is_none() {
+                        self.open_now(key, &title, cx);
+                    }
+                }
             }
         }
+        self.restore_conversation_windows(cx);
     }
 
     /// What the window says now (`polish/01-system.md` §5).
@@ -550,6 +549,8 @@ impl Shell {
             right: state.right_width,
             pins: self.sidebar_state.pins.clone(),
             frame: self.frame.get(),
+            call_popout_frame: self.call_state.popout_frame,
+            conversation_windows: self.conversation_state.windows.frames(),
             // Until the first answer, the place of the last launch is still the one to keep.
             open: match &self.restore {
                 Some((open, _)) => open.clone(),

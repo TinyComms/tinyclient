@@ -134,6 +134,26 @@ struct Fake {
     drafts_list: Mutex<Option<Value>>,
     /// Scheduled messages keyed by scheduled_message_id.
     scheduled: Mutex<Vec<Value>>,
+    /// Custom emoji uploaded via `emoji.add` (name -> url).
+    added_emoji: Mutex<HashMap<String, String>>,
+    /// Mutable user groups for `usergroups.list` / `create` / `update` / `users.update`.
+    usergroups: Mutex<Option<Vec<Value>>>,
+    /// Optional override for `users.channelSections.list`.
+    sections_override: Mutex<Option<Value>>,
+    /// Optional extra users for `users.info` / `edge:users/info`.
+    extra_users: Mutex<Vec<Value>>,
+    /// Fields merged onto the signed-in user (`U0ME` / `U0ME2`) for `users.info`.
+    self_user: Mutex<Option<Value>>,
+    /// Optional extra channels returned by `users.conversations`.
+    extra_conversations: Mutex<Vec<Value>>,
+    /// Optional override for `search.messages` (fn of page -> Value).
+    search_override: Mutex<Option<Value>>,
+    /// Optional paged `search.messages` pages (1-indexed).
+    search_pages: Mutex<Vec<Value>>,
+    /// Optional response for `search.files`.
+    search_files: Mutex<Option<Value>>,
+    /// Optional response for `search.modules`.
+    search_modules: Mutex<Option<Value>>,
 }
 
 fn unescape(text: &str) -> String {
@@ -159,6 +179,36 @@ fn form(body: &[u8]) -> HashMap<String, String> {
     let body = std::str::from_utf8(body).unwrap();
     let pairs = body.split('&').filter_map(|pair| pair.split_once('='));
     pairs.map(|(name, value)| (unescape(name), unescape(value))).collect()
+}
+
+fn multipart(body: &[u8], boundary: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let delim = format!("--{boundary}");
+    let text = String::from_utf8_lossy(body);
+    for part in text.split(&delim) {
+        let Some((head, rest)) = part.split_once("\r\n\r\n") else {
+            continue;
+        };
+        let value = rest.strip_suffix("\r\n").unwrap_or(rest);
+        let Some(name_start) = head.find("name=\"") else {
+            continue;
+        };
+        let after = &head[name_start + 6..];
+        let Some(name_end) = after.find('"') else {
+            continue;
+        };
+        let name = &after[..name_end];
+        if let Some(fn_start) = head.find("filename=\"") {
+            let fn_after = &head[fn_start + 10..];
+            if let Some(fn_end) = fn_after.find('"') {
+                out.insert(format!("{name}:filename"), fn_after[..fn_end].to_owned());
+            }
+            out.insert(format!("{name}:len"), value.len().to_string());
+        } else {
+            out.insert(name.to_owned(), value.to_owned());
+        }
+    }
+    out
 }
 
 impl Fake {
@@ -187,6 +237,16 @@ impl Fake {
             )])),
             drafts_list: Mutex::default(),
             scheduled: Mutex::default(),
+            added_emoji: Mutex::default(),
+            usergroups: Mutex::default(),
+            sections_override: Mutex::default(),
+            extra_users: Mutex::default(),
+            self_user: Mutex::default(),
+            extra_conversations: Mutex::default(),
+            search_override: Mutex::default(),
+            search_pages: Mutex::default(),
+            search_files: Mutex::default(),
+            search_modules: Mutex::default(),
         });
         let socket_url = format!("ws://{}/", socket.local_addr().unwrap());
         for (listener, serve) in [(http, Fake::http as fn(Arc<Fake>, TcpStream)), (socket, Fake::socket)] {
@@ -222,7 +282,21 @@ impl Fake {
             }));
         }
         let users = self.fixture(token, "users")?;
-        users.as_array()?.iter().find(|user| user["id"] == id).cloned()
+        let mut found = if let Some(user) = users.as_array()?.iter().find(|user| user["id"] == id) {
+            user.clone()
+        } else {
+            self.extra_users.lock().unwrap().iter().find(|user| user["id"] == id).cloned()?
+        };
+        if id == me(token) {
+            if let Some(over) = self.self_user.lock().unwrap().clone() {
+                if let (Some(base), Some(extra)) = (found.as_object_mut(), over.as_object()) {
+                    for (key, value) in extra {
+                        base.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        Some(found)
     }
 
     // HTTP.
@@ -282,7 +356,12 @@ impl Fake {
         };
         if let Some(method) = path.strip_prefix("/api/") {
             call.method = method.to_owned();
-            call.params = form(body);
+            let ct = header("content-type");
+            if let Some(boundary) = ct.split("boundary=").nth(1) {
+                call.params = multipart(body, boundary.trim());
+            } else {
+                call.params = form(body);
+            }
             call.token = call.params.get("token").cloned().unwrap_or_default();
             self.calls.lock().unwrap().push(call.clone());
             return self.api(&call);
@@ -299,10 +378,20 @@ impl Fake {
             assert_eq!(space, team(&call.token), "the edge cache is asked under the workspace's own id");
             return self.edge(&call.token, method, &asked);
         }
-        // A file: an upload, a thumbnail, a picture.
+        // A file: an upload, a thumbnail, a picture, or a clip WebVTT track.
         call.method = format!("file:{path}");
         call.token = header("authorization").trim_start_matches("Bearer ").to_owned();
         self.calls.lock().unwrap().push(call);
+        if path.ends_with(".vtt") {
+            let vtt = "WEBVTT\n\n00:00:00.500 --> 00:00:03.200\n<v Ana>Quick deploy update for everyone.</v>\n\n00:00:03.500 --> 00:00:07.000\nCanary is green and traffic is at 50%.\n";
+            return Reply {
+                status: "200 OK",
+                retry_after: None,
+                kind: "text/vtt",
+                cookie: None,
+                body: vtt.as_bytes().to_vec(),
+            };
+        }
         Reply {
             status: "200 OK",
             retry_after: None,
@@ -335,6 +424,26 @@ impl Fake {
         };
         let found = match call.method.as_str() {
             "chat.postMessage" => return self.post(call),
+            "chat.meMessage" => {
+                let text = param("text");
+                if channel.is_empty() || text.is_empty() {
+                    return refused("no_text");
+                }
+                let n = self.posted.fetch_add(1, Ordering::Relaxed) + 1;
+                let ts = format!("17600025{n:02}.000100");
+                Some(json!({
+                    "ok": true,
+                    "channel": channel,
+                    "ts": ts,
+                }))
+            }
+            "commands.list" => Some(json!({
+                "ok": true,
+                "commands": [
+                    {"command": "/deploy", "description": "Deploy a service", "usage": "[service] [env]"},
+                    {"command": "/standup", "description": "Start standup check-in", "usage": ""}
+                ]
+            })),
             method @ ("reactions.add" | "reactions.remove") => {
                 if param("name") == "no_entry_sign" {
                     return refused("too_many_reactions");
@@ -378,8 +487,32 @@ impl Fake {
                     .as_array()
                     .unwrap()
                     .iter()
-                    .map(|file| json!({"id": file["id"], "name": file["title"], "title": file["title"], "mimetype": "text/plain", "size": 3,
-                                        "url_private": format!("https://files.slack.com/files-pri/{}-{}/f", team(token), file["id"].as_str().unwrap())}))
+                    .map(|file| {
+                        let subtype = file["subtype"].as_str().unwrap_or("");
+                        let mime = match subtype {
+                            "slack_audio" => "audio/ogg",
+                            "slack_video" => "video/mp4",
+                            _ => "text/plain",
+                        };
+                        let mut out = json!({
+                            "id": file["id"],
+                            "name": file["title"],
+                            "title": file["title"],
+                            "mimetype": mime,
+                            "size": 3,
+                            "url_private": format!("https://files.slack.com/files-pri/{}-{}/f", team(token), file["id"].as_str().unwrap()),
+                        });
+                        if !subtype.is_empty() {
+                            out["subtype"] = subtype.into();
+                        }
+                        if let Some(ms) = file["duration_ms"].as_u64() {
+                            out["duration_ms"] = ms.into();
+                        }
+                        if let Some(wave) = file["audio_wave_samples"].as_array() {
+                            out["audio_wave_samples"] = Value::Array(wave.clone());
+                        }
+                        out
+                    })
                     .collect();
                 let number = self.posted.fetch_add(1, Ordering::Relaxed) + 1;
                 let ts = format!("17600020{number:02}.{number:06}");
@@ -471,6 +604,16 @@ impl Fake {
                 }
                 Some(listed)
             }
+            "users.conversations" => {
+                let mut listed = self.fixture(token, "users.conversations").unwrap();
+                let extra = self.extra_conversations.lock().unwrap().clone();
+                if !extra.is_empty() {
+                    if let Some(arr) = listed["channels"].as_array_mut() {
+                        arr.extend(extra);
+                    }
+                }
+                Some(listed)
+            }
             "conversations.history" if BUSY.contains(&channel) => Some(json!({"ok": true, "has_more": false, "messages": []})),
             "conversations.members" => {
                 if channel == "C0RND" {
@@ -555,14 +698,284 @@ impl Fake {
                 }
                 Some(json!({"ok": true}))
             }
-            "usergroups.list" => Some(json!({
-                "ok": true,
-                "usergroups": [
-                    {"id": "S0MINE", "handle": "oncall", "name": "On Call", "date_delete": 0, "users": [me(token), "U0ANA"]},
-                    {"id": "S0OTHER", "handle": "design", "name": "Design", "date_delete": 0, "users": ["U0ANA", "U0BEN"]},
-                    {"id": "S0OFF", "handle": "legacy", "name": "Legacy", "date_delete": 1700000000, "users": [me(token)]},
-                ],
-            })),
+            "usergroups.list" => {
+                let groups = self.usergroups.lock().unwrap().clone().unwrap_or_else(|| {
+                    vec![
+                        json!({"id": "S0MINE", "handle": "oncall", "name": "On Call", "description": "On-call rotation", "date_delete": 0, "users": [me(token), "U0ANA"]}),
+                        json!({"id": "S0OTHER", "handle": "design", "name": "Design", "description": "Design team", "date_delete": 0, "users": ["U0ANA", "U0BEN"]}),
+                        json!({"id": "S0OFF", "handle": "legacy", "name": "Legacy", "date_delete": 1700000000, "users": [me(token)]}),
+                    ]
+                });
+                Some(json!({"ok": true, "usergroups": groups}))
+            }
+            "usergroups.create" => {
+                let name = param("name");
+                let handle = param("handle");
+                if name.is_empty() || handle.is_empty() {
+                    return refused("invalid_arguments");
+                }
+                let mut guard = self.usergroups.lock().unwrap();
+                let list = guard.get_or_insert_with(|| {
+                    vec![
+                        json!({"id": "S0MINE", "handle": "oncall", "name": "On Call", "description": "On-call rotation", "date_delete": 0, "users": [me(token), "U0ANA"]}),
+                        json!({"id": "S0OTHER", "handle": "design", "name": "Design", "description": "Design team", "date_delete": 0, "users": ["U0ANA", "U0BEN"]}),
+                    ]
+                });
+                if list.iter().any(|g| g["handle"] == handle) {
+                    return refused("handle_already_exists");
+                }
+                let id = format!("S0NEW{}", list.len() + 1);
+                let created = json!({
+                    "id": id,
+                    "handle": handle,
+                    "name": name,
+                    "description": param("description"),
+                    "date_delete": 0,
+                    "users": [],
+                    "user_count": 0,
+                });
+                list.push(created.clone());
+                Some(json!({"ok": true, "usergroup": created}))
+            }
+            "usergroups.update" => {
+                let id = param("usergroup");
+                let mut guard = self.usergroups.lock().unwrap();
+                let list = guard.get_or_insert_with(|| {
+                    vec![
+                        json!({"id": "S0MINE", "handle": "oncall", "name": "On Call", "description": "On-call rotation", "date_delete": 0, "users": [me(token), "U0ANA"]}),
+                        json!({"id": "S0OTHER", "handle": "design", "name": "Design", "description": "Design team", "date_delete": 0, "users": ["U0ANA", "U0BEN"]}),
+                    ]
+                });
+                let Some(found) = list.iter_mut().find(|g| g["id"] == id) else {
+                    return refused("no_such_subteam");
+                };
+                if !param("name").is_empty() {
+                    found["name"] = param("name").into();
+                }
+                if !param("handle").is_empty() {
+                    found["handle"] = param("handle").into();
+                }
+                if call.params.contains_key("description") {
+                    found["description"] = param("description").into();
+                }
+                Some(json!({"ok": true, "usergroup": found.clone()}))
+            }
+            "usergroups.users.update" => {
+                let id = param("usergroup");
+                let users: Vec<String> = param("users")
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                let mut guard = self.usergroups.lock().unwrap();
+                let list = guard.get_or_insert_with(|| {
+                    vec![
+                        json!({"id": "S0MINE", "handle": "oncall", "name": "On Call", "description": "On-call rotation", "date_delete": 0, "users": [me(token), "U0ANA"]}),
+                        json!({"id": "S0OTHER", "handle": "design", "name": "Design", "description": "Design team", "date_delete": 0, "users": ["U0ANA", "U0BEN"]}),
+                    ]
+                });
+                let Some(found) = list.iter_mut().find(|g| g["id"] == id) else {
+                    return refused("no_such_subteam");
+                };
+                found["user_count"] = (users.len() as u64).into();
+                found["users"] = json!(users);
+                Some(json!({"ok": true, "usergroup": found.clone()}))
+            }
+            "users.admin.invite" => {
+                let email = param("email");
+                if email == "already@acme.example" {
+                    return refused("already_in_team");
+                }
+                if email.is_empty() || !email.contains('@') {
+                    return refused("invalid_email");
+                }
+                Some(json!({"ok": true}))
+            }
+            "emoji.add" => {
+                let name = param("name");
+                if name.is_empty() || param("mode") != "data" {
+                    return refused("error_no_image");
+                }
+                let mut added = self.added_emoji.lock().unwrap();
+                if added.contains_key(name) {
+                    return refused("error_name_taken");
+                }
+                added.insert(name.to_owned(), format!("{}/emoji/{name}.png", self.base));
+                Some(json!({"ok": true}))
+            }
+            "emoji.list" => {
+                let mut base = self.fixture(token, "emoji.list").unwrap();
+                let added = self.added_emoji.lock().unwrap().clone();
+                if let Some(map) = base["emoji"].as_object_mut() {
+                    for (k, v) in added {
+                        map.insert(k, v.into());
+                    }
+                }
+                Some(base)
+            }
+            "users.channelSections.list" => {
+                if let Some(over) = self.sections_override.lock().unwrap().clone() {
+                    Some(over)
+                } else {
+                    self.fixture(token, "users.channelSections.list")
+                }
+            }
+            "users.channelSections.channels.list" => {
+                if param("channel_section_id") == "S0BIG" && param("cursor") == "sec_p2" {
+                    Some(json!({
+                        "ok": true,
+                        "channel_ids": ["C0SIDE"],
+                        "response_metadata": {"next_cursor": ""}
+                    }))
+                } else {
+                    Some(json!({"ok": true, "channel_ids": [], "response_metadata": {"next_cursor": ""}}))
+                }
+            }
+            "users.channelSections.create" => {
+                let name = param("name");
+                if name.is_empty() {
+                    return refused("invalid_name_required");
+                }
+                Some(json!({
+                    "ok": true,
+                    "channel_section_id": "S0CUSTOM1",
+                    "channel_section": {"channel_section_id": "S0CUSTOM1", "name": name, "emoji": param("emoji")}
+                }))
+            }
+            "users.channelSections.update" | "users.channelSections.delete" | "users.channelSections.order" => {
+                Some(json!({"ok": true}))
+            }
+            "users.channelSections.channels.bulkUpdate" => {
+                if param("insert").is_empty() && param("remove").is_empty() {
+                    return refused("invalid_arguments");
+                }
+                Some(json!({"ok": true}))
+            }
+            "apps.profile.get" => {
+                let app = param("app");
+                if app == "A0DEP" || param("bot") == "B0DEP" {
+                    Some(json!({
+                        "ok": true,
+                        "app": {
+                            "id": "A0DEP",
+                            "name": "Deploy Bot",
+                            "long_description": "Deploys services to staging and production right from Slack.",
+                            "app_home_enabled": true,
+                            "installed_by": "U0ANA",
+                            "app_homepage_url": "https://deploybot.example.com",
+                            "help_url": "https://deploybot.example.com/help",
+                            "slash_commands": [
+                                {"command": "/deploy", "description": "Trigger a deploy", "usage_hint": "[service] [env]"},
+                                {"command": "/rollback", "description": "Roll back last deploy", "usage_hint": "[service]"}
+                            ]
+                        }
+                    }))
+                } else {
+                    return refused("app_not_found");
+                }
+            }
+            "bots.info" => {
+                let bot = param("bot");
+                if bot == "B0DEP" {
+                    Some(json!({
+                        "ok": true,
+                        "bot": {"id": "B0DEP", "app_id": "A0DEP", "name": "Deploy Bot"}
+                    }))
+                } else {
+                    return refused("bot_not_found");
+                }
+            }
+            "views.get" => {
+                let app = param("app_id");
+                if app == "A0DEP" && param("type") == "home" {
+                    Some(json!({
+                        "ok": true,
+                        "view": {
+                            "id": "V0HOME1",
+                            "type": "home",
+                            "blocks": [
+                                {"type": "header", "text": {"type": "plain_text", "text": "Deploy Dashboard"}},
+                                {"type": "section", "text": {"type": "mrkdwn", "text": "All *3* services healthy."}},
+                                {
+                                    "type": "actions",
+                                    "block_id": "home_actions",
+                                    "elements": [
+                                        {
+                                            "type": "button",
+                                            "action_id": "trigger_deploy",
+                                            "text": {"type": "plain_text", "text": "Deploy now"},
+                                            "value": "prod",
+                                            "style": "primary"
+                                        },
+                                        {
+                                            "type": "button",
+                                            "action_id": "open_docs",
+                                            "text": {"type": "plain_text", "text": "Docs"},
+                                            "url": "https://deploybot.example.com/docs"
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }))
+                } else {
+                    return refused("not_found");
+                }
+            }
+            "search.messages" => {
+                let page_idx = param("page").parse::<usize>().unwrap_or(1).saturating_sub(1);
+                let pages = self.search_pages.lock().unwrap();
+                if !pages.is_empty() {
+                    pages.get(page_idx).cloned().or_else(|| pages.last().cloned())
+                } else if let Some(over) = self.search_override.lock().unwrap().clone() {
+                    Some(over)
+                } else {
+                    self.fixture(token, "search.messages")
+                }
+            }
+            "search.files" => {
+                if let Some(over) = self.search_files.lock().unwrap().clone() {
+                    Some(over)
+                } else {
+                    Some(json!({
+                        "ok": true,
+                        "files": {
+                            "paging": {"count": 50, "total": 2, "page": 1, "pages": 1},
+                            "matches": [
+                                {
+                                    "id": "F0SRCH1",
+                                    "name": "architecture.pdf",
+                                    "title": "Architecture Spec",
+                                    "created": 1760000400,
+                                    "user": "U0ANA",
+                                    "mimetype": "application/pdf",
+                                    "size": 4096,
+                                    "url_private": format!("{}/files/F0SRCH1/architecture.pdf", self.base),
+                                    "permalink": "https://acme.slack.com/files/U0ANA/F0SRCH1/architecture.pdf"
+                                },
+                                {
+                                    "id": "F0SRCH2",
+                                    "name": "roadmap.docx",
+                                    "title": "Q4 Roadmap",
+                                    "created": 1760000390,
+                                    "user": "U0BEN",
+                                    "mode": "external",
+                                    "url_private": "https://docs.google.com/document/d/roadmap",
+                                    "permalink": "https://acme.slack.com/files/U0BEN/F0SRCH2/roadmap.docx"
+                                }
+                            ]
+                        }
+                    }))
+                }
+            }
+            "search.modules" => {
+                if let Some(over) = self.search_modules.lock().unwrap().clone() {
+                    Some(over)
+                } else {
+                    return refused("not_allowed_token_type");
+                }
+            }
             "dnd.info" => self.dnd_info.lock().unwrap().clone().or_else(|| Some(json!({
                 "ok": true,
                 "dnd_enabled": false,
@@ -752,7 +1165,17 @@ impl Fake {
                         "has_more": false
                     }));
                 }
-                let page = match (param("oldest"), param("inclusive"), param("latest")) {
+                let oldest = param("oldest");
+                if !oldest.is_empty() && oldest >= "1760000000" {
+                    if let Some(mut base) = self.fixture(token, &format!("conversations.history.{channel}")) {
+                        if let Some(arr) = base["messages"].as_array_mut() {
+                            arr.retain(|m| m["ts"].as_str().unwrap_or("") > oldest);
+                        }
+                        base["has_more"] = json!(false);
+                        return ok(base);
+                    }
+                }
+                let page = match (oldest, param("inclusive"), param("latest")) {
                     ("", "true", _) => ".around",
                     ("", _, "") => "",
                     ("", ..) => ".older",
@@ -2791,12 +3214,12 @@ fn a_reissued_cookie_is_used_and_saved_and_a_demand_only_slacks_app_can_meet_sto
     assert_eq!((saved["user_agent"].as_str(), saved["teams"].as_array().map(Vec::len)), (Some(agent()), Some(2)));
     assert_eq!((saved["teams"][0]["token"].as_str(), saved["teams"][1]["token"].as_str()), (Some(ALPHA), Some(BETA)));
 
-    // Slack wants a second factor set up: only its own app can do that. The account says so,
-    // and nothing more is asked of Slack for this workspace.
+    // Slack wants a second factor set up. The account says so, and nothing more is asked of
+    // Slack for this workspace until the user continues that sign-in.
     world.fake.refusing.lock().unwrap().insert("conversations.replies".to_owned(), "two_factor_setup_required".to_owned());
     world.messages(&alpha("C0GEN:1760000200.000200"));
     let required = world.until("the account to say what Slack wants", || Some(world.account("T01ALPHA").required).filter(|required| !required.is_empty()));
-    assert_eq!(required, "Slack wants two-factor authentication set up. Finish that in the Slack app.");
+    assert_eq!(required, "Slack wants two-factor authentication set up. Continue in tinyclient for this workspace.");
     world.fake.refusing.lock().unwrap().clear();
     let asked = world.fake.calls.lock().unwrap().iter().filter(|call| call.token == ALPHA).count();
     let members = world.ask(Request::Members { conversation: general.clone(), offset: 0, limit: 10 });
@@ -3928,6 +4351,7 @@ fn slack_invite_and_kick_channel_members() {
     let added = world.ask(Request::MembersAdd {
         conversation: rnd.clone(),
         people: vec!["U0NEW1".into(), "U0NEW2".into()],
+        share_history: None,
     });
     assert_eq!(added, Response::Ok);
     let invites = world.fake.calls(ALPHA, "conversations.invite");
@@ -3951,6 +4375,7 @@ fn slack_invite_and_kick_channel_members() {
     match world.ask(Request::MembersAdd {
         conversation: rnd.clone(),
         people: vec!["U0ALREADY".into()],
+        share_history: None,
     }) {
         Response::Error { code: ErrorCode::Refused, detail } => {
             assert!(detail.to_lowercase().contains("already"), "got: {detail}");
@@ -5611,6 +6036,7 @@ fn slack_search_filters_and_no_duplicate_in_modifier() {
         before: Some(1_767_225_600),
         after: Some(1_735_689_600),
         mentions_me: false,
+        sort: protocol::SearchSort::Newest,
     };
     let Response::MessageHits { .. } = world.ask(Request::SearchNetwork {
         conversation: Some(general.clone()),
@@ -5748,4 +6174,1305 @@ fn slack_follow_unfollow_thread_and_unread_reply_counting() {
     world.until("live thread_unsubscribed sets followed=false", || {
         world.conversation(&thread).filter(|c| !c.followed).map(|_| ())
     });
+}
+
+#[test]
+fn slack_workspace_info_invites_custom_emoji_and_user_groups() {
+    let world = World::start_with(|fake| {
+        *fake.self_user.lock().unwrap() = Some(json!({
+            "is_primary_owner": false,
+            "is_owner": false,
+            "is_admin": true,
+            "is_restricted": false,
+            "is_ultra_restricted": false
+        }));
+    });
+    world.ready();
+
+    // 1. SpaceInfo returns workspace domain, canonical HTTPS URL, and own user role.
+    let Response::SpaceInfo { info } = world.ask(Request::SpaceInfo { space: alpha("T01ALPHA") }) else {
+        panic!("expected SpaceInfo");
+    };
+    assert_eq!(info.space.name, "Acme");
+    assert_eq!(info.domain, "acme");
+    assert_eq!(info.url, "https://acme.slack.com");
+    assert!(!info.roles.is_empty(), "should report own workspace role: {:?}", info.roles);
+
+    // 2. InviteMember calls users.admin.invite and surfaces refusals clearly.
+    let acct = alpha("T01ALPHA").account();
+    assert_eq!(
+        world.ask(Request::InviteMember {
+            account: acct.clone(),
+            email: "newcomer@acme.example".into(),
+            channels: vec!["C0GEN".into(), "C0DEP".into()],
+            real_name: "New Comer".into(),
+        }),
+        Response::Ok
+    );
+    let invite_call = world.fake.calls(ALPHA, "users.admin.invite").pop().expect("users.admin.invite");
+    assert_eq!(invite_call.params["email"], "newcomer@acme.example");
+    assert_eq!(invite_call.params["channels"], "C0GEN,C0DEP");
+    assert_eq!(invite_call.params["real_name"], "New Comer");
+
+    let dup = world.ask(Request::InviteMember {
+        account: acct.clone(),
+        email: "already@acme.example".into(),
+        channels: Vec::new(),
+        real_name: String::new(),
+    });
+    assert!(matches!(dup, Response::Error { code: ErrorCode::Refused, .. }), "{dup:?}");
+
+    // 3. AddCustomEmoji validates file path & type, uploads multipart to emoji.add, and refreshes catalog.
+    let dir = world.dir.with_extension("emoji");
+    std::fs::create_dir_all(&dir).unwrap();
+    let img = dir.join("shipit_tiny.png");
+    std::fs::write(&img, b"\x89PNG\r\n\x1a\nfake-png-bytes").unwrap();
+    let bad = dir.join("not_an_image.txt");
+    std::fs::write(&bad, b"hello").unwrap();
+
+    let bad_resp = world.ask(Request::AddCustomEmoji {
+        account: acct.clone(),
+        name: "bad_txt".into(),
+        path: bad.to_string_lossy().into_owned(),
+    });
+    assert!(matches!(bad_resp, Response::Error { .. }), "non-image rejected: {bad_resp:?}");
+
+    let junk = dir.join("not_a_picture.png");
+    std::fs::write(&junk, b"not a png").unwrap();
+    let junk_resp = world.ask(Request::AddCustomEmoji {
+        account: acct.clone(),
+        name: "not_png".into(),
+        path: junk.to_string_lossy().into_owned(),
+    });
+    assert!(matches!(junk_resp, Response::Error { code: ErrorCode::Refused, .. }), "bytes that are not an image are refused: {junk_resp:?}");
+    assert!(world.fake.calls(ALPHA, "emoji.add").is_empty(), "emoji.add must not run for a non-image");
+
+    assert_eq!(
+        world.ask(Request::AddCustomEmoji {
+            account: acct.clone(),
+            name: "shipit_tiny".into(),
+            path: img.to_string_lossy().into_owned(),
+        }),
+        Response::Ok
+    );
+    let add_call = world.fake.calls(ALPHA, "emoji.add").pop().expect("emoji.add");
+    assert_eq!(add_call.params["mode"], "data");
+    assert_eq!(add_call.params["name"], "shipit_tiny");
+    assert_eq!(add_call.params["image:filename"], "shipit_tiny.png");
+
+    let Response::Catalog { items, .. } = world.ask(Request::Catalog {
+        account: acct.clone(),
+        kind: protocol::CatalogKind::Emoji,
+        space: None,
+        query: "shipit_tiny".into(),
+        cursor: None,
+    }) else {
+        panic!("expected emoji catalog");
+    };
+    assert!(items.iter().any(|item| item.name == ":shipit_tiny:"), "{items:?}");
+
+    // 4. User groups: list, create, update, and update members.
+    let Response::UserGroups { groups } = world.ask(Request::UserGroups { account: acct.clone() }) else {
+        panic!("expected UserGroups");
+    };
+    assert_eq!(groups.len(), 2, "disabled S0OFF is excluded: {groups:?}");
+    assert_eq!(groups[0].handle, "oncall");
+    assert!(groups[0].members.contains(&"U0ME".to_owned()));
+
+    let Response::UserGroup { group: created } = world.ask(Request::UserGroupCreate {
+        account: acct.clone(),
+        name: "Release".into(),
+        handle: "release".into(),
+        description: "Release engineers".into(),
+    }) else {
+        panic!("expected UserGroup");
+    };
+    assert_eq!((created.name.as_str(), created.handle.as_str()), ("Release", "release"));
+
+    let Response::UserGroup { group: updated } = world.ask(Request::UserGroupUpdate {
+        account: acct.clone(),
+        group_id: created.id.clone(),
+        name: Some("Release Crew".into()),
+        handle: None,
+        description: Some("Ships weekly".into()),
+    }) else {
+        panic!("expected updated UserGroup");
+    };
+    assert_eq!(updated.name, "Release Crew");
+    assert_eq!(updated.description, "Ships weekly");
+
+    let Response::UserGroup { group: with_members } = world.ask(Request::UserGroupMembers {
+        account: acct.clone(),
+        group_id: created.id.clone(),
+        users: vec!["U0ME".into(), "U0ANA".into()],
+    }) else {
+        panic!("expected UserGroup with members");
+    };
+    assert_eq!(with_members.members, vec!["U0ME".to_owned(), "U0ANA".to_owned()]);
+    assert_eq!(with_members.member_count, 2);
+}
+
+#[test]
+fn slack_guest_role_refuses_invite_emoji_upload_and_user_group_create() {
+    let world = World::start_with(|fake| {
+        *fake.self_user.lock().unwrap() = Some(json!({
+            "is_primary_owner": false,
+            "is_owner": false,
+            "is_admin": false,
+            "is_ultra_restricted": false,
+            "is_restricted": true
+        }));
+    });
+    world.ready();
+    let acct = alpha("T01ALPHA").account();
+    let dir = world.dir.with_extension("emoji-guest");
+    std::fs::create_dir_all(&dir).unwrap();
+    let img = dir.join("guest.png");
+    std::fs::write(&img, b"\x89PNG\r\n\x1a\nguest").unwrap();
+
+    let invite = world.ask(Request::InviteMember {
+        account: acct.clone(),
+        email: "newcomer@acme.example".into(),
+        channels: vec!["C0GEN".into()],
+        real_name: "New Comer".into(),
+    });
+    let emoji = world.ask(Request::AddCustomEmoji {
+        account: acct.clone(),
+        name: "guest_pic".into(),
+        path: img.to_string_lossy().into_owned(),
+    });
+    let group = world.ask(Request::UserGroupCreate {
+        account: acct,
+        name: "Guests".into(),
+        handle: "guests".into(),
+        description: String::new(),
+    });
+    for (label, response) in [("invite", invite), ("emoji", emoji), ("group", group)] {
+        assert!(matches!(response, Response::Error { code: ErrorCode::Refused, .. }), "{label} refused: {response:?}");
+    }
+    assert!(world.fake.calls(ALPHA, "users.admin.invite").is_empty());
+    assert!(world.fake.calls(ALPHA, "emoji.add").is_empty());
+    assert!(world.fake.calls(ALPHA, "usergroups.create").is_empty());
+}
+
+#[test]
+fn slack_member_role_refuses_emoji_upload() {
+    let world = World::start_with(|fake| {
+        *fake.self_user.lock().unwrap() = Some(json!({
+            "is_primary_owner": false,
+            "is_owner": false,
+            "is_admin": false,
+            "is_ultra_restricted": false,
+            "is_restricted": false
+        }));
+    });
+    world.ready();
+    let acct = alpha("T01ALPHA").account();
+    let dir = world.dir.with_extension("emoji-member");
+    std::fs::create_dir_all(&dir).unwrap();
+    let img = dir.join("member.png");
+    std::fs::write(&img, b"\x89PNG\r\n\x1a\nmember").unwrap();
+    let emoji = world.ask(Request::AddCustomEmoji {
+        account: acct,
+        name: "member_pic".into(),
+        path: img.to_string_lossy().into_owned(),
+    });
+    assert!(matches!(emoji, Response::Error { code: ErrorCode::Refused, .. }), "{emoji:?}");
+    assert!(world.fake.calls(ALPHA, "emoji.add").is_empty());
+}
+
+#[test]
+fn slack_app_home_about_and_recent_apps_sidebar_group() {
+    let world = World::start_with(|fake| {
+        fake.extra_users.lock().unwrap().push(json!({
+            "id": "U0CI",
+            "name": "cibot",
+            "real_name": "CI Bot",
+            "is_bot": true,
+            "is_app_user": true,
+            "profile": {
+                "display_name": "CI Bot",
+                "real_name": "CI Bot",
+                "api_app_id": "A0DEP",
+                "bot_id": "B0DEP"
+            }
+        }));
+        fake.extra_conversations.lock().unwrap().push(json!({
+            "id": "D0CIAPP",
+            "created": 1760000000,
+            "is_im": true,
+            "is_org_shared": false,
+            "user": "U0CI"
+        }));
+        *fake.sections_override.lock().unwrap() = Some(json!({
+            "ok": true,
+            "channel_sections": [
+                {"channel_section_id": "S0SHIP", "name": "Shipping", "type": "standard", "next_channel_section_id": "S0CHAN", "channel_ids_page": {"channel_ids": ["C0DEP"]}},
+                {"channel_section_id": "S0CHAN", "name": "Channels", "type": "channels", "next_channel_section_id": "S0APPS", "channel_ids_page": {"channel_ids": ["C0GEN", "C0RND", "C0SIDE"]}},
+                {"channel_section_id": "S0APPS", "name": "Apps", "type": "recent_apps", "channel_ids_page": {"channel_ids": ["D0CIAPP"]}}
+            ]
+        }));
+    });
+    world.ready();
+
+    // 1. Neither apps.profile.get nor views.get was called at connect.
+    assert!(world.fake.calls(ALPHA, "apps.profile.get").is_empty());
+    assert!(world.fake.calls(ALPHA, "views.get").is_empty());
+
+    // 2. Installed app listed in recent_apps appears in the workspace tree even without a prior DM in client.counts.
+    let (_, rows) = world.tree(&alpha("T01ALPHA")).unwrap();
+    let ci_row = rows.iter().find(|r| r.key.id == "D0CIAPP").expect("recent_apps entry should appear in tree");
+    assert!(ci_row.bot, "app row must be flagged bot=true so Apps group lists it");
+    assert_eq!(ci_row.title, "CI Bot");
+
+    // 3. Opening the app's Home + About tabs fetches apps.profile.get and views.get on demand.
+    let Response::AppView { view } = world.ask(Request::AppView {
+        conversation: alpha("D0BOT"),
+        include_home: true,
+    }) else {
+        panic!("expected Response::AppView");
+    };
+    assert_eq!(view.profile.app_id, "A0DEP");
+    assert_eq!(view.profile.name, "Deploy Bot");
+    assert!(view.profile.description.contains("Deploys services"));
+    assert_eq!(view.profile.installed_by, "Ana");
+    assert_eq!(view.profile.commands.len(), 2);
+    assert_eq!(view.profile.commands[0].command, "/deploy");
+    assert_eq!(view.profile.links.len(), 2);
+    assert_eq!(view.profile.open_url, "https://app.slack.com/client/T01ALPHA/D0BOT");
+    assert_eq!(view.profile.directory_url, "https://acme.slack.com/apps");
+    assert!(view.profile.home_enabled);
+
+    let home = view.home.expect("published Home view");
+    assert_eq!(home.view_id, "V0HOME1");
+    assert!(home.text.contains("Deploy Dashboard"), "{}", home.text);
+    assert!(home.text.contains("3 services healthy"), "{}", home.text);
+    assert_eq!(home.controls.len(), 2);
+    assert_eq!(home.controls[0].action_id, "trigger_deploy");
+
+    // 4. Clicking an interactive button on the Home tab sends blocks.actions with container.type = "view".
+    assert_eq!(
+        world.ask(Request::MessageAction {
+            conversation: alpha("D0BOT"),
+            message_id: format!("view:{}", home.view_id),
+            block_id: "home_actions".into(),
+            action_id: "trigger_deploy".into(),
+            element_type: "button".into(),
+            value: "prod".into(),
+            values: Vec::new(),
+        }),
+        Response::Ok
+    );
+    let act = world.fake.calls(ALPHA, "blocks.actions").pop().expect("blocks.actions");
+    let container: Value = serde_json::from_str(&act.params["container"]).unwrap();
+    assert_eq!(container["type"], "view");
+    assert_eq!(container["view_id"], "V0HOME1");
+}
+
+#[test]
+fn slack_search_paging_unjoined_channels_sort_files_and_everywhere() {
+    let world = World::start_with(|fake| {
+        // 150 matching messages across 2 pages (100 on page 1, 50 on page 2), including an
+        // unjoined public channel `C0PUB` (#watercooler) with public channel metadata.
+        let mut p1: Vec<Value> = (0..99)
+            .map(|i| {
+                let ts = format!("{}.000100", 1760005000 - i);
+                json!({
+                    "iid": format!("p1-{i}"),
+                    "team_id": "T01ALPHA",
+                    "channel_id": "C0GEN",
+                    "type": "message",
+                    "user": "U0ANA",
+                    "ts": ts,
+                    "text": format!("release checklist item {i}")
+                })
+            })
+            .collect();
+        p1.push(json!({
+            "iid": "p1-pub",
+            "team_id": "T01ALPHA",
+            "channel_id": "C0PUB",
+            "channel": {"id": "C0PUB", "name": "watercooler", "is_channel": true, "is_private": false},
+            "type": "message",
+            "user": "U0ANA",
+            "ts": "1760004900.000100",
+            "text": "release party in unjoined watercooler"
+        }));
+        let p2: Vec<Value> = (0..50)
+            .map(|i| {
+                let ts = format!("{}.000100", 1760004000 - i);
+                json!({
+                    "iid": format!("p2-{i}"),
+                    "team_id": "T01ALPHA",
+                    "channel_id": "C0DEP",
+                    "type": "message",
+                    "user": "U0BEN",
+                    "ts": ts,
+                    "text": format!("release archive item {i}")
+                })
+            })
+            .collect();
+        *fake.search_pages.lock().unwrap() = vec![
+            json!({
+                "ok": true,
+                "messages": {
+                    "paging": {"count": 100, "total": 150, "page": 1, "pages": 2},
+                    "matches": p1,
+                }
+            }),
+            json!({
+                "ok": true,
+                "messages": {
+                    "paging": {"count": 100, "total": 150, "page": 2, "pages": 2},
+                    "matches": p2,
+                }
+            }),
+        ];
+    });
+    world.ready();
+
+    // 1. Slack advertises search_global so Everywhere asks it too.
+    assert!(world.account("T01ALPHA").can.search_global);
+
+    // 2. Page 1 returns 100 hits (including unjoined public #watercooler) + cursor "2".
+    let Response::MessageHits { hits: page1, cursor: c1, .. } = world.ask(Request::SearchNetwork {
+        conversation: None,
+        space: Some(alpha("T01ALPHA")),
+        account: None,
+        network: None,
+        query: "release".into(),
+        filters: protocol::SearchFilters { sort: protocol::SearchSort::Relevance, ..Default::default() },
+        cursor: None,
+    }) else {
+        panic!("expected MessageHits page 1");
+    };
+    assert_eq!(page1.len(), 100);
+    assert_eq!(c1.as_deref(), Some("2"));
+    let pub_hit = page1.iter().find(|h| h.conversation.id == "C0PUB").expect("unjoined public channel hit");
+    assert_eq!(pub_hit.title, "#watercooler");
+    assert!(pub_hit.snippet.contains("release party"));
+    let first_call = world.fake.calls(ALPHA, "search.messages").pop().unwrap();
+    assert_eq!(first_call.params["sort"], "score");
+    assert_eq!(first_call.params["page"], "1");
+
+    // Clicking the unjoined channel hit opens via PreviewChannel.
+    let Response::Conversation { conversation: previewed } = world.ask(Request::PreviewChannel {
+        conversation: alpha("C0PUB"),
+    }) else {
+        panic!("expected PreviewChannel conversation");
+    };
+    assert!(!previewed.joined && previewed.read_only);
+
+    // 3. Page 2 returns the remaining 50 hits + cursor None.
+    let Response::MessageHits { hits: page2, cursor: c2, .. } = world.ask(Request::SearchNetwork {
+        conversation: None,
+        space: Some(alpha("T01ALPHA")),
+        account: None,
+        network: None,
+        query: "release".into(),
+        filters: protocol::SearchFilters::default(),
+        cursor: c1,
+    }) else {
+        panic!("expected MessageHits page 2");
+    };
+    assert_eq!(page2.len(), 50);
+    assert_eq!(c2, None);
+    let second_call = world.fake.calls(ALPHA, "search.messages").pop().unwrap();
+    assert_eq!(second_call.params["sort"], "timestamp");
+    assert_eq!(second_call.params["page"], "2");
+
+    // 4. Files search returns 2 matching files (hosted + external).
+    let Response::AccountFiles { items: files, more, .. } = world.ask(Request::SearchFiles {
+        conversation: None,
+        space: Some(alpha("T01ALPHA")),
+        account: None,
+        query: "roadmap".into(),
+        sort: protocol::SearchSort::Relevance,
+        cursor: None,
+    }) else {
+        panic!("expected AccountFiles for SearchFiles");
+    };
+    assert_eq!(files.len(), 2);
+    assert!(!more);
+    assert_eq!(files[0].title, "Architecture Spec");
+    assert_eq!(files[1].title, "Q4 Roadmap");
+    let files_call = world.fake.calls(ALPHA, "search.files").pop().unwrap();
+    assert_eq!(files_call.params["sort"], "score");
+
+    // 5. Everywhere search (conversation: None, space: None) asks Slack too.
+    let Response::MessageHits { hits: everywhere, not_searched, .. } = world.ask(Request::SearchNetwork {
+        conversation: None,
+        space: None,
+        account: None,
+        network: None,
+        query: "release".into(),
+        filters: protocol::SearchFilters::default(),
+        cursor: None,
+    }) else {
+        panic!("expected Everywhere MessageHits");
+    };
+    assert!(!everywhere.is_empty());
+    assert!(!not_searched.contains(&Network::Slack), "Slack should be searched globally: {not_searched:?}");
+
+    // The scoped search above already asked Slack for page 2. Everywhere keeps that page's
+    // cursor and asks for it once the local window of page 1 is shown.
+    let page2 = |world: &World| {
+        world
+            .fake
+            .calls(ALPHA, "search.messages")
+            .iter()
+            .filter(|call| call.params.get("page").map(String::as_str) == Some("2"))
+            .count()
+    };
+    let page2_before = page2(&world);
+    let mut cursor = None;
+    let mut saw_page2 = false;
+    for _ in 0..12 {
+        let Response::MessageHits { hits, cursor: next, not_searched, .. } = world.ask(Request::SearchNetwork {
+            conversation: None,
+            space: None,
+            account: None,
+            network: None,
+            query: "release".into(),
+            filters: protocol::SearchFilters::default(),
+            cursor,
+        }) else {
+            panic!("expected Everywhere MessageHits");
+        };
+        assert!(!hits.is_empty(), "each everywhere page has hits");
+        assert!(!not_searched.contains(&Network::Slack), "Slack stays searched: {not_searched:?}");
+        if page2(&world) > page2_before {
+            saw_page2 = true;
+            break;
+        }
+        cursor = next;
+        assert!(cursor.is_some(), "page 2 should be requested before the cursor runs out");
+    }
+    assert!(saw_page2, "everywhere search should ask Slack for page 2");
+}
+
+#[test]
+fn slack_search_omits_a_named_private_channel() {
+    let world = World::start_with(|fake| {
+        *fake.search_override.lock().unwrap() = Some(json!({
+            "ok": true,
+            "messages": {
+                "paging": {"count": 20, "total": 3, "page": 1, "pages": 1},
+                "matches": [
+                    {
+                        "channel_id": "C0PRIV",
+                        "channel": {"id": "C0PRIV", "name": "secret-plans", "is_channel": true, "is_private": true},
+                        "user": "U0ANA",
+                        "ts": "1760004800.000100",
+                        "text": "hidden plans"
+                    },
+                    {
+                        "channel_id": "C0UNK",
+                        "channel": {"id": "C0UNK", "name": "maybe-public", "is_channel": true},
+                        "user": "U0ANA",
+                        "ts": "1760004801.000100",
+                        "text": "missing privacy flag"
+                    },
+                    {
+                        "channel_id": "C0PUB",
+                        "channel": {"id": "C0PUB", "name": "watercooler", "is_channel": true, "is_private": false},
+                        "user": "U0ANA",
+                        "ts": "1760004802.000100",
+                        "text": "public watercooler note"
+                    }
+                ]
+            }
+        }));
+    });
+    world.ready();
+
+    let Response::MessageHits { hits, .. } = world.ask(Request::SearchNetwork {
+        conversation: None,
+        space: Some(alpha("T01ALPHA")),
+        account: None,
+        network: None,
+        query: "zzzz-not-in-the-text".into(),
+        filters: protocol::SearchFilters::default(),
+        cursor: None,
+    }) else {
+        panic!("expected MessageHits");
+    };
+    assert!(hits.iter().all(|hit| hit.conversation.id != "C0PRIV"), "a named private channel is omitted: {hits:?}");
+    assert!(hits.iter().all(|hit| hit.conversation.id != "C0UNK"), "a channel with no is_private is omitted: {hits:?}");
+    let public = hits.iter().find(|hit| hit.conversation.id == "C0PUB").expect("public unjoined hit");
+    assert_eq!(public.title, "#watercooler");
+}
+
+#[test]
+fn slack_search_falls_back_to_search_modules_when_search_messages_is_refused() {
+    let world = World::start_with(|fake| {
+        fake.refusing.lock().unwrap().insert("search.messages".into(), "not_allowed_token_type".into());
+        *fake.search_modules.lock().unwrap() = Some(json!({
+            "ok": true,
+            "pagination": {"page": 1, "page_count": 1},
+            "items": [{
+                "messages": [{
+                    "channel_id": "C0GEN",
+                    "user": "U0ANA",
+                    "ts": "1760000330.000330",
+                    "text": "deploy via search.modules"
+                }]
+            }]
+        }));
+    });
+    world.ready();
+
+    let Response::MessageHits { hits, .. } = world.ask(Request::SearchNetwork {
+        conversation: Some(alpha("C0GEN")),
+        space: None,
+        account: None,
+        network: None,
+        query: "deploy".into(),
+        filters: protocol::SearchFilters::default(),
+        cursor: None,
+    }) else {
+        panic!("expected MessageHits from search.modules fallback");
+    };
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].snippet.contains("search.modules"));
+    assert_eq!(world.fake.calls(ALPHA, "search.modules").len(), 1);
+}
+
+#[test]
+fn slack_sidebar_sections_mixed_types_paging_crud_live_events_and_paid_gating() {
+    let world = World::start_with(|fake| {
+        // Custom section S0BIG holds a channel (page 1), a DM (D0ANA), an app (D0BOT),
+        // an emoji, recent sort, AND pages to page 2 (`sec_p2` -> C0SIDE).
+        *fake.sections_override.lock().unwrap() = Some(json!({
+            "ok": true,
+            "channel_sections": [
+                {
+                    "channel_section_id": "S0BIG",
+                    "name": "Projects",
+                    "type": "standard",
+                    "emoji": "rocket",
+                    "sort": "recent",
+                    "next_channel_section_id": "S0CHAN",
+                    "channel_ids_page": {
+                        "channel_ids": ["C0DEP", "D0ANA", "D0BOT"],
+                        "next_cursor": "sec_p2"
+                    }
+                },
+                {
+                    "channel_section_id": "S0CHAN",
+                    "name": "Channels",
+                    "type": "channels",
+                    "channel_ids_page": {
+                        "channel_ids": ["C0GEN", "C0RND"]
+                    }
+                }
+            ]
+        }));
+    });
+    world.ready();
+
+    // 1. Custom section paged past first page, kept DM & app inside it, and preserved emoji + sort.
+    assert_eq!(world.fake.calls(ALPHA, "users.channelSections.channels.list").len(), 1);
+    let (groups, rows) = world.tree(&alpha("T01ALPHA")).unwrap();
+    let projects = groups.iter().find(|g| g.id == "S0BIG").expect("Projects section");
+    assert_eq!(projects.name, "Projects");
+    assert_eq!(projects.emoji, "🚀");
+    assert_eq!(projects.sort, "recent");
+    for id in ["C0DEP", "D0ANA", "D0BOT", "C0SIDE"] {
+        let row = rows.iter().find(|r| r.key.id == id).expect(id);
+        assert_eq!(row.group.as_deref(), Some("S0BIG"), "{id} should stay inside custom section S0BIG");
+    }
+
+    // 2. Create, rename, reorder, move channel, and delete custom section.
+    let space = alpha("T01ALPHA");
+    let Response::Section { group: created } = world.ask(Request::SectionCreate {
+        space: space.clone(),
+        name: "Urgent".into(),
+        emoji: "fire".into(),
+    }) else {
+        panic!("expected Response::Section");
+    };
+    assert_eq!((created.id.as_str(), created.name.as_str(), created.emoji.as_str()), ("S0CUSTOM1", "Urgent", "🔥"));
+
+    let updates = || world.fake.calls(ALPHA, "users.channelSections.update").len();
+    let deletes = || world.fake.calls(ALPHA, "users.channelSections.delete").len();
+    let orders = || world.fake.calls(ALPHA, "users.channelSections.order").len();
+    let bulks = || world.fake.calls(ALPHA, "users.channelSections.channels.bulkUpdate").len();
+    let (updates_before, deletes_before, orders_before, bulks_before) = (updates(), deletes(), orders(), bulks());
+    let foreign_rename = world.ask(Request::SectionRename {
+        space: space.clone(),
+        section_id: "S0FOREIGN".into(),
+        name: "Nope".into(),
+        emoji: None,
+    });
+    let foreign_delete = world.ask(Request::SectionDelete {
+        space: space.clone(),
+        section_id: "S0NOPE".into(),
+    });
+    let foreign_order = world.ask(Request::SectionReorder {
+        space: space.clone(),
+        section_ids: vec!["S0BIG".into(), "S0FOREIGN".into()],
+    });
+    let foreign_move = world.ask(Request::SectionMoveChannel {
+        space: space.clone(),
+        conversation: alpha("C0GEN"),
+        from_section: Some("S0CHAN".into()),
+        to_section: "S0NOPE".into(),
+    });
+    for response in [foreign_rename, foreign_delete, foreign_order, foreign_move] {
+        assert!(matches!(response, Response::Error { code: ErrorCode::Refused, .. }), "{response:?}");
+    }
+    assert_eq!((updates(), deletes(), orders(), bulks()), (updates_before, deletes_before, orders_before, bulks_before));
+
+    assert_eq!(
+        world.ask(Request::SectionRename {
+            space: space.clone(),
+            section_id: "S0CUSTOM1".into(),
+            name: "Priority".into(),
+            emoji: Some("star".into()),
+        }),
+        Response::Ok
+    );
+    let (groups, _) = world.tree(&space).unwrap();
+    let renamed = groups.iter().find(|g| g.id == "S0CUSTOM1").expect("renamed section");
+    assert_eq!((renamed.name.as_str(), renamed.emoji.as_str()), ("Priority", "⭐"));
+
+    assert_eq!(
+        world.ask(Request::SectionMoveChannel {
+            space: space.clone(),
+            conversation: alpha("C0GEN"),
+            from_section: Some("S0CHAN".into()),
+            to_section: "S0CUSTOM1".into(),
+        }),
+        Response::Ok
+    );
+    let (_, rows) = world.tree(&space).unwrap();
+    assert_eq!(rows.iter().find(|r| r.key.id == "C0GEN").unwrap().group.as_deref(), Some("S0CUSTOM1"));
+    let bulk = world.fake.calls(ALPHA, "users.channelSections.channels.bulkUpdate").pop().unwrap();
+    assert!(bulk.params["insert"].contains("S0CUSTOM1") && bulk.params["insert"].contains("C0GEN"));
+    assert!(bulk.params["remove"].contains("S0CHAN"));
+
+    assert_eq!(
+        world.ask(Request::SectionReorder {
+            space: space.clone(),
+            section_ids: vec!["S0CUSTOM1".into(), "S0BIG".into(), "S0CHAN".into()],
+        }),
+        Response::Ok
+    );
+    let (groups, _) = world.tree(&space).unwrap();
+    let positions: Vec<(&str, i32)> = groups
+        .iter()
+        .filter(|g| matches!(g.id.as_str(), "S0CUSTOM1" | "S0BIG" | "S0CHAN"))
+        .map(|g| (g.id.as_str(), g.position))
+        .collect();
+    assert_eq!(positions, [("S0CUSTOM1", 0), ("S0BIG", 1), ("S0CHAN", 2)]);
+
+    assert_eq!(
+        world.ask(Request::SectionDelete {
+            space: space.clone(),
+            section_id: "S0CUSTOM1".into(),
+        }),
+        Response::Ok
+    );
+    let (groups, _) = world.tree(&space).unwrap();
+    assert!(groups.iter().all(|g| g.id != "S0CUSTOM1"));
+
+    // 3. Live socket events update sections and channel memberships without reload.
+    world.fake.push(ALPHA, json!({
+        "type": "channel_sections_upserted",
+        "channel_sections": [{
+            "channel_section_id": "S0LIVE",
+            "name": "Live Ops",
+            "type": "standard",
+            "emoji": "zap"
+        }]
+    }));
+    world.until("live section upserted", || {
+        let (groups, _) = world.tree(&space)?;
+        groups.into_iter().find(|g| g.id == "S0LIVE" && g.name == "Live Ops" && g.emoji == "⚡")
+    });
+    world.fake.push(ALPHA, json!({
+        "type": "channel_sections_channels_upserted",
+        "channel_section_id": "S0LIVE",
+        "channel_ids": ["C0RND"]
+    }));
+    world.until("live channel moved into S0LIVE", || {
+        let (_, rows) = world.tree(&space)?;
+        rows.into_iter().find(|r| r.key.id == "C0RND" && r.group.as_deref() == Some("S0LIVE"))
+    });
+    world.fake.push(ALPHA, json!({
+        "type": "channel_sections_removed",
+        "channel_section_ids": ["S0LIVE"]
+    }));
+    world.until("live section removed", || {
+        let (groups, _) = world.tree(&space)?;
+        groups.iter().all(|g| g.id != "S0LIVE").then_some(())
+    });
+
+    // 4. Paid-plan refusal turns off sidebar_sections capability so the shell hides controls.
+    assert!(world.account("T01ALPHA").can.sidebar_sections);
+    world.fake.refusing.lock().unwrap().insert("users.channelSections.create".into(), "paid_only".into());
+    let refused = world.ask(Request::SectionCreate {
+        space,
+        name: "Free Workspace".into(),
+        emoji: String::new(),
+    });
+    assert!(matches!(refused, Response::Error { code: ErrorCode::Refused, .. }), "{refused:?}");
+    world.until("sidebar_sections capability disabled after paid_only", || {
+        (!world.account("T01ALPHA").can.sidebar_sections).then_some(())
+    });
+}
+
+#[test]
+fn slack_slash_commands_builtins_unknown_handoff_completion_and_ephemeral() {
+    let world = World::start();
+    world.ready();
+    let general = alpha("C0GEN");
+    world.general();
+
+    // 1. `/me waves` sends `chat.meMessage` (never `chat.postMessage`). The send answers
+    // while the row is still pending; Slack's acceptance is the stored row.
+    let post_before = world.fake.calls(ALPHA, "chat.postMessage").len();
+    world.send(&general, "slash-me-1", "/me waves");
+    let me_sent = world.until("the /me action to be sent", || {
+        world.messages(&general).into_iter().find(|message| {
+            message.client_id.as_deref() == Some("slash-me-1") && message.state == SendState::Sent
+        })
+    });
+    assert_eq!(me_sent.text, "waves");
+    assert_eq!(world.fake.calls(ALPHA, "chat.postMessage").len(), post_before);
+    let me_call = world.fake.calls(ALPHA, "chat.meMessage").pop().expect("chat.meMessage called");
+    assert_eq!((me_call.params["channel"].as_str(), me_call.params["text"].as_str()), ("C0GEN", "waves"));
+
+    // 2. `/unknown x` is not stored as a failed channel row. The handoff is ephemeral.
+    let post_before = world.fake.calls(ALPHA, "chat.postMessage").len();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let sock = world.dir.join("chat.sock");
+    let general_wait = general.clone();
+    std::thread::spawn(move || {
+        let ask_sock = |req: Request| -> Response {
+            let mut stream = ChatStream::connect(&sock).unwrap();
+            write_frame(&mut stream, &req).unwrap();
+            read_frame(&mut stream).unwrap()
+        };
+        let mut since = match ask_sock(Request::Status) {
+            Response::Status { seq, .. } => seq,
+            _ => 0,
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Response::Changes { seq, changes, .. } = ask_sock(Request::Wait { since }) {
+                since = seq;
+                for change in changes {
+                    if let Change::Ephemeral { conversation, message } = change {
+                        if conversation == general_wait && message.text.contains("Commands run in the official app") {
+                            let _ = tx.send(*message);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    sleep(Duration::from_millis(100));
+    let _unknown = world.send(&general, "slash-unk-1", "/unknown x");
+    let got = rx.recv_timeout(Duration::from_secs(5)).expect("unknown command handoff is ephemeral");
+    assert!(got.ephemeral);
+    assert!(got.text.contains("Commands run in the official app"));
+    assert_eq!(got.id, "ephemeral:slash-unk-1");
+    assert_eq!(world.fake.calls(ALPHA, "chat.postMessage").len(), post_before, "unknown command must not post as channel text");
+    world.until("pending unknown command row is gone", || {
+        world.messages(&general).iter().all(|message| message.client_id.as_deref() != Some("slash-unk-1")).then_some(())
+    });
+
+    // 3. `/shrug hello` posts `hello ¯\_(ツ)_/¯` via chat.postMessage.
+    world.send(&general, "slash-shrug-1", "/shrug hello");
+    let shrug = world.until("the shrug to be sent", || {
+        world.messages(&general).into_iter().find(|message| {
+            message.client_id.as_deref() == Some("slash-shrug-1") && message.state == SendState::Sent
+        })
+    });
+    assert_eq!(shrug.text, "hello ¯\\_(ツ)_/¯");
+
+    // 4. `/topic Ship v2` calls conversations.setTopic, removes temporary pending send, and emits Change::Ephemeral.
+    let wait_handle = world.ask(Request::Send {
+        conversation: general.clone(),
+        client_id: "slash-topic-1".into(),
+        text: "/topic Ship v2".into(),
+        reply_to: None,
+        with: Default::default(),
+    });
+    assert!(matches!(wait_handle, Response::Sent { .. }));
+    world.until("conversations.setTopic called by /topic", || {
+        world.fake.calls(ALPHA, "conversations.setTopic").into_iter().find(|c| c.params["topic"] == "Ship v2")
+    });
+    world.until("pending /topic row cleaned from persistent history", || {
+        world.messages(&general).iter().all(|m| m.client_id.as_deref() != Some("slash-topic-1")).then_some(())
+    });
+
+    // 5. `/mute` and `/away` map to their documented Slack calls.
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: general.clone(),
+            client_id: "slash-mute-1".into(),
+            text: "/mute".into(),
+            reply_to: None,
+            with: Default::default(),
+        }),
+        Response::Sent { .. }
+    ));
+    world.until("/mute calls setNotifications", || {
+        world.fake.calls(ALPHA, "users.prefs.setNotifications").into_iter().find(|c| c.params["name"] == "muted")
+    });
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: general.clone(),
+            client_id: "slash-away-1".into(),
+            text: "/away".into(),
+            reply_to: None,
+            with: Default::default(),
+        }),
+        Response::Sent { .. }
+    ));
+    world.until("/away calls users.setPresence", || {
+        world.fake.calls(ALPHA, "users.setPresence").into_iter().find(|c| c.params["presence"] == "away")
+    });
+
+    // 6. Workspace slash commands: built-ins + cached `commands.list` (fetched once per 24h).
+    let acct = alpha("T01ALPHA").account();
+    let Response::SlashCommands { commands } = world.ask(Request::SlashCommands { account: acct.clone() }) else {
+        panic!("expected SlashCommands");
+    };
+    assert!(commands.iter().any(|c| c.command == "/me" && c.builtin));
+    assert!(commands.iter().any(|c| c.command == "/deploy" && !c.builtin));
+    let Response::SlashCommands { commands: cached } = world.ask(Request::SlashCommands { account: acct }) else {
+        panic!("expected cached SlashCommands");
+    };
+    assert_eq!(commands.len(), cached.len());
+    assert_eq!(world.fake.calls(ALPHA, "commands.list").len(), 1, "commands.list should be cached 24h");
+
+    // 7. Live ephemeral socket event arrives with ephemeral=true via Change::Ephemeral and is NEVER stored in SQLite.
+    let eph_ts = "1760009999.000100";
+    let (tx, rx) = std::sync::mpsc::channel();
+    let sock = world.dir.join("chat.sock");
+    let general_wait = general.clone();
+    std::thread::spawn(move || {
+        let ask_sock = |req: Request| -> Response {
+            let mut stream = ChatStream::connect(&sock).unwrap();
+            write_frame(&mut stream, &req).unwrap();
+            read_frame(&mut stream).unwrap()
+        };
+        let mut since = match ask_sock(Request::Status) {
+            Response::Status { seq, .. } => seq,
+            _ => 0,
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if let Response::Changes { seq, changes, .. } = ask_sock(Request::Wait { since }) {
+                since = seq;
+                for ch in changes {
+                    if let Change::Ephemeral { conversation, message } = ch {
+                        if conversation == general_wait && message.id == eph_ts {
+                            let _ = tx.send(*message);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    sleep(Duration::from_millis(100));
+    world.fake.push(ALPHA, json!({
+        "type": "message",
+        "subtype": "ephemeral",
+        "is_ephemeral": true,
+        "channel": "C0GEN",
+        "user": "U0BOT",
+        "ts": eph_ts,
+        "text": "Deploy dry-run succeeded (only visible to you)"
+    }));
+    let got = rx.recv_timeout(Duration::from_secs(5)).expect("ephemeral message delivered via Change::Ephemeral");
+    assert!(got.ephemeral);
+    assert!(got.text.contains("Deploy dry-run succeeded"));
+    assert!(
+        world.message(&general, eph_ts).is_none(),
+        "ephemeral message must never be persisted in channel history"
+    );
+}
+
+#[test]
+fn slack_all_unreads_fetches_paced_history_on_open_and_marks_read() {
+    let world = World::start();
+    world.ready();
+
+    // 1. At connect, All Unreads MUST NOT trigger extra `conversations.history` calls with `oldest`.
+    let before = world.fake.calls(ALPHA, "conversations.history");
+    assert!(
+        before.iter().all(|c| c.params.get("oldest").map(String::as_str).unwrap_or("").is_empty()),
+        "All Unreads must never run at connect; saw calls: {before:#?}"
+    );
+
+    // Confirm #general initially has the coarse `has_unreads` count of 1 from `client.counts`.
+    let general = alpha("C0GEN");
+    let deploy = alpha("C0DEP");
+    let ana = alpha("D0ANA");
+    assert_eq!(world.conversation(&general).unwrap().unread, 1);
+
+    // 2. Opening All Unreads for T01ALPHA fetches each unmuted unread conversation once with `oldest`,
+    // excluding muted C0RND (0 mentions), and upgrades #general to its real unread count.
+    let space = alpha("T01ALPHA");
+    let Response::AllUnreads { groups } = world.ask(Request::AllUnreads {
+        network: Some(Network::Slack),
+        space: Some(space.clone()),
+        limit: 15,
+    }) else {
+        panic!("expected Response::AllUnreads");
+    };
+
+    let ids: Vec<&str> = groups.iter().map(|g| g.conversation.key.id.as_str()).collect();
+    assert_eq!(ids.len(), 3, "expected 3 unmuted unread conversations (C0GEN, C0DEP, D0ANA), got {ids:?}");
+    assert!(ids.contains(&"C0GEN"));
+    assert!(ids.contains(&"C0DEP"));
+    assert!(ids.contains(&"D0ANA"));
+    assert!(!ids.contains(&"C0RND"), "muted channel without mentions must be excluded");
+
+    let gen_group = groups.iter().find(|g| g.conversation.key == general).expect("C0GEN group");
+    assert_eq!(gen_group.messages.len(), 5, "C0GEN has 5 messages strictly newer than last_read 1760000100.000100");
+    assert_eq!(gen_group.total_unread, 5);
+    assert_eq!(world.conversation(&general).unwrap().unread, 5, "real unread count persisted from All Unreads fetch");
+
+    let dep_group = groups.iter().find(|g| g.conversation.key == deploy).expect("C0DEP group");
+    assert_eq!(dep_group.messages.len(), 1);
+    assert!(dep_group.messages[0].text.contains("approve the rollout"));
+
+    let ana_group = groups.iter().find(|g| g.conversation.key == ana).expect("D0ANA group");
+    assert_eq!(ana_group.messages.len(), 1);
+    assert!(ana_group.messages[0].text.contains("got a minute?"));
+
+    // Verify exactly 3 new `conversations.history` calls were made with `oldest` (one per unread channel).
+    let after = world.fake.calls(ALPHA, "conversations.history");
+    let unread_calls: Vec<_> = after
+        .iter()
+        .filter(|c| !c.params.get("oldest").map(String::as_str).unwrap_or("").is_empty())
+        .collect();
+    assert_eq!(unread_calls.len(), 3, "expected 3 paced conversations.history calls with oldest, got {unread_calls:#?}");
+    for ch in ["C0GEN", "C0DEP", "D0ANA"] {
+        assert!(unread_calls.iter().any(|c| c.params.get("channel").map(String::as_str) == Some(ch)));
+    }
+
+    // 3. Marking one group read sends exactly one `conversations.mark` and clears it from All Unreads.
+    let marks_before = world.fake.calls(ALPHA, "conversations.mark").len();
+    let latest_dep = dep_group.messages.last().unwrap().id.clone();
+    assert!(matches!(
+        world.ask(Request::MarkRead { conversation: deploy.clone(), message_id: latest_dep }),
+        Response::Ok
+    ));
+    world.until("conversations.mark for C0DEP", || {
+        let calls = world.fake.calls(ALPHA, "conversations.mark");
+        (calls.len() == marks_before + 1 && calls.last().is_some_and(|c| c.params.get("channel").map(String::as_str) == Some("C0DEP")))
+            .then_some(())
+    });
+    assert_eq!(world.conversation(&deploy).unwrap().unread, 0);
+
+    // Re-opening All Unreads now returns only the remaining 2 unread groups.
+    let Response::AllUnreads { groups: remaining } = world.ask(Request::AllUnreads {
+        network: Some(Network::Slack),
+        space: Some(space),
+        limit: 15,
+    }) else {
+        panic!("expected Response::AllUnreads after mark read");
+    };
+    assert_eq!(remaining.len(), 2);
+    assert!(!remaining.iter().any(|g| g.conversation.key == deploy));
+}
+
+#[test]
+fn slack_records_and_sends_audio_and_video_clips() {
+    let world = World::start();
+    world.ready();
+
+    assert!(world.account("T01ALPHA").can.voice_notes, "Slack must advertise voice_notes for clip recording");
+
+    let dir = world.dir.with_extension("clips");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // 1. Audio clip recorded as Ogg Opus (.opus) uploads as `slack_audio` (.ogg) with duration & waveform.
+    let audio_path = dir.join("voice-42.opus");
+    std::fs::write(&audio_path, b"OggS-fake-audio").unwrap();
+    let with_audio = protocol::Outgoing {
+        files: vec![protocol::OutgoingFile {
+            path: audio_path.to_string_lossy().into_owned(),
+            name: String::new(),
+            spoiler: false,
+            as_file: false,
+            original: false,
+            view_once: false,
+            media: None,
+        }],
+        voice: Some(protocol::VoiceNote {
+            duration: 12_400,
+            waveform: vec![0, 128, 255],
+        }),
+        ..Default::default()
+    };
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: alpha("C0GEN"),
+            client_id: "56101".into(),
+            text: "Quick update".into(),
+            reply_to: None,
+            with: with_audio,
+        }),
+        Response::Sent { .. }
+    ));
+    let sent = world.until("audio clip settles", || {
+        world
+            .messages(&alpha("C0GEN"))
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("56101") && m.state != SendState::Pending)
+    });
+    assert_eq!(sent.state, SendState::Sent);
+    assert_eq!(sent.attachments.len(), 1);
+    assert_eq!(sent.attachments[0].file.kind, MediaKind::Audio);
+    assert_eq!(sent.attachments[0].duration, 12);
+    assert!(!sent.attachments[0].waveform.is_empty());
+
+    let get_url = world.fake.calls(ALPHA, "files.getUploadURLExternal").pop().unwrap();
+    assert_eq!(get_url.params["filename"], "voice-42.ogg");
+    assert_eq!(get_url.params.get("subtype").map(String::as_str), Some("slack_audio"));
+
+    let completed = world.fake.calls(ALPHA, "files.completeUploadExternal").pop().unwrap();
+    let files: Value = serde_json::from_str(&completed.params["files"]).unwrap();
+    assert_eq!(files[0]["subtype"], "slack_audio");
+    assert_eq!(files[0]["duration_ms"], 12_400);
+    assert_eq!(files[0]["audio_wave_samples"], json!([0, 50, 100]));
+
+    // 2. Voice clip exceeding Slack's 5-minute cap is refused cleanly.
+    let too_long = protocol::Outgoing {
+        files: vec![protocol::OutgoingFile {
+            path: audio_path.to_string_lossy().into_owned(),
+            ..Default::default()
+        }],
+        voice: Some(protocol::VoiceNote {
+            duration: 300_001,
+            waveform: vec![64],
+        }),
+        ..Default::default()
+    };
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: alpha("C0GEN"),
+            client_id: "56102".into(),
+            text: String::new(),
+            reply_to: None,
+            with: too_long,
+        }),
+        Response::Sent { .. }
+    ));
+    let refused = world.until("overlong clip fails", || {
+        world
+            .messages(&alpha("C0GEN"))
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("56102") && m.state != SendState::Pending)
+    });
+    assert!(
+        matches!(&refused.state, SendState::Failed { reason } if reason.contains("5 minutes")),
+        "{:?}",
+        refused.state
+    );
+
+    // 3. Video clip with duration metadata uploads as `slack_video`.
+    let video_path = dir.join("demo-clip.mp4");
+    std::fs::write(&video_path, b"ftypmp42-fake-video").unwrap();
+    let with_video = protocol::Outgoing {
+        files: vec![protocol::OutgoingFile {
+            path: video_path.to_string_lossy().into_owned(),
+            media: Some(protocol::OutgoingMedia {
+                duration_ms: Some(45_000),
+                width: Some(1280),
+                height: Some(720),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: alpha("C0GEN"),
+            client_id: "56103".into(),
+            text: "Walkthrough".into(),
+            reply_to: None,
+            with: with_video,
+        }),
+        Response::Sent { .. }
+    ));
+    let video_sent = world.until("video clip settles", || {
+        world
+            .messages(&alpha("C0GEN"))
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("56103") && m.state != SendState::Pending)
+    });
+    assert_eq!(video_sent.state, SendState::Sent);
+    assert_eq!(video_sent.attachments.len(), 1);
+    assert_eq!(video_sent.attachments[0].file.kind, MediaKind::Video);
+    assert_eq!(video_sent.attachments[0].duration, 45);
+    let vid_url = world.fake.calls(ALPHA, "files.getUploadURLExternal").pop().unwrap();
+    assert_eq!(vid_url.params.get("subtype").map(String::as_str), Some("slack_video"));
+}
+
+#[test]
+fn slack_refuses_a_pdf_voice_note_instead_of_uploading_it_as_audio() {
+    let world = World::start();
+    world.ready();
+
+    let dir = world.dir.with_extension("pdf-clip");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pdf_path = dir.join("report.pdf");
+    std::fs::write(&pdf_path, b"%PDF-1.4 not a clip").unwrap();
+    let with_pdf = protocol::Outgoing {
+        files: vec![protocol::OutgoingFile {
+            path: pdf_path.to_string_lossy().into_owned(),
+            name: "report.pdf".into(),
+            ..Default::default()
+        }],
+        voice: Some(protocol::VoiceNote {
+            duration: 1_000,
+            waveform: vec![10, 20],
+        }),
+        ..Default::default()
+    };
+    assert!(matches!(
+        world.ask(Request::Send {
+            conversation: alpha("C0GEN"),
+            client_id: "56104".into(),
+            text: String::new(),
+            reply_to: None,
+            with: with_pdf,
+        }),
+        Response::Sent { .. }
+    ));
+    let refused = world.until("pdf voice note fails", || {
+        world
+            .messages(&alpha("C0GEN"))
+            .into_iter()
+            .find(|m| m.client_id.as_deref() == Some("56104") && m.state != SendState::Pending)
+    });
+    assert!(
+        matches!(&refused.state, SendState::Failed { reason } if reason == "Slack refused this clip. Only audio and video can be clips."),
+        "{:?}",
+        refused.state
+    );
+    let uploads = world.fake.calls(ALPHA, "files.getUploadURLExternal");
+    assert!(
+        uploads.iter().all(|call| call.params.get("subtype").map(String::as_str) != Some("slack_audio")),
+        "files.getUploadURLExternal must not be called with subtype=slack_audio: {uploads:?}"
+    );
+    assert!(
+        uploads.iter().all(|call| call.params.get("filename").map(String::as_str) != Some("report.pdf")),
+        "report.pdf must not be uploaded as a file: {uploads:?}"
+    );
+}
+
+#[test]
+fn slack_clip_transcript_vtt_and_transcoded_video() {
+    let world = World::start();
+    world.ready();
+    let general = alpha("C0GEN");
+    let _ = world.messages(&general);
+
+    let ts = "1760000950.000950";
+    let event = json!({
+        "type": "message",
+        "channel": "C0GEN",
+        "user": "U0ANA",
+        "text": "",
+        "ts": ts,
+        "event_ts": ts,
+        "files": [
+            {
+                "id": "F0CLIP1",
+                "name": "standup.ogg",
+                "title": "Standup update",
+                "mimetype": "audio/ogg",
+                "subtype": "slack_audio",
+                "size": 42_000,
+                "duration_ms": 7_500,
+                "audio_wave_samples": [10, 50, 90, 40],
+                "url_private": format!("{}/files-pri/T01ALPHA-F0CLIP1/standup.ogg", world.fake.base),
+                "vtt": format!("{}/files-pri/T01ALPHA-F0CLIP1/transcript.vtt", world.fake.base),
+                "transcription": {
+                    "status": "complete",
+                    "preview": { "content": "Quick deploy update for everyone." }
+                }
+            },
+            {
+                "id": "F0VID1",
+                "name": "walkthrough.mov",
+                "title": "Walkthrough",
+                "mimetype": "video/quicktime",
+                "subtype": "slack_video",
+                "size": 25_000_000,
+                "duration_ms": 30_000,
+                "url_private": format!("{}/files-pri/T01ALPHA-F0VID1/original.mov", world.fake.base),
+                "mp4": format!("{}/files-pri/T01ALPHA-F0VID1/transcoded.mp4", world.fake.base),
+                "thumb_video": format!("{}/files-tmb/T01ALPHA-F0VID1/thumb.jpg", world.fake.base),
+                "vtt": format!("{}/files-pri/T01ALPHA-F0VID1/captions.vtt", world.fake.base),
+                "transcription": {
+                    "status": "complete",
+                    "preview": "Demo preview"
+                }
+            }
+        ]
+    });
+    world.fake.push(ALPHA, event);
+
+    let msg = world.until("clip message stored", || world.message(&general, ts));
+    assert_eq!(msg.attachments.len(), 2);
+
+    // 1. Audio clip carries transcript preview/status and lazy VTT MediaFile, never eagerly fetched.
+    let audio = &msg.attachments[0];
+    assert_eq!(audio.file.kind, MediaKind::Audio);
+    assert_eq!(audio.duration, 7);
+    let tr = audio.transcript.as_ref().expect("audio clip transcript");
+    assert_eq!(tr.status, "complete");
+    assert_eq!(tr.preview, "Quick deploy update for everyone.");
+    assert!(tr.lines.is_empty(), "full lines must be fetched lazily, not stored eagerly");
+    let vtt_file = tr.file.as_ref().expect("vtt MediaFile registered");
+    assert_eq!(vtt_file.id, "F0CLIP1:vtt");
+    assert!(
+        world.fake.file("/files-pri/T01ALPHA-F0CLIP1/transcript.vtt").is_none(),
+        "VTT must not be fetched until the user opens the transcript"
+    );
+
+    // 2. On-demand Request::Fetch downloads the VTT with session headers and parses into timed cues.
+    let landed = world.fetched(&general, &vtt_file.id, None);
+    let path = landed.path.as_deref().expect("vtt landed on disk");
+    let vtt_call = world
+        .fake
+        .file("/files-pri/T01ALPHA-F0CLIP1/transcript.vtt")
+        .expect("vtt fetched on demand");
+    assert_eq!(vtt_call.token, ALPHA);
+    assert!(vtt_call.cookie.contains(COOKIE));
+    let raw = std::fs::read_to_string(path).unwrap();
+    let lines = protocol::parse_webvtt(&raw);
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0].start_ms, 500);
+    assert_eq!(lines[0].text, "Ana: Quick deploy update for everyone.");
+    assert_eq!(lines[1].start_ms, 3_500);
+    assert_eq!(protocol::active_caption(&lines, 4_000).map(|l| l.text.as_str()), Some("Canary is green and traffic is at 50%."));
+
+    // 3. Video clip prefers the smaller transcoded `mp4` copy over the raw `url_private` upload.
+    let video = &msg.attachments[1];
+    assert_eq!(video.file.kind, MediaKind::Video);
+    assert_eq!(video.transcript.as_ref().unwrap().preview, "Demo preview");
+    let _landed_vid = world.fetched(&general, &video.file.id, None);
+    assert!(
+        world.fake.file("/files-pri/T01ALPHA-F0VID1/transcoded.mp4").is_some(),
+        "must prefer transcoded mp4 copy over original mov"
+    );
+    assert!(
+        world.fake.file("/files-pri/T01ALPHA-F0VID1/original.mov").is_none(),
+        "must not fetch original mov when transcoded mp4 exists"
+    );
 }

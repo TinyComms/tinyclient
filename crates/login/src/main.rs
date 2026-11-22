@@ -13,6 +13,9 @@
 //! `--at X,Y` centres the window on that point, given in points from the top left of the main
 //! display: the middle of the window that asked for the sign-in.
 //!
+//! `--start URL` opens that Slack address instead of the usual sign-in page. The address must
+//! be https on slack.com or one of its workspaces. Other networks refuse the flag.
+//!
 //! `messages` uses an installed Chrome, Edge or Chromium with a disposable private profile.
 //! It prints `{cookies:{...},user_agent:...}` after Google's account page reaches Messages'
 //! config endpoint, then destroys the profile. It accepts `--at` but the external browser
@@ -66,6 +69,14 @@ fn main() {
             std::process::exit(USAGE);
         }
     };
+    let start = parse_start(&args).unwrap_or_else(|why| {
+        tracing::warn!("tinyclient-login: {why}");
+        std::process::exit(USAGE);
+    });
+    if start.is_some() && network != "slack" {
+        tracing::warn!("tinyclient-login: --start is only for a Slack workspace");
+        std::process::exit(USAGE);
+    }
     if network == "messages" {
         if let Err(why) = parse_at(&args) {
             tracing::warn!("tinyclient-login: {why}");
@@ -84,7 +95,7 @@ fn main() {
         std::process::exit(USAGE);
     });
     #[cfg(target_os = "macos")]
-    macos::run(site, at);
+    macos::run(site, at, start.as_deref());
     #[cfg(not(target_os = "macos"))]
-    desktop::run(site, at, network);
+    desktop::run(site, at, network, start.as_deref());
 }

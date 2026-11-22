@@ -3,7 +3,7 @@
 
 use super::content::{self, Mapped, Want};
 use super::filing::{self, Cursor, Facts, Filed};
-use super::peers::{is_replies, thread_id, Known, Who};
+use super::peers::{is_replies, thread_id, CallFlags, Known, Who};
 use super::wire::{self, Fault};
 use super::{live, presence, Account, PAGE};
 use crate::store::{ConversationRow, Filing, PreviewLine, preview_text};
@@ -101,6 +101,7 @@ fn row(account: &Account, who: Who, known: &Known) -> ConversationRow {
             row.title = "Replies".to_owned();
             row.read_only = true;
             row.bot = false;
+            row.call = other_call();
         }
         Who::User(id) if id == account.me => {
             // Saved Messages: the user's own notes, with no presence and no call.
@@ -117,23 +118,9 @@ fn row(account: &Account, who: Who, known: &Known) -> ConversationRow {
             row.peer = Some(who.text());
             // Calls are a later stage: until then a person's call opens in Telegram's own app,
             // gated by the full profile's call flags once fetched.
-            if !known.bot && !known.deleted {
-                match known.call_flags {
-                    None => {
-                        row.call = CallSupport::Handoff;
-                    }
-                    Some(flags) if flags.phone_private => {
-                        row.call = CallSupport::Restricted;
-                    }
-                    Some(flags) if !flags.phone_available => {
-                        row.call = CallSupport::None;
-                    }
-                    Some(flags) => {
-                        row.call = CallSupport::Handoff;
-                        row.call_video = flags.video_available;
-                    }
-                }
-            }
+            let call = user_call(known.bot, known.deleted, known.call_flags);
+            row.call = call.support;
+            row.call_video = call.video;
             if known.voice_forbidden == Some(true) {
                 row.voice_notes_forbidden = if known.name.is_empty() {
                     "This person doesn't accept voice and video messages.".to_owned()
@@ -147,7 +134,7 @@ fn row(account: &Account, who: Who, known: &Known) -> ConversationRow {
                 row.voice_notes_forbidden = "Voice and video messages aren't allowed in this group.".to_owned();
             }
         }
-        _ => {}
+        _ => row.call = other_call(),
     }
     row
 }
@@ -396,6 +383,34 @@ pub(super) fn remove_chat(account: &Account, who: Who) {
     }
 }
 
+/// A person's call, once the row knows whether they are a bot and what the full profile said.
+pub(super) struct UserCall {
+    pub support: CallSupport,
+    pub video: bool,
+}
+
+pub(super) fn user_call(bot: bool, deleted: bool, flags: Option<CallFlags>) -> UserCall {
+    if bot || deleted {
+        return UserCall { support: CallSupport::None, video: false };
+    }
+    match flags {
+        None => UserCall { support: CallSupport::Handoff, video: false },
+        Some(flags) if flags.phone_private => UserCall { support: CallSupport::Restricted, video: false },
+        Some(flags) if !flags.phone_available => UserCall { support: CallSupport::None, video: false },
+        Some(flags) => UserCall { support: CallSupport::Handoff, video: flags.video_available },
+    }
+}
+
+/// A group, a channel, or Replies. None of them place a call here.
+pub(super) fn other_call() -> CallSupport {
+    CallSupport::None
+}
+
+/// Premium, at the documented limits. That is the ceiling the capability table prints.
+pub(super) fn capability_ceiling() -> Capabilities {
+    capabilities(true, &super::premium::Limits::default())
+}
+
 /// What this account may send, from what Telegram says of it. Premium raises the file size
 /// and the caption. Custom emoji are listed for every account; a send names the document
 /// only with Premium, or in Saved Messages (`prepared`). The numbers are `help.getAppConfig`
@@ -464,6 +479,7 @@ fn capabilities(premium: bool, limits: &super::premium::Limits) -> Capabilities 
         active_sessions: true,
         unread_jumps: true,
         transcribe: true,
+        translate: true,
         ..Capabilities::default()
     }
 }

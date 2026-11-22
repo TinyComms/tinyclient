@@ -109,6 +109,8 @@ const TABLES: &str = "
         kind      TEXT NOT NULL DEFAULT 'section',
         muted     INTEGER NOT NULL DEFAULT 0,
         unread_only INTEGER NOT NULL DEFAULT 0,
+        emoji     TEXT NOT NULL DEFAULT '',
+        sort      TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (network, account, space, id)
     ) WITHOUT ROWID;
     CREATE TABLE conversation (
@@ -1187,6 +1189,12 @@ impl Store {
         if !column(&store.db, "space", "can_create_channels")? {
             store.db.execute_batch("ALTER TABLE space ADD COLUMN can_create_channels INTEGER NOT NULL DEFAULT 0")?;
         }
+        if !column(&store.db, "section", "emoji")? {
+            store.db.execute_batch("ALTER TABLE section ADD COLUMN emoji TEXT NOT NULL DEFAULT ''")?;
+        }
+        if !column(&store.db, "section", "sort")? {
+            store.db.execute_batch("ALTER TABLE section ADD COLUMN sort TEXT NOT NULL DEFAULT ''")?;
+        }
         Ok(store)
     }
 
@@ -1506,8 +1514,8 @@ impl Store {
             let is_collapsed = existing.get(&group.id).copied().unwrap_or(group.collapsed);
             tx.execute(
                 "INSERT OR REPLACE INTO section
-                     (network, account, space, id, name, position, collapsed, kind, muted, unread_only)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     (network, account, space, id, name, position, collapsed, kind, muted, unread_only, emoji, sort)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     word(&space.network),
                     space.account,
@@ -1519,6 +1527,8 @@ impl Store {
                     word(&group.kind),
                     group.muted,
                     group.unread_only,
+                    group.emoji,
+                    group.sort,
                 ],
             )?;
         }
@@ -1529,11 +1539,12 @@ impl Store {
     /// collapsed it is kept.
     pub fn upsert_group(&mut self, space: &Key, group: &Group) -> rusqlite::Result<()> {
         self.db.execute(
-            "INSERT INTO section (network, account, space, id, name, position, kind, muted, unread_only)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO section (network, account, space, id, name, position, kind, muted, unread_only, emoji, sort)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT (network, account, space, id) DO UPDATE SET
                  name = excluded.name, position = excluded.position, kind = excluded.kind,
-                 muted = excluded.muted, unread_only = excluded.unread_only",
+                 muted = excluded.muted, unread_only = excluded.unread_only,
+                 emoji = excluded.emoji, sort = excluded.sort",
             params![
                 word(&space.network),
                 space.account,
@@ -1543,10 +1554,35 @@ impl Store {
                 group.position,
                 word(&group.kind),
                 group.muted,
-                group.unread_only
+                group.unread_only,
+                group.emoji,
+                group.sort,
             ],
         )?;
         Ok(())
+    }
+
+    /// Moves one conversation into `group` (a section id in its Space).
+    pub fn set_conversation_group(&mut self, key: &Key, group: &str) -> rusqlite::Result<bool> {
+        let changed = self.db.execute(
+            "UPDATE conversation SET section = ?4
+              WHERE network = ?1 AND account = ?2 AND id = ?3",
+            params![word(&key.network), key.account, key.id, group],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Updates the positions of sections in `space` to match `section_ids` order.
+    pub fn reorder_groups(&mut self, space: &Key, section_ids: &[String]) -> rusqlite::Result<()> {
+        let tx = self.db.transaction()?;
+        for (pos, id) in section_ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE section SET position = ?5
+                  WHERE network = ?1 AND account = ?2 AND space = ?3 AND id = ?4",
+                params![word(&space.network), space.account, space.id, id, pos as i32],
+            )?;
+        }
+        tx.commit()
     }
 
     /// True if it was there. Its conversations stay, under no group.
@@ -1590,7 +1626,7 @@ impl Store {
                         (SELECT COUNT(*) FROM conversation c
                           WHERE c.network = g.network AND c.account = g.account
                             AND c.space = g.space AND c.section = g.id),
-                        g.muted, g.unread_only
+                        g.muted, g.unread_only, g.emoji, g.sort
                    FROM section g
                   WHERE g.network = ?1 AND g.account = ?2 AND g.space = ?3 ORDER BY g.position, g.id",
             )?
@@ -1604,6 +1640,8 @@ impl Store {
                     count: row.get(5)?,
                     muted: row.get(6)?,
                     unread_only: row.get(7)?,
+                    emoji: row.get(8)?,
+                    sort: row.get(9)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
@@ -1727,6 +1765,87 @@ impl Store {
                 conversation_from,
             )
             .optional()
+    }
+
+    /// Unread conversations for the All Unreads view (#606): unmuted (or mentioning me), not hidden,
+    /// not archived, not threads; ordered by mentions first, then newest activity.
+    pub fn unread_conversations(
+        &self,
+        network: Option<Network>,
+        space: Option<&Key>,
+        account: Option<&AccountKey>,
+        limit: u32,
+    ) -> rusqlite::Result<Vec<Conversation>> {
+        let mut clauses = vec![
+            "c.unread > 0".to_owned(),
+            "c.hidden = 0".to_owned(),
+            "c.archived = 0".to_owned(),
+            "c.kind != 'thread'".to_owned(),
+            "(c.muted = 0 OR c.mentions > 0)".to_owned(),
+        ];
+        let mut values: Vec<Value> = Vec::new();
+        if let Some(net) = network {
+            values.push(Value::Text(word(&net)));
+            clauses.push(format!("c.network = ?{}", values.len()));
+        }
+        if let Some(sp) = space {
+            values.push(Value::Text(word(&sp.network)));
+            let n_idx = values.len();
+            values.push(Value::Text(sp.account.clone()));
+            let a_idx = values.len();
+            values.push(Value::Text(sp.id.clone()));
+            let s_idx = values.len();
+            clauses.push(format!("c.network = ?{n_idx} AND c.account = ?{a_idx} AND c.space = ?{s_idx}"));
+        }
+        if let Some(acct) = account {
+            values.push(Value::Text(word(&acct.network)));
+            let n_idx = values.len();
+            values.push(Value::Text(acct.account.clone()));
+            let a_idx = values.len();
+            clauses.push(format!("c.network = ?{n_idx} AND c.account = ?{a_idx}"));
+        }
+        values.push(Value::Integer(i64::from(limit.clamp(1, 100))));
+        let limit_idx = values.len();
+        let sql = format!(
+            "{CONVERSATION} WHERE {} ORDER BY (c.mentions > 0) DESC, c.updated DESC, c.id LIMIT ?{limit_idx}",
+            clauses.join(" AND ")
+        );
+        let mut stmt = self.db.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(values), conversation_from)?;
+        rows.collect()
+    }
+
+    /// Cached unread messages for a conversation (oldest first), used by All Unreads for networks
+    /// without a live per-channel fetch or while offline (#606).
+    pub fn unread_messages(
+        &self,
+        conversation: &Key,
+        last_read: &str,
+        limit: u32,
+        now: i64,
+    ) -> rusqlite::Result<Vec<Message>> {
+        let cap = limit.clamp(1, 100);
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT id, text, body FROM message
+              WHERE network = ?1 AND account = ?2 AND conversation = ?3
+                AND (expires IS NULL OR expires > ?4)
+              {NEWEST_FIRST} LIMIT ?5"
+        ))?;
+        let mut messages: Vec<Message> = stmt
+            .query_map(
+                params![word(&conversation.network), conversation.account, conversation.id, now, cap],
+                message_from,
+            )?
+            .collect::<rusqlite::Result<_>>()?;
+        messages.reverse();
+        if !last_read.is_empty() {
+            if let Some(pos) = messages.iter().position(|m| m.id == last_read) {
+                messages = messages.split_off(pos + 1);
+            } else if last_read.contains('.') && last_read.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+                messages.retain(|m| m.id.as_str() > last_read);
+            }
+        }
+        Ok(messages)
     }
 
     /// Lists cached conversations matching `scope` for local export. Never touches any network

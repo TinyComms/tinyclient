@@ -1,5 +1,6 @@
 //! Slack, with the session the web client uses: its API for the sidebar, history and sending, and
-//! its websocket for everything live. One adapter is one workspace, with a socket of its own.
+//! its websocket for everything live. One adapter is one workspace, or one Enterprise Grid
+//! organisation, with a socket of its own.
 //!
 //! Slack documents its public API; several calls here are the web client's own and are marked
 //! "unverified" where no primary source confirmed their shape. The integrator should check those
@@ -83,25 +84,37 @@ const TREE_FRESH: Duration = Duration::from_secs(600);
 const OUTBOX: usize = 64;
 /// Errors that mean this workspace's session is over. The other workspaces are untouched.
 const ENDED: &[&str] = &["invalid_auth", "not_authed", "account_inactive", "token_revoked", "token_expired"];
-/// Errors that mean Slack wants something done in its own app before it answers again, and the
-/// words for it. Unverified: these are the documented names; what a real workspace sends when
-/// it demands a second factor or a fresh organization sign-in was not seen.
+/// Errors that mean Slack wants a fresh sign-in before it answers again, and the words for the
+/// account row. The row's button continues that sign-in here. Requests stay quiet for an hour,
+/// and nothing is asked again until the user chooses to continue. Unverified: these are the
+/// documented names; what a real workspace sends when it demands a second factor or a fresh
+/// organization sign-in was not seen.
 const DEMANDS: &[(&str, &str)] = &[
-    ("two_factor_setup_required", "Slack wants two-factor authentication set up. Finish that in the Slack app."),
-    ("org_login_required", "Your organization wants you to sign in again. Do that in the Slack app."),
-    ("team_access_not_granted", "This workspace has not let you in yet. Finish joining in the Slack app."),
-    ("password_change_required", "Slack wants your password changed. Do that in the Slack app."),
+    ("two_factor_setup_required", "Slack wants two-factor authentication set up. Continue in tinyclient for this workspace."),
+    ("org_login_required", "Your organization wants you to sign in again. Continue in tinyclient for this workspace."),
+    ("team_access_not_granted", "This workspace has not let you in yet. Continue in tinyclient to finish joining."),
+    ("password_change_required", "Slack wants your password changed. Continue in tinyclient for this workspace."),
 ];
+/// Shown on the account when the sign-in page says this browser is not allowed.
+pub const BROWSER_BLOCKED: &str = "This workspace does not allow signing in from this browser.";
 /// Addresses Slack itself serves. Nothing else in a message is ever registered for fetching.
 const HOSTS: &[&str] = &["slack.com", "slack-edge.com", "slack-imgs.com", "slack-files.com"];
 
-/// One workspace's part of the sign-in: what `accounts` hands to `start`.
+/// One workspace under an Enterprise Grid org. The org account holds these; each becomes a Space.
+#[derive(Deserialize)]
+struct Workspace {
+    id: String,
+    #[serde(default)]
+    name: String,
+}
+
+/// One workspace's part of the sign-in, or one Enterprise Grid org: what `accounts` hands to `start`.
 #[derive(Deserialize)]
 struct Session {
     token: String,
     /// The `d` cookie, as the browser stored it. One for every workspace of the sign-in.
     cookie: String,
-    /// The workspace's own address, `https://example.slack.com/`.
+    /// The workspace's own address, `https://example.slack.com/`, or the org's for a Grid account.
     url: String,
     #[serde(default)]
     team_id: String,
@@ -109,6 +122,15 @@ struct Session {
     /// agent changes as an anomaly, so every request and the socket carry this one.
     #[serde(default)]
     user_agent: String,
+    /// Workspaces of an Enterprise Grid org. Empty for a standalone workspace.
+    #[serde(default)]
+    workspaces: Vec<Workspace>,
+    /// The org id (`E…`) when this session is one Enterprise Grid organisation.
+    #[serde(default)]
+    enterprise_id: String,
+    /// The org's display name. Empty for a standalone workspace.
+    #[serde(default)]
+    enterprise_name: String,
 }
 
 /// Why a call to Slack failed. Deliberately not `Display`: it becomes a [`Failure`] or words
@@ -218,6 +240,17 @@ fn reason(fault: Fault) -> String {
             "external_email" => return info::EXTERNAL_EMAIL.to_owned(),
             "action_not_found" | "invalid_action" | "invalid_blocks" => "That app action is no longer available.",
             "trigger_expired" => "That app interaction expired. Try clicking again.",
+            "already_in_team" => "That person is already in this workspace.",
+            "already_invited" | "sent_recently" => "An invite was already sent to that address.",
+            "invalid_email" => "That does not look like a valid email address.",
+            "error_name_taken" => "A custom emoji with that name already exists.",
+            "error_bad_name_i18n" | "error_name_bad_characters" => "Emoji names may only contain lowercase letters, numbers, hyphens, and underscores.",
+            "error_invalid_image" | "error_no_image" | "error_too_big" => "That image cannot be used as a custom emoji.",
+            "handle_already_exists" => "A user group with that handle already exists.",
+            "name_already_exists" => "A user group with that name already exists.",
+            "paid_teams_only" | "paid_only" => "This feature requires a paid Slack plan.",
+            "no_permission" => "You do not have permission to do that in this workspace.",
+            "section_not_found" => "That section is not in this workspace.",
             "restricted_action" => "This workspace does not let you do that.",
             error if error.starts_with("restricted_action_") => "This workspace does not let you post here.",
             error => return format!("Slack refused ({error})."),
@@ -280,6 +313,8 @@ struct State {
     groups_listed: bool,
     /// User groups I belong to, learned once per connection and kept current on the socket.
     my_groups: HashSet<String>,
+    /// Our workspace role from `users.info`, so an admin write does not ask Slack again.
+    role: Option<info::WorkspaceRole>,
     /// Do Not Disturb state per user id (`dnd.info`, `dnd.teamInfo`, `dnd_updated`, `dnd_updated_user`).
     dnd: HashMap<String, people::DndState>,
     /// Underlying Slack presence (`Online`, `Idle`, `Offline`) before DND overlay.
@@ -340,7 +375,26 @@ fn per_minute(method: &str) -> f64 {
         "users.setPresence"
         | "reactions.remove"
         | "emoji.list"
+        | "emoji.add"
+        | "users.admin.invite"
         | "usergroups.list"
+        | "usergroups.create"
+        | "usergroups.update"
+        | "usergroups.users.update"
+        | "apps.profile.get"
+        | "bots.info"
+        | "views.get"
+        | "apps.home.get"
+        | "search.files"
+        | "search.modules"
+        | "users.channelSections.create"
+        | "users.channelSections.update"
+        | "users.channelSections.delete"
+        | "users.channelSections.order"
+        | "users.channelSections.channels.list"
+        | "users.channelSections.channels.bulkUpdate"
+        | "commands.list"
+        | "chat.meMessage"
         | "dnd.setSnooze"
         | "dnd.endSnooze"
         | "stars.add"
@@ -456,6 +510,8 @@ struct Slack {
     ctx: Context,
     agent: ureq::Agent,
     session: Session,
+    /// The `xoxc` token. Replaced when Slack rotates it, the way [`Self::cookie`] is.
+    token: Mutex<String>,
     /// `d=…`, sent with every request and the socket. Replaced when Slack reissues it.
     cookie: Mutex<String>,
     /// Where the API is: the workspace's own address unless a test moved it.
@@ -495,27 +551,62 @@ fn team_id(team: &Value) -> &str {
     }
 }
 
-/// One account per workspace. They share the sign-in's cookie and User-Agent and nothing else.
-///
-/// Enterprise Grid is not treated specially: each workspace of an org is its own account, so
-/// org-wide channels and direct messages appear under each of them. Making an org one account
-/// needs the org-level token, which this has not been run against.
+fn shown_name<'a>(team: &'a Value, url: &'a str, id: &'a str) -> &'a str {
+    match text_of(team, &["name", "team"]) {
+        "" => host(url).split('.').next().unwrap_or(id),
+        name => name,
+    }
+}
+
+/// One account per standalone workspace. An Enterprise Grid org whose sign-in carries an org
+/// token is one account: its workspaces are Spaces under that account, so an org-wide channel
+/// and a direct message are listed once. A workspace whose org has no token stays its own account.
+/// The org-token shape is what the sign-in helper records; it has not been run against a live org.
 pub fn accounts(session: &str) -> Result<Vec<Signed>, String> {
     let parsed: Value = serde_json::from_str(session).map_err(|err| err.to_string())?;
     let cookie = parsed["cookie"].as_str().ok_or("the Slack session has no cookie")?;
+    let agent = text_of(&parsed, &["user_agent"]);
     let mut found: Vec<Signed> = Vec::new();
+    let mut covered: HashSet<String> = HashSet::new();
+    for org in parsed["enterprises"].as_array().into_iter().flatten() {
+        let (token, url, id) = (text_of(org, &["token"]), text_of(org, &["url"]), team_id(org));
+        if token.is_empty() || url.is_empty() || !id.starts_with('E') || found.iter().any(|signed| signed.account == id) {
+            continue;
+        }
+        let name = shown_name(org, url, id);
+        let workspaces: Vec<Value> = teams(&parsed)
+            .into_iter()
+            .filter(|team| text_of(team, &["enterprise_id"]) == id && team_id(team) != id)
+            .map(|team| {
+                let wid = team_id(team);
+                json!({"id": wid, "name": shown_name(team, text_of(team, &["url"]), wid)})
+            })
+            .collect();
+        covered.insert(id.to_owned());
+        let session = json!({
+            "token": token, "cookie": cookie, "url": url, "team_id": id,
+            "user_agent": agent, "enterprise_id": id, "enterprise_name": name,
+            "workspaces": workspaces,
+        });
+        found.push(Signed {
+            account: id.to_owned(),
+            name: name.to_owned(),
+            session: session.to_string(),
+        });
+    }
     for team in teams(&parsed) {
+        let ent = text_of(team, &["enterprise_id"]);
+        if !ent.is_empty() && covered.contains(ent) {
+            continue;
+        }
         let (token, url, id) = (text_of(team, &["token"]), text_of(team, &["url"]), team_id(team));
         if token.is_empty() || url.is_empty() || found.iter().any(|signed| signed.account == id) {
             continue;
         }
-        let name = match text_of(team, &["name", "team"]) {
-            "" => host(url).split('.').next().unwrap_or(id),
-            name => name,
-        };
+        let name = shown_name(team, url, id);
         let session = json!({
             "token": token, "cookie": cookie, "url": url, "team_id": id,
-            "user_agent": text_of(&parsed, &["user_agent"]),
+            "user_agent": agent,
         });
         found.push(Signed {
             account: id.to_owned(),
@@ -535,12 +626,25 @@ pub(crate) fn prove_custom_emoji() -> Result<(), String> {
     message::prove_custom_emoji()
 }
 
-/// The session without one workspace, or `None` when it was the last.
+/// The session without one workspace or one org, or `None` when it was the last.
+/// Signing an org out also drops the workspaces that belonged to it.
 pub fn without(session: &str, account: &str) -> Option<String> {
     let mut parsed: Value = serde_json::from_str(session).ok()?;
-    let teams = parsed["teams"].as_array_mut()?;
-    teams.retain(|team| team_id(team) != account);
-    if teams.is_empty() {
+    let had_teams = parsed["teams"].is_array();
+    if let Some(teams) = parsed["teams"].as_array_mut() {
+        teams.retain(|team| team_id(team) != account && text_of(team, &["enterprise_id"]) != account);
+    } else if !parsed["enterprises"].is_array() {
+        return None;
+    }
+    if let Some(orgs) = parsed["enterprises"].as_array_mut() {
+        orgs.retain(|org| team_id(org) != account);
+    }
+    if parsed["enterprises"].as_array().is_some_and(|orgs| orgs.is_empty()) {
+        parsed.as_object_mut()?.remove("enterprises");
+    }
+    let teams_left = parsed["teams"].as_array().is_some_and(|teams| !teams.is_empty());
+    let orgs_left = parsed["enterprises"].as_array().is_some_and(|orgs| !orgs.is_empty());
+    if (!had_teams && !orgs_left) || (!teams_left && !orgs_left) {
         return None;
     }
     Some(parsed.to_string())
@@ -556,6 +660,118 @@ fn recookied(stored: &str, old: &str, fresh: &str) -> Option<String> {
     }
     parsed["cookie"] = fresh.into();
     Some(parsed.to_string())
+}
+
+/// The stored session with one account's token replaced, when it still holds the token this
+/// adapter was started with. Another save may have stored a newer one already; then it is left
+/// alone. The same rule as [`recookied`], for the `xoxc` token Slack rotates.
+fn retokened(stored: &str, account: &str, old: &str, fresh: &str) -> Option<String> {
+    if old.is_empty() || fresh.is_empty() || old == fresh {
+        return None;
+    }
+    let mut parsed: Value = serde_json::from_str(stored).ok()?;
+    let mut changed = false;
+    let replace = |entry: &mut Value| {
+        if team_id(entry) == account && entry["token"].as_str() == Some(old) {
+            entry["token"] = fresh.into();
+            true
+        } else {
+            false
+        }
+    };
+    if let Some(orgs) = parsed["enterprises"].as_array_mut() {
+        for org in orgs {
+            changed |= replace(org);
+        }
+    }
+    if let Some(teams) = parsed["teams"].as_array_mut() {
+        for team in teams {
+            changed |= replace(team);
+        }
+    }
+    if parsed["token"].as_str() == Some(old) && text_of(&parsed, &["team_id", "id"]) == account {
+        parsed["token"] = fresh.into();
+        changed = true;
+    }
+    changed.then(|| parsed.to_string())
+}
+
+/// `https` on `slack.com` or a subdomain, with no user or port. What a continue may open.
+fn slack_address(url: &str) -> bool {
+    let Some(host) = https_host(url) else {
+        return false;
+    };
+    let authority = url.strip_prefix("https://").unwrap_or("").split(['/', '?', '#']).next().unwrap_or("");
+    !authority.is_empty() && !authority.contains(':') && within(host, "slack.com")
+}
+
+/// The address of one workspace or org in a stored session, when it is a Slack page.
+pub fn workspace_url(session: &str, account: &str) -> Option<String> {
+    let parsed: Value = serde_json::from_str(session).ok()?;
+    listed(&parsed).into_iter().find_map(|entry| {
+        if team_id(entry) != account {
+            return None;
+        }
+        let url = text_of(entry, &["url"]);
+        slack_address(url).then(|| url.to_owned())
+    })
+}
+
+/// The stored session with one account's token taken from a fresh sign-in. Other workspaces
+/// stay, including a newer token the fresh window also printed for them. The shared cookie is
+/// written when the fresh session has one. `None` when that account did not come back with a
+/// token. An unchanged token still returns the session, so the workspace can reconnect.
+pub fn resumed(stored: &str, fresh: &str, account: &str) -> Option<String> {
+    let fresh: Value = serde_json::from_str(fresh).ok()?;
+    let found = listed(&fresh).into_iter().find(|entry| team_id(entry) == account)?;
+    let token = text_of(found, &["token"]).to_owned();
+    if token.is_empty() {
+        return None;
+    }
+    let url = text_of(found, &["url"]).to_owned();
+    let cookie = fresh["cookie"].as_str().filter(|cookie| !cookie.is_empty()).map(str::to_owned);
+    let mut parsed: Value = serde_json::from_str(stored).ok()?;
+    let mut placed = false;
+    let apply = |entry: &mut Value| {
+        if team_id(entry) != account {
+            return false;
+        }
+        entry["token"] = token.clone().into();
+        if slack_address(&url) {
+            entry["url"] = url.clone().into();
+        }
+        true
+    };
+    if let Some(orgs) = parsed["enterprises"].as_array_mut() {
+        for org in orgs {
+            placed |= apply(org);
+        }
+    }
+    if let Some(teams) = parsed["teams"].as_array_mut() {
+        for team in teams {
+            placed |= apply(team);
+        }
+    }
+    if !placed && team_id(&parsed) == account {
+        placed = apply(&mut parsed);
+    }
+    if !placed {
+        return None;
+    }
+    if let Some(cookie) = cookie {
+        parsed["cookie"] = cookie.into();
+    }
+    Some(parsed.to_string())
+}
+
+/// Enterprises, then workspaces. A session from before workspaces were listed is itself.
+fn listed(session: &Value) -> Vec<&Value> {
+    let mut found = Vec::new();
+    if let Some(orgs) = session["enterprises"].as_array() {
+        found.extend(orgs);
+    }
+    found.extend(teams(session));
+    found
 }
 
 /// Parses the session and returns at once: everything that could be slow (finding out which
@@ -589,6 +805,7 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
         let slack = Arc::new(Slack {
             ctx,
             agent,
+            token: Mutex::new(session.token.clone()),
             cookie: Mutex::new(format!("d={}", session.cookie)),
             edge: if moved { format!("{api}cache/") } else { "https://edgeapi.slack.com/cache/".to_owned() },
             api,
@@ -604,11 +821,15 @@ pub fn start(ctx: Context, session: &str, inbox: Receiver<Command>) -> Result<()
         // paced: the commands behind either (a cancel among them) are not held up.
         let other = |command| match command {
             Command::SendWith { conversation_id, client_id, text, reply_to, with } => {
-                let sending = slack.clone();
-                let (conversation, client) = (conversation_id.clone(), client_id.clone());
-                crate::blobs::upload::spawn(&slack.ctx, &conversation_id, &client_id, &with.files.clone(), move |up| {
-                    sending.send_with(&conversation, &client, &text, reply_to.as_deref(), &with, up)
-                });
+                if with.files.is_empty() && with.pick.is_none() && with.schedule.is_none() && parse_slash_command(&text).is_some() {
+                    slack.send(&conversation_id, &client_id, &text, reply_to.as_deref(), with.suppress_embeds);
+                } else {
+                    let sending = slack.clone();
+                    let (conversation, client) = (conversation_id.clone(), client_id.clone());
+                    crate::blobs::upload::spawn(&slack.ctx, &conversation_id, &client_id, &with.files.clone(), move |up| {
+                        sending.send_with(&conversation, &client, &text, reply_to.as_deref(), &with, up)
+                    });
+                }
             }
             Command::Previews(ids) => slack.previews(ids),
             command => slack.serve(command),
@@ -707,6 +928,43 @@ impl Slack {
         crate::hub::lock(&self.cookie).clone()
     }
 
+    /// The `xoxc` token in use now. Slack rotates it; the stored session is updated beside the cookie.
+    pub(super) fn token(&self) -> String {
+        crate::hub::lock(&self.token).clone()
+    }
+
+    /// True when this account is one Enterprise Grid org with its workspaces listed under it.
+    pub(super) fn is_enterprise(&self) -> bool {
+        self.ctx.account.account.starts_with('E') && !self.session.workspaces.is_empty()
+    }
+
+    /// The id the websocket names. On Enterprise Grid that is the org, which is what the web
+    /// client is believed to send. Unverified against a live org.
+    fn gateway(&self) -> String {
+        if self.is_enterprise() && !self.session.enterprise_id.is_empty() {
+            return self.session.enterprise_id.clone();
+        }
+        self.session.team_id.clone()
+    }
+
+    /// A response that carries a new `xoxc` token replaces the one in use and is saved, the same
+    /// way a reissued `d` cookie is. Unverified: which answers include it was not seen.
+    fn note_token(&self, body: &Value) {
+        let Some(fresh) = body.get("token").and_then(Value::as_str).filter(|token| token.starts_with("xoxc-")) else {
+            return;
+        };
+        let old = {
+            let mut held = crate::hub::lock(&self.token);
+            if held.as_str() == fresh {
+                return;
+            }
+            std::mem::replace(&mut *held, fresh.to_owned())
+        };
+        let account = self.ctx.account.account.clone();
+        let fresh = fresh.to_owned();
+        self.ctx.save_session(move |stored| retokened(stored, &account, &old, &fresh));
+    }
+
     /// True for an address Slack serves: its files, avatars, emoji and image proxy.
     fn hosted(&self, url: &str) -> bool {
         (self.moved && url.starts_with(&self.api))
@@ -727,7 +985,7 @@ impl Slack {
     /// agent, `net::browser()`, which is this session's browser only while the Safari installed
     /// is the one the user signed in with.
     fn download(&self, url: String) -> Download {
-        let headers = download_headers(&self.session.user_agent, &self.session.token, &self.cookie(), self.private(&url));
+        let headers = download_headers(&self.session.user_agent, &self.token(), &self.cookie(), self.private(&url));
         Download { url, headers, sealed: None }
     }
 
@@ -760,8 +1018,8 @@ impl Slack {
     }
 
     /// Reads Slack's `ok` envelope. A session Slack has ended is remembered, so the socket
-    /// thread reports this workspace expired whichever thread found out. A demand only Slack's
-    /// own app can meet stops every further request and is shown on the account.
+    /// thread reports this workspace expired whichever thread found out. A demand stops every
+    /// further request and is shown on the account. The hour's quiet is in `run`.
     fn checked(&self, method: &str, body: Value) -> Result<Value, Fault> {
         if body["ok"] == true {
             return Ok(body);
@@ -799,7 +1057,7 @@ impl Slack {
         }
     }
 
-    /// Refuses a call while Slack is waiting for the user to do something in its own app.
+    /// Refuses a call while Slack is waiting for the user to continue the sign-in.
     fn halted(&self, method: &str) -> Result<(), Fault> {
         match self.state().halted.clone() {
             Some(demand) if method != "auth.test" => Err(Fault::Slack(demand)),
@@ -818,7 +1076,8 @@ impl Slack {
     fn api(&self, method: &str, params: &[(&str, &str)]) -> Result<Value, Fault> {
         self.halted(method)?;
         let url = format!("{}api/{method}", self.api);
-        let mut form = vec![("token", self.session.token.as_str())];
+        let token = self.token();
+        let mut form = vec![("token", token.as_str())];
         form.extend(params.iter().filter(|(_, value)| !value.is_empty()));
         let net = |err: ureq::Error| Fault::Net(format!("{method}: {err}"));
         let stopped = || Fault::Net(format!("{method}: stopped"));
@@ -833,6 +1092,92 @@ impl Slack {
             let retry = response.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok());
             let limited = response.status().as_u16() == 429;
             let body: Value = if limited { Value::Null } else { response.body_mut().read_json().map_err(net)? };
+            if !limited {
+                self.note_token(&body);
+            }
+            if !limited && body["error"] != "ratelimited" {
+                return self.checked(method, body);
+            }
+            wait = retry.unwrap_or(5);
+            if attempt > 0 || wait > PATIENCE {
+                break;
+            }
+            if self.ctx.pause(Duration::from_secs(wait)) {
+                return Err(stopped());
+            }
+        }
+        Err(Fault::Limited(wait))
+    }
+
+    /// Multipart form POST to a Slack web API method (used by `emoji.add`).
+    /// Reuses the same session token, cookie, rate-limit handling, and cookie reissue as `api()`.
+    fn api_multipart(
+        &self,
+        method: &str,
+        fields: &[(&str, &str)],
+        file_field: &str,
+        filename: &str,
+        mime: &str,
+        bytes: &[u8],
+    ) -> Result<Value, Fault> {
+        self.halted(method)?;
+        let url = format!("{}api/{method}", self.api);
+        let boundary = format!("----tinyclient{:x}", fnv(filename) ^ (crate::hub::now() as u64));
+        let mut payload = Vec::with_capacity(bytes.len() + 512);
+        let push_field = |buf: &mut Vec<u8>, name: &str, value: &str| {
+            buf.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            buf.extend_from_slice(
+                format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").as_bytes(),
+            );
+        };
+        push_field(&mut payload, "token", self.session.token.as_str());
+        for &(k, v) in fields {
+            if !v.is_empty() {
+                push_field(&mut payload, k, v);
+            }
+        }
+        let safe_name: String = filename
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+            .collect();
+        let safe_name = if safe_name.is_empty() { "emoji.png" } else { safe_name.as_str() };
+        payload.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        payload.extend_from_slice(
+            format!(
+                "Content-Disposition: form-data; name=\"{file_field}\"; filename=\"{safe_name}\"\r\nContent-Type: {mime}\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        payload.extend_from_slice(bytes);
+        payload.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        let content_type = format!("multipart/form-data; boundary={boundary}");
+        let net = |err: ureq::Error| Fault::Net(format!("{method}: {err}"));
+        let stopped = || Fault::Net(format!("{method}: stopped"));
+        let mut wait = 0;
+        for attempt in 0..2 {
+            if self.pace(method) {
+                return Err(stopped());
+            }
+            let sent = self
+                .agent
+                .post(&url)
+                .header("Cookie", self.cookie())
+                .header("Content-Type", &content_type)
+                .send(payload.as_slice());
+            let mut response = sent.map_err(net)?;
+            self.reissued(response.headers());
+            let retry = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok());
+            let limited = response.status().as_u16() == 429;
+            let body: Value = if limited {
+                Value::Null
+            } else {
+                response.body_mut().read_json().map_err(net)?
+            };
             if !limited && body["error"] != "ratelimited" {
                 return self.checked(method, body);
             }
@@ -853,13 +1198,13 @@ impl Slack {
     /// bots and apps): the web client derives the address from the token and the workspace,
     /// every time it connects. Unverified against a real workspace; the form is the one
     /// wee-slack uses for the same kind of token, `gateway_server=<team>-1` included. On
-    /// Enterprise Grid the web client is believed to name the org there; that was not confirmed
-    /// either, so the workspace's own id is kept.
+    /// Enterprise Grid the gateway names the org.
     fn socket_url(&self) -> String {
         let base = address("TINYCLIENT_SLACK_SOCKET", "wss://wss-primary.slack.com/");
         format!(
             "{base}?token={}&gateway_server={}-1&slack_client=desktop&batch_presence_aware=1",
-            self.session.token, self.session.team_id
+            self.token(),
+            self.gateway()
         )
     }
 
@@ -875,8 +1220,8 @@ impl Slack {
         let auth = match self.api("auth.test", &[]) {
             Ok(auth) => auth,
             Err(fault) => {
-                // Slack wants something done in its own app. Asking again soon is how a flag
-                // becomes a ban, so this workspace is left alone for an hour.
+                // Slack wants a fresh sign-in. Asking again soon is how a flag becomes a ban,
+                // so this workspace is left alone for an hour. The account row can continue sooner.
                 if self.state().halted.is_some() {
                     self.ctx.pause(Duration::from_secs(3600));
                 }
@@ -888,9 +1233,14 @@ impl Slack {
         }
         let me = auth["user_id"].as_str().unwrap_or_default();
         let _ = self.me.set(me.to_owned());
-        let name = auth["team"].as_str().unwrap_or_default();
+        let team = auth["team"].as_str().unwrap_or_default();
+        let name = if self.is_enterprise() && !self.session.enterprise_name.is_empty() {
+            self.session.enterprise_name.as_str()
+        } else {
+            team
+        };
         self.ctx.describe(name, me)?;
-        self.ctx.capabilities(capabilities());
+        self.ctx.capabilities(capability_ceiling());
         self.space(name)?;
         let cookie = self.cookie();
         let headers = [
@@ -1043,6 +1393,10 @@ impl Slack {
             }
             "draft_saved" => self.draft_saved(event),
             "draft_deleted" | "draft_sent" => self.draft_deleted(event),
+            "channel_sections_upserted" => self.sections_upserted(event),
+            "channel_sections_removed" | "channel_sections_deleted" => self.sections_removed(event),
+            "channel_sections_channels_upserted" => self.sections_channels_changed(event, true),
+            "channel_sections_channels_removed" => self.sections_channels_changed(event, false),
             "goodbye" => Err(Failure::Dropped("Slack asked for a new connection".to_owned())),
             "error" => {
                 let error = &event["error"];
@@ -1122,6 +1476,12 @@ impl Slack {
             return Ok(());
         };
         let root = event["thread_ts"].as_str().filter(|root| *root != message.id);
+        // Ephemeral messages ("Only visible to you") are never written to persistent channel history.
+        if message.ephemeral {
+            let place = root.map_or_else(|| channel.to_owned(), |root| thread_id(channel, root));
+            self.ctx.ephemeral(&place, message);
+            return Ok(());
+        }
         // The files of a send of ours, shared: that send records it as its own.
         if event["files"].is_array() && self.shared_here(event, &message) {
             return Ok(());
@@ -1529,6 +1889,46 @@ impl Slack {
             }
             Command::CancelSend { client_id, .. } => crate::blobs::upload::cancel(&self.ctx.account, &client_id),
             Command::ConversationInfo { conversation_id, reply } => answer(reply, self.conversation_info(&conversation_id)),
+            Command::SpaceInfo { space_id, reply } => answer(reply, self.space_info(&space_id)),
+            Command::InviteMember { email, channels, real_name, reply } => {
+                answer(reply, self.invite_member(&email, &channels, &real_name))
+            }
+            Command::AddCustomEmoji { name, path, reply } => {
+                answer(reply, self.add_custom_emoji(&name, &path))
+            }
+            Command::UserGroups { reply } => answer(reply, self.user_groups()),
+            Command::UserGroupCreate { name, handle, description, reply } => {
+                answer(reply, self.user_group_create(&name, &handle, &description))
+            }
+            Command::UserGroupUpdate { group_id, name, handle, description, reply } => {
+                answer(
+                    reply,
+                    self.user_group_update(&group_id, name.as_deref(), handle.as_deref(), description.as_deref()),
+                )
+            }
+            Command::UserGroupMembers { group_id, users, reply } => {
+                answer(reply, self.user_group_members(&group_id, &users))
+            }
+            Command::AppView { conversation_id, include_home, reply } => {
+                answer(reply, self.app_view(&conversation_id, include_home))
+            }
+            Command::SectionCreate { name, emoji, reply, .. } => {
+                answer(reply, self.section_create(&name, &emoji))
+            }
+            Command::SectionRename { section_id, name, emoji, reply, .. } => {
+                answer(reply, self.section_rename(&section_id, &name, emoji.as_deref()))
+            }
+            Command::SectionDelete { section_id, reply, .. } => {
+                answer(reply, self.section_delete(&section_id))
+            }
+            Command::SectionReorder { section_ids, reply, .. } => {
+                answer(reply, self.section_reorder(&section_ids))
+            }
+            Command::SectionMoveChannel { conversation_id, from_section, to_section, reply, .. } => {
+                answer(reply, self.section_move_channel(&conversation_id, from_section.as_deref(), &to_section))
+            }
+            Command::SlashCommands { reply } => answer(reply, self.slash_commands()),
+            Command::AllUnreads { limit, reply } => answer(reply, self.all_unreads(limit)),
             Command::SetMute { conversation_id, notify, until: _, reply } => answer(reply, self.set_mute(&conversation_id, notify)),
             Command::Star { conversation_id, starred, reply } => answer(reply, self.star(&conversation_id, starred)),
             Command::StarMessage { conversation_id, message_id, starred, reply } => {
@@ -1578,12 +1978,15 @@ impl Slack {
             Command::Forward { from_conversation_id, message_ids, to_conversation_ids, note, reply } => {
                 answer(reply, self.forward(&from_conversation_id, &message_ids, &to_conversation_ids, &note))
             }
-            Command::Search { query, scope, filters, at, reply, .. } => {
+            Command::Search { query, scope, filters, cursor, at, reply } => {
                 if at.elapsed() >= SEARCH_PATIENCE {
                     drop(reply);
                 } else {
-                    answer(reply, self.search_messages(&query, &scope, &filters).map(Into::into));
+                    answer(reply, self.search_messages(&query, &scope, &filters, cursor.as_deref()));
                 }
+            }
+            Command::SearchFiles { query, scope, sort, cursor, reply } => {
+                answer(reply, self.search_files(&query, &scope, sort, cursor.as_deref()));
             }
             Command::SearchShared { conversation_id, kind, before, limit, reply } => {
                 match self.search_shared(&conversation_id, kind, before.as_deref(), limit) {
@@ -1658,7 +2061,7 @@ impl Slack {
             Command::Members { conversation_id, offset, limit, reply } => {
                 answer(reply, self.members(&conversation_id, offset, limit));
             }
-            Command::MembersAdd { conversation_id, people, reply } => {
+            Command::MembersAdd { conversation_id, people, reply, .. } => {
                 answer(reply, self.members_add(&conversation_id, &people));
             }
             Command::MembersRemove { conversation_id, person, reply } => {
@@ -1843,9 +2246,207 @@ impl Slack {
     /// Posts a message and ends the send. In a thread's conversation it is a reply to that
     /// thread. Slack has no reply outside threads, so a reply to a message in a channel is a
     /// reply in its thread that is also shown in the channel.
+    ///
+    /// Built-in slash commands (`/me`, `/shrug`, `/topic`, `/invite`, `/kick`, `/remove`,
+    /// `/leave`, `/join`, `/archive`, `/mute`, `/status`, `/dnd`, `/away`, `/active`, `/remind`)
+    /// are intercepted before `chat.postMessage`. Unknown `/commands` are refused with the
+    /// hand-off message and never posted as raw channel text.
     fn send(&self, conversation: &str, client_id: &str, text: &str, reply_to: Option<&str>, suppress: bool) {
+        if let Some((cmd, arg)) = parse_slash_command(text) {
+            match self.run_slash_command(conversation, client_id, cmd, arg, reply_to, suppress) {
+                SlashOutcome::Message(outcome) => self.ctx.sent(conversation, client_id, outcome),
+                SlashOutcome::Done(notice) => {
+                    let msg = notice.map(|body| {
+                        let mut m = Message::plain(
+                            format!("ephemeral:{client_id}"),
+                            "Slackbot",
+                            body,
+                            crate::hub::now(),
+                            false,
+                        );
+                        m.ephemeral = true;
+                        m
+                    });
+                    self.ctx.command_done(conversation, client_id, msg);
+                }
+            }
+            return;
+        }
         let outcome = self.post(conversation, client_id, text, reply_to, suppress, &[], false);
         self.ctx.sent(conversation, client_id, outcome);
+    }
+
+    fn resolve_user_arg(&self, raw: &str) -> String {
+        let token = raw.split_whitespace().next().unwrap_or("").trim();
+        if let Some(inner) = token.strip_prefix("<@").and_then(|s| s.strip_suffix('>')) {
+            return inner.split('|').next().unwrap_or("").to_owned();
+        }
+        let clean = token.trim_start_matches('@');
+        if (clean.starts_with('U') || clean.starts_with('W'))
+            && clean.len() >= 4
+            && clean.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        {
+            return clean.to_owned();
+        }
+        // Look up cached user by handle or display name.
+        self.state()
+            .users
+            .iter()
+            .find(|(_, u)| u.handle.eq_ignore_ascii_case(clean) || u.name.eq_ignore_ascii_case(clean))
+            .map(|(id, _)| id.clone())
+            .unwrap_or_else(|| clean.to_owned())
+    }
+
+    fn resolve_channel_arg(&self, raw: &str) -> String {
+        let token = raw.split_whitespace().next().unwrap_or("").trim();
+        if let Some(inner) = token.strip_prefix("<#").and_then(|s| s.strip_suffix('>')) {
+            return inner.split('|').next().unwrap_or("").to_owned();
+        }
+        token.trim_start_matches('#').to_owned()
+    }
+
+    fn run_slash_command(
+        &self,
+        conversation: &str,
+        client_id: &str,
+        cmd: &str,
+        arg: &str,
+        reply_to: Option<&str>,
+        suppress: bool,
+    ) -> SlashOutcome {
+        let channel = thread_of(conversation).map_or(conversation, |(c, _)| c);
+        match cmd {
+            "me" => {
+                if arg.is_empty() {
+                    return SlashOutcome::Message(Err("Usage: /me <text>".to_owned()));
+                }
+                let escaped = escape(arg);
+                let posted = self.api("chat.meMessage", &[("channel", channel), ("text", escaped.as_str())]).map_err(reason);
+                let outcome = posted.and_then(|resp| {
+                    let ts = resp["ts"].as_str().unwrap_or("").to_owned();
+                    let me = self.me.get().cloned().unwrap_or_default();
+                    let event = json!({
+                        "type": "message",
+                        "subtype": "me_message",
+                        "ts": ts,
+                        "user": me,
+                        "text": escaped,
+                    });
+                    self.message(channel, &event)
+                        .ok_or_else(|| "Slack accepted /me but returned no message.".to_owned())
+                });
+                SlashOutcome::Message(outcome)
+            }
+            "shrug" => {
+                let body = if arg.is_empty() {
+                    "¯\\_(ツ)_/¯".to_owned()
+                } else {
+                    format!("{arg} ¯\\_(ツ)_/¯")
+                };
+                SlashOutcome::Message(self.post(conversation, client_id, &body, reply_to, suppress, &[], false))
+            }
+            "topic" => match self.update_conversation(channel, None, Some(arg), None) {
+                Ok(()) => SlashOutcome::Done(Some("Channel topic updated.".to_owned())),
+                Err(fault) => SlashOutcome::Message(Err(reason(fault))),
+            },
+            "invite" => {
+                let uid = self.resolve_user_arg(arg);
+                if uid.is_empty() {
+                    return SlashOutcome::Message(Err("Usage: /invite @user".to_owned()));
+                }
+                match self.members_add(channel, &[uid]) {
+                    Ok(()) => SlashOutcome::Done(Some("Invited to this channel.".to_owned())),
+                    Err(fault) => SlashOutcome::Message(Err(reason(fault))),
+                }
+            }
+            "kick" | "remove" => {
+                let uid = self.resolve_user_arg(arg);
+                if uid.is_empty() {
+                    return SlashOutcome::Message(Err(format!("Usage: /{cmd} @user")));
+                }
+                match self.members_remove(channel, &uid) {
+                    Ok(()) => SlashOutcome::Done(Some("Removed from this channel.".to_owned())),
+                    Err(fault) => SlashOutcome::Message(Err(reason(fault))),
+                }
+            }
+            "leave" => match self.leave(channel) {
+                Ok(()) => SlashOutcome::Done(None),
+                Err(fault) => SlashOutcome::Message(Err(reason(fault))),
+            },
+            "join" => {
+                let cid = self.resolve_channel_arg(arg);
+                if cid.is_empty() {
+                    return SlashOutcome::Message(Err("Usage: /join #channel".to_owned()));
+                }
+                match self.join_channel(&cid) {
+                    Ok(()) => SlashOutcome::Done(Some(format!("Joined #{cid}."))),
+                    Err(fault) => SlashOutcome::Message(Err(reason(fault))),
+                }
+            }
+            "archive" => match self.archive_channel(channel, true) {
+                Ok(()) => SlashOutcome::Done(Some("Channel archived.".to_owned())),
+                Err(fault) => SlashOutcome::Message(Err(reason(fault))),
+            },
+            "mute" => match self.set_mute(channel, protocol::Notify::Nothing) {
+                Ok(()) => SlashOutcome::Done(Some("Channel muted.".to_owned())),
+                Err(fault) => SlashOutcome::Message(Err(reason(fault))),
+            },
+            "away" => match self.set_presence(Presence::Idle, None, None, None) {
+                Ok(()) => SlashOutcome::Done(Some("You are now set to away.".to_owned())),
+                Err(fault) => SlashOutcome::Message(Err(reason(fault))),
+            },
+            "active" => match self.set_presence(Presence::Online, None, None, None) {
+                Ok(()) => SlashOutcome::Done(Some("You are now set to active.".to_owned())),
+                Err(fault) => SlashOutcome::Message(Err(reason(fault))),
+            },
+            "status" => {
+                let (emoji, text) = if arg.is_empty() {
+                    (Some(String::new()), Some(String::new()))
+                } else if arg.starts_with(':') {
+                    if let Some(end) = arg[1..].find(':') {
+                        let em = arg[..end + 2].to_owned();
+                        let rest = arg[end + 2..].trim().to_owned();
+                        (Some(em), Some(rest))
+                    } else {
+                        (None, Some(arg.to_owned()))
+                    }
+                } else {
+                    (None, Some(arg.to_owned()))
+                };
+                match self.set_presence(Presence::Unknown, text, emoji, None) {
+                    Ok(()) => SlashOutcome::Done(Some("Status updated.".to_owned())),
+                    Err(fault) => SlashOutcome::Message(Err(reason(fault))),
+                }
+            }
+            "dnd" => {
+                if arg.eq_ignore_ascii_case("off") || arg.eq_ignore_ascii_case("end") {
+                    match self.set_presence(Presence::Online, None, None, None) {
+                        Ok(()) => SlashOutcome::Done(Some("Notifications resumed.".to_owned())),
+                        Err(fault) => SlashOutcome::Message(Err(reason(fault))),
+                    }
+                } else {
+                    let mins = parse_duration_minutes(arg).unwrap_or(30);
+                    let until = crate::hub::now() + mins * 60;
+                    match self.set_presence(Presence::Dnd, None, None, Some(until)) {
+                        Ok(()) => SlashOutcome::Done(Some(format!("Notifications paused for {mins} minutes."))),
+                        Err(fault) => SlashOutcome::Message(Err(reason(fault))),
+                    }
+                }
+            }
+            "remind" => {
+                if arg.is_empty() {
+                    return SlashOutcome::Message(Err("Usage: /remind <text>".to_owned()));
+                }
+                let when = crate::hub::now() + parse_duration_minutes(arg).unwrap_or(30) * 60;
+                let when_str = when.to_string();
+                match self.api("reminders.add", &[("text", arg), ("time", when_str.as_str())]) {
+                    Ok(_) => SlashOutcome::Done(Some("Reminder set.".to_owned())),
+                    Err(fault) => SlashOutcome::Message(Err(reason(fault))),
+                }
+            }
+            // Not a channel message: the pending row is dropped and the handoff is ephemeral.
+            _ => SlashOutcome::Done(Some("Commands run in the official app.".to_owned())),
+        }
     }
 
     /// The post itself, answering what Slack accepted.
@@ -2241,13 +2842,21 @@ impl Slack {
             }
         }
         let actions = json!([action]).to_string();
-        let container = json!({
-            "type": "message",
-            "message_ts": ts,
-            "channel_id": channel,
-            "is_ephemeral": false,
-        })
-        .to_string();
+        let container = if let Some(view_id) = ts.strip_prefix("view:") {
+            json!({
+                "type": "view",
+                "view_id": view_id,
+            })
+            .to_string()
+        } else {
+            json!({
+                "type": "message",
+                "message_ts": ts,
+                "channel_id": channel,
+                "is_ephemeral": false,
+            })
+            .to_string()
+        };
         let client_token = format!("tiny-{now}");
         let service_id = self
             .state()
@@ -2937,16 +3546,19 @@ pub(crate) fn prove_profile_fields() -> Result<(), String> {
 /// What a Slack account may send. The same on every plan (unverified: a workspace may lower
 /// the file limit or turn uploads off, which Slack then refuses in words). GIFs are enabled
 /// through `CatalogKind::Gifs` (`gifs.trending` / `gifs.search`) and posted as unfurled GIF URLs;
-/// a GIF pasted as a link or sent as a file also plays.
-fn capabilities() -> protocol::Capabilities {
+/// a GIF pasted as a link or sent as a file also plays. Voice clips are enabled through
+/// `voice_notes: true` and uploaded with Slack's clip `subtype` (`slack_audio` / `slack_video`).
+pub(crate) fn capability_ceiling() -> protocol::Capabilities {
     protocol::Capabilities {
         max_file_bytes: send::LARGEST,
         max_files: send::FILES as u32,
         custom_emoji: protocol::EmojiScope::All,
         gifs: true,
+        voice_notes: true,
         schedule: true,
         suppress_embeds: true,
         search: true,
+        search_global: true,
         close_direct: true,
         reply: false,
         edit: true,
@@ -2970,8 +3582,57 @@ fn capabilities() -> protocol::Capabilities {
         manage_files: true,
         dnd_snooze: true,
         follow_threads: true,
+        sidebar_sections: true,
         ..protocol::Capabilities::default()
     }
+}
+
+enum SlashOutcome {
+    Message(Result<Message, String>),
+    Done(Option<String>),
+}
+
+/// Parses a leading Slack slash command (`/cmd [args]`). Returns `(lowercase_cmd, trimmed_args)`.
+/// Ignores paths like `/usr/bin/env` (contains `/` in first token) and non-ASCII names.
+fn parse_slash_command(text: &str) -> Option<(&str, &str)> {
+    let trimmed = text.trim();
+    let rest = trimmed.strip_prefix('/')?;
+    let (head, tail) = match rest.find(char::is_whitespace) {
+        Some(at) => (&rest[..at], rest[at..].trim()),
+        None => (rest, ""),
+    };
+    if head.is_empty()
+        || head.len() > 64
+        || !head.as_bytes()[0].is_ascii_alphabetic()
+        || !head.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return None;
+    }
+    Some((head, tail))
+}
+
+/// Parses a simple duration in minutes from `/dnd 30`, `/dnd 2h`, or `/remind ... in 15 minutes`.
+fn parse_duration_minutes(text: &str) -> Option<i64> {
+    let lower = text.to_ascii_lowercase();
+    for token in lower.split_whitespace() {
+        if let Some(h) = token.strip_suffix('h').and_then(|n| n.parse::<i64>().ok()).filter(|&n| n > 0) {
+            return Some((h * 60).min(24 * 60));
+        }
+        if let Some(m) = token.strip_suffix('m').and_then(|n| n.parse::<i64>().ok()).filter(|&n| n > 0) {
+            return Some(m.min(24 * 60));
+        }
+        if let Ok(n) = token.parse::<i64>() {
+            if n > 0 {
+                return Some(n.min(24 * 60));
+            }
+        }
+    }
+    None
+}
+
+/// Every Slack conversation can hold a huddle, which the official app carries.
+pub(crate) fn call_support() -> protocol::CallSupport {
+    protocol::CallSupport::Handoff
 }
 
 /// A store error on the way out of a command, as a fault. Slack had already said yes.
@@ -3139,6 +3800,132 @@ mod tests {
     }
 
     #[test]
+    fn an_enterprise_grid_org_is_one_account_and_its_workspaces_are_not() {
+        let session = json!({
+            "cookie": "xoxd-abc", "user_agent": "Safari/1",
+            "enterprises": [{"id": "E9", "name": "Acme Org", "url": "https://acme.enterprise.slack.com/", "token": "xoxc-org"}],
+            "teams": [
+                {"id": "T1", "name": "Acme", "url": "https://acme.slack.com/", "token": "", "enterprise_id": "E9"},
+                {"id": "T2", "name": "Side", "url": "https://side.slack.com/", "token": "xoxc-2", "enterprise_id": "E9"},
+                {"id": "T3", "name": "Other", "url": "https://other.slack.com/", "token": "xoxc-3", "enterprise_id": ""},
+            ],
+        })
+        .to_string();
+        let found = accounts(&session).unwrap();
+        let listed: Vec<(&str, &str)> = found.iter().map(|signed| (signed.account.as_str(), signed.name.as_str())).collect();
+        assert_eq!(listed, [("E9", "Acme Org"), ("T3", "Other")]);
+        let org: Session = serde_json::from_str(&found[0].session).unwrap();
+        assert_eq!((org.token.as_str(), org.team_id.as_str(), org.enterprise_id.as_str()), ("xoxc-org", "E9", "E9"));
+        assert_eq!(org.enterprise_name.as_str(), "Acme Org");
+        let spaces: Vec<(&str, &str)> = org.workspaces.iter().map(|workspace| (workspace.id.as_str(), workspace.name.as_str())).collect();
+        assert_eq!(spaces, [("T1", "Acme"), ("T2", "Side")]);
+        let left = without(&session, "E9").unwrap();
+        let ids: Vec<String> = accounts(&left).unwrap().into_iter().map(|signed| signed.account).collect();
+        assert_eq!(ids, ["T3"]);
+        assert_eq!(without(&left, "T3"), None);
+    }
+
+    #[test]
+    fn a_channel_is_filed_under_one_workspace_of_the_org() {
+        let known = ["T1", "T2"];
+        let org_wide = json!({"id": "C0", "context_team_id": "EOTHER"});
+        assert_eq!(tree::workspace_of(&org_wide, &known, "T1"), "T1");
+        let named = json!({"id": "C1", "team": "T2"});
+        assert_eq!(tree::workspace_of(&named, &known, "T1"), "T2");
+        let shared = json!({"id": "C2", "shared_team_ids": ["EOTHER", "T1", "T2"]});
+        assert_eq!(tree::workspace_of(&shared, &known, "T1"), "T1");
+        let internal = json!({"id": "C3", "internal_team_ids": ["T2"]});
+        assert_eq!(tree::workspace_of(&internal, &known, "T1"), "T2");
+    }
+
+    #[test]
+    fn a_rotated_token_replaces_only_the_account_that_still_holds_the_old_one() {
+        let stored = json!({
+            "cookie": "xoxd-old",
+            "enterprises": [{"id": "E9", "token": "xoxc-org", "url": "https://acme.enterprise.slack.com/"}],
+            "teams": [
+                {"id": "T1", "token": "xoxc-1", "url": "https://a.slack.com/", "enterprise_id": "E9"},
+                {"id": "T3", "token": "xoxc-3", "url": "https://other.slack.com/"},
+            ],
+        })
+        .to_string();
+        let fresh: Value = serde_json::from_str(&retokened(&stored, "E9", "xoxc-org", "xoxc-new").unwrap()).unwrap();
+        assert_eq!(fresh["enterprises"][0]["token"], "xoxc-new");
+        assert_eq!(fresh["teams"][0]["token"], "xoxc-1");
+        assert_eq!(fresh["teams"][1]["token"], "xoxc-3");
+        assert_eq!(fresh["cookie"], "xoxd-old");
+        assert_eq!(retokened(&fresh.to_string(), "E9", "xoxc-org", "xoxc-other"), None);
+        assert_eq!(retokened(&stored, "T3", "xoxc-3", "xoxc-3"), None);
+        let team: Value = serde_json::from_str(&retokened(&stored, "T3", "xoxc-3", "xoxc-4").unwrap()).unwrap();
+        assert_eq!(team["teams"][1]["token"], "xoxc-4");
+        assert_eq!(team["enterprises"][0]["token"], "xoxc-org");
+    }
+
+    #[test]
+    fn continuing_one_workspace_replaces_only_its_token() {
+        let stored = json!({
+            "cookie": "xoxd-old", "user_agent": "Safari/1",
+            "enterprises": [{"id": "E9", "token": "xoxc-org", "url": "https://acme.enterprise.slack.com/"}],
+            "teams": [
+                {"id": "T1", "name": "Acme", "url": "https://acme.slack.com/", "token": "xoxc-1", "enterprise_id": "E9"},
+                {"id": "T3", "name": "Other", "url": "https://other.slack.com/", "token": "xoxc-3"},
+            ],
+        })
+        .to_string();
+        assert_eq!(workspace_url(&stored, "T3").as_deref(), Some("https://other.slack.com/"));
+        assert_eq!(workspace_url(&stored, "E9").as_deref(), Some("https://acme.enterprise.slack.com/"));
+        assert_eq!(workspace_url(&stored, "T9"), None);
+        assert_eq!(workspace_url(&stored.replace("https://other.slack.com/", "http://other.slack.com/"), "T3"), None);
+
+        let fresh = json!({
+            "cookie": "xoxd-new",
+            "enterprises": [{"id": "E9", "token": "xoxc-org-2", "url": "https://acme.enterprise.slack.com/"}],
+            "teams": [
+                {"id": "T1", "token": "xoxc-1-rotated", "url": "https://evil.example/"},
+                {"id": "T3", "token": "xoxc-3b", "url": "https://other.slack.com/"},
+            ],
+        })
+        .to_string();
+        let merged: Value = serde_json::from_str(&resumed(&stored, &fresh, "T3").unwrap()).unwrap();
+        assert_eq!(merged["teams"][0]["token"], "xoxc-1");
+        assert_eq!(merged["teams"][0]["url"], "https://acme.slack.com/");
+        assert_eq!(merged["teams"][1]["token"], "xoxc-3b");
+        assert_eq!(merged["enterprises"][0]["token"], "xoxc-org");
+        assert_eq!(merged["cookie"], "xoxd-new");
+        assert_eq!(merged["user_agent"], "Safari/1");
+        assert_eq!(merged["teams"].as_array().map(Vec::len), Some(2));
+
+        let org: Value = serde_json::from_str(&resumed(&stored, &fresh, "E9").unwrap()).unwrap();
+        assert_eq!(org["enterprises"][0]["token"], "xoxc-org-2");
+        assert_eq!(org["teams"][1]["token"], "xoxc-3");
+        assert_eq!(resumed(&stored, &fresh, "T9"), None);
+
+        let same = json!({"teams": [{"id": "T3", "token": "xoxc-3", "url": "https://other.slack.com/"}]}).to_string();
+        assert!(resumed(&stored, &same, "T3").is_some());
+        let kept: Value = serde_json::from_str(&resumed(&stored, &same, "T3").unwrap()).unwrap();
+        assert_eq!(kept["cookie"], "xoxd-old");
+
+        let old = r#"{"token":"xoxc-9","team_id":"T9","url":"https://glimmr.slack.com/","cookie":"xoxd-z"}"#;
+        assert_eq!(workspace_url(old, "T9").as_deref(), Some("https://glimmr.slack.com/"));
+        let again: Value = serde_json::from_str(&resumed(old, r#"{"token":"xoxc-10","team_id":"T9","url":"https://glimmr.slack.com/"}"#, "T9").unwrap()).unwrap();
+        assert_eq!((again["token"].as_str(), again["cookie"].as_str()), (Some("xoxc-10"), Some("xoxd-z")));
+    }
+
+    #[test]
+    fn the_demands_we_act_on_are_the_documented_names() {
+        let names: Vec<&str> = DEMANDS.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            names,
+            ["two_factor_setup_required", "org_login_required", "team_access_not_granted", "password_change_required"]
+        );
+        for (_, words) in DEMANDS {
+            assert!(words.contains("tinyclient"), "{words}");
+            assert!(!words.contains("from this browser"), "{words}");
+        }
+        assert!(BROWSER_BLOCKED.contains("from this browser"));
+    }
+
+    #[test]
     fn a_session_stored_before_workspaces_were_listed_still_signs_in() {
         let old = r#"{"token":"xoxc-9","team_id":"T9","team":"Glimmr","url":"https://glimmr.slack.com/","cookie":"xoxd-z"}"#;
         let found = accounts(old).unwrap();
@@ -3226,7 +4013,7 @@ mod tests {
     fn a_refused_send_is_told_in_words() {
         assert_eq!(
             reason(Fault::Slack("two_factor_setup_required".into())),
-            "Slack wants two-factor authentication set up. Finish that in the Slack app."
+            "Slack wants two-factor authentication set up. Continue in tinyclient for this workspace."
         );
         assert_eq!(reason(Fault::Slack("not_in_channel".into())), "You are not in this channel.");
         assert_eq!(
@@ -3235,6 +4022,9 @@ mod tests {
         );
         assert_eq!(reason(Fault::Limited(7)), "Slack is rate limiting you. Try again in 7 s.");
         assert_eq!(reason(Fault::Slack("fatal_error".into())), "Slack refused (fatal_error).");
+        let sso = reason(Fault::Slack("sso_required".into()));
+        assert_eq!(sso, "Slack refused (sso_required).");
+        assert!(!sso.contains("tinyclient"), "{sso}");
     }
 
     #[test]

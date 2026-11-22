@@ -1,0 +1,35 @@
+{
+ "value": [
+  {
+   "id": "tab-files",
+   "displayName": "Files",
+   "teamsAppId": "com.microsoft.teamspace.tab.files.sharepoint",
+   "webUrl": "https://contoso.sharepoint.com/sites/Platform/Shared%20Documents/General",
+   "configuration": {
+    "contentUrl": "https://contoso.sharepoint.com/sites/Platform/Shared%20Documents/General"
+   }
+  },
+  {
+   "id": "tab-planner",
+   "displayName": "Sprint Board",
+   "teamsAppId": "com.microsoft.teamspace.tab.planner",
+   "teamsApp": {
+    "id": "com.microsoft.teamspace.tab.planner",
+    "displayName": "Planner"
+   },
+   "webUrl": "https://tasks.office.com/contoso.com/en-US/Home/Planner/#/plantaskboard?planId=plan-1",
+   "configuration": {
+    "websiteUrl": "https://tasks.office.com/contoso.com/en-US/Home/Planner/#/plantaskboard?planId=plan-1"
+   }
+  },
+  {
+   "id": "tab-web",
+   "displayName": "Runbook",
+   "teamsAppId": "com.microsoft.teamspace.tab.web",
+   "configuration": {
+    "websiteUrl": "https://docs.contoso.example/runbook",
+    "contentUrl": "https://docs.contoso.example/runbook"
+   }
+  }
+ ]
+}

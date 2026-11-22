@@ -1,0 +1,12 @@
+{
+  "id": "slack-wave8e",
+  "title": "Slack workspace admin, apps, search, sections, slash commands, and All Unreads",
+  "platforms": ["windows", "macos", "linux"],
+  "not_applicable": {
+    "android": "Desktop Slack wave verified by unit and integration tests.",
+    "ios": "Desktop Slack wave verified by unit and integration tests."
+  },
+  "needs": [],
+  "release": false,
+  "max_still_seconds": 60
+}

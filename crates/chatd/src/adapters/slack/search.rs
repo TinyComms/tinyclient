@@ -1,9 +1,9 @@
 //! What the shell's Enter asks of Slack's own search: one conversation, or the whole workspace.
-//! One request, never a crawl: only hits in conversations the sidebar already knows come back.
 
 use super::{seconds, thread_id, thread_of, Fault, Slack};
-use crate::adapters::SearchScope;
-use protocol::MessageHit;
+use crate::adapters::{AccountFilesPage, SearchPage, SearchScope};
+use protocol::{MessageHit, SearchSort, SharedItem};
+use serde_json::Value;
 
 /// Slack's search answers this many hits a page at most.
 const SEARCH_HITS: &str = "100";
@@ -13,55 +13,140 @@ const SEARCH_MAX_CHARS: usize = 1024;
 impl Slack {
     /// The messages Slack itself finds for the pane's words, mapped like the cache's hits.
     ///
-    /// `search.messages` is the documented Web API method; the same token and `d` cookie that
-    /// carry every other call carry it. Unverified against a real workspace whether a web
-    /// session's `xoxc` token is allowed to call it; a session Slack refuses answers in words
-    /// (`reason`), never with invented hits.
+    /// Supports paging (`page=N`), sort order (`timestamp` vs `score`), unjoined public channel
+    /// hits (only when Slack sets `is_channel` and `is_private` false), and falls back to the web
+    /// client's `search.modules` (`module=messages`) if `search.messages` refuses with
+    /// `not_allowed_token_type`.
     pub(super) fn search_messages(
         &self,
         query: &str,
         scope: &SearchScope,
         filters: &protocol::SearchFilters,
-    ) -> Result<Vec<MessageHit>, Fault> {
+        cursor: Option<&str>,
+    ) -> Result<SearchPage, Fault> {
         let capped: String = query.chars().take(SEARCH_MAX_CHARS).collect();
         let query = capped.trim();
         let (asked, only) = self.search_query(query, scope, filters);
         let snippet_terms = strip_modifiers(query);
         let snippet_needle = if snippet_terms.is_empty() { query } else { snippet_terms.as_str() };
-        let found = self.api(
+        let page_num: u32 = cursor.and_then(|c| c.parse().ok()).unwrap_or(1).max(1);
+        let page_str = page_num.to_string();
+        let sort_param = match filters.sort {
+            SearchSort::Newest => "timestamp",
+            SearchSort::Relevance => "score",
+        };
+        let found = match self.api(
             "search.messages",
             &[
                 ("query", &asked),
                 ("count", SEARCH_HITS),
-                ("sort", "timestamp"),
+                ("page", &page_str),
+                ("sort", sort_param),
                 ("sort_dir", "desc"),
                 ("highlight", "false"),
             ],
-        )?;
-        let found = found["messages"]["matches"].as_array().map_or(&[][..], Vec::as_slice);
+        ) {
+            Ok(resp) => resp,
+            Err(Fault::Slack(ref err)) if err == "not_allowed_token_type" => {
+                // Unverified web-client fallback when `search.messages` refuses session tokens.
+                // If `search.modules` also fails, preserve the original refusal wording.
+                match self.api(
+                    "search.modules",
+                    &[
+                        ("module", "messages"),
+                        ("query", &asked),
+                        ("count", SEARCH_HITS),
+                        ("page", &page_str),
+                        ("sort", sort_param),
+                        ("sort_dir", "desc"),
+                    ],
+                ) {
+                    Ok(resp) => resp,
+                    Err(_) => return Err(Fault::Slack("not_allowed_token_type".to_owned())),
+                }
+            }
+            Err(fault) => return Err(fault),
+        };
+        let raw_matches: Vec<Value> = if let Some(arr) = found["messages"]["matches"].as_array() {
+            arr.clone()
+        } else if let Some(items) = found["items"].as_array() {
+            items
+                .iter()
+                .flat_map(|item| {
+                    if let Some(msgs) = item["messages"].as_array() {
+                        msgs.clone()
+                    } else {
+                        vec![item.clone()]
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let paging = if found["messages"]["paging"].is_object() {
+            &found["messages"]["paging"]
+        } else {
+            &found["pagination"]
+        };
+        let page = paging["page"].as_u64().unwrap_or(u64::from(page_num)) as u32;
+        let pages = paging["pages"]
+            .as_u64()
+            .or_else(|| paging["page_count"].as_u64())
+            .unwrap_or(1) as u32;
+        let next_cursor = (page < pages).then(|| (page + 1).to_string());
+        let space_name = self
+            .ctx
+            .hub
+            .store()
+            .spaces(Some(protocol::Network::Slack))
+            .ok()
+            .and_then(|spaces| spaces.into_iter().find(|s| s.key.id == self.ctx.account.account))
+            .map(|s| s.name)
+            .unwrap_or_default();
         let me = self.me.get().map(String::as_str).unwrap_or("");
         let mut hits = Vec::new();
-        for found in found {
-            let (Some(channel), Some(ts)) = (found["channel_id"].as_str(), found["ts"].as_str()) else {
+        for found in &raw_matches {
+            let channel = found["channel_id"]
+                .as_str()
+                .or_else(|| found["channel"]["id"].as_str())
+                .filter(|c| !c.is_empty());
+            let (Some(channel), Some(ts)) = (channel, found["ts"].as_str()) else {
                 continue;
             };
             // Slack's own filter is the words; this keeps to them if it widened the page.
             if only.as_deref().is_some_and(|only| only != channel) {
                 continue;
             }
-            // A hit in a conversation the sidebar does not know cannot be opened. A public
-            // channel the user never joined is not recorded by a search.
-            let Ok(Some(known)) = self.ctx.known(channel) else {
-                continue;
+            let (known_title, space_title) = match self.ctx.known(channel) {
+                Ok(Some(known)) => (known.title, known.space_title),
+                _ => {
+                    // Keep an unjoined hit only when Slack says it is a public channel.
+                    // A missing `is_private` is not public. Clicking opens a read-only preview.
+                    let ch = &found["channel"];
+                    let public_name = ch["name"]
+                        .as_str()
+                        .filter(|n| !n.is_empty())
+                        .filter(|_| {
+                            ch["is_channel"] == true
+                                && ch["is_private"] == false
+                                && ch["is_im"] != true
+                                && ch["is_mpim"] != true
+                                && ch["is_group"] != true
+                        });
+                    let Some(name) = public_name else {
+                        continue;
+                    };
+                    (format!("#{}", name.trim_start_matches('#')), space_name.clone())
+                }
             };
             let root = found["thread_ts"].as_str().filter(|root| *root != ts);
             let place = root.map_or_else(|| channel.to_owned(), |root| thread_id(channel, root));
             let title = match root {
                 // The thread has a row of its own to land on; recording it asks Slack nothing.
-                Some(root) if self.thread_known(channel, root).is_ok() => {
-                    self.ctx.known(&place).ok().flatten().map_or_else(|| known.title.clone(), |thread| thread.title)
+                Some(root) if self.ctx.known(channel).ok().flatten().is_some() && self.thread_known(channel, root).is_ok() => {
+                    self.ctx.known(&place).ok().flatten().map_or_else(|| known_title.clone(), |thread| thread.title)
                 }
-                _ => known.title.clone(),
+                _ => known_title,
             };
             let sender = found["user"].as_str().map_or_else(
                 || found["username"].as_str().unwrap_or("").to_owned(),
@@ -78,11 +163,140 @@ impl Slack {
                 sender,
                 snippet: crate::store::snippet(&rich.text, snippet_needle),
                 title,
-                space_title: known.space_title.clone(),
+                space_title,
                 outgoing: !me.is_empty() && found["user"].as_str() == Some(me),
             });
         }
-        Ok(hits)
+        Ok(SearchPage { hits, cursor: next_cursor, total: None })
+    }
+
+    /// Searches workspace files (`search.files`, with fallback to `search.modules` `module=files`).
+    pub(super) fn search_files(
+        &self,
+        query: &str,
+        scope: &SearchScope,
+        sort: SearchSort,
+        cursor: Option<&str>,
+    ) -> Result<AccountFilesPage, Fault> {
+        let capped: String = query.chars().take(SEARCH_MAX_CHARS).collect();
+        let query = capped.trim();
+        let (asked, _) = self.search_query(query, scope, &protocol::SearchFilters::default());
+        let page_num: u32 = cursor.and_then(|c| c.parse().ok()).unwrap_or(1).max(1);
+        let page_str = page_num.to_string();
+        let sort_param = match sort {
+            SearchSort::Newest => "timestamp",
+            SearchSort::Relevance => "score",
+        };
+        let found = match self.api(
+            "search.files",
+            &[
+                ("query", &asked),
+                ("count", "50"),
+                ("page", &page_str),
+                ("sort", sort_param),
+                ("sort_dir", "desc"),
+            ],
+        ) {
+            Ok(resp) => resp,
+            Err(Fault::Slack(ref err)) if err == "not_allowed_token_type" => {
+                match self.api(
+                    "search.modules",
+                    &[
+                        ("module", "files"),
+                        ("query", &asked),
+                        ("count", "50"),
+                        ("page", &page_str),
+                        ("sort", sort_param),
+                        ("sort_dir", "desc"),
+                    ],
+                ) {
+                    Ok(resp) => resp,
+                    Err(_) => return Err(Fault::Slack("not_allowed_token_type".to_owned())),
+                }
+            }
+            Err(fault) => return Err(fault),
+        };
+        let files = found["files"]["matches"]
+            .as_array()
+            .or_else(|| found["items"].as_array())
+            .map_or(&[][..], Vec::as_slice);
+        let mut items = Vec::with_capacity(files.len());
+        let mut media = Vec::new();
+        let mut variants = Vec::new();
+        for file in files {
+            let Some(id) = file["id"].as_str().filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let title = file["title"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| file["name"].as_str().filter(|s| !s.is_empty()))
+                .unwrap_or("untitled")
+                .to_owned();
+            let sent = file["created"]
+                .as_i64()
+                .or_else(|| file["timestamp"].as_i64())
+                .unwrap_or(0);
+            let sender = file["user"]
+                .as_str()
+                .filter(|u| !u.is_empty())
+                .map(|u| self.user(u).name)
+                .or_else(|| file["username"].as_str().map(str::to_owned))
+                .unwrap_or_default();
+            let permalink = file["permalink"]
+                .as_str()
+                .map(str::trim)
+                .filter(|u| u.starts_with("https://"))
+                .unwrap_or("")
+                .to_owned();
+            if self.is_external(file) {
+                let url = file["url_private"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|u| u.starts_with("https://"))
+                    .unwrap_or(&permalink)
+                    .to_owned();
+                items.push(SharedItem {
+                    message_id: id.to_owned(),
+                    sent,
+                    sender,
+                    attachment: None,
+                    url,
+                    title,
+                });
+                continue;
+            }
+            let attachment = self.file(file, &mut media, &mut variants);
+            items.push(SharedItem {
+                message_id: id.to_owned(),
+                sent,
+                sender,
+                attachment,
+                url: permalink,
+                title,
+            });
+        }
+        let mut sized = variants.iter().filter(|(_, sizes)| !sizes.is_empty());
+        if let Err(err) = self
+            .ctx
+            .media(&media)
+            .and_then(|()| sized.try_for_each(|(id, sizes)| self.ctx.media_variants(id, sizes)))
+        {
+            tracing::warn!("chatd: Slack: {err}");
+        }
+        let paging = if found["files"]["paging"].is_object() {
+            &found["files"]["paging"]
+        } else {
+            &found["pagination"]
+        };
+        let page = paging["page"].as_u64().unwrap_or(u64::from(page_num)) as u32;
+        let pages = paging["pages"]
+            .as_u64()
+            .or_else(|| paging["page_count"].as_u64())
+            .unwrap_or(1) as u32;
+        let more = page < pages;
+        let next_cursor = more.then(|| (page + 1).to_string());
+        Ok(AccountFilesPage { items, cursor: next_cursor, more })
     }
 
     /// Slack's own words for a scope and structured filters: `in:#channel`, `from:<@U…>`,
@@ -232,6 +446,7 @@ mod tests {
             before: Some(1_767_225_600), // 2026-01-01
             after: Some(1_735_689_600),  // 2025-01-01
             mentions_me: true,
+            sort: SearchSort::Newest,
         };
         let formatted = format_slack_query("deploy", &filters, Some("#general"), Some("U0ME"));
         assert_eq!(

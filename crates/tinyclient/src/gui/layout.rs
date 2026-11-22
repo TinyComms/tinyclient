@@ -4,7 +4,7 @@
 //! slots the other slices fill.
 
 use super::components::{
-    brand_mark, brand_state, button, button_disabled, divider, fade_in, icon_button, menu, menu_item,
+    brand_mark, brand_state, button, button_disabled, divider, fade_in, glyph, icon_button, menu, menu_item,
     menu_item_check, menu_item_danger, menu_label, menu_separator, network_icon, place, placed, popover, scrim, tip,
     toast, ButtonKind, Layer, Place, NO_GLYPH,
 };
@@ -160,6 +160,8 @@ pub struct State {
     toasts: u64,
     /// A newer release is waiting. Stays until the toast is dismissed.
     pub update_alert: bool,
+    /// Shell-level external link confirmation when no conversation pane is mounted.
+    link_ask: Option<super::conversation::links::LinkAsk>,
 }
 
 impl Default for State {
@@ -178,6 +180,7 @@ impl Default for State {
             toast: None,
             toasts: 0,
             update_alert: false,
+            link_ask: None,
         }
     }
 }
@@ -395,13 +398,19 @@ impl Shell {
         if super::phone::active() {
             return self.phone_back(Some(window), cx);
         }
+        if self.layout_state.link_ask.take().is_some() {
+            cx.notify();
+            return true;
+        }
         if self.sidebar_state.switcher.is_some() {
             self.close_switcher(window, cx);
         } else if self.layout_state.menu.is_some() {
             self.layout_state.menu = None;
-        } else if self.tiny_unfull(window, cx) {
+        } else if self.call_unfull(window, cx) {
             return true;
         } else if self.tiny_escape(cx) {
+            return true;
+        } else if self.call_escape(cx) {
             return true;
         } else if self.layout_state.floating {
             self.layout_state.floating = false;
@@ -542,6 +551,14 @@ impl Shell {
             })
             // Beside the conversation nothing leads the strip, so the close does.
             .when(!replaces, |row| row.child(close))
+            .when(pane.kind == RightKind::Thread && !super::phone::active() && self.thread_is_open(), |row| {
+                row.child(
+                    icon_button("open-thread-window", "icons/picture-in-picture-2.svg", false)
+                        .tooltip(tip("Open in New Window", None))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(|this, _, _, cx| this.pop_out_open_thread(cx))),
+                )
+            })
             .child(title);
         let strip = drags_window(div())
             .relative()
@@ -846,9 +863,10 @@ impl Shell {
                     .find(|a| a.key.network == network && a.link == Link::Connected && a.can.join_space_by_invite)
                     .map(|a| a.key.clone())
                 {
+                    let join_label = if network == Network::Teams { "Join a team…" } else { "Join a server…" };
                     items.push(menu_separator().into_any_element());
                     items.push(
-                        menu_item("join-server-invite", Some("icons/log-in.svg"), "Join a server…", None)
+                        menu_item("join-server-invite", Some("icons/log-in.svg"), join_label, None)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.close_menu(cx);
                                 this.open_join_server(account.clone(), cx);
@@ -909,15 +927,17 @@ impl Shell {
                 });
                 if can_leave {
                     let leave_key = space.clone();
+                    let default_noun = if space.network == Network::Teams { "this team" } else { "this server" };
+                    let leave_label = if space.network == Network::Teams { "Leave team…" } else { "Leave server…" };
                     let leave_name = self
                         .spaces
                         .iter()
                         .find(|s| &s.key == space)
                         .map(|s| s.name.clone())
-                        .unwrap_or_else(|| "this server".to_owned());
+                        .unwrap_or_else(|| default_noun.to_owned());
                     items.push(menu_separator().into_any_element());
                     items.push(
-                        menu_item_danger("space-leave", Some("icons/log-out.svg"), "Leave server…")
+                        menu_item_danger("space-leave", Some("icons/log-out.svg"), leave_label)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.close_menu(cx);
                                 this.open_leave_space(leave_key.clone(), leave_name.clone(), cx);
@@ -1120,6 +1140,7 @@ impl Shell {
                 }
                 // A phone has no Return key to name.
                 let keys = if super::phone::active() { None } else { Some("↵") };
+                let window_key = unpinned.key.clone();
                 items.push(
                     menu_item("open", Some(NO_GLYPH), "Open", keys)
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -1128,6 +1149,16 @@ impl Shell {
                         }))
                         .into_any_element(),
                 );
+                if !super::phone::active() {
+                    items.push(
+                        menu_item("open-window", Some("icons/picture-in-picture-2.svg"), "Open in New Window", None)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_menu(cx);
+                                this.pop_out_conversation(window_key.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
                 if conversation.kind.is_direct() {
                     let row = (**conversation).clone();
                     items.push(menu_separator().into_any_element());
@@ -1366,6 +1397,45 @@ impl Shell {
                 );
             }
         }
+        if network == Network::Slack && can.sidebar_sections {
+            if let Some(space_id) = row.space.as_ref() {
+                let space_key = Key {
+                    network,
+                    account: key.account.clone(),
+                    id: space_id.clone(),
+                };
+                if let Some(tree) = self.trees.get(&space_key) {
+                    let targets: Vec<(String, String)> = tree
+                        .groups
+                        .iter()
+                        .filter(|g| g.kind == protocol::GroupKind::Section && row.group.as_deref() != Some(g.id.as_str()))
+                        .map(|g| (g.id.clone(), g.name.clone()))
+                        .collect();
+                    if !targets.is_empty() {
+                        items.push(menu_separator().into_any_element());
+                        items.push(menu_label("Move to section").into_any_element());
+                        for (ix, (to_id, to_name)) in targets.into_iter().enumerate() {
+                            let sp = space_key.clone();
+                            let conv = key.clone();
+                            let from = row.group.clone();
+                            items.push(
+                                menu_item(
+                                    SharedString::from(format!("row-move-section-{ix}")),
+                                    Some("icons/folder.svg"),
+                                    to_name,
+                                    None,
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.move_to_section(sp.clone(), conv.clone(), from.clone(), to_id.clone(), cx);
+                                }))
+                                .into_any_element(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let close = super::people::can_close_direct(&row, &can);
         let clear = super::people::can_clear_history(&row, &can);
         if close || clear || leave {
@@ -1545,6 +1615,9 @@ impl Render for Shell {
         let phone_form = super::phone::form(super::phone::active(), f32::from(viewport.width), f32::from(viewport.height));
         super::phone::set_active(phone_form);
         super::phone::tokens::set_landscape(phone_form && viewport.width > viewport.height);
+        let sharing = super::streamer::sharing(self.snapshot.as_ref().and_then(|snapshot| snapshot.call.as_ref()));
+        super::streamer::sync(sharing);
+        self.arm_streamer_watch(cx);
         // A phone's window does not shrink for the soft keyboard (Android's NativeActivity and
         // iOS's full-screen view both keep their size and report the keyboard as an inset), so
         // the shell lifts its content above it; the composer then sits on the keyboard's edge
@@ -1636,10 +1709,14 @@ impl Render for Shell {
             chrome::clear_end();
             self.note_room(true, Some(width));
             let screen = self.phone_screen(snapshot, window, cx);
-            return root.child(screen).children(self.toast_layer(width, cx)).children(super::settings::phone_page(window, cx));
+            return root
+                .child(screen)
+                .children(self.toast_layer(width, cx))
+                .children(super::settings::phone_page(window, cx))
+                .children(self.streamer_mark(window, cx));
         }
         if self.snapshot.is_some() && snapshot.signed_in().is_empty() && settled {
-            return root.child(self.first_run(snapshot, cx)).children(window_chrome(window));
+            return root.child(self.first_run(snapshot, cx)).children(window_chrome(window)).children(self.streamer_mark(window, cx));
         }
 
         let state = &self.layout_state;
@@ -1654,9 +1731,12 @@ impl Render for Shell {
         self.note_room(self.pane_narrow(), Some(conversation_width(width - overview, &plan)));
         let floating = plan.sidebar.is_none() && state.floating;
         let replaced = plan.right.is_some_and(|(_, replaces)| replaces);
+        let call_view = self.call_view_active(snapshot);
         // With nothing open on a phone, the list is the whole screen: there is no sidebar
         // column to fall back to, and the conversation only exists when something is open.
-        let list_alone = if phone(width) {
+        let list_alone = if call_view {
+            false
+        } else if phone(width) {
             snapshot.open.is_none()
         } else {
             snapshot.open.is_none() && plan.sidebar.is_none() && !state.sidebar_hidden && !floating && !replaced
@@ -1686,6 +1766,7 @@ impl Render for Shell {
             .when(!replaced && !list_alone, |root| {
                 let pane = match (&snapshot.open, self.keychain_state(window, cx)) {
                     (_, Some(waiting)) => waiting,
+                    (_, None) if call_view => self.call_view_pane(snapshot, window, cx),
                     (Some(_), None) => self.conversation(snapshot, window, cx),
                     (None, None) if self.tiny_open() => self.tiny_page(plan.sidebar.is_some() || floating, window, cx),
                     (None, None) => self.nothing_open(window, cx),
@@ -1720,10 +1801,13 @@ impl Render for Shell {
             .children(self.create_channel_modal(cx))
             .children(self.join_server_modal(cx))
             .children(self.leave_space_modal(cx))
+            .children(self.link_ask_modal(window, cx))
+            .children(self.call_full_stage(snapshot, cx))
             .children(self.tiny_layer(window, cx))
             .children(self.menu_layer(snapshot, plan.sidebar.unwrap_or(state.sidebar_width), overview, window, cx))
             .children(self.toast_layer(width, cx))
             .children(window_chrome(window))
+            .children(self.streamer_mark(window, cx))
     }
 }
 
@@ -1826,6 +1910,80 @@ impl Shell {
     }
 }
 
+impl Shell {
+    /// One poll while "while sharing" also watches for OBS or Streamlabs. Idle windows otherwise
+    /// would not notice the broadcast app until the next paint.
+    fn arm_streamer_watch(&mut self, cx: &mut Context<Self>) {
+        if !super::streamer::take_watch() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(5)).await;
+                let keep = this
+                    .update(cx, |_, cx| {
+                        let keep = super::streamer::watch_wanted();
+                        if keep {
+                            cx.notify();
+                        }
+                        keep
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    super::streamer::release_watch();
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// The title-bar mark while Streamer mode is on. One click stores Off.
+    fn streamer_mark(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !super::streamer::is_active() {
+            return None;
+        }
+        let chip = div()
+            .id("streamer-off")
+            .absolute()
+            .top(px(12.))
+            .right(px(chrome::width(window) + 12.))
+            .occlude()
+            .h(px(28.))
+            .px(px(10.))
+            .flex()
+            .items_center()
+            .gap(px(6.))
+            .rounded(px(theme::R_CONTROL))
+            .bg(theme::hover())
+            .border_1()
+            .border_color(theme::border())
+            .type_small()
+            .font_weight(theme::MEDIUM)
+            .text_color(theme::text())
+            .cursor_pointer()
+            .tooltip(tip("Streamer mode is on. Click to turn it off.", None))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _, _, cx| this.streamer_turn_off(cx)))
+            .child(glyph("icons/eye-off.svg", 14., theme::text_soft()))
+            .child("Streamer mode");
+        Some(gpui::deferred(chip).priority(4).into_any_element())
+    }
+
+    fn streamer_turn_off(&mut self, cx: &mut Context<Self>) {
+        let mut values = super::app::prefs::values();
+        values.set(protocol::settings::GLOBAL, protocol::settings::STREAMER_MODE, Some("off".into()));
+        super::app::prefs::set_values(values);
+        let request = protocol::Request::Set {
+            scope: protocol::settings::GLOBAL.to_owned(),
+            key: protocol::settings::STREAMER_MODE.to_owned(),
+            value: Some("off".into()),
+        };
+        cx.background_executor().spawn(async move { crate::client::ask(&request) }).detach();
+        cx.notify();
+    }
+}
+
 /// The window's own buttons and resize edges, where the platform leaves them to the window.
 fn window_chrome(window: &Window) -> impl Iterator<Item = AnyElement> {
     let edges = chrome::edges(window).map(IntoElement::into_any_element);
@@ -1834,6 +1992,176 @@ fn window_chrome(window: &Window) -> impl Iterator<Item = AnyElement> {
 }
 
 impl Shell {
+    /// Opens an external web link using the mounted conversation pane when one is open, or
+    /// handles confirmation at the shell level when no conversation is open.
+    pub(in crate::gui) fn open_external_url(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.open.is_some() {
+            let pane = self.pane(cx);
+            pane.update(cx, |pane, cx| pane.open_external_link(url, window, cx));
+            return;
+        }
+        if super::conversation::links::is_mailto(url) {
+            cx.open_url(url);
+            return;
+        }
+        let Some(dest) = protocol::link::Destination::parse(url) else {
+            return;
+        };
+        let choices = super::app::prefs::choices();
+        let trusted = super::app::prefs::trusted_links().contains(&dest.domain);
+        if super::conversation::links::opens_at_once(&dest, choices.confirm_links, trusted) {
+            cx.open_url(&dest.target(choices.strip_tracking));
+            return;
+        }
+        self.layout_state.link_ask = Some(super::conversation::links::LinkAsk { dest, remember: false });
+        cx.notify();
+    }
+
+    fn close_link_ask(&mut self, cx: &mut Context<Self>) {
+        if self.layout_state.link_ask.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn go_to_link(&mut self, cx: &mut Context<Self>) {
+        let Some(ask) = self.layout_state.link_ask.take() else {
+            return;
+        };
+        if ask.remember && ask.can_remember() {
+            let mut trusted = super::app::prefs::trusted_links();
+            if trusted.add(&ask.dest.domain) {
+                super::app::prefs::set_trusted_links(trusted);
+                self.save_prefs(cx);
+            }
+        }
+        cx.open_url(&ask.target());
+        cx.notify();
+    }
+
+    fn link_ask_modal(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let ask = self.layout_state.link_ask.as_ref()?;
+        let dest = &ask.dest;
+        let target = ask.target();
+
+        let mut body = div().mt(px(12.)).flex().flex_col().gap(px(10.));
+        let mut site = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .child(div().type_title().font_weight(theme::SEMIBOLD).child(dest.domain_shown.clone()));
+        if dest.host_shown != dest.domain_shown {
+            site = site.child(div().type_ui().text_color(theme::text_soft()).child(dest.host_shown.clone()));
+        }
+        body = body.child(site);
+
+        let note = |warn: bool, words: String| {
+            div()
+                .p(px(10.))
+                .rounded(px(theme::R_CARD))
+                .bg(if warn { theme::warning_soft() } else { theme::raised() })
+                .type_ui()
+                .text_color(if warn { theme::text() } else { theme::text_soft() })
+                .child(words)
+        };
+        match dest.risk {
+            protocol::link::Risk::Lookalike => {
+                body = body.child(note(
+                    true,
+                    format!(
+                        "Careful: this name mixes alphabets, or uses letters that look like Latin ones. It may be pretending to be another site. Its real address is {}.",
+                        dest.host
+                    ),
+                ));
+            }
+            protocol::link::Risk::Idn => {
+                body = body.child(note(
+                    false,
+                    format!("This site's name uses letters outside A to Z. Its address on the internet is {}.", dest.host),
+                ));
+            }
+            protocol::link::Risk::None => {}
+        }
+        if dest.has_userinfo {
+            body = body.child(note(
+                true,
+                "Careful: the part of the address before the @ is a user name, not the site. The site is the one above.".to_owned(),
+            ));
+        }
+        body = body.child(
+            div()
+                .id("shell-link-address")
+                .p(px(10.))
+                .rounded(px(theme::R_CARD))
+                .bg(theme::raised())
+                .line_clamp(4)
+                .type_small()
+                .text_color(theme::text_soft())
+                .child(target.clone()),
+        );
+        if ask.can_remember() {
+            let on = ask.remember;
+            body = body.child(
+                div()
+                    .id("shell-link-remember")
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .cursor_pointer()
+                    .type_ui()
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(16.))
+                            .rounded(px(4.))
+                            .border_1()
+                            .border_color(if on { theme::accent() } else { theme::border_strong() })
+                            .when(on, |box_| box_.bg(theme::accent()))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_color(theme::on_accent())
+                            .child(if on { "✓" } else { "" }),
+                    )
+                    .child(format!("Don't ask again for {}", dest.domain_shown))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(ask) = this.layout_state.link_ask.as_mut() {
+                            ask.remember = !ask.remember;
+                            cx.notify();
+                        }
+                    })),
+            );
+        }
+
+        let room = f32::from(window.viewport_size().width) - 32.;
+        let copy = target.clone();
+        let panel = super::components::modal("Open this link?")
+            .w(px(if super::phone::active() { room.min(440.) } else { 440. }))
+            .child(body)
+            .child(
+                super::components::modal_buttons()
+                    .child(button("shell-link-cancel", ButtonKind::Ghost, "Cancel").on_click(cx.listener(|this, _, _, cx| this.close_link_ask(cx))))
+                    .child(button("shell-link-copy", ButtonKind::Secondary, "Copy link").on_click(cx.listener(move |this, _, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.clone()));
+                        this.close_link_ask(cx);
+                    })))
+                    .child(button("shell-link-open", ButtonKind::Primary, "Open").on_click(cx.listener(|this, _, _, cx| this.go_to_link(cx)))),
+            )
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        let size = window.viewport_size();
+        let scrim = div()
+            .id("shell-link-ask")
+            .w(size.width)
+            .h(size.height)
+            .bg(theme::scrim())
+            .occlude()
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.close_link_ask(cx)))
+            .child(fade_in("shell-link-ask-panel", 160, panel));
+        Some(gpui::deferred(gpui::anchored().position(gpui::point(px(0.), px(0.))).child(scrim)).priority(1).into_any_element())
+    }
+
     /// The toasts, 16 from the bottom-right: the crash toast stays until dismissed and sits
     /// above any other.
     fn toast_layer(&self, window_width: f32, cx: &mut Context<Self>) -> Option<Div> {

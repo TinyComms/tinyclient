@@ -21,7 +21,7 @@ use crate::gui::playing::{self, Play};
 use crate::gui::theme::{self, Type};
 use gpui::{
     canvas, div, fill, img, point, prelude::*, px, size, Bounds, Context, ImageSource, MouseButton, ObjectFit, Pixels,
-    Stateful, Div,
+    SharedString, Stateful, Div,
 };
 use protocol::{round_click, round_should_autoplay, Attachment, Message, PlayState, Playback, Request, RoundClick, RoundPhase};
 use std::f32::consts::{FRAC_PI_2, TAU};
@@ -56,7 +56,8 @@ impl Pane {
             return self.round_note(attachment, tile, cx).children(unplayed_dot);
         }
         let fetching = self.then.contains_key(&attachment.file.id);
-        let tile = match media::shape(attachment) {
+        let shape = media::shape(attachment);
+        let mut tile = match shape {
             Shape::Gif => {
                 let words = if fetching { "Loading…" } else { "GIF" };
                 tile.child(play_disc()).child(badge(words.to_owned()).left(px(6.)))
@@ -69,6 +70,70 @@ impl Pane {
                 tile.child(play_disc()).children(words.map(|words| badge(words).right(px(6.))))
             }
         };
+        if shape == Shape::Video {
+            if let Some(tr) = attachment.transcript.as_ref().filter(|t| !t.is_empty()) {
+                let captions_active = self.captions_on.contains(&attachment.file.id);
+                let (cc_id, cc_vtt) = (attachment.file.id.clone(), tr.file.clone());
+                let cc = div()
+                    .id(SharedString::from(format!("cc-{}", attachment.file.id)))
+                    .absolute()
+                    .bottom(px(6.))
+                    .left(px(6.))
+                    .h(px(20.))
+                    .px(px(6.))
+                    .rounded(px(4.))
+                    .bg(if captions_active { theme::accent() } else { gpui::rgba(0x000000aa) })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .type_micro()
+                    .font_weight(theme::SEMIBOLD)
+                    .text_color(gpui::white())
+                    .tooltip(tip(if captions_active { "Hide captions" } else { "Show captions" }, None))
+                    .child("CC")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_captions(cc_id.clone(), cc_vtt.clone(), cx);
+                    }));
+                if captions_active {
+                    let lines = self.transcript_lines(tr);
+                    let caption = if !lines.is_empty() {
+                        let at = self
+                            .playback_of(&attachment.file.id, cx)
+                            .0
+                            .as_ref()
+                            .map(|p| p.position(crate::gui::playing::now_ms()));
+                        at.and_then(|ms| protocol::active_caption(lines, ms))
+                            .or_else(|| lines.first())
+                            .map(|l| l.text.clone())
+                    } else if !tr.preview.is_empty() {
+                        Some(tr.preview.clone())
+                    } else if tr.file.is_some() {
+                        Some("Loading captions…".to_owned())
+                    } else {
+                        None
+                    };
+                    if let Some(caption) = caption {
+                        tile = tile.child(
+                            div()
+                                .absolute()
+                                .bottom(px(30.))
+                                .left(px(8.))
+                                .right(px(8.))
+                                .px(px(8.))
+                                .py(px(4.))
+                                .rounded(px(4.))
+                                .bg(gpui::rgba(0x000000bf))
+                                .type_small()
+                                .text_color(gpui::white())
+                                .child(caption),
+                        );
+                    }
+                }
+                tile = tile.child(cc);
+            }
+        }
         let attached = attachment.clone();
         let mark_id = (attachment.round && message.media_unread && !message.outgoing).then(|| message.id.clone());
         tile.tooltip(tip("Play in your video player", None))

@@ -11,6 +11,7 @@ const FORWARD: &str = "http://schema.skype.com/Forward";
 const EMOJI: &str = "http://schema.skype.com/Emoji";
 const CUSTOM_EMOJI: &str = "http://schema.skype.com/CustomEmoji";
 const GIPHY: &str = "http://schema.skype.com/Giphy";
+const STICKER: &str = "http://schema.skype.com/Sticker";
 
 /// What the text cannot say for itself, answered by the adapter.
 pub(super) trait Lookup {
@@ -29,6 +30,28 @@ pub(super) struct Image {
     pub width: u32,
     pub height: u32,
     pub name: String,
+}
+
+/// Whether an embedded `<URIObject>` is a voice message or a video clip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ClipKind {
+    Audio,
+    Video,
+}
+
+/// An embedded Teams voice message or video clip (`<URIObject type="Audio.1" ...>` / `Video.*`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MediaClip {
+    pub kind: ClipKind,
+    pub uri: String,
+    pub thumb: String,
+    pub doc_id: String,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: u64,
+    /// Duration in seconds (0 when absent).
+    pub duration: u32,
 }
 
 /// The message a chat reply quotes at its top.
@@ -59,6 +82,10 @@ pub(super) struct Parsed {
     pub images: Vec<Image>,
     /// GIFs from Teams' Giphy button, on Giphy's own host.
     pub gifs: Vec<Image>,
+    /// Stickers and memes from Teams' sticker picker, hosted on Teams' media store.
+    pub stickers: Vec<Image>,
+    /// Embedded voice messages and video clips (`<URIObject type="Audio.*" | "Video.*">`).
+    pub clips: Vec<MediaClip>,
     pub quote: Option<Quote>,
     pub forward: Option<ForwardQuote>,
     /// It holds a card or another object that is not text.
@@ -218,6 +245,10 @@ struct Element {
     hides: bool,
     /// True when this element opened `self.forward`.
     is_forward: bool,
+    /// True when this element opened `self.clip`.
+    is_clip: bool,
+    /// True when collecting text inside `<Duration>` of an active `self.clip`.
+    clip_duration: bool,
     block: bool,
 }
 
@@ -233,6 +264,61 @@ struct Builder<'a> {
     hidden: u32,
     quote: Option<Quote>,
     forward: Option<ForwardQuote>,
+    clip: Option<MediaClip>,
+}
+
+/// Parses a Teams media duration string into whole seconds (`PT12S`, `PT1M5S`, `00:01:05`, `12.5`, or ms).
+pub(super) fn parse_duration_secs(raw: &str, millis_hint: bool) -> u32 {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return 0;
+    }
+    if let Some(rest) = raw.strip_prefix("PT").or_else(|| raw.strip_prefix("pt")) {
+        let mut total = 0.0f64;
+        let mut num = String::new();
+        for ch in rest.chars() {
+            if ch.is_ascii_digit() || ch == '.' {
+                num.push(ch);
+            } else {
+                let val = num.parse::<f64>().unwrap_or(0.0);
+                num.clear();
+                match ch.to_ascii_uppercase() {
+                    'H' => total += val * 3600.0,
+                    'M' => total += val * 60.0,
+                    'S' => total += val,
+                    _ => {}
+                }
+            }
+        }
+        return total.round().clamp(0.0, u32::MAX as f64) as u32;
+    }
+    if raw.contains(':') {
+        let parts: Vec<f64> = raw.split(':').filter_map(|p| p.trim().parse::<f64>().ok()).collect();
+        let secs = match parts.as_slice() {
+            [m, s] => m * 60.0 + s,
+            [h, m, s] => h * 3600.0 + m * 60.0 + s,
+            _ => 0.0,
+        };
+        return secs.round().clamp(0.0, u32::MAX as f64) as u32;
+    }
+    let val = raw.parse::<f64>().unwrap_or(0.0);
+    if val <= 0.0 {
+        return 0;
+    }
+    let secs = if millis_hint { val / 1000.0 } else { val };
+    secs.round().max(1.0).min(u32::MAX as f64) as u32
+}
+
+/// Recognizes whether a `<URIObject type="...">` is a voice message or a video clip.
+fn clip_kind(uri_type: &str) -> Option<ClipKind> {
+    let lower = uri_type.trim().to_ascii_lowercase();
+    if lower.starts_with("audio.") || lower.contains("audiomsg") || lower.contains("voice") {
+        Some(ClipKind::Audio)
+    } else if lower.starts_with("video.") || lower.contains("videoclip") {
+        Some(ClipKind::Video)
+    } else {
+        None
+    }
 }
 
 const BLOCKS: &[&str] = &[
@@ -316,6 +402,15 @@ impl Builder<'_> {
             }
             return;
         }
+        if let Some(clip) = &mut self.clip {
+            if self.open.iter().rev().any(|e| e.clip_duration) && clip.duration == 0 {
+                let parsed = parse_duration_secs(text, false);
+                if parsed > 0 {
+                    clip.duration = parsed;
+                }
+            }
+            return;
+        }
         if self.hidden > 0 {
             return;
         }
@@ -380,6 +475,15 @@ impl Builder<'_> {
             });
             return;
         }
+        if kind == STICKER && self.lookup.hosted(src) {
+            self.out.stickers.push(Image {
+                src: src.to_owned(),
+                width: pixels(attrs, "width"),
+                height: pixels(attrs, "height"),
+                name: alt.to_owned(),
+            });
+            return;
+        }
         if self.lookup.hosted(src) {
             self.out.images.push(Image {
                 src: src.to_owned(),
@@ -408,6 +512,57 @@ impl Builder<'_> {
     }
 
     fn opened(&mut self, name: String, attrs: &[(String, String)], closed: bool) {
+        if let Some(clip) = &mut self.clip {
+            match name.as_str() {
+                "originalname" => {
+                    let v = attr(attrs, "v");
+                    if !v.is_empty() {
+                        clip.name = v.to_owned();
+                    }
+                }
+                "filesize" => {
+                    if let Ok(n) = attr(attrs, "v").trim().parse::<u64>() {
+                        clip.bytes = n;
+                    }
+                }
+                "duration" => {
+                    let v = attr(attrs, "v");
+                    if !v.is_empty() {
+                        let d = parse_duration_secs(v, false);
+                        if d > 0 {
+                            clip.duration = d;
+                        }
+                    }
+                }
+                "meta" => {
+                    let orig = attr(attrs, "originalname");
+                    if !orig.is_empty() && clip.name.is_empty() {
+                        clip.name = orig.to_owned();
+                    }
+                    let dur_ms = attr(attrs, "durationms");
+                    if !dur_ms.is_empty() && clip.duration == 0 {
+                        clip.duration = parse_duration_secs(dur_ms, true);
+                    }
+                }
+                _ => {}
+            }
+            if !closed && !VOID.contains(&name.as_str()) {
+                self.open.push(Element {
+                    tag: name.clone(),
+                    start: 0,
+                    spans: 0,
+                    style: None,
+                    mention: false,
+                    field: None,
+                    hides: false,
+                    is_forward: false,
+                    is_clip: false,
+                    clip_duration: name == "duration",
+                    block: false,
+                });
+            }
+            return;
+        }
         let block = BLOCKS.contains(&name.as_str());
         if block {
             self.line();
@@ -426,6 +581,34 @@ impl Builder<'_> {
             "img" => self.image(attrs),
             // A cell after the first on its row.
             "td" | "th" if !(self.due || self.out.text.is_empty() || self.out.text.ends_with('\n')) => self.say("\u{a0}|\u{a0}"),
+            "uriobject" if closed => {
+                if let Some(ck) = clip_kind(attr(attrs, "type")) {
+                    let dur = {
+                        let raw_d = attr(attrs, "duration");
+                        let raw_ms = attr(attrs, "durationms");
+                        if !raw_ms.is_empty() {
+                            parse_duration_secs(raw_ms, true)
+                        } else if !raw_d.is_empty() {
+                            parse_duration_secs(raw_d, false)
+                        } else {
+                            parse_duration_secs(attr(attrs, "length"), false)
+                        }
+                    };
+                    self.out.clips.push(MediaClip {
+                        kind: ck,
+                        uri: attr(attrs, "uri").trim().to_owned(),
+                        thumb: attr(attrs, "url_thumbnail").trim().to_owned(),
+                        doc_id: attr(attrs, "doc_id").trim().to_owned(),
+                        name: attr(attrs, "name").trim().to_owned(),
+                        width: pixels(attrs, "width"),
+                        height: pixels(attrs, "height"),
+                        bytes: 0,
+                        duration: dur,
+                    });
+                } else {
+                    self.out.card = true;
+                }
+            }
             _ => {}
         }
         if closed || VOID.contains(&name.as_str()) {
@@ -439,6 +622,8 @@ impl Builder<'_> {
             field: None,
             hides: false,
             is_forward: false,
+            is_clip: false,
+            clip_duration: false,
             block,
             tag: name,
         };
@@ -541,8 +726,40 @@ impl Builder<'_> {
                 let item = if element.tag == "at" { attr(attrs, "id") } else { attr(attrs, "itemid") };
                 self.lookup.mention(item).map(|(kind, id)| Style::Mention { kind, id })
             }
-            "uriobject" | "swift" | "script" | "style" | "title" | "head" => {
-                self.out.card |= matches!(element.tag.as_str(), "uriobject" | "swift");
+            "uriobject" => {
+                if let Some(clip_kind) = clip_kind(attr(attrs, "type")) {
+                    let dur = {
+                        let raw_d = attr(attrs, "duration");
+                        let raw_ms = attr(attrs, "durationms");
+                        if !raw_ms.is_empty() {
+                            parse_duration_secs(raw_ms, true)
+                        } else if !raw_d.is_empty() {
+                            parse_duration_secs(raw_d, false)
+                        } else {
+                            parse_duration_secs(attr(attrs, "length"), false)
+                        }
+                    };
+                    self.clip = Some(MediaClip {
+                        kind: clip_kind,
+                        uri: attr(attrs, "uri").trim().to_owned(),
+                        thumb: attr(attrs, "url_thumbnail").trim().to_owned(),
+                        doc_id: attr(attrs, "doc_id").trim().to_owned(),
+                        name: attr(attrs, "name").trim().to_owned(),
+                        width: pixels(attrs, "width"),
+                        height: pixels(attrs, "height"),
+                        bytes: 0,
+                        duration: dur,
+                    });
+                    element.is_clip = true;
+                } else {
+                    self.out.card = true;
+                }
+                self.hidden += 1;
+                element.hides = true;
+                None
+            }
+            "swift" | "script" | "style" | "title" | "head" => {
+                self.out.card |= element.tag == "swift";
                 self.hidden += 1;
                 element.hides = true;
                 None
@@ -567,7 +784,12 @@ impl Builder<'_> {
                 return;
             };
             if element.hides {
-                if element.is_forward {
+                if element.is_clip {
+                    if let Some(clip) = self.clip.take() {
+                        self.out.clips.push(clip);
+                    }
+                    self.hidden = self.hidden.saturating_sub(1);
+                } else if element.is_forward {
                     if let Some(fwd) = self.forward.take() {
                         match &mut self.out.forward {
                             Some(existing) => {
@@ -684,6 +906,7 @@ pub(super) fn parse(html: &str, lookup: &dyn Lookup, me: &str) -> Parsed {
         hidden: 0,
         quote: None,
         forward: None,
+        clip: None,
     };
     let mut rest = html;
     let mut text = String::new();
@@ -1550,5 +1773,68 @@ mod tests {
         assert_eq!(mentions[0]["mri"], "8:orgid:ana");
         assert_eq!(mentions[0]["mentionType"], "person");
         assert_eq!(mentions[0]["displayName"], "Ana Ruiz");
+    }
+
+    #[test]
+    fn voice_and_video_uri_objects_parse_as_media_clips_not_cards() {
+        let voice = read(
+            "<URIObject uri=\"https://eu-api.asm.skype.com/v1/objects/0-weu-d1-voice1\" type=\"Audio.1\" doc_id=\"0-weu-d1-voice1\">\
+             <Title></Title><Description></Description>\
+             <OriginalName v=\"voice-note.m4a\"/><FileSize v=\"48210\"/><Duration v=\"0:00:14.2\"/>\
+             </URIObject>",
+        );
+        assert!(!voice.card, "voice message must not be treated as an unsupported card");
+        assert_eq!(voice.clips.len(), 1);
+        assert_eq!(voice.clips[0].kind, ClipKind::Audio);
+        assert_eq!(voice.clips[0].uri, "https://eu-api.asm.skype.com/v1/objects/0-weu-d1-voice1");
+        assert_eq!(voice.clips[0].doc_id, "0-weu-d1-voice1");
+        assert_eq!(voice.clips[0].name, "voice-note.m4a");
+        assert_eq!(voice.clips[0].bytes, 48210);
+        assert_eq!(voice.clips[0].duration, 14);
+
+        let video = read(
+            "<URIObject uri=\"https://eu-api.asm.skype.com/v1/objects/0-weu-d1-vid1\" \
+             url_thumbnail=\"https://eu-api.asm.skype.com/v1/objects/0-weu-d1-vid1/views/video_imgt1\" \
+             type=\"Video.2/Media.1\" width=\"1280\" height=\"720\">\
+             <OriginalName v=\"demo.mp4\"/><FileSize v=\"123456\"/><Duration>00:01:05</Duration>\
+             </URIObject>",
+        );
+        assert!(!video.card, "video clip must not be treated as an unsupported card");
+        assert_eq!(video.clips.len(), 1);
+        assert_eq!(video.clips[0].kind, ClipKind::Video);
+        assert_eq!(video.clips[0].thumb, "https://eu-api.asm.skype.com/v1/objects/0-weu-d1-vid1/views/video_imgt1");
+        assert_eq!(video.clips[0].width, 1280);
+        assert_eq!(video.clips[0].height, 720);
+        assert_eq!(video.clips[0].duration, 65);
+
+        let self_closing = read(
+            "<URIObject uri=\"https://eu-api.asm.skype.com/v1/objects/0-weu-d1-v2\" type=\"Audio.1\" durationms=\"7500\" />",
+        );
+        assert!(!self_closing.card);
+        assert_eq!(self_closing.clips.len(), 1);
+        assert_eq!(self_closing.clips[0].duration, 8);
+
+        assert_eq!(parse_duration_secs("PT1M12S", false), 72);
+        assert_eq!(parse_duration_secs("0:02:03.4", false), 123);
+        assert_eq!(parse_duration_secs("9500", true), 10);
+    }
+
+    #[test]
+    fn sticker_images_from_teams_hosts_parse_as_stickers() {
+        let parsed = read(
+            "<p><img itemtype=\"http://schema.skype.com/Sticker\" \
+             src=\"https://eu-api.asm.skype.com/v1/objects/sticker-1/views/imgo\" \
+             width=\"180\" height=\"180\" alt=\"Ship It\"></p>",
+        );
+        assert_eq!(parsed.stickers.len(), 1);
+        assert_eq!(parsed.stickers[0].name, "Ship It");
+        assert_eq!(parsed.stickers[0].width, 180);
+        assert!(parsed.images.is_empty());
+
+        let untrusted = read(
+            "<p><img itemtype=\"http://schema.skype.com/Sticker\" \
+             src=\"https://evil.example/sticker.png\" alt=\"Bad\"></p>",
+        );
+        assert!(untrusted.stickers.is_empty());
     }
 }

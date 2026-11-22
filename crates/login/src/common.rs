@@ -62,26 +62,68 @@ pub fn user_agent() -> String {
 pub fn slack_session(local_config: &str) -> Option<serde_json::Value> {
     let config: serde_json::Value = serde_json::from_str(local_config).ok()?;
     let text = |value: &serde_json::Value| value.as_str().unwrap_or("").to_owned();
-    let teams: Vec<serde_json::Value> = config["teams"]
-        .as_object()?
+    let mut enterprises: Vec<serde_json::Value> = Vec::new();
+    if let Some(orgs) = config["enterprises"].as_object() {
+        for (id, org) in orgs {
+            let token = text(&org["token"]);
+            let url = text(&org["url"]);
+            if token.is_empty() || url.is_empty() {
+                continue;
+            }
+            enterprises.push(serde_json::json!({
+                "id": id,
+                "name": text(&org["name"]),
+                "url": url,
+                "token": token,
+                "enterprise_id": id,
+            }));
+        }
+    }
+    let org_ids_with_token: std::collections::HashSet<String> = enterprises
         .iter()
-        .filter(|(_, team)| !text(&team["token"]).is_empty() && !text(&team["url"]).is_empty())
-        .map(|(id, team)| {
-            serde_json::json!({
+        .filter_map(|org| org["id"].as_str().map(str::to_owned))
+        .collect();
+    let mut teams: Vec<serde_json::Value> = Vec::new();
+    if let Some(map) = config["teams"].as_object() {
+        for (id, team) in map {
+            let token = text(&team["token"]);
+            let url = text(&team["url"]);
+            let ent_id = text(&team["enterprise_id"]);
+            let covered_by_org = !ent_id.is_empty() && org_ids_with_token.contains(&ent_id);
+            if url.is_empty() || (token.is_empty() && !covered_by_org) {
+                continue;
+            }
+            let mut entry = serde_json::json!({
                 "id": id,
                 "name": text(&team["name"]),
-                "url": text(&team["url"]),
-                "token": text(&team["token"]),
-                "enterprise_id": text(&team["enterprise_id"]),
-            })
-        })
-        .collect();
-    let first = text(&teams.first()?["id"]);
+                "url": url,
+                "token": token,
+                "enterprise_id": ent_id,
+            });
+            let ent_name = text(&team["enterprise_name"]);
+            if !ent_name.is_empty() {
+                entry["enterprise_name"] = ent_name.into();
+            }
+            teams.push(entry);
+        }
+    }
+    if teams.is_empty() && enterprises.is_empty() {
+        return None;
+    }
+    let first = teams
+        .first()
+        .or_else(|| enterprises.first())
+        .map(|entry| text(&entry["id"]))
+        .unwrap_or_default();
     let active = match config["lastActiveTeamId"].as_str() {
         Some(active) if !active.is_empty() => active.to_owned(),
         _ => first,
     };
-    Some(serde_json::json!({"teams": teams, "active": active}))
+    let mut out = serde_json::json!({"teams": teams, "active": active});
+    if !enterprises.is_empty() {
+        out["enterprises"] = serde_json::Value::Array(enterprises);
+    }
+    Some(out)
 }
 
 pub fn web_client(url: &str) -> bool {
@@ -178,6 +220,40 @@ pub fn load_failed_message(message: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+/// True when a cookie domain is `slack.com` or a subdomain, including a leading dot.
+/// Same host rule as `page.cookie("slack.com", ...)`.
+pub fn slack_cookie_domain(domain: &str) -> bool {
+    let host = domain.trim_start_matches('.').to_ascii_lowercase();
+    host == "slack.com" || host.ends_with(".slack.com")
+}
+
+/// True when `url` is https on slack.com or a subdomain, with no user and no port.
+pub fn slack_page(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    if rest.is_empty() || rest.contains('@') {
+        return false;
+    }
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if host.is_empty() || host.contains(':') || host.starts_with('.') || host.contains("..") {
+        return false;
+    }
+    host == "slack.com" || host.strip_suffix("slack.com").is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+/// `--start URL` for one Slack workspace. Absent is fine. Anything else is an error.
+pub fn parse_start(args: &[String]) -> Result<Option<String>, String> {
+    let Some(flag) = args.iter().position(|arg| arg == "--start") else {
+        return Ok(None);
+    };
+    let value = args.get(flag + 1).ok_or("--start needs a Slack address")?;
+    if !slack_page(value) {
+        return Err(format!("--start needs an https address on slack.com, not {value:?}"));
+    }
+    Ok(Some(value.to_owned()))
+}
+
 pub fn parse_at(args: &[String]) -> Result<Option<(f64, f64)>, String> {
     let Some(flag) = args.iter().position(|arg| arg == "--at") else {
         return Ok(None);
@@ -223,7 +299,8 @@ pub fn finish(session: serde_json::Value) -> ! {
 #[cfg(test)]
 mod tests {
     use super::{
-        blocked, hands_off, origin, parse_at, route, session, slack_session, web_client, Route, DISCORD,
+        blocked, hands_off, origin, parse_at, parse_start, route, session, slack_cookie_domain,
+        slack_page, slack_session, web_client, Route, DISCORD,
     };
 
     #[test]
@@ -254,6 +331,38 @@ mod tests {
         assert!(parse_at(&args(&["slack", "--at", "640"])).is_err());
         assert!(parse_at(&args(&["slack", "--at", "a,b"])).is_err());
         assert!(parse_at(&args(&["slack", "--at", "nan,1"])).is_err());
+    }
+
+    #[test]
+    fn start_opens_a_slack_workspace_and_refuses_anything_else() {
+        let args = |list: &[&str]| list.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        assert_eq!(parse_start(&args(&["slack"])), Ok(None));
+        assert_eq!(
+            parse_start(&args(&["slack", "--start", "https://acme.slack.com/"])).unwrap().as_deref(),
+            Some("https://acme.slack.com/")
+        );
+        assert_eq!(
+            parse_start(&args(&["slack", "--start", "https://app.slack.com/client/T1", "--at", "1,2"])).unwrap().as_deref(),
+            Some("https://app.slack.com/client/T1")
+        );
+        assert!(slack_page("https://slack.com/"));
+        assert!(slack_cookie_domain("slack.com"));
+        assert!(slack_cookie_domain(".slack.com"));
+        assert!(slack_cookie_domain("acme.slack.com"));
+        assert!(slack_cookie_domain(".Acme.Slack.com"));
+        assert!(!slack_cookie_domain(""));
+        assert!(!slack_cookie_domain("notslack.com"));
+        assert!(!slack_cookie_domain("slack.com.evil.example"));
+        assert!(!slack_cookie_domain(".slack.com.evil.example"));
+        assert!(!slack_cookie_domain("evil.example"));
+        assert!(!slack_page("http://acme.slack.com/"));
+        assert!(!slack_page("https://acme.slack.com:443/"));
+        assert!(!slack_page("https://user@acme.slack.com/"));
+        assert!(!slack_page("https://evil.example/"));
+        assert!(!slack_page("https://slack.com.evil.example/"));
+        assert!(!slack_page("https://notslack.com/"));
+        assert!(parse_start(&args(&["slack", "--start"])).is_err());
+        assert!(parse_start(&args(&["slack", "--start", "https://evil.example/"])).is_err());
     }
 
     #[test]
@@ -332,6 +441,8 @@ mod tests {
         assert_eq!(route("https://glimmr.slack.com/", None), Route::Allow);
         assert_eq!(route("https://slack.com/signin#/signin", None), Route::Allow);
         assert_eq!(route("https://discord.com/login", None), Route::Allow);
+        assert_eq!(route("https://accounts.google.com/o/oauth2/v2/auth", Some("https://slack.com/signin")), Route::Allow);
+        assert_eq!(route("https://acme.okta.com/app/slack", Some("https://slack.com/signin")), Route::Allow);
         let url = "https://slack.com/checkcookie?redir=https://acme.slack.com/ssb/redirect";
         assert_eq!(route(url, None), Route::Allow);
         assert_eq!(route("https://slackers.example/x", None), Route::Allow);
@@ -389,6 +500,27 @@ mod tests {
             "enterprise_id":"E9"}},"lastActiveTeamId":"T1"}"#;
         assert_eq!(slack_session(listed), None);
         assert_eq!(slack_session(r#"{"teams":{"T1":{"url":"https://a.slack.com/","token":""}}}"#), None);
+    }
+
+    #[test]
+    fn an_org_token_keeps_workspaces_whose_own_tokens_are_empty() {
+        let config = r#"{"teams":{
+            "T1":{"name":"Acme","url":"https://acme.slack.com/","enterprise_id":"E9","enterprise_name":"Acme Org"},
+            "T2":{"name":"Side","url":"https://side.slack.com/","token":"xoxc-2","enterprise_id":"E9"}},
+            "enterprises":{"E9":{"name":"Acme Org","url":"https://acme.enterprise.slack.com/","token":"xoxc-org"}},
+            "lastActiveTeamId":"T1"}"#;
+        let made = slack_session(config).expect("a session");
+        assert_eq!(made["enterprises"][0]["id"], "E9");
+        assert_eq!(made["enterprises"][0]["token"], "xoxc-org");
+        assert_eq!(made["enterprises"][0]["name"], "Acme Org");
+        let teams = made["teams"].as_array().expect("teams");
+        assert_eq!(teams.len(), 2);
+        assert_eq!(teams[0]["id"], "T1");
+        assert_eq!(teams[0]["token"], "");
+        assert_eq!(teams[0]["enterprise_name"], "Acme Org");
+        assert_eq!(teams[1]["id"], "T2");
+        assert_eq!(teams[1]["token"], "xoxc-2");
+        assert_eq!(made["active"], "T1");
     }
 
     #[test]

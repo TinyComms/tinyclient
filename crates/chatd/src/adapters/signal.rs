@@ -1466,6 +1466,7 @@ fn row(peer: &Peer, title: &str) -> ConversationRow {
             row.listed = true;
             row.private = true;
             row.rights.pin = true;
+            row.call = call_offer(ConversationKind::Direct).support();
             row
         }
         Peer::Group(_) => {
@@ -1473,6 +1474,7 @@ fn row(peer: &Peer, title: &str) -> ConversationRow {
             let mut row = ConversationRow::new(peer.conversation(), ConversationKind::Group, title);
             row.listed = true;
             row.private = true;
+            row.call = call_offer(ConversationKind::Group).support();
             row
         }
     }
@@ -3248,6 +3250,19 @@ pub fn reaction_rules() -> protocol::ReactionRules {
     protocol::ReactionRules { mine: 1, replaces: true, ..protocol::ReactionRules::default() }
 }
 
+/// The ceiling: link previews on, which is what a linked account is asked for.
+pub(crate) fn capability_ceiling() -> protocol::Capabilities {
+    capabilities(true)
+}
+
+/// Signal calls stay on the phone. Directs and groups exist here; a voice room does not.
+pub(crate) fn call_offer(kind: ConversationKind) -> protocol::CallOffer {
+    match kind {
+        ConversationKind::Direct | ConversationKind::Group => protocol::CallOffer::Missing,
+        _ => protocol::CallOffer::Absent,
+    }
+}
+
 /// What this account may send: text up to the body other clients keep in the message itself,
 /// files up to Signal's limits, and a one-day edit window (how long Signal Desktop still sends an
 /// edit; a late delete is delete-for-me instead, decided in `delete`).
@@ -3507,7 +3522,7 @@ fn serve(account: &Arc<Account>, command: Command) {
         Command::ConversationInfo { conversation_id, reply } => {
             let _ = reply.send(conversation_info(account, &conversation_id));
         }
-        Command::MembersAdd { conversation_id, people, reply } => {
+        Command::MembersAdd { conversation_id, people, reply, .. } => {
             let _ = reply.send(members_add(account, &conversation_id, &people));
         }
         Command::MembersRemove { conversation_id, person, reply } => {

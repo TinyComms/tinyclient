@@ -62,6 +62,26 @@ pub(super) fn message_limit(premium: u8) -> usize {
     if premium == 2 { 2 * LONGEST } else { LONGEST }
 }
 
+/// What a Nitro account may send. Lower plans are the same constructor with a smaller file cap.
+pub(crate) fn capability_ceiling() -> protocol::Capabilities {
+    Discord::account_capabilities(2)
+}
+
+/// A direct or group DM is called here. Discord's own system account is not.
+pub(crate) fn private_call(system: bool) -> protocol::CallSupport {
+    if system { protocol::CallSupport::None } else { protocol::CallSupport::Native }
+}
+
+/// A voice channel is joined here.
+pub(crate) fn voice_channel_call() -> protocol::CallSupport {
+    voice::support(model::VOICE)
+}
+
+/// A stage opens in Discord.
+pub(crate) fn stage_channel_call() -> protocol::CallSupport {
+    voice::support(model::STAGE)
+}
+
 fn too_long(premium: u8, text: &str) -> Option<String> {
     let limit = message_limit(premium);
     (text.chars().count() > limit).then(|| format!("Message too long: Discord allows {limit} characters."))

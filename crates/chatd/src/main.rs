@@ -7,6 +7,10 @@ fn main() -> io::Result<()> {
         println!("chatd {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    if std::env::args().nth(1).as_deref() == Some("--capabilities") {
+        print!("{}", chatd::adapters::parity::markdown());
+        return Ok(());
+    }
     if std::env::var("TINYCLIENT_PROVE").ok().as_deref() == Some("tiny-reauth-history") {
         if let Err(err) = chatd::adapters::tiny::prove_reauthenticated_history() {
             eprintln!("tiny-reauth-history: {err}");

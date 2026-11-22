@@ -91,6 +91,7 @@ pub fn run() {
                             continue;
                         }
                         MediaRequest::LogLevel { level } => crate::relevel(&level),
+                        MediaRequest::CameraSettings(settings) => crate::picture::choose_camera_settings(settings),
                         _ => {
                             out::send(&MediaResponse::Refused { detail: "There is no call.".to_owned() });
                             continue;

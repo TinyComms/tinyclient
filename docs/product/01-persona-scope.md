@@ -75,7 +75,7 @@ These are part of the goal. They are not in the product yet, so each one opens i
 | Not yet | Until then |
 | --- | --- |
 | Admin on Discord, Slack, Teams, and Telegram | Open in the official app. Tiny server settings are in the Tiny column. |
-| Slack workflows, Teams tabs, Discord activities, Telegram mini apps | Open in the official app |
+| Slack workflows, Teams tabs, Discord activities, Telegram mini apps | A Slack shortcut link is labeled Workflow · Open in Slack. The others open in the official app. |
 | Bot buttons, menus, modals, slash-command forms | The text, images, and links render. The controls open in the official app. |
 | Canvases, lists, Loop, whiteboards | A link card |
 | Teams meetings, stage channels, huddle extras | `06-calls.md` |
